@@ -2631,3 +2631,87 @@ measures both servers, requires create/add refusals against loose sequences
 and declared generated-name tables before artifacts or DDL, checks numbering
 rename/installation against a loose table, and applies the free-name,
 alternative-name and same-plan release cases.
+
+<a id="dec-1635-1"></a>
+
+**DEC-1635.1. Enums and domains are shared declared objects with type files and identities.**
+A column's qualified `TypeRef` remains the reference spelling; membership in
+`Schema.types` distinguishes a managed definition from an external reference.
+`ManagedType` holds an enum's ordered values or a domain's column-style base,
+NOT NULL, default, named checks and explicit non-base collation. Collations
+share qualified identifier parsing with references but retain their own name
+type: an underscore prefix is legal for a collation and reserved on a type
+reference. Names belong to the containing map. `schema/<schema>.<name>.type.yml` follows the module
+file's leading-key rule and the ordinary scalar formatter. The optional
+`types` map adds `y_` uids under identity-file version 1, as `roles` did.
+State 30 records the definitions; states 6–29 remain readable. Published schema
+set 54 adds the two declaration shapes.
+
+PostgreSQL's catalog batch reuses `user_types`' label and constraint readers
+inside its existing statement snapshot, excluding extension members and engine
+schemas. Definition state excludes OIDs, owners and constraint validation;
+the existing reference pin retains those facts. A domain's inherited base
+collation is absent, an override is qualified. A catalog base outside the
+column type catalog, such as `int4range` or `int4multirange`, is preserved as a
+qualified reference, including its array marker. This does not admit range
+columns or add range definitions to the model. SQL Server refuses declarations
+by name. Composite definitions and ranges stay outside the managed model;
+standalone composite references remain admitted, range references refused.
+#1523 already lifted the enum/domain column omissions in the catalog and pure
+assembler: slice one preserves that admission and adds the type files beside
+the tables. Pull preserves existing type identities across recreation. Type
+files use the same encoding and pre-write case-collision refusal as other
+declarations (DECISIONS 135); diagnostics retain both original file spellings.
+
+The approved declared-domain owner-trust exemption is deferred for this slice.
+The potential-path gate and reviewed routine pins now span planning, bootstrap,
+apply, staged execution and resume (DEC-2181.1–4); changing only plan-time trust
+would grant an exemption replay does not share. Declaration alone changes none
+of today's eligibility, ownership, pin or routine-review rules. External
+references retain the same rules as before.
+
+Tests: `declared_types_round_trip_ordered_labels_and_verbatim_domain_text`,
+`invalid_type_shapes_and_duplicate_labels_are_refused`,
+`two_type_files_cannot_declare_the_same_identity`,
+`type_ids_are_optional_under_version_one_and_validate_their_own_namespace`,
+`collation_names_keep_sql_identity_without_type_only_restrictions`,
+`type_declaration_schema_and_loader_agree_on_kinds_and_unique_labels`,
+`missing_type_inventory_is_not_an_empty_catalog`,
+`domain_bases_outside_the_column_catalog_remain_qualified_references`,
+`a_sql_server_project_refuses_a_declared_type_by_name`, and
+`managed_types_and_their_columns_survive_pull_recreation_and_repull` cover the
+format, compatibility, negative shapes and catalog projection on 16 and 18.
+`existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays`
+keeps distinct quoted type identities and pins when one is managed and one is
+external. `type_files_differing_only_in_case_refuse_pull_before_any_project_write`
+checks DECISIONS 135 on both servers, preserving an empty or existing project.
+
+<a id="dec-1635-2"></a>
+
+**DEC-1635.2. Slice one refuses every managed type difference before emitting a plan.**
+A definition added, removed, replaced in kind, or changed in any attribute is
+a named refusal saying that lifecycle support arrives in later slices of
+#1635. No `Change`, rank, reordering pass or type DDL is introduced. Connected
+planning checks type definitions before reference prerequisites, so a missing
+declared enum does not become merely a missing column-type error. An equal
+definition plans no operation. A retained type uid without a declaration also
+refuses: a manual drop followed by a baseline must not let an empty plan
+record an identity the database does not hold. Newly managed live types enter the pinned
+baseline by their actual definition; already recorded ones still participate
+in drift and read-back movement checks. An undeclared, unrecorded live type
+stays unmanaged under the existing ignore/warn/error policy. Offline planning
+can compare a git/file baseline, but cannot obtain live proof; a declared type
+absent from that baseline is refused, and reference prerequisite restrictions
+remain unchanged.
+
+Tests: `every_type_lifecycle_difference_refuses_a_plan_by_name` covers enum
+addition, removal, reorder and rename, domain base, collation, NOT NULL,
+default and named-check differences, kind replacement, missing and removed
+definitions, and equal-definition negatives.
+`type_scope_leaves_unknown_types_to_the_unmanaged_policy` pins ownership scope.
+`an_empty_plan_cannot_keep_an_undeclared_type_identity` covers a retained uid
+after both the declaration and live definition have disappeared.
+`pulled_type_files_converge_and_each_type_change_is_refused_without_sql` runs
+pull/recreate/re-pull, equal plans, first-time type adoption through an
+unrelated staged column change, and each refusal through the CLI on 16 and
+18, requiring that no rejected plan artifact is written.

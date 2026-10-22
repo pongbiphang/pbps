@@ -55,6 +55,8 @@ pub struct Scoped {
     /// Roles the database has that the identity file does not name (ADR-0005).
     /// Left alone: their grants are neither compared nor touched.
     pub unmanaged_roles: Vec<pbps_model::RoleName>,
+    pub unmanaged_types: Vec<pbps_model::TypeRef>,
+    pub missing_types: Vec<pbps_model::TypeRef>,
 
     /// Facts about the managed set that the model cannot hold and a drift
     /// check must not call clean — a managed role's grant `WITH GRANT OPTION`,
@@ -115,6 +117,14 @@ pub fn scope(
     let managed: BTreeSet<&TableName> = ids.tables.values().collect();
 
     let mut scoped = Schema::default();
+    let mut unmanaged_types = Vec::new();
+    for (name, definition) in &schema.types {
+        if ids.type_uid(name).is_some() {
+            scoped.types.insert(name.clone(), definition.clone());
+        } else {
+            unmanaged_types.push(name.clone());
+        }
+    }
     let mut unmanaged = Vec::new();
     let mut external = BTreeMap::new();
     let mut unexpressible = Vec::new();
@@ -256,6 +266,13 @@ pub fn scope(
         missing,
         unmanaged_modules,
         unmanaged_roles,
+        unmanaged_types,
+        missing_types: ids
+            .types
+            .values()
+            .filter(|name| !schema.types.contains_key(*name))
+            .cloned()
+            .collect(),
         missing_roles,
         unexpressible,
         public_execute: Default::default(),
@@ -374,6 +391,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
         .keys()
         .chain(recorded.columns.keys())
         .chain(recorded.roles.keys())
+        .chain(recorded.types.keys())
         .chain(recorded.tombstones.keys())
         .cloned()
         .collect();
@@ -401,6 +419,13 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
             None => free_uid(UidKind::Role, name.raw(), &mut taken),
         };
         observed.roles.insert(uid, name.clone());
+    }
+    for name in live.types.keys() {
+        let uid = recorded
+            .type_uid(name)
+            .cloned()
+            .unwrap_or_else(|| free_uid(UidKind::Type, &name.raw().to_string(), &mut taken));
+        observed.types.insert(uid, name.clone());
     }
     observed
 }

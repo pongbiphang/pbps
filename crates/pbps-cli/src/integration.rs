@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 53;
+pub const SCHEMA_VERSION: u32 = 54;
+// 54: declared enum and domain files (#1635 slice one).
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -852,6 +853,47 @@ mod tests {
                 defs[name]["additionalProperties"],
                 serde_json::json!(false),
                 "{name} must refuse unknown fields: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn type_declaration_schema_and_loader_agree_on_kinds_and_unique_labels() {
+        let validator = jsonschema::validator_for(&schema(SchemaKind::Declaration)).unwrap();
+        for (value, valid) in [
+            (serde_json::json!({"enum": "app.e", "values": []}), true),
+            (
+                serde_json::json!({"enum": "app.e", "values": ["sad", "ok"]}),
+                true,
+            ),
+            (
+                serde_json::json!({"domain": "app.d", "type": "varchar(20)", "checks": {"c": "VALUE <> ''"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"enum": "app.e", "values": ["x", "x"]}),
+                false,
+            ),
+            (
+                serde_json::json!({"enum": "app.e", "values": ["x"], "unknown": true}),
+                false,
+            ),
+            (
+                serde_json::json!({"enum": "app.e", "domain": "app.d", "values": ["x"]}),
+                false,
+            ),
+            (
+                serde_json::json!({"domain": "app.d", "type": "text", "values": ["x"]}),
+                false,
+            ),
+            (serde_json::json!({"domain": "app.d"}), false),
+        ] {
+            assert_eq!(validator.is_valid(&value), valid, "{value}");
+            assert_eq!(
+                pbps_load::load_type_str(std::path::Path::new("type.yml"), &value.to_string())
+                    .is_ok(),
+                valid,
+                "{value}"
             );
         }
     }

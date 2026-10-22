@@ -173,6 +173,7 @@ where
         if captured.schema != checked.schema
             || captured.missing != checked.missing
             || captured.missing_roles != checked.missing_roles
+            || captured.missing_types != checked.missing_types
             || captured.unexpressible != checked.unexpressible
         {
             bail!(
@@ -4097,6 +4098,12 @@ pub(crate) fn unmanaged_objects(
         .map(|name| name.shown().to_string())
         .chain(
             scoped
+                .unmanaged_types
+                .iter()
+                .map(|name| format!("type {}", name.shown())),
+        )
+        .chain(
+            scoped
                 .unmanaged_modules
                 .iter()
                 .map(|id| id.shown().to_string()),
@@ -4181,6 +4188,18 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
             "warning: the identity file names {} table(s) this database does not have: {}",
             names.len(),
             names.join(", ")
+        );
+    }
+    if !scoped.missing_types.is_empty() {
+        eprintln!(
+            "warning: the identity file names {} type(s) this database does not have: {}",
+            scoped.missing_types.len(),
+            scoped
+                .missing_types
+                .iter()
+                .map(|name| name.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if !scoped.missing_roles.is_empty() {
@@ -4460,6 +4479,15 @@ fn refuse_pinned_movement(
     after: &Schema,
     label: &str,
 ) -> anyhow::Result<()> {
+    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
+    for name in types {
+        if before.types.get(name) != after.types.get(name) {
+            bail!(
+                "type `{}` changed during {label}; type lifecycle arrives in later slices of #1635",
+                name.shown()
+            );
+        }
+    }
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, plan.ids)?;
@@ -5654,7 +5682,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // never creates (#1600, #1606).
             crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
-            let held = ids.without(&scoped.missing).without_roles(&gone);
+            let held = ids
+                .without(&scoped.missing)
+                .without_roles(&gone)
+                .without_types(&scoped.missing_types);
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
@@ -5862,7 +5893,10 @@ pub fn cmd_baseline(
                 // What the database holds, as `snapshot` records it (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
-                let held = ids.without(&scoped.missing).without_roles(&gone);
+                let held = ids
+                    .without(&scoped.missing)
+                    .without_roles(&gone)
+                    .without_types(&scoped.missing_types);
                 let mut snapshot = with_provenance(
                     project.root(),
                     StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
@@ -6449,7 +6483,10 @@ pub fn cmd_bootstrap(
                 // those as held would make the next plan skip them (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
-                let held = ids.without(&built.missing).without_roles(&gone);
+                let held = ids
+                    .without(&built.missing)
+                    .without_roles(&gone)
+                    .without_types(&built.missing_types);
                 crate::engine::recheck_type_prerequisites(
                     &mut conn,
                     &bootstrap_pins,
@@ -6657,6 +6694,18 @@ pub fn cmd_plan_db(
 
         let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        if !resolved.ids.types.is_empty() {
+            let live = crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
+            let managed = Schema {
+                types: live.schema.types.into_iter()
+                    .filter(|(name, _)| resolved.ids.type_uid(name).is_some()).collect(),
+                ..Default::default()
+            };
+            let errors = pbps_diff::schema_diff::type_differences(&managed, &loaded.schema, dialect.as_ref());
+            if !errors.is_empty() {
+                bail!("{}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
+            }
+        }
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
             &[&loaded.schema],
@@ -6858,6 +6907,13 @@ pub fn cmd_plan_db(
             &as_recorded,
             &mut expected,
         )?;
+        // First declarations adopt the live definition, as newly managed
+        // cluster roles do. Already recorded types still participate in drift.
+        for (name, definition) in &as_recorded.types {
+            if entry.snapshot.ids.type_uid(name).is_none() {
+                expected.types.insert(name.clone(), definition.clone());
+            }
+        }
         let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
         if live != recorded {
             bail!(
@@ -8226,7 +8282,10 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         .await?
         .renames;
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
-    if plan.changes.is_empty() && original_ids.roles == plan.ids.roles {
+    if plan.changes.is_empty()
+        && original_ids.roles == plan.ids.roles
+        && original_ids.types == plan.ids.types
+    {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
         if !pinned_managed.references.is_empty() || !plan.type_pins.is_empty() {
@@ -8575,6 +8634,11 @@ fn rename_snapshot_roles(
 /// baseline UID; only their post-apply identity changes when a UID is replaced.
 fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
     let mut scoped = recorded.clone();
+    for (uid, name) in &declared.types {
+        if scoped.type_uid(name).is_none() {
+            scoped.types.insert(uid.clone(), name.clone());
+        }
+    }
     if !dialect.manages_roles() {
         for (uid, name) in &declared.roles {
             if !scoped.roles.values().any(|old| old == name) {
@@ -8893,6 +8957,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // on a resume — and each statement moves it, using what the emitter said
     // that statement does (`Statement::renames`).
     let mut live_ids = entry.snapshot.ids.clone();
+    // Types have no lifecycle statements in this slice: every planned type
+    // identity already exists and must remain in each checkpoint's scope.
+    live_ids.types = plan.ids.types.clone();
     if !dialect.manages_roles() {
         live_ids.roles = plan.ids.roles.clone();
     }
@@ -14468,8 +14535,10 @@ mod tests {
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
+            unmanaged_types: Vec::new(),
             unexpressible: Vec::new(),
             missing_roles: Vec::new(),
+            missing_types: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new().into(),
@@ -14524,8 +14593,10 @@ mod tests {
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
+            unmanaged_types: Vec::new(),
             unexpressible: Vec::new(),
             missing_roles: Vec::new(),
+            missing_types: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new().into(),

@@ -84,6 +84,23 @@ fn filename(name: &ObjectName, kind: Option<ModuleKind>) -> String {
     filename_of(&name.schema, &name.name, kind)
 }
 
+pub fn type_path(dir: &Path, name: &pbps_model::TypeRef) -> anyhow::Result<PathBuf> {
+    let readable = format!(
+        "{}.{}.type.yml",
+        escape_reserved_stem(component(name.schema())),
+        component(name.name())
+    );
+    let file = if readable.len() <= 240 {
+        readable
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(name.raw().to_string().as_bytes());
+        hasher.update(b"\0type");
+        format!("~pbps-{:x}.type.yml", hasher.finalize())
+    };
+    Ok(dir.join(file))
+}
+
 /// The file a module is written to, under its whole identity.
 ///
 /// The whole identity, because anything less lets `pull` write one
@@ -175,6 +192,12 @@ pub fn paths_of(
     schema: &pbps_model::Schema,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
+    for name in schema.types.keys() {
+        out.push((
+            format!("type {}", name.shown()),
+            type_path(directory, name)?,
+        ));
+    }
     // A partition is written in its parent's file, not one of its own
     // (#1170).
     for (name, table) in &schema.tables {
@@ -213,18 +236,25 @@ pub fn paths_of(
 /// repository out, so the refusal is unconditional rather than a property of
 /// the filesystem underneath (DECISIONS 135).
 pub fn refuse_folded_paths(paths: &[(String, PathBuf)]) -> anyhow::Result<()> {
-    let mut by_folded: std::collections::BTreeMap<String, Vec<&str>> =
+    let mut by_folded: std::collections::BTreeMap<String, Vec<(&str, &Path)>> =
         std::collections::BTreeMap::new();
     for (label, path) in paths {
         by_folded
             .entry(path.to_string_lossy().to_lowercase())
             .or_default()
-            .push(label);
+            .push((label, path));
     }
     let clashing: Vec<String> = by_folded
         .iter()
         .filter(|(_, labels)| labels.len() > 1)
-        .map(|(folded, labels)| format!("{} -> `{folded}`", labels.join(", ")))
+        .map(|(_, entries)| {
+            let labels = entries.iter().map(|(label, _)| *label).collect::<Vec<_>>();
+            let files = entries
+                .iter()
+                .map(|(_, path)| format!("`{}`", path.display()))
+                .collect::<Vec<_>>();
+            format!("{} -> {}", labels.join(", "), files.join(", "))
+        })
         .collect();
     if !clashing.is_empty() {
         bail!(
@@ -279,12 +309,22 @@ mod tests {
         schema
             .roles
             .insert("reader".to_owned().into(), pbps_model::Role::default());
+        for name in ["app.mood", "app.\"Mood\""] {
+            schema.types.insert(
+                name.parse().unwrap(),
+                pbps_model::ManagedType::Enum { values: vec![] },
+            );
+        }
 
         let paths = paths_of(dir, &schema).unwrap();
         let err = refuse_folded_paths(&paths).unwrap_err().to_string();
-        assert!(err.contains("2 declaration file name(s)"), "{err}");
+        assert!(err.contains("3 declaration file name(s)"), "{err}");
         assert!(err.contains("dbo.Customer, dbo.customer"), "{err}");
         assert!(err.contains("role Reader, role reader"), "{err}");
+        assert!(
+            err.contains("app.mood.type.yml") && err.contains("app.Mood.type.yml"),
+            "{err}"
+        );
         // The one that collides with nothing is not named.
         assert!(!err.contains("dbo.order"), "{err}");
 

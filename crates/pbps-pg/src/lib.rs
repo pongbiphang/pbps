@@ -2410,6 +2410,29 @@ impl Dialect for Postgres {
 
     /// Every problem with a role, before anything connects (ADR-0010 §1, §2
     /// and §6). See [`validate::role`].
+    fn validate_type(
+        &self,
+        name: &pbps_model::TypeRef,
+        definition: &pbps_model::ManagedType,
+    ) -> Vec<DialectError> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.normalize_type(&ColumnType::reference(name.clone())) {
+            errors.push(error);
+        }
+        if !catalog::a_projects_schema(name.schema()) {
+            errors.push(DialectError::Invalid {
+                dialect: self.name(),
+                message: "a declared type must belong to a project schema".into(),
+            });
+        }
+        if let pbps_model::ManagedType::Domain { base, .. } = definition
+            && let Err(error) = self.normalize_type(base)
+        {
+            errors.push(error);
+        }
+        errors
+    }
+
     fn validate_role(
         &self,
         name: &pbps_model::RoleName,

@@ -1262,16 +1262,18 @@ async fn fetch_subtypes(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Re
     Ok(())
 }
 
-async fn fetch_labels(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Result<(), DbError> {
-    let rows = conn
-        .query(&format!(
-            "SELECT enumtypid::pg_catalog.int8 AS typ, enumlabel::pg_catalog.text AS label
+fn labels_query(oids: &str) -> String {
+    format!(
+        "SELECT enumtypid::pg_catalog.int8 AS typ, enumlabel::pg_catalog.text AS label,
+                    enumsortorder AS ordinal
                FROM pg_catalog.pg_enum
-              WHERE enumtypid = ANY({})
-              ORDER BY enumtypid, enumsortorder",
-            oid_array(oids)
-        ))
-        .await?;
+              WHERE enumtypid = ANY({oids})
+              ORDER BY enumtypid, enumsortorder"
+    )
+}
+
+async fn fetch_labels(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Result<(), DbError> {
+    let rows = conn.query(&labels_query(&oid_array(oids))).await?;
     for row in &rows {
         into.labels
             .entry(need(row, "typ")?)
@@ -1281,26 +1283,25 @@ async fn fetch_labels(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Resu
     Ok(())
 }
 
-/// The `NOT NULL` row 18 keeps for a domain is left out (`contype = 'n'`):
-/// `typnotnull` holds it on every release, and 16 has no such row.
+// PostgreSQL 18 also catalogs NOT NULL; typnotnull is its portable source.
+fn constraints_query(oids: &str) -> String {
+    format!(
+        "SELECT contypid::pg_catalog.int8 AS typ, conname::pg_catalog.text AS name,
+                    contype::pg_catalog.text AS contype, convalidated AS validated,
+                    pg_catalog.pg_get_constraintdef(oid) AS definition,
+                    pg_catalog.pg_get_expr(conbin, 0::pg_catalog.oid) AS expression
+               FROM pg_catalog.pg_constraint
+              WHERE contypid = ANY({oids}) AND contype <> 'n'
+              ORDER BY contypid, conname::pg_catalog.text COLLATE \"C\""
+    )
+}
+
 async fn fetch_constraints(
     conn: &mut Conn,
     oids: &[Oid],
     into: &mut Catalog,
 ) -> Result<(), DbError> {
-    let rows = conn
-        .query(&format!(
-            "SELECT contypid::pg_catalog.int8 AS typ,
-                    conname::pg_catalog.text AS name,
-                    contype::pg_catalog.text AS contype,
-                    convalidated AS validated,
-                    pg_catalog.pg_get_constraintdef(oid) AS definition
-               FROM pg_catalog.pg_constraint
-              WHERE contypid = ANY({}) AND contype <> 'n'
-              ORDER BY contypid, conname::pg_catalog.text COLLATE \"C\"",
-            oid_array(oids)
-        ))
-        .await?;
+    let rows = conn.query(&constraints_query(&oid_array(oids))).await?;
     for row in &rows {
         into.constraints
             .entry(need(row, "typ")?)
@@ -1313,6 +1314,40 @@ async fn fetch_constraints(
             });
     }
     Ok(())
+}
+
+/// Reuses the canonical label and constraint reads inside the catalog's one
+/// statement snapshot. Type pins continue to include ownership and validation;
+/// these declarations describe the type's portable semantic definition only.
+pub(crate) fn managed_query() -> String {
+    let labels = labels_query("ARRAY[t.oid]");
+    let checks = constraints_query("ARRAY[t.oid]");
+    format!("SELECT n.nspname::text AS schema, t.typname::text AS name,
+                    t.typtype::text AS kind, t.typisdefined AS defined,
+                    pg_catalog.format_type(t.typbasetype, t.typtypmod) AS base,
+                    pg_catalog.quote_ident(bn.nspname) || '.' ||
+                        pg_catalog.quote_ident(COALESCE(be.typname, bt.typname)) ||
+                        CASE WHEN be.oid IS NOT NULL THEN '[]' ELSE '' END AS base_reference,
+                    t.typnotnull AS not_null,
+                    pg_catalog.pg_get_expr(t.typdefaultbin, 0::pg_catalog.oid) AS default_expr,
+                    CASE WHEN t.typcollation <> 0 AND t.typcollation <> bt.typcollation
+                         THEN pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(c.collname)
+                    END AS collation,
+                    COALESCE((SELECT jsonb_agg(label ORDER BY ordinal) FROM ({labels}) l), '[]'::jsonb) AS labels,
+                    COALESCE((SELECT jsonb_agg(to_jsonb(k) ORDER BY name) FROM ({checks}) k), '[]'::jsonb) AS checks
+               FROM pg_catalog.pg_type t
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+               LEFT JOIN pg_catalog.pg_type bt ON bt.oid = t.typbasetype
+               LEFT JOIN pg_catalog.pg_type be ON be.oid = bt.typelem AND be.typarray = bt.oid
+               LEFT JOIN pg_catalog.pg_namespace bn ON bn.oid = COALESCE(be.typnamespace, bt.typnamespace)
+               LEFT JOIN pg_catalog.pg_collation c ON c.oid = t.typcollation
+               LEFT JOIN pg_catalog.pg_namespace cn ON cn.oid = c.collnamespace
+              WHERE t.typtype IN ('d', 'e')
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND pg_catalog.left(n.nspname, 3) <> 'pg_'
+                AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d
+                                 WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                                   AND d.objid = t.oid AND d.deptype = 'e')")
 }
 
 async fn fetch_attributes(

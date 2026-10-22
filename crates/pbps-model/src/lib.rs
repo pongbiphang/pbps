@@ -33,6 +33,7 @@ pub mod escape;
 pub mod finding;
 pub mod ids;
 pub mod intent;
+pub mod managed_type;
 pub mod module;
 pub mod name;
 pub mod operation;
@@ -69,6 +70,7 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, IdsIndex, Move, Tombstone, ValidIds};
 pub use intent::Intent;
+pub use managed_type::ManagedType;
 pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,
     RoutineArg, RoutineArgError, RoutineId,
@@ -95,6 +97,6 @@ pub use schema::{
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
 pub use text::Text;
-pub use types::{ColumnType, TypeArg, TypeParseError, TypeRef};
+pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
 pub use zone::{SessionZone, ZoneError};

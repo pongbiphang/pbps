@@ -66,6 +66,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         tables,
         modules,
         roles,
+        ..
     } = schema;
     let mut s = String::new();
     let _ = write!(

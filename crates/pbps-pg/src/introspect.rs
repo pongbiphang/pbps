@@ -381,6 +381,7 @@ pub struct RawIndex {
 /// Everything one pull read, before any of it is interpreted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawCatalog {
+    pub types: BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
     pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
     pub columns: Vec<RawColumn>,
@@ -754,6 +755,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         session_role: raw.session_role.clone(),
         ..Pulled::default()
     };
+    pulled.schema.types = raw.types.clone();
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
     let policies_by_table = group(&raw.row_policies, |p| p.table_oid);

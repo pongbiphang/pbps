@@ -19,6 +19,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/managed_types.rs"]
+mod managed_types;
+
 #[path = "support/type_refs.rs"]
 mod type_refs;
 

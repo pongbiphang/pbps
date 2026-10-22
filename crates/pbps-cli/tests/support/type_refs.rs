@@ -50,12 +50,14 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         let db = own.connection();
         on_server(
             db,
-            "CREATE SCHEMA app; CREATE SCHEMA \"App\";
+            "CREATE SCHEMA app; CREATE SCHEMA \"Ext\";
             CREATE TYPE app.mood AS ENUM ('sad', 'happy');
             CREATE DOMAIN app.positive AS integer CHECK (VALUE > 0);
             CREATE TYPE app.pair AS (n integer, s text);
-            CREATE TYPE \"App\".\"Mood\" AS ENUM ('ok');",
+            CREATE TYPE \"Ext\".\"Mood\" AS ENUM ('ok');",
         );
+        // The project adopts app alone. Ext remains an ordinary external
+        // namespace, with its own #1523 pin beside managed app.mood (#1635).
         // Both names exist, so escaping a type identity cannot accidentally
         // pass by resolving to the only type the database holds (#2084 step 1c).
         let hostile_names = ["type\n\"\\\u{1b}名", r#"type\n"\\\u{1b}名"#];
@@ -70,7 +72,7 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             ));
         }
         let d = Demo::new("refs-roundtrip");
-        d.table(&declarations(&("  mood: {type: app.mood, default: \"'happy'::app.mood\"}\n  moods: {type: 'app.mood[]', default: \"'{}'::app.mood[]\"}\n  n: {type: app.positive}\n  ns: {type: 'app.positive[]'}\n  pair: {type: app.pair}\n  pairs: {type: 'app.pair[]'}\n  quoted: {type: '\"App\".\"Mood\"'}\n" .to_owned() + &extra)));
+        d.table(&declarations(&("  mood: {type: app.mood, default: \"'happy'::app.mood\"}\n  moods: {type: 'app.mood[]', default: \"'{}'::app.mood[]\"}\n  n: {type: app.positive}\n  ns: {type: 'app.positive[]'}\n  pair: {type: app.pair}\n  pairs: {type: 'app.pair[]'}\n  quoted: {type: '\"Ext\".\"Mood\"'}\n" .to_owned() + &extra)));
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", db]));
@@ -80,6 +82,19 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert!(saved.changes.is_empty(), "{:?}", saved.changes);
         assert_eq!(saved.type_pins.len(), 6);
+        let distinct_pins = |pins: &[pbps_model::TypePin]| {
+            let managed = pins
+                .iter()
+                .find(|p| p.schema == "app" && p.name == "mood")
+                .unwrap();
+            let external = pins
+                .iter()
+                .find(|p| p.schema == "Ext" && p.name == "Mood")
+                .unwrap();
+            assert_ne!(managed.oid, external.oid);
+            assert_ne!(managed.digest, external.digest);
+        };
+        distinct_pins(&saved.type_pins);
         for name in hostile_names {
             assert!(
                 saved
@@ -89,11 +104,98 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             );
         }
         succeeds(d.run(&["pull", "--db", db, "--force"]));
+        // Pull inventories every ordinary schema. Select the project's app
+        // declarations before adopting the newly minted type identities;
+        // Ext.Mood must remain a reference, rather than managed type state.
+        let external: pbps_model::TypeRef = "\"Ext\".\"Mood\"".parse().unwrap();
+        std::fs::remove_file(d.dir.join("schema/Ext.Mood.type.yml")).unwrap();
+        let ids_path = d.dir.join("schema.ids.json");
+        let mut ids: pbps_model::IdsFile =
+            serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+        let uid = ids.type_uid(&external).unwrap().clone();
+        assert_eq!(ids.types.remove(&uid), Some(external.clone()));
+        assert!(ids.types.values().all(|name| name.schema() == "app"));
+        std::fs::write(&ids_path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
         succeeds(d.run(&["validate"]));
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        assert!(
+            loaded
+                .schema
+                .types
+                .contains_key(&"app.mood".parse().unwrap())
+        );
+        assert!(!loaded.schema.types.contains_key(&external));
         let next = plan(&d, db);
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(next).unwrap()).unwrap();
         assert!(saved.changes.is_empty(), "{:?}", saved.changes);
+        assert_eq!(saved.type_pins.len(), 6);
+        distinct_pins(&saved.type_pins);
+        assert!(saved.ids.type_uid(&external).is_none());
+        assert!(saved.ids.type_uid(&"app.mood".parse().unwrap()).is_some());
+        // Explicitly prove schema cleanup on each major, in addition to the
+        // owned database guard that also runs if an assertion unwinds.
+        on_server(db, "DROP SCHEMA \"Ext\" CASCADE");
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_namespace WHERE nspname = 'Ext'"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn type_files_differing_only_in_case_refuse_pull_before_any_project_write() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_case");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad');
+            CREATE TYPE app.\"Mood\" AS ENUM ('ok'); CREATE TABLE app.t (id integer)",
+        );
+        for existing in [false, true] {
+            let d = Demo::new("refs-case");
+            let config = std::fs::read(d.dir.join("pbps.yml")).unwrap();
+            let declaration = d.dir.join("schema/app.t.yml");
+            let ids = d.dir.join("schema.ids.json");
+            if existing {
+                d.table(&declarations(""));
+                succeeds(d.run(&["plan"]));
+            }
+            let read_if_present = |path: &std::path::Path| match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read {}: {error}", path.display()),
+            };
+            let before_table = read_if_present(&declaration);
+            let before_ids = read_if_present(&ids);
+            let before_files = pbps_load::schema_files(&d.dir.join("schema")).unwrap();
+            let mut args = vec!["pull", "--db", db];
+            if existing {
+                args.push("--force");
+            }
+            let out = d.run(&args);
+            assert_ne!(code(&out), 0, "{}", stdout(&out));
+            let message = stderr(&out);
+            assert!(
+                message.contains("declaration file name(s) differ only in case")
+                    && message.contains("filesystem that ignores case would keep one of each")
+                    && message.contains("app.mood.type.yml")
+                    && message.contains("app.Mood.type.yml"),
+                "{message}"
+            );
+            assert_eq!(read_if_present(&declaration), before_table);
+            assert_eq!(read_if_present(&ids), before_ids);
+            assert_eq!(
+                pbps_load::schema_files(&d.dir.join("schema")).unwrap(),
+                before_files
+            );
+            assert_eq!(std::fs::read(d.dir.join("pbps.yml")).unwrap(), config);
+        }
     }
 }
 

@@ -3024,6 +3024,18 @@ pub trait Dialect {
         Vec::new()
     }
 
+    /// Shared type definitions have no lifecycle operations in slice one.
+    fn validate_type(
+        &self,
+        _name: &pbps_model::TypeRef,
+        _definition: &pbps_model::ManagedType,
+    ) -> Vec<DialectError> {
+        vec![DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "declared enum and domain types".into(),
+        }]
+    }
+
     /// Checks whether this dialect supports the features the table uses.
     ///
     /// Returns every problem rather than the first one — the user should see

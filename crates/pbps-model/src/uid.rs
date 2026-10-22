@@ -25,7 +25,7 @@ const LEN: usize = 6;
 /// held (DEC-2032.1, #2035).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{}` is missing the `t_`, `c_` or `r_` prefix", crate::escape::Escaped(.0))]
+    #[error("UID `{}` is missing the `t_`, `c_`, `r_` or `y_` prefix", crate::escape::Escaped(.0))]
     BadPrefix(String),
 
     #[error(
@@ -42,6 +42,7 @@ pub enum UidError {
 /// whether a line in the identity file is about a table or a column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UidKind {
+    Type,
     Table,
     Column,
     /// A database role (ADR-0005). Pinned alongside the two above because an
@@ -53,6 +54,7 @@ pub enum UidKind {
 impl UidKind {
     pub const fn prefix(self) -> &'static str {
         match self {
+            UidKind::Type => "y_",
             UidKind::Table => "t_",
             UidKind::Column => "c_",
             UidKind::Role => "r_",
@@ -118,7 +120,9 @@ impl Uid {
     }
 
     pub fn kind(&self) -> UidKind {
-        if self.0.starts_with("t_") {
+        if self.0.starts_with("y_") {
+            UidKind::Type
+        } else if self.0.starts_with("t_") {
             UidKind::Table
         } else if self.0.starts_with("r_") {
             UidKind::Role
@@ -146,6 +150,7 @@ impl FromStr for Uid {
             .strip_prefix("t_")
             .or_else(|| s.strip_prefix("c_"))
             .or_else(|| s.strip_prefix("r_"))
+            .or_else(|| s.strip_prefix("y_"))
             .ok_or_else(|| UidError::BadPrefix(s.to_owned()))?;
 
         if rest.len() != LEN {

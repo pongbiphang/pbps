@@ -443,6 +443,79 @@ pub struct TypeRef {
     name: String,
 }
 
+impl FromStr for TypeRef {
+    type Err = TypeParseError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let ty = parse_reference(text.trim())?;
+        if ty.is_array() {
+            return Err(bad_reference(
+                text,
+                "an object name cannot have an array suffix",
+            ));
+        }
+        ty.type_ref()
+            .cloned()
+            .ok_or_else(|| bad_reference(text, "expected a qualified type name"))
+    }
+}
+
+impl serde::Serialize for TypeRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw().to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TypeRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A domain's collation uses qualified SQL identifier syntax, without the
+/// type-only array-name restriction. Its identity is case-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollationName(TypeRef);
+
+impl CollationName {
+    pub fn name(&self) -> &str {
+        self.0.name()
+    }
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        self.0.raw()
+    }
+}
+
+impl FromStr for CollationName {
+    type Err = TypeParseError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (name, array) = qualified_parts(text.trim())?;
+        if array
+            || name.schema.is_empty()
+            || name.name.is_empty()
+            || name.schema.contains('\0')
+            || name.name.contains('\0')
+        {
+            return Err(bad_reference(text, "expected a qualified collation name"));
+        }
+        Ok(Self(name))
+    }
+}
+
+impl serde::Serialize for CollationName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw().to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CollationName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl TypeRef {
     /// A reference from two parts exactly as the engine keeps them, with no
     /// folding: the catalog's own `nspname` and `typname`.
@@ -574,6 +647,15 @@ fn bad_reference(whole: &str, reason: impl Into<String>) -> TypeParseError {
 
 /// Reads `schema.name` or `schema.name[]`, each part bare or double-quoted.
 fn parse_reference(whole: &str) -> Result<ColumnType, TypeParseError> {
+    let (user, array) = qualified_parts(whole)?;
+    if let Some(reason) = user.problem() {
+        return Err(bad_reference(whole, reason));
+    }
+    let ty = ColumnType::reference(user);
+    Ok(if array { ty.into_array() } else { ty })
+}
+
+fn qualified_parts(whole: &str) -> Result<(TypeRef, bool), TypeParseError> {
     let fail = |reason: &str| bad_reference(whole, reason);
     let (schema, rest) = take_part(whole, whole)?;
     let Some(rest) = rest.strip_prefix('.') else {
@@ -597,12 +679,7 @@ fn parse_reference(whole: &str) -> Result<ColumnType, TypeParseError> {
         _ if rest.starts_with('[') => return Err(TypeParseError::BadArray(whole.to_owned())),
         _ => return Err(fail("unexpected text after the name")),
     };
-    let user = TypeRef::unchecked(schema, name);
-    if let Some(reason) = user.problem() {
-        return Err(fail(&reason));
-    }
-    let ty = ColumnType::reference(user);
-    Ok(if array { ty.into_array() } else { ty })
+    Ok((TypeRef::unchecked(schema, name), array))
 }
 
 /// One name part from the front of `text`, and what follows it. A bare part is
@@ -1214,5 +1291,34 @@ mod tests {
             error.to_string(),
             r#"`""."line\n\\x"` is not a user-defined type reference pbps can hold: a name part is empty. Write `schema.name`, each part optionally in double quotes, optionally followed by `[]`"#
         );
+    }
+}
+
+#[cfg(test)]
+mod collation_name_tests {
+    use super::*;
+
+    #[test]
+    fn collation_names_keep_sql_identity_without_type_only_restrictions() {
+        for text in [
+            "app._collation",
+            "pg_catalog.\"C\"",
+            "\"App\".\"collation.with.dot\"",
+        ] {
+            let name: CollationName = text.parse().unwrap();
+            assert_eq!(
+                name.raw().to_string().parse::<CollationName>().unwrap(),
+                name
+            );
+            assert_eq!(
+                serde_json::from_str::<CollationName>(&serde_json::to_string(&name).unwrap())
+                    .unwrap(),
+                name
+            );
+        }
+        assert!("app._collation".parse::<TypeRef>().is_err());
+        for text in ["unqualified", "app.c[]", "app.c.extra", "app.\"\""] {
+            assert!(text.parse::<CollationName>().is_err(), "{text}");
+        }
     }
 }

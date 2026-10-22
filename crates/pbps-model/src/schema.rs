@@ -30,6 +30,10 @@ use crate::types::ColumnType;
 pub struct Schema {
     pub tables: BTreeMap<TableName, Table>,
 
+    /// Shared declared enums and domains (DEC-1635.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<crate::TypeRef, crate::ManagedType>,
+
     /// Views, procedures, functions and triggers (ADR-0002).
     ///
     /// Keyed by [`ModuleId`], not by name: what identifies a module depends on

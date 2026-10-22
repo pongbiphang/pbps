@@ -782,6 +782,55 @@ grants:
   objects and schemas. A role the ids file does not name is left alone, and so
   is a grant on an object nobody declares.
 
+### 4.8 Shared PostgreSQL types
+
+One enum or domain per `schema/<schema>.<name>.type.yml` file. The leading
+`enum:` or `domain:` gives both its kind and its qualified name. SQL Server
+refuses type declarations by name. A type has its own identity; a column
+continues to name it with `type: app.mood` (DEC-1635.1).
+
+```yaml
+# schema/app.mood.type.yml
+enum: app.mood
+values: [sad, ok, happy]
+```
+
+```yaml
+# schema/app.phone.type.yml
+domain: app.phone
+type: varchar(20)
+not_null: false
+default: "'0'"
+checks:
+  phone_digits: "VALUE ~ '^[0-9+ -]+$'"
+```
+
+An enum's `values` are ordered, unique strings; an empty enum is representable.
+A domain declares its base with the column type grammar, optional `not_null`
+(default false), `default`, named `checks`, and a qualified `collation` when it
+differs from its base's. Expressions remain verbatim. Formatting follows §4.3,
+including quoting labels that YAML would otherwise reinterpret. Unknown keys
+and kind-specific keys on the wrong kind are refused.
+
+Pull reads non-extension enums and domains in project schemas, including ones
+no table uses. References to declared types are managed through this map;
+undeclared types retain the existing external-reference pins and eligibility
+gate. Composite and range definitions and SQL Server alias definitions remain
+outside the managed model. Standalone composites continue to work by reference;
+ranges remain refused by the reference reader.
+
+Slice one of #1635 models and pulls these objects but emits no type DDL. Every
+creation, removal or definition difference refuses the plan by name, explaining
+that lifecycle support arrives in later slices (DEC-1635.2). An equal live type
+needs no operation. A live type outside the identities remains unmanaged under
+§8.2's policy. Offline planning can compare definitions supplied by a git/file
+baseline; it cannot prove a target's definition, and missing baseline types
+are refused. Existing offline reference eligibility restrictions remain.
+Declared domains retain the current external-type eligibility gate in this
+slice: declaration alone grants no owner-trust exemption. The approved trust
+rule needs coordinated plan, apply, staged, resume and prerequisite changes;
+that work is deferred rather than introducing a partial exemption.
+
 ## 5. The identity file (`schema.ids.json`)
 
 ### 5.1 Format
@@ -791,6 +840,9 @@ grants:
   "version": 1,
   "tables": {
     "t_a9k2mq": "dbo.customer"
+  },
+  "types": {
+    "y_s3k8mq": "app.mood"
   },
   "columns": {
     "c_k7x2mq": "dbo.customer.customer_id",
@@ -817,8 +869,13 @@ grants:
 ```
 
 It stores only **what cannot be derived from the YAML**: the identity mapping,
-the tombstones, and the moves a human allowed (6.5). Types, nullability and index definitions are never stored — the
+the tombstones, and the moves a human allowed (6.5). Column types, nullability and index definitions are never stored — the
 YAML already has them.
+
+The optional `roles` map holds `r_` uids and unqualified role names; the optional
+`types` map holds `y_` uids and qualified enum/domain names. Both are compatible
+evolutions under version 1: a file without either section loads with that map
+empty. Type definitions stay in YAML, never in the ids map.
 
 A 200-column project is 200 lines of `uid: name`, and a rename's diff is:
 
@@ -831,7 +888,7 @@ One name changing under one uid — an unambiguous rename signal in an MR review
 
 ### 5.2 UID rules
 
-- Format: a `c_` / `t_` prefix plus six random base32 characters
+- Format: a `c_` / `t_` / `r_` / `y_` prefix plus six random base32 characters
 - Globally unique, not merely unique within a table
 - **Users never have to type one or see one**; it is purely an internal identity
   anchor

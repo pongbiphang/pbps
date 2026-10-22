@@ -110,7 +110,9 @@ Managing domains, enums and composite types is out of scope for a different
 reason: they are user-defined *objects* with their own creation, ownership and drop
 semantics, not spellings of a built-in, and modelling them is a separate ADR.
 `pull` holds existing enums, domains and standalone composites by qualified
-reference, scalar or array (#1523, DEC-1523.1); pbps manages no type lifecycle.
+reference, scalar or array (#1523, DEC-1523.1). Slice one of #1635 now models
+and pulls declared enums and domains (DEC-1635.1); pbps still creates, alters
+and drops no type. Lifecycle support belongs to later slices of #1635.
 
 ## 2. `TypeChangeRisk` answers its question, and it answers it correctly
 

@@ -52,6 +52,9 @@ mod removal_names_tests;
 #[path = "support/rename_order.rs"]
 mod rename_order_tests;
 
+#[path = "support/managed_types.rs"]
+mod managed_types_tests;
+
 #[path = "support/user_types.rs"]
 mod user_types_tests;
 

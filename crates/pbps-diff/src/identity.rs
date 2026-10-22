@@ -235,6 +235,15 @@ fn resolve_with_provenance(
     let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
 
+    // Slice one records identity but never infers a rename or a drop. The
+    // differ refuses every lifecycle difference by name (DEC-1635.2).
+    for name in declared.types.keys() {
+        if r.ids.type_uid(name).is_none() {
+            let uid = fresh_uid(&r.ids, UidKind::Type);
+            r.ids.types.insert(uid, name.clone());
+        }
+    }
+
     resolve_tables(
         declared,
         intents,

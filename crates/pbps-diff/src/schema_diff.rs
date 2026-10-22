@@ -36,6 +36,11 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
+    #[error("type `{name}`: {reason}; type lifecycle arrives in later slices of #1635", name = .name.shown())]
+    TypeLifecycleUnsupported {
+        name: pbps_model::TypeRef,
+        reason: String,
+    },
     #[error(
         "column {column}: its partition default cannot be planned: {reason}",
         column = .column.shown(),
@@ -577,6 +582,47 @@ pub fn diff_partial(
 /// has none, and neither has a DEFAULT the plan drops, detaches or makes:
 /// one leaving goes in class 6, before the partition is created, and a new
 /// one starts empty. The name is the declared one because renames run in
+/// Slice-one lifecycle refusals, shared with connected prerequisite admission
+/// so a missing declared type is named before its column's reference gate.
+pub fn type_differences(
+    base: &Schema,
+    declared: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+) -> Vec<DiffError> {
+    let mut errs = Vec::new();
+    // Types are compared state, but have no Change or DDL in slice one.
+    // The caller has already cut the live catalog to the managed set.
+    let names: BTreeSet<_> = base.types.keys().chain(declared.types.keys()).collect();
+    for name in names {
+        let reason = match (base.types.get(name), declared.types.get(name)) {
+            (None, Some(_)) => Some("declared but absent from the target".to_owned()),
+            (Some(_), None) => Some("present in the managed target but not declared".to_owned()),
+            (Some(old), Some(new)) => {
+                let normalize = |definition: &pbps_model::ManagedType| {
+                    let mut definition = definition.clone();
+                    if let pbps_model::ManagedType::Domain { base, .. } = &mut definition {
+                        *base = dialect
+                            .normalize_type(base)
+                            .unwrap_or_else(|_| base.clone());
+                    }
+                    definition
+                };
+                let fields = normalize(old).differences(&normalize(new));
+                (!fields.is_empty()).then(|| format!("{} changed", fields.join(", ")))
+            }
+            (None, None) => None,
+        };
+        if let Some(reason) = reason {
+            errs.push(DiffError::TypeLifecycleUnsupported {
+                name: name.clone(),
+                reason,
+            });
+        }
+    }
+
+    errs
+}
+
 /// class 1, before every create.
 fn standing_default(
     base: Side<'_>,
@@ -626,6 +672,19 @@ pub(crate) fn diff_partial_rebuilding(
             .into_iter()
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
+
+    errs.extend(type_differences(base.schema, declared.schema, dialect));
+
+    // A retained uid is still a managed claim after a manual drop and a
+    // baseline. It cannot become an unheld identity in an empty apply.
+    for name in declared.ids.types.values() {
+        if !declared.schema.types.contains_key(name) && !base.schema.types.contains_key(name) {
+            errs.push(DiffError::TypeLifecycleUnsupported {
+                name: name.clone(),
+                reason: "its identity remains recorded but its declaration is absent".into(),
+            });
+        }
+    }
 
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
@@ -24363,5 +24422,195 @@ mod tests {
             .clone();
         assert_eq!(flat, legacy);
         assert_eq!(format!("{:?}", flat.changes), before);
+    }
+}
+
+#[cfg(test)]
+mod managed_type_tests {
+    use super::*;
+    use pbps_dialect::MinimalDialect;
+    use pbps_model::ManagedType;
+
+    fn schema(definition: ManagedType) -> Schema {
+        let mut schema = Schema::default();
+        schema.types.insert("app.t".parse().unwrap(), definition);
+        schema
+    }
+
+    #[test]
+    fn every_type_lifecycle_difference_refuses_a_plan_by_name() {
+        let enumeration = ManagedType::Enum {
+            values: vec!["sad".into(), "ok".into()],
+        };
+        let domain = ManagedType::Domain {
+            base: "varchar(20)".parse().unwrap(),
+            not_null: false,
+            default: Some("'0'".into()),
+            checks: [("digits".into(), "VALUE <> ''".into())].into(),
+            collation: None,
+        };
+        let mut cases = vec![
+            (Schema::default(), schema(enumeration.clone())),
+            (schema(enumeration.clone()), Schema::default()),
+        ];
+        for values in [
+            vec!["sad", "ok", "happy"],
+            vec!["sad"],
+            vec!["ok", "sad"],
+            vec!["blue", "ok"],
+        ] {
+            cases.push((
+                schema(enumeration.clone()),
+                schema(ManagedType::Enum {
+                    values: values.into_iter().map(str::to_owned).collect(),
+                }),
+            ));
+        }
+        for field in 0..8 {
+            let mut changed = domain.clone();
+            let ManagedType::Domain {
+                base,
+                not_null,
+                default,
+                checks,
+                collation,
+            } = &mut changed
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => *base = "text".parse().unwrap(),
+                1 => *not_null = true,
+                2 => *default = None,
+                3 => *default = Some("'1'".into()),
+                4 => checks.clear(),
+                5 => {
+                    checks.insert("digits".into(), "VALUE <> 'x'".into());
+                }
+                6 => {
+                    checks.insert("extra".into(), "VALUE <> 'x'".into());
+                }
+                _ => *collation = Some("pg_catalog.\"C\"".parse().unwrap()),
+            }
+            cases.push((schema(domain.clone()), schema(changed)));
+        }
+        cases.push((schema(domain.clone()), schema(enumeration.clone())));
+        for (base, declared) in cases {
+            let ids = IdsFile::default();
+            let errors = diff(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap_err();
+            assert!(
+                errors.iter().any(|error| {
+                    let message = error.to_string();
+                    message.contains("app.t")
+                        && message.contains("type lifecycle arrives in later slices")
+                }),
+                "{errors:?}"
+            );
+        }
+        for definition in [enumeration, domain] {
+            let base = schema(definition);
+            let ids = IdsFile::default();
+            let plan = diff(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(plan.changes().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_empty_plan_cannot_keep_an_undeclared_type_identity() {
+        let schema = Schema::default();
+        let mut ids = IdsFile::default();
+        ids.types
+            .insert("y_000001".parse().unwrap(), "app.gone".parse().unwrap());
+        let errors = diff(
+            Side {
+                schema: &schema,
+                ids: &ids,
+            },
+            Side {
+                schema: &schema,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|error| {
+                let message = error.to_string();
+                message.contains("app.gone")
+                    && message.contains("its identity remains recorded")
+                    && message.contains("type lifecycle arrives in later slices")
+            }),
+            "{errors:?}"
+        );
+        let empty = IdsFile::default();
+        assert!(
+            diff(
+                Side {
+                    schema: &schema,
+                    ids: &empty
+                },
+                Side {
+                    schema: &schema,
+                    ids: &empty
+                },
+                &MinimalDialect,
+                &Hints::default()
+            )
+            .unwrap()
+            .changes()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn type_scope_leaves_unknown_types_to_the_unmanaged_policy() {
+        let schema = schema(ManagedType::Enum { values: vec![] });
+        let ids = IdsFile::default();
+        let scoped = crate::scope(&schema, &ids, &Default::default(), &Default::default());
+        assert!(scoped.schema.types.is_empty());
+        assert_eq!(
+            scoped.unmanaged_types,
+            schema.types.keys().cloned().collect::<Vec<_>>()
+        );
+        let ids = crate::resolve(
+            &schema,
+            &ids,
+            &[],
+            &crate::Context {
+                operator: "test".into(),
+                today: "2026-10-23".into(),
+            },
+        )
+        .unwrap()
+        .ids;
+        let scoped = crate::scope(&schema, &ids, &Default::default(), &Default::default());
+        assert_eq!(scoped.schema.types, schema.types);
+        assert!(scoped.unmanaged_types.is_empty());
+        assert_eq!(crate::observed_ids(&schema, &ids).types, ids.types);
     }
 }

@@ -83,6 +83,10 @@ pub struct IdsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<Uid, crate::RoleName>,
 
+    /// Compatible evolution under version 1, as `roles` was (DEC-1635.1).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<Uid, crate::TypeRef>,
+
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
 
@@ -101,6 +105,7 @@ impl Default for IdsFile {
             tables: BTreeMap::new(),
             columns: BTreeMap::new(),
             roles: BTreeMap::new(),
+            types: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
         }
@@ -160,6 +165,14 @@ impl IdsFile {
     /// declaration's deletion, and ledger recording has its own boundary
     /// (DEC-1797.1, DEC-1600.1).
     pub fn check_held_by(&self, schema: &crate::Schema) -> Result<(), IdsError> {
+        for (uid, name) in &self.types {
+            if !schema.types.contains_key(name) {
+                return Err(IdsError::NotHeld {
+                    uid: uid.clone(),
+                    name: name.raw().to_string(),
+                });
+            }
+        }
         for (uid, name) in &self.tables {
             if !schema.tables.contains_key(name) {
                 return Err(IdsError::NotHeld {
@@ -223,6 +236,13 @@ impl IdsFile {
         kept
     }
 
+    #[must_use]
+    pub fn without_types(&self, types: &[crate::TypeRef]) -> Self {
+        let mut kept = self.clone();
+        kept.types.retain(|_, name| !types.contains(name));
+        kept
+    }
+
     /// Looks a UID up by name, scanning the file. A caller that looks up per
     /// table or per column builds an [`IdsIndex`] once instead (#1870).
     pub fn table_uid(&self, name: &TableName) -> Option<&Uid> {
@@ -237,6 +257,10 @@ impl IdsFile {
         self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
 
+    pub fn type_uid(&self, name: &crate::TypeRef) -> Option<&Uid> {
+        self.types.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
+    }
+
     /// Reverse lookups over this file, built once in one pass (#1870).
     pub fn index(&self) -> IdsIndex<'_> {
         IdsIndex::of(self)
@@ -247,6 +271,7 @@ impl IdsFile {
         self.tables.contains_key(uid)
             || self.columns.contains_key(uid)
             || self.roles.contains_key(uid)
+            || self.types.contains_key(uid)
             || self.tombstones.contains_key(uid)
     }
 
@@ -340,10 +365,17 @@ impl IdsFile {
             }
         }
 
+        for uid in self.types.keys() {
+            if uid.kind() != UidKind::Type {
+                return Err(IdsError::KindMismatch { uid: uid.clone() });
+            }
+        }
+
         for uid in self.tombstones.keys() {
             if self.tables.contains_key(uid)
                 || self.columns.contains_key(uid)
                 || self.roles.contains_key(uid)
+                || self.types.contains_key(uid)
             {
                 return Err(IdsError::LiveAndTombstoned { uid: uid.clone() });
             }
@@ -353,6 +385,7 @@ impl IdsFile {
         check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
         // Duplicate keys also feed IdsError, escaped whole until #2084 step 5.
         check_unique(self.roles.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
+        check_unique(self.types.iter().map(|(u, n)| (u, n.raw().to_string())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -390,6 +423,7 @@ impl IdsFile {
 /// returns what the scan returns: the lowest uid holding the name, should two
 /// hold one.
 pub struct IdsIndex<'a> {
+    types: BTreeMap<&'a crate::TypeRef, &'a Uid>,
     tables: BTreeMap<&'a TableName, &'a Uid>,
     columns: BTreeMap<&'a ColumnRef, &'a Uid>,
     roles: BTreeMap<&'a str, &'a Uid>,
@@ -418,6 +452,12 @@ impl<'a> IdsIndex<'a> {
             roles.entry(name.raw()).or_insert(uid);
         }
         Self {
+            types: ids
+                .types
+                .iter()
+                .rev()
+                .map(|(uid, name)| (name, uid))
+                .collect(),
             tables,
             columns,
             roles,
@@ -428,6 +468,10 @@ impl<'a> IdsIndex<'a> {
     /// [`IdsFile::table_uid`], by lookup.
     pub fn table_uid(&self, name: &TableName) -> Option<&'a Uid> {
         self.tables.get(name).copied()
+    }
+
+    pub fn type_uid(&self, name: &crate::TypeRef) -> Option<&'a Uid> {
+        self.types.get(name).copied()
     }
 
     /// [`IdsFile::column_uid`], by lookup.
@@ -1090,5 +1134,57 @@ mod tests {
         unicode.columns.insert(uid("c_k7x2mq"), col("app.名前.ünï"));
         let text = unicode.validate().unwrap_err().to_string();
         assert!(text.contains("`app.名前.ünï`"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod managed_type_tests {
+    use super::*;
+
+    #[test]
+    fn type_ids_are_optional_under_version_one_and_validate_their_own_namespace() {
+        let mut ids: IdsFile = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(ids.types.is_empty());
+        let name = crate::TypeRef::new("app", "mood").unwrap();
+        let uid: Uid = "y_000001".parse().unwrap();
+        ids.types.insert(uid.clone(), name.clone());
+        ids.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<IdsFile>(&serde_json::to_string(&ids).unwrap()).unwrap(),
+            ids
+        );
+        let mut wrong = ids.clone();
+        wrong
+            .types
+            .insert("r_000002".parse().unwrap(), name.clone());
+        assert!(matches!(
+            wrong.validate(),
+            Err(IdsError::KindMismatch { .. })
+        ));
+        let mut duplicate = ids.clone();
+        duplicate
+            .types
+            .insert("y_000002".parse().unwrap(), name.clone());
+        assert!(matches!(
+            duplicate.validate(),
+            Err(IdsError::DuplicateName { .. })
+        ));
+        assert!(matches!(
+            ids.check_held_by(&crate::Schema::default()),
+            Err(IdsError::NotHeld { .. })
+        ));
+        ids.tombstones.insert(
+            uid,
+            Tombstone {
+                was: name.raw().to_string(),
+                dropped_at: "2026-10-23".into(),
+                reason: "fixture".into(),
+                operator: "test".into(),
+            },
+        );
+        assert!(matches!(
+            ids.validate(),
+            Err(IdsError::LiveAndTombstoned { .. })
+        ));
     }
 }
