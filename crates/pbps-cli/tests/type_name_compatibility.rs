@@ -142,121 +142,126 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     }
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
 
 #[test]
 fn type_artifacts_keep_master_bytes_checksums_sql_and_declarations() {
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
-        &pbps_mssql::Mssql,
-    ] {
-        let (schema, mut plan, mut state) = artifacts(NAME, dialect);
-        let current_checksum = plan.checksum();
-        let sql = plan
-            .changes
-            .changes
-            .iter()
-            .flat_map(|p| dialect.emit(&p.change, Default::default()).unwrap())
-            .map(|s| s.sql)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let guard = if dialect.name() == "postgres" {
-            pbps_pg::type_refs::bootstrap_guard(&schema, &Default::default())
+    check_type_artifacts(&pbps_pg::Postgres::new());
+    check_type_artifacts(&pbps_mssql::Mssql);
+}
+
+fn check_type_artifacts<D>(dialect: &D)
+where
+    D: pbps_dialect::PlanDialect<Plan = dyn pbps_diff::order::PlanView<D>> + 'static,
+{
+    let (schema, mut plan, mut state) = artifacts(NAME, dialect);
+    let current_checksum = plan.wire_fingerprint();
+    let sql = plan
+        .changes
+        .changes
+        .iter()
+        .flat_map(|p| {
+            let ordered = pbps_diff::order::singleton(p.clone(), PlanMode::Transactional, dialect);
+            dialect.emit(&ordered, 0).unwrap()
+        })
+        .map(|s| s.sql)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let guard = if dialect.name() == "postgres" {
+        pbps_pg::type_refs::bootstrap_guard(&schema, &Default::default())
+            .unwrap()
+            .unwrap()
+    } else {
+        String::new()
+    };
+    let yaml = schema
+        .tables
+        .iter()
+        .map(|(n, t)| pbps_load::fmt::render(n, t, &[], None))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let files = schema
+        .tables
+        .keys()
+        .map(|name| {
+            declaration_file::path(std::path::Path::new("schema"), name, None)
                 .unwrap()
+                .strip_prefix("schema")
                 .unwrap()
+                .components()
+                .map(|part| part.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir =
+        std::env::temp_dir().join(format!("pbps-type-compatibility-{}", rand::random::<u64>()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let explain = |extra: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
+            .current_dir(&dir)
+            .args(["explain", "--plan", "plan.json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let json = explain(&["--format", "json"]);
+    let human = explain(&[]);
+    std::fs::remove_dir_all(dir).unwrap();
+    // Pin the captured artifact versions while explain exercises this build's
+    // current reader, as in the other hostile-name compatibility suites.
+    plan.version = 46;
+    state.version = 29;
+    state.plan_checksum = Some(plan.wire_fingerprint());
+    let outputs = [
+        ("schema.json", serde_json::to_string(&schema).unwrap()),
+        (
+            "declaration-schema.json",
+            serde_json::to_string(&schemars::schema_for!(pbps_load::dto::DeclarationFile)).unwrap(),
+        ),
+        ("changes-debug.txt", format!("{:?}", plan.changes)),
+        ("ids.json", serde_json::to_string(&state.ids).unwrap()),
+        ("plan.json", serde_json::to_string(&plan).unwrap()),
+        ("state.json", serde_json::to_string(&state).unwrap()),
+        ("plan.sha256", plan.wire_fingerprint()),
+        ("state.sha256", state_checksum(&schema, &state.ids)),
+        ("statements.sql", sql),
+        ("bootstrap.sql", guard),
+        ("declarations.yml", yaml),
+        ("filenames.txt", files),
+        ("explain.json", json),
+        ("explain.txt", human),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/name-compatibility/types")
+        .join(dialect.name());
+    for (name, actual) in outputs {
+        let expected = std::fs::read_to_string(root.join(name)).unwrap();
+        let expected = if name.starts_with("explain.") {
+            expected.replace(&plan.wire_fingerprint(), &current_checksum)
         } else {
-            String::new()
+            expected
         };
-        let yaml = schema
-            .tables
-            .iter()
-            .map(|(n, t)| pbps_load::fmt::render(n, t, &[], None))
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-        let files = schema
-            .tables
-            .keys()
-            .map(|name| {
-                declaration_file::path(std::path::Path::new("schema"), name, None)
-                    .unwrap()
-                    .strip_prefix("schema")
-                    .unwrap()
-                    .components()
-                    .map(|part| part.as_os_str().to_str().unwrap())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let dir =
-            std::env::temp_dir().join(format!("pbps-type-compatibility-{}", rand::random::<u64>()));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
-        let explain = |extra: &[&str]| {
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
-                .current_dir(&dir)
-                .args(["explain", "--plan", "plan.json"])
-                .args(extra)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            String::from_utf8(output.stdout).unwrap()
-        };
-        let json = explain(&["--format", "json"]);
-        let human = explain(&[]);
-        std::fs::remove_dir_all(dir).unwrap();
-        // Pin the captured artifact versions while explain exercises this build's
-        // current reader, as in the other hostile-name compatibility suites.
-        plan.version = 46;
-        state.version = 29;
-        state.plan_checksum = Some(plan.checksum());
-        let outputs = [
-            ("schema.json", serde_json::to_string(&schema).unwrap()),
-            (
-                "declaration-schema.json",
-                serde_json::to_string(&schemars::schema_for!(pbps_load::dto::DeclarationFile))
-                    .unwrap(),
-            ),
-            ("changes-debug.txt", format!("{:?}", plan.changes)),
-            ("ids.json", serde_json::to_string(&state.ids).unwrap()),
-            ("plan.json", serde_json::to_string(&plan).unwrap()),
-            ("state.json", serde_json::to_string(&state).unwrap()),
-            ("plan.sha256", plan.checksum()),
-            ("state.sha256", state_checksum(&schema, &state.ids)),
-            ("statements.sql", sql),
-            ("bootstrap.sql", guard),
-            ("declarations.yml", yaml),
-            ("filenames.txt", files),
-            ("explain.json", json),
-            ("explain.txt", human),
-        ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/name-compatibility/types")
-            .join(dialect.name());
-        for (name, actual) in outputs {
-            let expected = std::fs::read_to_string(root.join(name)).unwrap();
-            let expected = if name.starts_with("explain.") {
-                expected.replace(&plan.checksum(), &current_checksum)
-            } else {
-                expected
-            };
-            assert_eq!(actual, expected, "{}: {name}", dialect.name());
-        }
-        assert_eq!(
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
-            plan
-        );
-        assert_eq!(
-            StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
-            state
-        );
-        if dialect.name() == "postgres" {
-            let (_, mut other, _) = artifacts(SHOWN, dialect);
-            other.version = plan.version;
-            assert_ne!(plan.checksum(), other.checksum());
-        }
+        assert_eq!(actual, expected, "{}: {name}", dialect.name());
+    }
+    assert_eq!(
+        serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
+        plan
+    );
+    assert_eq!(
+        StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
+        state
+    );
+    if dialect.name() == "postgres" {
+        let (_, mut other, _) = artifacts(SHOWN, dialect);
+        other.version = plan.version;
+        assert_ne!(plan.wire_fingerprint(), other.wire_fingerprint());
     }
 }
 
