@@ -8283,3 +8283,29 @@ Pinned by the standing transition/flag matrices, rename and reused-name UID
 controls, dropped/replaced-owner and partial-risk cases, the deep module-drop
 chain, reversed-input settlement through both shared entry points, the
 independence controls, and Created/Standing fixtures in the ordering audit.
+
+<a id="dec-1959-6"></a>
+
+**DEC-1959.6. A new engine supplies facts, effects and lowering metadata to
+the existing compiler; closure measures report its remaining limits.** The
+ordering contract in ORDERING and ARCHITECTURE requires operation-local
+`engine_effects`, namespace slots and catalog-backed equality, observed
+ownership/binding/dependency facts, emitter-owned transaction/batch and
+intermediate-name metadata, indivisible statement groups, and typed
+engine-specific expansions. Engines do not add reorder passes or infer
+execution metadata by parsing emitted SQL. Only order changes operations;
+the certified engine brand and the saved-artifact admission exception remain
+as in DEC-1959.5. Existing staged execution remains one logical change; a
+plan of several non-transactional statements is refused pending a separate
+multi-transaction design. A batch boundary is not a commit boundary.
+
+The pipeline description does not combine settlements or remove scoped
+compatibility predicates/search. Their existing ordering, refusal points and
+byte-preserving constraints remain. The release verifier is not enabled.
+The S7 closure report distinguishes declared-effect tests from live evidence,
+including effects the current scenarios cannot show. It repeats the original
+S1b-iii mutations and compares the corrected benchmark's stage boundaries;
+the partial differ, old resolver and current settle are named separately.
+Update-site counts are bounded audited scenarios, not a claim that every
+future kind needs only effects. Host-dependent measurements and issue states
+belong to the closure evidence rather than durable architectural rules.

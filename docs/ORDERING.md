@@ -7,7 +7,7 @@ review round at a time, those combinations do not run out: #1285 took about
 twenty rounds. The set of change kinds is finite, so the question can be
 answered once for all of them.
 
-Read this before adding a `Change` variant, a sort class or a reordering pass.
+Read this before adding a `Change` variant, an ordering rule or engine.
 A new variant needs a row in [the table below](#what-each-change-requires);
 `every_change_kind_has_a_row_in_the_ordering_audit` refuses one that has none.
 
@@ -64,6 +64,68 @@ permutation or mint authority by running this intermediate stage alone.
 
 ## The mechanism
 
+The planner compiles logical changes into an executable, engine-branded plan.
+The stages below describe the ownership boundaries, not permission to combine
+the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
+
+1. **Operations.** A logical change has a stable source identity. Its operations
+   carry their own payload, `ObjectKey`, `Base | Final` incarnation and origin:
+   whole, split part, teardown or restoration. Facts from the baseline and
+   desired schema resolve ownership and the other end of a change; they do not
+   replace the step's payload. A raw proposal is non-executable.
+2. **Expansion.** A named obligation may require additional operations. Typed
+   rewrites add only parts of the existing logical change or its named
+   obligations; they cannot replace a rename with a drop and create. The driver
+   checks intent, scope, execution mode, each part's risk and targeted progress,
+   with a plan-size budget as a backstop. New-table parts and partition-default
+   restorations use this same mechanism. Added origins remain explainable and
+   are not added to the saved-plan wire format (DEC-1958.2, DEC-1959.2,
+   DEC-1959.4).
+3. **Effects and constraints.** Portable effects describe resources created,
+   removed, read, written and rewritten, and requirements on them. The dialect
+   adds engine effects. A resource index builds candidate edges; there is no
+   unconditional all-operation-pairs scan. Name claims/releases compete in
+   engine-defined slots, using observed holders and name equality. Declared,
+   lexical, catalog, binding and bounded-search evidence supplies the other
+   constraints. Two writes to a resource retain their base relative order.
+4. **Settlement.** `Schedule::settle` orders operations by their constraints
+   and names cycle or unmet-obligation refusals. The expansion driver also
+   checks its own obligations. The existing `Sink` ready-set choice uses the
+   base position; a held operation sinks
+   after what it waits for.
+   This is not a new rank or preference rule. Expansions and connected
+   continuations retain their existing individual settlements and refusal
+   points, without a constraint union. Only order applies their proposals.
+   Compatibility chains preserve old peer order solely for byte-identical
+   output (DEC-1959.1, DEC-1959.3, DEC-1959.4).
+5. **Lowering.** The completed canonical route produces `OrderedPlan<D>` for
+   its original engine. Lowering consumes certified input and returns an
+   immutable `LoweredPlan` branded by the concrete emitter. Each operation's
+   statements form an indivisible group in emitter order, with source IDs and
+   execution/name metadata. Scratch first settles its opaque SQL-free
+   blueprint. Neither rendering nor apply can accept a reordered raw
+   `ChangeSet`, and nothing reorders statements after lowering.
+6. **Verification and sealing.** Operation replay checks requirements against
+   the baseline after settlement; statement-level name checks use the emitter's
+   intermediate-name metadata. These independent checks run in tests/debug
+   builds; the release verifier remains off. They cannot discover an effect
+   nobody declared: live commutation tests and mutation audits measure that
+   gap. Sealing accepts the certified result; admission is the separate checked
+   route for a reviewed saved artifact and preserves its order. Neither adds
+   proof/origins to checksum bytes (DEC-1959.5).
+
+The canonical declaration/catalog route is `order::deployment::schedule`.
+CLI adapters supply observed facts and preserve re-diff/probe timing. A fact
+not read is distinct from a fact read and empty: unavailable stages report
+their skip. Resolver, connected catalog continuations and the shared route
+finish inside order. Some historical helper names and scoped compatibility
+predicates remain; a name is not a separate list-reordering authority.
+Bounded namespace search still proposes `Search` edges, and the PostgreSQL
+engine-generated-name trial remains scratch reconstruction rather than a
+generic slot allocator. These are retained limits, not extra scheduling passes.
+
+### Base ordering policy
+
 The differ sorts every planned change by, in order:
 
 1. **Class**, `order_key` in `crates/pbps-diff/src/schema_diff.rs`:
@@ -119,161 +181,33 @@ The differ sorts every planned change by, in order:
      first, at (0, 1) (DEC-1444.1).
 3. **`subject()`, then the change's rendering**, which only breaks ties.
 
-Then, in this order:
+## Adding an engine
 
-- **`rename_order::order`** (`crates/pbps-diff/src/order/rename_order.rs`) puts a
-  table rename after the drops that release its target name (DECISIONS 496,
-  DEC-496.1, DEC-536.1): a dropped table everywhere, an index on PostgreSQL
-  (indexes share the relation namespace), a named constraint on SQL Server.
-  It orders chains. A table rename cycle, through exact names or a
-  cross-schema move's intermediate name, is left out of its graph and refused
-  at diff time (`TableRenameCycle`, DEC-1966.1), as a column rename cycle is
-  (`ColumnRenameCycle`, DEC-541.1); a column chain is ordered by
-  `chain_depth`, and on a connected SQL Server plan by the collation's answer
-  (DEC-1366.3).
-- **On a connected SQL Server plan, `order_created_object_names`** (in
-  `crates/pbps-cli/src/engine.rs`, last of the passes that reorder) first
-  orders each table's column renames by the collation's answer (DEC-1366.3),
-  then walks the plan over the catalog's `sys.objects` names. Where that walk refuses the
-  order, it tries the other orders of the table renames among the drops and
-  proposes the first one it clears as `Search` edges, which `settle` applies
-  (`object_order`, DEC-1366.1, DEC-1957.3). A name only a later class frees
-  is refused with that change named (DEC-1366.2).
-- **On a connected PostgreSQL plan, `order_carried_moves`** (in
-  `crates/pbps-cli/src/deploy.rs`) replays the catalog's name occupants and
-  the tables and views at the carried names through the plan. Where a
-  cross-schema rename carries an index or owned sequence onto a held name,
-  it settles the plan over its name handovers (`order::slots::handovers`):
-  the plan's own names, the names a move passes through, and the catalog's
-  occupants as the first holders of theirs. So the move runs after the
-  rename that moves the holder away, and a chain of such moves is ordered by
-  the same evidence. The order settled is kept only where table renames
-  alone pass one another and the replay finds fewer clashes in it; a cycle,
-  or any other change the move would pass, keeps the order and the refusal
-  (DEC-1957.2). A creation taking an identity sequence's catalog name also
-  follows the numbering change that gives up or converts the identity. The
-  exact identity release states that handover even when a retype leaves
-  the generic slot release ambiguous (DEC-1986.2). That
-  handover is settled with the effects, carrying the creation's consumers
-  after it while keeping other steps in their relative order (DEC-1986.1).
-  A detach taking another detached partition's clone name uses the same
-  handover, from exact catalog releases for the clones the detach renames
-  (DEC-1558.1). A table rename taking the released name directly or through
-  a carried index joins that same effect closure, including when a partition
-  drop detaches and drops the clone first (DEC-1558.2). Its per-detach block
-  still owns temporary names and guards.
-  `refuse_created_name_occupants` calls it before the module
-  passes. It runs again, over the same catalog reads, after the last pass
-  that reorders, because a module pass may plan the revision again in the
-  differ's order (DEC-1767.1).
-- **One entry point finishes the order after the differ**:
-  `order::deployment::schedule` (DEC-1955.1, DEC-1959.5). The CLI's
-  `dependents::schedule` adapts facts for `plan --db`, bootstrap, the offline
-  `plan` preview and the dev rehearsal's baseline. Pure passes below are
-  owned by order. It runs each pass
-  in `plan --db`'s order and skips a pass that needs a catalog fact its caller
-  does not hold, reporting the skip: a fact read and empty is not a fact not
-  read. Offline, `weave` and the member ordering of role drops are skipped and
-  every other pass runs, so the preview of a new table orders what it calls
-  ahead of it as `plan --db` does (#1598). The resolver's answer is scheduled
-  by `plan --db` before it is sealed (#1516).
-- **Binding releases, `order::before_rewrites`**: the shared schedule gives
-  the effects incident to `BeforeRewrite` participants to `settle`: a
-  release, its key's rewrites and their transitive dependents. Edges owned by
-  the later connected computed-column pass stay deferred. Keep entries retain
-  every other step's relative order; plans without the requirement return
-  unchanged (DEC-2228.1).
-- **With the members read, `order::role_drops`** (`schedule` calls it once
-  `plan --db` has supplied the memberships) settles a role-only projection
-  over holder-before-member catalog edges and the existing depth policy.
-  Constraints chain same-depth peers in their original order and connect
-  adjacent layers, preserving the old global layering. The result fills the
-  same role slots, so every non-role step keeps its position and payload. No
-  expansion or pre-sort precedes `settle` (DEC-1959.1; DECISIONS 127, 139).
-- **On a PostgreSQL plan**, in this order:
-  - `weave`, when the catalog's dependents are supplied (`plan --db`), puts
-    each catalog dependent of a dropped or rebuilt module on the
-    right side of the drop: removed before it, restored after its create
-    (DECISIONS 311, DEC-942.1). A partition's part is released by its
-    parent's drop of the column, `DROP DEFAULT` or new generation
-    expression, and named through its parent's column rename (DEC-1699.1).
-    It is the first expansion of the rule driver (`order::expand`, #1958):
-    each dependent's split, removal and restoration is an obligation, met by
-    a rewrite that adds steps at an anchor and states `Catalog` edges, and
-    `settle` orders the plan after each rewrite (DEC-1958.2). Each added
-    step's origin is reported in the plan output, not sealed (DEC-1958.3).
-    A function's drop then goes after what releases its generated columns,
-    by an edge from each release, settled once (DEC-1168.1, DEC-1958.2).
-    `release_generated_inputs` then moves the retype or drop of a column a
-    generated column reads after the expression change that stops reading it,
-    and what needs the retype after it, by edges from the catalog and the
-    expressions' text (DEC-1316.1, DEC-1391.1), settled by
-    `Schedule::settle`; a moved change that would pass what needs it first
-    is refused by name (DEC-1956.3). `release_generated_inputs` is
-    one of the passes that read the catalog themselves and so stay
-    `plan --db`'s own calls after `schedule` (DEC-1955.1).
-  - `split_new_tables` runs `order::new_tables::NewTables` through the expansion
-    driver, after the shared generated-table expansion (DEC-1959.2). A
-    multi-part `Rewrite::Split` keeps the table and deferred expressions
-    adjacent; the existing lexical edges below place them. It splits the
-    parts of a new table whose text names a
-    function the plan creates out of it, ahead of that create. A generated
-    column calling a planned function starts a declaration-order suffix;
-    its prefix creates the relation at its ordinary position. Only
-    unsplittable shapes use a typed placeholder and SET EXPRESSION with a
-    known PostgreSQL 17+ capability, or retain the whole-table hold without
-    it (DEC-1503.1). Resolver preparation and scratch share the same parts.
-    Those creation parts retain CREATE's risks through resolver preparation;
-    saved-plan validation proves their preceding CREATE by table identity
-    before deriving the same context (DEC-1503.3).
-  - `split_moving_defaults` sets a create's own default after the last
-    function its text may call, where the create moves rows out of a DEFAULT
-    partition (DEC-1547.1).
-  - `after_the_rebuilds` settles the expression-bearing additions whose
-    text names a function the plan creates over `Lexical` edges from the last
-    function create, so they run right after it in their order, and places a
-    new column whose expression names one after that create, with what may
-    read the column after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
-    The retained `after_their_functions` hold is constraints too: callable
-    columns and whole-table holds wait for their named creates, the existing
-    `needs` closure follows them, and free peers are chained inside the old
-    window. Scratch uses constraints for its table groups, readers, foreign
-    keys and phase barriers; its generated constraints remain a subsequent
-    settlement (DEC-1959.3).
-    A constraint trigger's companion-name handovers join the same settle,
-    including its partition clones: the constraint addition, partition
-    creation or attachment taking the name sinks after the module change
-    releasing it. A partition inherits a constraint clone only while the
-    parent still has that constraint trigger; what needs the delayed
-    partition follows it, or is refused by name when rows would have to
-    cross a module change (DEC-2100.1, DEC-2100.2). A delayed claimer also
-    takes its effects graph's dependents with it, including a key's foreign
-    keys and replica identity; unrelated additions retain their places
-    (DEC-2100.3).
-    New-table creation parts state column-order, function, complete-shape,
-    row and validator edges through the same settlement mechanism
-    (DEC-1503.1).
-  - `after_their_parents_defaults` runs `order::parent_defaults::ParentDefaults`
-    through the expansion driver. The parent's recursive default set needs
-    each declared partition's own default restored: a missing restoration is
-    added for that parent operation, and a parent-to-restoration edge sinks
-    an earlier one through `settle`. Compatibility constraints chain the
-    restored peers in the old order solely for byte-identical output; a
-    later original restoration or partition create keeps its place
-    (DEC-1581.1, DEC-1959.4).
-  - `before_its_partitions_indexes` settles an edge from a partitioned
-    parent's new index to each partition index it could take, so that index
-    sinks to right after the parent's, with what rests on it (DEC-1688.1,
-    DEC-1967.2).
-  - `after_the_rows_that_leave` settles an edge from each row update or
-    delete of a table with a foreign key to a partitioned parent to the
-    drop or detach of a partition of it, so the drop runs after the rows
-    that may stop referencing it, where it passes nothing that may need it
-    done (DEC-1553.1).
-- **On SQL Server**, a retype or recollation drops and re-adds the keys,
-  indexes and checks over the column, through `retype_dependents` and
-  `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
-  module edit drops nothing.
+A third engine supplies the following ordering inputs; it does not write a
+reorder pass or manufacture an executable plan (DEC-1959.6).
+
+| Input | Engine responsibility | Shared consumer |
+| --- | --- | --- |
+| `Dialect::engine_effects` | Pure effects specific to the engine, reading each operation's own payload and supplied snapshots; include lexer/binding semantics that portable effects cannot state | Resource-indexed edges and operation replay |
+| `slots::slot` / `slots::slots` | Namespace scope, overlapping namespaces and routine signatures from the dialect's answers | Slot claims, releases and intermediate-name checks |
+| Slot equality | A catalog fact under the target's comparison/collation rules; exact comparison only where the engine contract establishes it | `CatalogFacts` / `Same`; unknown equality is skipped and reported, never assumed unequal |
+| Catalog facts | Actual occupants, releases, module/column/role bindings and dependencies, plus capabilities needed by an expansion; distinguish unread from read-empty | Pure order proposals and connected canonical continuations; I/O stays in the engine/CLI seam |
+| Statement lowering metadata | Transaction and batch requirements, intermediate `renames`/`role_renames`, `creates` and `releases`, plus execution guards such as row writes or index builds | Immutable lowering groups, rendering, checkpointing and statement-level verification |
+| Engine-specific expansions | Named obligations and typed teardown/restoration/split parts, with per-part risk, equivalence, progress and budget checks | The existing expansion driver and `settle` |
+
+An operation's group retains its source ID and origin even when it emits no
+statements. Admitted artifacts use their wire step IDs; skipped unsealed
+logical provenance is not reconstructed. Batch separation (`own_batch`) does
+not imply a commit; `transactional` is a separate requirement. Intermediate names are supplied by
+the emitter, never reconstructed by parsing SQL. Engines preserve their
+concrete type through certified lowering, rendering, sealing and apply.
+
+An ordinary plan remains one transaction and refuses a non-transactional
+statement. A plan of several non-transactional statements is refused until a
+multi-transaction design exists; metadata does not authorize automatic commit
+boundaries. The existing staged protocol remains restricted to one logical
+change, with its designed checkpoints and resume checks (ADR-0003). Adding an
+engine does not generalize that protocol or split an ordinary plan.
 
 ## Method
 
@@ -319,11 +253,10 @@ only the engine's lexer or catalog knows (DEC-1954.3). From those,
 requirement before the removal, a removal before what needs it gone, a
 rewrite before its readers, and two writes of one resource in their base
 order), replays the operations from the baseline and refuses an order they
-contradict (DEC-1954.6). It runs beside every order in tests and debug
-builds; the passes below still decide the order. Where a pass moves changes
-by edges, the resolver, the generated-column releases and the SQL Server
-computed-column releases, `order::schedule::Schedule::settle` orders them:
-Kahn's algorithm, the lowest position first among the changes that are
+contradict (DEC-1954.6). It runs beside ordering in tests and debug
+builds. `order::schedule::Schedule::settle` applies the constraints supplied
+by the existing canonical stages. It uses Kahn's algorithm, the lowest
+position first among the changes that are
 ready, so a change an edge holds back sinks to right after what it waits for
 and nothing else moves (DEC-1956.2). Each edge carries one `OrderReason`
 (DEC-1956.1). The verifier settles the effect graph over every order it
@@ -737,12 +670,13 @@ decision or the issue named in its row.
   the enum and refuses one this file does not name, and
   `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
   column the code disagrees with.
-- A new sort class, rank or reordering pass updates [the mechanism](#the-mechanism)
-  and re-reads the pairs its changes appear in. A pass that reorders a plan
-  after the differ belongs inside order's existing scheduled routes;
-  CLI supplies observations and proposals. Preserve the completed route's
-  authority and add compiler-negative coverage when changing that boundary
-  (DEC-1959.5).
+- A new ordering rule states an effect on existing resources, or supplies a
+  factual constraint to an existing order-owned route. Only a new obligation
+  needs a typed expansion. Check scoped compatibility/search predicates and
+  the existing base policy as well: effects are not a promise that these
+  semantic review sites have vanished. Do not add a caller-owned reorder
+  stage. Preserve completed-route authority and compiler-negative coverage
+  when changing its boundary (DEC-1959.5, DEC-1959.6).
 - A new interacting pair found in review goes into the matching table with its
   verdict. It is not fixed in isolation: decide whether it is fixed or
   content-dependent first.
