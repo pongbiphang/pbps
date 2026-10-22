@@ -1550,7 +1550,7 @@ pub fn row_security(server: &str, scratch_server: &str) {
                 "--checksum",
                 &plan_checksum(&artifact),
                 "--allow",
-                "grant-widen,destructive",
+                "grant-widen,destructive,revoke,row-security",
             ],
             Some(&targets),
         ));
@@ -1659,15 +1659,41 @@ row_policies:
     assert_eq!(value["data"]["changes"], 0, "{value}");
     assert!(value["findings"].to_string().contains("#595"), "{value}");
 
-    // Resolver selection does not bypass the standing-policy boundary.
+    // Standing replacements are delivered on the target while their opaque
+    // predicates still make no binding claim about scratch (#595).
     let held = d.dir.join("schema/app.held.yml");
     let original = std::fs::read_to_string(&held).unwrap();
     let edited = original.replace("id > 0", "id > 1");
     assert_ne!(edited, original);
     std::fs::write(&held, edited).unwrap();
+    successful(run(&d, &["plan"], None));
+    d.commit();
     write_prior(&artifact, &sql);
-    let refused = run(&d, &plan_args(&artifact, &sql), Some(&targets));
-    assert_ne!(code(&refused), 0);
-    assert!(format!("{}{}", stdout(&refused), stderr(&refused)).contains("#1173"));
-    assert_prior(&artifact, &sql);
+    successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
+    let replacement: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+    assert!(matches!(&replacement.changes.changes[..],[drop,create]
+        if matches!(drop.change,pbps_model::Change::DropPolicy {..})
+        && matches!(create.change,pbps_model::Change::CreatePolicy {..})));
+    assert_eq!(
+        replacement.changes.gated_risks(),
+        [
+            pbps_model::RiskClass::Revoke,
+            pbps_model::RiskClass::RowSecurity
+        ]
+        .into()
+    );
+    apply();
+    successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
+    let after = text_of(connection, catalog);
+    assert_ne!(after, before);
+    assert!(after.contains("(id > 1)"), "{after}");
+    let noop = successful(run(
+        &d,
+        &["plan", "--env", "prod", "--format", "json"],
+        Some(&targets),
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+    assert_eq!(value["data"]["changes"], 0, "{value}");
+    assert!(value["findings"].to_string().contains("#595"), "{value}");
 }

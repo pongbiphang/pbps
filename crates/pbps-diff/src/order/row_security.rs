@@ -275,16 +275,26 @@ pub fn policy_releases(
                 continue;
             }
             let refusal = format!(
-                "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
+                "{} cannot be {what}: policy `{}` on {} depends on it; explicitly remove or replace that policy in the declarations",
                 subject,
                 pbps_model::escape::Escaped(&policy.name),
                 policy.table.shown()
             );
-            // Compare opening UID identities, not a later holder of the same
-            // spelling. An individual standing policy is never removed here.
-            let Some(before) = changes.changes.iter().position(|p| {
+            // A vacated spelling must not release a different table's policy.
+            // Resolve each explicit removal at its statement boundary, then
+            // compare the opening catalog identity used by pg_depend.
+            let Some(before) = changes.changes.iter().enumerate().position(|(i, p)| {
                 if let Change::DropTable { uid, .. } = &p.change {
                     names.table_at(uid, At::Start) == Some(&policy.table)
+                } else if let Change::DropPolicy { table, name, .. } = &p.change {
+                    name == &policy.name
+                        && if let pbps_model::plan_names::Holder::Tracked(uid) =
+                            names.holder(table, At::Before(i))
+                        {
+                            names.table_at(uid, At::Start) == Some(&policy.table)
+                        } else {
+                            false
+                        }
                 } else {
                     false
                 }
@@ -309,12 +319,31 @@ pub fn check_releases(
     for release in policy_releases(changes, ids, found)? {
         if release.before >= release.after {
             release_bail!(
-                "{}; its table drop must precede the dependent change. Plan again.",
+                "{}; its policy or table drop must precede the dependent change. Plan again.",
                 release.refusal
             );
         }
     }
     Ok(())
+}
+
+/// RLS transitions must commit together with their closing guard. Include the
+/// descriptive CREATE TABLE payload so edited artifacts cannot hide a policy.
+pub fn requires_transaction(changes: &ChangeSet) -> bool {
+    changes.changes.iter().any(|step| {
+        matches!(
+            step.change,
+            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
+        ) || if let Change::CreateTable { table, .. } = &step.change {
+            table.has_row_security()
+        } else if let Change::AttachPartition { shape, .. }
+        | Change::DetachPartition { shape, .. } = &step.change
+        {
+            shape.has_row_security()
+        } else {
+            false
+        }
+    })
 }
 
 mod validation;

@@ -30,6 +30,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/row_security_roundtrip.rs"]
 mod row_security_roundtrip;
 
+#[path = "support/row_security_transitions.rs"]
+mod row_security_transitions;
+
 #[path = "support/raised_messages.rs"]
 mod raised_messages;
 
@@ -32533,27 +32536,29 @@ fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration
             let name = pbps_model::TableName::new("app", name);
             assert_eq!(snapshot.schema.tables[&name], loaded.tables[&name]);
         }
-        // The differ can plan a standing flag edit, but PostgreSQL SQL
-        // delivery still names PR C's boundary (DEC-1173.2).
+        // A standing flag transition now uses the same transactional delivery.
         let path = d.dir.join("schema/app.disabled.yml");
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("\nrow_security: {enabled: true}\n");
         std::fs::write(path, text).unwrap();
-        let refused = d.run(&["plan", "--db", connection]);
-        assert_ne!(code(&refused), 0);
-        assert!(
-            stderr(&refused).contains(
-                "standing-table row-security SQL delivery arrives with later PRs of #1173"
+        let plan = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "revoke"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+        let next: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+        assert_eq!(next["data"]["changes"], 0, "{next}");
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT relrowsecurity::int::bigint FROM pg_class WHERE oid='app.disabled'::regclass"
             ),
-            "{}",
-            stderr(&refused)
+            1
         );
-        assert!(
-            stderr(&refused).contains("app.disabled"),
-            "{}",
-            stderr(&refused)
-        );
-        assert_eq!(text_of(connection, catalog), before);
     }
 }
 
@@ -32671,7 +32676,8 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         let refused = d.run(&["plan", "--db", connection]);
         assert_ne!(code(&refused), 0);
         assert!(
-            stderr(&refused).contains("tenant_rows") && stderr(&refused).contains("#1173"),
+            stderr(&refused).contains("tenant_rows")
+                && stderr(&refused).contains("explicitly remove or replace"),
             "{}",
             stderr(&refused)
         );
@@ -32680,7 +32686,8 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         let refused = d.run(&["plan", "--db", connection]);
         assert_ne!(code(&refused), 0);
         assert!(
-            stderr(&refused).contains("tenant_rows") && stderr(&refused).contains("#1173"),
+            stderr(&refused).contains("tenant_rows")
+                && stderr(&refused).contains("explicitly remove or replace"),
             "{}",
             stderr(&refused)
         );
@@ -32734,7 +32741,7 @@ fn policy_rename_is_refused(d: &Demo, connection: &str) {
     );
     let said = stderr(&refused);
     assert!(
-        said.contains("gate") && said.contains("arrives with #1173"),
+        said.contains("gate") && said.contains("explicitly remove or replace"),
         "{said}"
     );
     assert_eq!(

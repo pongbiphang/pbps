@@ -44,7 +44,8 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
             Change::RenameTable { uid, from, to, .. } => {
                 tables.push((i, uid.clone(), Some(from.clone()), Some(to.clone())))
             }
-            Change::SetTablePersistence { uid, table, .. }
+            Change::SetRowSecurity { uid, table, .. }
+            | Change::SetTablePersistence { uid, table, .. }
             | Change::SetStorageParameters { uid, table, .. }
             | Change::SetReplicaIdentity { uid, table, .. }
             | Change::SetPartitionDefault { uid, table, .. }

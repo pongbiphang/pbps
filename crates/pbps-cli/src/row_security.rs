@@ -1,4 +1,4 @@
-//! The create-only policy contract; standing mutations arrive with #1173.
+//! Policy admission, dependency releases, and connected ownership targets.
 
 use pbps_model::IdsFile;
 #[cfg(test)]
@@ -28,7 +28,7 @@ pub(crate) fn check_policy_releases<D: ?Sized>(
     )?)
 }
 
-/// Test observations use the same create-only contract as admission.
+/// Test observations use the same origin contract as admission.
 #[cfg(test)]
 pub(crate) fn validate(
     changes: &ChangeSet,
@@ -38,6 +38,47 @@ pub(crate) fn validate(
     Ok(pbps_diff::order::row_security::validate(
         changes, ids, dialect,
     )?)
+}
+
+/// Ask the opening catalog identity, even when the operation runs after a
+/// rename. Newly created UIDs have no standing table to ask about.
+pub(crate) fn standing_owners(
+    changes: &pbps_model::ChangeSet,
+    ids: &IdsFile,
+) -> anyhow::Result<Vec<pbps_model::TableName>> {
+    use pbps_model::{
+        Change,
+        plan_names::{At, Holder, PlanNames},
+    };
+    let names = PlanNames::of(&changes.changes, ids)?;
+    let mut created = std::collections::BTreeSet::new();
+    let mut tables = std::collections::BTreeSet::new();
+    for (at, step) in changes.changes.iter().enumerate() {
+        if let Change::CreateTable { uid, .. } = &step.change {
+            created.insert(uid);
+        }
+        if let Change::DropPolicy { table, .. }
+        | Change::CreatePolicy { table, .. }
+        | Change::SetRowSecurity { table, .. } = &step.change
+        {
+            let Holder::Tracked(uid) = names.holder(table, At::Before(at)) else {
+                anyhow::bail!(
+                    "{}: row-security operation has no tracked table owner",
+                    table.shown()
+                );
+            };
+            if !created.contains(uid) {
+                let opening = names.table_at(uid, At::Start).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: row-security operation has no opening table identity",
+                        table.shown()
+                    )
+                })?;
+                tables.insert(opening.clone());
+            }
+        }
+    }
+    Ok(tables.into_iter().collect())
 }
 
 pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
@@ -214,7 +255,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            refused.contains("original_policy") && refused.contains("arrives with #1173"),
+            refused.contains("original_policy") && refused.contains("explicitly remove or replace"),
             "{refused}"
         );
         plan.changes.push(PlannedChange::new(Change::DropTable {
@@ -285,7 +326,7 @@ mod tests {
         assert!(
             error.contains("app.before.original cannot be renamed")
                 && error.contains("policy `gate`")
-                && error.contains("arrives with #1173"),
+                && error.contains("explicitly remove or replace"),
             "{error}"
         );
         ids.tables.remove(&owner_uid);
@@ -306,7 +347,7 @@ mod tests {
             check_policy_releases(&plan, &ids, &found)
                 .unwrap_err()
                 .to_string()
-                .contains("its table drop must precede")
+                .contains("its policy or table drop must precede")
         );
     }
 
@@ -576,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn standing_policy_delivery_refuses_while_created_policy_sql_is_unchanged() {
+    fn standing_policy_delivery_matches_created_policy_sql_and_mssql_refuses() {
         use pbps_dialect::PlanDialect as _;
         use pbps_diff::order::singleton;
         use pbps_model::PlanMode;
@@ -602,11 +643,9 @@ mod tests {
                 PlanMode::Transactional,
                 &pbps_mssql::Mssql,
             );
-            assert!(
-                pg.emit(&pg_standing, 0)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("arrives with later PRs of #1173")
+            assert_eq!(
+                pg.emit(&pg_standing, 0).unwrap(),
+                pg.emit(&created_plan, 0).unwrap()
             );
             assert!(
                 pbps_mssql::Mssql
@@ -632,10 +671,9 @@ mod tests {
             &pbps_mssql::Mssql,
         );
         assert!(
-            pg.emit(&pg_drop, 0)
-                .unwrap_err()
-                .to_string()
-                .contains("arrives with later PRs of #1173")
+            pg.emit(&pg_drop, 0).unwrap()[0]
+                .sql
+                .contains(r#"DROP POLICY "p" ON "app"."docs";"#)
         );
         assert!(pbps_mssql::Mssql.emit(&mssql_drop, 0).is_err());
     }
@@ -643,3 +681,232 @@ mod tests {
 
 #[cfg(test)]
 mod live_tests;
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+    use pbps_model::{
+        Change, ChangeSet, PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, TableName, Uid,
+    };
+
+    fn changes(raw: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            changes: raw.into_iter().map(PlannedChange::new).collect(),
+        }
+    }
+
+    #[test]
+    fn row_security_staged_reload_refuses_even_one_logical_change_with_an_approved_checksum() {
+        use pbps_model::{PlanBaseline, PlanOrigin, SavedPlan};
+        let table = TableName::new("app", "t");
+        let uid: Uid = "t_117301".parse().unwrap();
+        let ids = IdsFile {
+            tables: [(uid.clone(), table.clone())].into(),
+            ..Default::default()
+        };
+        for change in [
+            Change::DropPolicy {
+                table: table.clone(),
+                name: "p".into(),
+                policy: RowPolicy::default(),
+            },
+            Change::CreatePolicy {
+                table: table.clone(),
+                name: "p".into(),
+                policy: RowPolicy::default(),
+                origin: RowSecurityOrigin::Standing,
+            },
+            Change::SetRowSecurity {
+                uid: uid.clone(),
+                table: table.clone(),
+                from: RowSecurity::default(),
+                to: RowSecurity {
+                    enabled: true,
+                    forced: false,
+                },
+                origin: RowSecurityOrigin::Standing,
+            },
+        ] {
+            let mut cs = changes(vec![change]);
+            let pg = pbps_pg::Postgres::new();
+            let risks = pbps_diff::order::generated::risks(&cs, &ids, &pg);
+            cs.changes[0].risks = risks[0].clone();
+            let wire = SavedPlan::new(
+                PlanOrigin::Database,
+                "postgres",
+                "2026-10-23T00:00:00Z",
+                PlanBaseline {
+                    description: "staged RLS fixture".into(),
+                    checksum: "baseline".into(),
+                    database_collation: None,
+                    time_zone: None,
+                },
+                cs,
+                ids.clone(),
+            );
+            pbps_diff::order::validate_saved_plan(&wire, &pg).unwrap();
+            let staged = wire.staged();
+            assert_eq!(crate::logical_changes(&staged.changes), 1);
+            let checksum = staged.wire_fingerprint();
+            let loaded = serde_json::from_slice(&serde_json::to_vec(&staged).unwrap()).unwrap();
+            let error =
+                pbps_diff::order::admit(loaded, &pg, std::path::Path::new("plan.json"), &checksum)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("row-security changes require a transactional plan"),
+                "{error}"
+            );
+            assert!(
+                crate::validate_saved_plan(&staged, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("DEC-1173.3")
+            );
+        }
+        let hidden = changes(vec![Change::CreateTable {
+            uid,
+            name: table,
+            table: Box::new(pbps_model::Table {
+                row_security: RowSecurity {
+                    enabled: false,
+                    forced: true,
+                },
+                ..Default::default()
+            }),
+            beside_default: None,
+            moves_at_most: None,
+        }]);
+        let staged = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-10-23T00:00:00Z",
+            PlanBaseline {
+                description: "hidden RLS payload".into(),
+                checksum: "baseline".into(),
+                database_collation: None,
+                time_zone: None,
+            },
+            hidden.clone(),
+            ids,
+        )
+        .staged();
+        assert_eq!(crate::logical_changes(&staged.changes), 1);
+        let loaded = serde_json::from_slice(&serde_json::to_vec(&staged).unwrap()).unwrap();
+        let error = pbps_diff::order::admit(
+            loaded,
+            &pbps_pg::Postgres::new(),
+            std::path::Path::new("plan.json"),
+            &staged.wire_fingerprint(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("DEC-1173.3"), "{error}");
+        assert!(pbps_diff::order::row_security::requires_transaction(
+            &hidden
+        ));
+        assert!(!pbps_diff::order::row_security::requires_transaction(
+            &changes(vec![])
+        ));
+    }
+
+    #[test]
+    fn row_security_ownership_asks_opening_uids_and_skips_only_new_occupants() {
+        let uid: Uid = "t_117302".parse().unwrap();
+        let replacement: Uid = "t_117303".parse().unwrap();
+        let old = TableName::new("app", "old");
+        let new = TableName::new("app", "new");
+        let ids = IdsFile {
+            tables: [
+                (uid.clone(), new.clone()),
+                (replacement.clone(), old.clone()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let cs = changes(vec![
+            Change::RenameTable {
+                uid,
+                from: old.clone(),
+                to: new.clone(),
+                defaults: vec![],
+            },
+            Change::CreateTable {
+                uid: replacement,
+                name: old.clone(),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+            Change::CreatePolicy {
+                table: old.clone(),
+                name: "new".into(),
+                policy: RowPolicy::default(),
+                origin: RowSecurityOrigin::Created,
+            },
+            Change::DropPolicy {
+                table: new,
+                name: "standing".into(),
+                policy: RowPolicy::default(),
+            },
+        ]);
+        assert_eq!(standing_owners(&cs, &ids).unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn row_security_explicit_policy_release_uses_opening_owner_uid_and_policy_name() {
+        let owner: Uid = "t_117304".parse().unwrap();
+        let input: Uid = "t_117305".parse().unwrap();
+        let col: Uid = "c_117304".parse().unwrap();
+        let old = TableName::new("app", "old");
+        let new = TableName::new("app", "new");
+        let source = TableName::new("app", "source");
+        let ids = IdsFile {
+            tables: [(owner.clone(), new.clone()), (input, source.clone())].into(),
+            ..Default::default()
+        };
+        let mut cs = changes(vec![
+            Change::RenameTable {
+                uid: owner.clone(),
+                from: old.clone(),
+                to: new.clone(),
+                defaults: vec![],
+            },
+            Change::DropPolicy {
+                table: new,
+                name: "gate".into(),
+                policy: RowPolicy::default(),
+            },
+            Change::DropColumn {
+                uid: col.clone(),
+                column: source.column("v"),
+            },
+        ]);
+        let facts = [
+            (owner, vec![]),
+            (
+                col,
+                vec![pbps_diff::order::catalog::PolicyDependent {
+                    table: old,
+                    name: "gate".into(),
+                }],
+            ),
+        ]
+        .into();
+        let edges = policy_releases(&cs, &ids, &facts).unwrap();
+        assert_eq!((edges[0].before, edges[0].after), (1, 2));
+        pbps_diff::order::row_security::check_releases(&cs, &ids, &facts).unwrap();
+        let Change::DropPolicy { name, .. } = &mut cs.changes[1].change else {
+            unreachable!()
+        };
+        *name = "sibling".into();
+        let error = policy_releases(&cs, &ids, &facts)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("gate") && error.contains("explicitly remove or replace"),
+            "{error}"
+        );
+    }
+}

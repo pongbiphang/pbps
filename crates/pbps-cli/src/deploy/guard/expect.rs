@@ -90,10 +90,12 @@ struct TablePlan<'a> {
     identity: Option<Setting<'a, Option<&'a ReplicaIdentity>>>,
     storage: Option<Setting<'a, StorageSetting<'a>>>,
     persistence: Option<Setting<'a, bool>>,
+    row_security: Option<Setting<'a, &'a pbps_model::RowSecurity>>,
+    policies: Option<Setting<'a, ()>>,
 }
 
 pub(crate) struct TableChanges<'a> {
-    scalars: BTreeMap<&'a Uid, TablePlan<'a>>,
+    scalars: BTreeMap<Uid, TablePlan<'a>>,
     parents: BTreeSet<TableName>,
     parent_effects: BTreeMap<TableName, Vec<(usize, OwnEffect<'a>)>>,
     own_effects: BTreeMap<TableName, Vec<(usize, OwnEffect<'a>)>>,
@@ -152,17 +154,27 @@ pub(crate) struct Expected<'a> {
 
 impl<'a> TableChanges<'a> {
     pub(crate) fn of(plan: &'a ChangeSet, names: &pbps_model::plan_names::PlanNames<'_>) -> Self {
-        let mut tables: BTreeMap<&Uid, TablePlan<'_>> = BTreeMap::new();
+        let mut tables: BTreeMap<Uid, TablePlan<'_>> = BTreeMap::new();
         let mut parents = BTreeSet::new();
         let mut parent_effects: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut own_effects: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (at, p) in plan.changes.iter().enumerate() {
             match &p.change {
                 Change::RenameTable { uid, from, to, .. } => {
-                    tables.entry(uid).or_default().renamed = Some((from, to));
+                    tables.entry(uid.clone()).or_default().renamed = Some((from, to));
+                }
+                Change::SetRowSecurity { uid, table, to, .. } => {
+                    tables.entry(uid.clone()).or_default().row_security = Some((to, table));
+                }
+                Change::DropPolicy { table, .. } | Change::CreatePolicy { table, .. } => {
+                    if let pbps_model::plan_names::Holder::Tracked(uid) =
+                        names.holder(table, pbps_model::plan_names::At::Before(at))
+                    {
+                        tables.entry(uid.clone()).or_default().policies = Some(((), table));
+                    }
                 }
                 Change::SetReplicaIdentity { uid, table, to } => {
-                    tables.entry(uid).or_default().identity = Some((to.as_ref(), table));
+                    tables.entry(uid.clone()).or_default().identity = Some((to.as_ref(), table));
                 }
                 Change::SetStorageParameters {
                     uid,
@@ -170,14 +182,14 @@ impl<'a> TableChanges<'a> {
                     set,
                     reset,
                 } => {
-                    tables.entry(uid).or_default().storage = Some(((set, reset), table));
+                    tables.entry(uid.clone()).or_default().storage = Some(((set, reset), table));
                 }
                 Change::SetTablePersistence {
                     uid,
                     table,
                     unlogged,
                 } => {
-                    tables.entry(uid).or_default().persistence = Some((*unlogged, table));
+                    tables.entry(uid.clone()).or_default().persistence = Some((*unlogged, table));
                 }
                 Change::RenameColumn { table, .. } => {
                     parents.insert(table);
@@ -280,9 +292,6 @@ impl<'a> TableChanges<'a> {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
-                | Change::DropPolicy { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
                 | Change::PublicExecution { .. } => {}
             }
         }
@@ -321,8 +330,13 @@ impl<'a> TableChanges<'a> {
         // A rename alone supplies no scalar requirement. Retaining those
         // entries would make every touched table scan every rename even
         // when the plan changes no scalar at all.
-        tables
-            .retain(|_, p| p.identity.is_some() || p.storage.is_some() || p.persistence.is_some());
+        tables.retain(|_, p| {
+            p.identity.is_some()
+                || p.storage.is_some()
+                || p.persistence.is_some()
+                || p.row_security.is_some()
+                || p.policies.is_some()
+        });
         Self {
             scalars: tables,
             parents,
@@ -557,8 +571,18 @@ impl<'a> TableChanges<'a> {
             }
         }
         Expected {
-            row_security: Req::Keep(&was.row_security),
-            row_policies: Req::Keep(&was.row_policies),
+            row_security: Req::at_close(
+                &was.row_security,
+                self.setting(name, now_name, |p| p.row_security),
+                whole,
+            ),
+            // Parts::kept compares every untouched policy exactly; Parts::after
+            // compares each touched policy structurally, including both clauses.
+            row_policies: if self.setting(name, now_name, |p| p.policies).is_some() {
+                Req::Unpromised
+            } else {
+                Req::Keep(&was.row_policies)
+            },
             identity,
             storage,
             persistence,

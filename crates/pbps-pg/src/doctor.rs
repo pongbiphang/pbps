@@ -1011,6 +1011,32 @@ SELECT w.schema_name,
         .collect()
 }
 
+/// Ownership for standing RLS operations, using the same effective-role
+/// predicate as doctor. Presence stays separate from a negative owner answer.
+pub async fn table_ownership(
+    conn: &mut Conn,
+    tables: &[pbps_model::TableName],
+) -> Result<Vec<(pbps_model::TableName, bool, bool)>, DbError> {
+    let objects: Vec<_> = tables
+        .iter()
+        .map(|t| ObjectName {
+            schema: t.schema.clone(),
+            name: t.name.clone(),
+        })
+        .collect();
+    Ok(read_tables(conn, &objects, &MANAGED_KINDS)
+        .await?
+        .into_iter()
+        .map(|(object, present, rights)| {
+            (
+                pbps_model::TableName::new(object.schema, object.name),
+                present,
+                rights.owned,
+            )
+        })
+        .collect())
+}
+
 async fn read_tables(
     conn: &mut Conn,
     objects: &[ObjectName],

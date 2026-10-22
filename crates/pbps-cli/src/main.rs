@@ -4078,6 +4078,12 @@ fn oracle_validate_saved_plan(
              revision; use a transactional plan for multiple changes."
         );
     }
+    if plan.mode.is_staged() && pbps_diff::order::row_security::requires_transaction(&plan.changes)
+    {
+        bail!(
+            "row-security changes require a transactional plan; --staged is unsupported (DEC-1173.3)"
+        );
+    }
     plan.ids
         .validate()
         .context("the plan's post-apply identity mapping is inconsistent")?;

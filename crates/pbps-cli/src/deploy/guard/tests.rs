@@ -2457,3 +2457,132 @@ fn a_created_prefix_accepts_its_added_columns_and_rejects_unplanned_names_or_fie
         assert!(check(wrong).is_err(), "{field} must remain refused");
     }
 }
+
+#[test]
+fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_flags() {
+    use pbps_model::{PolicyCommand, PolicyRoles, RowPolicy, RowSecurity, RowSecurityOrigin};
+    let pg = pbps_pg::Postgres::new();
+    let name = TableName::new("app", "t");
+    let old = RowPolicy {
+        using: Some("id > 0".into()),
+        ..Default::default()
+    };
+    let mut baseline = table();
+    baseline.row_policies = [
+        ("p".into(), old.clone()),
+        ("kept".into(), old.clone()),
+        ("gone".into(), old.clone()),
+    ]
+    .into();
+    let target = RowPolicy {
+        command: PolicyCommand::Update,
+        restrictive: true,
+        to: PolicyRoles::Roles(["tenant".into()].into()),
+        using: Some("id > 1".into()),
+        with_check: Some("id > 2".into()),
+    };
+    let flags = RowSecurity {
+        enabled: false,
+        forced: true,
+    };
+    let changes = plan(vec![
+        Change::DropPolicy {
+            table: name.clone(),
+            name: "gone".into(),
+            policy: old.clone(),
+        },
+        Change::DropPolicy {
+            table: name.clone(),
+            name: "p".into(),
+            policy: old,
+        },
+        Change::CreatePolicy {
+            table: name.clone(),
+            name: "p".into(),
+            policy: target.clone(),
+            origin: RowSecurityOrigin::Standing,
+        },
+        Change::SetRowSecurity {
+            uid: "t_117306".parse().unwrap(),
+            table: name,
+            from: Default::default(),
+            to: flags,
+            origin: RowSecurityOrigin::Standing,
+        },
+    ]);
+    let before = schema(baseline.clone());
+    let mut final_table = baseline.clone();
+    final_table.row_policies.remove("gone");
+    final_table.row_policies.insert("p".into(), target);
+    final_table.row_security = flags;
+    // Catalog text normalization of a touched predicate is permitted.
+    final_table.row_policies.get_mut("p").unwrap().using = Some("(id > 1)".into());
+    for read in [Settled::Whole, Settled::Closing] {
+        refuse_unplanned_movement(
+            &pg,
+            &changes,
+            &before,
+            &schema(final_table.clone()),
+            "test",
+            read,
+        )
+        .unwrap();
+        for field in 0..11 {
+            let mut bad = final_table.clone();
+            match field {
+                0 => bad.row_policies.get_mut("p").unwrap().command = PolicyCommand::All,
+                1 => bad.row_policies.get_mut("p").unwrap().restrictive = false,
+                2 => bad.row_policies.get_mut("p").unwrap().to = PolicyRoles::Public,
+                3 => bad.row_policies.get_mut("p").unwrap().using = None,
+                4 => bad.row_policies.get_mut("p").unwrap().with_check = None,
+                5 => bad.row_policies.get_mut("kept").unwrap().using = Some("(id > 0)".into()),
+                6 => {
+                    bad.row_policies
+                        .insert("extra".into(), RowPolicy::default());
+                }
+                7 => {
+                    bad.row_policies.insert("gone".into(), RowPolicy::default());
+                }
+                8 => bad.row_security.enabled = true,
+                9 => bad.row_security.forced = false,
+                _ => {
+                    bad.row_policies.remove("kept");
+                }
+            }
+            assert!(
+                refuse_unplanned_movement(&pg, &changes, &before, &schema(bad), "test", read)
+                    .is_err(),
+                "field {field}"
+            );
+        }
+    }
+    // One clause's presence cannot stand in for the other.
+    for (using, with_check) in [(true, false), (false, true), (false, false)] {
+        let mut wanted = final_table.clone();
+        let p = wanted.row_policies.get_mut("p").unwrap();
+        p.using = using.then(|| "id > 1".into());
+        p.with_check = with_check.then(|| "id > 2".into());
+        let mut cs = changes.clone();
+        let Change::CreatePolicy { policy, .. } = &mut cs.changes[2].change else {
+            unreachable!()
+        };
+        *policy = p.clone();
+        refuse_unplanned_movement(
+            &pg,
+            &cs,
+            &before,
+            &schema(wanted.clone()),
+            "test",
+            Settled::Closing,
+        )
+        .unwrap();
+        let mut bad = wanted;
+        let p = bad.row_policies.get_mut("p").unwrap();
+        p.using = (!using).then(|| "id > 1".into());
+        p.with_check = (!with_check).then(|| "id > 2".into());
+        assert!(
+            refuse_unplanned_movement(&pg, &cs, &before, &schema(bad), "test", Settled::Closing)
+                .is_err()
+        );
+    }
+}

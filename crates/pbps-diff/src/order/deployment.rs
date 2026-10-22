@@ -250,6 +250,17 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
             },
         ) => *table == target && *name == target_name.raw(),
         (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Policy,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Policy(target_name),
+            },
+        ) => *table == target && *name == target_name,
+        (
             DependencyPart::Default { column, .. },
             Holds::TablePart {
                 table,
@@ -737,7 +748,7 @@ fn removal_of(
             // plan's own expression change can, and `weave` looks for that.
             Part::Policy(_) => {
                 return Err(format!(
-                    "{}: policy rebuild planning arrives with #1173",
+                    "{}: explicitly remove or replace the dependent policy in the declarations",
                     d.described
                 ));
             }
@@ -1160,16 +1171,17 @@ impl Weave<'_> {
         {
             return Ok(None);
         }
-        // A policy removed with its table needs ordering, never a synthesized
-        // DROP POLICY. The final catalog edges below place that owner before
-        // the routine even when the differ put the routine first.
+        // A policy explicitly removed, or removed with its table, needs
+        // ordering, never an automatic rebuild. Final catalog edges place the
+        // release before the routine even when the differ put it later.
         if matches!(
             d.holds,
             Holds::TablePart {
                 part: Part::Policy(_),
                 ..
             }
-        ) && find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some()
+        ) && (find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some()
+            || find(&view, &parts, &d.holds, partitions, removes).is_some())
         {
             return Ok(None);
         }
@@ -1421,7 +1433,9 @@ impl Expansion for Weave<'_> {
                     Holds::TablePart {
                         part: Part::Policy(_),
                         ..
-                    } => find(&view, &parts, &d.holds, partitions, removes_with_its_owner),
+                    } => find(&view, &parts, &d.holds, partitions, removes).or_else(|| {
+                        find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
+                    }),
                     Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
                 };
                 if let Some(i) = release.filter(|i| *i != at.drop_at) {

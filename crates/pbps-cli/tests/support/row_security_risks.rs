@@ -1,4 +1,4 @@
-//! Approval is enforced before the temporary standing-policy SQL boundary.
+//! Approval is enforced before connecting for standing-policy delivery.
 use super::*;
 use pbps_model::{
     Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, RowPolicy, RowSecurity,
@@ -32,7 +32,7 @@ fn fixture(changes: Vec<Change>) -> SavedPlan {
 }
 
 #[test]
-fn row_security_apply_requires_approval_before_the_temporary_delivery_refusal() {
+fn row_security_apply_requires_approval_before_connecting() {
     let d = Demo::new("row-security-gate1173");
     std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
     let table = TableName::new("app", "docs");
@@ -115,12 +115,7 @@ fn row_security_apply_requires_approval_before_the_temporary_delivery_refusal() 
         let out = invoke(Some(required));
         let err = stderr(&out);
         assert_eq!(code(&out), 1, "{err}");
-        assert!(
-            err.contains(
-                "standing-table row-security SQL delivery arrives with later PRs of #1173"
-            ),
-            "{err}"
-        );
+        assert!(err.contains("connect") || err.contains("refused"), "{err}");
         assert!(!err.contains("risks that were not approved"), "{err}");
     }
 }

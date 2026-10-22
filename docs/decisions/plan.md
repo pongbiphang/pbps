@@ -648,3 +648,27 @@ admission paths, strict wire payloads, real policy-removal effects, and CLI
 approval before the temporary delivery refusal. Mutation checks remove the
 row-security gate and the origin comparison independently; their refusal tests
 must fail before the guards are restored.
+
+
+<a id="dec-1173-3"></a>
+
+**DEC-1173.3. Row-security changes require transactional execution (#1173).**
+A policy replacement drops the old policy before creating its replacement;
+flags follow policies. A staged checkpoint between those statements could
+commit an access state the approver never selected. The connected planner
+refuses `--staged` before lowering any RLS change, and shared saved-plan
+admission refuses it again, including created-table operations and RLS hidden
+in a descriptive table payload. A matching checksum cannot waive this rule.
+
+Standing PostgreSQL policy and flag operations use transactional SQL and the
+existing effective-owner predicate, `pg_has_role(current_user, relowner,
+'USAGE')`, before planning and before apply writes. Explicit policy removals
+release catalog dependencies through the existing removal mechanism; unchanged
+policies are never automatically rebuilt. The closing guard keeps untouched
+policies exact and compares touched policy command, mode and recipients exactly,
+with USING and WITH CHECK presence checked separately. Probes retain their
+pre-plan RLS context and lazy unchecked wrapping (DEC-1172.3).
+
+No version changes: this closes an undeliverable execution path without changing
+plan 47, state 29 or schema set 53. Unit and PostgreSQL 16/18 tests pin staged
+admission, ownership, releases, transitions, rollback, stale baselines and guards.
