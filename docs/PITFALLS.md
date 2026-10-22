@@ -2086,6 +2086,10 @@ loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
 
+A scan-to-deparse race fixture must wait for the reader at a known lock before
+committing the drop; more routines or longer bodies cannot guarantee overlap
+under the suite's default parallel load.
+
 **And a test that could not tell whether the fix was there.** The spelling
 checks guard a cast with `pg_input_is_valid` inside a `CASE`, and that guard
 holds only where the planner does not constant-fold the list it reads from —
