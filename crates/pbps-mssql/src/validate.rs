@@ -14,6 +14,7 @@ use pbps_model::{
     GrantTarget, Module, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table,
     TableName, Value,
 };
+use unicode_normalization::{UnicodeNormalization as _, char::is_combining_mark};
 
 use crate::ident;
 use crate::rows::ValueKind;
@@ -508,7 +509,7 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
     for (name, table) in &schema.tables {
         for (check, c) in &table.checks {
             for (column, computed) in &table.computed {
-                if !computed.persisted && crate::Mssql.may_name(&c.expression, column.raw()) {
+                if !computed.persisted && check_may_read_computed(&c.expression, column.raw()) {
                     notes.push(format!(
                         "{name}: check constraint `{check}` may read the computed column \
                          `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
@@ -527,6 +528,87 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
         }
     }
     notes
+}
+
+/// Keep this broader catalog comparison in the advisory: other `may_name`
+/// callers use its answer to refuse or order plans (DEC-2163.1).
+fn check_may_read_computed(expression: &str, column: &str) -> bool {
+    if crate::Mssql.may_name(expression, column) {
+        return true;
+    }
+    // Strip literals/comments before folding. Folding raw SQL could turn a
+    // fullwidth punctuation character into syntax and change what is code.
+    let lexicon = crate::Mssql.lexicon();
+    let code = lexicon.code_only(expression);
+    if code.is_ascii() && column.is_ascii() {
+        return false;
+    }
+    let column = computed_note_fold(column);
+    // NFKD is not a catalog collation: measured, even ł/l, æ/ae and ß/ss
+    // bind on CI_AI. An unresolved letter on either side cannot prove no
+    // binding. Accept extra notes, but only for a possible code name.
+    let unresolved = |c: char| !c.is_ascii() && c.is_alphabetic();
+    let column_unresolved = column.chars().any(unresolved);
+    let may_bind = |name: &str| {
+        let name = computed_note_fold(name);
+        name == column || column_unresolved || name.chars().any(unresolved)
+    };
+    // Decode the original delimiters before folding their contents. A
+    // fullwidth closer is not doubled in SQL; folding it first would confuse
+    // it with a real, escaped closer in the same identifier.
+    let continues = |c: char| (lexicon.identifier_continues)(c) || is_combining_mark(c);
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut name = String::new();
+        if let Some(&(_, close)) = lexicon
+            .quoted_identifiers
+            .iter()
+            .find(|&&(open, _)| open == c)
+        {
+            while let Some(c) = chars.next() {
+                if c == close && chars.next_if_eq(&close).is_none() {
+                    break;
+                }
+                name.push(c);
+            }
+        } else if continues(c) {
+            name.push(c);
+            while let Some(c) = chars.next_if(|c| continues(*c)) {
+                name.push(c);
+            }
+            // A numeric constant cannot bind a column. Quoted numeric names
+            // above remain candidates, like every other quoted identifier.
+            if !name
+                .chars()
+                .any(|c| c.is_alphabetic() || matches!(c, '_' | '@' | '#' | '$'))
+            {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        if may_bind(&name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn computed_note_fold(text: &str) -> String {
+    // Compatibility decomposition supplies the width mapping, including
+    // halfwidth kana; canonical decomposition alone supplies neither.
+    text.nfkd()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !is_combining_mark(*c))
+        .map(|c| match c {
+            'ı' => 'i',
+            // Katakana letters and iteration marks share hiragana's order.
+            '\u{30a1}'..='\u{30f6}' | '\u{30fd}'..='\u{30fe}' => {
+                char::from_u32(u32::from(c) - 0x60).unwrap()
+            }
+            _ => c,
+        })
+        .collect()
 }
 
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
@@ -1500,6 +1582,105 @@ mod tests {
         for expression in ["p > 0", "a > 0", "a <> 'len'"] {
             let notes = checks_over_computed_columns(&with(expression));
             assert!(notes.is_empty(), "{expression}: {notes:?}");
+        }
+    }
+
+    #[test]
+    fn insensitive_catalog_spellings_of_unpersisted_computed_columns_are_noted() {
+        let declared = |column: &str, expression: &str, persisted: bool| {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("other".into(), Column::new("int".parse().unwrap()));
+            table.computed.insert(
+                column.into(),
+                pbps_model::ComputedColumn {
+                    expression: "other + 1".into(),
+                    persisted,
+                    not_null: false,
+                },
+            );
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+            Schema {
+                tables: [("dbo.t".parse().unwrap(), table)].into(),
+                ..Schema::default()
+            }
+        };
+        for (column, expression) in [
+            ("café", "cafe > 0"),
+            ("cafe", "café > 0"),
+            ("café", "[CAFE] > 0"),
+            ("café", "\"cafe\" > 0"),
+            ("café", "cafe\u{301} > 0"),
+            ("ｃａｆｅ", "cafe > 0"),
+            ("cafe", "ｃａｆｅ > 0"),
+            ("かたかな", "カタカナ > 0"),
+            ("カタカナ", "かたかな > 0"),
+            ("ｶﾀｶﾅ", "カタカナ > 0"),
+            ("が", "[ｶﾞ] > 0"),
+            ("café]x", "[cafe]]x] > 0"),
+            ("café\"x", "\"cafe\"\"x\" > 0"),
+            // These collation equivalences have no NFKD decomposition.
+            ("ł", "l > 0"),
+            ("l", "ł > 0"),
+            ("æ", "ae > 0"),
+            ("ß", "ss > 0"),
+        ] {
+            // The broader rule must remain local to the advisory.
+            assert!(!crate::Mssql.may_name(expression, column));
+            let schema = declared(column, expression, false);
+            let notes = crate::Mssql.declaration_notes(&schema);
+            assert_eq!(notes.len(), 1, "{column}, {expression}: {notes:?}");
+            assert!(notes[0].contains(&format!("may read the computed column `{column}`")));
+            assert!(notes[0].contains("1764"));
+            assert!(notes[0].contains("persisted: true"));
+            assert!(
+                super::table(
+                    &"dbo.t".parse().unwrap(),
+                    schema.tables.values().next().unwrap()
+                )
+                .is_empty()
+            );
+            assert!(
+                crate::Mssql
+                    .declaration_notes(&declared(column, expression, true))
+                    .is_empty()
+            );
+        }
+        for (column, expression) in [
+            ("café", "other > 0"),
+            ("café", "cafeteria > 0"),
+            ("café", "decafe > 0"),
+            ("café", "cafe_other > 0"),
+            ("café", "other <> N'cafe'"),
+            ("cafe", "other <> N'café'"),
+            ("café", "other > 0 /* cafe */"),
+            ("cafe", "other > 0 -- café"),
+            ("ł", "N'l' <> N''"),
+        ] {
+            let notes = crate::Mssql.declaration_notes(&declared(column, expression, false));
+            assert!(notes.is_empty(), "{column}, {expression}: {notes:?}");
+        }
+    }
+
+    #[test]
+    fn width_folding_keeps_original_identifier_escape_boundaries() {
+        for (column, expression) in [
+            ("café］]x", "[cafe］]]x] > 0"),
+            ("café＂\"x", "\"cafe＂\"\"x\" > 0"),
+            ("café＇x", "[cafe＇x] > 0"),
+        ] {
+            assert!(
+                check_may_read_computed(expression, column),
+                "{column}: {expression}"
+            );
+            assert!(!check_may_read_computed("other > 0", column));
+            assert!(!check_may_read_computed("other <> N'cafe］]x'", column));
         }
     }
 

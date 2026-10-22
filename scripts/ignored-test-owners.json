@@ -978,6 +978,7 @@
       ],
       "cases": [
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
+        "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",
         "an_object_over_a_left_out_column_is_left_out_with_it",
         "binding619::an_arrival_in_a_modules_own_schema_rebinds_its_one_part_names_and_no_other_arrival_does",

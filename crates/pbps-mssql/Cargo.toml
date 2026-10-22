@@ -23,6 +23,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 thiserror.workspace = true
 tiberius.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 pbps-diff = { workspace = true, features = ["test-fixtures"] }
