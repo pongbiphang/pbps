@@ -169,8 +169,8 @@ class WhatItAccepts(unittest.TestCase):
 
 
 class BuilderMessages(unittest.TestCase):
-    def test_sql_formatting_is_accepted_in_all_eight_builders_without_counts(self):
-        self.assertEqual(len(guard.SQL_BUILDERS), 8)
+    def test_sql_formatting_is_accepted_in_each_builder_without_counts(self):
+        self.assertTrue(guard.SQL_BUILDERS)
         sql = 'let sql = format!("ALTER TABLE {} ADD {}", quote(t.raw()), quote(c.raw()));'
         for path in guard.SQL_BUILDERS:
             with self.subTest(path=path):

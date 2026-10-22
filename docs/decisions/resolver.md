@@ -4002,3 +4002,52 @@ back. They refuse with the changed owner and the remedy to supply a new scratch
 database; cleanup sends no ALTER or DROP for them. Live variants pin restoration,
 unchanged refusals and residual admission through supplied acquisition.
 This supersedes the matching empty-check and residual rules in DEC-2236.1.
+
+<a id="dec-2267-1"></a>
+
+**DEC-2267.1. Reproduce database authorization inside the sandbox, entering
+scratch dbo irreversibly only for a captured dbo deployer with TRUSTWORTHY
+OFF.** Database reconstruction is separate from login defaults; compile
+sessions restore the captured effective language, date and SET settings and
+read them back. Ordinary deployers remain loginless users. A db_owner
+stand-in for dbo is wrong: an object DENY stops the member and does not stop
+dbo. Both routes enter from the sandbox `WITH NO REVERT`; the dbo route
+checks `is_trustworthy_on = 0` both before and after entry. This amends
+DEC-619.3's statement that both execution users are loginless.
+
+Measured on SQL Server 17.0.4075.5 on 2026-10-22, with both sa and ordinary
+owner logins, TRUSTWORTHY OFF makes entered dbo equal to the sandbox on every
+escape probe: another database (916), msdb (229), CREATE DATABASE (262),
+CREATE LOGIN (15247), server roles (15151), EXECUTE AS LOGIN (15406),
+TRUSTWORTHY and DB_CHAINING (5069), BULK (4860), REVERT (15196), and linked
+servers with fixed/self mappings (15274, measured on 16 because the 2025
+Linux provider cannot connect). Owner-login controls have the owner's
+reach. With TRUSTWORTHY ON, entered dbo gains that reach: an sa owner gives
+sysadmin and an ordinary owner gives access to its other database. The
+ordinary sandbox does not gain the same reach.
+
+The original BULK probe sends entry and SELECT in one batch and reports
+4860. The same SELECT in a later batch after entry reports 4834 (bulk-load
+permission denied). Both paths are measured and tested; neither returns
+the file bytes. Token `usage` is fixed-width, so the readers remove its SQL
+padding before matching `DENY ONLY`.
+
+The dbo entry adds only DENY ONLY owner-login/server-role entries to
+`sys.login_token`, and dbo/db_owner DENY ONLY entries beside guest/public
+in each system database's `sys.user_token`. Only the validated dbo route
+accepts these measured entries; grant-capable or unrelated additions refuse.
+The sandbox and ordinary deployer retain the strict guest/public token rule,
+and all routes retain the existing guest/public ACL and ownership rules.
+
+Staged-object authorization retains effective answers and visible grantor,
+grantee, object and column identities. Object states are typed GRANT,
+GRANT_WITH_GRANT_OPTION or DENY; column REVOKE is a distinct typed exception
+replayed after object grants. The authorization rule is `mssql-auth-v2`.
+Effective owners reuse capture's explicit/parent/schema resolution. A
+partition over every held schema and staged object, anchored to deployer and
+dbo, compares only equality relationships. Trusted setup sets ownership
+before ACLs because ALTER AUTHORIZATION clears object permissions. A
+file-supplied contradictory owner refuses without mutation. Final settlement
+re-reads database authority and staged effective permissions and ACL rows.
+The CLI still refuses at the externals boundary; this adds no fabricated
+prepared or binding certificate.

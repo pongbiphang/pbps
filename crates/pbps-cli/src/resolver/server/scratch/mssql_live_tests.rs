@@ -19,6 +19,92 @@ fn server(variable: &str) -> String {
         .unwrap_or_else(|_| panic!("{variable} must name the owned SQL Server resolver fixture"))
 }
 
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_sandbox() {
+    use pbps_mssql::resolver::{authorization as auth, environment};
+    let primary = server("PBPS_TEST_DB");
+    let source = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, on) = create_database(&source).await;
+    let mut owner = connection(&on).await;
+    let marker = sql::mark(&mut owner, &format!("{:032x}", rand::random::<u128>()))
+        .await
+        .unwrap();
+    let databases = sql::database_names(&mut owner).await.unwrap();
+    let mut target = connection(&primary).await;
+    let schemas = vec!["dbo".to_owned()];
+    let context = auth::read(&mut target, &schemas).await.unwrap();
+    let facts = environment::read(&mut target, &environment::Scope { schemas: &schemas })
+        .await
+        .unwrap();
+    let map = auth::PrincipalMap::generate(&context, &[], "cli2267");
+    let sandbox = "pbps_cli_sandbox2267";
+    sql::create_sandbox(&mut owner, sandbox).await.unwrap();
+    let mut compile = connection(&on).await;
+    assert!(sql::marked(&mut compile, &marker).await.unwrap());
+    sql::enter_sandbox(&mut compile, sandbox).await.unwrap();
+    sql::sandbox_checks(&mut compile, &databases, &name)
+        .await
+        .unwrap();
+    auth::reconstruct_database(&mut compile, &map, &context)
+        .await
+        .unwrap();
+    let entered = auth::enter_sandbox_deployer(
+        &mut compile,
+        &map,
+        &context,
+        &facts,
+        &auth::SandboxScope {
+            sandbox,
+            scratch: &name,
+            databases: &databases,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(entered.is_dbo());
+    assert!(sql::marked(&mut compile, &marker).await.unwrap());
+    // The ordinary check must still reject dbo's extra DENY ONLY entries.
+    assert!(
+        sql::sandbox_checks(&mut compile, &databases, &name)
+            .await
+            .is_err()
+    );
+    compile
+        .execute("CREATE TABLE dbo.compiled2267(i int);")
+        .await
+        .unwrap();
+    drop(compile);
+    let mut cleanup = connection(&on).await;
+    assert!(sql::marked(&mut cleanup, &marker).await.unwrap());
+    sql::enter_sandbox(&mut cleanup, sandbox).await.unwrap();
+    sql::sandbox_checks(&mut cleanup, &databases, &name)
+        .await
+        .unwrap();
+    sql::inventory::cleanup(&mut cleanup, Some(sandbox))
+        .await
+        .unwrap();
+    assert!(
+        sql::inventory::read(&mut cleanup, Some(sandbox))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(cleanup);
+    owner
+        .execute(&format!("DROP USER [{sandbox}];"))
+        .await
+        .unwrap();
+    assert!(
+        sql::inventory::read(&mut owner, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(owner);
+    drop_database(&source, &name).await;
+}
+
 async fn connection(url: &str) -> Conn {
     Conn::connect(Driver::Mssql, url).await.unwrap()
 }

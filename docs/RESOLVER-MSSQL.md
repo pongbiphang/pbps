@@ -171,17 +171,38 @@ for a moment keeps that type.
 
 ## 5. Reconstruction
 
-- **The deployer.** Scratch reproduces it with #611's context, as a second
-  user without a login that the sandbox (§6) creates. The user carries:
+- **The deployer.** Scratch reproduces #611's database context, without
+  `ALTER LOGIN` (DEC-2267.1). An ordinary deployer is a second user without
+  a login that the sandbox (§6) creates. The user carries:
   - its default schema, which statement-level names need (§2);
   - its role memberships;
-  - the database permissions the target grants it, and no more.
+  - the database and schema GRANTs and DENYs the target grants it;
+  - object and column permissions on staged objects, including role and
+    public rows. A column REVOKE remains an exception, never a DENY.
+
+  A target whose captured effective user is `dbo` enters scratch's own
+  `dbo` from the sandbox, also `WITH NO REVERT`. A db_owner member is not
+  equivalent: object DENY stops that member and does not stop dbo. Read
+  `is_trustworthy_on` before and after entry and require 0; otherwise an
+  entered dbo can gain the database owner's server reach. This amends
+  DEC-619.3's literal second-loginless-user requirement.
+
+  Restore the captured effective language, DATEFIRST, DATEFORMAT and SET
+  options on the compile connection and verify its reported values. Owner
+  partitions include every held schema, staged effective owners and deployer
+  and dbo anchors. Resolve explicit owner, parent owner, then schema owner;
+  compare equality relationships across subjects, never owner names or IDs.
+  Trusted setup assigns ownership before object ACL replay because changing
+  authorization clears those ACLs. Contradictory file ownership refuses
+  without repair. Settlement re-reads database and staged-object authority.
 
   The declared objects compile as this user, entered from the sandbox
   `WITH NO REVERT`. A statement the deployer may not run then refuses on
   scratch as on the target: `CREATE VIEW` without the permission (262), or
-  a table in a schema it cannot alter (2760). It can return neither to the
-  sandbox (15517) nor anywhere else (15196) [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
+  a table in a schema it cannot alter (2760). An ordinary deployer without
+  impersonation authority cannot return to the sandbox (15517); neither
+  entry can REVERT (15196)
+  [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
 - **Fingerprints.** A module's fingerprint carries `uses_ansi_nulls`,
   `uses_quoted_identifier` and `is_schema_bound`. The database collation and
   compatibility level are compared as reported facts (`mssql-reported-scope-v1`).
@@ -219,14 +240,17 @@ for a moment keeps that type.
     and scratch may never be the target database itself.
 - **A sandbox, not a confined login**
   ([DEC-619.3](decisions/resolver.md#dec-619-3)). Every statement pbps runs
-  on scratch for the plan runs as a user without a login:
+  on scratch for the plan runs inside a database execution context:
   - the baseline, the externals file and the deployer's reproduction run as
     the sandbox user, `db_owner` of the scratch database only;
-  - the declared objects run as the reproduced deployer (§5), a second
-    loginless user entered from the sandbox `WITH NO REVERT`.
+  - the declared objects run as the reproduced deployer (§5), an ordinary
+    loginless user or scratch's own dbo, entered from the sandbox
+    `WITH NO REVERT` (DEC-2267.1).
 
-  Both are loginless, so what is measured below holds for both, and the
-  deployer has less:
+  The ordinary deployer is loginless and carries its captured database
+  authority. The dbo route
+  requires TRUSTWORTHY OFF and passes the same escape probes; this replaces
+  the earlier statement that both execution identities are loginless:
   - **How it is entered.** The supplied account creates the user after the
     empty check, and impersonates it with `EXECUTE AS USER … WITH NO
     REVERT` before the first such statement. The session cannot leave it.
@@ -304,7 +328,14 @@ for a moment keeps that type.
         not restore the inventory.
     - **What `guest` and `public` hold in `master`, `tempdb` and `msdb`.**
       The sandbox enters them as `guest`. Its token there must be `guest`
-      and `public` only. Fixed rules apply on every build, without a
+      and `public` only for the sandbox and ordinary deployer. Only after
+      validated dbo entry, `dbo` (SQL USER) and `db_owner` (ROLE) may also
+      appear with usage `DENY ONLY`; any other entry or usage refuses.
+      The entered dbo's `sys.login_token` must contain the scratch owner's
+      login and its server roles only, all `DENY ONLY`. The guest/public
+      permission, membership and ownership rules stay unchanged; deny-only
+      identities do not become grant-capable ownership subjects.
+      Fixed rules apply on every build, without a
       permission-list snapshot (DEC-2236.1):
       - At database scope, exactly three GRANTs qualify: `CONNECT` to
         `guest`, and `VIEW ANY COLUMN MASTER KEY DEFINITION` and

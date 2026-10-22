@@ -31,9 +31,18 @@ use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod sandbox;
+mod staged;
+pub use sandbox::{SandboxDeployer, SandboxScope, apply_session_settings, enter_sandbox_deployer};
+pub use staged::{
+    ColumnPermissionState, OwnerPartition, PermissionScope, PermissionState, StagedGrant,
+    StagedObject, read_staged_permissions, reconstruct_owners, replay_staged_permissions,
+    verify_staged_authorization,
+};
+
 /// The versioned name of this authorization rule, measured on SQL Server
 /// 2025 (17.0).
-pub const RULE: &str = "mssql-auth-v1";
+pub const RULE: &str = "mssql-auth-v2";
 
 /// Principals every database has, which a reproduction refers to by their
 /// own name instead of cloning.
@@ -130,6 +139,12 @@ pub struct AuthorizationContext {
     /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
+    /// Object and column permissions in the staged scope (DEC-2267.1).
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "staged::serialize"
+    )]
+    pub staged: Box<BTreeMap<super::capture::ObjectIdentity, StagedObject>>,
 }
 
 impl AuthorizationContext {
@@ -343,6 +358,7 @@ pub async fn read(
         principal_owners: BTreeMap::new(),
         principals: BTreeMap::new(),
         spellings: BTreeMap::new(),
+        staged: Box::default(),
     };
     if !context.principal.superuser {
         context.database_grants = grants(
@@ -536,6 +552,13 @@ fn named_principals(
     named.extend(context.roles.keys().cloned());
     named.extend(context.impersonation.iter().cloned());
     named.extend(context.principal_owners.values().cloned());
+    for object in context.staged.values() {
+        named.insert(object.owner.clone());
+        for grant in &object.grants {
+            named.insert(grant.grantee.clone());
+            named.insert(grant.grantor.clone());
+        }
+    }
     for held in &context.principal_grants {
         named.insert(held.on.clone());
         named.insert(held.grant.grantee.clone());
@@ -638,9 +661,10 @@ impl PrincipalMap {
             .collect()
     }
 
-    /// The scratch user the compilation must `EXECUTE AS`, or `None` when
+    /// The legacy login-based scratch user to `EXECUTE AS`, or `None` when
     /// the deployer is `dbo`: the run login owns its scratch database and is
-    /// already `dbo` there.
+    /// already `dbo` there. Sandbox callers use `enter_sandbox_deployer`,
+    /// which always enters, including for dbo.
     pub fn deployer(&self, context: &AuthorizationContext) -> Option<pbps_model::RoleName> {
         if context.principal.superuser {
             return None;
@@ -659,6 +683,26 @@ pub async fn reconstruct(
     context: &AuthorizationContext,
     run_login: &str,
 ) -> Result<(), DbError> {
+    reconstruct_database(admin, map, context).await?;
+    // The older non-sandbox lifecycle starts a new connection as this login.
+    admin
+        .query(&format!(
+            "ALTER LOGIN {} WITH DEFAULT_LANGUAGE = {};",
+            bracket(run_login),
+            bracket(&context.language)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Reproduces database authority through the already-entered sandbox. No
+/// server-scoped statement is needed; compile-session settings are restored
+/// separately after irreversible deployer entry (DEC-2267.1).
+pub async fn reconstruct_database(
+    admin: &mut impl QueryConnection,
+    map: &PrincipalMap,
+    context: &AuthorizationContext,
+) -> Result<(), DbError> {
     let missing = |logical: &pbps_model::RoleName| {
         DbError::BadRow(format!(
             "the authorization reconstruction has no run-local principal for {logical}",
@@ -670,7 +714,11 @@ pub async fn reconstruct(
             continue;
         }
         let statement = match context.principals.get(logical) {
-            Some(PrincipalKind::Role) => format!("CREATE ROLE {};", bracket(run.raw())),
+            // The current user is the sandbox now. Without AUTHORIZATION
+            // SQL Server makes it the owner instead of the target's dbo.
+            Some(PrincipalKind::Role) => {
+                format!("CREATE ROLE {} AUTHORIZATION dbo;", bracket(run.raw()))
+            }
             Some(PrincipalKind::User) | None => {
                 format!("CREATE USER {} WITHOUT LOGIN;", bracket(run.raw()))
             }
@@ -726,9 +774,17 @@ pub async fn reconstruct(
             .ok_or_else(|| missing(&schema.owner))?;
         // `dbo` is in every database and cannot be created; a target whose
         // `dbo` schema changed hands has the change replayed instead.
-        let statement = if name == "dbo" {
+        let statement = if !admin
+            .query(&format!(
+                "SELECT name FROM sys.schemas WHERE name={};",
+                literal(name)
+            ))
+            .await?
+            .is_empty()
+        {
             format!(
-                "ALTER AUTHORIZATION ON SCHEMA::[dbo] TO {};",
+                "ALTER AUTHORIZATION ON SCHEMA::{} TO {};",
+                bracket(name),
                 bracket(owner.raw())
             )
         } else {
@@ -784,15 +840,6 @@ pub async fn reconstruct(
         };
         replay(admin, map, owner, &grants, &on).await?;
     }
-    // The scratch session speaks the run login's default language, as the
-    // deployment session speaks the deployment login's.
-    admin
-        .query(&format!(
-            "ALTER LOGIN {} WITH DEFAULT_LANGUAGE = {};",
-            bracket(run_login),
-            bracket(&context.language)
-        ))
-        .await?;
     Ok(())
 }
 
@@ -948,6 +995,7 @@ async fn replay(
     Ok(())
 }
 
+/// Legacy reversible entry; sandbox callers use [`enter_sandbox_deployer`].
 /// Switches the connection to the reproduced deployer, once: a second call
 /// on a session already running as it is a no-op. Every check re-enters, a
 /// user may `EXECUTE AS` itself, and each entry would stack one more
@@ -1338,6 +1386,7 @@ mod tests {
 
     fn context() -> AuthorizationContext {
         AuthorizationContext {
+            staged: Box::default(),
             principal: DeploymentPrincipal {
                 login: "deploy_login".into(),
                 effective: "dep".into(),
