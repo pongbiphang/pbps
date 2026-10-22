@@ -3981,3 +3981,24 @@ reverse-dependency cleanup (#2236).**
 `mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract`
 and `mssql_docker_removes_the_container_on_success_failure_and_cancellation`,
 with negative cases and live engine measurements.
+
+<a id="dec-2263-1"></a>
+
+**DEC-2263.1. Scratch emptiness checks only rehearsal-observable and separation
+state, with fixed definitions for mutable built-ins.** The closed sets are
+§7 of `RESOLVER-MSSQL.md`: user-created securables/non-securables, resolution,
+ownership/permission chains and compilation options; and the sandbox's token,
+grants, signatures, execution paths and possible outside sends. Physical
+allocation, plan collection and unused key material fall outside both sets:
+file growth/size/maxsize, primary autogrow, granular Query Store options and a
+DEK with encryption OFF pass without new reads, permissions or version baselines.
+In-set built-ins excluded by name or ID must exist; their alterable relevant
+columns equal one fixed definition across builds. Cleanup resets a known
+definition or refuses by name; it never recreates a missing built-in, including
+a revoked fixed database grant. The measured route, guest and fixed-role
+changes can be reset. System assembly and language ownership cannot: their
+fresh owner is `sys`, but even loginless `db_owner` gets 15151 assigning it
+back. They refuse with the changed owner and the remedy to supply a new scratch
+database; cleanup sends no ALTER or DROP for them. Live variants pin restoration,
+unchanged refusals and residual admission through supplied acquisition.
+This supersedes the matching empty-check and residual rules in DEC-2236.1.

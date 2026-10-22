@@ -1,5 +1,6 @@
 //! One inventory serves initial emptiness and final cleanup. Catalog reads
-//! are never allowed to fail into an empty result (DEC-2236.1).
+//! are never allowed to fail into an empty result (DEC-2236.1). Built-ins
+//! follow the rehearsal and separation sets, not a build snapshot (DEC-2263.1).
 
 use super::{ident, literal, text};
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
@@ -119,6 +120,18 @@ impl Inventory {
             key,
         });
     }
+
+    fn unrestorable(&mut self, name: String, rank: u16) {
+        self.add(
+            format!(
+                "{name}: this database cannot be restored to a fresh state; \
+                 supply a new scratch database"
+            ),
+            None,
+            rank,
+            None,
+        );
+    }
 }
 
 async fn rows(
@@ -211,20 +224,56 @@ pub async fn read(
         )
         .await?;
         if found.len() != 1 {
-            result.add(format!("missing SCHEMA {name}"), None, 90, None);
+            result.unrestorable(format!("missing SCHEMA {name}"), 90);
         }
     }
     let mut principals = BTreeSet::new();
     for row in rows(
         conn,
         "database_principals",
-        "SELECT name,type,principal_id,owning_principal_id FROM sys.database_principals;",
+        "SELECT name,type,principal_id,owning_principal_id,USER_NAME(owning_principal_id) AS \
+         owner,default_schema_name,allow_encrypted_value_modifications \
+         FROM sys.database_principals;",
     )
     .await?
     {
         let name = text(&row, "name")?;
         principals.insert(name.clone());
-        if FIXED.contains(&name.as_str()) || name == "public" || sandbox == Some(name.as_str()) {
+        if FIXED.contains(&name.as_str()) || name == "public" {
+            if text(&row, "type")? == "R" && row.try_get::<i32>("owning_principal_id")? != Some(1) {
+                result.add(
+                    format!("ROLE {name} owner {}", text(&row, "owner")?),
+                    Some(format!(
+                        "ALTER AUTHORIZATION ON ROLE::{} TO dbo;",
+                        ident(&name)
+                    )),
+                    89,
+                    None,
+                );
+            }
+            if name == "guest" {
+                if row.try_get::<&str>("default_schema_name")? != Some("guest") {
+                    result.add(
+                        "USER guest default schema".into(),
+                        Some("ALTER USER guest WITH DEFAULT_SCHEMA=guest;".into()),
+                        89,
+                        None,
+                    );
+                }
+                if row.try_get::<bool>("allow_encrypted_value_modifications")? != Some(false) {
+                    result.add(
+                        "USER guest ALLOW_ENCRYPTED_VALUE_MODIFICATIONS".into(),
+                        Some(
+                            "ALTER USER guest WITH ALLOW_ENCRYPTED_VALUE_MODIFICATIONS=OFF;".into(),
+                        ),
+                        89,
+                        None,
+                    );
+                }
+            }
+            continue;
+        }
+        if sandbox == Some(name.as_str()) {
             continue;
         }
         let kind = match text(&row, "type")?.as_str() {
@@ -258,7 +307,7 @@ pub async fn read(
     }
     for name in FIXED.iter().copied().chain(["public"]) {
         if !principals.contains(name) {
-            result.add(format!("missing principal {name}"), None, 100, None);
+            result.unrestorable(format!("missing principal {name}"), 100);
         }
     }
     let mut memberships = BTreeSet::new();
@@ -288,7 +337,7 @@ pub async fn read(
         );
     }
     if !memberships.contains(&("db_owner".into(), "dbo".into())) {
-        result.add("missing membership db_owner<-dbo".into(), None, 10, None);
+        result.unrestorable("missing membership db_owner<-dbo".into(), 10);
     }
     for row in rows(
         conn,
@@ -461,8 +510,7 @@ pub async fn read(
         (
             "external_languages",
             "EXTERNAL LANGUAGE",
-            "NOT (principal_id=4 AND ((external_language_id=1 AND language=N'R') OR \
-             (external_language_id=2 AND language=N'Python')))",
+            "external_language_id NOT IN(1,2)",
             70,
             false,
         ),
@@ -640,34 +688,38 @@ pub async fn read(
         conn,
         "filegroups",
         "SELECT name FROM sys.filegroups WHERE data_space_id<>1 OR name<>N'PRIMARY' OR \
-         is_default<>1 OR is_read_only<>0 OR is_autogrow_all_files<>0;",
+         is_default<>1 OR is_read_only<>0;",
     )
     .await?
     {
         let name = text(&row, "name")?;
-        result.add(
-            format!("FILEGROUP {name}"),
-            if name == "PRIMARY" {
-                None
-            } else {
+        if name == "PRIMARY" {
+            result.unrestorable(format!("FILEGROUP {name}"), 85);
+        } else {
+            result.add(
+                format!("FILEGROUP {name}"),
                 Some(format!(
                     "ALTER DATABASE CURRENT REMOVE FILEGROUP {};",
                     ident(&name)
-                ))
-            },
-            85,
-            None,
-        );
+                )),
+                85,
+                None,
+            );
+        }
     }
     for row in rows(
         conn,
         "database_files",
-        "SELECT name FROM sys.database_files WHERE file_id NOT IN(1,2) OR state<>0 OR \
+        "SELECT name,file_id FROM sys.database_files WHERE file_id NOT IN(1,2) OR state<>0 OR \
          is_read_only<>0;",
     )
     .await?
     {
         let name = text(&row, "name")?;
+        if matches!(row.try_get::<i32>("file_id")?, Some(1 | 2)) {
+            result.unrestorable(format!("FILE {name}"), 82);
+            continue;
+        }
         result.add(
             format!("FILE {name}"),
             Some(format!(
@@ -678,6 +730,7 @@ pub async fn read(
             None,
         );
     }
+    builtins(conn, &mut result).await?;
     references(conn, &mut result).await?;
     nonsecurables(conn, &mut result).await?;
     properties(conn, &mut result).await?;
@@ -688,6 +741,202 @@ pub async fn read(
     )
     .await?;
     Ok(result)
+}
+
+// Engine-owned definitions that reject ALTER/DROP need existence checks, not
+// a snapshot of their version-dependent IDs, timestamps or CLR identity.
+// Mutable in-set columns below instead have fixed definitions (DEC-2263.1).
+async fn builtins(conn: &mut impl QueryConnection, result: &mut Inventory) -> Result<(), DbError> {
+    let fixed: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "service_message_types",
+            "MESSAGE TYPE",
+            "message_type_id<=14",
+            &[
+                "http://schemas.microsoft.com/SQL/ServiceBroker/Error",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/EndDialog",
+                "http://schemas.microsoft.com/SQL/Notifications/QueryNotification",
+                "http://schemas.microsoft.com/SQL/Notifications/EventNotification",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/DialogTimer",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/BrokerConfigurationNotice/MissingRoute",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/BrokerConfigurationNotice/FailedRoute",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/BrokerConfigurationNotice/MissingRemoteServiceBinding",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/BrokerConfigurationNotice/FailedRemoteServiceBinding",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceEcho/Echo",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceDiagnostic/Query",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceDiagnostic/Status",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceDiagnostic/Description",
+                "DEFAULT",
+            ],
+        ),
+        (
+            "service_contracts",
+            "CONTRACT",
+            "service_contract_id<=6",
+            &[
+                "DEFAULT",
+                "http://schemas.microsoft.com/SQL/Notifications/PostEventNotification",
+                "http://schemas.microsoft.com/SQL/Notifications/PostQueryNotification",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/BrokerConfigurationNotice",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceDiagnostic",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceEcho",
+            ],
+        ),
+        (
+            "services",
+            "SERVICE",
+            "service_id<=3",
+            &[
+                "http://schemas.microsoft.com/SQL/Notifications/EventNotificationService",
+                "http://schemas.microsoft.com/SQL/Notifications/QueryNotificationService",
+                "http://schemas.microsoft.com/SQL/ServiceBroker/ServiceBroker",
+            ],
+        ),
+        (
+            "service_queues",
+            "QUEUE",
+            "is_ms_shipped=1",
+            &[
+                "QueryNotificationErrorsQueue",
+                "EventNotificationErrorsQueue",
+                "ServiceBrokerQueue",
+            ],
+        ),
+        (
+            "assemblies",
+            "ASSEMBLY",
+            "is_user_defined=0",
+            &["Microsoft.SqlServer.Types"],
+        ),
+        (
+            "xml_schema_collections",
+            "XML SCHEMA COLLECTION",
+            "schema_id=4",
+            &["sys"],
+        ),
+        ("filegroups", "FILEGROUP", "data_space_id=1", &["PRIMARY"]),
+    ];
+    for (catalog, kind, filter, expected) in fixed {
+        let found = rows(
+            conn,
+            catalog,
+            &format!("SELECT name FROM sys.{catalog} WHERE {filter};"),
+        )
+        .await?
+        .iter()
+        .map(|row| text(row, "name"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+        for name in *expected {
+            if !found.contains(*name) {
+                result.unrestorable(format!("missing {kind} {name}"), 80);
+            }
+        }
+        for name in &found {
+            if !expected.contains(&name.as_str()) {
+                result.unrestorable(format!("unknown built-in {kind} {name}"), 80);
+            }
+        }
+    }
+    for id in [1, 2] {
+        if rows(
+            conn,
+            "database_files",
+            &format!("SELECT name FROM sys.database_files WHERE file_id={id};"),
+        )
+        .await?
+        .len()
+            != 1
+        {
+            result.unrestorable(format!("missing FILE file_id={id}"), 82);
+        }
+    }
+    for (catalog, kind, name_column, filter, expected) in [
+        (
+            "assemblies",
+            "ASSEMBLY",
+            "name",
+            "is_user_defined=0",
+            &["Microsoft.SqlServer.Types"][..],
+        ),
+        (
+            "external_languages",
+            "EXTERNAL LANGUAGE",
+            "language",
+            "external_language_id IN(1,2)",
+            &["R", "Python"][..],
+        ),
+    ] {
+        let found = rows(conn, catalog, &format!(
+            "SELECT {name_column} AS name,USER_NAME(principal_id) AS owner FROM sys.{catalog} WHERE {filter};"
+        )).await?;
+        let names = found
+            .iter()
+            .map(|row| text(row, "name"))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for name in expected {
+            if !names.contains(*name) {
+                result.unrestorable(format!("missing {kind} {name}"), 70);
+            }
+        }
+        for row in found {
+            let name = text(&row, "name")?;
+            let owner = text(&row, "owner")?;
+            if !expected.contains(&name.as_str()) {
+                result.unrestorable(
+                    format!("unknown built-in {kind} {} owner {owner}", ident(&name)),
+                    70,
+                );
+            } else if owner != "sys" {
+                // Measured: even db_owner cannot assign ownership back to sys
+                // (15151). Dropping these system objects is forbidden too.
+                result.unrestorable(
+                    format!("{kind} {} owner {owner} (expected sys)", ident(&name)),
+                    70,
+                );
+            }
+        }
+    }
+    let route = rows(
+        conn,
+        "routes",
+        "SELECT address,USER_NAME(principal_id) AS owner,CONVERT(bit,CASE WHEN \
+         remote_service_name IS NULL AND broker_instance IS NULL AND lifetime IS NULL \
+         AND mirror_address IS NULL THEN 1 ELSE 0 END) AS fixed_destination FROM sys.routes \
+         WHERE name=N'AutoCreatedLocal';",
+    )
+    .await?;
+    if route.len() != 1 {
+        result.unrestorable("missing ROUTE AutoCreatedLocal".into(), 45);
+    } else {
+        let row = &route[0];
+        let owner = text(row, "owner")?;
+        if row.try_get::<bool>("fixed_destination")? != Some(true) {
+            // ALTER ROUTE cannot remove a service, broker, lifetime or mirror
+            // clause to recover the fixed NULL definition. Never recreate it.
+            result.unrestorable(
+                format!("ROUTE AutoCreatedLocal definition owner {owner}"),
+                45,
+            );
+        } else {
+            if text(row, "address")? != "LOCAL" {
+                result.add(
+                    "ROUTE AutoCreatedLocal address".into(),
+                    Some("ALTER ROUTE AutoCreatedLocal WITH ADDRESS=N'LOCAL';".into()),
+                    45,
+                    None,
+                );
+            }
+            if owner != "dbo" {
+                result.add(
+                    format!("ROUTE AutoCreatedLocal owner {owner}"),
+                    Some("ALTER AUTHORIZATION ON ROUTE::AutoCreatedLocal TO dbo;".into()),
+                    45,
+                    None,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 // A reference can hold a low-rank parent until after a high-rank child.
@@ -1195,13 +1444,9 @@ async fn permissions(
         );
     }
     for missing in expected.difference(&database) {
-        let fields: Vec<_> = missing.split('|').collect();
-        result.add(
-            format!("missing permission {missing}"),
-            Some(format!("GRANT {} TO {};", fields[2], ident(fields[0]))),
-            5,
-            None,
-        );
+        // A revoked fixed grant is missing built-in state, not a changed
+        // column of a present built-in. Never recreate it (DEC-2263.1).
+        result.unrestorable(format!("missing permission {missing}"), 5);
     }
     Ok(())
 }

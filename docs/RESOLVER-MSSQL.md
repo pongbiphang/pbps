@@ -388,6 +388,25 @@ for a moment keeps that type.
 
 ## 7. An empty scratch database
 
+The empty check covers two closed sets ([DEC-2263.1](decisions/resolver.md#dec-2263-1)):
+
+1. **What rehearsal observes:** every user-created securable and non-securable
+   in the catalog sweep; name resolution (schemas, principals, default schemas,
+   synonyms); ownership and permission chains (owners, grants, memberships,
+   signatures); and compilation options (the whole `sys.databases` comparison
+   in §6 and database-scoped configurations).
+2. **What separation relies on:** the sandbox's token and grants, signatures
+   and `EXECUTE AS` paths, and objects that could carry it outside scratch
+   if rehearsal sends on them, including broker routes and remote bindings.
+
+State outside both sets is an accepted residual by rule, listed below; it adds
+no read, permission or build-keyed baseline. Inside them, a built-in excluded
+by name or ID must exist. Its alterable rehearsal-relevant columns must match
+a fixed definition shared by every build. Cleanup restores only a fixed,
+known definition; otherwise it refuses by name and never recreates a missing
+built-in. This supersedes the matching empty-check and residual rules in
+DEC-2236.1.
+
 A database born from an unmodified `model` on the pinned build holds the
 fresh-install inventory
 [`a_database_born_from_model_holds_only_the_fresh_install_inventory`]:
@@ -403,9 +422,22 @@ fresh-install inventory
   or database DDL trigger, and no database-scoped configuration away from its
   default.
 
-The empty check has no build-keyed snapshot baseline. Outside the accepted
-residuals below, it requires no user-created catalog row and requires the
-fixed schema, principal, membership and database-grant lists above.
+The check requires the fixed schema, principal, membership and database-grant
+lists above, the system broker message types, contracts, services and queues,
+the `sys` XML schema collection and system assembly, `R` and `Python`, the
+primary filegroup and files, and `AutoCreatedLocal`.
+That route's address is `LOCAL`, its owner is `dbo`, and its service, broker,
+lifetime and mirror fields are NULL. Cleanup resets its address and owner;
+other changed destination fields refuse. `guest`'s default schema is `guest`
+and `ALLOW_ENCRYPTED_VALUE_MODIFICATIONS` is OFF. `public` and every fixed role
+are owned by `dbo`; changed owners are restored before dropping user principals.
+The system assembly and languages are owned by `sys`. An altered owner names
+the object and owner and refuses with "this database cannot be restored to a
+fresh state; supply a new scratch database": assigning ownership back to `sys`
+fails even as the loginless `db_owner` (15151). Cleanup issues no ALTER or DROP
+for them. A missing fixed grant also refuses: re-granting would recreate missing
+built-in state rather than reset a present object's column.
+
 SELECT on an ms-shipped catalog view is the
 measured exception: a fresh database's 232 system-object grants are all
 such SELECTs, including hidden views `sys.all_objects` does not list.
@@ -468,6 +500,13 @@ live only in their own catalog [`a_database_holds_securables_no_object_catalog_l
   There is no engine-provided enumeration of non-securable kinds. The
   explicit list remains necessary even though every securable class is
   checked against the engine's list.
+- **Accepted residual: physical allocation.** Primary data/log file growth,
+  size and maximum size, and `PRIMARY`'s `AUTOGROW_ALL_FILES`, can change as
+  the loginless `db_owner`. They govern allocation, not name resolution,
+  ownership, compilation or separation. File growth/size defaults vary by
+  version and provisioning. Their changes pass without a read or baseline
+  for those columns; the primary files/filegroup must still exist and remain
+  usable. User-added files and filegroups remain inventoried.
 - **Accepted residual: database encryption key with encryption OFF.** The
   whole `sys.databases` row is unchanged; reading the key needs server-level
   `VIEW SERVER SECURITY STATE` (15562 as the loginless `db_owner`). No object
@@ -481,7 +520,7 @@ live only in their own catalog [`a_database_holds_securables_no_object_catalog_l
   `is_default`, so a baseline would be build-keyed. They govern plan
   collection, never object creation, binding or compilation. Hints, forced
   plans and per-query tuning that affect execution remain inventoried and
-  cleaned. Neither residual adds a read, permission or baseline.
+  cleaned. These are instances of the two-set rule, not per-build exceptions.
 
 #723's check compares the newborn database with this inventory, read so,
 before sandbox setup or plan DDL. The live marker necessarily precedes it.
