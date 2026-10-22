@@ -199,7 +199,7 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                         else { crate::engine::planning_dialect(&mut conn).await? };
                     let (cs, ids) = scheduled(placeholder, true, pg.as_ref());
                     for part in &cs.changes {
-                        for sql in pg.emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
+                        for sql in pg.legacy_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
                     }
                     let rows = conn.query("SELECT g FROM app.a").await?;
                     assert_eq!(rows[0].try_get::<i32>("g")?, Some(6), "installation before attachment leaves standing values alone");
@@ -223,7 +223,7 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                         for (part, risks) in saved.changes.changes.iter_mut().zip(risks) { part.risks = risks; }
                         crate::validate_saved_plan(&saved, pg.as_ref())?;
                         for part in &saved.changes.changes {
-                            for sql in pg.emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
+                            for sql in pg.legacy_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
                         }
                         let rows = conn.query("SELECT g FROM app.a").await?;
                         assert_eq!(rows[0].try_get::<i32>("g")?, Some(10), "SET EXPRESSION recomputes attached standing rows");

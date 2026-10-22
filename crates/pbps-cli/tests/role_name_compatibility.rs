@@ -90,111 +90,117 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
 
 #[test]
 fn role_artifacts_keep_master_bytes_checksums_sql_and_declarations() {
-    for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
-        &pbps_mssql::Mssql,
-    ] {
-        let (schema, mut plan, mut state) = artifacts(NAME, dialect);
-        let current_checksum = plan.checksum();
-        let sql = plan
-            .changes
-            .changes
-            .iter()
-            .flat_map(|p| dialect.emit(&p.change, Default::default()).unwrap())
-            .map(|s| s.sql)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let pending = [Intent::RenameRole {
-            from: format!("{NAME}before").into(),
-            to: NAME.into(),
-        }];
-        let yaml = schema
-            .roles
-            .iter()
-            .map(|(name, role)| pbps_load::fmt::render_role(name, role, &pending))
-            .collect::<Vec<_>>()
-            .join("\n---\n");
-        // Historical fixture paths use `/` on every host.
-        let files = schema
-            .roles
-            .keys()
-            .map(|name| {
-                declaration_file::role_path(std::path::Path::new("schema"), name)
-                    .unwrap()
-                    .strip_prefix("schema")
-                    .unwrap()
-                    .components()
-                    .map(|part| part.as_os_str().to_str().unwrap())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let dir =
-            std::env::temp_dir().join(format!("pbps-role-compatibility-{}", rand::random::<u64>()));
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
-        let explain = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
-            .current_dir(&dir)
-            .args(["explain", "--plan", "plan.json", "--format", "json"])
-            .output()
-            .unwrap();
-        let text = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
-            .current_dir(&dir)
-            .args(["explain", "--plan", "plan.json", "--format", "text"])
-            .output()
-            .unwrap();
-        assert!(text.status.success(), "{text:?}");
-        let text = String::from_utf8(text.stdout).unwrap();
-        assert!(text.contains(&format!("role {SHOWN}")), "{text:?}");
-        assert!(!text.contains(NAME), "{text:?}");
-        assert!(
-            !text.contains(&pbps_model::escape::Escaped(SHOWN).to_string()),
-            "{text:?}"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-        assert!(explain.status.success(), "{explain:?}");
-        // Compare archived envelopes after explain has exercised the current
-        // applicable version, with the checksum that version produces.
-        plan.version = 44;
-        state.version = 27;
-        state.plan_checksum = Some(plan.checksum());
-        let outputs = [
-            ("schema.json", serde_json::to_string(&schema).unwrap()),
-            ("ids.json", serde_json::to_string(&state.ids).unwrap()),
-            ("plan.json", serde_json::to_string(&plan).unwrap()),
-            ("state.json", serde_json::to_string(&state).unwrap()),
-            ("plan.sha256", plan.checksum()),
-            ("state.sha256", state_checksum(&schema, &state.ids)),
-            ("statements.sql", sql),
-            ("declarations.yml", yaml),
-            ("filenames.txt", files),
-            ("explain.json", String::from_utf8(explain.stdout).unwrap()),
-        ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/name-compatibility/roles")
-            .join(dialect.name());
-        for (name, actual) in outputs {
-            let expected = std::fs::read_to_string(root.join(name)).unwrap();
-            let expected = if name == "explain.json" {
-                expected.replace(&plan.checksum(), &current_checksum)
-            } else {
-                expected
-            };
-            assert_eq!(actual, expected, "{name}");
-        }
-        assert_eq!(
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
-            plan
-        );
-        assert_eq!(
-            StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
-            state
-        );
-        let (_, mut other, _) = artifacts(SHOWN, dialect);
-        other.version = plan.version;
-        assert_ne!(plan.checksum(), other.checksum());
+    check_role_artifacts(&pbps_pg::Postgres::new());
+    check_role_artifacts(&pbps_mssql::Mssql);
+}
+
+fn check_role_artifacts<D>(dialect: &D)
+where
+    D: pbps_dialect::PlanDialect<Plan = dyn pbps_diff::order::PlanView<D>> + 'static,
+{
+    let (schema, mut plan, mut state) = artifacts(NAME, dialect);
+    let current_checksum = plan.checksum();
+    let sql = plan
+        .changes
+        .changes
+        .iter()
+        .flat_map(|p| {
+            let ordered = pbps_diff::order::singleton(p.clone(), PlanMode::Transactional, dialect);
+            dialect.emit(&ordered, 0).unwrap()
+        })
+        .map(|s| s.sql)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pending = [Intent::RenameRole {
+        from: format!("{NAME}before").into(),
+        to: NAME.into(),
+    }];
+    let yaml = schema
+        .roles
+        .iter()
+        .map(|(name, role)| pbps_load::fmt::render_role(name, role, &pending))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    // Historical fixture paths use `/` on every host.
+    let files = schema
+        .roles
+        .keys()
+        .map(|name| {
+            declaration_file::role_path(std::path::Path::new("schema"), name)
+                .unwrap()
+                .strip_prefix("schema")
+                .unwrap()
+                .components()
+                .map(|part| part.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir =
+        std::env::temp_dir().join(format!("pbps-role-compatibility-{}", rand::random::<u64>()));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
+    let explain = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&dir)
+        .args(["explain", "--plan", "plan.json", "--format", "json"])
+        .output()
+        .unwrap();
+    let text = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&dir)
+        .args(["explain", "--plan", "plan.json", "--format", "text"])
+        .output()
+        .unwrap();
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(&format!("role {SHOWN}")), "{text:?}");
+    assert!(!text.contains(NAME), "{text:?}");
+    assert!(
+        !text.contains(&pbps_model::escape::Escaped(SHOWN).to_string()),
+        "{text:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(explain.status.success(), "{explain:?}");
+    // Compare archived envelopes after explain has exercised the current
+    // applicable version, with the checksum that version produces.
+    plan.version = 44;
+    state.version = 27;
+    state.plan_checksum = Some(plan.checksum());
+    let outputs = [
+        ("schema.json", serde_json::to_string(&schema).unwrap()),
+        ("ids.json", serde_json::to_string(&state.ids).unwrap()),
+        ("plan.json", serde_json::to_string(&plan).unwrap()),
+        ("state.json", serde_json::to_string(&state).unwrap()),
+        ("plan.sha256", plan.checksum()),
+        ("state.sha256", state_checksum(&schema, &state.ids)),
+        ("statements.sql", sql),
+        ("declarations.yml", yaml),
+        ("filenames.txt", files),
+        ("explain.json", String::from_utf8(explain.stdout).unwrap()),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/name-compatibility/roles")
+        .join(dialect.name());
+    for (name, actual) in outputs {
+        let expected = std::fs::read_to_string(root.join(name)).unwrap();
+        let expected = if name == "explain.json" {
+            expected.replace(&plan.checksum(), &current_checksum)
+        } else {
+            expected
+        };
+        assert_eq!(actual, expected, "{name}");
     }
+    assert_eq!(
+        serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
+        plan
+    );
+    assert_eq!(
+        StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
+        state
+    );
+    let (_, mut other, _) = artifacts(SHOWN, dialect);
+    other.version = plan.version;
+    assert_ne!(plan.checksum(), other.checksum());
 }
 
 #[test]

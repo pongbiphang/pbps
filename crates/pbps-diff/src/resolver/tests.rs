@@ -4366,12 +4366,12 @@ impl pbps_dialect::Dialect for Candidates {
     fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
         pbps_dialect::MinimalDialect.quote_ident(ident)
     }
-    fn emit(
+    fn legacy_emit(
         &self,
         change: &Change,
         strategy: pbps_model::Strategy,
     ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-        pbps_dialect::MinimalDialect.emit(change, strategy)
+        pbps_dialect::MinimalDialect.legacy_emit(change, strategy)
     }
     fn normalize_type(
         &self,

@@ -16,7 +16,9 @@ pbps-diff      model <-> ids comparison -> immutable PlanningPlan. Produces no S
 pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
                probes, shared operational row-work answers. Connection-bound
                work is free async fns in the dialect
-               crate, not trait methods; pbps-cli::engine routes to them
+               crate, not trait methods; pbps-cli::engine routes to them.
+               Lowering takes the engine's associated input and returns immutable
+               operation groups branded by that emitter (DEC-1959.5)
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
                the ledger/lock statements, rename impact. Depends on pbps-diff
@@ -141,6 +143,14 @@ as model evidence or acquisition/compatibility proof (DECISIONS 494).
 resolver SQL runs through, implemented by the ordinary connection only. Only
 the private driver modules interpret connection options or name driver types.
 It contains no SQL or provisioning (DECISIONS 495).
+
+Scratch reconstruction consumes immutable logical planning input. Its engine
+owns an opaque SQL-free blueprint; order applies the existing function/phase
+and generated settlements separately. Only the completed engine-branded
+scratch input reaches its private lowering adapter. Private probes preserve
+lexical metadata and refusal timing without retaining SQL before settlement.
+The compiler prevents a fake engine or emitter from supplying the real
+engine's scratch/lowered collection (DEC-1959.5).
 
 The resolver's run lives in `pbps-cli::resolver::server::scratch`: it reaches
 a supplied scratch server through its connection string, or starts and

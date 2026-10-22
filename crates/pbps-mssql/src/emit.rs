@@ -290,7 +290,7 @@ pub fn takes_online(change: &Change) -> bool {
     }
 }
 
-pub fn emit(change: &Change, strategy: Strategy) -> Sql {
+pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
@@ -2308,6 +2308,15 @@ fn preserve_default_during_retype(
 
 #[cfg(test)]
 mod tests {
+    fn emit(change: &Change, strategy: Strategy) -> Sql {
+        crate::certified_emission_tests::compare_fixture(
+            &crate::Mssql,
+            change,
+            strategy,
+            super::emit(change, strategy),
+        )
+    }
+
     use super::*;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid};
 

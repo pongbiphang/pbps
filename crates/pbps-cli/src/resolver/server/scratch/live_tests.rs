@@ -5827,7 +5827,7 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                 guard.before_statements(&mut conn).await?;
                 let pg = pbps_pg::Postgres::new();
                 for p in &saved.changes.changes {
-                    for statement in pg.emit(&p.change, p.strategy)? {
+                    for statement in pg.legacy_emit(&p.change, p.strategy)? {
                         conn.execute(&statement.sql).await?;
                     }
                 }

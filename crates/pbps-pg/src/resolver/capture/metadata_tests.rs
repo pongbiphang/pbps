@@ -1,7 +1,6 @@
 //! Declaration-only metadata must not turn intact engine bindings into DDL.
 use super::*;
 use pbps_db::{Conn, Driver};
-use pbps_dialect::Dialect;
 use pbps_model::resolver::{Binding, BoundSurface, Surface, SurfaceResolution};
 use pbps_model::{Change, Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 
@@ -190,7 +189,7 @@ async fn exercise(connection: String) {
         for planned in &ordered.changes.changes {
             assert!(
                 dialect
-                    .emit(&planned.change, planned.strategy)
+                    .legacy_emit(&planned.change, planned.strategy)
                     .unwrap()
                     .is_empty()
             );

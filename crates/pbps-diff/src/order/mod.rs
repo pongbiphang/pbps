@@ -58,6 +58,7 @@ pub(crate) mod roles;
 pub mod row_security;
 mod saved;
 pub mod schedule;
+pub mod scratch;
 pub mod shadow;
 pub mod slots;
 pub mod verify;
@@ -78,6 +79,8 @@ pub use verify::{Violation, verify};
 mod benchmark;
 #[cfg(test)]
 mod expand_tests;
+#[cfg(test)]
+mod payload_tests;
 #[cfg(test)]
 mod saved_tests;
 #[cfg(test)]

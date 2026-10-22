@@ -37,7 +37,11 @@ impl Dialect for Slotted {
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
         MinimalDialect.quote_ident(ident)
     }
-    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
+    fn legacy_emit(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
         if let Change::RenameTable { from, to, .. } = change
             && from.schema != to.schema
         {
@@ -49,7 +53,7 @@ impl Dialect for Slotted {
                     .renaming(stop, to.clone()),
             ]);
         }
-        MinimalDialect.emit(change, strategy)
+        MinimalDialect.legacy_emit(change, strategy)
     }
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         MinimalDialect.normalize_type(ty)

@@ -933,6 +933,18 @@ impl Operations {
         }
     }
 
+    /// Refresh an observation's payload at the same positions, retaining its
+    /// immutable identities. This grants no execution authority; only order
+    /// can attach the collection to a completed plan (DEC-1959.5).
+    pub fn with_steps(&self, steps: &[PlannedChange]) -> Self {
+        assert_eq!(self.operations.len(), steps.len());
+        Self::from_operations(self.operations.iter().zip(steps).map(|(old, step)| {
+            let mut operation = old.clone();
+            operation.step = step.clone();
+            operation
+        }))
+    }
+
     /// The same operations, keeping their ids, in the order `sequence` gives.
     /// Retained only as the model's frozen unit-test oracle.
     ///

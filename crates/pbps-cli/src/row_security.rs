@@ -677,15 +677,14 @@ mod tests {
 
     #[test]
     fn standing_policy_delivery_refuses_while_created_policy_sql_is_unchanged() {
-        use pbps_dialect::Dialect as _;
+        use pbps_dialect::PlanDialect as _;
+        use pbps_diff::order::singleton;
+        use pbps_model::PlanMode;
         let pg = pbps_pg::Postgres::new();
         let (created, _) = fixture();
         for step in &created.changes[1..] {
-            assert!(
-                !pg.emit(&step.change, Default::default())
-                    .unwrap()
-                    .is_empty()
-            );
+            let created_plan = singleton(step.clone(), PlanMode::Transactional, &pg);
+            assert!(!pg.emit(&created_plan, 0).unwrap().is_empty());
             let mut standing = step.change.clone();
             let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
                 &mut standing
@@ -693,15 +692,25 @@ mod tests {
                 unreachable!("fixture contains only policy and flag steps");
             };
             *origin = RowSecurityOrigin::Standing;
+            let pg_standing = singleton(
+                PlannedChange::new(standing.clone()),
+                PlanMode::Transactional,
+                &pg,
+            );
+            let mssql_standing = singleton(
+                PlannedChange::new(standing),
+                PlanMode::Transactional,
+                &pbps_mssql::Mssql,
+            );
             assert!(
-                pg.emit(&standing, Default::default())
+                pg.emit(&pg_standing, 0)
                     .unwrap_err()
                     .to_string()
                     .contains("arrives with later PRs of #1173")
             );
             assert!(
                 pbps_mssql::Mssql
-                    .emit(&standing, Default::default())
+                    .emit(&mssql_standing, 0)
                     .unwrap_err()
                     .to_string()
                     .contains("PostgreSQL row-security")
@@ -712,13 +721,23 @@ mod tests {
             name: "p".into(),
             policy: RowPolicy::default(),
         };
+        let pg_drop = singleton(
+            PlannedChange::new(drop.clone()),
+            PlanMode::Transactional,
+            &pg,
+        );
+        let mssql_drop = singleton(
+            PlannedChange::new(drop),
+            PlanMode::Transactional,
+            &pbps_mssql::Mssql,
+        );
         assert!(
-            pg.emit(&drop, Default::default())
+            pg.emit(&pg_drop, 0)
                 .unwrap_err()
                 .to_string()
                 .contains("arrives with later PRs of #1173")
         );
-        assert!(pbps_mssql::Mssql.emit(&drop, Default::default()).is_err());
+        assert!(pbps_mssql::Mssql.emit(&mssql_drop, 0).is_err());
     }
 }
 

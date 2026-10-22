@@ -11,7 +11,7 @@ use pbps_model::{Change, ChangeSet, ModuleId, PlannedChange};
 mod plan;
 
 async fn execute(conn: &mut Conn, change: &Change) {
-    for statement in Mssql.emit(change, Default::default()).unwrap() {
+    for statement in Mssql.legacy_emit(change, Default::default()).unwrap() {
         conn.execute(&statement.sql).await.unwrap();
     }
 }
@@ -38,7 +38,7 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
         .unwrap();
     let z = ModuleId::Named(TableName::new("app", "z"));
     let sql = Mssql
-        .emit(
+        .legacy_emit(
             &Change::AlterModule {
                 id: z.clone(),
                 module: Box::new(after.modules[&z].clone()),

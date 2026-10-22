@@ -62,7 +62,10 @@ async fn self_reference_case(tag: &str, key: &str) {
         changes: vec![PlannedChange::new(change.clone())],
     };
     let probe = Mssql.fixture_preflight(&cs).probes.remove(0);
-    let stmt = Mssql.emit(&change, Default::default()).unwrap().remove(0);
+    let stmt = Mssql
+        .legacy_emit(&change, Default::default())
+        .unwrap()
+        .remove(0);
     let direct = attempt(
         &mut db.conn,
         "DELETE FROM dbo.node WHERE [co'de]]x]=N'lo''op'",

@@ -63,6 +63,15 @@ impl<D: ?Sized> std::ops::Deref for AdmittedPlan<D> {
     }
 }
 impl<D: ?Sized> PlanPayload for AdmittedPlan<D> {
+    fn operations(&self) -> pbps_model::operation::Operations {
+        // Saved bytes omit planning origins (DEC-1958.3). Each reviewed wire
+        // step is its own logical input here; never guess a lost source from
+        // the optional, unsealed in-memory provenance (DEC-1959.5).
+        pbps_model::operation::Operations::of_plan(
+            &self.wire.changes.changes,
+            pbps_model::operation::ModuleEdits::InPlace,
+        )
+    }
     fn changes(&self) -> &ChangeSet {
         &self.wire.changes
     }
@@ -155,6 +164,9 @@ impl<D: ?Sized> std::ops::Deref for SealedPlan<D> {
     }
 }
 impl<D: ?Sized> PlanPayload for SealedPlan<D> {
+    fn operations(&self) -> pbps_model::operation::Operations {
+        self.ordered.operations()
+    }
     fn changes(&self) -> &ChangeSet {
         self.ordered.changes()
     }

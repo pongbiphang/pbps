@@ -7907,7 +7907,7 @@ mapping and proof must stay together. No mutable accessor, public downgrade,
 raw conversion, deserialization or unchecked fixture factory grants authority.
 Fixtures use a test-only singleton or complete production entry points.
 The singleton certificate factory exists only under `cfg(test)` or the non-default
-`test-fixtures` feature enabled by engine dev-dependencies, never in ordinary
+`test-fixtures` feature enabled by engine and CLI dev-dependencies, never in ordinary
 CLI or release builds.
 
 Read-only access and a private certificate constructor are insufficient on
@@ -7941,6 +7941,13 @@ and read by lowering rather than supplied by its caller.
 OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
 dialect's invariant type brand through PlanView and PlanDialect, so real engines
 cannot lower another engine's certificate and sealing cannot relabel its dialect.
+Lowering an OrderedPlan uses its retained logical origins and operation IDs;
+a newly SealedPlan delegates to that same ordered collection. Admission is the
+saved-artifact exception: DEC-1958.3 omits origins from serialized changes, so
+AdmittedPlan treats each reviewed wire step as a logical input with wire-local
+IDs. It never guesses lost planning provenance from subjects, UIDs or optional
+in-memory annotations. These IDs need not equal the original planning IDs;
+SQL, saved-plan bytes, checksums and versions remain unchanged.
 RLS policy setup and catalog-owner releases use the same immutable planning
 boundary: order owns their final settlement, generated-table and name-slot
 constraints, and creation-risk write-back, while callers supply catalog facts.
@@ -7976,3 +7983,31 @@ transitional raw entries. Only the completed final head establishes compiler
 enforcement. Snapshot adapters in cfg(test) feed the real logical input and
 stage APIs and return only raw observations for byte oracles; they cannot
 construct execution authority. The fixture feature remains off in shipping builds.
+
+
+PR5b gives scratch its own complete canonical route without exposing a generic
+schedule-to-certificate finalizer. The engine supplies an opaque associated
+blueprint input. Order retains original part slots and operation IDs, applies
+function/phase compatibility, then generated constraints, with no union. Its
+ScratchPlan is branded by that engine, is immutable, and does not implement
+the general PlanView. A caller-defined engine therefore cannot use its result
+as PostgreSQL's scratch input or as a general OrderedPlan. PostgreSQL's
+blueprint metadata has no SQL field; the old Step SQL snapshot exists only
+under cfg(test). Engine-generated names and created identities remain live
+metadata observations, without permuting operations or replacing SQL.
+
+Lowering returns an immutable LoweredPlan branded by the actual emitter, not
+only by a shared PlanView input type. Otherwise a caller-defined emitter using
+that same input type could manufacture another engine's executable collection.
+Construction requires a concrete emitter; a trait object cannot erase that
+brand. Runtime engine routing must retain concrete engine variants.
+Operation groups retain source IDs and origins, including zero-statement
+operations. Only the associated input can reach lower/lower_all and script
+rendering. Scratch executes these immutable groups directly. Planning-time
+intermediate-name probes return only metadata at their previous refusal point.
+Raw emit/render entries remain explicitly named legacy compatibility entries
+for PR5c; obsolete raw scratch and raw lowering entries are removed. Frozen
+reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
+all Statement fields, both modes, SQL rendering, deterministic artifact bytes
+and checksums through real singleton routes; the non-default singleton
+fixture feature remains restricted to dev-dependencies.

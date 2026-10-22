@@ -228,7 +228,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             .changes
             .changes
             .iter()
-            .flat_map(|p| dialect.emit(&p.change, Default::default()).unwrap())
+            .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");

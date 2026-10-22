@@ -5,8 +5,7 @@
 
 use pbps_dialect::Dialect;
 use pbps_dialect::Released;
-use pbps_dialect::lower::{Batch, Lowered, Transaction, lower, lower_all};
-use pbps_model::operation::{ModuleEdits, Operations};
+use pbps_dialect::lower::{Batch, Lowered, Transaction, lower};
 use pbps_model::{
     Change, Column, Index, IndexColumn, IndexKey, Module, ModuleId, ModuleKind, PlannedChange,
     Strategy, Table, TableName,
@@ -24,8 +23,12 @@ fn planned(change: Change, strategy: Strategy) -> PlannedChange {
 }
 
 fn one(change: Change, strategy: Strategy) -> Lowered {
-    let ops = Operations::of_plan(&[planned(change, strategy)], ModuleEdits::InPlace);
-    lower(&ops.as_slice()[0], strategy, &Mssql).unwrap()
+    let plan = pbps_diff::order::singleton(
+        planned(change, strategy),
+        pbps_model::PlanMode::Transactional,
+        &Mssql,
+    );
+    lower(&plan as &dyn pbps_diff::order::PlanView<Mssql>, 0, &Mssql).unwrap()
 }
 
 fn rename(from: &str, to: &str) -> Change {
@@ -164,7 +167,7 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
         }),
         clustered: false,
     };
-    let changes = vec![
+    let changes = [
         planned(
             Change::CreateTable {
                 uid: "t_bbbbbb".parse().unwrap(),
@@ -194,24 +197,25 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
     ];
     let emitted: Vec<_> = changes
         .iter()
-        .flat_map(|p| Mssql.emit(&p.change, p.strategy).unwrap())
+        .flat_map(|p| Mssql.legacy_emit(&p.change, p.strategy).unwrap())
         .collect();
-    let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
-    let lowered: Vec<_> = lower_all(&ops, &Mssql)
-        .unwrap()
-        .into_iter()
-        .flat_map(Lowered::into_statements)
+    let lowered: Vec<_> = changes
+        .iter()
+        .flat_map(|p| {
+            let plan =
+                pbps_diff::order::singleton(p.clone(), pbps_model::PlanMode::Transactional, &Mssql);
+            pbps_dialect::lower::lower_all(&plan as &dyn pbps_diff::order::PlanView<Mssql>, &Mssql)
+                .unwrap()
+                .statements()
+                .to_vec()
+        })
         .collect();
     assert_eq!(lowered, emitted);
     // Negative: the comparison sees a strategy. Lowered offline, the online
     // index is another statement.
-    let offline: Vec<_> = ops
+    let offline: Vec<_> = changes
         .iter()
-        .flat_map(|op| {
-            lower(op, Strategy::default(), &Mssql)
-                .unwrap()
-                .into_statements()
-        })
+        .flat_map(|p| one(p.change.clone(), Strategy::default()).into_statements())
         .collect();
     assert_ne!(offline, emitted);
 }

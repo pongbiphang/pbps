@@ -330,7 +330,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
     let sql = |plan: &ChangeSet| {
         plan.changes
             .iter()
-            .flat_map(|p| Mssql.emit(&p.change, p.strategy).unwrap())
+            .flat_map(|p| Mssql.legacy_emit(&p.change, p.strategy).unwrap())
             .collect::<Vec<_>>()
     };
     assert_eq!(sql(&result), sql(&original));

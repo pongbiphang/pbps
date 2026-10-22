@@ -962,7 +962,7 @@ mod tests {
         // overload by its name alone. Identities are pinned on real engines.
         let order = crate::resolver::reconstruct::Reconstruction::new(
             &crate::Postgres::new(),
-            &[],
+            &crate::resolver::reconstruct::fixture_plan(&[]),
             &pbps_model::IdsFile::default(),
         )
         .unwrap();

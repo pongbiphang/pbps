@@ -194,6 +194,9 @@ jobs:
       # Intermediate settlements and external draft copies grant no SQL
       # emission authority (DEC-1959.5).
       - run: cargo test -p pbps-diff --doc
+      # Immutable lowering and SQL Server's private emitter are compiler gates.
+      - run: cargo test -p pbps-dialect --doc
+      - run: cargo test -p pbps-mssql --doc
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of

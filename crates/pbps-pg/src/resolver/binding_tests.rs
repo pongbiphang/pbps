@@ -2850,7 +2850,7 @@ fn build_reconstruction(
 ) -> Result<Reconstruction, crate::resolver::reconstruct::ReconstructError> {
     Reconstruction::new(
         pg,
-        changes,
+        &crate::resolver::reconstruct::fixture_plan(changes),
         &crate::resolver::reconstruct::fixture_ids(changes),
     )
 }

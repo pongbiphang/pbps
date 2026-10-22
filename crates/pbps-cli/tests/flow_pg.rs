@@ -3189,16 +3189,17 @@ fn partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers()
             CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (v);
             CREATE TABLE app.p2a PARTITION OF app.p2 FOR VALUES FROM (10) TO (20)", roles.1[0]));
         let emit = |permissions| {
-            pbps_dialect::Dialect::emit(
-                &pbps_pg::Postgres::new(),
-                &pbps_model::Change::Grant {
+            let pg = pbps_pg::Postgres::new();
+            let ordered = pbps_diff::order::singleton(
+                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
                     role: roles.1[0].clone().into(),
                     target: "app.p2a".parse().unwrap(),
                     permissions,
-                },
-                pbps_model::Strategy::default(),
-            )
-            .unwrap()
+                }),
+                pbps_model::PlanMode::Transactional,
+                &pg,
+            );
+            pbps_dialect::PlanDialect::emit(&pg, &ordered, 0).unwrap()
         };
         for statement in emit([pbps_model::Permission::Insert].into()) {
             on_server(conn, &statement.sql);
@@ -17472,7 +17473,7 @@ fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
     assert_eq!(plan.changes.changes.len(), 1);
     let pg = pbps_pg::Postgres::new();
     let p = &plan.changes.changes[0];
-    let statements = pg.emit(&p.change, p.strategy).unwrap();
+    let statements = pg.legacy_emit(&p.change, p.strategy).unwrap();
     assert_eq!(
         statements.len(),
         1,

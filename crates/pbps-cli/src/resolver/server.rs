@@ -63,7 +63,7 @@ pub struct ScopeRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct BindingRequest<'a> {
     /// The plan from an empty schema to `desired`, as the differ produces it.
-    pub bootstrap: &'a [pbps_model::Change],
+    pub bootstrap: &'a pbps_diff::order::PlanningPlan,
     /// The declarations. Scratch's user schemas hold these and nothing else.
     pub desired: &'a pbps_model::Schema,
     /// The target's managed side, by the names pbps's own model gives it.

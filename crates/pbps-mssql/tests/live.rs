@@ -1120,7 +1120,7 @@ async fn drop_login_when_idle(conn: &mut Conn, login: &str) -> Result<(), pbps_d
 /// Emits and executes every change of a plan, in plan order.
 async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
     for p in &cs.changes {
-        for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
+        for stmt in Mssql.legacy_emit(&p.change, p.strategy).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -1135,7 +1135,7 @@ async fn try_apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) -> Result<(), St
         .await
         .expect("begin");
     for p in &cs.changes {
-        for stmt in Mssql.emit(&p.change, p.strategy).expect("emit") {
+        for stmt in Mssql.legacy_emit(&p.change, p.strategy).expect("emit") {
             if let Err(e) = conn.execute(&stmt.sql).await {
                 conn.rollback(&Mssql.transaction_framing(&pbps_model::SessionZone::utc()))
                     .await
@@ -5536,7 +5536,7 @@ async fn a_cross_schema_rename_stops_where_the_emitter_says_it_does() {
         .expect("create the table");
 
     let statements = Mssql
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::RenameTable {
                 uid: "t_a9k2mq".parse().unwrap(),
                 from: "dbo.customer".parse().unwrap(),
@@ -9395,7 +9395,7 @@ async fn a_declaration_that_removes_rows_is_told_which_policy_catalog_read_its_c
         .remove(0)
         .sql;
     let guard_sql = Mssql
-        .emit(&deletion, Default::default())
+        .legacy_emit(&deletion, Default::default())
         .unwrap()
         .remove(0)
         .sql;
@@ -9829,7 +9829,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
         .unwrap();
     let missing_references = named_gaps(&referenced_permissions(&mut lp, &referenced).await);
     let alt_statement = &Mssql
-        .emit(&changes.changes[1].change, Default::default())
+        .legacy_emit(&changes.changes[1].change, Default::default())
         .unwrap()[0]
         .sql;
     let refused_key = lp.execute(alt_statement).await;
@@ -11734,7 +11734,9 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
     );
 
     // And the delete's own guard agrees, so the statement runs.
-    let stmts = Mssql.emit(&delete, Default::default()).expect("emit");
+    let stmts = Mssql
+        .legacy_emit(&delete, Default::default())
+        .expect("emit");
     db.conn
         .execute(&stmts[0].sql)
         .await
@@ -11798,7 +11800,9 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
         after_types: Default::default(),
         key_type: None,
     };
-    let sql = Mssql.emit(&delete, Default::default()).expect("emit")[0]
+    let sql = Mssql
+        .legacy_emit(&delete, Default::default())
+        .expect("emit")[0]
         .sql
         .clone();
 
@@ -11923,7 +11927,9 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         .await
         .expect("a child arrives after the probe");
 
-    let stmts = Mssql.emit(&delete, Default::default()).expect("emit");
+    let stmts = Mssql
+        .legacy_emit(&delete, Default::default())
+        .expect("emit");
     assert_eq!(stmts.len(), 1);
     let err = db
         .conn
@@ -12158,7 +12164,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         key_type: None,
     };
     let sql_of = |change: &pbps_model::Change| {
-        let stmts = Mssql.emit(change, Default::default()).expect("emit");
+        let stmts = Mssql.legacy_emit(change, Default::default()).expect("emit");
         assert_eq!(stmts.len(), 1, "{stmts:?}");
         stmts[0].sql.clone()
     };
@@ -13520,7 +13526,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     let statements: Vec<String> = cs
         .changes
         .iter()
-        .flat_map(|p| Mssql.emit(&p.change, p.strategy).expect("emit"))
+        .flat_map(|p| Mssql.legacy_emit(&p.change, p.strategy).expect("emit"))
         .map(|s| s.sql)
         .collect();
     assert_eq!(
@@ -15038,7 +15044,7 @@ async fn trailing_default_comments_preserve_insert_guards() {
         defaults: [("n".into(), "1 -- why".into())].into_iter().collect(),
         types: [("n".into(), ty("int"))].into_iter().collect(),
     };
-    let sql = Mssql.emit(&change, Default::default()).unwrap();
+    let sql = Mssql.legacy_emit(&change, Default::default()).unwrap();
     db.conn
         .execute(&sql[0].sql)
         .await

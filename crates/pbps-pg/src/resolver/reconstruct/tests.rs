@@ -1016,7 +1016,7 @@ fn build_reconstruction(
 ) -> Result<Reconstruction, crate::resolver::reconstruct::ReconstructError> {
     Reconstruction::new(
         pg,
-        changes,
+        &crate::resolver::reconstruct::fixture_plan(changes),
         &crate::resolver::reconstruct::fixture_ids(changes),
     )
 }
@@ -1133,7 +1133,13 @@ fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
         };
         let ids = crate::resolver::reconstruct::fixture_ids(&changes);
         let pg = crate::Postgres::new().with_server_version(180_000);
-        let reconstruction = Reconstruction::with_dependencies(&pg, &changes, &ids, &deps).unwrap();
+        let reconstruction = Reconstruction::with_dependencies(
+            &pg,
+            &crate::resolver::reconstruct::fixture_plan(&changes),
+            &ids,
+            &deps,
+        )
+        .unwrap();
         let sql = reconstruction
             .steps
             .iter()
@@ -1144,9 +1150,13 @@ fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
         assert!(sql.contains("SET EXPRESSION"), "{sql}");
         // An unrelated reader does not make the generation's callee a reader.
         if declared {
-            let reconstruction =
-                Reconstruction::with_dependencies(&pg, &changes, &ids, &Default::default())
-                    .unwrap();
+            let reconstruction = Reconstruction::with_dependencies(
+                &pg,
+                &crate::resolver::reconstruct::fixture_plan(&changes),
+                &ids,
+                &Default::default(),
+            )
+            .unwrap();
             assert!(
                 reconstruction
                     .steps
@@ -1215,4 +1225,35 @@ fn row_security_bootstraps_keep_the_namespace_without_claiming_policy_bindings()
         assert_eq!(statements(&recipe), expected);
         assert_eq!(recipe.len(), plain.len());
     }
+}
+
+#[test]
+fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
+    let pg = crate::Postgres::new();
+    let table = TableName::new("app", "bad\0name");
+    let changes = [
+        Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: table.clone(),
+            table: Box::new(Table::default()),
+            beside_default: None,
+            moves_at_most: None,
+        },
+        Change::CreateRole {
+            uid: "r_aaaaaa".parse().unwrap(),
+            name: "later".into(),
+        },
+    ];
+    let reason = crate::emit::emit(&pg, &changes[0], Strategy::default())
+        .unwrap_err()
+        .to_string();
+    let actual =
+        Reconstruction::new(&pg, &super::fixture_plan(&changes), &Default::default()).unwrap_err();
+    assert_eq!(
+        actual,
+        ReconstructError::Emit {
+            declaration: format!("table {}", table.shown()),
+            reason
+        }
+    );
 }

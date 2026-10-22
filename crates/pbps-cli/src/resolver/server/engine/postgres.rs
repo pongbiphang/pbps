@@ -1215,7 +1215,7 @@ pub(super) fn dropped_signatures(
 pub(in crate::resolver::server) fn reconstruction(
     driver: Driver,
     extras: &[String],
-    bootstrap: &[pbps_model::Change],
+    bootstrap: &pbps_diff::order::PlanningPlan,
     ids: &pbps_model::IdsFile,
     dependencies: &pbps_model::ModuleDeps,
     version: i64,

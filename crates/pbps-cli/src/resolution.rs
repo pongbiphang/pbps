@@ -261,7 +261,7 @@ pub async fn resolve(
     }
     let dialect = crate::dialect_for(request.project.config.dialect);
     let empty = pbps_model::Schema::default();
-    let bootstrap: Vec<pbps_model::Change> = pbps_diff::diff(
+    let bootstrap = pbps_diff::diff(
         pbps_diff::Side {
             schema: &empty,
             ids: &pbps_model::IdsFile::default(),
@@ -275,12 +275,7 @@ pub async fn resolve(
             anyhow::Error::new(crate::Unexpressible(errors))
                 .context("the declarations' bootstrap cannot be formed"),
         )
-    })?
-    .changes
-    .clone()
-    .into_iter()
-    .map(|planned| planned.change)
-    .collect();
+    })?;
     producer::produce(request, driver, &bootstrap).await
 }
 
@@ -323,7 +318,7 @@ mod producer {
     pub(super) async fn produce(
         request: &Request<'_>,
         driver: pbps_db::Driver,
-        bootstrap: &[pbps_model::Change],
+        bootstrap: &pbps_diff::order::PlanningPlan,
     ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
             bootstrap,
@@ -811,7 +806,7 @@ mod tests {
         let refusal = |target_identity| match rt.block_on(producer::produce(
             &request(target_identity),
             pbps_db::Driver::Postgres,
-            &[],
+            &pbps_diff::order::propose(pbps_model::ChangeSet::default()),
         )) {
             Err(Refused::Unanswerable(error)) => error.to_string(),
             Err(Refused::Finding(finding)) => panic!("not answered: {}", finding.id),

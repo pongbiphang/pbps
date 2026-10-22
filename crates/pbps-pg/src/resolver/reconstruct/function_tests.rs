@@ -160,7 +160,12 @@ fn multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds() {
                 let pg = version.map_or_else(crate::Postgres::new, |v| {
                     crate::Postgres::new().with_server_version(v)
                 });
-                let reconstruction = Reconstruction::new(&pg, &changes, &ids).unwrap();
+                let reconstruction = Reconstruction::new(
+                    &pg,
+                    &crate::resolver::reconstruct::fixture_plan(&changes),
+                    &ids,
+                )
+                .unwrap();
                 assert!(
                     reconstruction
                         .steps
@@ -173,9 +178,13 @@ fn multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds() {
                 let (cyclic, ids) = bootstrap(&cyclic, seed);
                 // Unknown/old engines keep the named hold and refusal. Modern
                 // placeholder behavior is pinned separately by #1503's tests.
-                let why = Reconstruction::new(&crate::Postgres::new(), &cyclic, &ids)
-                    .unwrap_err()
-                    .to_string();
+                let why = Reconstruction::new(
+                    &crate::Postgres::new(),
+                    &crate::resolver::reconstruct::fixture_plan(&cyclic),
+                    &ids,
+                )
+                .unwrap_err()
+                .to_string();
                 assert!(
                     why.contains("app.a") && why.contains("app.f(integer)"),
                     "{why}"
@@ -234,8 +243,12 @@ async fn held_tables_and_readers_compile_with_their_keys_on_both_servers() {
                 conn.execute("CREATE SCHEMA app")
                     .await
                     .map_err(|e| e.to_string())?;
-                let mut reconstruction =
-                    Reconstruction::new(&pg, &changes, &ids).map_err(|e| e.to_string())?;
+                let mut reconstruction = Reconstruction::new(
+                    &pg,
+                    &crate::resolver::reconstruct::fixture_plan(&changes),
+                    &ids,
+                )
+                .map_err(|e| e.to_string())?;
                 reconstruction
                     .compile(&pg, &pbps_model::SessionZone::utc(), &mut conn)
                     .await

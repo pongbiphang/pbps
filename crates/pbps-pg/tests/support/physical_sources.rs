@@ -166,7 +166,7 @@ async fn a_detached_column_removes_its_existing_foreign_key_before_the_reference
         "{reports:?}"
     );
     for p in &changes.changes {
-        for statement in pg.emit(&p.change, p.strategy).unwrap() {
+        for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }

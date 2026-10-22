@@ -48,7 +48,7 @@ async fn tightening_reads_prior_writes_and_never_future_writes() {
         db.conn.begin(&frame).await.unwrap();
         let mut accepted = true;
         'apply: for p in &plan.changes {
-            for statement in dialect.emit(&p.change, p.strategy).unwrap() {
+            for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
                 if db.conn.execute(&statement.sql).await.is_err() {
                     accepted = false;
                     break 'apply;
@@ -193,7 +193,7 @@ async fn check_deleted_self_reference(catalog_key: bool) {
             db.conn.begin(&frame).await.unwrap();
             let mut accepted = true;
             'apply: for p in &plan.changes {
-                for statement in dialect.emit(&p.change, p.strategy).unwrap() {
+                for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
                     if db.conn.execute(&statement.sql).await.is_err() {
                         accepted = false;
                         break 'apply;

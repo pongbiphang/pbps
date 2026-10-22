@@ -5,8 +5,7 @@
 
 use pbps_dialect::Dialect;
 use pbps_dialect::Released;
-use pbps_dialect::lower::{Batch, Execution, Lowered, Transaction, lower, lower_all};
-use pbps_model::operation::{ModuleEdits, Operations};
+use pbps_dialect::lower::{Batch, Execution, Lowered, Transaction, lower};
 use pbps_model::{
     Change, Column, Index, IndexColumn, IndexKey, Module, ModuleId, ModuleKind, PlannedChange,
     Strategy, Table, TableName,
@@ -18,8 +17,17 @@ fn t(s: &str) -> TableName {
 }
 
 fn one(change: Change, strategy: Strategy) -> Lowered {
-    let ops = Operations::of_plan(&[planned(change, strategy)], ModuleEdits::Rebuilt);
-    lower(&ops.as_slice()[0], strategy, &Postgres::new()).unwrap()
+    let plan = pbps_diff::order::singleton(
+        planned(change, strategy),
+        pbps_model::PlanMode::Transactional,
+        &Postgres::new(),
+    );
+    lower(
+        &plan as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
+        0,
+        &Postgres::new(),
+    )
+    .unwrap()
 }
 
 fn planned(change: Change, strategy: Strategy) -> PlannedChange {
@@ -232,23 +240,31 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
     let changes = corpus();
     let emitted: Vec<_> = changes
         .iter()
-        .flat_map(|p| pg.emit(&p.change, p.strategy).unwrap())
+        .flat_map(|p| pg.legacy_emit(&p.change, p.strategy).unwrap())
         .collect();
-    let lowered: Vec<_> = lower_all(&Operations::of_plan(&changes, ModuleEdits::Rebuilt), &pg)
-        .unwrap()
-        .into_iter()
-        .flat_map(Lowered::into_statements)
+    let lowered: Vec<_> = changes
+        .iter()
+        .flat_map(|p| {
+            let plan = pbps_diff::order::singleton(
+                p.clone(),
+                pbps_model::PlanMode::Transactional,
+                &Postgres::new(),
+            );
+            pbps_dialect::lower::lower_all(
+                &plan as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
+                &pg,
+            )
+            .unwrap()
+            .statements()
+            .to_vec()
+        })
         .collect();
     assert_eq!(lowered, emitted);
     // Negative: the comparison sees a strategy. Lowered offline, the online
     // index is another statement.
-    let offline: Vec<_> = Operations::of_plan(&changes, ModuleEdits::Rebuilt)
+    let offline: Vec<_> = changes
         .iter()
-        .flat_map(|op| {
-            lower(op, Strategy::default(), &pg)
-                .unwrap()
-                .into_statements()
-        })
+        .flat_map(|p| one(p.change.clone(), Strategy::default()).into_statements())
         .collect();
     assert_ne!(offline, emitted);
 }

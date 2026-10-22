@@ -13,7 +13,7 @@
 //! - [`types`] — what a type *is* ([`Dialect::normalize_type`]) and what changing
 //!   one *costs* ([`Dialect::type_change_risk`]).
 //! - [`validate`] — what the engine will refuse ([`Dialect::validate_table`]).
-//! - [`emit`] — the SQL ([`Dialect::emit`]). The only place in the codebase that
+//! - [`emit`] — the SQL ([`Dialect::legacy_emit`]). The only place in the codebase that
 //!   writes the SQL of a *change*.
 //! - [`preflight`] — the questions a change implies about the data
 //!   ([`Dialect::preflight`]), asked before the first statement runs.
@@ -24,6 +24,8 @@
 //! async functions taking a `pbps_db::Conn`, so the trait stays synchronous and
 //! nothing that only compares schemas has to drag a runtime along.
 
+#[cfg(test)]
+use pbps_dialect::PlanDialect;
 use std::borrow::Cow;
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
@@ -48,6 +50,29 @@ pub mod types;
 pub mod validate;
 
 /// The SQL Server dialect. Stateless: it holds knowledge, not a connection.
+/// A raw change and the implementation emitter cannot bypass the real
+/// SQL Server associated-input boundary.
+///
+/// ```compile_fail
+/// fn raw_lower(op: &pbps_model::operation::Operation) {
+///     pbps_dialect::lower::lower(op, 0, &pbps_mssql::Mssql);
+/// }
+/// ```
+/// ```compile_fail
+/// fn raw_render(sql: &[pbps_dialect::Statement]) {
+///     pbps_dialect::render_script(sql, &pbps_mssql::Mssql, &pbps_model::SessionZone::utc());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_dialect::PlanDialect;
+/// fn raw(changes: &pbps_model::ChangeSet) { pbps_mssql::Mssql.emit(changes, 0).unwrap(); }
+/// ```
+/// ```compile_fail
+/// fn private(change: &pbps_model::Change) {
+///     pbps_mssql::emit::emit(change, pbps_model::Strategy::default()).unwrap();
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mssql;
 
@@ -98,22 +123,18 @@ fn schema_bound_callees(
 impl pbps_dialect::PlanDialect for Mssql {
     type Plan = dyn pbps_diff::order::PlanView<Self>;
 
-    fn emit_ordered(
-        &self,
-        plan: &Self::Plan,
-        position: usize,
-    ) -> Result<Vec<Statement>, DialectError> {
+    fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        self.emit(&planned.change, planned.strategy)
+        emit::emit(&planned.change, planned.strategy)
     }
 
-    fn emit_staged_ordered(
+    fn emit_staged(
         &self,
         plan: &Self::Plan,
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        self.emit_staged(&planned.change, planned.strategy)
+        emit::emit(&planned.change, planned.strategy)
     }
 }
 
@@ -538,7 +559,21 @@ impl Dialect for Mssql {
         true
     }
 
-    fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError> {
+    fn intermediate_tables(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<TableName>, DialectError> {
+        Ok(pbps_dialect::lower::intermediate_tables(&emit::emit(
+            change, strategy,
+        )?))
+    }
+
+    fn legacy_emit(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
         emit::emit(change, strategy)
     }
 
@@ -921,6 +956,117 @@ mod tests {
 
 #[cfg(test)]
 mod certified_emission_tests {
+    // Existing emitter fixtures compare their frozen raw result with the real
+    // singleton route, including complete Statement metadata and wire bytes.
+    pub(crate) fn compare_fixture(
+        dialect: &Mssql,
+        change: &Change,
+        strategy: Strategy,
+        expected: Result<Vec<Statement>, DialectError>,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let mut planned = pbps_model::PlannedChange::new(change.clone());
+        planned.strategy = strategy;
+        let before = pbps_model::ChangeSet {
+            changes: vec![planned.clone()],
+        };
+        let ordered = pbps_diff::order::singleton(
+            planned.clone(),
+            pbps_model::PlanMode::Transactional,
+            dialect,
+        );
+        let actual = dialect.emit(&ordered, 0);
+        for mode in [
+            pbps_model::PlanMode::Transactional,
+            pbps_model::PlanMode::Staged,
+        ] {
+            let ordered = pbps_diff::order::singleton(planned.clone(), mode, dialect);
+            let lowered = pbps_dialect::lower::lower_all(
+                &ordered as &dyn pbps_diff::order::PlanView<Mssql>,
+                dialect,
+            );
+            let reference = match mode {
+                pbps_model::PlanMode::Transactional => {
+                    expected.as_ref().cloned().map_err(ToString::to_string)
+                }
+                pbps_model::PlanMode::Staged => {
+                    expected.as_ref().cloned().map_err(ToString::to_string)
+                }
+            };
+            assert_eq!(
+                lowered
+                    .as_ref()
+                    .map(|p| p.statements())
+                    .map_err(ToString::to_string),
+                reference
+                    .as_ref()
+                    .map(Vec::as_slice)
+                    .map_err(ToString::to_string)
+            );
+            if let Ok(lowered) = lowered {
+                assert_eq!(lowered.groups().len(), 1);
+                assert_eq!(
+                    (
+                        lowered.groups()[0].operation().source(),
+                        lowered.groups()[0].operation().part()
+                    ),
+                    (0, 0)
+                );
+                assert_eq!(
+                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
+                    pbps_dialect::legacy_render_script(
+                        reference.as_ref().unwrap(),
+                        dialect,
+                        &pbps_model::SessionZone::utc()
+                    )
+                );
+            }
+        }
+        assert_eq!(
+            actual.as_ref().map_err(ToString::to_string),
+            expected.as_ref().map_err(ToString::to_string)
+        );
+        let wire = |changes| {
+            pbps_model::SavedPlan::new(
+                pbps_model::PlanOrigin::Preview,
+                dialect.name(),
+                "2026-10-19T00:00:00Z",
+                pbps_model::PlanBaseline {
+                    description: "ordering byte oracle".into(),
+                    checksum: "baseline".into(),
+                    database_collation: None,
+                    time_zone: None,
+                },
+                changes,
+                pbps_model::IdsFile::default(),
+            )
+        };
+        let before = wire(before);
+        let after =
+            pbps_diff::order::seal(ordered.clone(), wire(ordered.changes().clone())).unwrap();
+        let bytes = |wire: &pbps_model::SavedPlan| {
+            let mut bytes = serde_json::to_vec_pretty(wire).unwrap();
+            bytes.push(b'\n');
+            bytes
+        };
+        assert_eq!(bytes(&before), bytes(after.wire()));
+        assert_eq!(before.checksum(), after.wire().checksum());
+        if let (Ok(actual), Ok(expected)) = (&actual, &expected) {
+            assert_eq!(
+                pbps_dialect::legacy_render_script(
+                    actual,
+                    dialect,
+                    &pbps_model::SessionZone::utc()
+                ),
+                pbps_dialect::legacy_render_script(
+                    expected,
+                    dialect,
+                    &pbps_model::SessionZone::utc()
+                )
+            );
+        }
+        actual
+    }
+
     use super::*;
     use pbps_diff::order::{PlanView, admit, seal, singleton};
     use pbps_model::{
@@ -939,7 +1085,7 @@ mod certified_emission_tests {
             })],
         };
         let expected = dialect
-            .emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .legacy_emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let ordered = singleton(changes.changes[0].clone(), mode, &dialect);
@@ -973,9 +1119,27 @@ mod certified_emission_tests {
             assert_eq!(sealed.checksum(), checksum);
             for input in [&ordered as &dyn PlanView<Mssql>, &sealed, &admitted] {
                 assert_eq!(input.mode(), mode);
-                let emitted = pbps_dialect::lower::lower_plan(input, &dialect).unwrap();
+                let emitted = pbps_dialect::lower::lower_all(input, &dialect).unwrap();
                 assert_eq!(emitted.statements(), expected);
             }
         }
+    }
+}
+
+// Frozen raw observations exist only in fixture builds; real emission uses
+// the private emitter and the engine-associated certified input.
+#[cfg(test)]
+impl Mssql {
+    pub(crate) fn legacy_emit(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
+        certified_emission_tests::compare_fixture(
+            self,
+            change,
+            strategy,
+            emit::emit(change, strategy),
+        )
     }
 }

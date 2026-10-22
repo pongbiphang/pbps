@@ -260,7 +260,7 @@ pub async fn run<E: Engine>(
         let p = &changes.changes[i];
         for stmt in engine
             .dialect()
-            .emit(&p.change, p.strategy)
+            .legacy_emit(&p.change, p.strategy)
             .map_err(|e| e.to_string())?
         {
             engine

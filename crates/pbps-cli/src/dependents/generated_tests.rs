@@ -341,7 +341,7 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
                 let cs = ordinary(&schema, &identities(&schema), dialect.as_ref()).map_err(anyhow::Error::msg)?;
                 conn.execute("BEGIN").await?;
                 for p in &cs.changes {
-                    for statement in dialect.emit(&p.change, p.strategy)? {
+                    for statement in dialect.legacy_emit(&p.change, p.strategy)? {
                         conn.execute(&statement.sql).await?;
                     }
                 }
@@ -430,7 +430,7 @@ async fn called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold(
                 let cs = result.map_err(anyhow::Error::msg)?;
                 assert!(cs.changes.iter().any(|p| matches!(p.change, Change::AlterColumnExpression { .. })));
                 assert!(!cs.changes.iter().any(|p| matches!(p.change, Change::AddColumn { .. })));
-                for p in &cs.changes { for sql in pg.emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; } }
+                for p in &cs.changes { for sql in pg.legacy_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; } }
                 let count = conn.query("SELECT count(*)::int4 AS n FROM information_schema.columns WHERE table_schema='app' AND table_name='v'").await?;
                 assert_eq!(count[0].try_get::<i32>("n")?, Some(3));
                 Ok(())
@@ -551,7 +551,7 @@ async fn transitive_table_readers_apply_placeholders_or_keep_the_named_hold() {
                     case == "chain"
                 );
                 for p in &cs.changes {
-                    for sql in pg.emit(&p.change, p.strategy)? {
+                    for sql in pg.legacy_emit(&p.change, p.strategy)? {
                         conn.execute(&sql.sql).await?;
                     }
                 }
