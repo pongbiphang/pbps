@@ -3817,6 +3817,9 @@ pub struct KeyNameHolder {
     /// A clone's parent trigger, from `tgparentid`. Its drop frees this row
     /// even when the partition is in another schema (DEC-2101.1).
     pub parent_trigger: Option<pbps_model::ModuleId>,
+    /// Whether this constraint trigger is a row trigger on a partitioned
+    /// table, producing companions when partitions arrive (DEC-2101.1).
+    pub clones_to_partitions: bool,
 }
 
 /// The [`KeyNameHolder`]s whose names start with one of `prefixes`, each a
@@ -3824,6 +3827,9 @@ pub struct KeyNameHolder {
 /// every name the engine may try for a key's index starts with
 /// (`implicit_primary_key_fallback`), so the rows are a superset the caller
 /// matches whole names against.
+/// Also includes constraint row triggers on partitioned tables whose current
+/// trigger names start with a wanted prefix, in any schema: a later partition
+/// may be in the key's schema, and a rename leaves the old companion name.
 pub async fn key_name_holders(
     conn: &mut Conn,
     prefixes: &[(String, String)],
@@ -3843,7 +3849,7 @@ pub async fn key_name_holders(
          SELECT n.nspname AS schema_name, c.relname::text AS holder_name,\n       \
                 ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
                 COALESCE(i.indisprimary, false) AS primary_key,\n       \
-                  false AS is_constraint, NULL::text AS trigger_name,\n       \
+                    false AS is_constraint, NULL::text AS trigger_name, false AS clones_to_partitions,\n       \
                   NULL::text AS parent_schema, NULL::text AS parent_table, NULL::text AS parent_trigger\n  \
            FROM pg_catalog.pg_class c\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
@@ -3861,7 +3867,8 @@ pub async fn key_name_holders(
                            AND starts_with(c.relname::text, w.prefix))\n\
          UNION ALL\n\
          SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p', true,\n       \
-                  tg.tgname::text, pn.nspname, pt.relname, ptg.tgname::text\n  \
+                    tg.tgname::text, COALESCE(t.relkind = 'p' AND (tg.tgtype & 1) <> 0, false),\n       \
+                    pn.nspname, pt.relname, ptg.tgname::text\n  \
            FROM pg_catalog.pg_constraint con\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace\n  \
            LEFT JOIN pg_catalog.pg_class t ON t.oid = con.conrelid\n  \
@@ -3872,7 +3879,10 @@ pub async fn key_name_holders(
              LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pt.relnamespace\n \
           WHERE EXISTS (SELECT 1 FROM wanted w\n                  \
                          WHERE w.schema_name = n.nspname\n                    \
-                           AND starts_with(con.conname::text, w.prefix))",
+                             AND starts_with(con.conname::text, w.prefix))\n \
+               OR (t.relkind = 'p' AND (tg.tgtype & 1) <> 0\n \
+                   AND EXISTS (SELECT 1 FROM wanted w\n \
+                                WHERE starts_with(tg.tgname::text, w.prefix)))",
         rows.join(", ")
     );
     let mut out = Vec::new();
@@ -3903,6 +3913,13 @@ pub async fn key_name_holders(
                 DbError::BadRow("the key-name holder query returned a NULL is_constraint".into())
             })?,
             trigger: row.try_get::<&str>("trigger_name")?.map(str::to_owned),
+            clones_to_partitions: row.try_get::<bool>("clones_to_partitions")?.ok_or_else(
+                || {
+                    DbError::BadRow(
+                        "the key-name holder query returned a NULL clones_to_partitions".into(),
+                    )
+                },
+            )?,
             parent_trigger: match row.try_get::<&str>("parent_trigger")? {
                 Some(name) => Some(pbps_model::ModuleId::Trigger {
                     on: TableName::new(text("parent_schema")?, text("parent_table")?),

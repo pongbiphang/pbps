@@ -30935,6 +30935,7 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
     assert_eq!(keyed.len(), 2, "{keyed:?}");
     assert!(keyed.iter().all(|h| h.primary_key), "{keyed:?}");
     assert!(found.iter().all(|h| h.parent_trigger.is_none()));
+    assert!(found.iter().all(|h| !h.clones_to_partitions));
     // The clone's constraint has no conparentid, and may be in another
     // schema. Its parent identity follows tgparentid, even after a trigger
     // rename leaves the companion constraint's name behind.
@@ -30943,7 +30944,9 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
          CREATE TABLE {other}.p1 PARTITION OF {s}.p FOR VALUES FROM (0) TO (10);
          CREATE CONSTRAINT TRIGGER n_pkey9 AFTER INSERT ON {s}.p
              FOR EACH ROW EXECUTE FUNCTION {s}.f();
-         ALTER TRIGGER n_pkey9 ON {s}.p RENAME TO renamed_parent"
+         ALTER TRIGGER n_pkey9 ON {s}.p RENAME TO renamed_parent;
+         CREATE TRIGGER renamed_ordinary AFTER INSERT ON {s}.p
+             FOR EACH ROW EXECUTE FUNCTION {s}.f()"
     ))
     .await
     .unwrap();
@@ -30954,6 +30957,7 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
     assert_eq!(clones[0].name, TableName::new(&other, "n_pkey9"));
     assert_eq!(clones[0].owner, Some(TableName::new(&other, "p1")));
     assert_eq!(clones[0].trigger.as_deref(), Some("renamed_parent"));
+    assert!(!clones[0].clones_to_partitions);
     assert_eq!(
         clones[0].parent_trigger,
         Some(pbps_model::ModuleId::Trigger {
@@ -30961,6 +30965,17 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
             name: "renamed_parent".into(),
         })
     );
+    // A future clone takes the current trigger name in the key's schema,
+    // even when the parent and its old companion name match neither filter.
+    let producers = key_name_holders(&mut conn, &[(other.clone(), "renamed_".into())])
+        .await
+        .unwrap();
+    assert_eq!(producers.len(), 1, "{producers:?}");
+    assert_eq!(producers[0].name, TableName::new(&s, "n_pkey9"));
+    assert_eq!(producers[0].owner, Some(TableName::new(&s, "p")));
+    assert_eq!(producers[0].trigger.as_deref(), Some("renamed_parent"));
+    assert!(producers[0].parent_trigger.is_none());
+    assert!(producers[0].clones_to_partitions);
     // Negative: nothing to read is no query and no holder.
     assert!(
         key_name_holders(&mut conn, &[])

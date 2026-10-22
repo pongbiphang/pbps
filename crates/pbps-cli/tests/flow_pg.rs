@@ -16305,6 +16305,119 @@ fn constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach() {
     }
 }
 
+/// #2276: unmanaged parent triggers still produce schema-wide key-name holders.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn unmanaged_constraint_trigger_clones_predict_the_later_key_name_on_both_servers() {
+    for (version, server) in [(16, old_server()), (18, server())] {
+        for constraint in [true, false] {
+            for attach in [true, false] {
+                let slug = format!("unmanaged-clone-2276-{version}-{constraint}-{attach}");
+                let own = OwnDatabase::new(&server, &slug);
+                let connection = own.connection();
+                on_server(connection, &format!(
+                    "CREATE SCHEMA app; CREATE SCHEMA parts;
+                     CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
+                     CREATE TABLE parts.n(id integer NOT NULL, label text);
+                     CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+                     {}",
+                    if attach { "CREATE TABLE parts.p1(id integer)" } else { "" }
+                ));
+                let d = Demo::new(&slug);
+                std::fs::write(
+                    d.dir.join("pbps.yml"),
+                    "dialect: postgres\nunmanaged: ignore\n",
+                )
+                .unwrap();
+                succeeds(d.run(&["pull", "--db", connection]));
+                d.commit();
+                succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+                // Install after recording the baseline, so neither declared
+                // snapshot contains the producer that the catalog must supply.
+                on_server(connection, &format!(
+                    "CREATE {}TRIGGER old_name AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f();
+                     ALTER TRIGGER old_name ON app.p RENAME TO n_pkey",
+                    if constraint { "CONSTRAINT " } else { "" }
+                ));
+                let statement_constraint = try_on_server(connection,
+                    "CREATE CONSTRAINT TRIGGER impossible AFTER INSERT ON app.p FOR EACH STATEMENT EXECUTE FUNCTION app.f()"
+                ).unwrap_err();
+                assert!(
+                    statement_constraint.contains("syntax error"),
+                    "{statement_constraint}"
+                );
+                if attach {
+                    std::fs::remove_file(d.dir.join("schema/parts.p1.yml")).unwrap();
+                }
+                std::fs::write(d.dir.join("schema/app.p.yml"),
+                    "table: app.p\ncolumns:\n  id: {type: integer}\npartition_by: [id]\npartitions:\n  parts.p1: {from: ['0'], to: ['10']}\n"
+                ).unwrap();
+                let expected = if constraint { "n_pkey1" } else { "n_pkey" };
+                let table = |expression: &str| {
+                    format!(
+                        "table: parts.n\ncolumns:\n  id: {{type: integer, nullable: false}}\n  label: {{type: text, default: \"{expression}\"}}\nprimary_key: [id]\n"
+                    )
+                };
+                let path = d.dir.join("schema/parts.n.yml");
+                std::fs::write(
+                    &path,
+                    table(&format!("('parts.{expected}'::regclass)::text")),
+                )
+                .unwrap();
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                let refused = d.dir.join("refused.json");
+                let output = d.run(&[
+                    "plan",
+                    "--db",
+                    connection,
+                    "--out",
+                    refused.to_str().unwrap(),
+                ]);
+                assert_ne!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+                assert!(
+                    stderr(&output).contains(&format!("names parts.{expected}")),
+                    "{}",
+                    stderr(&output)
+                );
+                assert!(!refused.exists());
+                // The reference resolves before the key exists. Removing it
+                // lets apply measure the name independently of the prediction.
+                std::fs::write(&path, table("''")).unwrap();
+                let plan = connected_artifact(&d, connection, false);
+                succeeds(approved_apply(
+                    &d,
+                    connection,
+                    &plan,
+                    &["--allow", "destructive,constraint"],
+                ));
+                assert_eq!(
+                    text_of(
+                        connection,
+                        "SELECT c.relname::text FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid='parts.n'::regclass AND i.indisprimary"
+                    ),
+                    expected
+                );
+                assert_eq!(scalar(connection,
+                    "SELECT count(*) FROM pg_trigger clone JOIN pg_trigger parent ON parent.oid=clone.tgparentid
+                     WHERE clone.tgrelid='parts.p1'::regclass AND parent.tgrelid='app.p'::regclass
+                       AND clone.tgname='n_pkey' AND (clone.tgtype & 1) <> 0"
+                ), 1);
+                assert_eq!(scalar(connection,
+                    "SELECT count(*) FROM pg_trigger clone JOIN pg_constraint con ON con.oid=clone.tgconstraint
+                     WHERE clone.tgrelid='parts.p1'::regclass AND clone.tgname='n_pkey'
+                       AND con.conname='n_pkey' AND con.conparentid=0 AND clone.tgparentid<>0"
+                ), i64::from(constraint));
+                println!(
+                    "PostgreSQL {}: constraint={constraint}, attach={attach}, key={expected}; row clone verified",
+                    text_of(connection, "SHOW server_version")
+                );
+                succeeds(d.run(&["verify", "--db", connection]));
+            }
+        }
+    }
+}
+
 /// #2102: pre-flight must reserve future clones before the attach's first statement.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
