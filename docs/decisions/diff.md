@@ -7934,6 +7934,12 @@ Admission computes the artifact checksum and checks the approved checksum,
 origin and dialect itself after the version refusal and before payload validation.
 Execution mode is bound to the certified input, checked when sealing metadata,
 and read by lowering rather than supplied by its caller.
+RLS policy setup and catalog-owner releases use the same immutable planning
+boundary: order owns their final settlement, generated-table and name-slot
+constraints, and creation-risk write-back, while callers supply catalog facts.
+The create-only RLS validator is shared by saved admission and transitional CLI
+consumers; the frozen master RLS settlement pins operations, SQL, checksums and
+refusals without enabling a raw production write-back.
 
 Dialect's associated plan input avoids a dependency cycle: concrete engines
 bind it to the sealed diff view, while pure semantic consumers remain generic.

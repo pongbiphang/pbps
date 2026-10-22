@@ -7,14 +7,14 @@ use pbps_model::{ChangeSet, SavedPlan};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct AdmissionError(#[source] Box<dyn std::error::Error + Send + Sync>);
+#[error(transparent)]
+pub struct AdmissionError(Box<dyn std::error::Error + Send + Sync>);
 
 impl AdmissionError {
-    fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+    pub(super) fn from_error(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self(Box::new(error))
     }
-    fn message(message: String) -> Self {
+    pub(super) fn message(message: String) -> Self {
         #[derive(Debug, thiserror::Error)]
         #[error("{0}")]
         struct Message(String);
@@ -336,27 +336,10 @@ pub fn validate_saved_plan(
         ))
     })?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
+    super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 
     let risks = super::generated::risks(&plan.changes, &plan.ids, dialect);
     for (index, planned) in plan.changes.changes.iter().enumerate() {
-        // A saved artifact need not have passed this build's differ. Refuse
-        // every operation carrying a complete table shape (DEC-1172.1).
-        // The other operations carry no Table payload.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        let shape = match &planned.change {
-            pbps_model::Change::CreateTable { name, table, .. } => Some((name, table)),
-            pbps_model::Change::AttachPartition { table, shape, .. }
-            | pbps_model::Change::DetachPartition { table, shape, .. } => Some((table, shape)),
-            _ => None,
-        };
-        if let Some((name, table)) = shape
-            && table.has_row_security()
-        {
-            refuse!(
-                "{} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
-                name.shown()
-            );
-        }
         let expected = &risks[index];
         if &planned.risks != expected {
             let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {

@@ -2,10 +2,10 @@
 
 use anyhow::bail;
 use pbps_model::{
-    Change, ChangeSet, IdsFile, TableName, Uid,
-    plan_names::{At, Holder, PlanNames},
+    Change, ChangeSet, IdsFile, Uid,
+    plan_names::{At, PlanNames},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Exact policy dependents of edited columns and dropped or renamed tables.
 /// An absent entry is unread; an empty vector records a successful empty read.
@@ -34,14 +34,7 @@ pub(crate) fn policy_target_uid(change: &Change) -> Option<&Uid> {
     }
 }
 
-/// A whole-table removal releases this policy before a referenced column edit.
-/// Keeping the named refusal beside the edge lets apply check the saved order
-/// without repairing or extending the approved plan.
-pub(crate) struct PolicyRelease {
-    pub before: usize,
-    pub after: usize,
-    pub refusal: String,
-}
+pub(crate) use pbps_diff::order::row_security::PolicyRelease;
 
 pub(crate) fn policy_releases(
     changes: &ChangeSet,
@@ -137,172 +130,15 @@ pub(crate) fn check_policy_releases(
     Ok(())
 }
 
-/// A checksum authenticates the bytes, not a forged creation origin or an
-/// ignored policy hidden inside CREATE TABLE's descriptive payload.
+/// Admission and the transitional CLI consumer share the same RLS checks.
 pub(crate) fn validate(
     changes: &ChangeSet,
     ids: &IdsFile,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<()> {
-    if !changes.changes.iter().any(|step| {
-        matches!(
-            &step.change,
-            Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
-        ) || if let Change::CreateTable { table, .. } = &step.change {
-            table.has_row_security()
-        } else if let Change::AttachPartition { shape, .. }
-        | Change::DetachPartition { shape, .. } = &step.change
-        {
-            shape.has_row_security()
-        } else {
-            false
-        }
-    }) {
-        return Ok(());
-    }
-    let mut created = BTreeMap::new();
-    for (at, step) in changes.changes.iter().enumerate() {
-        if let Change::CreateTable {
-            uid, name, table, ..
-        } = &step.change
-        {
-            if table.has_row_security() {
-                if dialect.name() != "postgres"
-                    || table.partition_by.is_some()
-                    || table.partition_of.is_some()
-                {
-                    bail!(
-                        "{}: row-security policies and flags require an ordinary PostgreSQL table",
-                        name.shown()
-                    );
-                }
-                if let Some(problem) = dialect.validate_table(name, table).into_iter().next() {
-                    bail!("{}: {problem}", name.shown());
-                }
-                if table.data.is_some() {
-                    bail!(
-                        "{}: data cannot be declared with row-security flags or policies",
-                        name.shown()
-                    );
-                }
-            }
-            if created.insert(uid, (at, name, table)).is_some() {
-                bail!(
-                    "{}: duplicate table creation cannot establish a policy origin",
-                    name.shown()
-                );
-            }
-        } else if let Change::AttachPartition { table, shape, .. }
-        | Change::DetachPartition { table, shape, .. } = &step.change
-            && shape.has_row_security()
-        {
-            bail!(
-                "{}: row security on partition trees is unsupported",
-                table.shown()
-            );
-        }
-    }
-    let names = PlanNames::of(&changes.changes, ids)?;
-    let mut policies: BTreeMap<&Uid, BTreeMap<&str, usize>> = BTreeMap::new();
-    let mut flags = BTreeSet::new();
-    let owner = |table: &TableName, at: usize| -> anyhow::Result<&Uid> {
-        let Holder::Tracked(uid) = names.holder(table, At::Before(at)) else {
-            bail!(
-                "{}: created row-security origin has no preceding table creation",
-                table.shown()
-            );
-        };
-        let Some((start, _, _)) = created.get(uid) else {
-            bail!(
-                "{}: standing-table row-security planning arrives with #1173",
-                table.shown()
-            );
-        };
-        if *start >= at {
-            bail!(
-                "{}: row-security operation precedes its table creation",
-                table.shown()
-            );
-        }
-        Ok(uid)
-    };
-    for (at, step) in changes.changes.iter().enumerate() {
-        if let Change::CreatePolicy {
-            table,
-            name,
-            policy,
-            ..
-        } = &step.change
-        {
-            let uid = owner(table, at)?;
-            let (_, _, shape) = created[uid];
-            if dialect.name() != "postgres" || shape.row_policies.get(name) != Some(policy) {
-                bail!(
-                    "{} policy `{}`: created origin or payload does not match CREATE TABLE",
-                    table.shown(),
-                    pbps_model::escape::Escaped(name)
-                );
-            }
-            let problems = policy.problems();
-            if !problems.is_empty() {
-                bail!(
-                    "{} policy `{}`: {}",
-                    table.shown(),
-                    pbps_model::escape::Escaped(name),
-                    problems.join("; ")
-                );
-            }
-            if flags.contains(uid) || policies.entry(uid).or_default().insert(name, at).is_some() {
-                bail!(
-                    "{} policy `{}`: duplicate policy or policy after row-security flags",
-                    table.shown(),
-                    pbps_model::escape::Escaped(name)
-                );
-            }
-        } else if let Change::SetRowSecurity {
-            uid,
-            table,
-            from,
-            to,
-            ..
-        } = &step.change
-        {
-            let actual = owner(table, at)?;
-            let (_, _, shape) = created[actual];
-            if dialect.name() != "postgres"
-                || actual != uid
-                || !from.is_default()
-                || to.is_default()
-                || *to != shape.row_security
-                || !flags.insert(actual)
-            {
-                bail!(
-                    "{}: row-security created origin, UID or flag payload is inconsistent",
-                    table.shown()
-                );
-            }
-            if policies.get(actual).map_or(0, BTreeMap::len) != shape.row_policies.len() {
-                bail!("{}: row-security flags precede its policies", table.shown());
-            }
-        }
-    }
-    for (uid, (_, name, shape)) in created {
-        if policies.get(uid).map_or(0, BTreeMap::len) != shape.row_policies.len()
-            || flags.contains(uid) != !shape.row_security.is_default()
-        {
-            bail!(
-                "{}: CREATE TABLE's row-security payload has missing explicit operations; regenerate the plan",
-                name.shown()
-            );
-        }
-        if !ids.tables.contains_key(uid) || ids.tables.get(uid) != names.table_at(uid, At::End) {
-            bail!(
-                "{}: created table UID is absent from plan identities",
-                name.shown()
-            );
-        }
-    }
-    Ok(())
+    Ok(pbps_diff::order::row_security::validate(
+        changes, ids, dialect,
+    )?)
 }
 
 pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
@@ -323,7 +159,7 @@ pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pbps_model::{PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, Table};
+    use pbps_model::{PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, Table, TableName};
 
     fn fixture() -> (ChangeSet, IdsFile) {
         let uid: Uid = "t_117200".parse().unwrap();
@@ -370,6 +206,54 @@ mod tests {
             },
             ids,
         )
+    }
+
+    #[test]
+    fn saved_admission_keeps_complete_rls_bytes_and_refuses_missing_policy_operations() {
+        use pbps_diff::order::admit;
+        use pbps_model::{PlanBaseline, PlanOrigin, SavedPlan};
+
+        let (changes, ids) = fixture();
+        let dialect = pbps_pg::Postgres::new();
+        let wire = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-10-22T00:00:00Z",
+            PlanBaseline {
+                description: "RLS admission fixture".into(),
+                checksum: "baseline".into(),
+                database_collation: None,
+                time_zone: None,
+            },
+            changes,
+            ids,
+        );
+        let path = std::path::Path::new("plan.json");
+        let bytes = serde_json::to_vec(&wire).unwrap();
+        let checksum = wire.checksum();
+        let admitted = admit(
+            serde_json::from_slice(&bytes).unwrap(),
+            &dialect,
+            path,
+            &checksum,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(admitted.wire()).unwrap(), bytes);
+        assert_eq!(admitted.checksum(), checksum);
+        for missing in 0..3 {
+            let mut incomplete = wire.clone();
+            incomplete.changes.changes.remove(missing);
+            let refused = validate(&incomplete.changes, &incomplete.ids, &dialect).unwrap_err();
+            let expected = refused.to_string();
+            assert_eq!(format!("{refused:#}"), expected);
+            let checksum = incomplete.checksum();
+            let refused = admit(incomplete, &dialect, path, &checksum).unwrap_err();
+            assert_eq!(
+                format!("{:#}", anyhow::Error::new(refused)),
+                expected,
+                "missing operation {missing}"
+            );
+        }
     }
 
     #[test]

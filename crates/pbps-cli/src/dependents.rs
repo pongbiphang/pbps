@@ -1037,7 +1037,7 @@ fn module_order(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<Vec<Order>, String> {
     Weave {
         roots: dropped_modules(cs)
