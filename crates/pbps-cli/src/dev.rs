@@ -30,7 +30,7 @@ use anyhow::{Context as _, bail};
 
 use pbps_config::Project;
 use pbps_db::Conn;
-use pbps_dialect::{Dialect, Statement};
+use pbps_dialect::Dialect;
 use pbps_model::{Change, ChangeSet, IdsFile, Schema};
 
 use crate::db;
@@ -116,8 +116,8 @@ pub fn rehearse(
     baseline_hints: &pbps_model::Hints,
     declared: &Schema,
     declared_ids: &IdsFile,
-    plan: &[Statement],
-    dialect: &dyn Dialect,
+    plan: &crate::emission::LoweredPlan<'_>,
+    dialect: &(dyn Dialect + 'static),
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
     // The scratch-database lifecycle and container setup below are SQL
@@ -176,7 +176,10 @@ pub fn rehearse(
         dialect,
     )?
     .changes;
-    let build = crate::statements(&build, dialect, pbps_model::PlanMode::Transactional)?;
+    let build = crate::statements(
+        &build.ordered(pbps_model::PlanMode::Transactional, dialect),
+        dialect,
+    )?;
 
     let container = match spec {
         Spec::Docker(image) => Some(Container::start(image)?),
@@ -209,8 +212,8 @@ pub fn rehearse(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     connection: &str,
-    build: &[Statement],
-    plan: &[Statement],
+    build: &crate::emission::LoweredPlan<'_>,
+    plan: &crate::emission::LoweredPlan<'_>,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,
@@ -263,8 +266,8 @@ async fn run(
 async fn rehearse_in(
     conn: &mut Conn,
     name: &str,
-    build: &[Statement],
-    plan: &[Statement],
+    build: &crate::emission::LoweredPlan<'_>,
+    plan: &crate::emission::LoweredPlan<'_>,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,

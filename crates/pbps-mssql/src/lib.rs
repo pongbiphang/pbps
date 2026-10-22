@@ -139,6 +139,16 @@ impl pbps_dialect::PlanDialect for Mssql {
 }
 
 impl Dialect for Mssql {
+    fn statement_count(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+        mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        let _ = mode;
+        emit::emit(change, strategy).map(|statements| statements.len())
+    }
+
     fn name(&self) -> &'static str {
         types::DIALECT
     }

@@ -197,7 +197,7 @@ pub(crate) struct Inputs {
     desired: Schema,
     base_ids: IdsFile,
     desired_ids: IdsFile,
-    bootstrap: pbps_diff::order::PlanningPlan,
+    bootstrap: pbps_diff::order::DiffPlan,
     pub(crate) hints: Hints,
 }
 

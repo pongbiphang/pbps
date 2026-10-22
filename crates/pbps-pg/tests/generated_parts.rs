@@ -70,7 +70,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         let empty = Schema::default();
         let no_ids = IdsFile::default();
         let pg = Postgres::new().with_server_version(180_000);
-        let mut cs = pbps_diff::diff(
+        let cs = pbps_diff::diff(
             pbps_diff::Side {
                 schema: &empty,
                 ids: &no_ids,
@@ -83,6 +83,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
             &Default::default(),
         )
         .unwrap();
+        let mut cs = pbps_diff::order::propose(cs.changes().clone());
         generated::expand(&mut cs, &ids, &Default::default(), &pg).unwrap();
         cs =
             pbps_diff::order::writebacks::PlanningInput::new(vec![pbps_model::PlannedChange::new(

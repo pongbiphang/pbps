@@ -160,17 +160,17 @@ fn reason_word(reason: OrderReason) -> &'static str {
 
 /// A settled plan.
 #[derive(Debug, Clone)]
-pub struct Settled {
-    pub changes: super::PlanningPlan,
+pub struct Settled<S = super::plan::Draft> {
+    pub changes: super::PlanningPlan<S>,
     /// The edges that ordered it, over its own positions.
     pub proof: OrderingProof,
     /// For each position of `changes`, the position it came from.
     pub sequence: Vec<usize>,
 }
 
-impl Settled {
+impl<S> Settled<S> {
     /// A settlement is an intermediate result, never an execution permit.
-    pub fn into_planning(self) -> super::PlanningPlan {
+    pub fn into_planning(self) -> super::PlanningPlan<S> {
         self.changes
     }
 }
@@ -275,20 +275,25 @@ impl Schedule {
     }
 
     /// `changes`, which the schedule was built over, in its order.
-    pub fn settle(&self, plan: super::PlanningPlan) -> Result<Settled, Refusal> {
+    pub fn settle<S>(&self, plan: super::PlanningPlan<S>) -> Result<Settled<S>, Refusal> {
         let settled = self.settle_raw(plan.payload)?;
         let origins = settled
             .sequence
             .iter()
             .map(|&at| plan.origins[at].clone())
             .collect();
+        let identities = plan
+            .identities
+            .map(|operations| super::reordered_operations(&operations, &settled.sequence));
+        let mut changes = super::PlanningPlan::new(
+            settled.changes,
+            origins,
+            plan.logical,
+            settled.proof.clone(),
+        );
+        changes.identities = identities;
         Ok(Settled {
-            changes: super::PlanningPlan::new(
-                settled.changes,
-                origins,
-                plan.logical,
-                settled.proof.clone(),
-            ),
+            changes,
             proof: settled.proof,
             sequence: settled.sequence,
         })

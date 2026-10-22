@@ -107,7 +107,11 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
     (cs, schema, ids, before, before_ids)
 }
 
-fn scheduled(placeholder: bool, generated: bool, pg: &dyn Dialect) -> (ChangeSet, IdsFile) {
+fn scheduled(
+    placeholder: bool,
+    generated: bool,
+    pg: &(dyn Dialect + 'static),
+) -> (ChangeSet, IdsFile) {
     let (cs, schema, ids, before, before_ids) = fixture(placeholder, generated);
     let scheduled = super::super::schedule::schedule(
         pbps_diff::order::propose(cs),

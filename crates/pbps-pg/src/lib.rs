@@ -879,6 +879,19 @@ fn default_problems(
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
 /// }
 /// ```
+/// Canonical completion also keeps its planner: the final constructor cannot
+/// relabel a completed PostgreSQL route as SQL Server, or the reverse.
+///
+/// ```compile_fail
+/// fn pg_canonical_cannot_reach_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>) {
+///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_mssql::Mssql);
+/// }
+/// ```
+/// ```compile_fail
+/// fn mssql_canonical_cannot_reach_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>) {
+///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_pg::Postgres::new());
+/// }
+/// ```
 impl pbps_dialect::PlanDialect for Postgres {
     type Plan = dyn pbps_diff::order::PlanView<Self>;
 
@@ -899,6 +912,21 @@ impl pbps_dialect::PlanDialect for Postgres {
 }
 
 impl Dialect for Postgres {
+    fn statement_count(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+        mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        match mode {
+            pbps_model::PlanMode::Transactional => emit::emit(self, change, strategy),
+            pbps_model::PlanMode::Staged => {
+                emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
+            }
+        }
+        .map(|statements| statements.len())
+    }
+
     fn validate_plan_analysis(
         &self,
         plan: &pbps_model::SavedPlan,
@@ -7426,6 +7454,12 @@ mod certified_emission_tests {
                 PlanMode::Transactional => &transactional,
                 PlanMode::Staged => &staged,
             };
+            assert_eq!(
+                dialect
+                    .statement_count(&change.change, change.strategy, mode)
+                    .unwrap(),
+                expected.len()
+            );
             for input in [&ordered as &dyn PlanView<Postgres>, &sealed, &admitted] {
                 assert_eq!(input.mode(), mode);
                 let lowered = pbps_dialect::lower::lower_all(input, &dialect).unwrap();

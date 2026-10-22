@@ -75,12 +75,52 @@ fn same_change(then: &pbps_model::Change, now: &pbps_model::Change) -> bool {
 /// Replace the final intermediate's proof with the resolver's existing
 /// ordinal remap. This is the old publication check, not a constraint union
 /// or a new ordering stage; the caller retains its run-bound recheck.
-pub fn finish(
-    before: &super::PlanningPlan,
-    mut after: super::PlanningPlan,
+pub fn finish<S, T>(
+    before: &super::PlanningPlan<T>,
+    mut after: super::PlanningPlan<S>,
     describe: impl Fn(&pbps_model::Change) -> String,
-) -> Result<super::PlanningPlan, String> {
+) -> Result<super::PlanningPlan<S>, String> {
     let edges = remap(before, &after, before.proof().edges(), describe)?;
+    if let Some(identities) = &before.identities {
+        // Reuse the same equal-change ordinal matching as the proof remap.
+        // Scope tails and woven additions keep their actual planning sources.
+        let extras = pbps_model::operation::Operations::expanded(
+            after.logical,
+            after
+                .origins
+                .iter()
+                .cloned()
+                .zip(after.payload.changes.iter().cloned()),
+            pbps_model::operation::ModuleEdits::InPlace,
+        );
+        let mut matched = vec![None; after.payload.changes.len()];
+        for (position, planned) in before.payload.changes.iter().enumerate() {
+            let found = after
+                .payload
+                .changes
+                .iter()
+                .enumerate()
+                .position(|(i, now)| {
+                    matched[i].is_none() && same_change(&planned.change, &now.change)
+                })
+                .expect("the proof remap already matched every operation");
+            matched[found] = Some(position);
+        }
+        let operations = pbps_model::operation::Operations::from_operations(
+            matched.into_iter().enumerate().map(|(i, from)| {
+                from.map_or_else(
+                    || extras.as_slice()[i].clone(),
+                    |from| identities.as_slice()[from].clone(),
+                )
+            }),
+        )
+        .with_steps(&after.payload.changes);
+        after.origins = operations
+            .iter()
+            .map(|operation| operation.origin().clone())
+            .collect();
+        after.identities = Some(operations);
+    }
     after.proof = pbps_model::resolver::OrderingProof::new(&after, edges)
         .map_err(|error| format!("the final order: {error}"))?;
     Ok(after)

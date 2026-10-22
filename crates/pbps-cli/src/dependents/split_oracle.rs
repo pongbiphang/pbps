@@ -400,7 +400,7 @@ fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
         .insert(SHOWN.into(), table.indexes["ix_plain"].clone());
     let ids = super::generated_tests::identities(&schema);
     let dialect = pbps_pg::Postgres::new();
-    let mut changes = pbps_diff::diff(
+    let changes = pbps_diff::diff(
         pbps_diff::Side {
             schema: &Schema::default(),
             ids: &IdsFile::default(),
@@ -413,6 +413,7 @@ fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
         &Hints::default(),
     )
     .unwrap();
+    let mut changes = pbps_diff::order::propose(changes.changes().clone());
     let mut expected = changes.changes().clone();
     let count = split_new_tables(&mut expected, &[&ids], &ModuleDeps::new(), &dialect).unwrap();
     assert_eq!(

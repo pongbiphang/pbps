@@ -1,117 +1,20 @@
 //! The create-only policy contract; standing mutations arrive with #1173.
 
-use anyhow::bail;
-use pbps_model::{
-    Change, ChangeSet, IdsFile, Uid,
-    plan_names::{At, PlanNames},
-};
-use std::collections::BTreeMap;
+#[cfg(test)]
+use pbps_model::{Change, Uid};
+use pbps_model::{ChangeSet, IdsFile};
 
-/// Exact policy dependents of edited columns and dropped or renamed tables.
-/// An absent entry is unread; an empty vector records a successful empty read.
-pub(crate) type PolicyDependents = BTreeMap<Uid, Vec<pbps_pg::modules::PolicyDependent>>;
+pub(crate) use pbps_diff::order::row_security::{PolicyDependents, column_edit, policy_target_uid};
 
-/// Destructive column edits shared with engine probes. Rename dependencies
-/// are read separately, without invoking drop/retype-only probes.
-pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'static str)> {
-    if let Change::DropColumn { uid, column } = change {
-        Some((uid, column, "dropped"))
-    } else if let Change::AlterColumnType { uid, column, .. } = change {
-        Some((uid, column, "retyped"))
-    } else {
-        None
-    }
-}
-
-pub(crate) fn policy_target_uid(change: &Change) -> Option<&Uid> {
-    if let Change::DropTable { uid, .. }
-    | Change::RenameTable { uid, .. }
-    | Change::RenameColumn { uid, .. } = change
-    {
-        Some(uid)
-    } else {
-        column_edit(change).map(|(uid, _, _)| uid)
-    }
-}
-
-pub(crate) use pbps_diff::order::row_security::PolicyRelease;
-
+#[cfg(test)]
 pub(crate) fn policy_releases(
     changes: &ChangeSet,
     ids: &IdsFile,
     found: &PolicyDependents,
-) -> anyhow::Result<Vec<PolicyRelease>> {
-    let names = PlanNames::of(&changes.changes, ids)?;
-    let mut edges = Vec::new();
-    for (at, step) in changes.changes.iter().enumerate() {
-        let Some(uid) = policy_target_uid(&step.change) else {
-            continue;
-        };
-        let policies = found.get(uid).ok_or_else(|| {
-            anyhow::anyhow!("policy dependents of {uid} were not read from PostgreSQL")
-        })?;
-        if policies.is_empty() {
-            continue;
-        }
-        let (subject, what, dropped_table) = if matches!(
-            &step.change,
-            Change::DropTable { .. } | Change::RenameTable { .. }
-        ) {
-            let table = names.table_at(uid, At::Start).ok_or_else(|| {
-                anyhow::anyhow!("policy dependent table {uid} has no opening catalog identity")
-            })?;
-            if matches!(&step.change, Change::DropTable { .. }) {
-                (table.shown().to_string(), "dropped", Some(table))
-            } else {
-                (table.shown().to_string(), "renamed", None)
-            }
-        } else {
-            let what = if matches!(&step.change, Change::RenameColumn { .. }) {
-                "renamed"
-            } else {
-                column_edit(&step.change)
-                    .expect("a policy target is a table or column")
-                    .2
-            };
-            let (owner, name) = names.column_at(uid, At::Start).ok_or_else(|| {
-                anyhow::anyhow!("policy dependent column {uid} has no opening catalog identity")
-            })?;
-            let table = names.table_at(owner, At::Start).ok_or_else(|| {
-                anyhow::anyhow!("policy dependent column {uid} has no opening table identity")
-            })?;
-            (table.column(name).shown().to_string(), what, None)
-        };
-        for policy in policies {
-            // DROP TABLE takes its own policies automatically, including
-            // normal attribute references in its own predicates.
-            if dropped_table == Some(&policy.table) {
-                continue;
-            }
-            let refusal = format!(
-                "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
-                subject,
-                pbps_model::escape::Escaped(&policy.name),
-                policy.table.shown()
-            );
-            // Compare opening UID identities, not a later holder of the same
-            // spelling. An individual standing policy is never removed here.
-            let Some(before) = changes.changes.iter().position(|p| {
-                if let Change::DropTable { uid, .. } = &p.change {
-                    names.table_at(uid, At::Start) == Some(&policy.table)
-                } else {
-                    false
-                }
-            }) else {
-                bail!("{refusal}");
-            };
-            edges.push(PolicyRelease {
-                before,
-                after: at,
-                refusal,
-            });
-        }
-    }
-    Ok(edges)
+) -> anyhow::Result<Vec<pbps_diff::order::row_security::PolicyRelease>> {
+    Ok(pbps_diff::order::row_security::policy_releases(
+        changes, ids, found,
+    )?)
 }
 
 pub(crate) fn check_policy_releases(
@@ -119,18 +22,13 @@ pub(crate) fn check_policy_releases(
     ids: &IdsFile,
     found: &PolicyDependents,
 ) -> anyhow::Result<()> {
-    for release in policy_releases(changes, ids, found)? {
-        if release.before >= release.after {
-            bail!(
-                "{}; its table drop must precede the dependent change. Plan again.",
-                release.refusal
-            );
-        }
-    }
-    Ok(())
+    Ok(pbps_diff::order::row_security::check_releases(
+        changes, ids, found,
+    )?)
 }
 
-/// Admission and the transitional CLI consumer share the same RLS checks.
+/// Test observations use the same create-only contract as admission.
+#[cfg(test)]
 pub(crate) fn validate(
     changes: &ChangeSet,
     ids: &IdsFile,

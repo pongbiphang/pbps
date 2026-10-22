@@ -237,7 +237,7 @@ pub fn cmd_explain(
         json,
         "plan.inconsistent",
         path,
-        crate::validate_saved_plan(&plan, dialect.as_ref()),
+        pbps_diff::order::validate_saved_plan(&plan, dialect.as_ref()).map_err(anyhow::Error::from),
     )?;
 
     // The third failure the envelope has to survive, and the least obvious: a
@@ -442,7 +442,7 @@ fn explain(
                 reason: u.reason,
             })
             .collect(),
-        statement_count: crate::statements(cs, dialect, plan.mode)?.len(),
+        statement_count: crate::emission::statement_count(&plan.changes, dialect, plan.mode)?,
         target: match target {
             Resolved::None => None,
             Resolved::Reachable(t) => Some(target_state(t)?),

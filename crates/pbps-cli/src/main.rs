@@ -14,6 +14,7 @@ mod dependents;
 mod deploy;
 mod dev;
 mod doctor;
+mod emission;
 mod engine;
 mod explain;
 mod externals_draft;
@@ -39,6 +40,34 @@ mod test_pg;
 #[cfg(test)]
 #[path = "../../pbps-model/tests/support/plan_ids.rs"]
 mod test_plan_ids;
+
+#[cfg(test)]
+fn fixture_ordered(
+    cs: pbps_model::ChangeSet,
+    dialect: &(dyn Dialect + 'static),
+) -> pbps_diff::order::AdmittedPlan<dyn pbps_dialect::Dialect> {
+    let wire = pbps_model::SavedPlan::new(
+        pbps_model::PlanOrigin::Database,
+        dialect.name(),
+        "2026-10-22",
+        pbps_model::PlanBaseline {
+            description: "fixture".into(),
+            checksum: "fixture".into(),
+            database_collation: None,
+            time_zone: None,
+        },
+        cs,
+        IdsFile::default(),
+    );
+    let approved = wire.checksum();
+    pbps_diff::order::admit(
+        wire,
+        dialect,
+        std::path::Path::new("fixture.json"),
+        &approved,
+    )
+    .unwrap()
+}
 
 /// The command ran correctly and found something the user must act on.
 ///
@@ -1715,8 +1744,8 @@ fn policy_context_at(
 /// A block with problems contributes nothing here: `validate` reports the
 /// problems, and evaluating half a block would report against rules the
 /// project did not manage to configure.
-pub fn attach_policy_findings(
-    cs: &mut PlanningPlan,
+pub fn attach_policy_findings<S: Clone>(
+    cs: &mut PlanningPlan<S>,
     project: &Project,
     dialect: &dyn Dialect,
     connected: bool,
@@ -3487,6 +3516,10 @@ fn cmd_plan(
         .into());
     }
 
+    let ordered = cs
+        .clone()
+        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
+
     if let Some(path) = out {
         // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
         // §7.3's "a plan computed offline is never accepted by apply" has to be
@@ -3508,6 +3541,7 @@ fn cmd_plan(
         plan.module_deps = loaded.hints.module_deps.clone();
         plan.trusted_roles = project.config.trusted_roles.clone();
         plan.git_sha = db::git_sha(project.root());
+        let plan = pbps_diff::order::seal(ordered.clone(), plan)?;
         // The artifact is the deliverable, so failing to write it is a failure
         // of the whole command — but it is still the *command* that could not
         // finish, not a finding about the declarations. A read-only or missing
@@ -3529,7 +3563,7 @@ fn cmd_plan(
             "plan",
             json,
             "plan.unwritable",
-            render_sql(&cs, dialect.as_ref(), &base.description),
+            render_sql(&ordered, dialect.as_ref(), &base.description),
         )?;
         output::or_unanswerable(
             "plan",
@@ -3575,7 +3609,7 @@ fn cmd_plan(
             "plan",
             json,
             "plan.unrenderable",
-            statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional),
+            statements(&ordered, dialect.as_ref()),
         )?;
         let rehearsal = output::or_unanswerable(
             "plan",
@@ -3659,14 +3693,17 @@ fn cmd_plan(
 
 /// Writes a plan file. A trailing newline, so it never shows
 /// "\ No newline at end of file" when a reviewer diffs two of them.
-fn write_plan(path: &std::path::Path, plan: &pbps_model::SavedPlan) -> anyhow::Result<()> {
+fn write_plan(
+    path: &std::path::Path,
+    plan: &impl pbps_diff::order::ArtifactView,
+) -> anyhow::Result<()> {
     std::fs::write(path, rendered_plan(plan)?)
         .with_context(|| format!("cannot write `{}`", path.display()))
 }
 
 /// A plan file's contents, as [`write_plan`] writes them.
-fn rendered_plan(plan: &pbps_model::SavedPlan) -> anyhow::Result<String> {
-    Ok(format!("{}\n", serde_json::to_string_pretty(plan)?))
+fn rendered_plan(plan: &impl pbps_diff::order::ArtifactView) -> anyhow::Result<String> {
+    Ok(format!("{}\n", serde_json::to_string_pretty(plan.wire())?))
 }
 
 /// Renders the change set as one SQL script.
@@ -3674,12 +3711,12 @@ fn rendered_plan(plan: &pbps_model::SavedPlan) -> anyhow::Result<String> {
 /// An offline plan is a preview (SPEC §7.3): the header says so, so a script
 /// that escapes into a chat or a ticket still carries its own warning label.
 fn render_sql(
-    cs: &pbps_model::ChangeSet,
+    cs: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
     dialect: &dyn Dialect,
     baseline: &str,
 ) -> anyhow::Result<String> {
     // An offline plan is never staged: `--staged` needs a target.
-    let statements = statements(cs, dialect, pbps_model::PlanMode::Transactional)?;
+    let statements = statements(cs, dialect)?;
     // No target to ask: UTC, as before, until #1918 gives a preview the
     // declared zone or a refusal (DEC-1916.1).
     Ok(sql_script(
@@ -3695,15 +3732,15 @@ fn render_sql(
 /// Apart so a command that learns the zone only once it connects — a
 /// bootstrap with a target — emits early, where an emitter's refusal still
 /// stops it, and renders once the zone is known (DEC-1916.1).
-pub(crate) fn sql_script(
-    statements: &[pbps_dialect::Statement],
-    dialect: &dyn Dialect,
+pub(crate) fn sql_script<'a>(
+    statements: &emission::LoweredPlan<'a>,
+    dialect: &'a dyn Dialect,
     baseline: &str,
     zone: &pbps_model::SessionZone,
 ) -> String {
     format!(
         "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
-        pbps_dialect::legacy_render_script(statements, dialect, zone)
+        pbps_dialect::render_script(statements, &emission::Emitter(dialect), zone)
     )
 }
 
@@ -3713,16 +3750,11 @@ pub(crate) fn sql_script(
 /// express must stop the apply at statement zero, not halfway through — which is
 /// the same reason `plan` renders the SQL rather than the executor doing it one
 /// change at a time.
-pub(crate) fn statements(
-    cs: &pbps_model::ChangeSet,
-    dialect: &dyn Dialect,
-    mode: pbps_model::PlanMode,
-) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
-    let mut statements = Vec::new();
-    for p in &cs.changes {
-        statements.extend(emitted(dialect, p, mode)?);
-    }
-    Ok(statements)
+pub(crate) fn statements<'a>(
+    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
+    dialect: &'a dyn Dialect,
+) -> anyhow::Result<emission::LoweredPlan<'a>> {
+    emission::lower(plan, dialect)
 }
 
 /// One planned change's statements in a plan of `mode`. A staged plan
@@ -3731,12 +3763,17 @@ pub(crate) fn statements(
 /// plan's statements per change counts these.
 pub(crate) fn emitted(
     dialect: &dyn Dialect,
-    p: &pbps_model::PlannedChange,
+    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
+    position: usize,
     mode: pbps_model::PlanMode,
 ) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
     match mode {
-        pbps_model::PlanMode::Transactional => dialect.legacy_emit(&p.change, p.strategy),
-        pbps_model::PlanMode::Staged => dialect.legacy_emit_staged(&p.change, p.strategy),
+        pbps_model::PlanMode::Transactional => {
+            pbps_dialect::PlanDialect::emit(&emission::Emitter(dialect), plan, position)
+        }
+        pbps_model::PlanMode::Staged => {
+            pbps_dialect::PlanDialect::emit_staged(&emission::Emitter(dialect), plan, position)
+        }
     }
     .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))
 }
@@ -3815,6 +3852,7 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
 /// Asked of the dialect rather than assumed, twice over: only an engine whose
 /// `CREATE` hands a routine to `PUBLIC` has a decision to make, and only one
 /// that rebuilds modules makes an `AlterModule` another `CREATE`.
+#[cfg(test)]
 fn public_execution_decisions_match_their_modules(
     cs: &pbps_model::ChangeSet,
     dialect: &dyn Dialect,
@@ -3942,7 +3980,25 @@ fn public_execution_decisions_match_their_modules(
 /// edited `risks: []` from turning a DROP into an ungated operation. Type-change
 /// risk needs dialect knowledge, exactly as it did when the differ produced the
 /// plan.
+#[cfg(test)]
 pub(crate) fn validate_saved_plan(
+    plan: &pbps_model::SavedPlan,
+    dialect: &dyn Dialect,
+) -> anyhow::Result<()> {
+    let result = pbps_diff::order::validate_saved_plan(plan, dialect).map_err(anyhow::Error::from);
+    #[cfg(test)]
+    {
+        let old = oracle_validate_saved_plan(plan, dialect);
+        assert_eq!(
+            result.as_ref().map_err(|e| format!("{e:#}")),
+            old.as_ref().map_err(|e| format!("{e:#}"))
+        );
+    }
+    result
+}
+
+#[cfg(test)]
+fn oracle_validate_saved_plan(
     plan: &pbps_model::SavedPlan,
     dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {

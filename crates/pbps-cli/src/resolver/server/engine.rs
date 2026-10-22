@@ -444,7 +444,7 @@ pub(super) fn ordinary(
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
     extras: &[String],
-) -> Result<pbps_diff::order::PlanningPlan, Error> {
+) -> Result<pbps_diff::order::DiffPlan, Error> {
     match driver {
         Driver::Postgres => postgres::ordinary(base, desired, hints, extras),
         Driver::Mssql => pbps_diff::resolver::ordinary(base, desired, &pbps_mssql::Mssql, hints)
@@ -462,7 +462,8 @@ impl Binding {
         hints: &Hints,
         extras: &[String],
         surfaces: &[SurfaceResolution],
-    ) -> Result<pbps_diff::resolver::Ordered, Error> {
+    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>, Error>
+    {
         match self {
             Self::Postgres(binding) => binding.plan(base, desired, hints, extras, surfaces),
         }

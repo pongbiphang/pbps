@@ -243,8 +243,8 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 }
                 let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
                 assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-                let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+                let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
                     &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
@@ -274,8 +274,8 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
         conn.begin(&framing).await.unwrap();
         assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-        let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+        let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
             &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
@@ -492,10 +492,10 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     };
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.unwrap();
-    let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(
+    let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(
         &mut conn,
-        &mut cs,
+        cs,
         &after,
         sources,
         &ModuleDeps::default(),

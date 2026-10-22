@@ -56,8 +56,8 @@ impl Prepared {
 /// The same initial generated expansion and settlement as reconstruction,
 /// retaining the differ's sources while dropping its deployment-only metadata.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub fn prepare(
-    input: &super::PlanningPlan,
+pub fn prepare<S>(
+    input: &super::PlanningPlan<S>,
     ids: &pbps_model::IdsFile,
     dependencies: &pbps_model::ModuleDeps,
     dialect: &(impl Dialect + ?Sized),

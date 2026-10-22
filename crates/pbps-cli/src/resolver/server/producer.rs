@@ -82,14 +82,14 @@ pub(super) struct Identity {
 
 /// Seals `changes`, the plan in its final order, with `proof` over that
 /// order.
-pub(super) fn seal(
+pub(super) fn seal<S>(
     key: &EnvironmentFingerprintKey,
     sealed: Sealing,
-    changes: pbps_diff::order::PlanningPlan,
+    changes: pbps_diff::order::PlanningPlan<S>,
     proof: pbps_model::resolver::OrderingProof,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
-) -> Result<ResolvedPlan, Error> {
+) -> Result<ResolvedPlan<S>, Error> {
     let Sealing {
         planned,
         opening_catalog,
@@ -189,7 +189,8 @@ pub(super) fn seal(
 /// already holds whatever those passes added or moved (DEC-1516.1).
 pub struct Unsealed {
     pub(super) key: EnvironmentFingerprintKey,
-    pub(super) ordered: pbps_diff::resolver::Ordered,
+    pub(super) ordered:
+        pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>,
     pub(super) sealing: Sealing,
     pub(super) opening: Opening,
 }
@@ -208,7 +209,7 @@ pub(super) struct Opening {
 
 impl Unsealed {
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_diff::order::PlanningPlan {
+    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<pbps_pg::Postgres> {
         &self.ordered.changes
     }
 
@@ -322,12 +323,12 @@ impl Rechecked {
     /// edge the resolver ordered must still hold in the final order, and no
     /// change it ordered may be gone: a pass that undoes the resolver's
     /// order is a defect, refused here rather than sealed (#1516).
-    pub fn seal(
+    pub fn seal<D: pbps_dialect::Dialect + ?Sized>(
         self,
-        changes: pbps_diff::order::PlanningPlan,
+        changes: pbps_diff::order::CanonicalPlan<D>,
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
-    ) -> Result<ResolvedPlan, Error> {
+    ) -> Result<ResolvedPlan<pbps_diff::order::Canonical<D>>, Error> {
         let run = self.0;
         let changes =
             pbps_diff::order::resolver_remap::finish(&run.ordered.changes, changes, describe)
@@ -337,7 +338,7 @@ impl Rechecked {
     }
 
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_diff::order::PlanningPlan {
+    pub fn changes(&self) -> &pbps_diff::order::CanonicalPlan<pbps_pg::Postgres> {
         self.0.changes()
     }
 }

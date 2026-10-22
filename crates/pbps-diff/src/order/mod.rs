@@ -40,8 +40,10 @@ let _ = pbps_diff::order::singleton(
 "#
 )]
 
+pub mod catalog;
 pub mod commute;
 mod companions;
+pub mod deployment;
 pub mod edges;
 pub mod expand;
 pub mod generated;
@@ -67,10 +69,15 @@ pub mod writebacks;
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use plan::singleton;
-pub use plan::{OrderedPlan, PlanView, PlanningPlan, propose, take};
+pub use plan::{
+    Canonical, CanonicalPlan, DiffPlan, Differ, Draft, OrderedPlan, PlanView, PlanningPlan,
+    RouteState, propose, take,
+};
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;
-pub use saved::{AdmissionError, AdmittedPlan, SealedPlan, admit, seal, validate_saved_plan};
+pub use saved::{
+    AdmissionError, AdmittedPlan, ArtifactView, SealedPlan, admit, seal, validate_saved_plan,
+};
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{Report, Shadowed, analyse};
 pub use verify::{Violation, verify};
@@ -96,3 +103,5 @@ pub use companions::{
 pub use normalization::{drop_parameter_changes_of_rebuilt_indexes, normalize};
 
 pub use resolver_finish::reordered_operations;
+
+pub(crate) use plan::differ;

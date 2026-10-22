@@ -6,15 +6,15 @@ use pbps_model::operation::{ModuleEdits, Operations, Origin};
 use pbps_model::resolver::OrderingProof;
 use pbps_model::{ChangeSet, IdsFile};
 
-pub(crate) fn finish(
+pub(crate) fn finish<D: Dialect + ?Sized>(
     mut ordered: Ordered,
     sequence: &[usize],
     logical: usize,
     origins: Vec<Origin>,
     ids: &IdsFile,
-    dialect: &(impl Dialect + ?Sized),
+    dialect: &D,
     module_edits: ModuleEdits,
-) -> Result<(Ordered, Operations), Error> {
+) -> Result<(Ordered<super::Canonical<D>>, Operations), Error> {
     // Settlement can put a validator after seed rows. Preparation's empty
     // context cannot certify that final position (DEC-1503.4); seal the same
     // risks saved-plan validation will derive, including in operation copies.
@@ -42,7 +42,14 @@ pub(crate) fn finish(
         module_edits,
     );
     let operations = reordered_operations(&operations, sequence);
-    Ok((ordered, operations))
+    ordered.changes.identities = Some(operations.clone());
+    Ok((
+        Ordered {
+            changes: super::plan::canonical(ordered.changes, dialect),
+            proof: ordered.proof,
+        },
+        operations,
+    ))
 }
 
 /// Preserve the operation IDs assigned in expansion order. This produces a

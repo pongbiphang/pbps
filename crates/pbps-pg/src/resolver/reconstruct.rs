@@ -204,18 +204,18 @@ impl Reconstruction {
     ///     pbps_pg::resolver::reconstruct::Reconstruction::new(pg, changes, ids);
     /// }
     /// ```
-    pub fn new(
+    pub fn new<S: Clone>(
         dialect: &crate::Postgres,
-        bootstrap: &pbps_diff::order::PlanningPlan,
+        bootstrap: &pbps_diff::order::PlanningPlan<S>,
         ids: &pbps_model::IdsFile,
     ) -> Result<Self, ReconstructError> {
         Self::with_dependencies(dialect, bootstrap, ids, &pbps_model::ModuleDeps::new())
     }
 
     #[allow(clippy::wildcard_enum_match_arm)]
-    pub fn with_dependencies(
+    pub fn with_dependencies<S: Clone>(
         dialect: &crate::Postgres,
-        bootstrap: &pbps_diff::order::PlanningPlan,
+        bootstrap: &pbps_diff::order::PlanningPlan<S>,
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Self, ReconstructError> {

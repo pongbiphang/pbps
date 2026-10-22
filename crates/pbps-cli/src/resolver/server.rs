@@ -63,7 +63,7 @@ pub struct ScopeRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct BindingRequest<'a> {
     /// The plan from an empty schema to `desired`, as the differ produces it.
-    pub bootstrap: &'a pbps_diff::order::PlanningPlan,
+    pub bootstrap: &'a pbps_diff::order::DiffPlan,
     /// The declarations. Scratch's user schemas hold these and nothing else.
     pub desired: &'a pbps_model::Schema,
     /// The target's managed side, by the names pbps's own model gives it.
@@ -72,8 +72,8 @@ pub struct BindingRequest<'a> {
 
 /// Complete same-capture qualified plan. It contains only ordered typed
 /// changes and keyed evidence; no raw target or scratch capture escapes.
-pub struct ResolvedPlan {
-    pub changes: pbps_diff::order::PlanningPlan,
+pub struct ResolvedPlan<S = pbps_diff::order::Canonical<pbps_pg::Postgres>> {
+    pub changes: pbps_diff::order::PlanningPlan<S>,
     pub evidence: pbps_model::resolver::ResolverEvidence,
 }
 

@@ -26,6 +26,15 @@ macro_rules! refuse {
     ($($arg:tt)*) => { return Err(AdmissionError::message(format!($($arg)*))) };
 }
 
+/// Only a newly sealed or checked artifact may be written or used for an
+/// executable checksum. The model DTO remains readable untrusted wire data.
+pub trait ArtifactView: super::plan::sealed::Sealed {
+    fn wire(&self) -> &SavedPlan;
+    fn checksum(&self) -> String {
+        self.wire().checksum()
+    }
+}
+
 /// A reviewed wire artifact accepted by the existing artifact checks. Its
 /// checksum-pinned sequence is trusted under SPEC's saved-plan contract;
 /// admission neither reorders it nor enables the deferred release verifier.
@@ -59,6 +68,11 @@ impl<D: ?Sized> AdmittedPlan<D> {
 impl<D: ?Sized> std::ops::Deref for AdmittedPlan<D> {
     type Target = SavedPlan;
     fn deref(&self) -> &SavedPlan {
+        &self.wire
+    }
+}
+impl<D: ?Sized> ArtifactView for AdmittedPlan<D> {
+    fn wire(&self) -> &SavedPlan {
         &self.wire
     }
 }
@@ -147,6 +161,11 @@ impl<D: ?Sized> Clone for SealedPlan<D> {
             wire: self.wire.clone(),
             ordered: self.ordered.clone(),
         }
+    }
+}
+impl<D: ?Sized> ArtifactView for SealedPlan<D> {
+    fn wire(&self) -> &SavedPlan {
+        &self.wire
     }
 }
 impl<D: ?Sized> SealedPlan<D> {
@@ -374,10 +393,11 @@ pub fn validate_saved_plan(
              revision; use a transactional plan for multiple changes."
         );
     }
-    plan.ids.validate().map_err(|error| {
-        AdmissionError::message(format!(
-            "the plan's post-apply identity mapping is inconsistent: {error}"
-        ))
+    plan.ids.validate().map_err(|source| {
+        #[derive(Debug, thiserror::Error)]
+        #[error("the plan's post-apply identity mapping is inconsistent")]
+        struct Identity(#[source] Box<dyn std::error::Error + Send + Sync>);
+        AdmissionError::from_error(Identity(Box::new(source)))
     })?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;

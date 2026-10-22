@@ -14,7 +14,7 @@ mod part_risks;
 pub(crate) fn ordinary(
     schema: &Schema,
     ids: &IdsFile,
-    dialect: &dyn Dialect,
+    dialect: &(dyn Dialect + 'static),
 ) -> Result<ChangeSet, String> {
     ordinary_with_dependencies(schema, ids, &ModuleDeps::new(), dialect)
 }
@@ -23,7 +23,7 @@ fn ordinary_with_dependencies(
     schema: &Schema,
     ids: &IdsFile,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(dyn Dialect + 'static),
 ) -> Result<ChangeSet, String> {
     let empty = Schema::default();
     let before_ids = IdsFile::default();

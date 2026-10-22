@@ -36,6 +36,14 @@ enforcement. Loaded artifacts use the separate checked `AdmittedPlan` trust
 contract, never a claim that admission ordered them. The release verifier stays
 off, and no rank, tie-break or ordering pass is added.
 
+The canonical deployment route also consumes RLS policy-dependent facts before
+certification. The final policy/flag setup and catalog-owner release settlement
+remain after the existing rewrite schedule and before creation-risk refresh.
+`order::row_security` selects the same opening-UID releases and retains the
+existing combined effect, generated, slot and module-catalog graph only for
+those releases. PostgreSQL reads the facts; the CLI cannot write back a raw
+permutation or mint authority by running this intermediate stage alone.
+
 ## The mechanism
 
 The differ sorts every planned change by, in order:

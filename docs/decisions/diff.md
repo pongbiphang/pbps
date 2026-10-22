@@ -7890,128 +7890,6 @@ the existing split and woven partition-default pins, and the live
 pinned PostgreSQL 16 and 18 fixtures.
 
 
-<a id="dec-1959-5"></a>
-
-**DEC-1959.5. Execution authority belongs to a completed canonical ordering
-route, with immutable planning results and a separate saved-artifact admission.**
-Part of #1959, S7 PR5a–5c. The maintainer chose compiler enforcement on
-2026-10-19, with no grep fallback and with the release verifier still off.
-`PlanningPlan` is an immutable, non-executable intermediate result. A
-settlement, expansion or differ result is not permission to emit or apply SQL.
-`propose` starts fresh logical PlanningPlan input without execution authority;
-an external copy must still complete the canonical route. Raw ChangeSet
-settlement belongs inside `pbps-diff::order`. Public planning
-stages consume the owned intermediate and facts, constraints or typed rewrites;
-only a completed canonical route may mint `OrderedPlan`. Its payload, source
-mapping and proof must stay together. No mutable accessor, public downgrade,
-raw conversion, deserialization or unchecked fixture factory grants authority.
-Fixtures use a test-only singleton or complete production entry points.
-The singleton certificate factory exists only under `cfg(test)` or the non-default
-`test-fixtures` feature enabled by engine and CLI dev-dependencies, never in ordinary
-CLI or release builds.
-
-Read-only access and a private certificate constructor are insufficient on
-their own. The reproduced external-consumer counterexample first ordered
-`a -> b` and `b -> c` with the required second-before-first edge, cloned the
-read-only payload, reversed it outside order, then passed that copy through a
-public empty schedule. The former API minted a fresh OrderedPlan without the
-original edge, and real PostgreSQL lowering accepted the wrong rename order.
-This was a compiler/API demonstration; its SQL was not executed. The
-`OrderedPlan` compile-fail counterexample pins external reorder plus empty
-settle failing to reach `PlanView`. Intermediate planning must not implement
-that trait. Carrying every earlier constraint forward is not the remedy:
-current stages deliberately settle separately, and constraint unions can
-change bytes or invent cycles. Preserve every stage, its refusal timing and
-its existing ranks and Sink tie-break. Compatibility chains exist only for
-byte-identical output, as in DEC-1959.1, DEC-1959.3 and DEC-1959.4.
-
-A loaded SavedPlan is the untrusted wire DTO, not evidence that ordering ran.
-Checked admission constructs `AdmittedPlan`, never OrderedPlan. Both executable
-types implement diff's sealed PlanView; caller-defined views do not. Admission
-trusts the reviewed, checksum-pinned wire order as-is under SPEC's saved-plan
-contract, without reordering or enabling the release verifier. Version,
-checksum, origin, identity, analysis, risk and mode checks retain their existing
-order and refusal priority. Newly saved artifacts bind metadata to the exact
-completed OrderedPlan. Wire fields, defaults, version, serialization order,
-checksum bytes and resolver fingerprints do not change.
-Admission computes the artifact checksum and checks the approved checksum,
-origin and dialect itself after the version refusal and before payload validation.
-Execution mode is bound to the certified input, checked when sealing metadata,
-and read by lowering rather than supplied by its caller.
-OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
-dialect's invariant type brand through PlanView and PlanDialect, so real engines
-cannot lower another engine's certificate and sealing cannot relabel its dialect.
-Lowering an OrderedPlan uses its retained logical origins and operation IDs;
-a newly SealedPlan delegates to that same ordered collection. Admission is the
-saved-artifact exception: DEC-1958.3 omits origins from serialized changes, so
-AdmittedPlan treats each reviewed wire step as a logical input with wire-local
-IDs. It never guesses lost planning provenance from subjects, UIDs or optional
-in-memory annotations. These IDs need not equal the original planning IDs;
-SQL, saved-plan bytes, checksums and versions remain unchanged.
-RLS policy setup and catalog-owner releases use the same immutable planning
-boundary: order owns their final settlement, generated-table and name-slot
-constraints, and creation-risk write-back, while callers supply catalog facts.
-The create-only RLS validator is shared by saved admission and transitional CLI
-consumers; the frozen master RLS settlement pins operations, SQL, checksums and
-refusals without enabling a raw production write-back.
-
-PlanDialect's associated plan input avoids a dependency cycle: concrete engines
-bind it to the sealed diff view, while pure semantic consumers remain generic.
-The sole new production crate edge is a normal `pbps-mssql -> pbps-diff` dependency,
-matching PostgreSQL. Database transport and administrative SQL retain their
-existing responsibilities. Lowering retains immutable operation groups; emit,
-render, writer and execution entry points require the certified input rather
-than replaceable raw changes or statements.
-
-The scratch route must retain source-mapped, SQL-free blueprint parts until its existing
-function/phase and generated-constraint settlements finish separately. Private
-emitter probes may answer finite lexical metadata questions and preserve the
-original emission-refusal timing; they grant no executable statement collection.
-Only the completed blueprint is lowered. Engine-generated name observations and
-trials remain connection-local and cannot permute that blueprint. The cfg(test)
-frozen oracle compares SQL and every Step field through both old settlements.
-PostgreSQL and SQL Server fixture oracles pin SQL, artifact bytes and checksums;
-compiler-negative doctests must run explicitly in CI because `--all-targets`
-does not run them.
-
-The implementation is delivered as three stacked PRs. PR5a owns immutable
-producer results, source/proof write-backs and existing normalization, with
-raw consumer APIs explicitly transitional. PR5b moves scratch's blueprint
-before lowering and migrates engine inputs and emission fixtures. PR5c gates
-artifact, apply, explain, bootstrap and rehearsal consumers and removes the
-transitional raw entries. Only the completed final head establishes compiler
-enforcement. Snapshot adapters in cfg(test) feed the real logical input and
-stage APIs and return only raw observations for byte oracles; they cannot
-construct execution authority. The fixture feature remains off in shipping builds.
-
-
-PR5b gives scratch its own complete canonical route without exposing a generic
-schedule-to-certificate finalizer. The engine supplies an opaque associated
-blueprint input. Order retains original part slots and operation IDs, applies
-function/phase compatibility, then generated constraints, with no union. Its
-ScratchPlan is branded by that engine, is immutable, and does not implement
-the general PlanView. A caller-defined engine therefore cannot use its result
-as PostgreSQL's scratch input or as a general OrderedPlan. PostgreSQL's
-blueprint metadata has no SQL field; the old Step SQL snapshot exists only
-under cfg(test). Engine-generated names and created identities remain live
-metadata observations, without permuting operations or replacing SQL.
-
-Lowering returns an immutable LoweredPlan branded by the actual emitter, not
-only by a shared PlanView input type. Otherwise a caller-defined emitter using
-that same input type could manufacture another engine's executable collection.
-Construction requires a concrete emitter; a trait object cannot erase that
-brand. Runtime engine routing must retain concrete engine variants.
-Operation groups retain source IDs and origins, including zero-statement
-operations. Only the associated input can reach lower/lower_all and script
-rendering. Scratch executes these immutable groups directly. Planning-time
-intermediate-name probes return only metadata at their previous refusal point.
-Raw emit/render entries remain explicitly named legacy compatibility entries
-for PR5c; obsolete raw scratch and raw lowering entries are removed. Frozen
-reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
-all Statement fields, both modes, SQL rendering, deterministic artifact bytes
-and checksums through real singleton routes; the non-default singleton
-fixture feature remains restricted to dev-dependencies.
-
 <a id="dec-2101-1"></a>
 
 **DEC-2101.1. Generated key-name replay follows a constraint trigger's
@@ -8087,3 +7965,137 @@ refuses both table forms on both servers and applies after removing the
 comment. `a_trigger_rebuild_reads_its_own_constraint_attachments` checks
 the direct rebuild reader with a comment and a security label, and with
 bare constraint and ordinary triggers as negative controls.
+
+<a id="dec-1959-5"></a>
+
+**DEC-1959.5. Execution authority belongs to a completed canonical ordering
+route, with immutable planning results and a separate saved-artifact admission.**
+Part of #1959, S7 PR5a–5c. The maintainer chose compiler enforcement on
+2026-10-19, with no grep fallback and with the release verifier still off.
+`PlanningPlan` is an immutable, non-executable intermediate result. A
+settlement, expansion or differ result is not permission to emit or apply SQL.
+`propose` starts fresh logical PlanningPlan input without execution authority;
+an external copy must still complete the canonical route. Raw ChangeSet
+settlement belongs inside `pbps-diff::order`. Public planning
+stages consume the owned intermediate and facts, constraints or typed rewrites;
+only a completed canonical route may mint `OrderedPlan`. Its payload, source
+mapping and proof must stay together. No mutable accessor, public downgrade,
+raw conversion, deserialization or unchecked fixture factory grants authority.
+Fixtures use a test-only singleton or complete production entry points.
+The singleton certificate factory exists only under `cfg(test)` or the non-default
+`test-fixtures` feature enabled by engine and CLI dev-dependencies, never in ordinary
+CLI or release builds.
+
+Read-only access and a private certificate constructor are insufficient on
+their own. The reproduced external-consumer counterexample first ordered
+`a -> b` and `b -> c` with the required second-before-first edge, cloned the
+read-only payload, reversed it outside order, then passed that copy through a
+public empty schedule. The former API minted a fresh OrderedPlan without the
+original edge, and real PostgreSQL lowering accepted the wrong rename order.
+This was a compiler/API demonstration; its SQL was not executed. The
+`OrderedPlan` compile-fail counterexample pins external reorder plus empty
+settle failing to reach `PlanView`. Intermediate planning must not implement
+that trait. Carrying every earlier constraint forward is not the remedy:
+current stages deliberately settle separately, and constraint unions can
+change bytes or invent cycles. Preserve every stage, its refusal timing and
+its existing ranks and Sink tie-break. Compatibility chains exist only for
+byte-identical output, as in DEC-1959.1, DEC-1959.3 and DEC-1959.4.
+
+A loaded SavedPlan is the untrusted wire DTO, not evidence that ordering ran.
+Checked admission constructs `AdmittedPlan`, never OrderedPlan. Both executable
+types implement diff's sealed PlanView; caller-defined views do not. Admission
+trusts the reviewed, checksum-pinned wire order as-is under SPEC's saved-plan
+contract, without reordering or enabling the release verifier. Version,
+checksum, origin, identity, analysis, risk and mode checks retain their existing
+order and refusal priority. Newly saved artifacts bind metadata to the exact
+completed OrderedPlan. Wire fields, defaults, version, serialization order,
+checksum bytes and resolver fingerprints do not change.
+Admission computes the artifact checksum and checks the approved checksum,
+origin and dialect itself after the version refusal and before payload validation.
+Execution mode is bound to the certified input, checked when sealing metadata,
+and read by lowering rather than supplied by its caller.
+OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
+dialect's invariant type brand through PlanView and PlanDialect, so real engines
+cannot lower another engine's certificate and sealing cannot relabel its dialect.
+Lowering an OrderedPlan uses its retained logical origins and operation IDs;
+a newly SealedPlan delegates to that same ordered collection. Admission is the
+saved-artifact exception: DEC-1958.3 omits origins from serialized changes, so
+AdmittedPlan treats each reviewed wire step as a logical input with wire-local
+IDs. It never guesses lost planning provenance from subjects, UIDs or optional
+in-memory annotations. These IDs need not equal the original planning IDs;
+SQL, saved-plan bytes, checksums and versions remain unchanged.
+RLS policy setup and catalog-owner releases use the same immutable planning
+boundary: order owns their final settlement, generated-table and name-slot
+constraints, and creation-risk write-back, while callers supply catalog facts.
+The create-only RLS validator is shared by saved admission and transitional CLI
+consumers; the frozen master RLS settlement pins operations, SQL, checksums and
+refusals without enabling a raw production write-back.
+The canonical deployment route consumes policy-dependent facts at that same
+final RLS stage before granting execution authority. Pure policy facts and
+owner-release selection live in order beside module facts; PostgreSQL retains
+the catalog reads and re-exports their shared value types. The original
+policy-owner teardown, paired routine drop/create and combined release graph
+keep their existing order and refusal priority, without a new stage or crate edge.
+
+PlanDialect's associated plan input avoids a dependency cycle: concrete engines
+bind it to the sealed diff view, while pure semantic consumers remain generic.
+The sole new production crate edge is a normal `pbps-mssql -> pbps-diff` dependency,
+matching PostgreSQL. Database transport and administrative SQL retain their
+existing responsibilities. Lowering retains immutable operation groups; emit,
+render, writer and execution entry points require the certified input rather
+than replaceable raw changes or statements.
+
+The scratch route must retain source-mapped, SQL-free blueprint parts until its existing
+function/phase and generated-constraint settlements finish separately. Private
+emitter probes may answer finite lexical metadata questions and preserve the
+original emission-refusal timing; they grant no executable statement collection.
+Only the completed blueprint is lowered. Engine-generated name observations and
+trials remain connection-local and cannot permute that blueprint. The cfg(test)
+frozen oracle compares SQL and every Step field through both old settlements.
+PostgreSQL and SQL Server fixture oracles pin SQL, artifact bytes and checksums;
+compiler-negative doctests must run explicitly in CI because `--all-targets`
+does not run them.
+
+The implementation is delivered as three stacked PRs. PR5a owns immutable
+producer results, source/proof write-backs and existing normalization, with
+raw consumer APIs explicitly transitional. PR5b moves scratch's blueprint
+before lowering and migrates engine inputs and emission fixtures. PR5c gates
+artifact, apply, explain, bootstrap and rehearsal consumers and removes the
+transitional raw entries. Only the completed final head establishes compiler
+enforcement. Snapshot adapters in cfg(test) feed the real logical input and
+stage APIs and return only raw observations for byte oracles; they cannot
+construct execution authority. The fixture feature remains off in shipping builds.
+
+
+PR5b gives scratch its own complete canonical route without exposing a generic
+schedule-to-certificate finalizer. The engine supplies an opaque associated
+blueprint input. Order retains original part slots and operation IDs, applies
+function/phase compatibility, then generated constraints, with no union. Its
+ScratchPlan is branded by that engine, is immutable, and does not implement
+the general PlanView. A caller-defined engine therefore cannot use its result
+as PostgreSQL's scratch input or as a general OrderedPlan. PostgreSQL's
+blueprint metadata has no SQL field; the old Step SQL snapshot exists only
+under cfg(test). Engine-generated names and created identities remain live
+metadata observations, without permuting operations or replacing SQL.
+
+Lowering returns an immutable LoweredPlan branded by the actual emitter, not
+only by a shared PlanView input type. Otherwise a caller-defined emitter using
+that same input type could manufacture another engine's executable collection.
+Construction requires a concrete emitter; a trait object cannot erase that
+brand. Runtime engine routing must retain concrete engine variants.
+Operation groups retain source IDs and origins, including zero-statement
+operations. Only the associated input can reach lower/lower_all and script
+rendering. Scratch executes these immutable groups directly. Planning-time
+intermediate-name probes return only metadata at their previous refusal point.
+Raw emit/render entries remain explicitly named legacy compatibility entries
+for PR5c; obsolete raw scratch and raw lowering entries are removed. Frozen
+reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
+all Statement fields, both modes, SQL rendering, deterministic artifact bytes
+and checksums through real singleton routes; the non-default singleton
+fixture feature remains restricted to dev-dependencies.
+
+The completed canonical intermediate also retains the invariant planner type.
+Its final constructor binds that same concrete dialect; selecting a different
+engine there must not relabel an already completed route. Semantic observations
+carry an erased brand that neither real emitter accepts. The transitional CLI
+adapter remains private to PR5c's first commit and is removed with its consumers.

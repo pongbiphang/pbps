@@ -318,7 +318,7 @@ mod producer {
     pub(super) async fn produce(
         request: &Request<'_>,
         driver: pbps_db::Driver,
-        bootstrap: &pbps_diff::order::PlanningPlan,
+        bootstrap: &pbps_diff::order::DiffPlan,
     ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
             bootstrap,
@@ -806,7 +806,19 @@ mod tests {
         let refusal = |target_identity| match rt.block_on(producer::produce(
             &request(target_identity),
             pbps_db::Driver::Postgres,
-            &pbps_diff::order::propose(pbps_model::ChangeSet::default()),
+            &pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &pbps_model::Schema::default(),
+                    ids: &pbps_model::IdsFile::default(),
+                },
+                pbps_diff::Side {
+                    schema: &pbps_model::Schema::default(),
+                    ids: &pbps_model::IdsFile::default(),
+                },
+                &pbps_dialect::MinimalDialect,
+                &pbps_model::Hints::default(),
+            )
+            .unwrap(),
         )) {
             Err(Refused::Unanswerable(error)) => error.to_string(),
             Err(Refused::Finding(finding)) => panic!("not answered: {}", finding.id),

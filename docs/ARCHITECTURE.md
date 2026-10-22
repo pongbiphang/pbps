@@ -55,6 +55,10 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   crate names either. A third engine is a compile error in every `engine`
   function until it has an answer for each.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
+- Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
+  PostgreSQL owns their reads and re-exports the shared value types. The
+  canonical order route selects and settles policy-owner releases before
+  granting execution authority; this adds no crate dependency (DEC-1959.5).
 - Schema semantics and typed read reports reach the synchronous UI only through
   `current_exe()` run with `--no-input`. CLI supplies its launch token and the
   documentation style hash. The shipped viewer reads no project files itself;

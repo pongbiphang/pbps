@@ -21,6 +21,108 @@ pub(super) mod sealed {
 /// ```
 pub trait PlanView<D: ?Sized>: PlanPayload + sealed::Sealed {}
 
+/// Draft inputs have no execution authority, including after arbitrary settlement.
+#[derive(Debug, Clone)]
+pub struct Draft;
+/// The differ's immutable result has completed its existing sort/rename stages.
+#[derive(Debug, Clone)]
+pub struct Differ;
+/// Raw copies never acquire the differ's completed-stage provenance.
+/// ```compile_fail
+/// let raw = pbps_diff::order::propose(pbps_model::ChangeSet::default());
+/// let _: pbps_diff::order::DiffPlan = raw;
+/// ```
+pub type DiffPlan = PlanningPlan<Differ>;
+
+mod route_state {
+    pub trait Sealed {}
+}
+/// Which immutable inputs may complete the shared route. A raw proposal stays
+/// non-executable even after the shared stages, so a copied/reversed payload
+/// cannot impersonate the differ's completed stages.
+pub trait RouteState: route_state::Sealed + Clone + std::fmt::Debug {
+    type Output<D: pbps_dialect::Dialect + ?Sized>: Clone + std::fmt::Debug;
+    type Input: Clone + std::fmt::Debug;
+}
+impl route_state::Sealed for Draft {}
+impl RouteState for Draft {
+    type Output<D: pbps_dialect::Dialect + ?Sized> = Draft;
+    type Input = Draft;
+}
+impl route_state::Sealed for Differ {}
+impl RouteState for Differ {
+    type Output<D: pbps_dialect::Dialect + ?Sized> = Canonical<D>;
+    type Input = Differ;
+}
+impl<D: ?Sized> route_state::Sealed for Canonical<D> {}
+impl<E: ?Sized> RouteState for Canonical<E> {
+    type Output<D: pbps_dialect::Dialect + ?Sized> = Canonical<D>;
+    type Input = Differ;
+}
+
+pub(crate) fn differ(plan: PlanningPlan) -> DiffPlan {
+    state(plan)
+}
+pub(super) fn state<S, T>(plan: PlanningPlan<S>) -> PlanningPlan<T> {
+    let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
+    done.identities = plan.identities;
+    done
+}
+
+/// This marker is produced only by the complete declaration/catalog route.
+pub struct Canonical<D: ?Sized>(std::marker::PhantomData<fn(&D) -> &D>);
+impl<D: ?Sized> Clone for Canonical<D> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<D: ?Sized> std::fmt::Debug for Canonical<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Canonical")
+    }
+}
+/// A completed route may continue through the existing order-owned connected
+/// stages and annotations. Its immutable payload cannot be replaced by a draft.
+/// Even running the shared stages on copied raw input cannot impersonate
+/// the differ's preceding sort and rename stages.
+/// ```compile_fail
+/// use pbps_diff::{Side, order::{deployment::{Sources, schedule::{Declarations, Facts, schedule}}, propose}};
+/// fn copied_input(dialect: &pbps_dialect::MinimalDialect) {
+/// let schema = pbps_model::Schema::default();
+/// let ids = pbps_model::IdsFile::default();
+/// let result = schedule(propose(pbps_model::ChangeSet::default()), &Declarations {
+///     schema: &schema, sources: Sources { before: Side { schema: &schema, ids: &ids }, after: &ids },
+///     module_deps: &Default::default(),
+/// }, &Facts::default(), dialect).unwrap();
+/// let _ = result.changes.ordered(pbps_model::PlanMode::Transactional, dialect);
+/// }
+/// ```
+pub type CanonicalPlan<D> = PlanningPlan<Canonical<D>>;
+
+pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
+    plan: PlanningPlan,
+    _dialect: &D,
+) -> CanonicalPlan<D> {
+    let identities = plan.identities.or_else(|| {
+        Some(pbps_model::operation::Operations::expanded(
+            plan.logical,
+            plan.origins
+                .iter()
+                .cloned()
+                .zip(plan.payload.changes.iter().cloned()),
+            pbps_model::operation::ModuleEdits::InPlace,
+        ))
+    });
+    let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
+    done.identities = identities;
+    done
+}
+impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
+    pub fn ordered(self, mode: PlanMode, dialect: &D) -> OrderedPlan<D> {
+        OrderedPlan::from_canonical(self, mode, dialect)
+    }
+}
+
 /// An immutable intermediate result. Ordering another stage may replace it,
 /// but neither it nor a cloned payload can be passed to an engine.
 ///
@@ -30,14 +132,16 @@ pub trait PlanView<D: ?Sized>: PlanPayload + sealed::Sealed {}
 /// }
 /// ```
 #[derive(Debug, Clone)]
-pub struct PlanningPlan {
+pub struct PlanningPlan<S = Draft> {
+    state: std::marker::PhantomData<S>,
     pub(super) payload: ChangeSet,
     pub(super) origins: Vec<pbps_model::operation::Origin>,
     pub(super) logical: usize,
     pub(super) proof: OrderingProof,
+    pub(super) identities: Option<pbps_model::operation::Operations>,
 }
 
-impl PlanningPlan {
+impl<S> PlanningPlan<S> {
     pub(super) fn new(
         payload: ChangeSet,
         origins: Vec<pbps_model::operation::Origin>,
@@ -46,10 +150,12 @@ impl PlanningPlan {
     ) -> Self {
         assert_eq!(payload.changes.len(), origins.len());
         Self {
+            state: std::marker::PhantomData,
             payload,
             origins,
             logical,
             proof,
+            identities: None,
         }
     }
     pub fn changes(&self) -> &ChangeSet {
@@ -76,26 +182,26 @@ impl PlanningPlan {
         self.proof = OrderingProof::new(&self.payload, Default::default()).unwrap();
     }
 }
-impl std::ops::Deref for PlanningPlan {
+impl<S> std::ops::Deref for PlanningPlan<S> {
     type Target = ChangeSet;
     fn deref(&self) -> &ChangeSet {
         &self.payload
     }
 }
-impl PartialEq for PlanningPlan {
-    fn eq(&self, other: &Self) -> bool {
+impl<S, T> PartialEq<PlanningPlan<T>> for PlanningPlan<S> {
+    fn eq(&self, other: &PlanningPlan<T>) -> bool {
         self.payload == other.payload
             && self.origins == other.origins
             && self.logical == other.logical
     }
 }
-impl PartialEq<ChangeSet> for PlanningPlan {
+impl<S> PartialEq<ChangeSet> for PlanningPlan<S> {
     fn eq(&self, other: &ChangeSet) -> bool {
         self.payload == *other
     }
 }
-impl PartialEq<PlanningPlan> for ChangeSet {
-    fn eq(&self, other: &PlanningPlan) -> bool {
+impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
+    fn eq(&self, other: &PlanningPlan<S>) -> bool {
         *self == other.payload
     }
 }
@@ -114,8 +220,12 @@ pub fn propose(payload: ChangeSet) -> PlanningPlan {
 
 /// Moves an intermediate out of an adapter, preserving the old empty-on-error
 /// behavior of mem::take without exposing a Default execution certificate.
-pub fn take(plan: &mut PlanningPlan) -> PlanningPlan {
-    std::mem::replace(plan, propose(ChangeSet::default()))
+pub fn take<S>(plan: &mut PlanningPlan<S>) -> PlanningPlan<S> {
+    let empty = propose(ChangeSet::default());
+    std::mem::replace(
+        plan,
+        PlanningPlan::new(empty.payload, empty.origins, empty.logical, empty.proof),
+    )
 }
 
 /// A raw snapshot cannot enter settlement without starting new, non-executable
@@ -195,14 +305,40 @@ impl<D: ?Sized> OrderedPlan<D> {
         D: pbps_dialect::Dialect,
     {
         Self {
-            identities: pbps_model::operation::Operations::expanded(
-                plan.logical,
-                plan.origins
-                    .iter()
-                    .cloned()
-                    .zip(plan.payload.changes.iter().cloned()),
-                pbps_model::operation::ModuleEdits::InPlace,
-            ),
+            identities: plan.identities.unwrap_or_else(|| {
+                pbps_model::operation::Operations::expanded(
+                    plan.logical,
+                    plan.origins
+                        .iter()
+                        .cloned()
+                        .zip(plan.payload.changes.iter().cloned()),
+                    pbps_model::operation::ModuleEdits::InPlace,
+                )
+            }),
+            changes: plan.payload,
+            origins: plan.origins,
+            proof: plan.proof,
+            mode,
+            dialect: dialect.name(),
+            brand: std::marker::PhantomData,
+        }
+    }
+
+    fn from_canonical(plan: CanonicalPlan<D>, mode: PlanMode, dialect: &D) -> Self
+    where
+        D: pbps_dialect::Dialect,
+    {
+        Self {
+            identities: plan.identities.unwrap_or_else(|| {
+                pbps_model::operation::Operations::expanded(
+                    plan.logical,
+                    plan.origins
+                        .iter()
+                        .cloned()
+                        .zip(plan.payload.changes.iter().cloned()),
+                    pbps_model::operation::ModuleEdits::InPlace,
+                )
+            }),
             changes: plan.payload,
             origins: plan.origins,
             proof: plan.proof,

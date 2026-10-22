@@ -3080,6 +3080,20 @@ pub trait Dialect {
         })
     }
 
+    /// Report-only emission metadata. Preview artifacts remain explainable
+    /// without admission granting permission to emit or execute their SQL.
+    fn statement_count(
+        &self,
+        _change: &Change,
+        _strategy: Strategy,
+        _mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        Err(DialectError::NotBuilt {
+            dialect: self.name(),
+            part: "statement-count observations".into(),
+        })
+    }
+
     /// Planning-time metadata only. Concrete engines answer through a private
     /// probe at the old refusal point; no executable statement group escapes.
     fn intermediate_tables(
