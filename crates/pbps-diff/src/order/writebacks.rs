@@ -1,7 +1,7 @@
 //! Applications of existing ordering proposals and closed payload edits.
 //! Callers supply facts; only order writes the resulting operation sequence.
 use pbps_dialect::Dialect;
-use pbps_model::{Change, Finding, IdsFile, PlannedChange, TableName};
+use pbps_model::{Change, Finding, IdsFile, PlannedChange, RoleName, TableName};
 use std::collections::BTreeMap;
 
 pub fn scatter(
@@ -65,7 +65,10 @@ fn address(change: &mut Change, table: &TableName) {
     }
 }
 
-pub fn role_members(changes: &mut super::PlanningPlan, members: &BTreeMap<String, Vec<String>>) {
+pub fn role_members(
+    changes: &mut super::PlanningPlan,
+    members: &BTreeMap<RoleName, Vec<RoleName>>,
+) {
     for planned in &mut changes.payload.changes {
         if let Change::DropRole {
             name, members: of, ..

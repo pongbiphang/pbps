@@ -10,7 +10,10 @@ mod declaration_file;
 const NAME: &str = "role\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"role\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
-fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnapshot) {
+fn artifacts(
+    text: &str,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) -> (Schema, SavedPlan, StateSnapshot) {
     let target = GrantTarget::Object(TableName::new("app", text));
     let mut role = Role {
         description: Some("a role's original text".into()),
@@ -91,7 +94,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
 #[test]
 fn role_artifacts_keep_master_bytes_checksums_sql_and_declarations() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
         &pbps_mssql::Mssql,
     ] {
         let (schema, mut plan, mut state) = artifacts(NAME, dialect);
