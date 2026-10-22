@@ -88,6 +88,50 @@ modes, so a caller-defined emitter cannot substitute an executable collection.
 The normal `pbps-mssql -> pbps-diff` edge remains the only added workspace
 crate dependency; no transport/engine dependency enters diff or dialect.
 
+## New-engine ordering contract
+
+An engine supplies ordering facts and lowering semantics to the shared
+compiler; it supplies no reorder pass. The complete contract and pipeline are
+in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
+
+- `Dialect::engine_effects` adds pure, operation-local effects to the portable
+  effects. Baseline/desired snapshots establish ownership and the change's
+  other end, not substitute payloads.
+- The shared [`pbps_dialect::slots::slots`](../crates/pbps-dialect/src/slots.rs#L366)
+  mapper uses the engine's `Dialect::shares_namespace_with_tables`,
+  `Dialect::indexes_share_namespace_with_tables`,
+  `Dialect::constraints_share_namespace_with_tables` and `Dialect::overloads`
+  hooks to map addresses into namespaces. Slot equality is a catalog fact
+  under its identifier/collation rules. Unknown equality is reported/skipped,
+  never interpreted as inequality.
+- Engine catalog I/O supplies holders, bindings, dependencies, releases and
+  capabilities as neutral facts. Unread and read-empty remain distinct;
+  `pbps-diff::order` owns their pure constraints and structural application.
+- The emitter supplies `Statement` transaction and batch requirements,
+  intermediate rename/create/release names and execution metadata. Lowering
+  retains source IDs/origins and indivisible statement groups, branded by the
+  concrete engine. No consumer infers this metadata from SQL or reorders it.
+- Engine-specific obligations use typed expansions with equivalence,
+  per-part risk, targeted progress and budget checks. Canonical scheduling,
+  scratch blueprints and connected continuations finish inside order; only
+  certified input reaches rendering, sealing and execution.
+
+Ordinary transactional plans refuse non-transactional statements
+([`reject_non_transactional`](../crates/pbps-cli/src/deploy.rs#L9907)).
+A staged plan contains exactly one logical change
+([planning limit](../crates/pbps-cli/src/deploy.rs#L7600)); its lowered
+statements run in order, each committed, under the existing checkpoint and
+resume protocol ([staged executor](../crates/pbps-cli/src/deploy.rs#L8908),
+ADR-0003). A new engine whose single change lowers to several non-transactional
+statements uses this staged route and must make each statement resumable or
+idempotent under that protocol. Several logical changes needing
+non-transactional execution remain refused until a separate multi-transaction
+design exists. Batch boundaries do not authorize commits.
+The release verifier remains off; tests/debug replay and live commutation
+checks remain complementary guards, with mutation audits exposing missing
+effects. This contract adds no dependency, rank, tie-break, settlement stage,
+constraint union or saved-plan field.
+
 ## Isolated compose
 
 [ADR-0017](ADR-0017-isolated-compose.md) is implemented and qualified (#745–#748).

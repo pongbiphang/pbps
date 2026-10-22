@@ -10,22 +10,34 @@ by an exact-text patch, runs the order tests, and restores the file.
 Run from the repository root, with a clean `effects.rs`:
 
     python3 scripts/effect-mutations.py [--audit] [NAME ...]
+    python3 scripts/effect-mutations.py --s7 [--output DIR] [NAME ...]
 
 With `--audit` it runs the commutation suite's audit instead
 (`PBPS_COMMUTE_ALL=1`, both engines, which need `PBPS_TEST_PG_DB` and
 `PBPS_TEST_DB` as the live scripts set them): whether a scenario on the
 engine holds the dependency each effect states.
 
+The --s7 mode repeats the original M01–M20 sample and command matrix from
+#1965 (including the five initially caught effects), with per-command logs,
+source backup/checksums and shadow observations under target/s7-closure.
+A failure counts only after its exact tests pass on the restored source;
+confirmation commands, logs and results are recorded per mutation.
+
 It first runs the same commands unmutated, and stops if they fail: a test
 that fails for another reason would read as every mutation caught.
 
-Exits 0 when every mutation fails a test (under `--audit`, every one but
-those `UNSHOWABLE` lists, and none of those), 1 otherwise, and 2 when an
+Exits 0 when every mutation has a confirmed test failure (under `--audit`,
+every one but those `UNSHOWABLE` lists, and none of those), 1 otherwise, and 2 when an
 anchor is missing or the mutated crate does not compile: a patch that matches
 nothing, or code that no longer builds, proves nothing about the tests.
 S7 (#1959) re-runs it; an anchor that moved is updated here, never dropped.
 """
+import argparse
+import hashlib
+import json
 import os
+import re
+import time
 import pathlib
 import subprocess
 import sys
@@ -53,7 +65,7 @@ MUTATIONS = [
      "                self.creates(Resource::Column(ObjectKey::Column(column.clone())));\n",
      ""),
     ("DropColumn: Absent of the column's dependents",
-     "                self.requires_dependents_of_column_gone(&owner, &column.name);\n",
+     "                self.requires_dependents_of_column_gone(&owner, column.name.raw());\n",
      ""),
     ("RenameColumn: Rewrites of the column",
      "                let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));\n"
@@ -99,7 +111,7 @@ MUTATIONS = [
     ("AddIndex: Exists of the indexed columns",
      "                for key in index.columns.iter().map(|c| &c.key) {\n"
      "                    if let IndexKey::Column(c) = key {\n"
-     "                        self.requires_column(table, c, false);\n"
+     "                        self.requires_column(table, c.raw(), false);\n"
      "                    }\n"
      "                }\n",
      ""),
@@ -116,7 +128,7 @@ MUTATIONS = [
      "                    self.requires_key_unreferenced(&owner, &old.columns);\n",
      ""),
     ("DropComputedColumn: Absent of what reads it",
-     "                    self.requires_computed_dependents_gone(&owner, name);\n",
+     "                    self.requires_computed_dependents_gone(&owner, name.raw());\n",
      "                    let _ = name;\n"),
 ]
 
@@ -136,7 +148,7 @@ UNSHOWABLE = {
 }
 
 
-def main(args):
+def legacy_main(args):
     commands = AUDIT if "--audit" in args else TESTS
     selected = [a for a in args if a != "--audit"]
     env = dict(os.environ, PBPS_COMMUTE_ALL="1") if commands is AUDIT else None
@@ -156,7 +168,7 @@ def main(args):
     # variable unset), and would read as every mutation caught.
     baseline = [subprocess.run(c, capture_output=True, text=True, env=env)
                 for c in commands]
-    if any(o.returncode != 0 for o in baseline):
+    if any(test_status(o.returncode, o.stdout + o.stderr) != "passed" for o in baseline):
         print("the unmutated run fails; nothing below would mean anything:")
         print("".join(o.stdout + o.stderr for o in baseline)[-4000:])
         return 2
@@ -172,14 +184,19 @@ def main(args):
                     for c in commands]
             log = "".join(o.stdout + o.stderr for o in outs)
             expected = commands is AUDIT and name in UNSHOWABLE
-            if "test result: FAILED" in log:
+            runs = [{"command": command, "status": test_status(o.returncode, o.stdout + o.stderr),
+                     "failed_tests": failed_tests(o.stdout + o.stderr)}
+                    for command, o in zip(commands, outs)]
+            EFFECTS.write_text(original)
+            status, _ = mutation_result(runs, env)
+            if status == "invalid":
+                print(f"invalid evidence  {name}")
+                broken.append(name)
+            elif status == "killed":
                 print(f"caught    {name}")
                 if expected:
                     print(f"          (listed as unshowable: update UNSHOWABLE)")
                     survived.append(name)
-            elif any(o.returncode != 0 for o in outs):
-                print(f"no build  {name}")
-                broken.append(name)
             elif expected:
                 print(f"unshown   {name}")
             else:
@@ -190,6 +207,181 @@ def main(args):
     if broken:
         return 2
     return 1 if survived else 0
+
+
+# Keep the original M01–M20 order, including the five effects already caught
+# in #1965. The default/--audit modes retain #2091's narrower sample.
+EXTRA = {
+    "DropTable": ("DropTable: Absent of inbound foreign keys",
+                  "                self.requires_inbound_keys_gone(&owner);\n", ""),
+    "AlterColumnNullability": (
+        "AlterColumnNullability: the NOT NULL produced or ended",
+        "                self.nullability_moves(&key, !*to_nullable, *to_nullable);\n", ""),
+    "InsertRow": ("InsertRow: the columns the row writes",
+                  "                written.extend(defaults.keys().map(ColumnName::raw));\n"
+                  "                self.row_writes(table, &owner, &written);\n"
+                  "                // The statement's postcondition",
+                  "                written.extend(defaults.keys().map(ColumnName::raw));\n"
+                  "                // The statement's postcondition"),
+    "Grant": ("Grant: every grant effect",
+              "            Change::Grant { role, target, .. } => self.permission(role, target, true)?,\n",
+              "            Change::Grant { .. } => {},\n"),
+    "PublicExecution": (
+        "PublicExecution: Is of the routine",
+        "            Change::PublicExecution { routine, .. } => {\n"
+        "                self.requires(Requirement::Is(\n"
+        "                    ObjectKey::Module(crate::ModuleId::Routine(routine.clone())),\n"
+        "                    Incarnation::Final,\n"
+        "                ));\n",
+        "            Change::PublicExecution { .. } => {\n"),
+}
+ORIGINAL_KINDS = (
+    "CreateTable", "DropTable", "RenameTable", "AddColumn", "DropColumn",
+    "RenameColumn", "AlterColumnType", "AlterColumnNullability", "AlterColumnDefault",
+    "AddUnique", "AddForeignKey", "AddCheck", "AddIndex", "InsertRow", "DeleteRow",
+    "AlterModule", "Grant", "SetPrimaryKey", "DropComputedColumn", "PublicExecution",
+)
+S7_MUTATIONS = [dict((m[0].split(":")[0], m) for m in MUTATIONS).get(k, EXTRA.get(k))
+                for k in ORIGINAL_KINDS]
+S7_COMMANDS = [
+    ["cargo", "test", "-p", "pbps-model", "--lib"],
+    ["cargo", "test", "-p", "pbps-diff", "--lib"],
+    *[["cargo", "test", "-p", crate, "--test", "engine_effects"]
+      for crate in ("pbps-pg", "pbps-mssql")],
+    *AUDIT,
+]
+
+
+def test_status(code, log):
+    """Classify a harness run; a failure still needs restored-source confirmation."""
+    totals = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed", log)
+    if not totals or not any(int(a) + int(b) for a, b in totals):
+        return "invalid"
+    if code == 0 and all(int(b) == 0 for _, b in totals):
+        return "passed"
+    if code != 0 and any(int(b) for _, b in totals):
+        return "failed"
+    return "invalid"
+
+
+def failed_tests(log):
+    return re.findall(r"^test (.+) \.{3} FAILED$", log, re.M)
+
+
+def mutation_result(runs, env):
+    """The caller must restore the source before confirming every named failure."""
+    if any(r["status"] == "invalid" for r in runs):
+        return "invalid", {"status": "invalid", "reason": "invalid mutated run", "runs": []}
+    failed = [r for r in runs if r["status"] == "failed"]
+    if not failed:
+        return "survived", {"status": "not_needed", "runs": []}
+    if any(not r["failed_tests"] for r in failed):
+        return "invalid", {"status": "invalid", "reason": "empty failed-test list", "runs": []}
+    confirmations = []
+    for run in failed:
+        command = run["command"]
+        split = command.index("--") if "--" in command else len(command)
+        # Replace the suite filter, retaining the ignored/live harness mode.
+        flags = [arg for arg in command[split + 1:]
+                 if arg in ("--ignored", "--include-ignored", "--nocapture", "--show-output")]
+        for name in run["failed_tests"]:
+            exact = command[:split] + ["--", "--exact", name] + flags
+            started = time.monotonic()
+            output = subprocess.run(exact, capture_output=True, text=True, env=env)
+            log = output.stdout + output.stderr
+            status = test_status(output.returncode, log)
+            # An exact rerun must execute the named test, not pass by selecting zero.
+            totals = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed", log)
+            if status == "passed" and totals != [("1", "0")]:
+                status = "invalid"
+            confirmations.append({"test": name, "command": exact, "returncode": output.returncode,
+                                  "status": status, "log": log,
+                                  "seconds": time.monotonic() - started})
+    confirmed = all(r["status"] == "passed" for r in confirmations)
+    return ("killed" if confirmed else "invalid",
+            {"status": "passed" if confirmed else "invalid", "runs": confirmations})
+
+
+def run_case(directory, commands, env):
+    directory.mkdir(parents=True, exist_ok=False)
+    records = []
+    for i, command in enumerate(commands, 1):
+        started = time.monotonic()
+        output = subprocess.run(command, capture_output=True, text=True, env=env)
+        log = output.stdout + output.stderr
+        (directory / f"{i:02}.log").write_text(log)
+        records.append({"command": command, "returncode": output.returncode,
+                        "status": test_status(output.returncode, log),
+                        "seconds": time.monotonic() - started,
+                        "failed_tests": failed_tests(log)})
+    return records
+
+
+def s7_main(args):
+    parser = argparse.ArgumentParser(description="Repeat #1965's original 20 mutations")
+    parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("target/s7-closure/mutations"))
+    parser.add_argument("names", nargs="*")
+    options = parser.parse_args(args)
+    original = EFFECTS.read_bytes()
+    text = original.decode()
+    chosen = [(f"M{i:02}", m) for i, m in enumerate(S7_MUTATIONS, 1)
+              if not options.names or any(n in m[0] for n in options.names)]
+    if not chosen or any(not any(n in m[0] for m in S7_MUTATIONS) for n in options.names):
+        print("no mutation matches a requested name")
+        return 2
+    for _, (name, anchor, _) in chosen:
+        if text.count(anchor) != 1:
+            print(f"anchor for {name!r} occurs {text.count(anchor)} times")
+            return 2
+    for key in ("PBPS_TEST_PG_DB", "PBPS_TEST_DB"):
+        if not os.environ.get(key):
+            print(f"{key} is required; no audit was run")
+            return 2
+    out = options.output
+    out.mkdir(parents=True, exist_ok=False)
+    (out / "original-effects.rs").write_bytes(original)
+    env = dict(os.environ)
+    # The original report used the capped suites, not #2091's all-pairs mode.
+    env.pop("PBPS_COMMUTE_ALL", None)
+    report = {"sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "source_sha256": hashlib.sha256(original).hexdigest(), "mutations": []}
+    def persist():
+        (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    try:
+        env["PBPS_ORDER_SHADOW"] = str((out / "baseline-shadow.log").resolve())
+        report["baseline"] = run_case(out / "baseline", S7_COMMANDS, env)
+        persist()
+        if any(r["status"] != "passed" for r in report["baseline"]):
+            print("unmutated baseline failed; see", out)
+            return 2
+        print("baseline passed", flush=True)
+        for identity, (name, anchor, replacement) in chosen:
+            EFFECTS.write_text(text.replace(anchor, replacement))
+            env["PBPS_ORDER_SHADOW"] = str((out / f"{identity}-shadow.log").resolve())
+            runs = run_case(out / identity, S7_COMMANDS, env)
+            EFFECTS.write_bytes(original)
+            confirmation_env = dict(env, PBPS_ORDER_SHADOW=str(
+                (out / f"{identity}-confirmation-shadow.log").resolve()))
+            status, confirmation = mutation_result(runs, confirmation_env)
+            report["mutations"].append({"id": identity, "effect": name, "status": status,
+                                        "live_unshowable": name in UNSHOWABLE, "runs": runs,
+                                        "confirmation": confirmation})
+            persist()
+            print(identity, status, name, flush=True)
+            EFFECTS.write_bytes(original)
+    finally:
+        EFFECTS.write_bytes(original)
+        report["restored_sha256"] = hashlib.sha256(EFFECTS.read_bytes()).hexdigest()
+        persist()
+    if any(m["status"] == "invalid" for m in report["mutations"]):
+        return 2
+    return int(any(m["status"] == "survived" for m in report["mutations"]))
+
+
+def main(args):
+    if "--s7" in args:
+        return s7_main([a for a in args if a != "--s7"])
+    return legacy_main(args)
 
 
 if __name__ == "__main__":
