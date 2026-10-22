@@ -1387,3 +1387,27 @@ only. Binding correctness, before/after scratch inventory and the armed crowd
 cleanup guard remain, with cleanup before assertions. The focused 20,000-role
 reverse-map lookup test retains its CPU-shape guard; SQL request counts do not
 measure the in-process lookup cost.
+
+<a id="dec-2183-1"></a>
+
+**DEC-2183.1. The ignored-test audit checks key spellings only at scheduling
+mapping paths and refuses quoted keys containing backslashes there.** The
+scheduling witness reads a bounded YAML subset by canonical key spelling;
+normalizing just some double-quoted escapes would leave another spelling that
+can hide a disabling condition. Refusing every backslash-bearing quoted key at
+those positions is smaller and complete without a second YAML string decoder.
+Single-quoted keys decode only doubled single quotes: `'i''f'` names `i'f`, not
+`if`, and passes. The same conservative backslash rule applies to single-quoted
+keys even though their backslashes are literal.
+
+The guard follows block indentation and flow mapping/sequence boundaries to
+the job, its `strategy` and `strategy.matrix`, and each `steps` item. Quoted
+audited names and whitespace before their colons are refused only at those
+paths; nested `env`, action `with`, and `services` values are opaque to this
+policy. Quoted scalar values and block scalar text never become mapping keys.
+`steps` is also guarded because it selects the step mapping path. The script
+has no YAML parser elsewhere, and CI runs it without a YAML dependency; this
+lexical guard preserves the existing scheduling reader rather than replacing
+it or claiming that unsupported flow scheduling definitions execute. A table
+crosses audited and unrelated paths with quoting, whitespace and hexadecimal
+or Unicode escapes in block and flow forms, including a flow job header.

@@ -16,6 +16,7 @@ import ignored_test_inventory as audit
 
 
 KEY = ("demo", "lib", "demo")
+SCHEDULING_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include", "exclude", "runs-on", "steps")
 WORKFLOW = """jobs:
   live:
     runs-on: ubuntu-latest
@@ -203,6 +204,45 @@ class Ownership(unittest.TestCase):
                 self.workflow.write_text(workflow)
                 self.assertEqual(self.check(), 1)
 
+    def test_unrelated_mapping_keys_do_not_change_execution_ownership(self):
+        positions = {
+            "job-env-block": "    env:\n      ENTRY\n",
+            "job-env-flow": "    env: { ENTRY }\n",
+            "step-env-block": "    steps:\n      - env:\n          ENTRY\n        run: echo setup\n",
+            "step-env-flow": "    steps:\n      - env: { ENTRY }\n        run: echo setup\n",
+            "with-block": "    steps:\n      - uses: demo/action@v1\n        with:\n          ENTRY\n",
+            "with-flow": "    steps:\n      - uses: demo/action@v1\n        with: { ENTRY }\n",
+            "with-flow-multiline": "    steps:\n      - uses: demo/action@v1\n        with: {\n          ENTRY\n        }\n",
+            "services-block": "    services:\n      database:\n        env:\n          ENTRY\n",
+            "services-flow": "    services: { database: { env: { ENTRY } } }\n",
+            "nested-path-names": "    env:\n      strategy:\n        matrix:\n          steps:\n            - ENTRY\n",
+        }
+        for position, template in positions.items():
+            for key in SCHEDULING_KEYS:
+                for spelling in key_spellings(key):
+                    with self.subTest(position=position, key=key, spelling=spelling):
+                        extra = template.replace("ENTRY", spelling + ": value")
+                        # Step templates already introduce steps; retain the
+                        # actual owner after the unrelated setup/action step.
+                        workflow = WORKFLOW.replace("    steps:\n", extra if "    steps:\n" in extra
+                                                    else extra + "    steps:\n")
+                        self.workflow.write_text(workflow)
+                        self.assertEqual(self.check(), 1)
+
+        # Colons, braces and commas inside scalars are values, not entries;
+        # opaque mappings need not use the scheduling reader's key grammar.
+        for value in ('{ ? [a, b] : { "if": x } }',
+                      '{ text: "} , \\\"if\\\": false", other: { \'run\': value } }',
+                      '{ text: \'a\'\'b, }\', other: { "if": x } }'):
+            with self.subTest(value=value):
+                self.workflow.write_text(WORKFLOW.replace("    steps:", f"    env: {value}\n    steps:"))
+                self.assertEqual(self.check(), 1)
+        for scalar in ('"text\n        \'if\': x\n        text"',
+                       "'text\n        \"if\": x\n        text'", "|\n          \"if\": false"):
+            with self.subTest(scalar=scalar):
+                self.workflow.write_text(WORKFLOW.replace("      - run:", f"      - name: {scalar}\n        run:"))
+                self.assertEqual(self.check(), 1)
+
     def test_matrix_condition_must_have_an_executed_variant(self):
         workflow = WORKFLOW.replace("    steps:", "    strategy:\n      matrix:\n        engine: [pg, mssql]\n    steps:")
         workflow = workflow.replace("      - run:", "      - name: selected\n        if: matrix.engine == 'pg'\n        run:")
@@ -334,6 +374,61 @@ class Ownership(unittest.TestCase):
         self.targets[KEY]["all"].remove("ordinary")
         with self.assertRaisesRegex(audit.InventoryError, "missing parent test"):
             self.check()
+
+
+def key_spellings(key):
+    """The same spelling table applies at every mapping position."""
+    return (key + " ", key + "\t", f'"{key}"', f"'{key}'", f'"{key}" ',
+            '"' + ''.join(f'\\x{ord(char):02x}' for char in key) + '"',
+            '"' + ''.join(f'\\u{ord(char):04x}' for char in key) + '"',
+            '"' + ''.join(f'\\U{ord(char):08x}' for char in key) + '"',
+            "'\\" + key + "'")
+
+
+class WorkflowKeySpellings(unittest.TestCase):
+    positions = {
+        "job-block": "    ENTRY\n",
+        "job-flow": "    { ENTRY }\n",
+        "job-flow-after-opaque-value": "    { env: { 'if': x }, ENTRY }\n",
+        "job-flow-multiline": "    {\n      ENTRY\n    }\n",
+        "strategy-block": "    strategy:\n      ENTRY\n",
+        "strategy-flow": "    strategy: { ENTRY }\n",
+        "matrix-block": "    strategy:\n      matrix:\n        ENTRY\n",
+        "matrix-flow": "    strategy: { matrix: { ENTRY } }\n",
+        "step-first-key": "    steps:\n      - ENTRY\n",
+        "step-later-key": "    steps:\n      - name: selected\n        ENTRY\n",
+        "step-flow": "    steps:\n      - { ENTRY }\n",
+        "step-flow-after-opaque-value": "    steps:\n      - { env: { 'run': x }, ENTRY }\n",
+        "steps-flow-sequence": "    steps: [{ ENTRY }]\n",
+        "step-flow-multiline": "    steps:\n      - { name: selected,\n          ENTRY }\n",
+    }
+
+    def test_every_audited_position_refuses_every_alternate_key_spelling(self):
+        for position, template in self.positions.items():
+            for key in SCHEDULING_KEYS:
+                for spelling in key_spellings(key):
+                    with self.subTest(position=position, key=key, spelling=spelling):
+                        value = "true" if key == "continue-on-error" else "false"
+                        source = "jobs:\n  live:\n" + template.replace("ENTRY", spelling + ": " + value)
+                        with self.assertRaisesRegex(audit.InventoryError, "an alternate spelling of a key"):
+                            list(audit.workflow_runs(source, "live"))
+                        if position == "job-flow":
+                            # Also exercise a flow value on the job header.
+                            source = source.replace("live:\n    {", "live: {")
+                            with self.assertRaisesRegex(audit.InventoryError, "an alternate spelling of a key"):
+                                list(audit.workflow_runs(source, "live"))
+
+        # JSON-style quoted keys may omit the space after their colon.
+        for source in ('jobs:\n  live: {"if":false}\n',
+                       'jobs:\n  live:\n    steps: [{"if":false}]\n'):
+            with self.subTest(source=source), self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
+                list(audit.workflow_runs(source, "live"))
+
+    def test_canonical_and_distinct_quoted_keys_pass_the_spelling_guard(self):
+        for position, template in self.positions.items():
+            for key in (*SCHEDULING_KEYS, "'i''f'", '"i\'f"', "'timeout-minutes' "):
+                with self.subTest(position=position, key=key):
+                    audit.check_workflow_key_spellings(template.replace("ENTRY", key + ": value"), "live")
 
 
 class CargoSelectors(unittest.TestCase):

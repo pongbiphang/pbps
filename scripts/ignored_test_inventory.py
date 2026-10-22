@@ -580,30 +580,109 @@ KEEPS_FAILURES = ("false", "${{ false }}")
 
 # Every key the readings below look for, each by one spelling: unquoted, with
 # its colon right after it. YAML takes the same key quoted or with whitespace
-# before the colon, and those readings would not see it, so any other spelling
-# of one of these is refused and only the one they read passes (#1863).
-AUDITED_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include", "exclude", "runs-on")
+# before the colon, and those readings would not see it. Restrict this guard
+# to the mappings they read; an action input or environment variable with the
+# same name cannot change scheduling (DEC-2183.1).
+AUDITED_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include", "exclude", "runs-on", "steps")
+YAML_QUOTED = r""""(?:\\[\s\S]|[^"\\])*"|'(?:''|[^'])*'"""
+YAML_QUOTED_SCALAR = re.compile(YAML_QUOTED)
+YAML_KEY = re.compile(r"(" + YAML_QUOTED + r"|[^\s{}\[\],:'\"#]+)([ \t]*):")
+YAML_FLOW_SCALAR = re.compile(r"(?:" + YAML_QUOTED + r"|#[^\n]*|[^,}\]\"'#])*")
+YAML_FLOW_DELIMITER = re.compile(YAML_QUOTED + r"|#[^\n]*|[{}\[\]]")
+
+
+def check_workflow_key_spellings(body, job):
+    """Track block/flow mapping paths without interpreting scalar values."""
+    def entry(match, path):
+        spelling, space = match.groups()
+        quoted = spelling[0] in "\"'"
+        name = spelling[1:-1] if quoted else spelling
+        if spelling[0] == "'": name = name.replace("''", "'")
+        audited = path in ((), ("strategy",), ("strategy", "matrix"), ("steps", None))
+        # Refuse escapes rather than maintaining a second YAML string decoder.
+        # Single quotes only unescape doubled quotes; i''f is not the key if.
+        require(not (audited and ((quoted and "\\" in name)
+                                 or (name in AUDITED_KEYS and (quoted or space)))),
+                f"an alternate spelling of a key needs an explicit audit: {job}: {match[0]}")
+        return (*path, name)
+
+    def whitespace(index):
+        return re.compile(r"(?:\s+|#[^\n]*)*").match(body, index).end()
+
+    def flow(index, path):
+        # Opaque values need only a balanced end, not our mapping grammar.
+        # In particular, action inputs may use YAML's explicit/complex keys.
+        if path not in ((), ("strategy",), ("strategy", "matrix"), ("steps",), ("steps", None)):
+            depth = 0
+            for token in YAML_FLOW_DELIMITER.finditer(body, index):
+                if token[0] in ("{", "["): depth += 1
+                elif token[0] in ("}", "]"):
+                    depth -= 1
+                    if depth == 0: return token.end()
+            raise InventoryError(f"unterminated flow mapping: {job}")
+        mapping = body[index] == "{"
+        closing = "}" if mapping else "]"
+        index = whitespace(index + 1)
+        while index < len(body) and body[index] != closing:
+            child = (*path, None)
+            if mapping:
+                key = YAML_KEY.match(body, index)
+                require(key is not None, f"unsupported flow mapping needs an explicit audit: {job}")
+                child, index = entry(key, path), whitespace(key.end())
+            if index < len(body) and body[index] in "{[":
+                index = flow(index, child)
+            else:
+                index = YAML_FLOW_SCALAR.match(body, index).end()
+            index = whitespace(index)
+            require(index < len(body), f"unterminated flow mapping: {job}")
+            if body[index] == closing: break
+            require(body[index] == ",", f"unsupported flow mapping needs an explicit audit: {job}")
+            index = whitespace(index + 1)
+        require(index < len(body) and body[index] == closing, f"unterminated flow mapping: {job}")
+        return index + 1
+
+    stack, block, consumed, offset = [], None, 0, 0
+    for line in body.splitlines(keepends=True):
+        start, offset = offset, offset + len(line)
+        if start < consumed or not line.strip() or line.lstrip().startswith("#"): continue
+        indent = len(line) - len(line.lstrip(" "))
+        if block is not None:
+            if indent > block: continue
+            block = None
+        while stack and indent <= stack[-1][0]: stack.pop()
+        path = stack[-1][1] if stack else ()
+        sequence = re.match(r"-(?:[ \t]+|(?=\n|$))", line[indent:])
+        if sequence:
+            path = (*path, None)
+            stack.append((indent, path))
+            indent += sequence.end()
+        index = start + indent
+        if index >= len(body): continue
+        if body[index] in "{[":
+            consumed = flow(index, path)
+            continue
+        key = YAML_KEY.match(body, index)
+        if not key: continue
+        child = entry(key, path)
+        stack.append((indent, child))
+        index = re.compile(r"[ \t]*").match(body, key.end()).end()
+        if index < len(body) and body[index] in "{[":
+            consumed = flow(index, child)
+        else:
+            scalar = YAML_QUOTED_SCALAR.match(body, index)
+            consumed = scalar.end() if scalar else key.end()
+            if re.match(r"[|>][-+0-9]*\s*(?:#.*)?$", body[index:offset].rstrip("\n")):
+                block = indent
 
 
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
-    match = re.search(r"^  " + re.escape(job) + r":\s*$", source, re.M)
+    match = re.search(r"^  " + re.escape(job) + r":(?=\s|$)", source, re.M)
     require(match is not None, f"missing CI job: {job}")
     tail = source[match.end():]
-    following = re.search(r"^  [\w-]+:\s*$", tail, re.M)
+    following = re.search(r"^  [\w-]+:(?=\s|$)", tail, re.M)
     body = tail[:following.start()] if following else tail
-    # A block scalar's lines are its text, not mapping entries: they run on
-    # while indented past the column of the key that opened it.
-    block = None
-    for line in body.splitlines():
-        if block is not None:
-            if not line.strip() or len(line) - len(line.lstrip(" ")) > block: continue
-            block = None
-        key = re.match(r"(\s*(?:-\s+)?)(?:(['\"])([\w-]+)\2|([\w-]+))(\s*):(?:\s|$)", line)
-        if not key: continue
-        require(not ((key[3] or key[4]) in AUDITED_KEYS and (key[2] or key[5])),
-                f"an alternate spelling of a key needs an explicit audit: {job}: {line.strip()}")
-        if re.search(r":\s*[|>][-+0-9]*\s*(?:#.*)?$", line): block = len(key[1])
+    check_workflow_key_spellings(body, job)
     if platform is not None:
         runner = re.search(r"^    runs-on: ([\w-]+)\s*$", body, re.M)
         prefix = {"linux": "ubuntu-", "win32": "windows-", "darwin": "macos-"}[platform]
