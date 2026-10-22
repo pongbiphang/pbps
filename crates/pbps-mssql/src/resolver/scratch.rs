@@ -225,6 +225,34 @@ pub async fn sandbox_checks(
     databases: &[String],
     scratch: &str,
 ) -> Result<(), DbError> {
+    // The instance setting overrides is_db_chaining_on even when the
+    // scratch database's own option still reports zero.
+    let chaining = async {
+        let row = one(
+            conn.query(
+                "SELECT CONVERT(int,value_in_use) AS value_in_use FROM sys.configurations \
+                 WHERE name=N'cross db ownership chaining';",
+            )
+            .await?,
+            "cross db ownership chaining",
+        )?;
+        row.try_get::<i32>("value_in_use")?
+            .ok_or_else(|| DbError::BadRow("value_in_use is NULL".into()))
+    }
+    .await
+    .map_err(|error| {
+        DbError::Refused(format!(
+            "instance option cross db ownership chaining is unreadable: {error}"
+        ))
+    })?;
+    if chaining != 0 {
+        return Err(DbError::Refused(
+            "instance option cross db ownership chaining must be 0; EXEC sp_configure \
+             'cross db ownership chaining', 0; RECONFIGURE; or use a scratch instance \
+             with the option disabled"
+                .into(),
+        ));
+    }
     for name in databases {
         let row = one(
             conn.query(&format!(
