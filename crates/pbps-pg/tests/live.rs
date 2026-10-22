@@ -17769,13 +17769,12 @@ async fn views_with_nondefault_options_are_named_and_default_options_stay_plain(
 /// query and this code have gone out of step", which is the one diagnosis that
 /// is certainly wrong: nothing is out of step, the catalog moved.
 ///
-/// Two halves. The engine's, which is what the rule rests on and is exact; and
-/// the reader's, driven by dropping views out from under a pull until it
-/// happens.
+/// Two halves: the engine's NULL result, and the reader's diagnosis when a
+/// routine is dropped while its module query is paused at a view's deparse.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_module_dropped_between_the_scan_and_the_deparse_says_the_catalog_moved() {
-    let mut conn = connect().await;
+    let mut conn = TestDb::create("vanishing").await;
     // The deparsers answer `NULL` for an oid that is not there rather than
     // raising, which is why this arrives as a row and not as `XX000`. If a
     // later engine raises instead, this fails and the reader's rule is the
@@ -17790,70 +17789,84 @@ async fn a_module_dropped_between_the_scan_and_the_deparse_says_the_catalog_move
         );
     }
 
-    // One schema of routines, dropped one at a time. Not whole schemas: a
-    // `DROP SCHEMA … CASCADE` storm deadlocks against the rest of this suite
-    // doing the same thing, and a test that destabilises its neighbours is not
-    // paying for itself. Routines rather than views because
-    // `pg_get_functiondef` is the deparser that answers `NULL` for an oid that
-    // is gone — `pg_get_viewdef` more often catches the drop mid-flight and
-    // raises `XX000`, which is the path that was already right.
-    const ROUTINES: usize = 40;
     let s = emit_schema("vanishing");
     fresh(&mut conn, &s).await;
-    // Long bodies rather than many routines: what has to be long is the
-    // *deparse*, so that a drop has somewhere to land inside it, and forty
-    // statements do not slow the rest of the suite down the way four hundred
-    // do.
-    let padding = "-- ".to_owned() + &"pad ".repeat(500);
-    for n in 0..ROUTINES {
-        conn.execute(&format!(
-            "CREATE FUNCTION {s}.f{n}(a int) RETURNS int LANGUAGE sql AS $$\n{padding}\n\
-             SELECT a $$"
+    conn.execute(&format!(
+        "CREATE VIEW {s}.pause AS SELECT 1 AS n; \
+         CREATE FUNCTION {s}.f(a int) RETURNS int LANGUAGE sql AS $$ SELECT a $$; \
+         SET max_parallel_workers_per_gather = 0"
+    ))
+    .await
+    .expect("a view to pause at and a routine to drop");
+    let reader_pid = number(&mut conn, "SELECT pg_catalog.pg_backend_pid()").await;
+    let view_oid = oid(&mut conn, &format!("SELECT '{s}.pause'::regclass::int8")).await;
+    let mut churner = conn.second().await;
+    churner
+        .execute(&format!(
+            "BEGIN; LOCK TABLE {s}.pause IN ACCESS EXCLUSIVE MODE"
         ))
         .await
-        .expect("a routine");
-    }
+        .expect("hold the view before the reader starts");
 
-    let churn_schema = s.clone();
-    let churn = tokio::spawn(async move {
-        let mut churner = connect().await;
-        for n in 0..ROUTINES {
-            churner
-                .execute(&format!("DROP FUNCTION {churn_schema}.f{n}(int)"))
-                .await
-                .expect("drop one routine");
+    // The serial module query's UNION ALL visits views before routines.
+    // pg_get_viewdef takes ACCESS SHARE on this view, so its queued lock
+    // proves the pull has its catalog snapshot but has not deparsed f yet.
+    // Commit the drop before releasing that lock: the snapshot still sees
+    // f's pg_proc row, while pg_get_functiondef's syscache lookup sees it gone.
+    // A database of our own keeps other pulls out of this handshake.
+    let (pulled, ()) = tokio::join!(pbps_pg::catalog::introspect(&mut conn), async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if truth(
+                &mut churner,
+                &format!(
+                    "SELECT EXISTS (SELECT FROM pg_catalog.pg_locks \
+                     WHERE pid = {reader_pid} AND relation = {view_oid}::oid \
+                       AND mode = 'AccessShareLock' AND NOT granted)"
+                ),
+            )
+            .await
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pull never queued at the view's deparse"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        churner
+            .execute(&format!("DROP FUNCTION {s}.f(int); COMMIT"))
+            .await
+            .expect("commit the drop before the reader resumes");
     });
+    drop(churner);
+    conn.drop().await;
 
     let mut caught = 0usize;
-    let mut pulls = 0usize;
-    while !churn.is_finished() {
-        pulls += 1;
-        if let Err(e) = pbps_pg::catalog::introspect(&mut conn).await {
-            let message = e.to_string();
-            assert!(
-                !message.contains("gone out of step"),
-                "a vanished module is not a reader out of step with its query: {message}"
-            );
-            assert!(
-                message.contains("the catalog changed while it was being read"),
-                "the pull failed for a reason this test does not cause: {message}"
-            );
-            caught += 1;
-        }
+    if let Err(e) = pulled {
+        let message = e.to_string();
+        assert!(
+            !message.contains("gone out of step"),
+            "a vanished module is not a reader out of step with its query: {message}"
+        );
+        assert!(
+            message.contains("the catalog changed while it was being read"),
+            "the pull failed for a reason this test does not cause: {message}"
+        );
+        assert!(
+            message.contains(&format!("`{s}.f` (kind `f`)"))
+                && message.contains("gone when its definition was deparsed"),
+            "the pull must catch this routine's NULL deparse: {message}"
+        );
+        caught += 1;
     }
-    churn.await.expect("the churner finished");
-    drop_schema(&mut conn, &s).await;
 
     // Asserted to have fired, because a test that can pass without reaching
-    // the case is one that will go on passing when the case breaks. The
-    // fixture is sized for it: every pull scans all of these schemas, and the
-    // churn drops them one at a time, so a pull that overlaps none of the
-    // drops means the churn outran the reader and the counts say so.
+    // the case is one that will go on passing when the case breaks.
     assert!(
         caught > 0,
-        "{pulls} pulls ran and none of them overlapped a drop; the fixture has stopped \
-         reaching the case it exists for"
+        "the pull missed the drop; the fixture has stopped reaching the case it exists for"
     );
 }
 
