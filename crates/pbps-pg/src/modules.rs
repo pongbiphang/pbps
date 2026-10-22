@@ -271,6 +271,24 @@ pub async fn before_a_rebuild(
             read_trigger_enabled(conn, oid, &mut carries).await?;
             read_attached(conn, oid, "pg_trigger", &mut carries).await?;
             read_extension_ties(conn, oid, "pg_trigger", &mut carries).await?;
+            // The trigger's own companion row carries state too; checking
+            // only its clones misses an ordinary table and the parent's
+            // comment alike (DEC-2107.1).
+            let row = conn
+                .query_with(
+                    "SELECT tgconstraint::int8 AS constraint_oid FROM pg_catalog.pg_trigger \
+                     WHERE oid = ($1::int8)::oid",
+                    &[Param::I64(oid)],
+                )
+                .await?;
+            let constraint = row
+                .first()
+                .ok_or_else(|| not_in_the_catalog(id))?
+                .try_get::<i64>("constraint_oid")?
+                .ok_or_else(|| DbError::BadRow("a trigger without tgconstraint".into()))?;
+            if constraint != 0 {
+                read_attached(conn, constraint, "pg_constraint", &mut carries).await?;
+            }
             read_clones(conn, oid, changes, &mut carries).await?;
         }
     }

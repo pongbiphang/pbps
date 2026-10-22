@@ -8011,3 +8011,79 @@ reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
 all Statement fields, both modes, SQL rendering, deterministic artifact bytes
 and checksums through real singleton routes; the non-default singleton
 fixture feature remains restricted to dev-dependencies.
+
+<a id="dec-2101-1"></a>
+
+**DEC-2101.1. Generated key-name replay follows a constraint trigger's
+companions through their parent trigger and their partition's lifetime.**
+Measured on PostgreSQL 16.15 and 18.6: a parent's constraint row and each
+partition clone's row share the trigger's name, but the clone has
+`conparentid = 0`; its `tgparentid` identifies the parent trigger instead.
+Dropping the parent trigger removes every clone constraint. Creating or
+attaching a partition creates another companion under the parent's trigger
+name; detaching removes it. A clone holding `n_pkey` in its partition's
+schema makes an unnamed key choose `n_pkey1`; after the parent drop it
+chooses `n_pkey`. The parent may be in a different schema. A trigger rename leaves existing
+companions under their old names; a partition created afterwards receives
+the new trigger name.
+
+The catalog holder retains both its actual constraint name and its parent
+trigger identity. Replay frees a clone with that parent, while table
+renames move its owner and the parent's address independently. Baseline
+modules and the shared partition relation seed the clone producers; module
+creation or alteration, partition creation and attach add companions only
+where they stand at that position. Drop and detach remove them. Ordinary
+triggers create no companion. These are schema-wide key candidates, not
+the table-local slots of DEC-2100.1; no ordering pass or change kind is added.
+
+Tests: `constraint_trigger_clone_holders_follow_their_parent_and_partition_lifetimes`
+covers drops, rebuilds, creates, attaches, detaches, parent renames and
+ordinary/unrelated-trigger controls. The connected live
+`constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach`
+refuses a regclass reference to the actual later index, then applies after
+the reference is removed and verifies its name on both servers.
+
+<a id="dec-2102-1"></a>
+
+**DEC-2102.1. An attach's trigger probe reserves the names of parent row
+triggers the plan creates after the attach.** Measured on PostgreSQL 16.15
+and 18.6: a table with its own row trigger `x` can attach to a parent with
+no `x`; a later parent row-trigger creation fails because the partition
+already holds `x`. A parent statement trigger `x` succeeds and creates no
+clone. Dropping an old parent row trigger before the attach does not make
+the name available to its replacement's clone.
+
+The probe unions the surviving catalog parent row-trigger names with
+`CreateModule` and `AlterModule` names after this attach, using
+`clones_to_partitions` to distinguish row triggers. The table's own triggers
+dropped before the attach remain excluded. Range, list, hash and DEFAULT
+attaches use the same probe. Planned names appear in its description so a
+refusal identifies the future collision before the first statement.
+
+Tests: `an_attach_counts_future_parent_row_triggers_but_not_statement_triggers`
+pins creation, alteration, statement and unrelated-parent cases. The live
+`an_attach_refuses_unmanaged_names_of_planned_parent_row_triggers` covers
+new and rebuilt parents on both servers, verifies an earlier marker table
+was never created, and applies the statement-trigger controls.
+
+<a id="dec-2107-1"></a>
+
+**DEC-2107.1. A trigger rebuild reads attachments on its own companion
+constraint as well as on its clones.** Measured on PostgreSQL 16.15 and
+18.6: `COMMENT ON CONSTRAINT` addresses the trigger's `tgconstraint` row;
+dropping the trigger removes that row and its comment, on an ordinary
+table and on a partitioned parent. The parent's drop also removes a clone's
+constraint comment. Neither trigger nor routine recreation restores it.
+
+After resolving the trigger once, the rebuild check reads `tgconstraint`
+by that oid and passes a nonzero companion to the existing address-based
+attachment reader. Its comments and security labels are carried state
+that refuses the rebuild by name, including a rebuild induced by the
+routine it executes. Zero means an ordinary trigger has no companion;
+a missing or unreadable catalog row is an error, not empty carried state.
+
+Tests: `a_routine_rebuild_refuses_its_constraint_triggers_own_comment`
+refuses both table forms on both servers and applies after removing the
+comment. `a_trigger_rebuild_reads_its_own_constraint_attachments` checks
+the direct rebuild reader with a comment and a security label, and with
+bare constraint and ordinary triggers as negative controls.

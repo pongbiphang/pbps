@@ -3610,7 +3610,12 @@ pub async fn account_for_module_dependents(
                 anyhow::anyhow!("module_dependents (PostgreSQL): reading what holds key names: {e}")
             })?;
     let mut later = Vec::new();
-    for name in crate::dependents::names_a_later_relation(changes, dialect, Some(&holders)) {
+    for name in crate::dependents::names_a_later_relation(
+        changes,
+        dialect,
+        Some(&holders),
+        sources.before.schema,
+    ) {
         if !resolves_now(conn, &name).await? {
             later.push(name);
         }

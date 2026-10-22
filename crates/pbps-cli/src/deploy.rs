@@ -6150,7 +6150,12 @@ pub fn cmd_bootstrap(
     // refusal names them all.
     let mut refused = Vec::new();
     if dialect.name() == "postgres" {
-        let offline = crate::dependents::names_a_later_relation(&cs, dialect.as_ref(), None);
+        let offline = crate::dependents::names_a_later_relation(
+            &cs,
+            dialect.as_ref(),
+            None,
+            &Schema::default(),
+        );
         let prefixes = crate::dependents::key_name_prefixes(&cs);
         match target {
             Some(target)
@@ -6165,6 +6170,7 @@ pub fn cmd_bootstrap(
                         &cs,
                         dialect.as_ref(),
                         Some(&holders),
+                        &Schema::default(),
                     ) {
                         if name.searched.is_empty()
                             || !crate::engine::resolves_now(&mut conn, &name).await?

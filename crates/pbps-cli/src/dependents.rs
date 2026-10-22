@@ -2414,6 +2414,7 @@ pub(crate) fn names_a_later_relation(
     cs: &ChangeSet,
     dialect: &dyn Dialect,
     holders: Option<&[KeyNameHolder]>,
+    baseline: &Schema,
 ) -> Vec<LaterName> {
     let mut arrivals: Vec<Arrival> = Vec::new();
     let mut keys: Vec<Arrival> = Vec::new();
@@ -2425,7 +2426,7 @@ pub(crate) fn names_a_later_relation(
             }
         }
     }
-    let (keyed, told) = key_arrivals(cs, dialect, keys, &arrivals, holders);
+    let (keyed, told) = key_arrivals(cs, dialect, keys, &arrivals, holders, baseline);
     arrivals.extend(keyed.iter().cloned());
     // The names the target may hold now, which offline is every key's: one
     // held makes the engine number the index instead, and the literal names
@@ -3022,6 +3023,7 @@ fn key_arrivals(
     mut keys: Vec<Arrival>,
     named: &[Arrival],
     holders: Option<&[KeyNameHolder]>,
+    baseline: &Schema,
 ) -> (Vec<Arrival>, bool) {
     keys.sort_by_key(|(at, _)| *at);
     let in_schema = |table: &TableName, name: String| TableName::new(table.schema.clone(), name);
@@ -3048,17 +3050,19 @@ fn key_arrivals(
         .iter()
         .enumerate()
         .flat_map(|(j, p)| {
-            constraints_added(&p.change, dialect)
+            constraints_added(&p.change)
                 .into_iter()
                 .map(move |c| (j, c))
         })
         .collect();
     let mut present: Vec<KeyNameHolder> = holders.to_vec();
+    let mut clones = KeyTriggerClones::of(baseline, dialect);
     let mut keys = keys.into_iter().peekable();
     for (j, p) in cs.changes.iter().enumerate() {
         // A change's drop runs ahead of what the same change creates: a key
         // replaced in one change frees its index's name for the new one.
         replay(&mut present, &p.change);
+        clones.replay(&mut present, &p.change, dialect);
         while let Some((at, table)) = keys.next_if(|(at, _)| at.0 == j) {
             let held = |r: &TableName, out: &[Arrival]| {
                 named.iter().any(|(_, n)| n == r)
@@ -3106,10 +3110,16 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
                     h.owner = Some(to.clone());
                     h.name.schema.clone_from(&to.schema);
                 }
+                if let Some(ModuleId::Trigger { on, .. }) = &mut h.parent_trigger
+                    && on == from
+                {
+                    *on = to.clone();
+                }
             }
         }
         Change::DropTable { name, .. } => {
-            present.retain(|h| !(owned(h, name) || (!h.constraint && h.name == *name)));
+            present.retain(|h| !(owned(h, name) || (!h.constraint && h.name == *name)
+                || matches!(&h.parent_trigger, Some(ModuleId::Trigger { on, .. }) if on == name)));
         }
         // A unique constraint is its index and itself.
         Change::DropUnique { table, name } => {
@@ -3134,25 +3144,168 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
         // trigger's own name, which a rename leaves apart from the row's
         // (#1738, #1752 review).
         Change::DropModule {
-            id: ModuleId::Trigger { on, name },
+            id: id @ ModuleId::Trigger { on, name },
             ..
-        } => present.retain(|h| !(owned(h, on) && h.trigger.as_deref() == Some(name.as_str()))),
+        }
+        | Change::AlterModule {
+            id: id @ ModuleId::Trigger { on, name },
+            ..
+        } => present.retain(|h| {
+            !(h.parent_trigger.as_ref() == Some(id)
+                || (owned(h, on) && h.trigger.as_deref() == Some(name.as_str())))
+        }),
+        Change::DetachPartition { table, .. } => {
+            present.retain(|h| !(owned(h, table) && h.parent_trigger.is_some()));
+        }
         _ => {}
     }
 }
 
+/// The parent triggers and partitions standing at each replay position.
+/// Catalog holders retain their actual companion names; only new clones
+/// take the parent's current trigger name (DEC-2101.1).
+struct KeyTriggerClones {
+    parents: BTreeMap<TableName, TableName>,
+    triggers: BTreeMap<(TableName, String), bool>,
+}
+
+impl KeyTriggerClones {
+    fn of(baseline: &Schema, dialect: &dyn Dialect) -> Self {
+        let partitions = Partitions::of(baseline);
+        Self {
+            parents: baseline
+                .tables
+                .keys()
+                .filter_map(|table| {
+                    partitions
+                        .parent(table)
+                        .map(|parent| (table.clone(), parent.clone()))
+                })
+                .collect(),
+            triggers: baseline
+                .modules
+                .iter()
+                .filter_map(|(id, module)| {
+                    if let ModuleId::Trigger { on, name } = id
+                        && dialect.declares_a_constraint(module)
+                    {
+                        Some((
+                            (on.clone(), name.clone()),
+                            dialect.clones_to_partitions(module),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn replay(&mut self, present: &mut Vec<KeyNameHolder>, change: &Change, dialect: &dyn Dialect) {
+        let holder =
+            |on: &TableName, (parent, name): &(TableName, String), clone: bool| KeyNameHolder {
+                name: TableName::new(&on.schema, name),
+                owner: Some(on.clone()),
+                primary_key: false,
+                constraint: true,
+                trigger: Some(name.clone()),
+                parent_trigger: clone.then(|| ModuleId::Trigger {
+                    on: parent.clone(),
+                    name: name.clone(),
+                }),
+            };
+        match change {
+            Change::RenameTable { from, to, .. } => {
+                self.parents = std::mem::take(&mut self.parents)
+                    .into_iter()
+                    .map(|(p, of)| {
+                        (
+                            if p == *from { to.clone() } else { p },
+                            if of == *from { to.clone() } else { of },
+                        )
+                    })
+                    .collect();
+                self.triggers = std::mem::take(&mut self.triggers)
+                    .into_iter()
+                    .map(|((on, name), clones)| {
+                        ((if on == *from { to.clone() } else { on }, name), clones)
+                    })
+                    .collect();
+            }
+            Change::DropTable { name, .. } => {
+                self.parents.retain(|p, of| p != name && of != name);
+                self.triggers.retain(|(on, _), _| on != name);
+            }
+            Change::DetachPartition { table, .. } => {
+                self.parents.remove(table);
+            }
+            Change::DropModule {
+                id: ModuleId::Trigger { on, name },
+                ..
+            } => {
+                self.triggers.remove(&(on.clone(), name.clone()));
+            }
+            Change::CreateModule {
+                id: ModuleId::Trigger { on, name },
+                module,
+            }
+            | Change::AlterModule {
+                id: ModuleId::Trigger { on, name },
+                module,
+            } => {
+                let id = (on.clone(), name.clone());
+                self.triggers.remove(&id);
+                if dialect.declares_a_constraint(module) {
+                    let clones = dialect.clones_to_partitions(module);
+                    self.triggers.insert(id.clone(), clones);
+                    present.push(holder(on, &id, false));
+                    if clones {
+                        present.extend(
+                            self.parents
+                                .iter()
+                                .filter(|(_, of)| *of == on)
+                                .map(|(p, _)| holder(p, &id, true)),
+                        );
+                    }
+                }
+            }
+            Change::AttachPartition { table, parent, .. } => {
+                self.arrive(present, table, parent, &holder);
+            }
+            Change::CreateTable { name, table, .. } => {
+                if let Some(of) = &table.partition_of {
+                    self.arrive(present, name, &of.parent, &holder);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn arrive(
+        &mut self,
+        present: &mut Vec<KeyNameHolder>,
+        table: &TableName,
+        parent: &TableName,
+        holder: &impl Fn(&TableName, &(TableName, String), bool) -> KeyNameHolder,
+    ) {
+        self.parents.insert(table.clone(), parent.clone());
+        present.extend(
+            self.triggers
+                .iter()
+                .filter(|(id, clones)| **clones && id.0 == *parent)
+                .map(|(id, _)| holder(table, id, true)),
+        );
+    }
+}
+
 /// The constraints other than keys a change adds, by name in their table's
-/// schema, which is the constraint's: a constraint trigger's row among them,
-/// so one the plan drops and creates again holds its name from there on
-/// (#1738).
+/// schema, which is the constraint's. Trigger companions instead follow
+/// their module and partition lifetimes through `KeyTriggerClones`.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn constraints_added(change: &Change, dialect: &dyn Dialect) -> Vec<TableName> {
+fn constraints_added(change: &Change) -> Vec<TableName> {
     let in_schema = |table: &TableName, name: &str| TableName::new(table.schema.clone(), name);
     match change {
-        Change::CreateModule {
-            id: ModuleId::Trigger { on, name },
-            module,
-        } if dialect.declares_a_constraint(module) => vec![in_schema(on, name)],
         Change::AddCheck { table, name, .. } | Change::AddForeignKey { table, name, .. } => {
             vec![in_schema(table, name.raw())]
         }
@@ -4128,6 +4281,15 @@ mod tests {
         settle_public_execution, split_moving_defaults, take_public_execution,
     };
     use super::*;
+
+    fn names_a_later_relation(
+        cs: &ChangeSet,
+        dialect: &dyn Dialect,
+        holders: Option<&[KeyNameHolder]>,
+    ) -> Vec<LaterName> {
+        super::names_a_later_relation(cs, dialect, holders, &Schema::default())
+    }
+
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
 
     fn split_new_tables(
@@ -8929,6 +9091,202 @@ mod tests {
         assert!(later[0].searched.is_empty(), "{later:?}");
     }
 
+    #[test]
+    fn constraint_trigger_clone_holders_follow_their_parent_and_partition_lifetimes() {
+        let parent: TableName = "app.p".parse().unwrap();
+        let child: TableName = "parts.p1".parse().unwrap();
+        let id: ModuleId = "app.p.n_pkey".parse().unwrap();
+        let module = |constraint| {
+            Box::new(pbps_model::Module {
+                kind: ModuleKind::Trigger,
+                description: None,
+                definition: format!(
+                    "{}AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f()",
+                    if constraint { "CONSTRAINT " } else { "" }
+                ),
+            })
+        };
+        let mut baseline = Schema::default();
+        baseline.modules.insert(id.clone(), *module(true));
+        baseline.tables.insert(parent.clone(), Default::default());
+        baseline.tables.insert(
+            child.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("0".into())],
+                        to: vec![pbps_model::BoundDatum::Value("10".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let holder = KeyNameHolder {
+            name: "parts.n_pkey".parse().unwrap(),
+            owner: Some(child.clone()),
+            primary_key: false,
+            constraint: true,
+            trigger: Some("n_pkey".into()),
+            parent_trigger: Some(id.clone()),
+        };
+        let drop = |id: ModuleId| Change::DropModule {
+            id,
+            kind: ModuleKind::Trigger,
+        };
+        let create = |constraint| Change::CreateModule {
+            id: id.clone(),
+            module: module(constraint),
+        };
+        let attach = Change::AttachPartition {
+            uid: Uid::derived(UidKind::Table, "parts.p2", 0),
+            table: "parts.p2".parse().unwrap(),
+            parent: parent.clone(),
+            bound: pbps_model::PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("10".into())],
+                to: vec![pbps_model::BoundDatum::Value("20".into())],
+            },
+            key: vec![],
+            shape: Box::default(),
+        };
+        let key = Change::SetPrimaryKey {
+            table: "parts.n".parse().unwrap(),
+            from: None,
+            nonclustered: false,
+            to: Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            }),
+        };
+        let arrival = |mut prefix: Vec<Change>, holders: &[KeyNameHolder], baseline: &Schema| {
+            let at = prefix.len();
+            prefix.push(key.clone());
+            let cs = plan(prefix);
+            key_arrivals(
+                &cs,
+                &*pg(),
+                vec![((at, AT_CREATE + 1), "parts.n".parse().unwrap())],
+                &[],
+                Some(holders),
+                baseline,
+            )
+            .0[0]
+                .1
+                .clone()
+        };
+        let row = std::slice::from_ref(&holder);
+        assert_eq!(arrival(vec![], row, &baseline).name, "n_pkey1");
+        assert_eq!(
+            arrival(vec![drop(id.clone())], row, &baseline).name,
+            "n_pkey"
+        );
+        assert_eq!(
+            arrival(
+                vec![drop("app.other.n_pkey".parse().unwrap())],
+                row,
+                &baseline
+            )
+            .name,
+            "n_pkey1"
+        );
+        assert_eq!(
+            arrival(vec![drop(id.clone()), create(false)], row, &baseline).name,
+            "n_pkey"
+        );
+        assert_eq!(
+            arrival(vec![drop(id.clone()), create(true)], row, &baseline).name,
+            "n_pkey1"
+        );
+        assert_eq!(
+            arrival(vec![attach.clone()], &[], &baseline).name,
+            "n_pkey1"
+        );
+        assert_eq!(
+            arrival(vec![drop(id.clone()), attach.clone()], &[], &baseline).name,
+            "n_pkey"
+        );
+        assert_eq!(
+            arrival(
+                vec![
+                    attach.clone(),
+                    Change::DetachPartition {
+                        uid: Uid::derived(UidKind::Table, "parts.p2", 0),
+                        table: "parts.p2".parse().unwrap(),
+                        parent: parent.clone(),
+                        names: vec![],
+                        shape: Box::default(),
+                    }
+                ],
+                &[],
+                &baseline
+            )
+            .name,
+            "n_pkey"
+        );
+        let new_partition = Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "parts.p2", 0),
+            name: "parts.p2".parse().unwrap(),
+            table: Box::new(pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Range {
+                        from: vec![pbps_model::BoundDatum::Value("10".into())],
+                        to: vec![pbps_model::BoundDatum::Value("20".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        assert_eq!(arrival(vec![new_partition], &[], &baseline).name, "n_pkey1");
+        let mut without_trigger = baseline.clone();
+        without_trigger.modules.clear();
+        assert_eq!(
+            arrival(vec![create(true)], &[], &without_trigger).name,
+            "n_pkey1"
+        );
+        assert_eq!(
+            arrival(
+                vec![Change::AlterModule {
+                    id: id.clone(),
+                    module: module(false)
+                }],
+                row,
+                &baseline
+            )
+            .name,
+            "n_pkey"
+        );
+        let mut ordinary = baseline.clone();
+        ordinary.modules.insert(id.clone(), *module(false));
+        assert_eq!(arrival(vec![attach], &[], &ordinary).name, "n_pkey");
+        let moved: TableName = "moved.p".parse().unwrap();
+        assert_eq!(
+            arrival(
+                vec![
+                    Change::RenameTable {
+                        uid: Uid::derived(UidKind::Table, "app.p", 0),
+                        from: parent,
+                        to: moved.clone(),
+                        defaults: vec![],
+                    },
+                    drop(ModuleId::Trigger {
+                        on: moved,
+                        name: "n_pkey".into()
+                    })
+                ],
+                row,
+                &baseline
+            )
+            .name,
+            "n_pkey"
+        );
+    }
+
     /// #1738: a constraint trigger's `pg_constraint` row holds its name like
     /// any constraint, and `DROP TRIGGER` frees it (measured on 16 and 18).
     /// Dropped first, the key takes `n_pkey`, so a default naming it is
@@ -8963,6 +9321,7 @@ mod tests {
                 primary_key: false,
                 constraint: true,
                 trigger: Some(trigger.into()),
+                parent_trigger: None,
             }]
         };
         let row = row_of("n_pkey");
@@ -9057,6 +9416,7 @@ mod tests {
             primary_key,
             constraint: false,
             trigger: None,
+            parent_trigger: None,
         };
         // What the planner refuses, with the target asked about nothing:
         // each name told is qualified here, so none is asked.
@@ -9265,6 +9625,7 @@ mod tests {
             primary_key: true,
             constraint: false,
             trigger: None,
+            parent_trigger: None,
         }];
         assert_eq!(refused(swapped("old_pkey"), &old_key), Vec::<String>::new());
         assert_eq!(refused(swapped("old_pkey1"), &old_key).len(), 1);
@@ -9283,6 +9644,7 @@ mod tests {
                 primary_key: false,
                 constraint: false,
                 trigger: None,
+                parent_trigger: None,
             },
             KeyNameHolder {
                 name: TableName::new("archive", "n_pkey1"),
@@ -9290,6 +9652,7 @@ mod tests {
                 primary_key: false,
                 constraint: false,
                 trigger: None,
+                parent_trigger: None,
             },
         ];
         assert_eq!(refused(moved("n_pkey1"), &held), Vec::<String>::new());
@@ -9339,6 +9702,7 @@ mod tests {
             primary_key: false,
             constraint: false,
             trigger: None,
+            parent_trigger: None,
         };
         let mut in_s2 = new_table(Some("('s2.n_pkey'::regclass)::text"), None, &[]);
         in_s2.primary_key = Some(unnamed());
@@ -9374,6 +9738,7 @@ mod tests {
             primary_key: false,
             constraint: true,
             trigger: None,
+            parent_trigger: None,
         }];
         let after_drop = vec![
             Change::DropTable {
