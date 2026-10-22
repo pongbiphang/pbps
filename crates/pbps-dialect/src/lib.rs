@@ -2772,9 +2772,8 @@ pub trait Dialect {
     /// whose generated names meet do not fail: the engine suffixes the later
     /// one, and which one is later is the plan's order. A declared name equal
     /// to a fallback is the same order dependence as one equal to the first
-    /// choice. The default is none, like the first choices. A first choice
-    /// the engine never retries, one created by name, is listed after every
-    /// one that has a fallback, so it has none at its position.
+    /// choice. The default is none, like the first choices. Fixed declared
+    /// sequence names are claimed separately; they have no fallback.
     fn implicit_relation_fallbacks(
         &self,
         _name: &TableName,
@@ -3812,6 +3811,11 @@ pub fn name_read_sequences(schema: &mut Schema, dialect: &(impl Dialect + ?Sized
 /// in, each checked against everything already claimed. A check or
 /// foreign-key constraint has no backing index and is not in this union
 /// (ADR-0009 §1; issue #179 owns per-table constraint-kind reuse).
+/// Declared owned-sequence names are fixed claims too (DEC-1898.1), checked
+/// against those names and one another. Engine-generated relations may yield
+/// to them, so these fixed names do not themselves collide with a generated
+/// first choice or fallback. An unnamed owned sequence claims nothing here:
+/// a rename may have kept an earlier name, which only a connected plan knows.
 ///
 /// # The one pair this does not report, and who owns it instead
 ///
@@ -3834,30 +3838,42 @@ pub fn check_index_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> 
     check_index_names_with_sources(schema, dialect, &Default::default())
 }
 
-/// The same namespace check for a diagnostic recovery schema, retaining its
-/// supplied sources through both initial name claims and fallback simulation.
-pub fn check_index_names_with_sources(
+/// Only the fixed owned-sequence-name refusals from [`check_index_names`].
+/// Offline planning uses this narrower gate without adopting the other
+/// relation-name refusals that belong to validation and connected planning.
+/// Both paths share the claim rule and its diagnostic text (DEC-1898.1).
+pub fn check_fixed_sequence_names(
     schema: &Schema,
     dialect: &(impl Dialect + ?Sized),
-    conflicts: &pbps_model::diagnostic::SourceConflicts,
 ) -> Vec<String> {
     if !dialect.indexes_share_namespace_with_tables() {
         return Vec::new();
     }
-    /// A name already taken, and by what. `key_of` is the table whose own
-    /// constraint-name rule already covers this claim — `Some` for a named
-    /// primary key or unique constraint, `None` for an index, a table or a
-    /// module, which that rule does not compare.
-    struct Claim<'a> {
-        descriptor: String,
-        key_of: Option<&'a TableName>,
-    }
-    let unclaimed = |descriptor| Claim {
+    let (mut claimed, _) = declared_relation_claims(schema, dialect);
+    let (_, problems) =
+        claim_fixed_sequence_names(schema, dialect, &Default::default(), &mut claimed);
+    problems
+}
+
+/// A name already taken, and by what. `key_of` is the table whose own
+/// constraint-name rule already covers this claim — `Some` for a named
+/// primary key or unique constraint, `None` for an index, a table or a
+/// module, which that rule does not compare.
+struct RelationClaim<'a> {
+    descriptor: String,
+    key_of: Option<&'a TableName>,
+}
+
+fn declared_relation_claims<'a>(
+    schema: &'a Schema,
+    dialect: &(impl Dialect + ?Sized),
+) -> (BTreeMap<ObjectName, RelationClaim<'a>>, Vec<String>) {
+    let unclaimed = |descriptor| RelationClaim {
         descriptor,
         key_of: None,
     };
     let mut problems = Vec::new();
-    let mut claimed: BTreeMap<ObjectName, Claim<'_>> = BTreeMap::new();
+    let mut claimed: BTreeMap<ObjectName, RelationClaim<'_>> = BTreeMap::new();
     for name in schema.tables.keys() {
         claimed.insert(
             name.clone(),
@@ -3873,7 +3889,7 @@ pub fn check_index_names_with_sources(
         }
     }
     for (table_name, table) in &schema.tables {
-        let mut declared: Vec<(&str, Claim<'_>)> = Vec::new();
+        let mut declared: Vec<(&str, RelationClaim<'_>)> = Vec::new();
         for index_name in table.indexes.keys() {
             declared.push((
                 index_name.as_str(),
@@ -3886,7 +3902,7 @@ pub fn check_index_names_with_sources(
         if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
             declared.push((
                 pk_name,
-                Claim {
+                RelationClaim {
                     descriptor: format!(
                         "primary key `{table_name}.{pk_name}`",
                         table_name = table_name.shown()
@@ -3898,7 +3914,7 @@ pub fn check_index_names_with_sources(
         for unique_name in table.unique.keys() {
             declared.push((
                 unique_name.as_str(),
-                Claim {
+                RelationClaim {
                     descriptor: format!(
                         "unique constraint `{table_name}.{unique_name}`",
                         table_name = table_name.shown()
@@ -3929,6 +3945,73 @@ pub fn check_index_names_with_sources(
             }
         }
     }
+    (claimed, problems)
+}
+
+fn claim_fixed_sequence_names(
+    schema: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+    conflicts: &pbps_model::diagnostic::SourceConflicts,
+    claimed: &mut BTreeMap<ObjectName, RelationClaim<'_>>,
+) -> (BTreeSet<ObjectName>, Vec<String>) {
+    // Fixed sequence names are checked against declared relations and one
+    // another, while generated relations may yield to them (DEC-1898.1).
+    // An unnamed serial may keep a name from before a rename; only a
+    // connected plan knows the name it actually creates or keeps (#1899).
+    let mut problems = Vec::new();
+    let mut fixed_names = BTreeSet::new();
+    for (table_name, table) in &schema.tables {
+        let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(table_name));
+        for (column, spec) in &table.columns {
+            for source in sources.get(column.raw(), spec) {
+                let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                    name: Some(name),
+                    ..
+                }) = source
+                else {
+                    continue;
+                };
+                let claim_name = ObjectName::new(table_name.schema.clone(), name.clone());
+                let descriptor = format!(
+                    "the sequence of `serial` column `{table_name}.{column}`",
+                    table_name = table_name.shown(),
+                    column = column.shown(),
+                );
+                fixed_names.insert(claim_name.clone());
+                if let Some(existing) = claimed.insert(
+                    claim_name.clone(),
+                    RelationClaim {
+                        descriptor: descriptor.clone(),
+                        key_of: None,
+                    },
+                ) {
+                    problems.push(format!(
+                        "{} and {descriptor} are both named `{claim_name}`; {} keeps tables, \
+                           views, indexes and sequences in one namespace per schema, so it can \
+                           hold only one of them. Rename the other object, or the sequence's \
+                           `sequence: {{name: ...}}`.",
+                        existing.descriptor,
+                        dialect.name(),
+                        claim_name = claim_name.shown(),
+                    ));
+                }
+            }
+        }
+    }
+    (fixed_names, problems)
+}
+
+/// The same namespace check for a diagnostic recovery schema, retaining its
+/// supplied sources through both initial name claims and fallback simulation.
+pub fn check_index_names_with_sources(
+    schema: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+    conflicts: &pbps_model::diagnostic::SourceConflicts,
+) -> Vec<String> {
+    if !dialect.indexes_share_namespace_with_tables() {
+        return Vec::new();
+    }
+    let (mut claimed, mut problems) = declared_relation_claims(schema, dialect);
     // The names the engine generates for what a table implies: the index
     // behind an unnamed primary key, the sequence behind an identity column.
     // Asked after every declared name is in, because which of two claimants
@@ -3940,6 +4023,9 @@ pub fn check_index_names_with_sources(
     // itself (#465, DEC-465.1). It resolves it by suffixing the later one,
     // so the names it may fall back to are in play as well (#987).
     let declared_names: BTreeSet<ObjectName> = claimed.keys().cloned().collect();
+    let (fixed_names, fixed_problems) =
+        claim_fixed_sequence_names(schema, dialect, conflicts, &mut claimed);
+    problems.extend(fixed_problems);
     let mut claimants = Vec::new();
     for (table_name, table) in &schema.tables {
         let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(table_name));
@@ -4001,7 +4087,7 @@ pub fn check_index_names_with_sources(
                 }),
         )
         .collect();
-    let reach = fallback_reach(&claimants, None, &constraint_names, dialect);
+    let reach = fallback_reach(&claimants, None, &constraint_names, &fixed_names, dialect);
     let mut reported = BTreeSet::new();
     for (k, names) in reach.iter().enumerate() {
         for claim_name in names.iter().skip(1) {
@@ -4020,10 +4106,16 @@ pub fn check_index_names_with_sources(
                 .filter(|j| reach[*j].iter().skip(1).any(|n| n == claim_name))
                 .filter(|j| asked.insert(&claimants[*j].first))
                 .find(|j| {
-                    !fallback_reach(&claimants, Some(*j), &constraint_names, dialect)
-                        .iter()
-                        .flatten()
-                        .any(|n| n == claim_name)
+                    !fallback_reach(
+                        &claimants,
+                        Some(*j),
+                        &constraint_names,
+                        &fixed_names,
+                        dialect,
+                    )
+                    .iter()
+                    .flatten()
+                    .any(|n| n == claim_name)
                 });
             let (landing, remedy) = match freeing {
                 Some(j) => (j, claimants[j].relation.remedy),
@@ -4034,8 +4126,8 @@ pub fn check_index_names_with_sources(
             problems.push(format!(
                 "{} and {descriptor} may both be named `{claim_name}`: {} gives \
                  {descriptor} this name when the name it would take first is already \
-                 taken, by another generated name or by a constraint, which depends on \
-                 the order they are created in. {}",
+                 taken, by another generated name, by a declared sequence or by a constraint, \
+                 which depends on the order they are created in. {}",
                 existing.descriptor,
                 dialect.name(),
                 remedy,
@@ -4079,10 +4171,13 @@ struct Claimant<'a> {
 /// A name in `constraint_names` is taken for a claimant that yields to
 /// constraints without any other claimant taking it: the constraint can be
 /// created first (#1112).
+/// A declared sequence's fixed name is taken for every claimant, without
+/// entering the generated claimant list or acquiring a fallback (DEC-1898.1).
 fn fallback_reach(
     claimants: &[Claimant<'_>],
     without: Option<usize>,
     constraint_names: &BTreeSet<ObjectName>,
+    fixed_names: &BTreeSet<ObjectName>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Vec<ObjectName>> {
     let live: Vec<usize> = (0..claimants.len())
@@ -4106,24 +4201,19 @@ fn fallback_reach(
         for &k in &live {
             let retry = reach[k].len();
             let yields = claimants[k].relation.yields_to_constraints;
-            // The names a constraint takes need no claimant; the rest need a
-            // different other claimant each, so no more than there are.
-            let by_constraints = if yields {
-                reach[k]
-                    .iter()
-                    .filter(|n| constraint_names.contains(*n))
-                    .count()
-            } else {
-                0
+            // A constraint or a fixed sequence needs no generated claimant;
+            // each remaining name needs a different other claimant.
+            let fixed = |name: &ObjectName| {
+                fixed_names.contains(name) || (yields && constraint_names.contains(name))
             };
-            if retry - by_constraints >= live.len() {
+            let by_fixed = reach[k].iter().filter(|n| fixed(n)).count();
+            if retry - by_fixed >= live.len() {
                 continue;
             }
             let taker = &mut takers[k];
             while taken[k] < retry {
                 let t = taken[k];
-                let by_constraint = yields && constraint_names.contains(&reach[k][t]);
-                if !by_constraint
+                if !fixed(&reach[k][t])
                     && !augment(t, &reach[k], k, &holders, &mut BTreeSet::new(), taker)
                 {
                     break;
@@ -5812,6 +5902,158 @@ mod tests {
             check_index_names(&schema, &MinimalDialect).is_empty(),
             "an index name is only unique per table on SQL Server"
         );
+    }
+
+    fn with_serial(mut table: Table, column: &str, name: Option<&str>) -> Table {
+        let mut spec = pbps_model::Column::new("integer".parse().unwrap()).not_null();
+        spec.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+            start: 1,
+            increment: 1,
+            name: name.map(str::to_owned),
+            options: Default::default(),
+        });
+        table.columns.insert(column.into(), spec);
+        table
+    }
+
+    #[test]
+    fn declared_serial_sequence_names_are_unique_per_schema_and_name_both_columns() {
+        for schema in [
+            schema_of(&[(
+                "app.t",
+                with_serial(with_serial(table(), "a", Some("s")), "b", Some("s")),
+            )]),
+            schema_of(&[
+                ("app.t", with_serial(table(), "a", Some("s"))),
+                ("app.u", with_serial(table(), "b", Some("s"))),
+            ]),
+        ] {
+            let found = check_index_names(&schema, &OverloadingDialect);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains("`serial` column `app.t.a`"), "{found:?}");
+            assert_eq!(
+                check_fixed_sequence_names(&schema, &OverloadingDialect),
+                found
+            );
+            assert!(
+                found[0].contains("`app.t.b`") || found[0].contains("`app.u.b`"),
+                "{found:?}"
+            );
+            assert!(found[0].contains("both named `app.s`"), "{found:?}");
+        }
+        for (other_schema, other_name) in [("other", Some("s")), ("app", Some("S")), ("app", None)]
+        {
+            let schema = schema_of(&[
+                ("app.t", with_serial(table(), "a", Some("s"))),
+                (
+                    &format!("{other_schema}.u"),
+                    with_serial(table(), "b", other_name),
+                ),
+            ]);
+            let found = check_index_names(&schema, &OverloadingDialect);
+            assert!(found.is_empty(), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn declared_serial_sequence_names_collide_with_each_declared_relation_kind() {
+        for (other, descriptor) in [
+            (schema_of(&[("app.s", table())]), "table `app.s`"),
+            (
+                schema_with(&[("app.s", ModuleKind::View)], &[]),
+                "view `app.s`",
+            ),
+            (
+                schema_of(&[("app.u", with_index(table(), "s"))]),
+                "index `app.u.s`",
+            ),
+            (
+                schema_of(&[("app.u", with_primary_key(table(), "s"))]),
+                "primary key `app.u.s`",
+            ),
+            (
+                schema_of(&[("app.u", with_unique(table(), "s"))]),
+                "unique constraint `app.u.s`",
+            ),
+        ] {
+            let mut schema = other;
+            schema.tables.insert(
+                "app.t".parse().unwrap(),
+                with_serial(table(), "n", Some("s")),
+            );
+            let found = check_index_names(&schema, &OverloadingDialect);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains(descriptor), "{found:?}");
+            assert!(found[0].contains("`serial` column `app.t.n`"), "{found:?}");
+            assert_eq!(
+                check_fixed_sequence_names(&schema, &OverloadingDialect),
+                found
+            );
+        }
+        // Checks have no backing relation, and an omitted sequence name is unknown.
+        let schema = schema_of(&[
+            ("app.t", with_serial(table(), "n", Some("s"))),
+            ("app.u", with_check(table(), "s")),
+        ]);
+        assert!(check_index_names(&schema, &OverloadingDialect).is_empty());
+        let schema = schema_of(&[
+            ("app.t", with_serial(table(), "n", None)),
+            ("app.t_n_seq", table()),
+        ]);
+        assert!(check_index_names(&schema, &OverloadingDialect).is_empty());
+    }
+
+    #[test]
+    fn diagnostic_serial_sequence_claims_keep_rejected_column_sources() {
+        let schema = schema_of(&[
+            ("app.t", with_serial(table(), "a", Some("s"))),
+            ("app.u", with_serial(table(), "b", None)),
+        ]);
+        let sequence = schema.tables[&"app.t".parse().unwrap()].columns["a"]
+            .value_source
+            .clone();
+        let conflicts = [(
+            "app.u".parse().unwrap(),
+            [(
+                "b".into(),
+                vec![pbps_model::ValueSource::Default("0".into()), sequence],
+            )]
+            .into(),
+        )]
+        .into();
+        let found = check_index_names_with_sources(&schema, &OverloadingDialect, &conflicts);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("`app.t.a`") && found[0].contains("`app.u.b`"),
+            "{found:?}"
+        );
+        assert!(check_index_names(&schema, &OverloadingDialect).is_empty());
+    }
+
+    #[test]
+    fn fixed_sequence_checks_exclude_other_collisions_and_share_each_refusal_once() {
+        let mut schema = schema_of(&[
+            (
+                "app.t",
+                with_serial(with_index(table(), "ix_n"), "n", Some("s")),
+            ),
+            ("app.u", with_index(table(), "ix_n")),
+        ]);
+        // An unrelated fixed sequence does not bring ordinary index conflicts
+        // into the offline plan's narrower gate.
+        assert_eq!(check_index_names(&schema, &OverloadingDialect).len(), 1);
+        assert!(check_fixed_sequence_names(&schema, &OverloadingDialect).is_empty());
+
+        schema.tables.insert("app.s".parse().unwrap(), table());
+        let fixed = check_fixed_sequence_names(&schema, &OverloadingDialect);
+        assert_eq!(fixed.len(), 1, "{fixed:?}");
+        let all = check_index_names(&schema, &OverloadingDialect);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(
+            all.iter().filter(|problem| **problem == fixed[0]).count(),
+            1
+        );
+        assert!(check_fixed_sequence_names(&schema, &MinimalDialect).is_empty());
     }
 
     /// An index named after a table in the same schema is the same namespace

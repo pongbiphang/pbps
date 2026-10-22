@@ -1794,9 +1794,9 @@ impl Dialect for Postgres {
     /// names the engine generates for what a `CREATE TABLE` implies (#465,
     /// DEC-465.1). A unique constraint is always named in a declaration, so
     /// its generated name cannot arise. A `serial` column's sequence is
-    /// created by name, the declared one or that same generated one (#1631,
-    /// `emit::owned_sequence`), and claims it the same way, with no fallback:
-    /// the engine does not choose it.
+    /// created by name (`emit::owned_sequence`), with no engine retry. Its
+    /// declared name is a fixed claim in `check_index_names`; an unnamed
+    /// one's actual name is the connected plan's to claim (#1899).
     fn owned_sequence_name(
         &self,
         table: &TableName,
@@ -1830,10 +1830,6 @@ impl Dialect for Postgres {
         sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<pbps_dialect::ImplicitRelation> {
         let mut out = Vec::new();
-        // A `serial`'s sequence is created by name, so the engine never
-        // retries it: after every name that has a fallback, which
-        // `implicit_relation_fallbacks` lists at the same positions (#1631).
-        let mut by_name = Vec::new();
         if table
             .primary_key
             .as_ref()
@@ -1857,7 +1853,8 @@ impl Dialect for Postgres {
                 .iter()
                 .any(|source| match source {
                     pbps_model::ValueSource::Identity(_) => true,
-                    // Claimed below, where the declaration names it.
+                    // Declared sequence names are fixed claims, not engine
+                    // choices with a fallback (DEC-1898.1).
                     pbps_model::ValueSource::None
                     | pbps_model::ValueSource::Default(_)
                     | pbps_model::ValueSource::Sequence(_)
@@ -1881,33 +1878,7 @@ impl Dialect for Postgres {
                     yields_to_constraints: false,
                 });
             }
-            // A `serial`'s sequence only where the declaration names it. An
-            // unnamed one is not known: a rename keeps the sequence's name,
-            // so the name this table and column would generate may be no
-            // sequence's, and claiming it refused a valid declaration that
-            // used it. The name a plan creates one under is the connected
-            // plan's to claim (#1631, #1899).
-            for source in sources.get(column.raw(), spec) {
-                let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
-                    name: Some(sequence),
-                    ..
-                }) = source
-                else {
-                    continue;
-                };
-                by_name.push(pbps_dialect::ImplicitRelation {
-                    name: sequence.clone(),
-                    descriptor: format!(
-                        "the sequence of `serial` column `{name}.{column}`",
-                        name = name.shown(),
-                        column = column.shown(),
-                    ),
-                    remedy: "Rename the other object, or the sequence's `sequence: {name: ...}`.",
-                    yields_to_constraints: false,
-                });
-            }
         }
-        out.extend(by_name);
         out
     }
 
@@ -1959,8 +1930,7 @@ impl Dialect for Postgres {
                 .iter()
                 .any(|source| match source {
                     pbps_model::ValueSource::Identity(_) => true,
-                    // Created by name, so the engine never retries one, and listed
-                    // after every name here (#1631).
+                    // Created by name, so the engine never retries one.
                     pbps_model::ValueSource::None
                     | pbps_model::ValueSource::Default(_)
                     | pbps_model::ValueSource::Sequence(_)
@@ -3455,7 +3425,81 @@ mod tests {
         let fallbacks = pg.implicit_relation_fallbacks(&TableName::new("app", "t"), &t, 1);
         assert_eq!(names[0].name, "t_id_seq");
         assert_eq!(fallbacks, ["t_id_seq1"]);
-        assert_eq!(names[1].name, "u_id_seq");
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn a_declared_serial_sequence_can_take_an_identitys_first_choice_or_fallback() {
+        use pbps_model::{Column, Identity, OwnedSequence, Schema, Table, ValueSource};
+        let pg = super::Postgres::new();
+        let mut numbered = Table::default();
+        let mut id = Column::new("integer".parse().unwrap()).not_null();
+        id.value_source = ValueSource::Identity(Identity {
+            seed: 1,
+            increment: 1,
+            options: Default::default(),
+        });
+        numbered.columns.insert("id".into(), id);
+        let long = |last| TableName::new("app", format!("{}{last}", "a".repeat(59)));
+        let first = pg.implicit_relation_names(&long('x'), &numbered)[0]
+            .name
+            .clone();
+        let fallback = pg.implicit_relation_fallbacks(&long('x'), &numbered, 1)[0].clone();
+        for name in [&first, &fallback] {
+            let mut serial = Column::new("integer".parse().unwrap()).not_null();
+            serial.value_source = ValueSource::Sequence(OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: Some(name.clone()),
+                options: Default::default(),
+            });
+            let mut table = Table::default();
+            table.columns.insert("n".into(), serial);
+            let mut schema = Schema::default();
+            schema.tables.insert(long('x'), numbered.clone());
+            schema.tables.insert(long('y'), numbered.clone());
+            schema
+                .tables
+                .insert(TableName::new("app", "serials"), table);
+            let found = pbps_dialect::check_index_names(&schema, &pg);
+            assert!(found.is_empty(), "{found:?}");
+            // A fixed first choice can still send an identity to a fallback
+            // occupied by a declared table; that collision stays refused.
+            if name == &first {
+                schema
+                    .tables
+                    .insert(TableName::new("app", &fallback), Table::default());
+                let found = pbps_dialect::check_index_names(&schema, &pg);
+                assert_eq!(found.len(), 1, "{found:?}");
+                assert!(found[0].contains("identity column"), "{found:?}");
+                assert!(
+                    found[0].contains(&format!("table `app.{fallback}`")),
+                    "{found:?}"
+                );
+            }
+        }
+        // The same generated/truncated spelling is unknown for an unnamed serial.
+        let mut unnamed = numbered.clone();
+        unnamed.columns.get_mut("id").unwrap().value_source =
+            ValueSource::Sequence(OwnedSequence {
+                start: 1,
+                increment: 1,
+                name: None,
+                options: Default::default(),
+            });
+        let mut named = unnamed.clone();
+        if let ValueSource::Sequence(sequence) =
+            &mut named.columns.get_mut("id").unwrap().value_source
+        {
+            sequence.name = Some(first);
+        }
+        let mut schema = Schema::default();
+        schema.tables.insert(long('x'), unnamed);
+        schema
+            .tables
+            .insert(TableName::new("app", "serials"), named);
+        let found = pbps_dialect::check_index_names(&schema, &pg);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// #1112: PostgreSQL names a primary key's index with

@@ -3188,11 +3188,17 @@ fn cmd_plan(
     // and on the baseline inside `baseline::load`. Skipped on either side, a
     // routine written `f(int)` at the baseline and `f(integer)` now would be
     // two keys, and the plan a drop and a create of an unchanged object.
-    let collisions = routine_ids_as_the_dialect_spells_them(
+    let mut collisions = routine_ids_as_the_dialect_spells_them(
         &mut loaded.schema,
         &mut loaded.hints,
         dialect.as_ref(),
     );
+    // Offline previews must refuse fixed sequence-name collisions before
+    // resolving ids or writing artifacts, just as connected plans do (DEC-1898.1).
+    collisions.extend(pbps_dialect::check_fixed_sequence_names(
+        &loaded.schema,
+        dialect.as_ref(),
+    ));
     if !collisions.is_empty() {
         if json {
             output::unanswerable(

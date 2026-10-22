@@ -3229,6 +3229,105 @@ fn partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers()
     }
 }
 
+/// Fixed serial sequence names must be refused before either planning path
+/// writes artifacts or executes DDL, rather than failing at CREATE SEQUENCE.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn duplicate_declared_serial_sequence_names_are_refused_before_planning_on_both_servers() {
+    for (version, server) in [(16, old_server()), (18, server())] {
+        let own = OwnDatabase::new(&server, "serial-claims1898");
+        let connection = own.connection();
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("serial-claims1898");
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt empty database",
+        ]));
+        let duplicate = "table: app.t\ncolumns:\n  a: {type: serial, sequence: {name: s}}\n  b: {type: serial, sequence: {name: s}}\n";
+        d.table(duplicate);
+        let validation = json_output(d.run(&["validate", "--format", "json"]));
+        let collisions: Vec<_> = validation["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "schema.name-collision")
+            .collect();
+        assert_eq!(collisions.len(), 1, "{validation}");
+        let diagnostic = collisions[0]["message"].as_str().unwrap();
+        let plan = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        for connected in [false, true] {
+            let mut args = vec![
+                "plan",
+                "--out",
+                plan.to_str().unwrap(),
+                "--sql",
+                sql.to_str().unwrap(),
+            ];
+            if connected {
+                args.extend(["--db", connection]);
+            }
+            let output = d.run(&args);
+            let message = format!("{}{}", stdout(&output), stderr(&output));
+            assert_eq!(code(&output), 1, "{message}");
+            assert_eq!(message.matches(diagnostic).count(), 1, "{message}");
+            for name in ["app.t.a", "app.t.b", "app.s"] {
+                assert!(message.contains(name), "{message}");
+            }
+            assert!(
+                !plan.exists() && !sql.exists(),
+                "a refused plan wrote artifacts"
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'app'"
+                ),
+                0
+            );
+        }
+        // Distinct declared names remain valid on both planning paths.
+        d.table(&duplicate.replace(
+            "b: {type: serial, sequence: {name: s}}",
+            "b: {type: serial, sequence: {name: other_s}}",
+        ));
+        succeeds(d.run(&["plan"]));
+        succeeds(d.run(&["plan", "--db", connection]));
+
+        // Ordinary duplicate indexes remain previewable offline, while the
+        // connected path retains its existing full declaration validation.
+        let d = Demo::new("ordinary-index-claims1898");
+        d.table("table: app.t\ncolumns:\n  n: {type: integer}\nindexes:\n  ix_n: {columns: [n]}\n");
+        std::fs::write(
+            d.dir.join("schema/app.u.yml"),
+            "table: app.u\ncolumns:\n  n: {type: integer}\nindexes:\n  ix_n: {columns: [n]}\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        let connected = d.run(&["plan", "--db", connection]);
+        assert_eq!(
+            code(&connected),
+            1,
+            "{}{}",
+            stdout(&connected),
+            stderr(&connected)
+        );
+        for index in ["app.t.ix_n", "app.u.ix_n"] {
+            assert!(stderr(&connected).contains(index), "{}", stderr(&connected));
+        }
+    }
+}
+
 /// A connected plan's base is a read, which knows the name the engine
 /// generated for a `serial`'s sequence: a declaration naming another one
 /// renames it, gated as `rename` (#1889). The same name a git baseline
@@ -9270,6 +9369,9 @@ fn two_tables_with_one_index_name_are_refused() {
         "{}",
         stderr(&o)
     );
+    // This remains validate's refusal; an offline plan still permits a
+    // preview of ordinary relation collisions (DEC-1898.1).
+    succeeds(d.run(&["plan"]));
     let o = d.run(&["validate", "--format", "json"]);
     assert!(
         stdout(&o).contains("schema.name-collision"),

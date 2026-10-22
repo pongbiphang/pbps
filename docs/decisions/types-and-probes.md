@@ -2497,3 +2497,65 @@ Pinned by `potential_type_paths_are_checked_even_without_an_added_column`, `an_e
 **DEC-2181.4. An input-path node needs an execution proof as well as a known layout.** The semantic node match refuses by default. Measured on 16 and 18, I/O coercions reconstruct the target's nested domains, while stored typed constants and relabels do not; array coercions execute their explicit element expression. PostgreSQL 18 SQL/JSON return coercions also run domain checks without an explicit coercion child and remain unreadable until qualified.
 
 Pinned by `io_coercions_execute_nested_checks_and_require_trust_on_postgres_16`, `io_coercions_execute_nested_checks_and_require_trust_on_postgres_18`, `json_return_coercion_runs_a_domain_check_and_is_unreadable_on_postgres_18` and `a_known_node_layout_without_an_execution_proof_is_refused`.
+
+<a id="dec-1898-1"></a>
+
+**DEC-1898.1. A serial's explicitly declared sequence name is a fixed
+relation claim in its schema, and an omitted name claims nothing offline.**
+Amends DEC-1631.1's namespace implementation: two names created by
+`CREATE SEQUENCE` cannot be treated as two implicit first choices that the
+engine resolves by suffixing the later one.
+
+Measured on PostgreSQL 16.15 and 18.6: `CREATE SEQUENCE` fails with `42P07`,
+`relation "..." already exists`, when its name belongs to another sequence,
+a table, a view, an index, or the index backing a named primary key or unique
+constraint. The same sequence name in two schemas succeeds. With serial-owned
+sequences already taking `t_id_seq` and `t_id_seq1`, creating an identity on
+`t.id` instead chooses `t_id_seq2`: its implicit name and fallbacks yield to
+existing relations.
+
+`check_index_names_with_sources` claims each explicit `sequence: {name: ...}`
+against tables, views, declared indexes, constraint-backed indexes and other
+explicit sequence names in that schema, naming both owners on refusal. It
+also retains sources beside a rejected column for diagnostic validation.
+These fixed names are outside the implicit claimant list: an identity's
+first choice or fallback may equal one without refusing the declaration,
+while fallback reach still accounts for a fixed name already being taken.
+The existing checks for other declared relations meeting generated names
+remain in force. Connected `plan --db` already runs the full declaration
+check through `deploy::refuse_invalid_declarations`, `declaration_problems`
+and `check_index_names_with_sources`. Offline `plan` previously ran none of
+these relation-namespace checks. It now calls only `check_fixed_sequence_names`
+before resolving identities or writing artifacts, so this change adds only
+fixed sequence-name refusals there. Ordinary index collisions remain
+previewable offline and refused by connected planning. Both entry points
+share the fixed-claim implementation and report the same text once.
+
+An unnamed serial stays unclaimed offline. Renaming its table or column
+keeps its old sequence name, so generating a new name from the declaration
+would claim a name that may belong to no sequence. A declared serial name
+equal to another serial's generated name, including its 63-byte truncation,
+therefore remains accepted here. The generated-name collision test from
+this issue belongs to #1899's connected check, which knows which columns
+the plan actually creates; it is deliberately not implemented offline.
+
+Tests: `declared_serial_sequence_names_are_unique_per_schema_and_name_both_columns`
+covers same-table and cross-table duplicates, with different schemas,
+different case and omitted names as negatives.
+`declared_serial_sequence_names_collide_with_each_declared_relation_kind`
+covers tables, views, indexes and both constraint-backed indexes, with checks
+and an unnamed serial's generated spelling as negatives.
+`diagnostic_serial_sequence_claims_keep_rejected_column_sources` covers
+diagnostic recovery. `a_declared_serial_sequence_can_take_an_identitys_first_choice_or_fallback`
+covers implicit first choices and fallbacks, plus an unnamed serial's
+truncated spelling and a declared table still blocking an identity fallback.
+Live on both supported servers,
+`duplicate_declared_serial_sequence_names_are_refused_before_planning_on_both_servers`
+requires offline and connected `plan` to name both columns, write no plan or
+SQL artifact and create no relation, with the same single diagnostic as
+`validate`; distinct explicit names still plan. It also keeps ordinary
+duplicate indexes previewable offline and refused by connected planning.
+`fixed_sequence_checks_exclude_other_collisions_and_share_each_refusal_once`
+covers mixed index/sequence collisions and identical, unduplicated diagnostics.
+`two_tables_with_one_index_name_are_refused` keeps the offline-preview boundary
+covered without a live server.
