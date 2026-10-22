@@ -2721,9 +2721,9 @@ impl Change {
                 let identity_loosened = matches!(from, ValueSource::Identity(_))
                     && matches!(to, ValueSource::Sequence(_));
                 // A kept source retuned to end sooner: the bound it counts
-                // toward set or tightened, or its cycle turned off. A writer
-                // working today then fails when the numbers run out, where
-                // before it went on (#1921, DEC-1921.1).
+                // toward set or tightened without cycling, or its cycle
+                // turned off. A writer working today then fails when the
+                // numbers run out, where before it went on (#1921, DEC-1921.1).
                 let ends_sooner = match (from, to) {
                     (ValueSource::Identity(was), ValueSource::Identity(now)) => now
                         .options

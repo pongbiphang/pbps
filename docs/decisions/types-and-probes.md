@@ -2262,10 +2262,13 @@ declared for the narrower type fit the wider. A widening keeps the retype
 first, where the old bounds fit (ORDERING.md).
 
 **Gated** (maintainer, 2026-10-14) as `numbering` only where a writer
-working today fails sooner: the bound the sequence counts toward set or
-lowered (raised, counting down), or its cycle turned off. A bound raised or
-removed, the other bound, a cycle turned on, and a cache changed are not:
-none can fail an insert that succeeds now.
+working today fails sooner: with a non-cycling destination, the bound the
+sequence counts toward set or lowered (raised, counting down), or its cycle
+turned off. A tightened bound with a cycling destination only wraps sooner
+and is not gated. A bound raised or removed, the other bound, a cycle turned
+on, and a cache changed are not gated either: none can fail an insert that
+succeeds now. The counter probe below still checks a bound moved while
+cycling, since the engine refuses one its counter is already past.
 
 **Probed.** Measured, the engine refuses a bound the counter is already
 past (`RESTART value (10) cannot be greater than MAXVALUE (5)`), mid-apply.

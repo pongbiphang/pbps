@@ -468,10 +468,11 @@ indexes:
   is the engine's own for the type and direction, and spelling that default
   is refused, so a declaration has one spelling. They are read back, created,
   and retuned in place; a retune that makes a writer fail sooner — the bound
-  it counts toward set or lowered, or the cycle turned off — is gated as
-  `numbering`, and the pre-flight counts a counter already past the new
-  bounds. A cycle on a column under a primary key, unique constraint or
-  unique index is refused: once it wraps, an insert fails as a duplicate.
+  it counts toward set or tightened with a non-cycling destination, or the
+  cycle turned off — is gated as `numbering`, and the pre-flight counts a
+  counter already past the new bounds. A cycle on a column under a primary
+  key, unique constraint or unique index is refused: once it wraps, an insert
+  fails as a duplicate.
   SQL Server's identity has only a seed and an increment, and refuses them
   (DEC-1921.1).
 - **A SQL Server computed column is declared under `computed:`**, beside
@@ -1074,7 +1075,7 @@ exists is never consulted, since no plan creates it again.
 | `revoke` | A permission is revoked, a role dropped (4.7), or standing-table row access is narrowed (DEC-1173.1) | A running application loses access mid-flight |
 | `row-security` | Standing-table row access widens: DISABLE, NO FORCE, create permissive policy, drop restrictive policy, or any policy replacement | Previously hidden or protected rows become accessible; **gated** by `--allow row-security` |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
-| `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); a sequence's bound lowered, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner |
+| `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); the bound a sequence counts toward set or tightened with a non-cycling destination, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner. A tightened bound with a cycling destination only wraps sooner |
 
 On standing tables, ENABLE, FORCE, creating a restrictive policy and dropping a
 permissive policy carry `revoke`. Every policy replacement carries both `revoke`

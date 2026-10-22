@@ -1306,9 +1306,10 @@ impl SequenceOptions {
     }
 
     /// Whether `self`, replacing `was`, can make a writer fail sooner
-    /// (DEC-1921.1): the bound it counts toward set or tightened, or a
-    /// cycle turned off. Needs no type: an explicit bound is always inside
-    /// the default one it replaces, so `None` is the loosest.
+    /// (DEC-1921.1): the bound it counts toward set or tightened without
+    /// cycling, or a cycle turned off. A cycling destination wraps sooner
+    /// rather than running out. Needs no type: an explicit bound is always
+    /// inside the default one it replaces, so `None` is the loosest.
     pub fn ends_sooner_than(&self, was: &SequenceOptions, increment: i64) -> bool {
         let tighter = |now: Option<i64>, then: Option<i64>, below: bool| match (now, then) {
             (None, _) => false,
@@ -1326,7 +1327,7 @@ impl SequenceOptions {
         } else {
             tighter(self.max, was.max, true)
         };
-        bound || (was.cycle && !self.cycle)
+        !self.cycle && (bound || was.cycle)
     }
 }
 

@@ -6732,9 +6732,10 @@ mod tests {
 
     /// A kept source retuned is gated as `numbering` only where its numbers
     /// end sooner, making a writer fail where it went on before (#1921,
-    /// DEC-1921.1): the bound it counts toward set or lowered (raised,
-    /// counting down), or its cycle turned off. A bound raised or removed, a
-    /// cycle turned on, and a cache changed are not.
+    /// DEC-1921.1): without cycling, the bound it counts toward set or lowered
+    /// (raised, counting down), or its cycle turned off. A bound tightened
+    /// while the destination cycles only wraps sooner. A bound raised or
+    /// removed, a cycle turned on, and a cache changed are not gated.
     #[test]
     fn a_retune_is_gated_only_where_its_numbers_end_sooner() {
         use pbps_model::{
@@ -6814,8 +6815,43 @@ mod tests {
                 up(o(None, Some(100), false, None)),
                 true,
             ),
+            (
+                up(o(None, Some(100), true, None)),
+                up(o(None, Some(50), false, None)),
+                true,
+            ),
             (down(none), down(o(Some(-100), None, false, None)), true),
+            (
+                down(o(Some(-100), None, false, None)),
+                down(o(Some(-50), None, false, None)),
+                true,
+            ),
+            (
+                down(o(Some(-100), None, true, None)),
+                down(o(Some(-50), None, false, None)),
+                true,
+            ),
             // Negative: each change that ends no sooner.
+            (
+                up(o(None, Some(100), true, None)),
+                up(o(None, Some(50), true, None)),
+                false,
+            ),
+            (
+                down(o(Some(-100), None, true, None)),
+                down(o(Some(-50), None, true, None)),
+                false,
+            ),
+            (
+                up(o(None, Some(100), false, None)),
+                up(o(None, Some(50), true, None)),
+                false,
+            ),
+            (
+                down(o(Some(-100), None, false, None)),
+                down(o(Some(-50), None, true, None)),
+                false,
+            ),
             (
                 up(o(None, Some(100), false, None)),
                 up(o(None, Some(500), false, None)),
