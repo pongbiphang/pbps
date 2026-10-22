@@ -375,6 +375,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::DropPolicy { .. }
                 | Change::CreatePolicy { .. }
                 | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }

@@ -506,6 +506,17 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "DropPolicy",
+                Change::DropPolicy {
+                    table: tn("t"),
+                    name: "policy".into(),
+                    policy: RowPolicy {
+                        using: Some("x > 0".into()),
+                        ..Default::default()
+                    },
+                },
+            ),
+            (
                 "CreatePolicy",
                 Change::CreatePolicy {
                     table: tn("t"),
@@ -875,6 +886,19 @@ mod effects_of_each_kind {
             );
             let fx = effects(&ops.as_slice()[0], &owners, snapshot, desired)
                 .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            if kind == "DropPolicy" {
+                assert!(fx.creates.is_empty());
+                assert_eq!(fx.removes.len(), 1);
+                let names =
+                    pbps_model::operation::names(&ops.as_slice()[0], &owners, snapshot).unwrap();
+                assert!(names.claims.is_empty());
+                assert_eq!(names.releases.len(), 1);
+                assert_eq!(
+                    names.releases[0].address.kind,
+                    pbps_model::operation::NameKind::Policy
+                );
+                assert_eq!(names.releases[0].address.name, "policy");
+            }
             seen.entry(kind).or_default().extend(words(&fx));
         }
         let table = requires_table();

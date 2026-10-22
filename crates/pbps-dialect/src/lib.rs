@@ -545,7 +545,9 @@ impl Unchecked {
             Change::AddColumn { table, name, .. } => {
                 format!("new NOT NULL column {}", table.column(name).raw())
             }
-            Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => change.subject(),
+            Change::DropPolicy { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. } => change.subject(),
             Change::SetReplicaIdentity { table, .. } => {
                 format!("replica identity of {table}", table = table.raw())
             }

@@ -336,6 +336,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::DropForeignKey { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }

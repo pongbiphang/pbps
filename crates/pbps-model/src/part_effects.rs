@@ -190,6 +190,9 @@ impl Change {
             Change::AlterColumnExpression { column, .. } => {
                 vec![direct(Part::Generated(column.clone()), Effect::Rewritten)]
             }
+            Change::DropPolicy { table, name, .. } => {
+                named(table, crate::Part::Policy, name, Effect::Removed)
+            }
             Change::CreatePolicy { table, name, .. } => {
                 named(table, crate::Part::Policy, name, Effect::Created)
             }

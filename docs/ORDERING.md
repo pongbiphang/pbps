@@ -356,6 +356,7 @@ requirement is common to all of them, so it is listed once,
 | `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
+| `DropPolicy` | 0 (registration only; relative ordering arrives in #1173 PR B) | A standing table; SQL delivery arrives in PR C | Removes one table-local policy | Exists, removes |
 | `CreatePolicy` | 14 (14, 2) | P: a matching table created in this plan; all modules, structural changes and bootstrap inserts first. Predicate bindings remain #595's named limitation | One table-local policy, with its own name namespace | Exists, creates |
 | `SetRowSecurity` | 14 (14, 3) | P: its matching created table and all planned policies; modules and bootstrap inserts first | Rewrites the table's independent RLS flags; no standing transitions until #1173 | Exists, rewrites |
 | `CreateRole` | 15 | The name free | A role | creates |

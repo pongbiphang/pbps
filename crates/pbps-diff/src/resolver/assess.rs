@@ -248,6 +248,7 @@ fn moves_bindings(
         | Change::DropForeignKey { .. }
         | Change::AlterColumnNullability { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

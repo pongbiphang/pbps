@@ -1222,5 +1222,51 @@
       "id": "app.t.trig",
       "kind": "trigger"
     }
+  },
+  {
+    "name": "DropPolicy/select-public",
+    "change": {
+      "op": "drop_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "select",
+        "to": "public",
+        "using": "n > 0"
+      }
+    }
+  },
+  {
+    "name": "DropPolicy/update-restrictive",
+    "change": {
+      "op": "drop_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "update",
+        "restrictive": true,
+        "to": {
+          "roles": [
+            "reader",
+            "writer"
+          ]
+        },
+        "using": "n > 0",
+        "with_check": "n < 100"
+      }
+    }
+  },
+  {
+    "name": "DropPolicy/insert-check",
+    "change": {
+      "op": "drop_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "insert",
+        "to": "public",
+        "with_check": "n > 0"
+      }
+    }
   }
 ]

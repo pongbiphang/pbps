@@ -27,6 +27,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/raised_messages.rs"]
 mod raised_messages;
 
+#[path = "support/row_security_risks.rs"]
+mod row_security_risks;
+
 #[test]
 #[ignore = "needs live mssql"]
 fn raised_guard_messages_are_shown_once_on_every_apply_path() {

@@ -688,6 +688,7 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         // NOT NULL are the partition's (#1581).
         | Change::SetPartitionDefault { table, .. }
         | Change::SetPartitionNotNull { table, .. }
+        | Change::DropPolicy { table, .. }
         | Change::CreatePolicy { table, .. }
             | Change::SetRowSecurity { table, .. }
             | Change::SetReplicaIdentity { table, .. }

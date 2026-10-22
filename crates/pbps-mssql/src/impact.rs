@@ -91,6 +91,7 @@ pub async fn key_drop_blockers(
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::DropPolicy { .. }
                 | Change::CreatePolicy { .. }
                 | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
@@ -258,6 +259,7 @@ pub async fn key_drop_blockers(
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

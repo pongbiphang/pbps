@@ -619,6 +619,9 @@ impl Declared {
                     remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                 }
+                Change::DropPolicy { table, name, .. } => {
+                    remove_nested(&mut self.expressions.policies, table, name);
+                }
                 Change::CreatePolicy {
                     table,
                     name,

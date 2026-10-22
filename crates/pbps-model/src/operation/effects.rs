@@ -791,7 +791,7 @@ impl Cx<'_> {
                     ));
                 }
             }
-            Change::CreatePolicy { table, .. } => {
+            Change::CreatePolicy { table, .. } | Change::DropPolicy { table, .. } => {
                 let owner = self.table(table)?;
                 self.exists(ObjectKey::Table(owner));
             }

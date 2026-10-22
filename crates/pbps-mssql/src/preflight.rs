@@ -884,6 +884,7 @@ name = name.raw(),
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

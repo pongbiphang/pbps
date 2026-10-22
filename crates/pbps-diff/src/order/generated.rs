@@ -112,6 +112,9 @@ fn table_use(change: &Change) -> TableUse<'_> {
         | Change::SetIndexStorageParameters { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
+        // Removing a policy binds no new expression or column: only its
+        // existing owner/name is needed, not a generated installation's prefix.
+        | Change::DropPolicy { .. }
         | Change::DropModule { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
@@ -264,9 +267,9 @@ pub fn parts(
     ))
 }
 
-/// Derive creation-part risks from typed ownership, never diagnostic provenance.
-/// Generated-column installations identify this family after serialization;
-/// an earlier CREATE of that identity proves its context (DEC-1503.3).
+/// Derive contextual risks from typed ownership, never diagnostic provenance.
+/// An earlier CREATE proves generated-part context (DEC-1503.3); policy
+/// replacements pair by table identity and policy name (DEC-1173.1).
 pub fn risks(
     cs: &ChangeSet,
     ids: &IdsFile,
@@ -277,9 +280,47 @@ pub fn risks(
     let names = cs
         .changes
         .iter()
-        .any(|p| matches!(p.change, Change::CreateTable { .. }))
+        .any(|p| {
+            matches!(
+                p.change,
+                Change::CreateTable { .. }
+                    | Change::DropPolicy { .. }
+                    | Change::CreatePolicy { .. }
+            )
+        })
         .then(|| PlanNames::of(&cs.changes, ids).ok())
         .flatten();
+    // Every replacement is unknown in both directions, even a mode flip
+    // whose two intrinsic risks happen to agree. Table identity, not spelling,
+    // keeps this pairing correct across renames and reused names (DEC-1173.1).
+    let mut dropped = BTreeSet::new();
+    let mut installed = BTreeSet::new();
+    let mut policy_keys = BTreeMap::new();
+    for (at, p) in cs.changes.iter().enumerate() {
+        let (Change::DropPolicy { table, name, .. }
+        | Change::CreatePolicy {
+            table,
+            name,
+            origin: pbps_model::RowSecurityOrigin::Standing,
+            ..
+        }) = &p.change
+        else {
+            continue;
+        };
+        let is_drop = matches!(&p.change, Change::DropPolicy { .. });
+        if let Some(names) = &names
+            && let Holder::Tracked(uid) = names.holder(table, At::Before(at))
+        {
+            let key = (uid.clone(), name.clone());
+            policy_keys.insert(at, key.clone());
+            if is_drop {
+                dropped.insert(key);
+            } else {
+                installed.insert(key);
+            }
+        }
+    }
+    let replacements: BTreeSet<_> = dropped.intersection(&installed).cloned().collect();
     let mut first_write = BTreeMap::new();
     let mut parents = BTreeMap::new();
     for (at, p) in cs.changes.iter().enumerate() {
@@ -391,7 +432,14 @@ pub fn risks(
                     .then_some(&p.change)
                 })
             };
-            dialect.change_risks(source().unwrap_or(&part.change))
+            let mut risks = dialect.change_risks(source().unwrap_or(&part.change));
+            if policy_keys
+                .get(&at)
+                .is_some_and(|key| replacements.contains(key))
+            {
+                risks.extend([RiskClass::Revoke, RiskClass::RowSecurity]);
+            }
+            risks
         })
         .collect()
 }
@@ -555,6 +603,7 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::DropIndex { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
+        | Change::DropPolicy { .. }
         | Change::SetRowSecurity { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }

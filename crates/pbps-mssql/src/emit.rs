@@ -531,7 +531,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 table = table.raw()
             ),
         }),
-        Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {
+        Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {
             Err(DialectError::Unsupported {
                 dialect: DIALECT,
                 feature: "PostgreSQL row-security operations".into(),

@@ -76,6 +76,8 @@ pub enum RiskClass {
     /// the sequence's name away; or the source removed, so an insert that
     /// left the column to it fails `NOT NULL`.
     Numbering,
+    /// Row-level access widens; explicit approval is required (DEC-1173.1).
+    RowSecurity,
 }
 
 impl RiskClass {
@@ -92,6 +94,7 @@ impl RiskClass {
             RiskClass::Revoke => "revoke",
             RiskClass::GrantWiden => "grant-widen",
             RiskClass::Numbering => "numbering",
+            RiskClass::RowSecurity => "row-security",
         }
     }
 
@@ -139,13 +142,16 @@ impl RiskClass {
             RiskClass::GrantWiden => {
                 "access widens: a role can do more than before, which the merge request should have reviewed"
             }
+            RiskClass::RowSecurity => {
+                "row-level access can widen: rows previously hidden or protected can become accessible"
+            }
             RiskClass::Numbering => {
                 "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails, or one fails sooner because the numbers now end earlier"
             }
         }
     }
 
-    pub const ALL: [RiskClass; 10] = [
+    pub const ALL: [RiskClass; 11] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -156,6 +162,7 @@ impl RiskClass {
         RiskClass::Revoke,
         RiskClass::GrantWiden,
         RiskClass::Numbering,
+        RiskClass::RowSecurity,
     ];
 }
 
@@ -519,7 +526,13 @@ pub enum Change {
         policy: crate::RowPolicy,
         origin: RowSecurityOrigin,
     },
-    /// Created tables only; standing-table transitions arrive with #1173.
+    /// The dropped definition pins risk classification, including latent policies.
+    DropPolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
+    },
+    /// Independent PostgreSQL ENABLE and FORCE transitions.
     SetRowSecurity {
         uid: Uid,
         table: TableName,
@@ -969,12 +982,13 @@ impl<'a> From<&'a Cell> for CellAfter<'a> {
     }
 }
 
-/// A creation decision is valid only beside its matching table creation.
-/// #1173 adds standing-table transitions and their risks.
+/// Whether the owning table is created in this plan, verified by UID on admission.
+/// Standing-table edits carry access risks even while RLS is disabled (DEC-1173.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowSecurityOrigin {
     Created,
+    Standing,
 }
 
 /// Which attribute of a column a change moves.
@@ -1376,6 +1390,7 @@ impl Change {
             | Change::SetStorageParameters { table, .. }
             | Change::SetPartitionDefault { table, .. }
             | Change::SetPartitionNotNull { table, .. }
+            | Change::DropPolicy { table, .. }
             | Change::CreatePolicy { table, .. }
             | Change::SetRowSecurity { table, .. }
             | Change::SetReplicaIdentity { table, .. }
@@ -1465,6 +1480,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1583,6 +1599,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1656,6 +1673,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1774,6 +1792,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1842,6 +1861,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1928,6 +1948,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1991,6 +2012,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2052,6 +2074,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2156,6 +2179,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2226,6 +2250,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2273,6 +2298,9 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
+            Change::DropPolicy { table, name, .. } => {
+                it(table, Some(name), PartAfter::Gone(Part::Policy))
+            }
             Change::CreatePolicy {
                 table,
                 name,
@@ -2423,6 +2451,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2488,6 +2517,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2541,6 +2571,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -2790,6 +2821,33 @@ impl Change {
             } => {
                 r.insert(RiskClass::GrantWiden);
             }
+            // Classify latent policies as enabled: a later ENABLE must not
+            // be the first time their access change appears (DEC-1173.1).
+            Change::CreatePolicy {
+                policy, origin: RowSecurityOrigin::Standing, ..
+            } => {
+                r.insert(if policy.restrictive {
+                    RiskClass::Revoke
+                } else {
+                    RiskClass::RowSecurity
+                });
+            }
+            Change::DropPolicy { policy, .. } => {
+                r.insert(if policy.restrictive {
+                    RiskClass::RowSecurity
+                } else {
+                    RiskClass::Revoke
+                });
+            }
+            Change::SetRowSecurity {
+                from, to, origin: RowSecurityOrigin::Standing, ..
+            } => {
+                for (was, now) in [(from.enabled, to.enabled), (from.forced, to.forced)] {
+                    if was != now {
+                        r.insert(if now { RiskClass::Revoke } else { RiskClass::RowSecurity });
+                    }
+                }
+            }
             Change::CreateTable { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability {
@@ -2831,8 +2889,8 @@ impl Change {
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it
             // (DEC-1444.1).
-            | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. }
+            | Change::CreatePolicy { origin: RowSecurityOrigin::Created, .. }
+            | Change::SetRowSecurity { origin: RowSecurityOrigin::Created, .. }
             | Change::SetReplicaIdentity { .. }
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table

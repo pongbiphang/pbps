@@ -450,9 +450,9 @@ pub fn names(
                 name.raw(),
             )?;
         }
-        Change::CreatePolicy { table, name, .. } => {
+        Change::CreatePolicy { table, name, .. } | Change::DropPolicy { table, name, .. } => {
             nx.part(
-                true,
+                matches!(op.change(), Change::CreatePolicy { .. }),
                 table,
                 NameKind::Policy,
                 PartKey::Policy(name.clone()),

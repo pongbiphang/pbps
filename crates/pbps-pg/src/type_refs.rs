@@ -62,6 +62,7 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetPartitionDefault { .. }

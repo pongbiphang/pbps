@@ -1488,6 +1488,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::SetPartitionDefault { .. }
             | change @ pbps_model::Change::SetPartitionNotNull { .. }
             | change @ pbps_model::Change::SetStorageParameters { .. }
+            | change @ pbps_model::Change::DropPolicy { .. }
             | change @ pbps_model::Change::CreatePolicy { .. }
             | change @ pbps_model::Change::SetRowSecurity { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
