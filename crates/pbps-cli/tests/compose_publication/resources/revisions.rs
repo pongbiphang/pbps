@@ -49,7 +49,7 @@ fn discovery_cannot_return_a_cached_preview_after_actual_retirement() {
     for linked in [false, true] {
         let f = Fixture::new(&format!("revision-retirement-{linked}"));
         let other = linked.then(|| {
-            let path = f.repo.root.with_extension("linked");
+            let path = sibling(&f.repo.root, "linked");
             git(
                 &f.repo.root,
                 &[

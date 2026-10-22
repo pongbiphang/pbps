@@ -190,7 +190,7 @@ fn transport_loss_and_a_lost_acknowledgement_are_not_proof_of_no_write() {
         destination(&f, true);
         signer(&f, Some("true"));
         let (_store, preview, candidate) = f.ready();
-        let moved = f.remote.with_extension("moved");
+        let moved = sibling(&f.remote, "moved");
         let mut publisher = f.publisher();
         let result = publisher.confirm_observed(&candidate, &|at| match (lost, at) {
             ("transport", Boundary::BeforePush) => {

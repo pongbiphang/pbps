@@ -2085,6 +2085,10 @@ serialise, two of them destroyed the third's schema mid-read. The failure was
 loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
+Use the test support's `sibling` helper to append suffixes to the complete
+temporary path: replacing an extension in a dotted fixture name can discard
+its PID, letting another process replace a frozen compose destination and
+correctly trigger `DestinationChanged` (#2077).
 
 A scan-to-deparse race fixture must wait for the reader at a known lock before
 committing the drop; more routines or longer bodies cannot guarantee overlap

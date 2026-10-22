@@ -53,6 +53,14 @@ fn user_refs(root: &Path) -> Vec<u8> {
         .into_bytes()
 }
 
+// Keep dotted fixture names and their PID intact in every derived sibling.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 struct Repository {
     root: PathBuf,
     project: PathBuf,

@@ -18,7 +18,7 @@ pub(super) struct Http {
 }
 impl Http {
     pub(super) fn new(f: &Fixture) -> Self {
-        let root = f.repo.root.with_extension("http");
+        let root = sibling(&f.repo.root, "http");
         fs::create_dir(&root).unwrap();
         for name in ["reviewed.git", "observation.git", "publication.git"] {
             git(

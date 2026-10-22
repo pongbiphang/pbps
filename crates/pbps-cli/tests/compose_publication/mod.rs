@@ -21,7 +21,7 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Self {
         let repo = Repository::new(&format!("publication-{name}"), "project");
-        let remote = repo.root.with_extension("remote.git");
+        let remote = sibling(&repo.root, "remote.git");
         let _ = fs::remove_dir_all(&remote);
         git(
             &repo.root,
@@ -317,7 +317,7 @@ fn restored_pre_commit_prerequisites_allow_the_same_frozen_candidate_to_proceed(
         let f = Fixture::new(&format!("late-prerequisite-{signing}"));
         let (_store, preview, candidate) = f.ready();
         let before = f.repo.preserved();
-        let offline = f.remote.with_extension("offline");
+        let offline = sibling(&f.remote, "offline");
         let mut publisher = f.publisher();
         let created = std::cell::Cell::new(false);
         let refused = publisher.confirm_observed(&candidate, &|at| {
@@ -362,6 +362,25 @@ fn restored_pre_commit_prerequisites_allow_the_same_frozen_candidate_to_proceed(
         assert_eq!(publisher.confirm(&candidate), completed);
         f.source_unchanged(&before);
     }
+}
+
+#[test]
+fn dotted_fixture_names_keep_frozen_destinations_isolated() {
+    let first = Fixture::new("remote-isolation.author");
+    let (_store, preview, candidate) = first.ready();
+    // Keep a replaced directory's inode alive so reuse cannot hide the bug.
+    let _reviewed_destination = fs::File::open(&first.remote).unwrap();
+    // Construct the other fixture after freezing, so a shared remote path
+    // deterministically replaces the destination the candidate reviewed.
+    let second = Fixture::new("remote-isolation.committer");
+    let delivered = first.publisher().confirm(&candidate);
+    assert_eq!(delivered.status, Status::Delivered, "{delivered:?}");
+    assert_ne!(first.remote, second.remote);
+    assert_eq!(
+        first.remote_ref(&preview.output_ref).as_deref(),
+        Some(commit(&delivered))
+    );
+    assert_eq!(second.remote_ref(&preview.output_ref), None);
 }
 
 #[test]
@@ -774,7 +793,7 @@ fn changed_signing_policy_before_commit_and_replaced_repository_refuse_publicati
 
     let f = Fixture::new("repository-drift");
     let (_store, preview, candidate) = f.ready();
-    let old = f.repo.root.with_extension("old");
+    let old = sibling(&f.repo.root, "old");
     fs::rename(&f.repo.root, &old).unwrap();
     git(
         &f.remote,
@@ -936,7 +955,7 @@ fn a_local_remote_replaced_at_the_same_path_is_not_the_reviewed_repository() {
             } else {
                 f.remote.clone()
             };
-            let old = f.remote.with_extension("identity-original");
+            let old = sibling(&f.remote, "identity-original");
             fs::rename(&target, &old).unwrap();
             git(
                 &f.repo.root,
@@ -1089,7 +1108,7 @@ fn an_offline_destination_is_unavailable_and_restoration_reuses_the_known_commit
             publisher.confirm_observed(&candidate, &|at| at != Boundary::AfterPersist(stage))
         });
         drop(publisher);
-        let offline = f.remote.with_extension("offline");
+        let offline = sibling(&f.remote, "offline");
         fs::rename(&f.remote, &offline).unwrap();
         let mut publisher = f.publisher();
         let result = if initial.is_some() {
