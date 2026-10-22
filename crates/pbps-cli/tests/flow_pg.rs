@@ -16225,6 +16225,245 @@ fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
     );
 }
 
+/// #2101: the key's schema sees the clone, independently of its parent's schema.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach() {
+    for attach in [false, true] {
+        let slug = format!("clone-key-2101-{attach}");
+        let own = OwnDatabase::new(&server(), &slug);
+        let connection = own.connection();
+        on_server(connection, &format!(
+            "CREATE SCHEMA app; CREATE SCHEMA parts;
+             CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
+             CREATE TABLE parts.n(id integer NOT NULL, label text);
+             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+             CREATE CONSTRAINT TRIGGER n_pkey AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f();
+             {}",
+            if attach { "CREATE TABLE parts.p1(id integer)" }
+            else { "CREATE TABLE parts.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10)" }
+        ));
+        let d = Demo::new(&slug);
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        if attach {
+            std::fs::remove_file(d.dir.join("schema/parts.p1.yml")).unwrap();
+            std::fs::write(d.dir.join("schema/app.p.yml"),
+                "table: app.p\ncolumns:\n  id: {type: integer}\npartition_by: [id]\npartitions:\n  parts.p1: {from: ['0'], to: ['10']}\n").unwrap();
+        } else {
+            std::fs::remove_file(d.dir.join("schema/app.p%2En_pkey.trigger.yml")).unwrap();
+        }
+        let expected = if attach { "n_pkey1" } else { "n_pkey" };
+        let table = |expression: &str| {
+            format!(
+                "table: parts.n\ncolumns:\n  id: {{type: integer, nullable: false}}\n  label: {{type: text, default: \"{expression}\"}}\nprimary_key: [id]\n"
+            )
+        };
+        let path = d.dir.join("schema/parts.n.yml");
+        std::fs::write(
+            &path,
+            table(&format!("('parts.{expected}'::regclass)::text")),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let refused = d.dir.join("refused.json");
+        let output = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            refused.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&output), 0, "{}", stdout(&output));
+        assert!(
+            stderr(&output).contains(&format!("names parts.{expected}")),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!refused.exists());
+        std::fs::write(&path, table("''")).unwrap();
+        let plan = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive,constraint"],
+        ));
+        assert_eq!(
+            text_of(
+                connection,
+                "SELECT c.relname::text FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid='parts.n'::regclass AND i.indisprimary"
+            ),
+            expected
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+/// #2102: pre-flight must reserve future clones before the attach's first statement.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_attach_refuses_unmanaged_names_of_planned_parent_row_triggers() {
+    for row in [true, false] {
+        for rebuilt in [true, false] {
+            let slug = format!("attach-trigger-2102-{row}-{rebuilt}");
+            let own = OwnDatabase::new(&server(), &slug);
+            let connection = own.connection();
+            on_server(connection,
+                "CREATE SCHEMA app; CREATE TABLE app.p(id integer) PARTITION BY RANGE(id);
+                 CREATE TABLE app.p1(id integer);
+                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;");
+            if rebuilt {
+                on_server(
+                    connection,
+                    &format!(
+                        "CREATE TRIGGER x AFTER INSERT ON app.p FOR EACH {} EXECUTE FUNCTION app.f()",
+                        if row { "ROW" } else { "STATEMENT" }
+                    ),
+                );
+            }
+            let d = Demo::new(&slug);
+            succeeds(d.run(&["pull", "--db", connection]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+            on_server(
+                connection,
+                "CREATE TRIGGER x AFTER INSERT ON app.p1 FOR EACH ROW EXECUTE FUNCTION app.f()",
+            );
+            std::fs::remove_file(d.dir.join("schema/app.p1.yml")).unwrap();
+            std::fs::write(d.dir.join("schema/app.p.yml"),
+                "table: app.p\ncolumns:\n  id: {type: integer}\npartition_by: [id]\npartitions:\n  p1: {from: ['0'], to: ['10']}\n").unwrap();
+            std::fs::write(d.dir.join("schema/app.p%2Ex.trigger.yml"), format!(
+                "trigger: app.x\non: app.p\ndefinition: AFTER INSERT OR UPDATE ON app.p FOR EACH {} EXECUTE FUNCTION app.f()\n", if row { "ROW" } else { "STATEMENT" }
+            )).unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.a_marker.yml"),
+                "table: app.a_marker\ncolumns:\n  id: {type: integer}\n",
+            )
+            .unwrap();
+            let plan = connected_artifact(&d, connection, false);
+            let output = approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "destructive,constraint"],
+            );
+            if row {
+                assert_ne!(code(&output), 0, "{}", stdout(&output));
+                let message = format!("{}{}", stdout(&output), stderr(&output));
+                assert!(
+                    message.contains("planned row triggers: x") && message.contains("app.p1"),
+                    "{message}"
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_class WHERE oid=to_regclass('app.a_marker')"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_inherits WHERE inhrelid='app.p1'::regclass"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_trigger WHERE tgrelid='app.p'::regclass AND tgname='x'"
+                    ),
+                    i64::from(rebuilt)
+                );
+            } else {
+                succeeds(output);
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_inherits WHERE inhrelid='app.p1'::regclass"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_trigger WHERE tgrelid='app.p1'::regclass AND tgname='x' AND tgparentid=0"
+                    ),
+                    1
+                );
+            }
+        }
+    }
+}
+
+/// #2107: a parent or ordinary trigger's own companion is lost with its routine rebuild.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_routine_rebuild_refuses_its_constraint_triggers_own_comment() {
+    for partitioned in [false, true] {
+        let slug = format!("trigger-comment-2107-{partitioned}");
+        let own = OwnDatabase::new(&server(), &slug);
+        let connection = own.connection();
+        on_server(connection, &format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t(id integer){};
+             {}CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+             CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();
+             COMMENT ON CONSTRAINT audit ON app.t IS 'keep the audit constraint comment';",
+            if partitioned { " PARTITION BY RANGE(id)" } else { "" },
+            if partitioned { "CREATE TABLE app.p1 PARTITION OF app.t FOR VALUES FROM (0) TO (10);" } else { "" }
+        ));
+        let d = Demo::new(&slug);
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let routine = d.dir.join("schema/app.f%28%29.function.yml");
+        let original = std::fs::read_to_string(&routine).unwrap();
+        let changed = original.replace("RETURN NULL", "RETURN NEW");
+        assert_ne!(changed, original);
+        std::fs::write(routine, changed).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let artifact = d.dir.join("refused.json");
+        let output = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            artifact.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&output), 0, "{}", stdout(&output));
+        let why = stderr(&output);
+        assert!(
+            why.contains("comment")
+                && why.contains("keep the audit constraint comment")
+                && why.contains("audit"),
+            "{why}"
+        );
+        assert!(!artifact.exists());
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_constraint c JOIN pg_description d ON d.objoid=c.oid AND d.classoid='pg_constraint'::regclass WHERE c.conrelid='app.t'::regclass AND c.conname='audit' AND d.description='keep the audit constraint comment'"
+            ),
+            1
+        );
+        // With no attached state, the same rebuild is valid and applies.
+        on_server(connection, "COMMENT ON CONSTRAINT audit ON app.t IS NULL");
+        let plan = d.dir.join("unadorned.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
 /// A constraint trigger and its partition clones release their companion
 /// constraint names before a check or foreign key takes them (#2100).
 #[test]

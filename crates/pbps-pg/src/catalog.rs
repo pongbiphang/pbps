@@ -3814,6 +3814,9 @@ pub struct KeyNameHolder {
     /// ordinary trigger may then take the row's name (measured, #1752
     /// review). An ordinary trigger has no row and holds no name.
     pub trigger: Option<String>,
+    /// A clone's parent trigger, from `tgparentid`. Its drop frees this row
+    /// even when the partition is in another schema (DEC-2101.1).
+    pub parent_trigger: Option<pbps_model::ModuleId>,
 }
 
 /// The [`KeyNameHolder`]s whose names start with one of `prefixes`, each a
@@ -3840,7 +3843,8 @@ pub async fn key_name_holders(
          SELECT n.nspname AS schema_name, c.relname::text AS holder_name,\n       \
                 ownns.nspname AS owner_schema, own.relname AS owner_name,\n       \
                 COALESCE(i.indisprimary, false) AS primary_key,\n       \
-                false AS is_constraint, NULL::text AS trigger_name\n  \
+                  false AS is_constraint, NULL::text AS trigger_name,\n       \
+                  NULL::text AS parent_schema, NULL::text AS parent_table, NULL::text AS parent_trigger\n  \
            FROM pg_catalog.pg_class c\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid\n  \
@@ -3857,12 +3861,15 @@ pub async fn key_name_holders(
                            AND starts_with(c.relname::text, w.prefix))\n\
          UNION ALL\n\
          SELECT n.nspname, con.conname::text, tn.nspname, t.relname, con.contype = 'p', true,\n       \
-                (SELECT tg.tgname::text FROM pg_catalog.pg_trigger tg\n                  \
-                  WHERE con.contype = 't' AND tg.tgconstraint = con.oid)\n  \
+                  tg.tgname::text, pn.nspname, pt.relname, ptg.tgname::text\n  \
            FROM pg_catalog.pg_constraint con\n  \
            JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace\n  \
            LEFT JOIN pg_catalog.pg_class t ON t.oid = con.conrelid\n  \
            LEFT JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace\n \
+             LEFT JOIN pg_catalog.pg_trigger tg ON con.contype = 't' AND tg.tgconstraint = con.oid\n \
+             LEFT JOIN pg_catalog.pg_trigger ptg ON ptg.oid = tg.tgparentid\n \
+             LEFT JOIN pg_catalog.pg_class pt ON pt.oid = ptg.tgrelid\n \
+             LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pt.relnamespace\n \
           WHERE EXISTS (SELECT 1 FROM wanted w\n                  \
                          WHERE w.schema_name = n.nspname\n                    \
                            AND starts_with(con.conname::text, w.prefix))",
@@ -3896,6 +3903,13 @@ pub async fn key_name_holders(
                 DbError::BadRow("the key-name holder query returned a NULL is_constraint".into())
             })?,
             trigger: row.try_get::<&str>("trigger_name")?.map(str::to_owned),
+            parent_trigger: match row.try_get::<&str>("parent_trigger")? {
+                Some(name) => Some(pbps_model::ModuleId::Trigger {
+                    on: TableName::new(text("parent_schema")?, text("parent_table")?),
+                    name: name.to_owned(),
+                }),
+                None => None,
+            },
         });
     }
     Ok(out)

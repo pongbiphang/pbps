@@ -138,7 +138,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, WrittenCell};
-use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
+use pbps_dialect::{Dialect, DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
 use pbps_model::ChangeSet;
 use pbps_model::plan_names::PlanNames;
@@ -4315,7 +4315,7 @@ fn partition_probes(
             let leaving = leaving(parent);
             for probe in [
                 attach_range_probe(table, parent, bound),
-                attach_trigger_probe(table, parent, &changes[..step]),
+                attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {
                 match probe {
@@ -4365,7 +4365,7 @@ fn partition_probes(
                 .collect();
             for probe in [
                 attach_default_rows_probe(table, parent, &beside, &leaving),
-                attach_trigger_probe(table, parent, &changes[..step]),
+                attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {
                 match probe {
@@ -5231,7 +5231,51 @@ fn attach_trigger_probe(
     table: &TableName,
     parent: &TableName,
     before: &[pbps_model::PlannedChange],
+    after: &[pbps_model::PlannedChange],
 ) -> Result<Probe, DialectError> {
+    // Attach precedes module creation. A future parent's row trigger still
+    // needs its clone's name on this table, even when its old version was
+    // dropped before the attach (DEC-2102.1).
+    let planned: BTreeSet<&str> = after
+        .iter()
+        .filter_map(|p| {
+            if let Change::CreateModule {
+                id: pbps_model::ModuleId::Trigger { on, name },
+                module,
+            }
+            | Change::AlterModule {
+                id: pbps_model::ModuleId::Trigger { on, name },
+                module,
+            } = &p.change
+                && on == parent
+                && crate::Postgres::new().clones_to_partitions(module)
+            {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let planned_match = if planned.is_empty() {
+        "false".to_owned()
+    } else {
+        format!(
+            "tg.tgname IN ({})",
+            planned
+                .iter()
+                .map(|n| value_literal(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let named = if planned.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (including planned row triggers: {})",
+            planned.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    };
     let dropped = |on_table: &TableName, alias: &str| -> String {
         let clauses: Vec<String> = before
             .iter()
@@ -5257,7 +5301,7 @@ fn attach_trigger_probe(
     };
     Ok(Probe::new(
         format!(
-            "triggers on {table} named as a row trigger of {parent}, which the engine clones \
+            "triggers on {table} named as a row trigger of {parent}{named}, which the engine clones \
              onto it under that name as it attaches it: rename or drop them before it is \
              attached, then plan again",
             table = table.raw(),
@@ -5269,10 +5313,10 @@ fn attach_trigger_probe(
                 "(SELECT count(*) FROM pg_catalog.pg_trigger tg \
                  WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal \
                  AND NOT ({}) \
-                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_trigger ptg \
+                 AND (EXISTS (SELECT 1 FROM pg_catalog.pg_trigger ptg \
                               WHERE ptg.tgrelid = pg_catalog.to_regclass({}) \
                                 AND NOT ptg.tgisinternal AND ptg.tgname = tg.tgname \
-                                AND (ptg.tgtype & 1) <> 0 AND NOT ({})))",
+                                  AND (ptg.tgtype & 1) <> 0 AND NOT ({})) OR {planned_match}))",
                 value_literal(&qualified(table)?),
                 dropped(table, "tg"),
                 value_literal(&qualified(parent)?),
@@ -5652,6 +5696,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_attach_counts_future_parent_row_triggers_but_not_statement_triggers() {
+        let planned = |on: &str, name: &str, row: bool, alter: bool| {
+            let id = format!("{on}.{name}").parse().unwrap();
+            let module = Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::Trigger,
+                description: None,
+                definition: format!(
+                    "AFTER INSERT ON {on} FOR EACH {} EXECUTE FUNCTION app.f()",
+                    if row { "ROW" } else { "STATEMENT" }
+                ),
+            });
+            pbps_model::PlannedChange::new(if alter {
+                Change::AlterModule { id, module }
+            } else {
+                Change::CreateModule { id, module }
+            })
+        };
+        let probe = attach_trigger_probe(
+            &"app.t".parse().unwrap(),
+            &"app.p".parse().unwrap(),
+            &[],
+            &[
+                planned("app.p", "row", true, false),
+                planned("app.p", "rebuilt", true, true),
+                planned("app.p", "statement", false, false),
+                planned("app.other", "unrelated", true, false),
+            ],
+        )
+        .unwrap();
+        assert!(
+            probe.sql.contains("tg.tgname IN (E'rebuilt', E'row')"),
+            "{}",
+            probe.sql
+        );
+        assert!(
+            probe.description.contains("rebuilt, row"),
+            "{}",
+            probe.description
+        );
+        assert!(!probe.sql.contains("E'statement'") && !probe.sql.contains("E'unrelated'"));
+        let absent = attach_trigger_probe(
+            &"app.t".parse().unwrap(),
+            &"app.p".parse().unwrap(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !absent.sql.contains(" IN (") && !absent.description.contains("planned row triggers")
+        );
+    }
+
     /// A partition created with its parent asks nothing of rows; one created
     /// under a standing parent, and a partition dropped, each ask one count
     /// (#1171).
@@ -5810,6 +5907,7 @@ mod tests {
                 drop("app.ev", "row"),
                 drop("app.other", "else"),
             ],
+            &[],
         )
         .unwrap();
         assert!(

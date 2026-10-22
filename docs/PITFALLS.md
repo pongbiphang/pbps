@@ -330,6 +330,13 @@ made beside its DEFAULT it was not: the move ran, and a foreign key's
 `ON DELETE CASCADE` deleted the row that referenced a moved one. Zero is a
 count of no rows only when the relation was found (#1547, DEC-1547.1).
 
+**A trigger's names and state beyond its own address.** A parent row
+trigger's clone takes a constraint name on each partition, at an attach or a
+later create on the parent, and a constraint trigger's own `pg_constraint`
+row carries comments and labels the trigger's address does not. A replay,
+probe or rebuild check that reads only the trigger itself misses all three
+(DEC-2101.1, DEC-2102.1, DEC-2107.1).
+
 ## The engine fills in a type's defaulted arguments
 
 `decimal` is stored as `decimal(18,0)`, `char` as `char(1)`, `float` as

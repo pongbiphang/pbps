@@ -15145,6 +15145,68 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
     conn.drop().await;
 }
 
+/// #2107: both attachment catalogs are read on the trigger's companion,
+/// without confusing the zero address of an ordinary trigger with a row.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_trigger_rebuild_reads_its_own_constraint_attachments() {
+    let mut conn = connect().await;
+    let s = probe_schema_9("trigger_attachments2107");
+    fresh(&mut conn, &s).await;
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t(id integer);
+         CREATE FUNCTION {s}.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+         CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.f();
+         CREATE TRIGGER ordinary AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.f();
+         COMMENT ON CONSTRAINT audit ON {s}.t IS 'own constraint comment';
+         INSERT INTO pg_catalog.pg_seclabel(objoid, classoid, objsubid, provider, label)
+         SELECT tgconstraint, 'pg_constraint'::regclass, 0, 'pbps_test', 'own constraint label'
+           FROM pg_trigger WHERE tgrelid='{s}.t'::regclass AND tgname='audit';"
+    )).await.unwrap();
+    let id = format!("{s}.t.audit").parse().unwrap();
+    let read = read_a_rebuild(
+        &mut conn,
+        &id,
+        pbps_model::ModuleKind::Trigger,
+        &Default::default(),
+    )
+    .await;
+    let refusal = read.refusal().unwrap();
+    assert!(
+        refusal.contains("own constraint comment") && refusal.contains("own constraint label"),
+        "{refusal}"
+    );
+    let ordinary = format!("{s}.t.ordinary").parse().unwrap();
+    assert!(
+        read_a_rebuild(
+            &mut conn,
+            &ordinary,
+            pbps_model::ModuleKind::Trigger,
+            &Default::default()
+        )
+        .await
+        .refusal()
+        .is_none()
+    );
+    conn.execute(&format!(
+        "COMMENT ON CONSTRAINT audit ON {s}.t IS NULL;
+         DELETE FROM pg_catalog.pg_seclabel WHERE classoid='pg_constraint'::regclass
+           AND objoid=(SELECT tgconstraint FROM pg_trigger WHERE tgrelid='{s}.t'::regclass AND tgname='audit')"
+    )).await.unwrap();
+    assert!(
+        read_a_rebuild(
+            &mut conn,
+            &id,
+            pbps_model::ModuleKind::Trigger,
+            &Default::default()
+        )
+        .await
+        .refusal()
+        .is_none()
+    );
+    drop_schema(&mut conn, &s).await;
+}
+
 /// Opens a transaction, because [`pbps_pg::modules::before_a_rebuild`] takes
 /// the object's lock and holds it through the rebuild — outside a transaction
 /// the lock would be released at the end of the statement that took it.
@@ -30866,6 +30928,33 @@ async fn key_name_holders_name_each_holder_its_owner_and_its_kind() {
         .expect("the key read");
     assert_eq!(keyed.len(), 2, "{keyed:?}");
     assert!(keyed.iter().all(|h| h.primary_key), "{keyed:?}");
+    assert!(found.iter().all(|h| h.parent_trigger.is_none()));
+    // The clone's constraint has no conparentid, and may be in another
+    // schema. Its parent identity follows tgparentid, even after a trigger
+    // rename leaves the companion constraint's name behind.
+    conn.execute(&format!(
+        "CREATE TABLE {s}.p(id integer) PARTITION BY RANGE(id);
+         CREATE TABLE {other}.p1 PARTITION OF {s}.p FOR VALUES FROM (0) TO (10);
+         CREATE CONSTRAINT TRIGGER n_pkey9 AFTER INSERT ON {s}.p
+             FOR EACH ROW EXECUTE FUNCTION {s}.f();
+         ALTER TRIGGER n_pkey9 ON {s}.p RENAME TO renamed_parent"
+    ))
+    .await
+    .unwrap();
+    let clones = key_name_holders(&mut conn, &[(other.clone(), "n_pkey9".into())])
+        .await
+        .unwrap();
+    assert_eq!(clones.len(), 1, "{clones:?}");
+    assert_eq!(clones[0].name, TableName::new(&other, "n_pkey9"));
+    assert_eq!(clones[0].owner, Some(TableName::new(&other, "p1")));
+    assert_eq!(clones[0].trigger.as_deref(), Some("renamed_parent"));
+    assert_eq!(
+        clones[0].parent_trigger,
+        Some(pbps_model::ModuleId::Trigger {
+            on: TableName::new(&s, "p"),
+            name: "renamed_parent".into(),
+        })
+    );
     // Negative: nothing to read is no query and no holder.
     assert!(
         key_name_holders(&mut conn, &[])
