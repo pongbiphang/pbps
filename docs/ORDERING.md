@@ -199,9 +199,14 @@ Then, in this order:
     New-table creation parts state column-order, function, complete-shape,
     row and validator edges through the same settlement mechanism
     (DEC-1503.1).
-  - `after_their_parents_defaults` then sets each partition's own default
-    again after a parent's default the plan sets, which reaches every
-    partition (DEC-1581.1).
+  - `after_their_parents_defaults` runs `order::parent_defaults::ParentDefaults`
+    through the expansion driver. The parent's recursive default set needs
+    each declared partition's own default restored: a missing restoration is
+    added for that parent operation, and a parent-to-restoration edge sinks
+    an earlier one through `settle`. Compatibility constraints chain the
+    restored peers in the old order solely for byte-identical output; a
+    later original restoration or partition create keeps its place
+    (DEC-1581.1, DEC-1959.4).
   - `before_its_partitions_indexes` settles an edge from a partitioned
     parent's new index to each partition index it could take, so that index
     sinks to right after the parent's, with what rests on it (DEC-1688.1,
@@ -518,7 +523,7 @@ one class and the dependents a class cannot see.
 | Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL | fixed, value | (12, 2), after the rows of its table; split from a retype; the probe reads the rows after the plan's writes | ✓ DEC-1367.1 |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
-| Parent's default set → a partition's own default on that column | value | `after_their_parents_defaults`: the partition's after the parent's, which overwrites it | ✓ DEC-1581.1 |
+| Parent's default set → a partition's own default on that column | value | `order::parent_defaults`: expansion supplies a missing restoration; parent and compatibility constraints are settled, retaining the old bytes | ✓ DEC-1581.1, DEC-1959.4 |
 | Nullability relaxed → expression recomputing a NULL | value | rank −1 before 0 | ✓ DEC-1168.1 |
 | Nullability tightened → an identity put on the column | fixed | rank +1 before +2. Measured on 16 and 18, the engine refuses an identity on a nullable column ("must be declared NOT NULL"). Where the plan inserts rows into the table, both stay in class 9 ahead of the inserts, the tightening folded into a retype; where it only updates or deletes them, both follow the deletes, at (12, 2) and (12, 3); where it deletes and inserts both, the table's inserts follow the identity at (12, 4), and another table's rows referencing it are refused (#1367) | ✓ DEC-1889.1 |
 | Retype → a numbering source put on, or an owned sequence kept, on the column | fixed | rank −1 before +2: a sequence is created or moved `AS` the final type, and the column's values are read in it | ✓ DEC-1889.1 |
