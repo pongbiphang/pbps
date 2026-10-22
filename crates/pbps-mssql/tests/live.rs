@@ -1095,6 +1095,70 @@ impl TestDb {
     }
 }
 
+/// Metadata binding follows the scratch database's catalog collation, not a
+/// COLLATE on expression data. The advisory cannot know that collation.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn insensitive_catalog_names_bind_computed_columns_before_checks_are_refused() {
+    for (collation, expected_code) in [
+        ("Latin1_General_100_CI_AI", "1764"),
+        ("Latin1_General_100_CI_AS", "207"),
+    ] {
+        let mut db = TestDb::create_collated("computed_note2163", collation).await;
+        let observations = async {
+            let mut schema = Schema::default();
+            let mut codes = Vec::new();
+            for (index, (column, reference)) in [("café", "cafe"), ("cafe", "café")]
+                .into_iter()
+                .enumerate()
+            {
+                let table_name = format!("t{index}");
+                db.conn
+                    .execute(&format!(
+                        "CREATE TABLE dbo.{table_name} (a int, [{column}] AS (a + 1));"
+                    ))
+                    .await?;
+                let result = db.conn.execute(&format!(
+                    "ALTER TABLE dbo.{table_name} ADD CONSTRAINT ck{index} CHECK ([{reference}] > 0);"
+                )).await;
+                codes.push(result.map_err(|error| (error.server_error_code(), error.to_string())));
+                let mut table = Table::default();
+                table.columns.insert("a".into(), Column::new("int".parse().unwrap()));
+                table.computed.insert(column.into(), pbps_model::ComputedColumn {
+                    expression: "a + 1".into(), persisted: false, not_null: false,
+                });
+                table.checks.insert(format!("ck{index}").into(), pbps_model::CheckConstraint {
+                    expression: format!("[{reference}] > 0"),
+                });
+                schema.tables.insert(TableName::new("dbo", table_name), table);
+            }
+            // An unrelated ASCII column and a literal containing the computed
+            // name do not read it, even on the insensitive catalog.
+            db.conn.execute("ALTER TABLE dbo.t0 ADD CONSTRAINT ck_other CHECK (a > 0 AND N'cafe' <> N'café');").await?;
+            if expected_code == "1764" {
+                db.conn.execute("CREATE TABLE dbo.persisted (a int, [café] AS (a + 1) PERSISTED, CONSTRAINT ck_p CHECK (cafe > 0));").await?;
+            }
+            Ok::<_, pbps_db::DbError>((codes, Mssql.declaration_notes(&schema)))
+        }.await;
+        db.drop().await;
+        let (codes, notes) = observations.expect("measure catalog binding");
+        for result in codes {
+            let (code, message) = result.expect_err("the engine must refuse this check");
+            assert_eq!(
+                code.as_deref(),
+                Some(expected_code),
+                "{collation}: {message}"
+            );
+        }
+        assert_eq!(notes.len(), 2, "{collation}: {notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("1764") && note.contains("persisted: true"))
+        );
+    }
+}
+
 /// Drops a server login once the server has finished with its last session.
 ///
 /// A client that drops its connection returns before the server tears the

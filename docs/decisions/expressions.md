@@ -991,3 +991,66 @@ connected plan and bootstrap refuse; the one-reading spellings apply clean).
 contrast. An offset-less `timestamptz` is read in the target's recorded zone,
 which every set shares, and is no longer refused; the remedy names an offset,
 not UTC.*
+
+<a id="dec-2163-1"></a>
+
+**DEC-2163.1. A CHECK's advisory about an unpersisted computed column must
+allow insensitive catalog spellings on either side.** Offline validation
+does not know the database's catalog collation. Measured on SQL Server
+17.0.4075.5 in separately created scratch databases, under
+`Latin1_General_100_CI_AI`, a CHECK spelling `cafe` binds to computed column
+`café`, and spelling `café` binds to column `cafe`; both fail with 1764
+(followed by 1750). Under `Latin1_General_100_CI_AS` these accent differences
+instead fail with 207, an unknown column. A persisted `café` accepts the
+`cafe` check under CI_AI; a check over an unrelated plain column and literals
+is accepted. A column's data collation is not this measurement: each database
+was created with the chosen collation so its metadata binding uses it.
+
+Also measured, `Japanese_XJIS_140_CI_AI` binds fullwidth `ｃａｆｅ` to `cafe`,
+hiragana `かたかな` to katakana `カタカナ`, each reverse direction,
+halfwidth `ｶﾀｶﾅ` to `カタカナ`, and `が` to halfwidth `ｶﾞ`, then refuses
+the unpersisted CHECK with 1764. With `Japanese_XJIS_140_CI_AI_KS_WS`, those
+width/kana differences instead fail with 207; the accent cases still give
+1764. Insensitivity is the absence of `_KS`/`_WS` in these installed names,
+not an invented `_KI`/`_WI` suffix. Both Latin collations also bind the width
+and kana pairs. All measurement databases were dropped.
+
+The note first keeps `may_name`'s answer, then folds only code, with literals
+and comments already removed by the SQL Server lexer. If either spelling
+contains non-ASCII characters, NFKD supplies accent decomposition and width
+mapping (fullwidth Latin and halfwidth kana); combining marks are stripped,
+katakana letters and iteration marks map to hiragana, and the existing
+case/Turkish fold is retained. Read whole code identifiers and decode their
+original doubled delimiters before folding their contents: a fullwidth closer
+is not escaped like an ASCII closer, and compatibility punctuation must not
+become SQL syntax. The reverse accent case requires the
+same rule when the column is ASCII but its code spelling is not.
+
+NFKD is not a catalog collation. Measured under both AI catalogs, `ł`/`l`,
+`æ`/`ae` and `ß`/`ss` also bind and give 1764, although NFKD does not make
+them equal. A failed folded comparison with a remaining non-ASCII letter on
+either side therefore retains the note if code contains a possible name.
+This deliberately allows extra notes, including unrelated names with such
+unresolved letters; it cannot claim to reproduce a catalog's weights.
+Fully ASCII folded names still require a boundary match, so `café` versus
+an unrelated ASCII name produces no note. Persisted columns produce none,
+and letters only in comments/literals do not enter the comparison.
+
+The fallback is private to this advisory. The caller sweep found
+`may_name` in generation dependencies, deployment ordering, standing computed
+input guards, and SQL Server/shared engine effects, where extra matches can
+refuse or reorder valid plans; its semantics stay unchanged. The existing
+locked `unicode-normalization` package, already used by `stringprep`, supplies
+decomposition; this adds a direct dependency, no new package. Its MIT/Apache-2.0
+licenses meet `deny.toml`.
+
+Tests: `insensitive_catalog_spellings_of_unpersisted_computed_columns_are_noted`
+pins forward/reverse accents and widths, decomposed accents, kana, escaped
+delimiters, unresolved letters, and the unchanged `may_name` answer. Negative
+cases cover unrelated ASCII names, longer identifiers, persisted columns,
+comments and literals. `width_folding_keeps_original_identifier_escape_boundaries`
+pins names mixing fullwidth punctuation with escaped ASCII closers and
+literal/unrelated-name negatives. The ignored live test
+`insensitive_catalog_names_bind_computed_columns_before_checks_are_refused`
+creates AI and AS databases, pins both accent directions' 1764/207 errors,
+checks the advisory, and accepts the persisted/plain-column/literal controls.

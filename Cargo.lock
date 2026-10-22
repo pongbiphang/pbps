@@ -1462,6 +1462,7 @@ dependencies = [
  "thiserror",
  "tiberius",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]
