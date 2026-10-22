@@ -331,9 +331,9 @@ fn refuse_occupied_names(
 }
 
 /// The relation names this plan creates: its tables, the views it creates
-/// that it does not also drop, and the indexes it creates by name. A view
-/// dropped and created in one plan is a rebuild, and its name is already its
-/// own.
+/// that it does not also drop, the indexes it creates by name, and fixed
+/// sequence targets (DEC-1899.1). A view dropped and created in one plan is
+/// a rebuild, and its name is already its own.
 // The complement is every change that creates or frees no relation name.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableName> {
@@ -349,8 +349,71 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
     cs.changes
         .iter()
         .filter(|p| !matches!(&p.change, Change::CreateModule { id, .. } if dropped.contains(id)))
-        .flat_map(|p| relation_names_created(&p.change))
+        .flat_map(|p| {
+            relation_names_created(&p.change).into_iter().chain(
+                sequence_names_claimed(&p.change)
+                    .into_iter()
+                    .map(|(name, _)| name),
+            )
+        })
         .collect()
+}
+
+/// Fixed sequence targets, with their columns for diagnostics. Keep these
+/// out of `relation_names_created`: its identity-release and detach callers
+/// select ordering edges, which this namespace check does not add (DEC-1899.1).
+/// The dialect calls the emitter's `owned_sequence`, including truncation.
+// The complement is every change that creates or renames no owned sequence.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn sequence_names_claimed(
+    change: &pbps_model::Change,
+) -> Vec<(TableName, pbps_model::ColumnRef)> {
+    use pbps_model::{Change, ColumnRef, ValueSource};
+    let named = |column: ColumnRef, source: &ValueSource| {
+        let ValueSource::Sequence(sequence) = source else {
+            return None;
+        };
+        let name = pbps_pg::Postgres::new()
+            .owned_sequence_name(&column.table, column.name.raw(), sequence)
+            .expect("PostgreSQL always names an owned sequence");
+        Some((TableName::new(&column.table.schema, name), column))
+    };
+    match change {
+        Change::CreateTable { name, table, .. } => table
+            .columns
+            .iter()
+            .filter_map(|(column, declared)| {
+                named(
+                    ColumnRef::new(name.clone(), column.clone()),
+                    &declared.value_source,
+                )
+            })
+            .collect(),
+        Change::AddColumn {
+            table,
+            name,
+            column,
+            ..
+        } => named(
+            ColumnRef::new(table.clone(), name.clone()),
+            &column.value_source,
+        )
+        .into_iter()
+        .collect(),
+        Change::AlterColumnNumbering {
+            column, from, to, ..
+        } => {
+            if let (ValueSource::Sequence(was), ValueSource::Sequence(now)) = (from, to)
+                && !(was.name.is_some() && now.name.is_some() && was.name != now.name)
+            {
+                // A retune, or an omitted name on either side, keeps the
+                // catalog name; the emitter does not rename it.
+                return Vec::new();
+            }
+            named(column.clone(), to).into_iter().collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The relation names one change creates: a table, a view, and the index
@@ -457,8 +520,8 @@ pub(crate) fn refuse_uninventoried_occupants(
     if taken.is_empty() {
         return Ok(());
     }
-    // Keep the existing rename remedy unchanged. A detach's clone-name
-    // claim needs the same separate-deployment remedy, naming the detach.
+    // A detach's clone-name claim needs a separate-deployment remedy,
+    // naming the detach.
     let remedy = if cs
         .changes
         .iter()
@@ -468,7 +531,8 @@ pub(crate) fn refuse_uninventoried_occupants(
          Free that name in a plan of its own first (another partition's clone: detach that \
          partition first), or declare another name (DEC-1565.1)."
     } else {
-        "Each `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
+        "Each `CREATE`, sequence rename, or the `SET SCHEMA` of each cross-schema rename would be \
+         refused at apply. \
          Rename the declaration, or drop or rename the object in the database. Where a later \
          rename in this plan moves the holder away, apply that rename in a plan of its own \
          first."
@@ -787,6 +851,7 @@ fn name_clashes(
         })
         .collect();
     let mut created: BTreeSet<TableName> = BTreeSet::new();
+    let mut sequences = BTreeMap::<TableName, pbps_model::ColumnRef>::new();
     let mut taken: Vec<(Option<usize>, String)> = Vec::new();
     for (at, p) in changes.iter().enumerate() {
         present.retain(|o| !o.freed_by(&p.change));
@@ -900,6 +965,17 @@ fn name_clashes(
             ));
         }
         for name in relation_names_created(&p.change) {
+            if let Some(column) = sequences.get(&name) {
+                taken.push((
+                    None,
+                    format!(
+                        "relation `{}` this plan creates meets sequence `{}` for column `{}`",
+                        name.shown(),
+                        name.shown(),
+                        column.shown()
+                    ),
+                ));
+            }
             let detaching = if let pbps_model::Change::DetachPartition { table, .. } = &p.change {
                 Some(table)
             } else {
@@ -944,6 +1020,36 @@ fn name_clashes(
                         }),
                 );
             }
+            created.insert(name);
+        }
+        for (name, column) in sequence_names_claimed(&p.change) {
+            let claim = format!(
+                "sequence `{}` for column `{}`",
+                name.shown(),
+                column.shown()
+            );
+            for occupant in present.iter().filter(|o| o.name == name) {
+                taken.push((None, format!("{claim}: {}", occupant.taken())));
+            }
+            if let Some((_, holder)) = held.iter().find(|(at, _)| at == &name) {
+                taken.push((
+                    None,
+                    format!("{claim} claims `{}` where {holder}", name.shown()),
+                ));
+            } else if created.contains(&name) {
+                taken.push((
+                    None,
+                    format!(
+                        "{claim} meets relation `{}` this plan creates",
+                        name.shown()
+                    ),
+                ));
+            }
+            held.push((
+                name.clone(),
+                format!("{claim}, which this plan claims first"),
+            ));
+            sequences.insert(name.clone(), column);
             created.insert(name);
         }
     }
@@ -14056,6 +14162,230 @@ mod tests {
             kind: ModuleKind::View,
         });
         assert!(created_relation_names(&plan(vec![drop_view, new_view])).is_empty());
+    }
+
+    #[test]
+    fn serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged() {
+        use pbps_model::{Change, Column, OwnedSequence, Table, ValueSource};
+        let pg = pbps_pg::Postgres::new();
+        for (table, column) in [
+            ("renamed", "new_id"),
+            (
+                "a_very_long_table_name_that_must_be_truncated_for_its_sequence",
+                "a_long_column_name",
+            ),
+            (
+                "資料表資料表資料表資料表資料表資料表",
+                "編號編號編號編號編號",
+            ),
+        ] {
+            for declared in [None, Some("chosen")] {
+                let name = TableName::new("moved", table);
+                let mut c = Column::new("integer".parse().unwrap()).not_null();
+                c.value_source = ValueSource::Sequence(OwnedSequence {
+                    name: declared.map(Into::into),
+                    ..OwnedSequence::serial()
+                });
+                let mut t = Table::default();
+                t.columns.insert(column.into(), c.clone());
+                let create = Change::CreateTable {
+                    uid: "t_aaaaaa".parse().unwrap(),
+                    name: name.clone(),
+                    table: Box::new(t),
+                    beside_default: None,
+                    moves_at_most: None,
+                };
+                let add = Change::AddColumn {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    table: name.clone(),
+                    name: column.into(),
+                    column: Box::new(c),
+                };
+                assert_eq!(relation_names_created(&create), vec![name]);
+                assert!(relation_names_created(&add).is_empty());
+                for change in [create, add] {
+                    let claims = sequence_names_claimed(&change);
+                    assert_eq!(claims.len(), 1);
+                    let (sequence, owner) = &claims[0];
+                    assert_eq!(owner.name.raw(), column);
+                    assert!(sequence.name.len() <= 63);
+                    let sql = pg.emit(&change, pbps_model::Strategy::default()).unwrap();
+                    assert!(sql.iter().any(|s| {
+                        s.sql
+                            .contains(&format!("CREATE SEQUENCE \"moved\".\"{}\"", sequence.name))
+                    }));
+                    assert!(
+                        created_relation_names(&pbps_model::ChangeSet {
+                            changes: vec![pbps_model::PlannedChange::new(change)]
+                        })
+                        .contains(sequence)
+                    );
+                }
+            }
+        }
+        let add_identity = Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: TableName::new("app", "t"),
+            name: "id".into(),
+            column: Box::new(
+                serde_json::from_str(
+                    r#"{"type":"integer","nullable":false,"identity":{"seed":1,"increment":1}}"#,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(sequence_names_claimed(&add_identity).is_empty());
+    }
+
+    #[test]
+    fn fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases() {
+        use pbps_model::{Change, Column, ColumnRef, OwnedSequence, Table, ValueSource};
+        use pbps_pg::catalog::NameOccupant;
+        let table = TableName::new("app", "t");
+        let target = TableName::new("app", "t_id_seq");
+        let serial = |name: Option<&str>| {
+            ValueSource::Sequence(OwnedSequence {
+                name: name.map(Into::into),
+                ..OwnedSequence::serial()
+            })
+        };
+        let mut column = Column::new("integer".parse().unwrap()).not_null();
+        column.value_source = serial(None);
+        let mut t = Table::default();
+        t.columns.insert("id".into(), column.clone());
+        let create = Change::CreateTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: table.clone(),
+            table: Box::new(t),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        let add = Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(),
+            table: table.clone(),
+            name: "id".into(),
+            column: Box::new(column),
+        };
+        let numbering = |from, to| Change::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: ColumnRef::new(table.clone(), "id"),
+            ty: "integer".parse().unwrap(),
+            from,
+            to,
+        };
+        let identity = ValueSource::Identity(pbps_model::Identity {
+            seed: 1,
+            increment: 1,
+            options: Default::default(),
+        });
+        let claims = [
+            create,
+            add,
+            numbering(serial(Some("old_seq")), serial(Some("t_id_seq"))),
+            numbering(ValueSource::None, serial(None)),
+            numbering(identity.clone(), serial(None)),
+        ];
+        let replay = |changes: Vec<Change>,
+                      occupants: &[NameOccupant],
+                      relations: &[(TableName, &'static str)]| {
+            name_clashes(
+                &changes
+                    .into_iter()
+                    .map(pbps_model::PlannedChange::new)
+                    .collect::<Vec<_>>(),
+                occupants,
+                relations,
+                &Default::default(),
+            )
+        };
+        let other_table = Change::CreateTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            name: target.clone(),
+            table: Box::default(),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        let index = Change::AddIndex {
+            table: TableName::new("app", "other"),
+            name: target.name.clone().into(),
+            index: Box::new(serde_json::from_str(r#"{"columns":[{"name":"n"}]}"#).unwrap()),
+            clustered: false,
+        };
+        for claim in claims {
+            assert!(
+                created_relation_names(&pbps_model::ChangeSet {
+                    changes: vec![pbps_model::PlannedChange::new(claim.clone())]
+                })
+                .contains(&target)
+            );
+            for kind in ["sequence", "index", "composite type"] {
+                let occupant = NameOccupant {
+                    name: target.clone(),
+                    kind,
+                    owner: None,
+                    owner_column: None,
+                };
+                let clashes = replay(vec![claim.clone()], &[occupant], &[]);
+                assert!(
+                    clashes.iter().any(|(_, s)| s.contains("app.t_id_seq")
+                        && s.contains("app.t.id")
+                        && s.contains(kind)),
+                    "{clashes:?}"
+                );
+            }
+            for kind in ["table", "view"] {
+                assert!(!replay(vec![claim.clone()], &[], &[(target.clone(), kind)]).is_empty());
+            }
+            for other in [other_table.clone(), index.clone()] {
+                for changes in [
+                    vec![claim.clone(), other.clone()],
+                    vec![other, claim.clone()],
+                ] {
+                    assert!(!replay(changes, &[], &[]).is_empty());
+                }
+            }
+            let drop = Change::DropTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: target.clone(),
+                detach_from: None,
+            };
+            assert!(
+                replay(vec![drop, claim.clone()], &[], &[(target.clone(), "table")]).is_empty()
+            );
+            let owner = TableName::new("app", "old");
+            let occupant = NameOccupant {
+                name: target.clone(),
+                kind: "sequence",
+                owner: Some(owner.clone()),
+                owner_column: Some("id".into()),
+            };
+            let drop = Change::DropTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: owner,
+                detach_from: None,
+            };
+            assert!(replay(vec![drop, claim.clone()], &[occupant], &[]).is_empty());
+            let elsewhere = NameOccupant {
+                name: TableName::new("other", "t_id_seq"),
+                kind: "sequence",
+                owner: None,
+                owner_column: None,
+            };
+            assert!(replay(vec![claim], &[elsewhere], &[]).is_empty());
+        }
+        // Unknown or unchanged names keep the existing sequence even after
+        // its table/column is renamed; removing/converting it claims none.
+        for (from, to) in [
+            (serial(None), serial(Some("chosen"))),
+            (serial(Some("old_seq")), serial(None)),
+            (serial(Some("old_seq")), serial(Some("old_seq"))),
+            (serial(Some("old_seq")), identity),
+            (serial(None), ValueSource::None),
+        ] {
+            assert!(sequence_names_claimed(&numbering(from, to)).is_empty());
+        }
+        let other = numbering(ValueSource::None, serial(Some("other")));
+        assert!(replay(vec![other], &[], &[(target, "table")]).is_empty());
     }
 
     /// The name checks behind DEC-316.1, one occupant at a time. A relation

@@ -543,6 +543,7 @@
         "a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it",
         "a_connected_plan_knows_a_serials_generated_sequence_name",
         "duplicate_declared_serial_sequence_names_are_refused_before_planning_on_both_servers",
+        "connected_serial_sequence_claims_refuse_occupants_before_ddl_on_both_servers",
         "a_partitioned_parents_serial_round_trips_without_partition_drift",
         "an_attached_partition_takes_its_serial_parents_default_on_both_servers",
         "a_standing_parents_serial_changes_reach_every_partition_on_both_servers",
