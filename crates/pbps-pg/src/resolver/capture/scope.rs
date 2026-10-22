@@ -9,10 +9,188 @@ use pbps_db::resolver::capture::ObjectIdentity;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Locator {
     pub class: &'static str,
     pub index: usize,
+}
+
+type NamedRows<'a> = BTreeMap<(Option<&'a str>, &'a str), Vec<usize>>;
+
+// Only positions and shallow names live here. Hashes shortlist comparisons;
+// complete logical identities still decide equality, including collisions.
+struct Index<'a> {
+    identities: BTreeMap<&'static str, BTreeMap<u64, Vec<usize>>>,
+    names: BTreeMap<&'static str, NamedRows<'a>>,
+    children: BTreeMap<(&'static str, &'static str), BTreeMap<u32, Vec<usize>>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(catalog: &'a Catalog) -> Result<Self, Uncovered> {
+        let mut result = Self {
+            identities: BTreeMap::new(),
+            names: BTreeMap::new(),
+            children: BTreeMap::new(),
+        };
+        for &class in properties::CLASSES {
+            if class == "pg_depend" {
+                continue;
+            }
+            for (index, row) in catalog.rows[class].iter().enumerate() {
+                if class == "pg_attribute" && row.get("attisdropped") == Some(&Value::Bool(true)) {
+                    continue;
+                }
+                let id = catalog
+                    .identity(class, row)
+                    .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?;
+                let bucket = result
+                    .identities
+                    .entry(class)
+                    .or_default()
+                    .entry(logical::identity_key(&id))
+                    .or_default();
+                for previous in bucket.iter() {
+                    if catalog
+                        .identity(class, &catalog.rows[class][*previous])
+                        .is_ok_and(|previous| previous == id)
+                    {
+                        return Err(Uncovered::class(class, "duplicate logical identity"));
+                    }
+                }
+                bucket.push(index);
+            }
+        }
+        // Candidate predicates examine only these names, never routine kinds,
+        // relation kinds or signatures. All overloads retain source order.
+        for (class, name, namespace) in [
+            ("pg_namespace", "nspname", None),
+            ("pg_class", "relname", Some("relnamespace")),
+            ("pg_proc", "proname", Some("pronamespace")),
+            ("pg_type", "typname", Some("typnamespace")),
+            ("pg_operator", "oprname", Some("oprnamespace")),
+            ("pg_collation", "collname", Some("collnamespace")),
+            ("pg_opclass", "opcname", Some("opcnamespace")),
+            ("pg_opfamily", "opfname", Some("opfnamespace")),
+            ("pg_extension", "extname", None),
+        ] {
+            let names = result.names.entry(class).or_default();
+            for (index, row) in catalog.rows[class].iter().enumerate() {
+                // Keep this fallible even if identity validation stops reading
+                // one of these fields in a future catalog-class definition.
+                let namespace = if let Some(field) = namespace {
+                    let oid = logical::number(row, field)
+                        .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?;
+                    let namespace = catalog
+                        .row("pg_namespace", oid)
+                        .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?;
+                    Some(
+                        logical::string(namespace, "nspname")
+                            .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?,
+                    )
+                } else {
+                    None
+                };
+                let name = logical::string(row, name)
+                    .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?;
+                names.entry((namespace, name)).or_default().push(index);
+            }
+        }
+        Ok(result)
+    }
+
+    fn named(&self, class: &str, namespace: Option<&str>, name: Option<&str>) -> Vec<usize> {
+        let mut rows = Vec::new();
+        if class == "pg_cast" {
+            // Cast predicates have neither a namespace nor a name.
+            if let Some(buckets) = self.identities.get(class) {
+                rows.extend(buckets.values().flatten().copied());
+            }
+        } else if let Some(names) = self.names.get(class) {
+            if let (Some(namespace), Some(name)) = (namespace, name) {
+                rows.extend(
+                    names
+                        .get(&(Some(namespace), name))
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+            } else {
+                for (&(ns, spelling), positions) in names {
+                    if namespace.is_none_or(|wanted| ns == Some(wanted))
+                        && name.is_none_or(|wanted| spelling == wanted)
+                    {
+                        rows.extend(positions);
+                    }
+                }
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    fn find(&self, catalog: &Catalog, id: &ObjectIdentity) -> Option<Locator> {
+        let class = match id.class.as_str() {
+            "column" => "pg_attribute",
+            "pg_authid" => "pg_roles",
+            class => class,
+        };
+        let (&class, buckets) = self.identities.get_key_value(class)?;
+        buckets
+            .get(&logical::identity_key(id))?
+            .iter()
+            .copied()
+            .find_map(|index| {
+                catalog
+                    .identity(class, &catalog.rows[class][index])
+                    .is_ok_and(|found| found == *id)
+                    .then_some(Locator { class, index })
+            })
+    }
+
+    fn object(&self, catalog: &Catalog, class: &str, oid: u32) -> Option<Locator> {
+        let class = if class == "pg_authid" {
+            "pg_roles"
+        } else {
+            class
+        };
+        let class = *properties::CLASSES
+            .iter()
+            .find(|&&candidate| candidate == class && candidate != "pg_depend")?;
+        Some(Locator {
+            class,
+            index: catalog.position(class, oid).ok()?,
+        })
+    }
+
+    fn address(
+        &self,
+        catalog: &Catalog,
+        class_oid: u32,
+        oid: u32,
+        subobject: i32,
+    ) -> Option<Locator> {
+        let class_row = catalog.row("pg_class", class_oid).ok()?;
+        let namespace = catalog
+            .row(
+                "pg_namespace",
+                logical::number(class_row, "relnamespace").ok()?,
+            )
+            .ok()?;
+        if logical::string(namespace, "nspname").ok()? != "pg_catalog" {
+            return None;
+        }
+        let class = logical::string(class_row, "relname").ok()?;
+        if subobject == 0 {
+            self.object(catalog, class, oid)
+        } else if class == "pg_class" {
+            Some(Locator {
+                class: "pg_attribute",
+                index: catalog.column_position(oid, subobject).ok()?,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 // No source, private property or verifier implements Debug/Serialize here.
@@ -28,7 +206,8 @@ pub(super) struct Prepared {
 struct Builder<'a> {
     catalog: &'a Catalog,
     major: u32,
-    index: BTreeMap<ObjectIdentity, Locator>,
+    index: Index<'a>,
+    selected: BTreeSet<Locator>,
     pending: VecDeque<ObjectIdentity>,
     result: Prepared,
 }
@@ -38,36 +217,12 @@ pub(super) fn prepare(
     major: u32,
     scope: &CaptureScope,
 ) -> Result<Prepared, Uncovered> {
-    let mut index = BTreeMap::new();
-    for &class in properties::CLASSES {
-        if class == "pg_depend" {
-            continue;
-        }
-        for (position, row) in catalog.rows[class].iter().enumerate() {
-            if class == "pg_attribute" && row.get("attisdropped") == Some(&Value::Bool(true)) {
-                continue;
-            }
-            let identity = catalog
-                .identity(class, row)
-                .map_err(|_| Uncovered::class(class, "unreadable logical identity"))?;
-            if index
-                .insert(
-                    identity,
-                    Locator {
-                        class,
-                        index: position,
-                    },
-                )
-                .is_some()
-            {
-                return Err(Uncovered::class(class, "duplicate logical identity"));
-            }
-        }
-    }
+    let index = Index::new(catalog)?;
     let mut builder = Builder {
         catalog,
         major,
         index,
+        selected: BTreeSet::new(),
         pending: VecDeque::new(),
         result: Prepared {
             members: BTreeMap::new(),
@@ -89,24 +244,30 @@ pub(super) fn prepare(
         "pg_parameter_acl",
         "pg_database",
     ] {
-        for row in &catalog.rows[class] {
-            builder.add_row(class, row)?;
+        for index in 0..catalog.rows[class].len() {
+            builder.add_row(Locator { class, index })?;
         }
     }
     // Both ledger recipes are qualified before baseline acceptance. Include
     // their source/type closure before either recipe may invoke rendering;
     // identity sequences and internally owned objects join the closure below.
-    for row in &catalog.rows["pg_class"] {
-        if catalog.identity("pg_class", row).is_ok_and(|id| {
-            [
-                pbps_db::ledger::STATE_TABLE_NAME,
-                pbps_db::ledger::LOCK_TABLE_NAME,
-            ]
-            .iter()
-            .any(|name| id.name == [crate::state::LEDGER_SCHEMA, *name])
-        }) {
-            builder.add_row("pg_class", row)?;
-        }
+    let mut ledger = Vec::new();
+    for name in [
+        pbps_db::ledger::STATE_TABLE_NAME,
+        pbps_db::ledger::LOCK_TABLE_NAME,
+    ] {
+        ledger.extend(builder.index.named(
+            "pg_class",
+            Some(crate::state::LEDGER_SCHEMA),
+            Some(name),
+        ));
+    }
+    ledger.sort_unstable();
+    for index in ledger {
+        builder.add_row(Locator {
+            class: "pg_class",
+            index,
+        })?;
     }
     for object in &scope.retained {
         // A dependency row is not a catalog object; it is read when its
@@ -130,31 +291,24 @@ pub(super) fn prepare(
         if let Some(namespace) = &candidate.namespace {
             // Namespace absence is recorded by the empty membership; when it
             // exists, its ownership/ACL are prerequisites too.
-            for row in &catalog.rows["pg_namespace"] {
-                if logical::string(row, "nspname") == Ok(namespace) {
-                    builder.add_row("pg_namespace", row)?;
-                }
+            for index in builder.index.named("pg_namespace", None, Some(namespace)) {
+                builder.add_row(Locator {
+                    class: "pg_namespace",
+                    index,
+                })?;
             }
         }
         let mut members = BTreeSet::new();
-        for row in &catalog.rows[class] {
+        for index in builder.index.named(
+            class,
+            candidate.namespace.as_deref(),
+            candidate.name.as_deref(),
+        ) {
             let id = catalog
-                .identity(class, row)
+                .identity(class, &catalog.rows[class][index])
                 .map_err(|_| Uncovered::class(class, "unreadable candidate identity"))?;
-            let name_index = usize::from(!global);
-            if candidate
-                .namespace
-                .as_ref()
-                .is_some_and(|ns| id.name.first() != Some(ns))
-                || candidate
-                    .name
-                    .as_ref()
-                    .is_some_and(|name| id.name.get(name_index) != Some(name))
-            {
-                continue;
-            }
             members.insert(id.clone());
-            builder.add(id)?;
+            builder.add_at(id, Locator { class, index });
         }
         builder.result.candidates.insert(candidate.clone(), members);
     }
@@ -175,33 +329,46 @@ impl Builder<'_> {
         if id.class == "query-output" {
             return Ok(());
         }
-        let locator = *self
+        let locator = self
             .index
-            .get(&id)
+            .find(self.catalog, &id)
             .ok_or_else(|| Uncovered::object(&id, "required object is absent or unsupported"))?;
-        if self.result.members.insert(id.clone(), locator).is_none() {
-            self.pending.push_back(id);
-        }
+        self.add_at(id, locator);
         Ok(())
     }
 
-    fn add_row(&mut self, class: &'static str, row: &Row) -> Result<(), Uncovered> {
+    fn add_at(&mut self, id: ObjectIdentity, locator: Locator) {
+        if self.selected.insert(locator) {
+            self.result.members.insert(id.clone(), locator);
+            self.pending.push_back(id);
+        }
+    }
+
+    fn add_row(&mut self, locator: Locator) -> Result<(), Uncovered> {
+        if self.selected.contains(&locator) {
+            return Ok(());
+        }
         let id = self
             .catalog
-            .identity(class, row)
-            .map_err(|_| Uncovered::class(class, "unreadable prerequisite identity"))?;
-        self.add(id)
+            .identity(
+                locator.class,
+                &self.catalog.rows[locator.class][locator.index],
+            )
+            .map_err(|_| Uncovered::class(locator.class, "unreadable prerequisite identity"))?;
+        self.add_at(id, locator);
+        Ok(())
     }
 
     fn reference(&mut self, class: &str, oid: u32) -> Result<(), Uncovered> {
         if oid == 0 {
             return Ok(());
         }
-        self.add(
-            self.catalog
-                .object(class, oid)
-                .map_err(|_| Uncovered::class(class, "unreadable referenced prerequisite"))?,
-        )
+        let fail = || Uncovered::class(class, "unreadable referenced prerequisite");
+        let locator = self
+            .index
+            .object(self.catalog, class, oid)
+            .ok_or_else(fail)?;
+        self.add_row(locator)
     }
 
     fn expand(&mut self, id: &ObjectIdentity) -> Result<(), Uncovered> {
@@ -324,17 +491,36 @@ impl Builder<'_> {
             _ => &[],
         };
         for &(child, field) in children {
-            for row in &self.catalog.rows[child] {
-                if logical::number(row, field)
-                    .map_err(|_| Uncovered::class(child, "unreadable child membership"))?
-                    == oid
-                {
+            // Build on first use: malformed membership still refuses at
+            // the original child traversal, never ahead of an earlier error.
+            if !self.index.children.contains_key(&(child, field)) {
+                let mut parents: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+                for (index, row) in self.catalog.rows[child].iter().enumerate() {
+                    let parent = logical::number(row, field)
+                        .map_err(|_| Uncovered::class(child, "unreadable child membership"))?;
                     if child == "pg_attribute"
                         && row.get("attisdropped") == Some(&Value::Bool(true))
                     {
                         continue;
                     }
-                    self.add_row(child, row)?;
+                    parents.entry(parent).or_default().push(index);
+                }
+                self.index.children.insert((child, field), parents);
+            }
+            // Each parent expands once. Taking its rows avoids cloning and
+            // retains the snapshot's order, including system attributes.
+            if let Some(rows) = self
+                .index
+                .children
+                .get_mut(&(child, field))
+                .unwrap()
+                .remove(&oid)
+            {
+                for index in rows {
+                    self.add_row(Locator {
+                        class: child,
+                        index,
+                    })?;
                 }
             }
         }
@@ -382,19 +568,19 @@ impl Builder<'_> {
             for row in &self.catalog.rows[class] {
                 let (class_field, object_field, sub_field) = ("classid", "objid", "objsubid");
                 let fail = || Uncovered::class(class, "unreadable prerequisite dependency");
-                let subject = self.catalog.address(
+                let subject = self.index.address(
+                    self.catalog,
                     logical::number(row, class_field).map_err(|_| fail())?,
                     logical::number(row, object_field).map_err(|_| fail())?,
                     logical::signed(row, sub_field).map_err(|_| fail())?,
                 );
-                let mut selected = subject
-                    .as_ref()
-                    .is_ok_and(|id| self.result.members.contains_key(id));
+                let mut selected = subject.is_some_and(|locator| self.selected.contains(&locator));
                 if class == "pg_depend"
                     && logical::string(row, "deptype")
                         .is_ok_and(|kind| matches!(kind, "e" | "i" | "a" | "P" | "S"))
                 {
-                    let extension = self.catalog.address(
+                    let extension = self.index.address(
+                        self.catalog,
                         logical::number(row, "refclassid").map_err(|_| fail())?,
                         logical::number(row, "refobjid").map_err(|_| fail())?,
                         logical::signed(row, "refobjsubid").map_err(|_| fail())?,
@@ -402,9 +588,7 @@ impl Builder<'_> {
                     // Extension membership and auto/internal ownership are
                     // complete child sets. An unknown required child class
                     // refuses instead of disappearing from the closure.
-                    selected |= extension
-                        .as_ref()
-                        .is_ok_and(|id| self.result.members.contains_key(id));
+                    selected |= extension.is_some_and(|locator| self.selected.contains(&locator));
                 }
                 if !selected
                     || self.toast(row).map_err(|_| fail())?
@@ -424,3 +608,6 @@ impl Builder<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

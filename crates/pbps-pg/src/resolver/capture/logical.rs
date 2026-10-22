@@ -4,14 +4,15 @@
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 
 pub(super) type Row = Map<String, Value>;
 
 // No Debug or Serialize: rows include complete source and private properties.
 pub(super) struct Catalog {
     pub rows: BTreeMap<String, Vec<Row>>,
-    by_oid: BTreeMap<(String, u32), usize>,
+    by_oid: BTreeMap<String, BTreeMap<u32, usize>>,
     by_attribute: BTreeMap<(u32, i32), usize>,
 }
 
@@ -32,14 +33,16 @@ impl Catalog {
     pub fn new(rows: BTreeMap<String, Vec<Row>>) -> Result<Self> {
         let mut by_oid = BTreeMap::new();
         for (class, members) in &rows {
+            let mut members_by_oid = BTreeMap::new();
             for (index, row) in members.iter().enumerate() {
                 if row.contains_key("oid") {
                     let oid = number(row, "oid")?;
-                    if oid == 0 || by_oid.insert((class.clone(), oid), index).is_some() {
+                    if oid == 0 || members_by_oid.insert(oid, index).is_some() {
                         return Err(Uncovered::DuplicateObject);
                     }
                 }
             }
+            by_oid.insert(class.clone(), members_by_oid);
         }
         let mut by_attribute = BTreeMap::new();
         if let Some(attributes) = rows.get("pg_attribute") {
@@ -66,11 +69,37 @@ impl Catalog {
             class
         };
         let rows = self.rows.get(class).ok_or(Uncovered::MissingClass)?;
-        let index = self
-            .by_oid
-            .get(&(class.to_owned(), oid))
+        rows.get(self.position(class, oid)?)
+            .ok_or(Uncovered::MissingObject)
+    }
+
+    pub fn position(&self, class: &str, oid: u32) -> Result<usize> {
+        let class = if class == "pg_authid" {
+            "pg_roles"
+        } else {
+            class
+        };
+        if !self.rows.contains_key(class) {
+            return Err(Uncovered::MissingClass);
+        }
+        self.by_oid
+            .get(class)
+            .and_then(|members| members.get(&oid))
+            .copied()
+            .ok_or(Uncovered::MissingObject)
+    }
+
+    pub fn column_position(&self, relation: u32, attribute: i32) -> Result<usize> {
+        let index = *self
+            .by_attribute
+            .get(&(relation, attribute))
             .ok_or(Uncovered::MissingObject)?;
-        rows.get(*index).ok_or(Uncovered::MissingObject)
+        let row = &self.rows["pg_attribute"][index];
+        match row.get("attisdropped").and_then(Value::as_bool) {
+            Some(false) => Ok(index),
+            Some(true) => Err(Uncovered::DroppedColumn),
+            None => Err(Uncovered::MissingProperty),
+        }
     }
 
     pub fn object(&self, class: &str, oid: u32) -> Result<ObjectIdentity> {
@@ -361,6 +390,24 @@ impl Catalog {
             self.object(class, oid)
         }
     }
+}
+
+// An in-memory shortlist only: callers compare complete identities on every
+// collision. This is neither a persisted fingerprint nor a uniqueness proof.
+pub(super) fn identity_key(id: &ObjectIdentity) -> u64 {
+    let mut names = DefaultHasher::new();
+    for name in &id.name {
+        name.hash(&mut names);
+    }
+    let mut signature = DefaultHasher::new();
+    for child in &id.signature {
+        identity_key(child).hash(&mut signature);
+    }
+    let mut key = DefaultHasher::new();
+    id.class.hash(&mut key);
+    names.finish().hash(&mut key);
+    signature.finish().hash(&mut key);
+    key.finish()
 }
 
 /// A trigger PostgreSQL created for a constraint, as opposed to a declared

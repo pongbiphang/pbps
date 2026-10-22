@@ -525,3 +525,87 @@ Run with the fixture connection variables and
 `cargo test -p pbps-pg --test live -- --ignored --exact
 the_ledger_trust_check_stays_linear_in_the_clusters_roles --nocapture`.
 Both local wrappers and CI continue to select the ordinary `test` profile.
+
+## Resolver capture closure index
+
+Measured #2128 against `5b885dd395bdb5c79b48f465b3b39d64cec7eabc` on
+2026-10-22, using the shared Intel Core i7-8850H host, Rust 1.99.0, two build
+jobs, the warm lane-2 target, PostgreSQL 18.6/16.15 targets and a separate
+PostgreSQL 18.6 scratch. No profile, dependency or `RUSTFLAGS` setting changed.
+
+A was the preserved baseline executable; B was an indexed executable. Both
+used the CI scratch module's `live-test` profile (opt 1, line-tables-only,
+debug assertions and overflow checks enabled). After full-module warm-ups,
+each indexed implementation ran A B A B, without compilation or profiling:
+
+```bash
+/usr/bin/time -f '%e %U %S %M' "$executable" \
+  --ignored --test-threads=1 resolver::server::scratch::live_tests --show-output
+```
+
+The simple implementation retains `Catalog::identity` for the ordered
+validation pass, discards those temporary identities, and stores comparison
+keys and row positions. The alternative uses one shared validation/construction
+walk, retaining only comparison keys during validation; it adds 61 production
+lines over the simple implementation. Both index candidates and child groups,
+select dependency membership by local row position, and avoid allocating an
+OID lookup's class key. Every successful run selected the same 92 tests.
+User CPU includes child processes; the load columns show one-minute averages
+at each run's start and end. All three load averages were recorded.
+
+| Implementation | Pair | A wall / user CPU, s | B wall / user CPU, s | A load, start → end | B load, start → end |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Simple | 1 | 893.63 / 273.96 | 907.34 / 251.84 | 2.04 → 3.10 | 3.10 → 2.03 |
+| Simple | 2 | 1140.15 / 355.52 | 952.59 / 267.51 | 2.03 → 2.48 | 2.48 → 13.67 |
+| Shared walk | 1 | 1616.68 / 494.42 | 1243.09 / 324.75 | 13.67 → 11.54 | 11.54 → 16.65 |
+| Shared walk | 2 | 1178.16 / 368.16 | 1128.70 / 320.52 | 9.10 → 4.64 | 4.64 → 11.37 |
+
+The simple pairs saved 8.1%/24.8% user CPU (median 16.4%); the shared walk
+saved 34.3%/12.9% (median 23.6%). The simple implementation retains about
+69% of that observed median saving and is kept: validation still uses the
+original identity rules directly, with no second validator. The separate
+candidate-name projection is checked against those rules for every candidate
+class. Load varied sharply, reaching 26.14 in sampled one-minute observations;
+baseline user CPU alone ranged from 273.96 to 494.42 seconds. These paired
+observations do not isolate the alternative's incremental benefit or establish
+a fixed CI speedup.
+
+One baseline attempt in the shared-walk block passed 88 tests and failed four:
+PostgreSQL reported SQLSTATE 53100 (`No space left on device`), Podman could
+not write layer metadata, and one scratch startup timed out. Space had
+recovered to 67 GiB when checked. One unchanged full-module retry passed all
+92 tests; the failed attempt is excluded from the table. Both warm-ups and
+all eight successful measured runs passed, including the Docker cases.
+
+A full-module GDB profile before and after the selected implementation used
+the `test` profile (opt 0), a one-second sleep between observations, threads
+observed in state `R`, and `thread apply all bt 80`. The denominator excludes
+stacks with a syscall top frame or no readable top frame. Both profiled runs
+passed all 92 tests; profiled timings are excluded from the execution table.
+The visible inclusive shares are:
+
+| Frame group | Before, % of on-CPU stacks | After, % of on-CPU stacks |
+| --- | ---: | ---: |
+| Capture | 55.55 | 52.09 |
+| Catalog batch | 39.87 | 45.14 |
+| Deserialization in batch | 33.35 | 40.37 |
+| Scope preparation | 28.17 | 20.02 |
+| Identity construction during preparation | 17.47 | 10.22 |
+| Children during preparation | 2.89 | 1.01 |
+| Dependencies during preparation | 2.24 | 1.26 |
+
+There were 2,009/1,194 eligible on-CPU stacks and 514/338 stacks reaching the
+80-frame limit (before/after). Sampled one-minute load ranged from
+5.10–29.95 before and 3.09–5.67 after. Identity construction accounted for
+62.01%/51.05% of preparation stacks; children accounted for 39.19%/25.53%
+of expansion stacks. Inclusive frames overlap, and truncated ancestry limits
+these shares; they are not exact function CPU percentages. Catalog reads,
+rendering and canonicalization were unchanged.
+
+With one fixed key and the same capture fixtures, the selected implementation's
+sealed manifests, including membership, bindings and fingerprints, matched the
+baseline byte for byte: 545,231 bytes on PostgreSQL 16 and 588,663 on
+PostgreSQL 18. The 67 targeted unit tests and 26 live capture regressions passed.
+Independently removing the unrelated-duplicate guard and skipping unrelated
+identity validation each made its new negative test fail; restoring the guards
+returned the suite to green.
