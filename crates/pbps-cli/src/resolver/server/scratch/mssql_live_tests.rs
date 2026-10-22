@@ -16,7 +16,13 @@ async fn connection(url: &str) -> Conn {
     Conn::connect(Driver::Mssql, url).await.unwrap()
 }
 
-async fn refusal(target: &str, scratch: &str) -> ProduceError {
+// Repeated acquisitions inside nested Docker fixtures otherwise copy their
+// futures into a debug poll frame that exhausts the default test-thread stack.
+fn refusal<'a>(target: &'a str, scratch: &'a str) -> impl Future<Output = ProduceError> + 'a {
+    Box::pin(refusal_inner(target, scratch))
+}
+
+async fn refusal_inner(target: &str, scratch: &str) -> ProduceError {
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
@@ -655,4 +661,71 @@ async fn mssql_docker_removes_the_container_on_success_failure_and_cancellation(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(removed, "cancelled container {id} remained");
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh() {
+    let target = server("PBPS_TEST_DB");
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, on) = create_database(&scratch).await;
+    let cases: Vec<(String, String)> = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-mssql/tests/live/scratch2236-catalogs.json"
+    )))
+    .unwrap();
+    let login = format!("pbps2236_owner_{:032x}", rand::random::<u128>());
+    let password = sql::password(&format!("{:032x}", rand::random::<u128>()));
+    let mut admin = connection(&scratch).await;
+    admin
+        .execute(&format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD=N'{password}',CHECK_POLICY=ON; \
+         ALTER AUTHORIZATION ON DATABASE::[{name}] TO [{login}];",
+        ))
+        .await
+        .unwrap();
+    let supplied = format!("{on};User Id={login};Password={password}");
+    let mut conn = connection(&supplied).await;
+    let result: Result<(), String> = async {
+        if sql::provisions(&mut conn)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err("the fixture owner unexpectedly has instance creation privileges".into());
+        }
+        for (expected, create) in cases {
+            conn.execute(&create)
+                .await
+                .map_err(|error| error.to_string())?;
+            let refused = refusal(&target, &supplied).await.to_string();
+            let untouched = sql::inventory::read(&mut conn, None)
+                .await
+                .map_err(|error| error.to_string())?
+                .names();
+            let cleanup = sql::inventory::cleanup(&mut conn, None).await;
+            let fresh = sql::inventory::read(&mut conn, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !refused.contains(&expected)
+                || !untouched.iter().any(|item| item.contains(&expected))
+                || cleanup.is_err()
+                || !fresh.is_empty()
+            {
+                return Err(format!(
+                    "{expected}: refusal={refused}; untouched={untouched:?}; \
+                     cleanup={cleanup:?}; remaining={:?}",
+                    fresh.names(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    .await;
+    drop(conn);
+    drop_database(&scratch, &name).await;
+    admin
+        .execute(&format!("DROP LOGIN [{login}];"))
+        .await
+        .unwrap();
+    result.unwrap();
 }

@@ -4,7 +4,7 @@
 use super::{ident, literal, text};
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Explicit ownership lives in these catalogs when they expose principal_id.
 pub(super) const OWNERSHIP_CATALOGS: &[&str] = &[
@@ -27,6 +27,7 @@ pub(super) const OWNERSHIP_CATALOGS: &[&str] = &[
     "xml_schema_collections",
     "external_languages",
     "external_models",
+    "external_libraries",
 ];
 
 const CLASS_CATALOGS: &[(&str, &str)] = &[
@@ -284,7 +285,9 @@ pub async fn read(
         conn,
         "objects",
         "SELECT o.object_id,o.parent_object_id,o.type,o.name,SCHEMA_NAME(o.schema_id) AS \
-         schema_name, OBJECT_NAME(o.parent_object_id) AS parent_name FROM sys.objects o \
+         schema_name, OBJECT_NAME(o.parent_object_id) AS parent_name, \
+         CONVERT(bit,CASE WHEN EXISTS(SELECT 1 FROM sys.external_tables e WHERE \
+         e.object_id=o.object_id) THEN 1 ELSE 0 END) AS is_external FROM sys.objects o \
          WHERE o.is_ms_shipped=0 AND o.type<>N'TT';",
     )
     .await?
@@ -294,7 +297,18 @@ pub async fn read(
         let qualified = format!("{}.{}", ident(&schema), ident(&name));
         let kind = text(&row, "type")?;
         let (drop, rank) = match kind.trim() {
-            "U" => (Some(format!("DROP TABLE {qualified};")), 50),
+            "U" => (
+                Some(format!(
+                    "DROP {}TABLE {qualified};",
+                    if row.try_get::<bool>("is_external")? == Some(true) {
+                        "EXTERNAL "
+                    } else {
+                        ""
+                    }
+                )),
+                50,
+            ),
+            "SP" => (Some(format!("DROP SECURITY POLICY {qualified};")), 19),
             "V" => (Some(format!("DROP VIEW {qualified};")), 40),
             "P" | "PC" => (Some(format!("DROP PROCEDURE {qualified};")), 40),
             "FN" | "IF" | "TF" | "FS" | "FT" => (Some(format!("DROP FUNCTION {qualified};")), 60),
@@ -394,6 +408,28 @@ pub async fn read(
             false,
         ),
         ("services", "SERVICE", "service_id>3", 25, false),
+        (
+            "conversation_priorities",
+            "BROKER PRIORITY",
+            "1=1",
+            20,
+            false,
+        ),
+        (
+            "external_data_sources",
+            "EXTERNAL DATA SOURCE",
+            "1=1",
+            65,
+            false,
+        ),
+        (
+            "external_file_formats",
+            "EXTERNAL FILE FORMAT",
+            "1=1",
+            65,
+            false,
+        ),
+        ("external_libraries", "EXTERNAL LIBRARY", "1=1", 65, false),
         ("routes", "ROUTE", "name<>N'AutoCreatedLocal'", 45, false),
         (
             "remote_service_bindings",
@@ -595,6 +631,7 @@ pub async fn read(
             None,
         );
     }
+    nonsecurables(conn, &mut result).await?;
     properties(conn, &mut result).await?;
     permissions(
         conn,
@@ -603,6 +640,198 @@ pub async fn read(
     )
     .await?;
     Ok(result)
+}
+
+// These persistent database settings and broker/Query Store records have no
+// securable class or sys.objects row (DEC-2236.1).
+async fn nonsecurables(
+    conn: &mut impl QueryConnection,
+    result: &mut Inventory,
+) -> Result<(), DbError> {
+    for row in rows(
+        conn,
+        "conversation_endpoints",
+        "SELECT CONVERT(nvarchar(36),conversation_handle) AS name FROM \
+         sys.conversation_endpoints WHERE is_system=0;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        result.add(
+            format!("conversation endpoint {name}"),
+            Some(format!(
+                "DECLARE @handle uniqueidentifier={}; END CONVERSATION @handle WITH CLEANUP;",
+                literal(&name)
+            )),
+            16,
+            None,
+        );
+    }
+    // An orphan has no safe END CONVERSATION target. Do not let a parent join
+    // hide it, or count an unreadable child catalog as empty.
+    for (catalog, projection, join) in [
+        (
+            "conversation_groups",
+            "CONVERT(nvarchar(36),c.conversation_group_id)",
+            "e.conversation_group_id=c.conversation_group_id",
+        ),
+        (
+            "transmission_queue",
+            "CONVERT(nvarchar(36),c.conversation_handle)",
+            "e.conversation_handle=c.conversation_handle",
+        ),
+    ] {
+        for row in rows(
+            conn,
+            catalog,
+            &format!(
+                "SELECT {projection} AS name FROM sys.{catalog} c WHERE NOT EXISTS(SELECT 1 \
+             FROM sys.conversation_endpoints e WHERE {join});"
+            ),
+        )
+        .await?
+        {
+            result.add(format!("{catalog} {}", text(&row, "name")?), None, 17, None);
+        }
+    }
+    for row in rows(
+        conn,
+        "change_tracking_tables",
+        "SELECT SCHEMA_NAME(o.schema_id) AS schema_name,o.name FROM sys.change_tracking_tables c \
+         JOIN sys.objects o ON o.object_id=c.object_id;",
+    )
+    .await?
+    {
+        let name = format!(
+            "{}.{}",
+            ident(&text(&row, "schema_name")?),
+            ident(&text(&row, "name")?)
+        );
+        // Its primary key cannot be removed while tracking is enabled (3735).
+        result.add(
+            format!("table change tracking {name}"),
+            Some(format!("ALTER TABLE {name} DISABLE CHANGE_TRACKING;")),
+            17,
+            None,
+        );
+    }
+    for (catalog, sql, name, cleanup) in [
+        (
+            "change_tracking_databases",
+            "SELECT database_id FROM sys.change_tracking_databases WHERE database_id=DB_ID();",
+            "database change tracking",
+            "ALTER DATABASE CURRENT SET CHANGE_TRACKING=OFF;",
+        ),
+        (
+            "database_filestream_options",
+            "SELECT database_id FROM sys.database_filestream_options WHERE database_id=DB_ID() \
+          AND (non_transacted_access<>0 OR directory_name IS NOT NULL);",
+            "database FILESTREAM options",
+            "ALTER DATABASE CURRENT SET FILESTREAM(NON_TRANSACTED_ACCESS=OFF,DIRECTORY_NAME=NULL);",
+        ),
+        (
+            "database_automatic_tuning_mode",
+            "SELECT desired_state FROM sys.database_automatic_tuning_mode \
+             WHERE desired_state_desc<>N'AUTO';",
+            "database automatic tuning mode",
+            "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING=AUTO;",
+        ),
+    ] {
+        if !rows(conn, catalog, sql).await?.is_empty() {
+            result.add(
+                name.into(),
+                Some(cleanup.into()),
+                if catalog == "database_automatic_tuning_mode" {
+                    78
+                } else {
+                    80
+                },
+                None,
+            );
+        }
+    }
+    for row in rows(
+        conn,
+        "database_automatic_tuning_options",
+        "SELECT name FROM sys.database_automatic_tuning_options \
+         WHERE desired_state_desc<>N'DEFAULT';",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        result.add(
+            format!("automatic tuning option {name}"),
+            (name == "FORCE_LAST_GOOD_PLAN").then(|| {
+                "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING(FORCE_LAST_GOOD_PLAN=DEFAULT);".into()
+            }),
+            79,
+            None,
+        );
+    }
+    for row in rows(
+        conn,
+        "database_ledger_digest_locations",
+        "SELECT path FROM sys.database_ledger_digest_locations;",
+    )
+    .await?
+    {
+        // Historical endpoints survive disabling uploads; no supported catalog
+        // deletion can erase this ledger history.
+        result.add(
+            format!("ledger digest location {}", text(&row, "path")?),
+            None,
+            80,
+            None,
+        );
+    }
+    let mut queries: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    for (catalog, projection, filter) in [
+        ("query_store_query_hints", "query_id", "source=0"),
+        ("query_store_plan", "query_id,plan_id", "is_forced_plan=1"),
+        (
+            "database_automatic_tuning_configurations",
+            "CONVERT(bigint,type_value) AS query_id",
+            "1=1",
+        ),
+    ] {
+        for row in rows(
+            conn,
+            catalog,
+            &format!("SELECT DISTINCT {projection} FROM sys.{catalog} WHERE {filter};"),
+        )
+        .await?
+        {
+            let id = row
+                .try_get::<i64>("query_id")?
+                .ok_or_else(|| DbError::BadRow(format!("sys.{catalog} has no query_id")))?;
+            let cleanup = queries.entry(id).or_default();
+            if catalog == "query_store_query_hints" {
+                // SQL Server refuses removal of a hinted query (12456).
+                cleanup.push(format!(
+                    "EXEC sys.sp_query_store_clear_hints @query_id={id};"
+                ));
+            } else if catalog == "query_store_plan" {
+                let plan = row
+                    .try_get::<i64>("plan_id")?
+                    .ok_or_else(|| DbError::BadRow("a forced plan has no plan_id".into()))?;
+                cleanup.push(format!(
+                    "EXEC sys.sp_query_store_unforce_plan @query_id={id},@plan_id={plan};"
+                ));
+            }
+        }
+    }
+    for (id, mut cleanup) in queries {
+        cleanup.push(format!(
+            "EXEC sys.sp_query_store_remove_query @query_id={id};"
+        ));
+        result.add(
+            format!("Query Store intent query {id}"),
+            Some(cleanup.join(" ")),
+            30,
+            None,
+        );
+    }
+    Ok(())
 }
 
 async fn properties(

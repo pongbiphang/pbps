@@ -842,3 +842,92 @@ async fn system_database_permissions_follow_fixed_rules_and_restore_each_change(
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner() {
+    let mut db = TestDb::create("catalogs2236").await;
+    let cases: Vec<(String, String)> =
+        serde_json::from_str(include_str!("scratch2236-catalogs.json")).unwrap();
+    db.conn
+        .execute(
+            "CREATE USER catalog_owner WITHOUT LOGIN; \
+         ALTER ROLE db_owner ADD MEMBER catalog_owner; \
+         EXECUTE AS USER=N'catalog_owner';",
+        )
+        .await
+        .unwrap();
+    for (expected, create) in cases {
+        db.conn.execute(&create).await.unwrap();
+        let names = inventory::read(&mut db.conn, Some("catalog_owner"))
+            .await
+            .unwrap()
+            .names();
+        let found = names.iter().any(|name| name.contains(&expected));
+        let cleanup = inventory::cleanup(&mut db.conn, Some("catalog_owner")).await;
+        let fresh = inventory::read(&mut db.conn, Some("catalog_owner"))
+            .await
+            .unwrap();
+        // Restore the owned fixture before asserting either half of the contract.
+        if !found || cleanup.is_err() || !fresh.is_empty() {
+            db.conn.execute("REVERT;").await.unwrap();
+            db.drop().await;
+            panic!(
+                "{expected}: found={names:?}; cleanup={cleanup:?}; remaining={:?}",
+                fresh.names()
+            );
+        }
+    }
+    db.conn
+        .execute("DENY SELECT ON sys.database_ledger_digest_locations TO public;")
+        .await
+        .unwrap();
+    let denied = inventory::read(&mut db.conn, Some("catalog_owner"))
+        .await
+        .unwrap_err()
+        .to_string();
+    db.conn
+        .execute("REVERT; REVOKE SELECT ON sys.database_ledger_digest_locations FROM public;")
+        .await
+        .unwrap();
+    db.conn
+        .execute("EXECUTE AS USER=N'catalog_owner';")
+        .await
+        .unwrap();
+    assert!(
+        denied.contains("sys.database_ledger_digest_locations"),
+        "{denied}"
+    );
+    db.conn
+        .execute("REVERT; DROP USER catalog_owner;")
+        .await
+        .unwrap();
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn ledger_soft_deletion_refuses_with_the_retained_object_names() {
+    let mut db = TestDb::create("ledger2236").await;
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.kept(i int) WITH(LEDGER=ON(APPEND_ONLY=ON)); DROP TABLE dbo.kept;",
+        )
+        .await
+        .unwrap();
+    let names = inventory::read(&mut db.conn, None).await.unwrap().names();
+    let refused = inventory::cleanup(&mut db.conn, None).await;
+    db.drop().await;
+    assert!(
+        names
+            .iter()
+            .any(|name| name.contains("MSSQL_DroppedLedgerTable_kept_")),
+        "{names:?}"
+    );
+    assert!(
+        refused
+            .unwrap_err()
+            .iter()
+            .any(|name| name.contains("MSSQL_DroppedLedger"))
+    );
+}

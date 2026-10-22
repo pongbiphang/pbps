@@ -1864,7 +1864,9 @@
         "scratch2236::a_live_marker_distinguishes_instances_and_pins_the_backend_before_any_setup",
         "scratch2236::inherited_model_objects_refuse_and_the_model_is_restored_before_assertions",
         "scratch2236::failed_database_creation_and_failed_reference_reads_release_every_recorded_resource",
-        "scratch2236::system_database_permissions_follow_fixed_rules_and_restore_each_change"
+        "scratch2236::system_database_permissions_follow_fixed_rules_and_restore_each_change",
+        "scratch2236::independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner",
+        "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names"
       ]
     },
     {
@@ -1888,7 +1890,8 @@
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_cleanup_names_the_retained_sandbox_after_failure",
         "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_guest_admission_dirty_inventory_and_persistent_options_refuse_by_name",
-        "resolver::server::scratch::mssql_live_tests::mssql_docker_removes_the_container_on_success_failure_and_cancellation"
+        "resolver::server::scratch::mssql_live_tests::mssql_docker_removes_the_container_on_success_failure_and_cancellation",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh"
       ]
     }
   ]

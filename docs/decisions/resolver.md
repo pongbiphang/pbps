@@ -3827,14 +3827,43 @@ reverse-dependency cleanup (#2236).**
   so the two comparisons cannot contradict one another.
 - **Option C for emptiness.** Each database-scoped securable class
   reported by `sys.fn_builtin_permissions` must have a known catalog.
-  The read also includes partition functions and schemes, plan guides,
-  event notifications, audit specifications, filegroups and files,
-  Always Encrypted master keys, encryption keys and their values, and
-  every extended-property class. No user-created row qualifies. The fixed
-  schemas, principals, membership and database grants must be present;
-  engine-created broker objects and the system-owned R/Python languages
+  A sweep of `sys.all_views` on pinned 17.0.4075.5 also covers partition
+  functions and schemes, plan guides, event notifications, audit
+  specifications, filegroups and files, Always Encrypted keys and values,
+  every extended-property class, broker priorities, conversation endpoints
+  and orphan groups/transmissions, external data sources/file
+  formats/libraries, database and table change tracking, FILESTREAM
+  settings, automatic tuning mode/options, Query Store hints/forced
+  plans/per-query tuning, and ledger digest locations. Historical digest
+  locations have no safe cleanup rule and refuse by name. A populated ledger
+  digest location could not be tested because it needs external storage;
+  the guard refuses any returned row. Parent removal was measured for search
+  properties, sensitivity classifications,
+  security predicates, XML/JSON/spatial/columnstore indexes, ordinary
+  columns/constraints/statistics/parameters/dependencies and external
+  library files. Full-text catalogs can be created and dropped, but stoplist
+  and index creation fail (7609); empty child catalogs are not a
+  parent-removal measurement. Ledger history retains
+  soft-deleted objects, so their names still refuse. Outside the accepted
+  residuals below, no user-created row qualifies. The fixed schemas,
+  principals, membership and database grants must be present; engine-created
+  broker objects and the system-owned R/Python languages
   are the measured built-ins. A denied or unreadable catalog refuses by
   name, never as an empty inventory.
+- **Accepted residual: database encryption key with encryption OFF.** The
+  whole `sys.databases` row is unchanged; reading the key needs server-level
+  `VIEW SERVER SECURITY STATE` (15562 as the loginless `db_owner`). No object
+  creation, binding or compilation depends on it. Encryption ON changes
+  `is_encrypted`, so the whole-row comparison refuses. pbps never creates
+  a database encryption key, so cleanup cannot leave one behind; run-owned
+  and Docker databases start new.
+- **Accepted residual: granular Query Store options.** `db_owner` can change
+  `QUERY_CAPTURE_MODE`, `MAX_STORAGE_SIZE_MB` and similar options without
+  changing `sys.databases`. Fresh defaults vary by version with no
+  `is_default`, so a baseline would be build-keyed. They govern plan
+  collection, never object creation, binding or compilation. Hints, forced
+  plans and per-query tuning that affect execution remain inventoried and
+  cleaned. Neither residual adds a read, permission or baseline.
 - **System-view SELECTs have a measured reason.** A fresh user database's
   232 system-object grants are all SELECT on catalog views; 24 are hidden
   from `sys.all_objects` but report `IsMSShipped` and `IsView` through
@@ -3886,7 +3915,14 @@ reverse-dependency cleanup (#2236).**
   owning roles or users (dropping an owner first is engine error 15421).
   Modules, tables and types
   precede schemas, which precede owning roles/users. Partition schemes
-  precede functions, and encryption keys precede master keys. Unknown
+  precede functions, and encryption keys precede master keys. Conversations
+  end before broker parents are dropped; external tables use their own DROP
+  syntax before data sources/formats/credentials. Security policies precede
+  their tables and functions. Table change tracking is disabled before
+  primary keys (3735), and database tracking after tables. Tuning mode
+  returns to AUTO before options return to DEFAULT (15715); runtime actual
+  state is not a baseline. Hints and forced plans are cleared before Query
+  Store query removal (12456). Unknown
   cleanup kinds refuse with their names. A fresh administrator session
   drops the sandbox last and re-reads the full inventory. All other cleanup
   DDL stays in a `NO REVERT` sandbox, guarded on each statement: database

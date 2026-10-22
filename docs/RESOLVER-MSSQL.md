@@ -403,9 +403,10 @@ fresh-install inventory
   or database DDL trigger, and no database-scoped configuration away from its
   default.
 
-The empty check has no build-keyed snapshot baseline. It requires no
-user-created catalog row and the fixed schema, principal, membership and
-database-grant lists above. SELECT on an ms-shipped catalog view is the
+The empty check has no build-keyed snapshot baseline. Outside the accepted
+residuals below, it requires no user-created catalog row and requires the
+fixed schema, principal, membership and database-grant lists above.
+SELECT on an ms-shipped catalog view is the
 measured exception: a fresh database's 232 system-object grants are all
 such SELECTs, including hidden views `sys.all_objects` does not list.
 They cannot be schema-bound, creation does not execute their reads, and
@@ -413,7 +414,8 @@ the loginless `db_owner` sandbox can grant, deny and revoke them itself.
 Every other permission on a system object must be absent. A denied catalog
 read refuses by catalog name; it never certifies emptiness (DEC-2236.1).
 
-**How the inventory is read.** Not from a hand-written list of catalogs. A
+**How the inventory is read.** Securable classes and an explicit sweep of
+non-securable catalogs supply the inventory. A
 database holds things `sys.objects` never lists: a master key, a
 certificate, an asymmetric key, and a partition function and scheme each
 live only in their own catalog [`a_database_holds_securables_no_object_catalog_lists`].
@@ -427,18 +429,59 @@ live only in their own catalog [`a_database_holds_securables_no_object_catalog_l
   rows, and the system broker objects a new database carries are among
   them. A class with no known catalog refuses by name, so a class a later
   build adds is refused until it is read.
-- **Objects that are no securable.** These are read from their catalogs
-  too:
-  - partition functions and schemes;
-  - plan guides;
-  - event notifications;
-  - database audit specifications;
-  - the database's filegroups and files;
+- **Objects that are no securable.** The inventory was swept against
+  `sys.all_views` on the pinned 17.0.4075.5 build. Beyond the securable
+  classes it reads:
+  - partition functions and schemes, plan guides and event notifications;
+  - database audit specifications, filegroups and files;
   - Always Encrypted master keys, encryption keys and their values;
-  - extended properties, every class.
+  - extended properties, every class;
+  - broker priorities and conversation endpoints, plus conversation groups
+    and queued transmissions without an endpoint;
+  - external data sources, file formats and libraries;
+  - database and table change tracking;
+  - FILESTREAM non-transacted access and directory settings;
+  - automatic tuning mode and explicitly selected tuning options;
+  - user Query Store hints, forced plans and per-query tuning settings;
+  - ledger digest locations, including historical locations, which refuse
+    by name because there is no safe cleanup rule.
 
-  The engine names no list of these, so this is the one part written by
-  hand.
+  A populated ledger digest location could not be tested because it needs
+  external storage; the guard refuses any returned row.
+
+  Fresh FILESTREAM settings are OFF with no directory. Fresh automatic
+  tuning uses AUTO mode and DEFAULT options; its runtime actual state is
+  not a baseline. Database-ID catalogs are filtered to the current database.
+  Query Store execution statistics alone are runtime history; recorded
+  hints, forced plans and tuning overrides are persistent intent.
+
+  Parent cleanup was measured for search properties, sensitivity labels,
+  security predicates, selective XML paths and namespaces, JSON and spatial
+  indexes, columnstore metadata, table change tracking, ordinary columns,
+  constraints, statistics, parameters and dependencies. Dropping their
+  inventoried parent removes the corresponding user rows. External library
+  files disappear with their library. Full-text catalogs can be created and
+  dropped, but stoplist and index creation fail on this image (7609), so
+  empty full-text child catalogs are not evidence of parent cleanup. Ledger deletion retains named, soft-deleted table/view
+  objects and history; it must refuse rather than report a fresh database.
+
+  There is no engine-provided enumeration of non-securable kinds. The
+  explicit list remains necessary even though every securable class is
+  checked against the engine's list.
+- **Accepted residual: database encryption key with encryption OFF.** The
+  whole `sys.databases` row is unchanged; reading the key needs server-level
+  `VIEW SERVER SECURITY STATE` (15562 as the loginless `db_owner`). No object
+  creation, binding or compilation depends on it. Encryption ON changes
+  `is_encrypted`, so the whole-row comparison refuses. pbps never creates
+  a database encryption key, so cleanup cannot leave one behind; run-owned
+  and Docker databases start new.
+- **Accepted residual: granular Query Store options.** `db_owner` can change
+  `QUERY_CAPTURE_MODE`, `MAX_STORAGE_SIZE_MB` and similar options without
+  changing `sys.databases`. Fresh defaults vary by version with no
+  `is_default`, so a baseline would be build-keyed. They govern plan
+  collection, never object creation, binding or compilation. Hints, forced
+  plans and per-query tuning that affect execution remain inventoried and
+  cleaned. Neither residual adds a read, permission or baseline.
 
 #723's check compares the newborn database with this inventory, read so,
 before sandbox setup or plan DDL. The live marker necessarily precedes it.
@@ -463,6 +506,13 @@ refuses by name, rather than being left behind:
   then works in reverse dependency order: schema-bound
   dependents, then modules, tables, types, synonyms and other
   schema-contained objects, then schemas, then database roles and users.
+  Conversations end before services and priorities are dropped. External
+  tables use `DROP EXTERNAL TABLE` before data sources, file formats and
+  credentials. Security policies precede tables and functions. Table change
+  tracking is disabled before primary keys are dropped (3735), and database
+  tracking is disabled after the tables. Automatic tuning returns to AUTO
+  before options return to DEFAULT (15715). Query Store hints and forced
+  plans are cleared before their query is removed (12456).
   Partition schemes precede their functions, and encryption keys precede
   their master keys. A role owned by another role or user goes before its
   owner; that ownership chain is a dependency too (15421).
