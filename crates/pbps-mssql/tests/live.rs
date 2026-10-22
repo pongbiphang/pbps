@@ -18164,6 +18164,111 @@ async fn rename_chains_report_each_identity_once_without_changing_dependency_dec
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn role_names_refuse_backslash_and_ffff_but_preserve_controls_unicode_and_width() {
+    let mut db = TestDb::create("role_chars2232").await;
+    for (bad, code) in [('\\', "15006"), ('\u{ffff}', "1055")] {
+        for (prefix, suffix) in [("", ""), ("", "reader"), ("app", "reader"), ("app", "")] {
+            let name = pbps_model::RoleName::from(format!("{prefix}{bad}{suffix}"));
+            let errors = Mssql.validate_role(&name, &Default::default(), &Schema::default());
+            assert_eq!(errors.len(), 1, "{name:?}: {errors:?}");
+            let quoted = Mssql.quote_ident(name.raw()).unwrap();
+            let error = db
+                .conn
+                .execute(&format!("CREATE ROLE {quoted};"))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.server_error_code().as_deref(),
+                Some(code),
+                "{name:?}: {error}"
+            );
+        }
+    }
+    let names = [
+        "reader\nline",
+        "reader\rline",
+        "reader\u{1b}[31m",
+        "reader\u{9b}2J",
+        "reader\u{202e}名前",
+        "名前",
+        "😀",
+        "\u{fffe}",
+        "\u{fdd0}",
+        "\u{1fffe}",
+        "\u{10ffff}",
+        "fullwidth＼reader",
+        "small﹨reader",
+        "fullwidth］reader",
+        "reader's]role",
+        "app.reader",
+        "/reader",
+        "#reader",
+        "##reader",
+        "@reader",
+        " ",
+        "\t",
+        "\n",
+    ];
+    for raw in names.into_iter().map(str::to_owned).chain([
+        "a".repeat(128),
+        "名".repeat(128),
+        "😀".repeat(64),
+        "]".repeat(128),
+    ]) {
+        let name = pbps_model::RoleName::from(raw);
+        let errors = Mssql.validate_role(&name, &Default::default(), &Schema::default());
+        assert!(errors.is_empty(), "{name:?}: {errors:?}");
+        let quoted = Mssql.quote_ident(name.raw()).unwrap();
+        db.conn
+            .execute(&format!("CREATE ROLE {quoted};"))
+            .await
+            .unwrap();
+        // Read the one newly created role without comparing names under the
+        // catalog collation: controls and lookalikes must keep their raw bytes.
+        let rows = db.conn.query("SELECT name FROM sys.database_principals WHERE type = 'R' AND is_fixed_role = 0 AND principal_id <> DATABASE_PRINCIPAL_ID(N'public');").await.unwrap();
+        assert_eq!(rows.len(), 1, "{name:?}");
+        assert_eq!(
+            rows[0].try_get::<&str>("name").unwrap(),
+            Some(name.raw()),
+            "{name:?}"
+        );
+        db.conn
+            .execute(&format!("DROP ROLE {quoted};"))
+            .await
+            .unwrap();
+    }
+    for raw in [
+        "a".repeat(129),
+        "名".repeat(129),
+        "😀".repeat(65),
+        format!("{}a", "😀".repeat(64)),
+    ] {
+        let name = pbps_model::RoleName::from(raw);
+        assert_eq!(
+            Mssql
+                .validate_role(&name, &Default::default(), &Schema::default())
+                .len(),
+            1
+        );
+        assert!(Mssql.quote_ident(name.raw()).is_err());
+        // Bypass only the quoter's width guard to measure the engine's bound.
+        let quoted = format!("[{}]", name.raw().replace(']', "]]"));
+        let error = db
+            .conn
+            .execute(&format!("CREATE ROLE {quoted};"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.server_error_code().as_deref(),
+            Some("103"),
+            "{name:?}: {error}"
+        );
+    }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
     let mut db = TestDb::create("role_name").await;
     let owner = pbps_model::RoleName::from("role\nowner\r\u{1b}[31m\u{9b}\u{202e}名前");

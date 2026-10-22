@@ -979,6 +979,7 @@
         "darwin"
       ],
       "cases": [
+        "role_names_refuse_backslash_and_ffff_but_preserve_controls_unicode_and_width",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",

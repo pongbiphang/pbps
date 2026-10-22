@@ -76,6 +76,20 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
     if let Err(e) = ident::quote(name.raw()) {
         errs.push(e);
     }
+    // SQL Server 2025 refuses these in role names even when bracket-quoted;
+    // the generic identifier quoter must still accept them for other objects.
+    if let Some(c) = name.raw().chars().find(|c| matches!(c, '\\' | '\u{ffff}')) {
+        let reason = if c == '\\' {
+            "a backslash (U+005C)"
+        } else {
+            "U+FFFF"
+        };
+        errs.push(invalid(format!(
+            "role `{name}` cannot contain {reason}",
+            // Whole-message escaping remains until #2084 step 5.
+            name = name.raw(),
+        )));
+    }
     if FIXED_ROLES
         .iter()
         .any(|f| f.eq_ignore_ascii_case(name.raw()))
@@ -3158,6 +3172,90 @@ mod tests {
             !super::role(&pbps_model::RoleName::from("ok"), &bad, &Schema::default()).is_empty()
         );
     }
+    #[test]
+    fn role_names_with_backslash_or_ffff_are_refused_before_grants() {
+        for (bad, shown, reason) in [
+            ('\\', r"\\", "a backslash (U+005C)"),
+            ('\u{ffff}', "\u{ffff}", "U+FFFF"),
+        ] {
+            for (prefix, suffix) in [("", ""), ("", "reader"), ("app", "reader"), ("app", "")] {
+                let name = format!("{prefix}{bad}{suffix}");
+                // This restriction belongs to roles, not the identifier quoter.
+                assert_eq!(ident::quote(&name).unwrap(), format!("[{name}]"));
+                let errors = super::role(&name.into(), &Role::default(), &Schema::default());
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(
+                    errors[0].to_string(),
+                    format!("mssql: role `{prefix}{shown}{suffix}` cannot contain {reason}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_role_name_is_escaped_once() {
+        let name = pbps_model::RoleName::from("reader\n\r\u{1b}[31m\u{9b}\u{202e}名\\end");
+        let errors = super::role(&name, &Role::default(), &Schema::default());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].to_string(),
+            r"mssql: role `reader\n\r\u{1b}[31m\u{9b}\u{202e}名\\end` cannot contain a backslash (U+005C)"
+        );
+    }
+
+    #[test]
+    fn engine_accepted_role_names_keep_controls_unicode_and_utf16_boundaries() {
+        let names = [
+            "reader\nline",
+            "reader\rline",
+            "reader\u{1b}[31m",
+            "reader\u{9b}2J",
+            "reader\u{202e}名前",
+            "名前",
+            "😀",
+            "\u{fffe}",
+            "\u{fdd0}",
+            "\u{1fffe}",
+            "\u{10ffff}",
+            "fullwidth＼reader",
+            "small﹨reader",
+            "fullwidth］reader",
+            "reader's]role",
+            "app.reader",
+            "/reader",
+            "#reader",
+            "##reader",
+            "@reader",
+            " ",
+            "\t",
+            "\n",
+        ];
+        for name in names.into_iter().map(str::to_owned).chain([
+            "a".repeat(128),
+            "名".repeat(128),
+            "😀".repeat(64),
+            "]".repeat(128),
+        ]) {
+            let errors = super::role(&name.clone().into(), &Role::default(), &Schema::default());
+            assert!(errors.is_empty(), "{name:?}: {errors:?}");
+        }
+        for name in [
+            String::new(),
+            "a\0b".into(),
+            "a".repeat(129),
+            "名".repeat(129),
+            "😀".repeat(65),
+            format!("{}a", "😀".repeat(64)),
+        ] {
+            let errors = super::role(&name.clone().into(), &Role::default(), &Schema::default());
+            assert_eq!(errors.len(), 1, "{name:?}: {errors:?}");
+            assert!(
+                matches!(errors[0], DialectError::UnquotableIdent(_)),
+                "{errors:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_cross_kind_constraint_name_collision_is_reported() {
         use pbps_model::{
