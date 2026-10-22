@@ -101,8 +101,7 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True, stderr=subprocess.PIPE)
 
 
-def snapshot(ref, sites):
-    sha = git("rev-parse", "--verify", ref+"^{commit}").strip()
+def snapshot(sha, sites):
     rows = []
     for item in sites:
         lines = git("show", sha+":"+item["path"]).splitlines()
@@ -122,11 +121,15 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args=parser.parse_args()
     try:
-        report={"method": "audited conditional update/review sites, not universal edit counts",
-                "before": snapshot(args.before, BEFORE), "after": snapshot(args.after, AFTER),
-                "common_before": snapshot(args.before, COMMON), "common_after": snapshot(args.after, COMMON),
-                "cases": {name: dict(scope=case["scope"], before=snapshot(args.before,case["before"]),
-                                          after=snapshot(args.after,case["after"]))
+        # Resolve both refs before reading any section: a ref may move during the inventory.
+        before_sha=git("rev-parse", "--verify", args.before+"^{commit}").strip()
+        after_sha=git("rev-parse", "--verify", args.after+"^{commit}").strip()
+        report={"before_sha": before_sha, "after_sha": after_sha,
+                "method": "audited conditional update/review sites, not universal edit counts",
+                "before": snapshot(before_sha, BEFORE), "after": snapshot(after_sha, AFTER),
+                "common_before": snapshot(before_sha, COMMON), "common_after": snapshot(after_sha, COMMON),
+                "cases": {name: dict(scope=case["scope"], before=snapshot(before_sha,case["before"]),
+                                          after=snapshot(after_sha,case["after"]))
                           for name,case in CASES.items()}}
     except (subprocess.CalledProcessError, ValueError) as error:
         parser.exit(2, str(error)+"\n")
