@@ -789,17 +789,14 @@ fn fast_domain_defaults_evaluate_on_empty_tables_and_require_trusted_owners() {
                 0,
                 "the empty-table plan admitted an untrusted domain default"
             );
-            let reason = if user_function {
-                "not built into PostgreSQL"
-            } else {
-                &role.name
-            };
-            assert!(
-                stderr(&refused).contains(reason),
-                "{}{}",
-                stdout(&refused),
-                stderr(&refused)
-            );
+            for reason in ["app.trap", role.name.as_str(), "trusted_roles"] {
+                assert!(
+                    stderr(&refused).contains(reason),
+                    "{}{}",
+                    stdout(&refused),
+                    stderr(&refused)
+                );
+            }
             assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 0);
             assert_eq!(
                 scalar(
@@ -1771,6 +1768,10 @@ fn potential_type_paths_are_checked_even_without_an_added_column() {
         ));
         succeeds(d.run(&["plan"]));
         d.commit();
+        refused_plan(&d, db, "trusted_roles");
+        let config = d.dir.join("pbps.yml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
         let admitted = plan(&d, db);
         succeeds(apply_plan(&d, db, &admitted, false));
     }
@@ -1855,6 +1856,228 @@ fn any_language_roots_require_source_review_and_the_saved_opt_in() {
 #[ignore = "needs live PostgreSQL 18"]
 fn io_coercion_roots_require_source_review_on_postgres_18() {
     io_coercion_roots_require_source_review(&server());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn whole_input_path_owners_require_trust_and_later_checks_invalidate_pins_on_postgres_16() {
+    whole_input_path_owners(&std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn whole_input_path_owners_require_trust_and_later_checks_invalidate_pins_on_postgres_18() {
+    whole_input_path_owners(&server());
+}
+
+fn whole_input_path_owners(server: &str) {
+    let owner = UntrustedRole::new(server, "whole_path");
+    let own = OwnDatabase::new(server, "whole_path");
+    let db = own.connection();
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+         GRANT USAGE ON SCHEMA app TO {owner}; GRANT USAGE ON SEQUENCE app.calls TO {owner};
+         CREATE DOMAIN app.bare AS integer; ALTER DOMAIN app.bare OWNER TO {owner};
+         CREATE DOMAIN app.outer_domain AS app.bare;
+         CREATE DOMAIN app.items AS app.bare[];
+         CREATE TYPE app.record AS (v app.bare);
+         CREATE TYPE app.mood AS ENUM ('ok'); ALTER TYPE app.mood OWNER TO {owner};
+         CREATE DOMAIN app.over_enum AS app.mood;
+         CREATE DOMAIN app.with_abs AS integer CHECK (pg_catalog.abs(VALUE) >= 0);
+         CREATE DOMAIN app.with_plus AS integer CHECK (VALUE + 1 > 0)",
+            owner = owner.name,
+        ),
+    );
+    let d = Demo::new("whole-path");
+    d.keyed(db);
+    d.table(&declarations(""));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", db]));
+    on_server(db, "INSERT INTO app.t VALUES (1)");
+    let config = d.dir.join("pbps.yml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    let trust_owner = || {
+        std::fs::write(
+            &config,
+            format!("{base}\ntrusted_roles: [{}]\n", owner.name),
+        )
+        .unwrap()
+    };
+    let refused = |reference: &str, object: &str| {
+        d.table(&declarations(&format!("  n: {{type: '{reference}'}}\n")));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("untrusted.json");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0, "{reference}: {}", stdout(&out));
+        for name in [object, owner.name.as_str(), "trusted_roles"] {
+            assert!(stderr(&out).contains(name), "{reference}: {}", stderr(&out));
+        }
+        assert!(!path.exists());
+    };
+    // Every root is code-free; the trusted containers still require trust
+    // in their nested domain, element, attribute and enum owners.
+    for (reference, untrusted) in [
+        ("app.bare", "app.bare"),
+        ("app.bare[]", "app.bare"),
+        ("app.outer_domain", "app.bare"),
+        ("app.items", "app.bare"),
+        ("app.record", "app.bare"),
+        ("app.mood", "app.mood"),
+        ("app.over_enum", "app.mood"),
+    ] {
+        std::fs::write(&config, &base).unwrap();
+        refused(reference, untrusted);
+        trust_owner();
+        plan(&d, db);
+    }
+    on_server(db, "ALTER DOMAIN app.bare OWNER TO CURRENT_USER");
+    // OID-based code eligibility must not bypass catalog ownership for a
+    // built-in type, function or operator, either.
+    for (reference, object, alter) in [
+        ("app.bare", "integer", "ALTER TYPE pg_catalog.int4"),
+        (
+            "information_schema.cardinal_number",
+            "integer",
+            "ALTER TYPE pg_catalog.int4",
+        ),
+        (
+            "app.bare",
+            "int4in",
+            "ALTER FUNCTION pg_catalog.int4in(cstring)",
+        ),
+        (
+            "app.bare",
+            "int4out",
+            "ALTER FUNCTION pg_catalog.int4out(integer)",
+        ),
+        (
+            "app.items",
+            "array_subscript_handler",
+            "ALTER FUNCTION pg_catalog.array_subscript_handler(internal)",
+        ),
+        (
+            "app.with_abs",
+            "abs",
+            "ALTER FUNCTION pg_catalog.abs(integer)",
+        ),
+        (
+            "app.with_plus",
+            "+",
+            "ALTER OPERATOR pg_catalog.+(integer,integer)",
+        ),
+    ] {
+        std::fs::write(&config, &base).unwrap();
+        on_server(db, &format!("{alter} OWNER TO {}", owner.name));
+        refused(reference, object);
+        trust_owner();
+        plan(&d, db);
+        on_server(db, &format!("{alter} OWNER TO CURRENT_USER"));
+    }
+    on_server(
+        db,
+        &format!("ALTER DOMAIN app.bare OWNER TO {}", owner.name),
+    );
+    trust_owner();
+    d.table(&declarations("  n: {type: app.bare}\n"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    on_server(
+        db,
+        &format!(
+            "CREATE FUNCTION app.add_check_after_validation() RETURNS event_trigger
+         LANGUAGE plpgsql SECURITY DEFINER AS $body$
+         BEGIN
+           ALTER DOMAIN app.bare ADD CONSTRAINT after_validation
+             CHECK (VALUE IS NULL OR VALUE > 0);
+           PERFORM pg_catalog.nextval('app.calls');
+         END $body$;
+         ALTER FUNCTION app.add_check_after_validation() OWNER TO {}",
+            owner.name
+        ),
+    );
+    let path = plan(&d, db);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.type_pins.len(), 1);
+    // The owner is trusted; a mutation after the statement's opening checks
+    // still has to be detected by the closing pins. The marker proves the
+    // event ran, and survives the DDL rollback (DEC-319.1).
+    on_server(
+        db,
+        "CREATE EVENT TRIGGER add_check_after_validation ON ddl_command_start
+        WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION app.add_check_after_validation()",
+    );
+    let out = apply_plan(&d, db, &path, false);
+    assert_ne!(code(&out), 0);
+    assert!(
+        stderr(&out).contains("changed since planning"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        1
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_attribute
+        WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_constraint
+        WHERE contypid='app.bare'::regtype AND conname='after_validation'"
+        ),
+        0
+    );
+    on_server(
+        db,
+        "DROP EVENT TRIGGER add_check_after_validation;
+        DROP FUNCTION app.add_check_after_validation(); ALTER SEQUENCE app.calls RESTART WITH 1",
+    );
+    let path = plan(&d, db);
+    on_server(
+        db,
+        &format!(
+            "SET ROLE {}; ALTER DOMAIN app.bare ADD CONSTRAINT later
+         CHECK (pg_catalog.nextval('app.calls') > 0); RESET ROLE",
+            owner.name
+        ),
+    );
+    let out = apply_plan(&d, db, &path, false);
+    assert_ne!(code(&out), 0);
+    assert!(
+        stderr(&out).contains("changed since planning"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        0
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_attribute
+        WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+        ),
+        0
+    );
+    let current = plan(&d, db);
+    succeeds(apply_plan(&d, db, &current, false));
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", db]));
 }
 
 #[test]

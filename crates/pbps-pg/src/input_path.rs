@@ -30,11 +30,9 @@
 //!   [`crate::catalog`]), or when the caller has declared it trusted. A role that
 //!   can act as an owner without being trusted is named in the refusal.
 //!
-//! Except for a proven-empty array cast, which retains its target owner check,
-//! a type contributing no evaluated code needs no trusted owner. A type whose
-//! whole input path runs no code at all is admitted without either
-//! question: an enum, a composite or an array whose leaves have no CHECK and no
-//! DEFAULT, a domain with neither. Nothing is evaluated, so nobody's code runs.
+//! Ownership applies to the whole input path, even where no code runs now:
+//! an untrusted owner could add code after validation. Pins detect changes;
+//! they add to owner trust rather than replacing it (DEC-2181.3).
 //!
 //! # The input path
 //!
@@ -47,9 +45,8 @@
 //! an I/O coercion also follows the target's reconstructed attributes, elements
 //! and range bounds. A known node layout without an audited execution proof is
 //! unreadable (DEC-2181.4).
-//! A type the engine made (OID below 16384)
-//! is a leaf: nothing a role can write is behind it. The set is closed by
-//! reading, not by listing the kinds of object that might lead somewhere else.
+//! Built-in types keep the same structural ownership walk. The set is closed
+//! by reading, not by listing the kinds of object that might lead elsewhere.
 //!
 //! Every CHECK of every domain on the path counts, but only the declared type's
 //! own DEFAULT does: `ADD COLUMN` evaluates the column type's default and no
@@ -85,9 +82,9 @@
 //! subscript function. For a type the engine did not make, those are the support
 //! functions and operator classes of a base type, which only a superuser can
 //! create, so this gate treats them as trusted code and checks the owner (b) of
-//! every type on the path and nothing behind it. A superuser who builds a base
-//! type or an operator class out of an untrusted role's functions has trusted
-//! that role.
+//! every type on the path. Declared input, output and subscript handlers still
+//! require owner trust, including built-ins. Dynamic operator-class selection
+//! keeps the superuser-created support-code contract.
 //!
 //! # Re-audit per major
 //!
@@ -198,7 +195,7 @@ pub struct Admitted {
 impl Admitted {
     /// Whether the input path runs any code at all (a CHECK or a DEFAULT
     /// somewhere on it). `false` is an enum, or a composite or array whose
-    /// leaves have neither: admitted without asking who owns what.
+    /// leaves have neither. Owner trust is required in either case.
     #[must_use]
     pub fn runs_code(&self) -> bool {
         self.runs_code
@@ -213,6 +210,8 @@ pub enum Reason {
     /// A type owned by a role that is not trusted, or that an untrusted role can
     /// act as.
     Owner(OwnerReason),
+    /// An untrusted owner or actor can change an input-path routine.
+    RoutineOwner(RoutineOwnerReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -294,6 +293,14 @@ pub struct OwnerReason {
     pub owner: pbps_model::RoleName,
     /// An untrusted role that can act as `owner`: `owner` itself when the owner
     /// is the untrusted role, a member of it otherwise.
+    pub actor: pbps_model::RoleName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RoutineOwnerReason {
+    pub kind: RoutineKind,
+    pub identity: String,
+    pub owner: pbps_model::RoleName,
     pub actor: pbps_model::RoleName,
 }
 
@@ -400,6 +407,14 @@ impl fmt::Display for Reason {
                 o.owner.shown(),
                 o.actor.shown()
             ),
+            Self::RoutineOwner(o) => write!(
+                f,
+                "the type input {} `{}` is owned by `{}`, and untrusted role `{}` can act as that owner; pinning does not replace owner trust",
+                o.kind.as_str(),
+                o.identity,
+                o.owner.shown(),
+                o.actor.shown()
+            ),
         }
     }
 }
@@ -444,9 +459,10 @@ struct Facts {
     non_immutable: bool,
     /// The routines that are not admitted, with where each is used.
     routines: Vec<RoutineReason>,
-    /// The types on the path that a role can change (OID at or above 16384),
-    /// with the identity and the owner for a message.
+    /// All structural types, even when the fill evaluates no code in them.
     types: Vec<OwnedType>,
+    /// Includes built-ins and operator implementations, before code eligibility.
+    routine_owners: Vec<OwnedRoutine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,26 +470,36 @@ struct OwnedType {
     oid: Oid,
     ty: String,
     owner: pbps_model::RoleName,
+    owner_oid: Oid,
 }
 
-/// The verdict on what was read. `actors` maps a type to the untrusted roles
-/// that can act as its owner.
-fn verdict(
-    facts: Facts,
-    actors: &BTreeMap<Oid, Vec<pbps_model::RoleName>>,
-    check_owners: bool,
-) -> InputPath {
-    // Ordinary code-free paths ask nobody anything. A proven-empty array
-    // skips element code only, retaining the cast target's owner check.
-    if !facts.runs_code && !check_owners {
-        return InputPath::Admitted(Admitted { runs_code: false });
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedRoutine {
+    kind: RoutineKind,
+    identity: String,
+    owner: pbps_model::RoleName,
+    owner_oid: Oid,
+}
+
+/// The verdict on what was read. `actors` maps an owner to the untrusted roles
+/// that can act as it. Key by OID so a rename cannot hide an untrusted owner.
+fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<pbps_model::RoleName>>) -> InputPath {
     let mut reasons: Vec<Reason> = facts.routines.into_iter().map(Reason::Routine).collect();
     for t in &facts.types {
-        for actor in actors.get(&t.oid).into_iter().flatten() {
+        for actor in actors.get(&t.owner_oid).into_iter().flatten() {
             reasons.push(Reason::Owner(OwnerReason {
                 ty: t.ty.clone(),
                 owner: t.owner.clone(),
+                actor: actor.clone(),
+            }));
+        }
+    }
+    for routine in facts.routine_owners {
+        for actor in actors.get(&routine.owner_oid).into_iter().flatten() {
+            reasons.push(Reason::RoutineOwner(RoutineOwnerReason {
+                kind: routine.kind,
+                identity: routine.identity.clone(),
+                owner: routine.owner.clone(),
                 actor: actor.clone(),
             }));
         }
@@ -550,7 +576,7 @@ impl<'a> Added<'a> {
     }
 
     /// A proven-empty array coerces no elements (measured on 16 and 18).
-    /// Retain the cast target's owner check while skipping element code.
+    /// Retain all structural owner checks while skipping element code.
     #[must_use]
     pub fn empty_array_fill(mut self) -> Self {
         self.fill = Fill::EmptyArray;
@@ -786,14 +812,18 @@ async fn pass(
     let wanted: BTreeSet<Oid> = gathered
         .iter()
         .flatten()
-        .flat_map(|f| f.types.iter().map(|t| t.oid))
+        .flat_map(|f| {
+            f.types
+                .iter()
+                .map(|t| t.owner_oid)
+                .chain(f.routine_owners.iter().map(|r| r.owner_oid))
+        })
         .collect();
     let actors = untrusted_actors(conn, trusted, &wanted).await?;
     Ok(gathered
         .into_iter()
-        .zip(added)
-        .map(|(facts, column)| match facts {
-            Ok(facts) => verdict(facts, &actors, column.fill == Fill::EmptyArray),
+        .map(|facts| match facts {
+            Ok(facts) => verdict(facts, &actors),
             Err(why) => InputPath::Unreadable(Unreadable::Failed(why)),
         })
         .collect())
@@ -875,8 +905,10 @@ struct TypeRow {
     name: String,
     typtype: String,
     owner: pbps_model::RoleName,
+    owner_oid: Oid,
     /// A domain's DEFAULT as the stored node tree's text.
     default: Option<String>,
+    handlers: Vec<Oid>,
 }
 
 /// What the input path of `root` reaches and what runs on it.
@@ -888,36 +920,8 @@ async fn gather(
 ) -> Result<Facts, Failure> {
     let root = added.ty.oid();
     let own_default = added.own_default;
-    if added.array && added.fill == Fill::Null {
-        return Ok(Facts {
-            runs_code: false,
-            non_immutable: false,
-            routines: Vec::new(),
-            types: Vec::new(),
-        });
-    }
-    if added.array && added.fill == Fill::EmptyArray {
-        let ty = reach(conn, &[root], false)
-            .await?
-            .into_iter()
-            .find(|t| t.oid == root)
-            .ok_or_else(|| {
-                DbError::BadRow(format!("type {root} disappeared while it was being read"))
-            })?;
-        return Ok(Facts {
-            runs_code: false,
-            non_immutable: false,
-            routines: Vec::new(),
-            // PostgreSQL keeps an array's owner equal to its element type's.
-            // Check that owner without visiting the unevaluated element path.
-            types: vec![OwnedType {
-                oid: ty.oid,
-                ty: ty.name,
-                owner: ty.owner,
-            }],
-        });
-    }
-    let mut evaluated = BTreeSet::new();
+    let mut owners = BTreeMap::new();
+    let mut handlers = BTreeSet::new();
     let mut types: BTreeMap<Oid, TypeRow> = BTreeMap::new();
     // Where each routine is used, by OID.
     let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
@@ -935,6 +939,39 @@ async fn gather(
             return Err(Failure::Uncertified(format!(
                 "types are nested more than {MAX_DEPTH} deep"
             )));
+        }
+        // Fill shape controls evaluation, never trust: a currently code-free
+        // owner can add code between validation and DDL (DEC-2181.3).
+        let structural = reach(conn, &roots.keys().copied().collect::<Vec<_>>(), true).await?;
+        if let Some(gone) = roots
+            .keys()
+            .find(|r| !structural.iter().any(|t| t.oid == **r))
+        {
+            return Err(Failure::Read(DbError::BadRow(format!(
+                "type {gone} disappeared while it was being read"
+            ))));
+        }
+        for ty in &structural {
+            handlers.extend(ty.handlers.iter().copied().filter(|oid| *oid != 0));
+        }
+        owners.extend(structural.into_iter().map(|t| {
+            (
+                t.oid,
+                OwnedType {
+                    oid: t.oid,
+                    ty: t.name,
+                    owner: t.owner,
+                    owner_oid: t.owner_oid,
+                },
+            )
+        }));
+        if owners.len() > MAX_TYPES {
+            return Err(Failure::Uncertified(format!(
+                "a type is made of more than {MAX_TYPES} types"
+            )));
+        }
+        if added.array && matches!(added.fill, Fill::Null | Fill::EmptyArray) {
+            break;
         }
         let mut reached = BTreeMap::new();
         for constructs in [false, true] {
@@ -964,10 +1001,7 @@ async fn gather(
             .filter(|t| !types.contains_key(&t.oid))
             .collect();
         let mut bounds: Vec<(Use, Bound)> = Vec::new();
-        let domains: Vec<&TypeRow> = fresh
-            .iter()
-            .filter(|t| t.typtype == "d" && !is_builtin(t.oid))
-            .collect();
+        let domains: Vec<&TypeRow> = fresh.iter().filter(|t| t.typtype == "d").collect();
         for domain in &domains {
             // Only the declared type's own DEFAULT is evaluated: `ADD COLUMN`
             // reads the column's type for one, and a domain it is made of, or
@@ -983,7 +1017,6 @@ async fn gather(
             }
             if let Some(text) = &domain.default {
                 runs_code = true;
-                evaluated.insert(domain.oid);
                 let used_by = Use {
                     ty: domain.name.clone(),
                     part: Part::Default,
@@ -995,7 +1028,6 @@ async fn gather(
             let wanted: Vec<Oid> = domains.iter().map(|t| t.oid).collect();
             for (domain, constraint, text) in checks(conn, &wanted).await? {
                 runs_code = true;
-                evaluated.insert(domain);
                 let used_by = Use {
                     ty: domains
                         .iter()
@@ -1032,14 +1064,13 @@ async fn gather(
             // too, even when this type was already reached without them.
             for ty in &bound.domain_coercions {
                 let ty = Oid::from(*ty);
-                if !is_builtin(ty) && !types.contains_key(&ty) && !fresh.iter().any(|t| t.oid == ty)
-                {
+                if !types.contains_key(&ty) && !fresh.iter().any(|t| t.oid == ty) {
                     next.entry(ty).or_insert(false);
                 }
             }
             for ty in &bound.input_coercions {
                 let ty = Oid::from(*ty);
-                if !is_builtin(ty) && !constructed.contains(&ty) {
+                if !constructed.contains(&ty) {
                     next.insert(ty, true);
                 }
             }
@@ -1053,22 +1084,28 @@ async fn gather(
         roots = next;
     }
 
-    let (routines, non_immutable) =
+    let (routines, non_immutable, mut routine_owners) =
         unadmitted_routines(conn, runs_sql, &functions, &operators, &row_compares).await?;
-    let owned = types
-        .values()
-        .filter(|t| !is_builtin(t.oid) && evaluated.contains(&t.oid))
-        .map(|t| OwnedType {
-            oid: t.oid,
-            ty: t.name.clone(),
-            owner: t.owner.clone(),
-        })
-        .collect();
+    let handler_rows = function_rows(conn, &handlers.iter().copied().collect::<Vec<_>>()).await?;
+    for oid in handlers {
+        let row = handler_rows.get(&oid).ok_or_else(|| {
+            Failure::Uncertified(format!(
+                "the type handler with OID {oid} is not in the catalog"
+            ))
+        })?;
+        routine_owners.push(OwnedRoutine {
+            kind: RoutineKind::Function,
+            identity: row.identity.clone(),
+            owner: row.owner.clone(),
+            owner_oid: row.owner_oid,
+        });
+    }
     Ok(Facts {
         runs_code,
         non_immutable,
         routines,
-        types: owned,
+        types: owners.into_values().collect(),
+        routine_owners,
     })
 }
 
@@ -1080,9 +1117,8 @@ fn certify(text: &str, major: u32, used_by: &Use) -> Result<Bound, Failure> {
 /// Every type reached from `roots` by what a type is made of, the roots
 /// included where evaluated: a domain's base always, and a composite's
 /// attributes, array's element or range's subtype for a constructing fill.
-/// Types the engine made are returned and not entered. One statement, so one snapshot.
+/// Built-in types keep their base and element edges. One statement, so one snapshot.
 async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<TypeRow>, DbError> {
-    let first = Oid::from(FIRST_NORMAL_OBJECT_ID);
     let rows = conn
         .query(&format!(
             "WITH RECURSIVE reach(oid) AS (
@@ -1104,13 +1140,16 @@ async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<T
                       UNION ALL
                       SELECT g.rngsubtype FROM pg_catalog.pg_range g
                        WHERE {constructs} AND (g.rngtypid = t.oid OR g.rngmultitypid = t.oid)
-                  ) e
-                  WHERE r.oid >= {first}::pg_catalog.oid)
+                  ) e)
              SELECT t.oid::pg_catalog.int8 AS oid,
                     i.identity AS name,
                     t.typtype::pg_catalog.text AS typtype,
                     ow.rolname::pg_catalog.text AS owner,
-                    t.typdefaultbin::pg_catalog.text AS default_expr
+                    ow.oid::pg_catalog.int8 AS owner_oid,
+                    t.typdefaultbin::pg_catalog.text AS default_expr,
+                    pg_catalog.json_build_array(t.typinput::pg_catalog.oid::pg_catalog.int8,
+                        t.typoutput::pg_catalog.oid::pg_catalog.int8,
+                        t.typsubscript::pg_catalog.oid::pg_catalog.int8)::pg_catalog.text AS handlers
                FROM reach r
                JOIN pg_catalog.pg_type t ON t.oid = r.oid
                JOIN pg_catalog.pg_roles ow ON ow.oid = t.typowner
@@ -1134,6 +1173,7 @@ async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<T
                 oid: need(row, "oid")?,
                 name: need::<&str>(row, "name")?.to_owned(),
                 owner: need::<&str>(row, "owner")?.into(),
+                owner_oid: need(row, "owner_oid")?,
                 // Only a domain has a default of this kind.
                 default: if typtype == "d" {
                     row.try_get::<&str>("default_expr")?.map(str::to_owned)
@@ -1141,6 +1181,9 @@ async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<T
                     None
                 },
                 typtype,
+                handlers: serde_json::from_str(need::<&str>(row, "handlers")?).map_err(|e| {
+                    DbError::BadRow(format!("the type handlers could not be read: {e}"))
+                })?,
             })
         })
         .collect()
@@ -1196,6 +1239,7 @@ fn check_text(name: &str, contype: &str, expr: Option<&str>) -> Result<String, S
 struct OperatorRow {
     identity: String,
     owner: pbps_model::RoleName,
+    owner_oid: Oid,
     /// The function the operator runs.
     code: Oid,
 }
@@ -1216,6 +1260,7 @@ fn operator_function(oid: Oid, row: &OperatorRow) -> Result<Oid, String> {
 struct FunctionRow {
     identity: String,
     owner: pbps_model::RoleName,
+    owner_oid: Oid,
     volatility: String,
 }
 
@@ -1229,7 +1274,7 @@ async fn unadmitted_routines(
     functions: &BTreeMap<Oid, Vec<Use>>,
     operators: &BTreeMap<Oid, Vec<Use>>,
     row_compares: &BTreeMap<(Oid, Oid), Vec<Use>>,
-) -> Result<(Vec<RoutineReason>, bool), Failure> {
+) -> Result<(Vec<RoutineReason>, bool, Vec<OwnedRoutine>), Failure> {
     let mut operator_ids: BTreeSet<Oid> = operators.keys().copied().collect();
     operator_ids.extend(row_compares.keys().map(|(operator, _)| *operator));
     let operator_rows = operator_rows(conn, &operator_ids.into_iter().collect::<Vec<_>>()).await?;
@@ -1271,6 +1316,22 @@ async fn unadmitted_routines(
             }
         }
     }
+    // Retain all routine owners before any built-in eligibility shortcut.
+    let mut owners: Vec<_> = function_rows
+        .values()
+        .map(|r| OwnedRoutine {
+            kind: RoutineKind::Function,
+            identity: r.identity.clone(),
+            owner: r.owner.clone(),
+            owner_oid: r.owner_oid,
+        })
+        .collect();
+    owners.extend(operator_rows.values().map(|r| OwnedRoutine {
+        kind: RoutineKind::Operator,
+        identity: r.identity.clone(),
+        owner: r.owner.clone(),
+        owner_oid: r.owner_oid,
+    }));
 
     // An operator node also names the function it runs (`opfuncid`), which is
     // checked like any other so that a node that disagrees with the catalog
@@ -1352,7 +1413,7 @@ async fn unadmitted_routines(
             });
         }
     }
-    Ok((out, non_immutable))
+    Ok((out, non_immutable, owners))
 }
 
 /// The btree comparison function (support function 1) of the operator family
@@ -1407,6 +1468,7 @@ async fn operator_rows(
             "SELECT o.oid::pg_catalog.int8 AS oid,
                     i.identity AS identity,
                     ow.rolname::pg_catalog.text AS owner,
+                    ow.oid::pg_catalog.int8 AS owner_oid,
                     o.oprcode::pg_catalog.oid::pg_catalog.int8 AS code
                FROM pg_catalog.pg_operator o
                JOIN pg_catalog.pg_roles ow ON ow.oid = o.oprowner
@@ -1423,6 +1485,7 @@ async fn operator_rows(
                 OperatorRow {
                     identity: need::<&str>(row, "identity")?.to_owned(),
                     owner: need::<&str>(row, "owner")?.into(),
+                    owner_oid: need(row, "owner_oid")?,
                     code: need(row, "code")?,
                 },
             ))
@@ -1442,7 +1505,8 @@ async fn function_rows(
             "SELECT p.oid::pg_catalog.int8 AS oid,
                     i.identity AS identity,
                     p.provolatile::pg_catalog.text AS volatility,
-                    ow.rolname::pg_catalog.text AS owner
+                    ow.rolname::pg_catalog.text AS owner,
+                    ow.oid::pg_catalog.int8 AS owner_oid
                FROM pg_catalog.pg_proc p
                JOIN pg_catalog.pg_roles ow ON ow.oid = p.proowner
               CROSS JOIN LATERAL pg_catalog.pg_identify_object(
@@ -1458,6 +1522,7 @@ async fn function_rows(
                 FunctionRow {
                     identity: need::<&str>(row, "identity")?.to_owned(),
                     owner: need::<&str>(row, "owner")?.into(),
+                    owner_oid: need(row, "owner_oid")?,
                     volatility: need::<&str>(row, "volatility")?.to_owned(),
                 },
             ))
@@ -1467,7 +1532,7 @@ async fn function_rows(
 
 // -- the owners ---------------------------------------------------------------
 
-/// For each type, the roles that are not trusted and can act as its owner: the
+/// For each owner, the roles that are not trusted and can act as it: the
 /// owner itself when it is one of them, and every untrusted role that reaches
 /// the owner by membership with `SET`, `INHERIT` or `ADMIN`. It is the walk of
 /// DEC-1663.1 ([`untrusted_role_walk`]) with `trusted` as the roles a human
@@ -1475,36 +1540,35 @@ async fn function_rows(
 async fn untrusted_actors(
     conn: &mut Conn,
     trusted: &[pbps_model::RoleName],
-    types: &BTreeSet<Oid>,
+    owners: &BTreeSet<Oid>,
 ) -> Result<BTreeMap<Oid, Vec<pbps_model::RoleName>>, DbError> {
     let mut out: BTreeMap<Oid, Vec<pbps_model::RoleName>> = BTreeMap::new();
-    if types.is_empty() {
+    if owners.is_empty() {
         return Ok(out);
     }
-    let wanted: Vec<Oid> = types.iter().copied().collect();
-    let json = json(trusted)?;
+    let declared = json(trusted)?;
+    let wanted = oid_array(&owners.iter().copied().collect::<Vec<_>>());
     let rows = conn
         .query_with(
             &format!(
                 "WITH RECURSIVE {walk}
-                 SELECT DISTINCT t.oid::pg_catalog.int8 AS typ,
+                 SELECT DISTINCT o.oid::pg_catalog.int8 AS owner_oid,
                                  a.rolname::pg_catalog.text AS actor
-                   FROM pg_catalog.pg_type t
-                   JOIN reach r ON r.oid OPERATOR(pg_catalog.=) t.typowner
+                   FROM pg_catalog.pg_roles o
+                   JOIN reach r ON r.oid OPERATOR(pg_catalog.=) o.oid
                    JOIN others a ON a.oid OPERATOR(pg_catalog.=) r.origin
-                  WHERE t.oid = ANY({types})
+                  WHERE o.oid OPERATOR(pg_catalog.=) ANY({wanted})
                   ORDER BY 1, 2",
                 walk = untrusted_role_walk(
                     "ARRAY(SELECT pg_catalog.jsonb_array_elements_text(\
                      $1::pg_catalog.text::pg_catalog.jsonb))"
                 ),
-                types = oid_array(&wanted),
             ),
-            &[Param::Str(&json)],
+            &[Param::Str(&declared)],
         )
         .await?;
     for row in &rows {
-        out.entry(need(row, "typ")?)
+        out.entry(need(row, "owner_oid")?)
             .or_default()
             .push(need::<&str>(row, "actor")?.into());
     }
@@ -1585,6 +1649,7 @@ mod tests {
             oid,
             ty: ty.to_owned(),
             owner: owner.to_owned().into(),
+            owner_oid: oid,
         }
     }
 
@@ -1663,21 +1728,23 @@ mod tests {
     }
 
     #[test]
-    fn a_path_that_runs_no_code_is_admitted_whatever_the_owner_or_the_routine() {
-        // An enum, or a composite whose leaves have no CHECK or DEFAULT: the
-        // facts can name an untrusted owner and a user function, and nothing
-        // runs, so nothing is asked.
+    fn a_code_free_path_requires_trusted_owners_before_admission() {
         let facts = Facts {
             runs_code: false,
             non_immutable: false,
-            routines: vec![user_function()],
+            routines: Vec::new(),
+            routine_owners: Vec::new(),
             types: vec![owned(40001, "app.mood", "mallory")],
         };
         let actors = BTreeMap::from([(40001, vec!["mallory".into()])]);
-        let InputPath::Admitted(admitted) = verdict(facts, &actors, false) else {
-            panic!("a path that runs no code must be admitted");
+        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors) else {
+            panic!("a code-free path still requires trusted owners");
         };
-        assert!(!admitted.runs_code());
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(
+            verdict(facts, &no_actors()),
+            InputPath::Admitted(Admitted { runs_code: false })
+        );
     }
 
     #[test]
@@ -1685,10 +1752,11 @@ mod tests {
         let facts = Facts {
             runs_code: true,
             non_immutable: false,
+            routine_owners: Vec::new(),
             routines: Vec::new(),
             types: vec![owned(40002, "app.positive", "deployer")],
         };
-        let InputPath::Admitted(admitted) = verdict(facts, &no_actors(), false) else {
+        let InputPath::Admitted(admitted) = verdict(facts, &no_actors()) else {
             panic!("built-in code on a trusted type must be admitted");
         };
         assert!(admitted.runs_code());
@@ -1699,16 +1767,17 @@ mod tests {
         let facts = Facts {
             runs_code: false,
             non_immutable: false,
+            routine_owners: Vec::new(),
             routines: Vec::new(),
             types: vec![owned(40002, "app.checked", "owner_role")],
         };
         let actors = BTreeMap::from([(40002, vec!["member".into()])]);
-        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors, true) else {
+        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors) else {
             panic!("an empty array still requires a trusted target owner");
         };
         assert!(reasons[0].to_string().contains("member"));
         assert_eq!(
-            verdict(facts, &no_actors(), true),
+            verdict(facts, &no_actors()),
             InputPath::Admitted(Admitted { runs_code: false })
         );
     }
@@ -1718,10 +1787,11 @@ mod tests {
         let facts = Facts {
             runs_code: true,
             non_immutable: false,
+            routine_owners: Vec::new(),
             routines: vec![user_function()],
             types: vec![owned(40002, "app.positive", "deployer")],
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors(), false) else {
+        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
             panic!("a user function must refuse");
         };
         assert_eq!(reasons, vec![Reason::Routine(user_function())]);
@@ -1736,6 +1806,7 @@ mod tests {
         let facts = Facts {
             runs_code: true,
             non_immutable: false,
+            routine_owners: Vec::new(),
             routines: Vec::new(),
             types: vec![
                 owned(40002, "app.positive", "owner_role"),
@@ -1743,7 +1814,7 @@ mod tests {
             ],
         };
         let actors = BTreeMap::from([(40002, vec!["member_a".into(), "owner_role".into()])]);
-        let InputPath::Refused(reasons) = verdict(facts, &actors, false) else {
+        let InputPath::Refused(reasons) = verdict(facts, &actors) else {
             panic!("an untrusted actor must refuse");
         };
         assert_eq!(reasons.len(), 2, "{reasons:?}");
@@ -1767,10 +1838,11 @@ mod tests {
         let facts = Facts {
             runs_code: true,
             non_immutable: false,
+            routine_owners: Vec::new(),
             routines: vec![user_function(), user_function()],
             types: Vec::new(),
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors(), false) else {
+        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
             panic!("refused");
         };
         assert_eq!(reasons.len(), 1);
@@ -1967,6 +2039,7 @@ mod tests {
         let shell = OperatorRow {
             identity: "app.@+@(integer,integer)".to_owned(),
             owner: "alice".to_owned().into(),
+            owner_oid: 42,
             code: 0,
         };
         assert!(operator_function(40000, &shell).is_err());

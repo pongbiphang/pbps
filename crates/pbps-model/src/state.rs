@@ -617,7 +617,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 28);
+        assert_eq!(CURRENT_VERSION, 29);
     }
 
     fn schema_with(ty: &str) -> Schema {

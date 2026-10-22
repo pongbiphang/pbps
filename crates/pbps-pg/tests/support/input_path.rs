@@ -71,7 +71,7 @@ fn routines(reasons: &[Reason]) -> Vec<&RoutineReason> {
         .iter()
         .filter_map(|r| match r {
             Reason::Routine(r) => Some(r),
-            Reason::Owner(_) => None,
+            Reason::Owner(_) | Reason::RoutineOwner(_) => None,
         })
         .collect()
 }
@@ -81,7 +81,7 @@ fn owner_reasons(reasons: &[Reason]) -> Vec<&OwnerReason> {
         .iter()
         .filter_map(|r| match r {
             Reason::Owner(o) => Some(o),
-            Reason::Routine(_) => None,
+            Reason::Routine(_) | Reason::RoutineOwner(_) => None,
         })
         .collect()
 }
@@ -1112,7 +1112,15 @@ async fn a_role_that_inherits_from_or_administers_the_deployer_is_named() {
              CREATE TYPE app.pair AS (m app.mine);",
         )
         .await;
-        assert!(!admitted(&gate(&mut me, &[], "pair").await, "NULL pair"));
+        let path = gate(&mut me, &[], "pair").await;
+        assert_eq!(
+            actors(refused(&path, "NULL pair")),
+            BTreeSet::from([inherits.clone(), administers.clone()])
+        );
+        assert!(!admitted(
+            &gate(&mut me, &[inherits.as_str(), administers.as_str()], "pair").await,
+            "trusted NULL pair"
+        ));
         for name in ["mine"] {
             let path = gate(&mut me, &[], name).await;
             assert_eq!(
@@ -1129,11 +1137,10 @@ async fn a_role_that_inherits_from_or_administers_the_deployer_is_named() {
     }
 }
 
-/// A type whose input path runs no code is admitted whoever owns it, and
-/// whatever its leaves are owned by: nothing is evaluated.
+/// Owners of a code-free input path still need trust: they can add code later.
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
-async fn a_type_that_runs_no_code_is_admitted_whoever_owns_it() {
+async fn a_type_that_runs_no_code_still_requires_trusted_owners() {
     for server in servers() {
         let mut db = Scratch::create(&server, "gnocode").await;
         let (_, mut me) = deployer(&mut db).await;
@@ -1167,12 +1174,34 @@ async fn a_type_that_runs_no_code_is_admitted_whoever_owns_it() {
             "holds",
         ] {
             let path = gate(&mut me, &[], name).await;
-            assert!(
-                !admitted(&path, &format!("{name} on {label}")),
-                "{name} runs no code"
-            );
+            assert!(actors(refused(&path, name)).contains(&stranger), "{path:?}");
+            assert!(!admitted(
+                &gate(&mut me, &[stranger.as_str()], name).await,
+                &format!("{name} trusted on {label}")
+            ));
         }
-        // Negative: the moment a CHECK is on the path, the stranger counts.
+        let reference = TypeRef::new("app", "required").unwrap();
+        let reads = user_types::read(&mut me, Within::OwnTransaction, &[reference]).await;
+        let TypeRead::Present(ty) = &reads[0] else {
+            panic!("required type disappeared")
+        };
+        // NULL and proven-empty arrays skip element evaluation, never owners.
+        for column in [
+            Added::new(ty, true).array(true).null_fill(),
+            Added::new(ty, true).array(true).empty_array_fill(),
+        ] {
+            let paths = input_path::read(&mut me, Within::OwnTransaction, &[], &[column]).await;
+            assert!(actors(refused(&paths[0], "array owner")).contains(&stranger));
+            let paths = input_path::read(
+                &mut me,
+                Within::OwnTransaction,
+                &[stranger.clone().into()],
+                &[column],
+            )
+            .await;
+            assert!(!admitted(&paths[0], "trusted array owner"));
+        }
+        // Code remains classified separately from unconditional owner trust.
         db.sql(&format!(
             "CREATE DOMAIN app.checked AS integer CHECK (VALUE > 0);
              ALTER DOMAIN app.checked OWNER TO {stranger};
@@ -1183,7 +1212,7 @@ async fn a_type_that_runs_no_code_is_admitted_whoever_owns_it() {
         ))
         .await;
         assert!(!admitted(
-            &gate(&mut me, &[], "holds_checked").await,
+            &gate(&mut me, &[stranger.as_str()], "holds_checked").await,
             "NULL composite"
         ));
         for name in ["checked", "defaulted"] {
@@ -1203,11 +1232,11 @@ async fn a_type_that_runs_no_code_is_admitted_whoever_owns_it() {
         )
         .await;
         assert!(admitted(
-            &gate(&mut me, &[], "checked_mood").await,
-            "an enum owner cannot add code"
+            &gate(&mut me, &[stranger.as_str()], "checked_mood").await,
+            "the enum owner is explicitly trusted"
         ));
         assert!(admitted(
-            &gate(&mut me, &[], "constant_pair").await,
+            &gate(&mut me, &[stranger.as_str()], "constant_pair").await,
             "a stored composite constant runs no input conversion"
         ));
         run(

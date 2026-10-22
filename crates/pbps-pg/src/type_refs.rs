@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use pbps_db::{Conn, DbError, Param};
+use pbps_db::{Conn, DbError};
 use pbps_model::{
     Change, ChangeSet, Column, ColumnName, ColumnType, ModuleKind, Schema, TypePin, TypeRef,
     ValueSource,
@@ -62,6 +62,8 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -357,68 +359,7 @@ pub async fn input_routines(
             return Err(failed(why));
         }
     }
-    check_routine_owners(conn, trusted, &roots).await?;
     Ok(roots)
-}
-
-/// A pin detects replacement; only owner/actor trust admits running the code.
-async fn check_routine_owners(
-    conn: &mut Conn,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    routines: &BTreeSet<i64>,
-) -> Result<(), DbError> {
-    use crate::user_types::need;
-    if routines.is_empty() {
-        return Ok(());
-    }
-    let declared = serde_json::to_string(trusted).map_err(|e| failed(e.to_string()))?;
-    let rows = conn
-        .query_with(
-            &format!(
-                "WITH RECURSIVE {walk}
-                 SELECT p.oid::pg_catalog.int8 AS oid,
-                        pg_catalog.format('%I.%I(%s)', n.nspname, p.proname,
-                            pg_catalog.pg_get_function_identity_arguments(p.oid)) AS routine,
-                        ow.rolname::pg_catalog.text AS owner,
-                        a.rolname::pg_catalog.text AS actor
-                   FROM pg_catalog.pg_proc p
-                   JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
-                   JOIN pg_catalog.pg_roles ow ON ow.oid OPERATOR(pg_catalog.=) p.proowner
-                   LEFT JOIN reach r ON r.oid OPERATOR(pg_catalog.=) p.proowner
-                   LEFT JOIN others a ON a.oid OPERATOR(pg_catalog.=) r.origin
-                  WHERE p.oid OPERATOR(pg_catalog.=) ANY({routines})
-                  ORDER BY p.oid, a.rolname",
-                walk = crate::catalog::untrusted_role_walk(
-                    "ARRAY(SELECT pg_catalog.jsonb_array_elements_text(\
-                     $1::pg_catalog.text::pg_catalog.jsonb))"
-                ),
-                routines = user_types::oid_array(&routines.iter().copied().collect::<Vec<_>>()),
-            ),
-            &[Param::Str(&declared)],
-        )
-        .await?;
-    let mut seen = BTreeSet::new();
-    for row in &rows {
-        seen.insert(need::<i64>(row, "oid")?);
-        let routine = need::<&str>(row, "routine")?;
-        let owner = pbps_model::RoleName::from(need::<&str>(row, "owner")?);
-        if let Some(actor) = row.try_get::<&str>("actor")? {
-            let actor = pbps_model::RoleName::from(actor);
-            return Err(failed(format!(
-                "type input function `{routine}` is owned by `{owner}`, and untrusted role \
-                 `{actor}` can act as that owner; pinning does not replace owner trust. \
-                 Declare the role in `trusted_roles` in `pbps.yml` only if it is trusted",
-                owner = owner.shown(),
-                actor = actor.shown()
-            )));
-        }
-    }
-    if &seen != routines {
-        return Err(failed(
-            "an input routine disappeared while checking its owner",
-        ));
-    }
-    Ok(())
 }
 
 /// Offline reconstruction asserts prerequisites before it creates any object.
