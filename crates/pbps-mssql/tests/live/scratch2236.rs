@@ -3,6 +3,9 @@
 use super::{TestDb, connect_live};
 use pbps_mssql::resolver::scratch::{self, inventory, options};
 
+#[path = "../support/scratch_catalogs.rs"]
+mod catalog_cases;
+
 async fn model_row(conn: &mut pbps_db::Conn) -> serde_json::Value {
     let rows = conn
         .query(
@@ -847,8 +850,7 @@ async fn system_database_permissions_follow_fixed_rules_and_restore_each_change(
 #[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner() {
     let mut db = TestDb::create("catalogs2236").await;
-    let cases: Vec<(String, String)> =
-        serde_json::from_str(include_str!("scratch2236-catalogs.json")).unwrap();
+    let cases = catalog_cases::cases();
     db.conn
         .execute(
             "CREATE USER catalog_owner WITHOUT LOGIN; \
@@ -857,7 +859,7 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         )
         .await
         .unwrap();
-    for (expected, create) in cases {
+    for (expected, create) in cases.restore {
         db.conn.execute(&create).await.unwrap();
         let names = inventory::read(&mut db.conn, Some("catalog_owner"))
             .await
@@ -911,6 +913,68 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
     for (catalog, denied) in denied_reads {
         let denied = denied.unwrap_err().to_string();
         assert!(denied.contains(&format!("sys.{catalog}")), "{denied}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn unrestorable_built_ins_refuse_unchanged_and_out_of_set_state_passes() {
+    let cases = catalog_cases::cases();
+    for (refuses, (expected, create)) in cases
+        .refuse
+        .into_iter()
+        .map(|case| (true, case))
+        .chain(cases.residual.into_iter().map(|case| (false, case)))
+    {
+        let mut db = TestDb::create("builtin2263").await;
+        let result: Result<(), String> = async {
+            db.conn.execute(
+                "CREATE USER catalog_owner WITHOUT LOGIN; ALTER ROLE db_owner ADD MEMBER \
+                 catalog_owner; EXECUTE AS USER=N'catalog_owner';",
+            ).await.map_err(|error| error.to_string())?;
+            db.conn.execute(&create).await.map_err(|error| error.to_string())?;
+            let before = db.conn.query(catalog_cases::BUILTIN_STATE).await
+                .map_err(|error| error.to_string())?;
+            let before = before[0].try_get::<&str>("state").unwrap().unwrap().to_owned();
+            let names = inventory::read(&mut db.conn, Some("catalog_owner")).await
+                .map_err(|error| error.to_string())?.names();
+            let cleanup = inventory::cleanup(&mut db.conn, Some("catalog_owner")).await;
+            let remaining = inventory::read(&mut db.conn, Some("catalog_owner")).await
+                .map_err(|error| error.to_string())?.names();
+            let after = db.conn.query(catalog_cases::BUILTIN_STATE).await
+                .map_err(|error| error.to_string())?;
+            let after = after[0].try_get::<&str>("state").unwrap().unwrap();
+            let valid = if refuses {
+                names.iter().any(|name| name.contains(&expected))
+                    && cleanup.as_ref().is_err_and(|errors| errors.iter().any(|error|
+                        error.contains(&expected) && error.contains(
+                            "this database cannot be restored to a fresh state; supply a new scratch database"
+                        )))
+                    && remaining == names && before == after
+            } else {
+                names.is_empty() && cleanup.is_ok() && remaining.is_empty() && before == after
+            };
+            if !valid {
+                return Err(format!("{expected}: names={names:?}; cleanup={cleanup:?}; remaining={remaining:?}; unchanged={}", before == after));
+            }
+            Ok(())
+        }.await;
+        // The sys owner cannot be restored even by fixture ALTER AUTHORIZATION.
+        // Drop this owned database before asserting the measured refusal.
+        db.conn.execute("REVERT;").await.unwrap();
+        let name = db.name.clone();
+        db.drop().await;
+        let mut conn = connect_live(&super::conn_str()).await.unwrap();
+        assert!(
+            conn.query(&format!(
+                "SELECT name FROM sys.databases WHERE name=N'{name}';"
+            ))
+            .await
+            .unwrap()
+            .is_empty(),
+            "fixture database {name} remained"
+        );
+        result.unwrap();
     }
 }
 

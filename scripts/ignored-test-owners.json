@@ -1940,7 +1940,8 @@
         "scratch2236::independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner",
         "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names",
         "scratch2236::assembly_references_drop_dependents_before_providers_as_owner",
-        "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys"
+        "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys",
+        "scratch2236::unrestorable_built_ins_refuse_unchanged_and_out_of_set_state_passes"
       ]
     },
     {
@@ -1965,7 +1966,8 @@
         "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_guest_admission_dirty_inventory_and_persistent_options_refuse_by_name",
         "resolver::server::scratch::mssql_live_tests::mssql_docker_removes_the_container_on_success_failure_and_cancellation",
-        "resolver::server::scratch::mssql_live_tests::mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh"
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_rehearsal"
       ]
     }
   ]

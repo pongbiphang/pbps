@@ -7,6 +7,13 @@ use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Schema};
 use pbps_mssql::resolver::scratch as sql;
 
+mod catalog_cases {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-mssql/tests/support/scratch_catalogs.rs"
+    ));
+}
+
 fn server(variable: &str) -> String {
     std::env::var(variable)
         .unwrap_or_else(|_| panic!("{variable} must name the owned SQL Server resolver fixture"))
@@ -669,11 +676,7 @@ async fn mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restor
     let target = server("PBPS_TEST_DB");
     let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
     let (name, on) = create_database(&scratch).await;
-    let cases: Vec<(String, String)> = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../pbps-mssql/tests/live/scratch2236-catalogs.json"
-    )))
-    .unwrap();
+    let cases = catalog_cases::cases();
     let login = format!("pbps2236_owner_{:032x}", rand::random::<u128>());
     let password = sql::password(&format!("{:032x}", rand::random::<u128>()));
     let mut admin = connection(&scratch).await;
@@ -693,7 +696,7 @@ async fn mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restor
         {
             return Err("the fixture owner unexpectedly has instance creation privileges".into());
         }
-        for (expected, create) in cases {
+        for (expected, create) in cases.restore {
             conn.execute(&create)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -728,4 +731,89 @@ async fn mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restor
         .await
         .unwrap();
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_rehearsal() {
+    let target = server("PBPS_TEST_DB");
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let cases = catalog_cases::cases();
+    let login = format!("pbps2263_owner_{:032x}", rand::random::<u128>());
+    let password = sql::password(&format!("{:032x}", rand::random::<u128>()));
+    let mut admin = connection(&scratch).await;
+    admin
+        .execute(&format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD=N'{password}',CHECK_POLICY=ON;"
+        ))
+        .await
+        .unwrap();
+    let mut results = Vec::new();
+    for (refuses, (expected, create)) in cases
+        .refuse
+        .into_iter()
+        .map(|case| (true, case))
+        .chain(cases.residual.into_iter().map(|case| (false, case)))
+    {
+        let (name, on) = create_database(&scratch).await;
+        admin
+            .execute(&format!(
+                "ALTER AUTHORIZATION ON DATABASE::[{name}] TO [{login}];"
+            ))
+            .await
+            .unwrap();
+        let supplied = format!("{on};User Id={login};Password={password}");
+        let mut conn = connection(&supplied).await;
+        let result: Result<(), String> = async {
+            conn.execute(&create).await.map_err(|error| error.to_string())?;
+            let before = conn.query(catalog_cases::BUILTIN_STATE).await
+                .map_err(|error| error.to_string())?;
+            let before = before[0].try_get::<&str>("state").unwrap().unwrap().to_owned();
+            let refused = refusal(&target, &supplied).await.to_string();
+            let names = sql::inventory::read(&mut conn, None).await
+                .map_err(|error| error.to_string())?.names();
+            let cleanup = sql::inventory::cleanup(&mut conn, None).await;
+            let remaining = sql::inventory::read(&mut conn, None).await
+                .map_err(|error| error.to_string())?.names();
+            let after = conn.query(catalog_cases::BUILTIN_STATE).await
+                .map_err(|error| error.to_string())?;
+            let after = after[0].try_get::<&str>("state").unwrap().unwrap();
+            let valid = if refuses {
+                refused.contains(&expected)
+                    && names.iter().any(|name| name.contains(&expected))
+                    && cleanup.as_ref().is_err_and(|errors| errors.iter().any(|error|
+                        error.contains(&expected) && error.contains(
+                            "this database cannot be restored to a fresh state; supply a new scratch database"
+                        )))
+                    && remaining == names && before == after
+            } else {
+                refused.contains("#2237") && names.is_empty() && cleanup.is_ok()
+                    && remaining.is_empty() && before == after
+            };
+            if !valid {
+                return Err(format!("{expected}: refusal={refused}; names={names:?}; cleanup={cleanup:?}; remaining={remaining:?}; unchanged={}", before == after));
+            }
+            Ok(())
+        }.await;
+        drop(conn);
+        // An owned database is the only measured way to discard changed sys
+        // ownership; perform it before asserting and keep the login until last.
+        drop_database(&scratch, &name).await;
+        let absent = admin
+            .query(&format!(
+                "SELECT name FROM sys.databases WHERE name=N'{name}';"
+            ))
+            .await
+            .unwrap()
+            .is_empty();
+        results.push((name, absent, result));
+    }
+    admin
+        .execute(&format!("DROP LOGIN [{login}];"))
+        .await
+        .unwrap();
+    for (name, absent, result) in results {
+        assert!(absent, "fixture database {name} remained");
+        result.unwrap();
+    }
 }
