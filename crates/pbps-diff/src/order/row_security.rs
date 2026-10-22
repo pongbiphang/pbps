@@ -1,4 +1,4 @@
-//! The creation boundary shared by ordinary and resolver schedules.
+//! Policy teardown and setup shared by ordinary and resolver schedules.
 
 use super::{PlanningPlan, Schedule, Source};
 use pbps_dialect::Dialect;
@@ -129,8 +129,8 @@ pub fn module_constraints(
     Ok(())
 }
 
-/// Policies follow the structural/module/data build; flags follow policies.
-/// These are setup phases, not inferred bindings inside predicate text.
+/// Policy drops precede module/column teardown; installs follow the build,
+/// and flags follow policies. These phases do not infer predicate bindings.
 pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, usize)> {
     let changes: Vec<_> = changes.into_iter().collect();
     let policies: Vec<_> = changes
@@ -143,7 +143,12 @@ pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, u
         .enumerate()
         .filter_map(|(i, c)| matches!(c, Change::SetRowSecurity { .. }).then_some(i))
         .collect();
-    if policies.is_empty() && flags.is_empty() {
+    let drops: Vec<_> = changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| matches!(c, Change::DropPolicy { .. }).then_some(i))
+        .collect();
+    if drops.is_empty() && policies.is_empty() && flags.is_empty() {
         return Vec::new();
     }
     let suppliers: Vec<_> = changes
@@ -167,6 +172,14 @@ pub fn edges<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Vec<(usize, u
         })
         .collect();
     let mut out = Vec::new();
+    for (later, change) in changes.iter().enumerate() {
+        if matches!(
+            change,
+            Change::DropModule { .. } | Change::DropColumn { .. } | Change::AlterColumnType { .. }
+        ) {
+            out.extend(drops.iter().map(|&earlier| (earlier, later)));
+        }
+    }
     for &later in policies.iter().chain(&flags) {
         out.extend(suppliers.iter().map(|&earlier| (earlier, later)));
     }
@@ -306,3 +319,6 @@ pub fn check_releases(
 
 mod validation;
 pub use validation::validate;
+
+#[cfg(test)]
+mod tests;
