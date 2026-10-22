@@ -32,6 +32,7 @@
 //! rendering a caller shows — a securable in `GRANT` spelling, an edition's
 //! name — is rendered by the engine and travels as text.
 
+use pbps_diff::order::PlanningPlan;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::catalog::{CatalogNames, Pulled, RowsError, Spellings};
@@ -773,7 +774,7 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// plan the revision afresh in the differ's order, have run.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     label: &str,
     plan: Planned<'_>,
 ) -> anyhow::Result<Option<NameFacts>> {
@@ -869,7 +870,7 @@ impl NameFacts {
     /// DEC-1957.2), then refuses what is left (#951, #1749, #1765).
     pub fn order_and_refuse(
         &self,
-        cs: &mut ChangeSet,
+        cs: &mut PlanningPlan,
         label: &str,
         plan: Planned<'_>,
     ) -> anyhow::Result<()> {
@@ -985,7 +986,7 @@ fn computed_catalog_table(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub async fn order_computed_by_edges(
     conn: &mut Conn,
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<Vec<(pbps_model::Change, pbps_model::Change)>> {
     if conn.driver() != Driver::Mssql {
@@ -1157,7 +1158,7 @@ pub async fn refuse_added_computed_calls(
 /// called after every other one, so what it settles is what is saved.
 pub async fn order_created_object_names(
     conn: &mut Conn,
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &pbps_model::IdsFile,
     label: &str,
     precedence: &[(pbps_model::Change, pbps_model::Change)],
@@ -1946,7 +1947,7 @@ fn release_of(
 // The complement is every change that carries no generation expression.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn order_after_releases(
-    changes: &mut ChangeSet,
+    changes: &mut PlanningPlan,
     ids: &pbps_model::IdsFile,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
 ) -> Result<usize, String> {
@@ -2300,7 +2301,7 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
 /// retypes or drops a column of. PostgreSQL only.
 pub async fn release_generated_inputs(
     conn: &mut Conn,
-    changes: &mut ChangeSet,
+    changes: &mut PlanningPlan,
     ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<usize> {
     if conn.driver() != Driver::Postgres {
@@ -3510,13 +3511,13 @@ async fn module_dependents(
 #[allow(clippy::too_many_arguments)]
 pub async fn account_for_module_dependents(
     conn: &mut Conn,
-    changes: &mut ChangeSet,
+    changes: &mut PlanningPlan,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &dyn pbps_dialect::Dialect,
-    rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
+    rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan>,
 ) -> anyhow::Result<ConnectedCheck> {
     let declarations = crate::dependents::schedule::Declarations {
         schema: declared,
@@ -3532,7 +3533,7 @@ pub async fn account_for_module_dependents(
     };
     if conn.driver() != Driver::Postgres {
         let scheduled = crate::dependents::schedule::schedule(
-            std::mem::take(changes),
+            pbps_diff::order::take(changes),
             &declarations,
             &read,
             dialect,
@@ -3564,7 +3565,7 @@ pub async fn account_for_module_dependents(
         .with_module_dependents(&found)
         .with_policy_dependents(&policies);
     let scheduled = crate::dependents::schedule::schedule(
-        std::mem::take(changes),
+        pbps_diff::order::take(changes),
         &declarations,
         &facts,
         dialect,
@@ -3842,7 +3843,9 @@ mod tests {
         dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
     ) -> Result<usize, String> {
         let ids = crate::plan_fixture::ids(changes);
-        super::order_after_releases(changes, &ids, dependences)
+        crate::test_planning(changes, |plan| {
+            super::order_after_releases(plan, &ids, dependences)
+        })
     }
     fn unreleased(
         changes: &ChangeSet,
@@ -5216,6 +5219,16 @@ mod tests {
 #[cfg(test)]
 mod plan_name_tests {
     use super::*;
+    fn order_after_releases(
+        changes: &mut ChangeSet,
+        ids: &pbps_model::IdsFile,
+        dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
+    ) -> Result<usize, String> {
+        crate::test_planning(changes, |plan| {
+            super::order_after_releases(plan, ids, dependences)
+        })
+    }
+
     use pbps_model::{Change, GrantTarget, Permission, PlannedChange};
 
     #[test]

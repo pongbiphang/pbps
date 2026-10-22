@@ -200,9 +200,9 @@ impl Reconstruction {
                 .map(pbps_model::PlannedChange::new)
                 .collect(),
         };
-        pbps_diff::order::generated::expand(&mut expanded, ids, dependencies, dialect)
+        pbps_diff::order::generated::legacy_expand(&mut expanded, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
-        pbps_diff::order::generated::settle(&mut expanded, &declared, dependencies, dialect)
+        pbps_diff::order::generated::legacy_settle(&mut expanded, &declared, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
         let edges =
             pbps_diff::order::generated::constraints(&expanded, &declared, dependencies, dialect);
@@ -1040,7 +1040,7 @@ fn settle_steps(
             .collect(),
     };
     let settled = schedule
-        .settle(order_plan.clone())
+        .settle(pbps_diff::order::propose(order_plan.clone()))
         .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
     let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
     Ok(settled

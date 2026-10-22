@@ -31,6 +31,8 @@ thiserror.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
+pbps-diff = { workspace = true, features = ["test-fixtures"] }
+pbps-mssql.workspace = true
 # The commutation suite (#1965) declares its scenarios in YAML and loads them
 # the way `plan` loads a schema directory.
 pbps-load.workspace = true

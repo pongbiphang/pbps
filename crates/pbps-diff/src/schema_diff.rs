@@ -402,9 +402,9 @@ struct Indexes<'a> {
 pub fn diff(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
 }
 
@@ -425,10 +425,10 @@ pub fn diff(
 pub fn diff_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -477,12 +477,12 @@ pub enum Screen {
 pub fn diff_read_back(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     screen: Screen,
     read_back: &Schema,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -500,10 +500,10 @@ pub fn diff_read_back(
 pub fn diff_connected(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -520,13 +520,13 @@ pub fn diff_connected(
 pub(crate) fn rebuilding_by(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
     screen: Screen,
     read_back: Option<&Schema>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     let d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
@@ -537,7 +537,7 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        Ok(d.changes)
+        Ok(crate::order::propose(d.changes))
     } else {
         Err(d.errors)
     }
@@ -559,7 +559,7 @@ pub(crate) fn rebuilding_by(
 pub fn diff_partial(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
 ) -> Diffed {
     diff_partial_rebuilding(
@@ -618,7 +618,7 @@ fn standing_default(
 pub(crate) fn diff_partial_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
@@ -1244,7 +1244,7 @@ pub(crate) fn diff_partial_rebuilding(
     // exactly as a plan would be.
     // After every pass that rebuilds an index: its `CREATE` carries the
     // declared parameters (#1483 review).
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+    crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
         p.risks = dialect.change_risks(&p.change);
@@ -1532,12 +1532,12 @@ pub(crate) fn diff_partial_rebuilding(
         false
     }
     for (rename, to) in &vacates {
-        let folded = crate::rename_order::case_folded(to.raw());
+        let folded = crate::order::rename_order::case_folded(to.raw());
         for vacating in vacates.keys() {
             if vacating != rename
                 && vacating.0 == rename.0
                 && vacating.1 != *to
-                && crate::rename_order::case_folded(vacating.1.raw()) == folded
+                && crate::order::rename_order::case_folded(vacating.1.raw()) == folded
                 && !reaches(&waits, vacating, rename)
             {
                 waits
@@ -2026,7 +2026,7 @@ pub(crate) fn diff_partial_rebuilding(
     // sides of every comparison, a third of a 4,000-table plan's CPU
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
-    planned.sort_by_cached_key(|p| {
+    crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
             class,
@@ -2057,7 +2057,7 @@ pub(crate) fn diff_partial_rebuilding(
             format!("{:?}", p.change),
         )
     });
-    for cycle in crate::rename_order::order(&mut planned, base, &renames, dialect) {
+    for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
     Diffed {
@@ -2086,7 +2086,7 @@ fn diff_columns(
     declared_table_name: &TableName,
     base_table: &Table,
     declared_table: &Table,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -2941,7 +2941,7 @@ fn recreate_retyped_dependents(
     base: Side<'_>,
     declared: Side<'_>,
     renames: &Renames,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     let also = |dependents: &mut pbps_dialect::RetypeDependents,
@@ -3370,7 +3370,7 @@ fn detached_names(
     parent: &Table,
     partition: &Table,
     declared: &Table,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
@@ -3591,7 +3591,7 @@ fn attached(
     table: &Table,
     declared: &Table,
     of: &pbps_model::PartitionOf,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     read_back: Option<&Schema>,
 ) -> Result<Attached, Vec<String>> {
     let mut what = Vec::new();
@@ -4799,7 +4799,7 @@ fn diff_partition_columns(
     base: Side<'_>,
     declared: Side<'_>,
     index: &Indexes<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
     errors: &mut Vec<DiffError>,
 ) {
@@ -4917,7 +4917,7 @@ fn diff_partition_columns(
 /// Keep the serial expression in the dialect, while the saved change keeps
 /// the same concrete fallback text as a plain default (DEC-2218.1).
 fn partition_default(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     parent: &TableName,
     column: &ColumnName,
     declared: Option<&pbps_model::Column>,
@@ -4974,7 +4974,7 @@ fn change_in_words(change: &Change) -> String {
 fn refuse_computed_dependencies(
     base: &Schema,
     declared: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     screen: Screen,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
@@ -6281,7 +6281,7 @@ fn dependency_rank(
 fn diff_roles(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     // Whether the *principal* is this tool's at all (ADR-0010 §3,
@@ -6688,7 +6688,7 @@ fn diff_roles(
 /// everything else.
 fn revoke_public_execution(
     base: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     changes: &mut Vec<Change>,
 ) {
@@ -6774,7 +6774,7 @@ fn diff_modules(
     base: &Schema,
     declared: &Schema,
     changing_hands: &BTreeSet<TableName>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     for (id, module) in &declared.modules {
@@ -7469,7 +7469,7 @@ mod tests {
     /// schema's relation namespace with tables at all
     /// (`Dialect::indexes_share_namespace_with_tables`, issue #176).
     fn run_with(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         declared: &Schema,
         intents: &[Intent],
@@ -7493,6 +7493,8 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+        .changes()
+        .clone()
     }
 
     /// `MinimalDialect`, except that `int` and `integer` are one type, as
@@ -9577,6 +9579,7 @@ mod tests {
             outcome(declared, intents)
                 .unwrap_or_else(|e| panic!("refused: {e:?}"))
                 .changes
+                .clone()
                 .into_iter()
                 .map(|p| p.change)
                 .collect()
@@ -9868,7 +9871,13 @@ mod tests {
                 &MinimalDialect,
                 &Hints::default(),
             )
-            .map(|cs| cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>())
+            .map(|cs| {
+                cs.changes
+                    .clone()
+                    .into_iter()
+                    .map(|p| p.change)
+                    .collect::<Vec<_>>()
+            })
             .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
         let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
@@ -16264,7 +16273,7 @@ mod tests {
     /// renaming `app.old` into its name, then diffed from the undeployed
     /// baseline as a plan that carries both (#536).
     fn a_dropped_tables_name_reused_by_a_later_rename(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         intermediate: &Schema,
         declared: &Schema,
@@ -16307,8 +16316,15 @@ mod tests {
         )
     }
 
-    fn diff_with(base: Side<'_>, declared: Side<'_>, dialect: &dyn Dialect) -> ChangeSet {
-        diff(base, declared, dialect, &Hints::default()).unwrap()
+    fn diff_with(
+        base: Side<'_>,
+        declared: Side<'_>,
+        dialect: &(impl Dialect + ?Sized),
+    ) -> ChangeSet {
+        diff(base, declared, dialect, &Hints::default())
+            .unwrap()
+            .changes()
+            .clone()
     }
 
     /// DEC-981.3, the other two release paths: a table rename vacating a name
@@ -17389,7 +17405,7 @@ mod tests {
 
     /// [`across_revisions`], against a caller-chosen dialect.
     fn across_revisions_with(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         revisions: &[(Schema, Vec<Intent>)],
     ) -> ChangeSet {
@@ -21249,6 +21265,8 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+        .changes()
+        .clone()
     }
 
     #[test]
@@ -22499,7 +22517,7 @@ mod tests {
         }
 
         fn kinds_on(
-            dialect: &dyn pbps_dialect::Dialect,
+            dialect: &(impl pbps_dialect::Dialect + ?Sized),
             base: &(Schema, IdsFile),
             declared: &(Schema, IdsFile),
         ) -> Vec<String> {
@@ -23313,7 +23331,7 @@ mod tests {
         }
 
         fn run(
-            dialect: &dyn Dialect,
+            dialect: &(impl Dialect + ?Sized),
             base: &Schema,
             declared: &Schema,
             hints: &Hints,
@@ -23334,6 +23352,8 @@ mod tests {
                 hints,
             )
             .unwrap()
+            .changes()
+            .clone()
         }
 
         fn decided(cs: &ChangeSet) -> Vec<(String, PublicAccess, RoutineOrigin)> {
@@ -23746,7 +23766,10 @@ mod tests {
         };
         let mut legacy = cs.clone();
         crate::order::roles::legacy::legacy_order(&mut legacy);
-        cs = crate::order::role_drops(cs).unwrap();
+        cs = crate::order::role_drops(crate::order::propose(cs))
+            .unwrap()
+            .changes()
+            .clone();
         assert_eq!(cs, legacy);
         assert_eq!(
             crate::order::roles::legacy::checksum(&cs),
@@ -23769,7 +23792,10 @@ mod tests {
         let before = format!("{:?}", flat.changes);
         let mut legacy = flat.clone();
         crate::order::roles::legacy::legacy_order(&mut legacy);
-        flat = crate::order::role_drops(flat).unwrap();
+        flat = crate::order::role_drops(crate::order::propose(flat))
+            .unwrap()
+            .changes()
+            .clone();
         assert_eq!(flat, legacy);
         assert_eq!(format!("{:?}", flat.changes), before);
     }

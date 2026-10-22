@@ -161,10 +161,26 @@ fn reason_word(reason: OrderReason) -> &'static str {
 /// A settled plan.
 #[derive(Debug, Clone)]
 pub struct Settled {
-    pub changes: ChangeSet,
+    pub changes: super::PlanningPlan,
     /// The edges that ordered it, over its own positions.
     pub proof: OrderingProof,
     /// For each position of `changes`, the position it came from.
+    pub sequence: Vec<usize>,
+}
+
+impl Settled {
+    /// A settlement is an intermediate result, never an execution permit.
+    pub fn into_planning(self) -> super::PlanningPlan {
+        self.changes
+    }
+}
+
+/// Raw settlement remains an implementation detail of order. Its result is
+/// never exposed as executable authority.
+#[derive(Debug)]
+pub(super) struct DraftSettled {
+    pub changes: ChangeSet,
+    pub proof: OrderingProof,
     pub sequence: Vec<usize>,
 }
 
@@ -259,7 +275,26 @@ impl Schedule {
     }
 
     /// `changes`, which the schedule was built over, in its order.
-    pub fn settle(&self, changes: ChangeSet) -> Result<Settled, Refusal> {
+    pub fn settle(&self, plan: super::PlanningPlan) -> Result<Settled, Refusal> {
+        let settled = self.settle_raw(plan.payload)?;
+        let origins = settled
+            .sequence
+            .iter()
+            .map(|&at| plan.origins[at].clone())
+            .collect();
+        Ok(Settled {
+            changes: super::PlanningPlan::new(
+                settled.changes,
+                origins,
+                plan.logical,
+                settled.proof.clone(),
+            ),
+            proof: settled.proof,
+            sequence: settled.sequence,
+        })
+    }
+
+    pub(super) fn settle_raw(&self, changes: ChangeSet) -> Result<DraftSettled, Refusal> {
         if changes.changes.len() != self.steps {
             return Err(Refusal::Mismatch {
                 steps: self.steps,
@@ -291,7 +326,7 @@ impl Schedule {
         // names a step of it, which is all the proof validates.
         let proof = OrderingProof::new(&ordered, edges)
             .expect("a Kahn order runs every edge it kept forward");
-        Ok(Settled {
+        Ok(DraftSettled {
             changes: ordered,
             proof,
             sequence,

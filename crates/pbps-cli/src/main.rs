@@ -2,6 +2,7 @@
 
 //! `pbps` — declarative database schema version control.
 
+use pbps_diff::order::PlanningPlan;
 mod adopt;
 mod artifact;
 mod baseline;
@@ -1715,7 +1716,7 @@ fn policy_context_at(
 /// problems, and evaluating half a block would report against rules the
 /// project did not manage to configure.
 pub fn attach_policy_findings(
-    cs: &mut pbps_model::ChangeSet,
+    cs: &mut PlanningPlan,
     project: &Project,
     dialect: &dyn Dialect,
     connected: bool,
@@ -1732,12 +1733,11 @@ pub fn attach_policy_findings(
     }
     let ctx = policy_context(project, dialect, connected);
     let mut out = Vec::new();
-    for (at, f) in pbps_policy::plan(cs, &policies, &ctx) {
-        out.push(policy_finding(&f));
-        if let Some(p) = cs.changes.get_mut(at) {
-            p.findings.push(f);
-        }
+    let findings = pbps_policy::plan(cs, &policies, &ctx);
+    for (_, finding) in &findings {
+        out.push(policy_finding(finding));
     }
+    pbps_diff::order::writebacks::findings(cs, &findings);
     out
 }
 
@@ -3492,7 +3492,7 @@ fn cmd_plan(
                 checksum: pbps_model::state_checksum(&base.schema, &base.ids),
                 database_collation: None,
             },
-            cs.clone(),
+            cs.changes().clone(),
             res.ids.clone(),
         );
         plan.module_deps = loaded.hints.module_deps.clone();
@@ -4102,6 +4102,20 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+// Existing byte oracles keep raw snapshots as their expected/observed data.
+// Every actual transformation still goes through the real non-executable
+// input and stage APIs; this helper cannot construct an OrderedPlan.
+#[cfg(test)]
+pub(crate) fn test_planning<T>(
+    snapshot: &mut pbps_model::ChangeSet,
+    stage: impl FnOnce(&mut pbps_diff::order::PlanningPlan) -> T,
+) -> T {
+    let mut plan = pbps_diff::order::propose(snapshot.clone());
+    let result = stage(&mut plan);
+    *snapshot = plan.changes().clone();
+    result
 }
 
 #[cfg(test)]

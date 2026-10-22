@@ -11,7 +11,7 @@ use super::{Schedule, Source};
 /// Orders drops whose memberships the caller has read and written into them.
 /// The role-only projection lets `settle` reorder them without carrying any
 /// non-role step across a drop, even when their slots are interleaved.
-pub fn role_drops(mut changes: ChangeSet) -> Result<ChangeSet, String> {
+pub fn role_drops(mut changes: super::PlanningPlan) -> Result<super::PlanningPlan, String> {
     let slots: Vec<_> = changes
         .changes
         .iter()
@@ -23,11 +23,21 @@ pub fn role_drops(mut changes: ChangeSet) -> Result<ChangeSet, String> {
     };
     let schedule = constraints(&drops);
     let settled = schedule
-        .settle(drops.clone())
+        .settle_raw(drops.clone())
         .map_err(|refusal| refusal.describe(&drops))?;
-    for (slot, drop) in slots.into_iter().zip(settled.changes.changes) {
-        changes.changes[slot] = drop;
+    let origins: Vec<_> = slots
+        .iter()
+        .map(|&at| changes.origins[at].clone())
+        .collect();
+    for ((slot, drop), &from) in slots
+        .into_iter()
+        .zip(settled.changes.changes)
+        .zip(&settled.sequence)
+    {
+        changes.payload.changes[slot] = drop;
+        changes.origins[slot] = origins[from].clone();
     }
+    changes.invalidate();
     Ok(changes)
 }
 

@@ -17,6 +17,7 @@
 //! passes run in `plan --db`'s order, and a caller that supplies the same
 //! facts gets the order it always got.
 
+use pbps_diff::order::PlanningPlan;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -141,7 +142,7 @@ impl fmt::Display for Skipped {
 /// The plan in its final order, and what it took to get there.
 #[derive(Debug)]
 pub(crate) struct Scheduled {
-    pub changes: ChangeSet,
+    pub changes: PlanningPlan,
     /// Changes the passes added: a dependent put back around a module, a
     /// partition's own default set again.
     pub added: usize,
@@ -181,7 +182,7 @@ impl std::error::Error for Refusal {}
 /// The plan is taken and returned rather than edited, so a refusal leaves no
 /// half-ordered plan behind.
 pub(crate) fn schedule(
-    mut cs: ChangeSet,
+    mut cs: PlanningPlan,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
     dialect: &dyn Dialect,
@@ -299,14 +300,7 @@ pub(crate) fn schedule(
     {
         match facts.role_members {
             Some(members) => {
-                for p in &mut cs.changes {
-                    if let Change::DropRole {
-                        name, members: of, ..
-                    } = &mut p.change
-                    {
-                        *of = members.get(name).cloned().unwrap_or_default();
-                    }
-                }
+                pbps_diff::order::writebacks::role_members(&mut cs, members);
                 cs = pbps_diff::order::role_drops(cs).map_err(Refusal)?;
             }
             None => skipped.push(Skipped::RoleDrops),
@@ -343,59 +337,24 @@ pub(crate) fn schedule(
         Vec::new()
     };
     if !edges.is_empty() || !releases.is_empty() {
-        let mut schedule = if releases.is_empty() {
-            pbps_diff::order::Schedule::new(cs.changes.len())
-        } else {
-            // Catalog policy edges can move a column release past a routine
-            // drop or a name handover. Settle them with the existing effect,
-            // name-slot and module-catalog constraints, not a positional move
-            // that invents dependencies between unrelated table drops.
-            policy_release_schedule(&cs, declared, facts, dialect)?
-        };
-        for release in &releases {
-            schedule.edge(
-                release.before,
-                release.after,
-                pbps_diff::order::Source::Catalog,
-                pbps_model::resolver::OrderReason::Structural,
-            );
-        }
-        for (before, after) in edges {
-            schedule.edge(
-                before,
-                after,
-                pbps_diff::order::Source::Effect,
-                pbps_model::resolver::OrderReason::Structural,
-            );
-        }
-        cs = schedule
-            .settle(cs.clone())
-            .map_err(|why| {
-                Refusal(format!(
-                    "{}{}",
-                    why.describe(&cs),
-                    if releases.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "\n{}",
-                            releases
-                                .iter()
-                                .map(|r| r.refusal.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )
-                    }
-                ))
-            })?
-            .changes;
+        #[cfg(test)]
+        let old = rls_oracle::settle(cs.changes().clone(), declared, facts, dialect);
+        let done = (|| {
+            let schedule = if releases.is_empty() {
+                pbps_diff::order::Schedule::new(cs.changes.len())
+            } else {
+                // Preserve the existing combined graph and its refusal priority.
+                policy_release_schedule(&cs, declared, facts, dialect)?
+            };
+            pbps_diff::order::row_security::settle(cs.clone(), schedule, &releases).map_err(Refusal)
+        })();
+        #[cfg(test)]
+        rls_oracle::same(&done, &old, dialect);
+        cs = done?;
     }
     // The complete typed plan proves which additions finish a newly
     // generated table, even if an older lowering added them separately.
-    let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
-    for (part, risks) in cs.changes.iter_mut().zip(risks) {
-        part.risks = risks;
-    }
+    pbps_diff::order::writebacks::creation_risks(&mut cs, declared.sources.after, dialect);
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not
@@ -494,71 +453,34 @@ mod role_order_oracle;
 /// Existing structural constraints remain true when catalog policy releases
 /// require a different teardown order. This graph is used only for that case.
 fn policy_release_schedule(
-    cs: &ChangeSet,
+    cs: &PlanningPlan,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
     dialect: &dyn Dialect,
 ) -> Result<pbps_diff::order::Schedule, Refusal> {
-    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
-    let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)
-        .map_err(|why| Refusal(why.to_string()))?;
-    let owners = PlanOwners::new(names, declared.sources.before.ids, declared.sources.after);
-    let before = Snapshot {
-        schema: declared.sources.before.schema,
-        ids: declared.sources.before.ids,
-    };
-    let after = Snapshot {
-        schema: declared.schema,
-        ids: declared.sources.after,
-    };
-    let effects = pbps_diff::order::analyse(&operations, &owners, before, after, dialect);
-    if let Some((id, why)) = effects.unowned.first() {
-        return Err(Refusal(format!(
-            "policy release operation {id} has unread effects: {why}"
-        )));
-    }
-    let graph = pbps_diff::order::graph(
-        operations.as_slice(),
-        &effects.effects,
-        &pbps_diff::order::Baseline::of(before, &owners),
+    let mut schedule = pbps_diff::order::row_security::release_schedule(
+        cs,
+        declared.sources.before,
+        pbps_diff::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
         declared.module_deps,
-        pbps_diff::order::Checks::ALL,
-    );
-    let mut schedule = pbps_diff::order::Schedule::of_graph(&graph, operations.as_slice());
-    for edge in
-        pbps_diff::order::generated::constraints(cs, declared.schema, declared.module_deps, dialect)
-    {
-        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
-    }
-    let slots = pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
-    if !slots.unowned.is_empty() || !slots.unlowered.is_empty() {
-        return Err(Refusal(
-            "policy release has unread name-slot effects".into(),
-        ));
-    }
-    pbps_diff::order::slots::schedule(
-        &mut schedule,
-        &pbps_diff::order::slots::edges(&slots, None, &[]),
-    );
+        dialect,
+    )
+    .map_err(Refusal)?;
     if let Some(found) = facts.module_dependents {
-        for edge in super::module_order(cs, found, declared.schema, declared.sources, dialect)
-            .map_err(Refusal::module_passes)?
-        {
-            let (
-                pbps_diff::order::expand::Step::Plan(before),
-                pbps_diff::order::expand::Step::Plan(after),
-            ) = (edge.before, edge.after)
-            else {
-                return Err(Refusal(
-                    "module catalog edge names an unexpanded operation".into(),
-                ));
-            };
-            schedule.edge(before, after, edge.source, edge.reason);
-        }
+        let edges = super::module_order(cs, found, declared.schema, declared.sources, dialect)
+            .map_err(Refusal::module_passes)?;
+        pbps_diff::order::row_security::module_constraints(&mut schedule, edges)
+            .map_err(Refusal)?;
     }
     Ok(schedule)
 }
+
+#[cfg(test)]
+#[path = "rls_oracle.rs"]
+mod rls_oracle;
 
 #[cfg(test)]
 mod tests {
@@ -645,7 +567,7 @@ mod tests {
         (schema, ids)
     }
 
-    fn differ_order(schema: &Schema, ids: &IdsFile) -> ChangeSet {
+    fn differ_order(schema: &Schema, ids: &IdsFile) -> PlanningPlan {
         pbps_diff::diff(
             pbps_diff::Side {
                 schema: &Schema::default(),
@@ -659,7 +581,7 @@ mod tests {
     }
 
     fn scheduled(
-        cs: ChangeSet,
+        cs: PlanningPlan,
         schema: &Schema,
         ids: &IdsFile,
         facts: &Facts<'_>,
@@ -796,13 +718,19 @@ mod tests {
                 },
                 module_deps: &ModuleDeps::new(),
             };
-            let offline = schedule(changes.clone(), &declared, &Facts::default(), &pg()).unwrap();
+            let offline = schedule(
+                pbps_diff::order::propose(changes.clone()),
+                &declared,
+                &Facts::default(),
+                &pg(),
+            )
+            .unwrap();
             assert_eq!(offline.skipped, [Skipped::PolicyDependents]);
             assert_eq!(offline.skipped[0].id(), "plan.policy-dependents-unread");
             assert_eq!(offline.changes, changes);
             assert!(
                 schedule(
-                    changes.clone(),
+                    pbps_diff::order::propose(changes.clone()),
                     &declared,
                     &Facts::default().with_policy_dependents(&BTreeMap::new()),
                     &pg()
@@ -818,7 +746,7 @@ mod tests {
             ]
             .into();
             let no_policy = schedule(
-                changes.clone(),
+                pbps_diff::order::propose(changes.clone()),
                 &declared,
                 &Facts::default().with_policy_dependents(&empty),
                 &pg(),
@@ -848,7 +776,13 @@ mod tests {
             ]
             .into();
             let facts = Facts::default().with_policy_dependents(&found);
-            let ordered = schedule(changes.clone(), &declared, &facts, &pg()).unwrap();
+            let ordered = schedule(
+                pbps_diff::order::propose(changes.clone()),
+                &declared,
+                &facts,
+                &pg(),
+            )
+            .unwrap();
             assert_eq!(
                 ordered
                     .changes
@@ -926,7 +860,7 @@ mod tests {
         ]
         .into();
         let ordered = schedule(
-            changes.clone(),
+            pbps_diff::order::propose(changes.clone()),
             &declared,
             &Facts::default().with_policy_dependents(&found),
             &pg(),
@@ -946,7 +880,7 @@ mod tests {
         let mut retained = changes.clone();
         retained.changes.remove(1);
         let error = schedule(
-            retained,
+            pbps_diff::order::propose(retained),
             &declared,
             &Facts::default().with_policy_dependents(&found),
             &pg(),
@@ -962,7 +896,7 @@ mod tests {
             .unwrap()
             .push(policy(0, "closes_cycle"));
         let error = schedule(
-            changes,
+            pbps_diff::order::propose(changes),
             &declared,
             &Facts::default().with_policy_dependents(&found),
             &pg(),
@@ -990,7 +924,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut changes = differ_order(&schema, &ids);
+        let mut changes = differ_order(&schema, &ids).changes().clone();
         // The module passes can move suppliers after the initial class sort.
         // Start with that adverse order to pin the final scheduling boundary.
         changes.changes.sort_by_key(|p| {
@@ -999,9 +933,14 @@ mod tests {
                 Change::CreateModule { .. } | Change::PublicExecution { .. }
             )
         });
-        let result = scheduled(changes, &schema, &ids, &Facts::default())
-            .unwrap()
-            .changes;
+        let result = scheduled(
+            pbps_diff::order::propose(changes),
+            &schema,
+            &ids,
+            &Facts::default(),
+        )
+        .unwrap()
+        .changes;
         let policy = result
             .changes
             .iter()
@@ -1301,7 +1240,7 @@ mod tests {
         };
 
         fn after_the_rebuilds(
-            cs: &mut ChangeSet,
+            cs: &mut PlanningPlan,
             released: &BTreeSet<super::ColumnRef>,
             deps: &ModuleDeps,
             schema: &Schema,
@@ -1311,17 +1250,17 @@ mod tests {
             crate::dependents::after_the_rebuilds(cs, released, deps, schema, order, dialect)
         }
 
-        pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
+        pub(super) fn bootstrap(mut cs: PlanningPlan, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             split_new_tables(&mut cs, &[ids], &ModuleDeps::new(), &pg()).unwrap();
             after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
                 .unwrap();
             after_their_parents_defaults(&mut cs, schema, &[ids], &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
-            cs
+            cs.changes().clone()
         }
 
-        pub(super) fn connected(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
+        pub(super) fn connected(mut cs: PlanningPlan, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             let both = [ids, &IdsFile::default()];
             split_new_tables(&mut cs, &both, &ModuleDeps::new(), &pg()).unwrap();
@@ -1331,7 +1270,7 @@ mod tests {
             after_their_parents_defaults(&mut cs, schema, &both, &pg()).unwrap();
             before_its_partitions_indexes(&mut cs, schema, &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
-            cs
+            cs.changes().clone()
         }
     }
 
@@ -1404,12 +1343,18 @@ mod tests {
         )]);
         let nothing = ModuleDependents::from([(id("app.f(integer)"), Vec::new())]);
 
-        let offline = scheduled(plan(), &schema, &ids, &Facts::default()).unwrap();
+        let offline = scheduled(
+            pbps_diff::order::propose(plan()),
+            &schema,
+            &ids,
+            &Facts::default(),
+        )
+        .unwrap();
         assert_eq!(offline.skipped, [Skipped::Weave]);
         assert_eq!(offline.changes, plan());
 
         let empty = scheduled(
-            plan(),
+            pbps_diff::order::propose(plan()),
             &schema,
             &ids,
             &Facts::default().with_module_dependents(&nothing),
@@ -1418,7 +1363,7 @@ mod tests {
         assert_eq!(empty.skipped, []);
 
         let refused = scheduled(
-            plan(),
+            pbps_diff::order::propose(plan()),
             &schema,
             &ids,
             &Facts::default().with_module_dependents(&stranger),
@@ -1471,7 +1416,7 @@ mod tests {
         let sql_server = pbps_mssql::Mssql;
         let run = |facts: &Facts<'_>| {
             schedule(
-                plan(),
+                pbps_diff::order::propose(plan()),
                 &Declarations {
                     schema: &schema,
                     sources: Sources {
@@ -1520,7 +1465,7 @@ mod tests {
         super::role_order_oracle::legacy_order(&mut expected);
         assert_eq!(connected.changes, expected);
         assert_eq!(
-            serde_json::to_vec(&connected.changes).unwrap(),
+            serde_json::to_vec(&connected.changes.changes()).unwrap(),
             serde_json::to_vec(&expected).unwrap()
         );
         assert_eq!(
@@ -1555,7 +1500,7 @@ mod tests {
             members.push("member".into());
         }
         let unread = schedule(
-            supplied.clone(),
+            pbps_diff::order::propose(supplied.clone()),
             &Declarations {
                 schema: &schema,
                 sources: Sources {
@@ -1609,10 +1554,11 @@ mod tests {
                 }
                 let mut expected = input.clone();
                 super::role_order_oracle::legacy_order(&mut expected);
-                let actual = pbps_diff::order::role_drops(input).unwrap();
+                let actual =
+                    pbps_diff::order::role_drops(pbps_diff::order::propose(input)).unwrap();
                 assert_eq!(actual, expected);
                 assert_eq!(
-                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&actual.changes()).unwrap(),
                     serde_json::to_vec(&expected).unwrap()
                 );
                 assert_eq!(

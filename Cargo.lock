@@ -1471,6 +1471,7 @@ dependencies = [
  "pbps-diff",
  "pbps-load",
  "pbps-model",
+ "pbps-mssql",
  "rustix",
  "serde",
  "serde_json",

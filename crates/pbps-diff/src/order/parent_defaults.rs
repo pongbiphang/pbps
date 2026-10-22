@@ -11,13 +11,13 @@ use pbps_model::{Change, ColumnRef, IdsFile, PlannedChange, Schema, TableName, V
 use super::Source;
 use super::expand::{Added, Addition, Anchor, Expansion, Order, Rewrite, Step};
 
-pub struct ParentDefaults<'a> {
+pub struct ParentDefaults<'a, D: Dialect + ?Sized> {
     /// Input to this expansion, so additions are recognized without making
     /// unsealed diagnostic provenance an input to ordering.
     pub initial: &'a [PlannedChange],
     pub declared: &'a Schema,
     pub ids: &'a [&'a IdsFile],
-    pub dialect: &'a dyn Dialect,
+    pub dialect: &'a D,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ fn order(before: Step, after: Step, source: Source) -> Order {
     }
 }
 
-impl ParentDefaults<'_> {
+impl<D: Dialect + ?Sized> ParentDefaults<'_, D> {
     fn own(&self, column: &ColumnRef) -> Vec<(TableName, String)> {
         self.declared
             .tables
@@ -134,7 +134,7 @@ impl ParentDefaults<'_> {
     }
 }
 
-impl Expansion for ParentDefaults<'_> {
+impl<D: Dialect + ?Sized> Expansion for ParentDefaults<'_, D> {
     type Obligation = Restoration;
 
     fn rule(&self) -> &'static str {

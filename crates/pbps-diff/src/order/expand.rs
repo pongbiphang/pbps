@@ -138,21 +138,23 @@ pub trait Expansion {
 /// A plan an expansion has finished.
 #[derive(Debug, Clone)]
 pub struct Expanded {
-    pub changes: ChangeSet,
+    pub changes: super::PlanningPlan,
     pub rewrites: usize,
 }
 
 /// Runs `expansion` over `plan` until nothing is unmet, with `factor`
 /// rewrites per operation the plan asks for: [`FACTOR`] outside the tests.
 pub fn expand<E: Expansion>(
-    plan: ChangeSet,
+    plan: super::PlanningPlan,
     expansion: &E,
     factor: usize,
 ) -> Result<Expanded, String> {
+    let input = plan.clone();
     let logical: Vec<String> = plan.changes.iter().map(|p| p.change.subject()).collect();
     let mut state = State {
         origins: (0..plan.changes.len()).map(Origin::Whole).collect(),
-        changes: plan.changes,
+        changes: plan.payload.changes,
+        proof: input.proof.clone(),
     };
     // The operations the plan asks for: its own, and one per obligation it
     // states before any rewrite. Weave asks for a teardown or a restoration
@@ -208,9 +210,32 @@ pub fn expand<E: Expansion>(
         ));
     }
     Ok(Expanded {
-        changes: ChangeSet {
-            changes: state.changes,
-        },
+        changes: super::PlanningPlan::new(
+            ChangeSet {
+                changes: state.changes,
+            },
+            state
+                .origins
+                .into_iter()
+                .map(|origin| match origin {
+                    Origin::Whole(at) => input.origins[at].clone(),
+                    Origin::SplitPart(at) => match input.origins[at].source() {
+                        LogicalSource::Change(at) => Origin::SplitPart(at),
+                        LogicalSource::Rebinding(_) => input.origins[at].clone(),
+                    },
+                    Origin::Teardown(LogicalSource::Change(at)) => {
+                        Origin::Teardown(input.origins[at].source())
+                    }
+                    Origin::Restoration(LogicalSource::Change(at)) => {
+                        Origin::Restoration(input.origins[at].source())
+                    }
+                    origin @ (Origin::Teardown(LogicalSource::Rebinding(_))
+                    | Origin::Restoration(LogicalSource::Rebinding(_))) => origin,
+                })
+                .collect(),
+            input.logical,
+            state.proof,
+        ),
         rewrites,
     })
 }
@@ -227,6 +252,7 @@ struct State {
     changes: Vec<PlannedChange>,
     /// Beside each step, what it is to the plan's logical changes.
     origins: Vec<Origin>,
+    proof: pbps_model::resolver::OrderingProof,
 }
 
 impl State {
@@ -389,7 +415,7 @@ impl State {
             changes: std::mem::take(&mut self.changes),
         };
         let settled = schedule
-            .settle(changes.clone())
+            .settle_raw(changes.clone())
             .map_err(|r| r.describe(&changes))?;
         let mut origins: Vec<Option<Origin>> = std::mem::take(&mut self.origins)
             .into_iter()
@@ -401,6 +427,7 @@ impl State {
             .map(|&i| origins[i].take().expect("a sequence is a permutation"))
             .collect();
         self.changes = settled.changes.changes;
+        self.proof = settled.proof;
         Ok(())
     }
 

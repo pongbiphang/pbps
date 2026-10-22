@@ -110,7 +110,7 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
 fn scheduled(placeholder: bool, generated: bool, pg: &dyn Dialect) -> (ChangeSet, IdsFile) {
     let (cs, schema, ids, before, before_ids) = fixture(placeholder, generated);
     let scheduled = super::super::schedule::schedule(
-        cs,
+        pbps_diff::order::propose(cs),
         &super::super::schedule::Declarations {
             schema: &schema,
             sources: Sources {
@@ -126,7 +126,7 @@ fn scheduled(placeholder: bool, generated: bool, pg: &dyn Dialect) -> (ChangeSet
         pg,
     )
     .unwrap();
-    (scheduled.changes, ids)
+    (scheduled.changes.changes().clone(), ids)
 }
 
 #[test]
@@ -163,8 +163,14 @@ fn attachments_follow_complete_columns_and_unsplit_attachments_keep_their_order(
     let (input, schema, ids, _, _) = fixture(false, false);
     let mut output = input.clone();
     let pg = pbps_pg::Postgres::new();
-    pbps_diff::order::generated::expand(&mut output, &ids, &ModuleDeps::new(), &pg).unwrap();
-    pbps_diff::order::generated::settle(&mut output, &schema, &ModuleDeps::new(), &pg).unwrap();
+    crate::test_planning(&mut output, |plan| {
+        pbps_diff::order::generated::expand(plan, &ids, &ModuleDeps::new(), &pg)
+    })
+    .unwrap();
+    crate::test_planning(&mut output, |plan| {
+        pbps_diff::order::generated::settle(plan, &schema, &ModuleDeps::new(), &pg)
+    })
+    .unwrap();
     assert_eq!(
         input, output,
         "an attachment into an unsplit table is unchanged"

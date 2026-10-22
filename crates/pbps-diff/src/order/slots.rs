@@ -62,7 +62,7 @@ pub fn analyse(
     operations: &[Operation],
     owners: &dyn Owners,
     before: Snapshot<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Slots {
     let mut out = Slots::default();
     for op in operations {
@@ -147,7 +147,7 @@ pub fn analyse(
     out
 }
 
-fn table_slot(dialect: &dyn Dialect, table: &TableName) -> Option<SlotKey> {
+fn table_slot(dialect: &(impl Dialect + ?Sized), table: &TableName) -> Option<SlotKey> {
     // A table's name is one slot in its schema.
     slots_of(
         dialect,
@@ -202,7 +202,7 @@ pub fn carried(
     facts: &CatalogFacts,
     owners: &dyn Owners,
     before: Snapshot<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Carried> {
     let declared: BTreeSet<SlotKey> = baseline_names(dialect, owners, before)
         .into_iter()
@@ -500,7 +500,7 @@ pub fn handovers(
     changes: &[pbps_model::PlannedChange],
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     facts: &CatalogFacts,
 ) -> Result<super::Schedule, String> {
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners};
@@ -597,7 +597,7 @@ impl Occupier {
 pub fn verify(
     operations: &[Operation],
     slots: &Slots,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     facts: Option<&CatalogFacts>,
     owners: &dyn Owners,
     before: Snapshot<'_>,

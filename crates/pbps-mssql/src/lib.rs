@@ -95,6 +95,28 @@ fn schema_bound_callees(
         .collect()
 }
 
+impl pbps_dialect::PlanDialect for Mssql {
+    type Plan = dyn pbps_diff::order::PlanView<Self>;
+
+    fn emit_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit(&planned.change, planned.strategy)
+    }
+
+    fn emit_staged_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit_staged(&planned.change, planned.strategy)
+    }
+}
+
 impl Dialect for Mssql {
     fn name(&self) -> &'static str {
         types::DIALECT
@@ -885,5 +907,66 @@ mod tests {
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod certified_emission_tests {
+    use super::*;
+    use pbps_diff::order::{PlanView, admit, seal, singleton};
+    use pbps_model::{
+        Change, ChangeSet, IdsFile, PlanBaseline, PlanMode, PlanOrigin, PlannedChange, SavedPlan,
+    };
+
+    #[test]
+    fn certified_lowering_preserves_statement_bytes_and_mode() {
+        let dialect = Mssql;
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.old_name".parse().unwrap(),
+                to: "dbo.new_name".parse().unwrap(),
+                defaults: Vec::new(),
+            })],
+        };
+        let expected = dialect
+            .emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .unwrap();
+        for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let ordered = singleton(changes.changes[0].clone(), mode, &dialect);
+            let mut wire = SavedPlan::new(
+                PlanOrigin::Database,
+                dialect.name(),
+                "2026-10-22T00:00:00Z",
+                PlanBaseline {
+                    description: "target".into(),
+                    checksum: "baseline".into(),
+                    database_collation: None,
+                    time_zone: None,
+                },
+                ordered.changes().clone(),
+                IdsFile::default(),
+            );
+            wire.mode = mode;
+            let bytes = serde_json::to_string(&wire).unwrap();
+            let checksum = wire.checksum();
+            let admitted = admit(
+                serde_json::from_str(&bytes).unwrap(),
+                &dialect,
+                std::path::Path::new("plan.json"),
+                &checksum,
+            )
+            .unwrap();
+            let sealed = seal(ordered.clone(), wire).unwrap();
+            assert_eq!(serde_json::to_string(admitted.wire()).unwrap(), bytes);
+            assert_eq!(serde_json::to_string(sealed.wire()).unwrap(), bytes);
+            assert_eq!(admitted.checksum(), checksum);
+            assert_eq!(sealed.checksum(), checksum);
+            for input in [&ordered as &dyn PlanView<Mssql>, &sealed, &admitted] {
+                assert_eq!(input.mode(), mode);
+                let emitted = pbps_dialect::lower::lower_plan(input, &dialect).unwrap();
+                assert_eq!(emitted.statements(), expected);
+            }
+        }
     }
 }

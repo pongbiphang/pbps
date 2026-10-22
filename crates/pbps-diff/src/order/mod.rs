@@ -22,23 +22,54 @@
 //! computed-column releases (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).
 
+#![cfg_attr(
+    not(feature = "test-fixtures"),
+    doc = r#"
+The emitter fixture constructor is absent from an ordinary external build:
+
+```compile_fail
+let _ = pbps_diff::order::singleton(
+    pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
+        uid: "r_aaaaaa".parse().unwrap(),
+        name: "reader".into(),
+    }),
+    pbps_model::PlanMode::Transactional,
+    &pbps_dialect::MinimalDialect,
+);
+```
+"#
+)]
+
 pub mod commute;
+mod companions;
 pub mod edges;
 pub mod expand;
 pub mod generated;
 pub mod new_tables;
+pub(crate) mod normalization;
 pub mod parent_defaults;
+mod plan;
+pub(crate) mod rename_order;
+pub(crate) mod resolver_finish;
+pub(crate) mod resolver_prepare;
+pub mod resolver_remap;
 mod rewrites;
 pub(crate) mod roles;
 pub mod row_security;
+mod saved;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;
 pub mod verify;
+pub mod writebacks;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use plan::singleton;
+pub use plan::{OrderedPlan, PlanView, PlanningPlan, propose, take};
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;
+pub use saved::{AdmissionError, AdmittedPlan, SealedPlan, admit, seal, validate_saved_plan};
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{Report, Shadowed, analyse};
 pub use verify::{Violation, verify};
@@ -48,8 +79,17 @@ mod benchmark;
 #[cfg(test)]
 mod expand_tests;
 #[cfg(test)]
+mod saved_tests;
+#[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]
 mod slot_tests;
 #[cfg(test)]
 mod tests;
+
+pub use companions::{
+    PublicDecisions, settle_public_execution, split_moving_defaults, take_public_execution,
+};
+pub use normalization::{drop_parameter_changes_of_rebuilt_indexes, normalize};
+
+pub use resolver_finish::reordered_operations;

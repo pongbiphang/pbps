@@ -58,7 +58,7 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
         changes: [1, 0, 2, 3, 4].map(|i| changes.changes[i].clone()).to_vec(),
     };
     let shared = order::before_rewrites(
-        changes,
+        pbps_diff::order::propose(changes),
         Side {
             schema: &before,
             ids: &ids,
@@ -79,7 +79,7 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
     connected.edge(2, 4, Source::Catalog, OrderReason::Structural);
     connected.keep(0, 1, "the caller releases its old binding first".into());
     let ready = connected.settle(shared).unwrap().changes;
-    for PlannedChange { change, .. } in ready.changes {
+    for PlannedChange { change, .. } in ready.changes.clone() {
         execute(&mut db.conn, &change).await;
     }
     db.conn.execute("IF app.f(2) <> 3 OR app.g(2) <> 3 OR (SELECT c FROM app.t) <> 4 THROW 51000, 'wrong combined result', 1; IF NOT EXISTS (SELECT 1 FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t') AND name = N'c' AND is_persisted = 1) THROW 51000, 'computed column was not rebuilt', 1;").await.unwrap();

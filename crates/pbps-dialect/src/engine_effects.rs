@@ -24,7 +24,7 @@ fn column_of(change: &Change, renames_block: bool) -> Option<ColumnRef> {
 /// until the plan drops them. A lexical over-approximation, by the dialect's
 /// own lexer (DEC-174, DEC-1174.1).
 pub fn text_dependents(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     op: &Operation,
     owners: &dyn Owners,
     before: Snapshot<'_>,
@@ -106,7 +106,7 @@ pub fn text_dependents(
 /// names the column is skipped, as in [`text_dependents`].
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn retype_blockers(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     op: &Operation,
     owners: &dyn Owners,
     before: Snapshot<'_>,

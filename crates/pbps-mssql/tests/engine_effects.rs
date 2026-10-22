@@ -66,7 +66,7 @@ fn violations_ending_in(after: &Schema, logical: Vec<Change>, order: &[usize]) -
     };
     let shadowed = analyse(&ops, &owners, snapshot, ending, &Mssql);
     assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
-    let ordered = ops.reordered(order);
+    let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
@@ -310,7 +310,8 @@ impl Diffed {
             &pbps_model::Hints::default(),
         )
         .expect("diff")
-        .changes;
+        .changes
+        .clone();
         let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
         let names = PlanNames::of(&changes, &ids).unwrap();
         let owners = PlanOwners::new(names, &base_ids, &ids);
@@ -350,7 +351,7 @@ impl Diffed {
     }
 
     fn verify(&self, order: &[usize]) -> Vec<Violation> {
-        let ordered = self.ops.reordered(order);
+        let ordered = pbps_diff::order::reordered_operations(&self.ops, order);
         let effects: Vec<_> = order.iter().map(|&i| self.effects[i].clone()).collect();
         pbps_diff::order::verify(
             ordered.as_slice(),
@@ -585,7 +586,7 @@ fn violations_from(
     );
     let baseline = Baseline::of(b, &owners);
     let shadowed = analyse(&ops, &owners, b, a, &Mssql);
-    let ordered = ops.reordered(order);
+    let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
@@ -688,7 +689,7 @@ fn schema_bound_callers_require_their_callees_final_definition() {
                     assert!(diffed.verify(&reversed).iter().any(|v| matches!(v, Violation::Edge { edge, .. }
                         if edge.source == Source::Effect && edge.because == Because::Rewrites(ObjectKey::Module(callee.clone())))), "{definition}");
                     assert_eq!(commute::swapped(&graph, 2, f, g), None, "{definition}");
-                    let ordered = diffed.ops.reordered(&reversed);
+                    let ordered = pbps_diff::order::reordered_operations(&diffed.ops, &reversed);
                     let effects: Vec<_> = reversed
                         .iter()
                         .map(|&i| diffed.effects[i].clone())
@@ -707,7 +708,7 @@ fn schema_bound_callers_require_their_callees_final_definition() {
                             .collect(),
                     };
                     let settled = Schedule::of_graph(&backwards_graph, ordered.as_slice())
-                        .settle(backwards)
+                        .settle(pbps_diff::order::propose(backwards))
                         .unwrap();
                     assert_eq!(settled.changes.changes, diffed.changes, "{definition}");
                 } else {

@@ -277,6 +277,7 @@ pub async fn resolve(
         )
     })?
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect();

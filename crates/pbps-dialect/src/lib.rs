@@ -2161,7 +2161,7 @@ impl RetypeDependents {
     /// rebuilds these around the step (`recreate_retyped_dependents`), and the
     /// step's engine effects require them gone (#1998), from this one answer.
     pub fn of_retype(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         (from, to): (&ColumnType, &ColumnType),
         recollates: bool,
         nullability: Option<bool>,
@@ -2218,8 +2218,67 @@ pub struct RangeSeries {
     pub partitions: Vec<SeriesPartition>,
 }
 
+/// Pure evidence validation failures shared with saved-artifact admission.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanAnalysisError {
+    #[error(transparent)]
+    Evidence(#[from] pbps_model::resolver::EvidenceError),
+    #[error("this build cannot enforce resolver evidence for {}", pbps_model::escape::Escaped(.0))]
+    Unsupported(String),
+}
+
+/// A read-only logical payload, without emission authority.
+pub trait PlanPayload {
+    fn changes(&self) -> &pbps_model::ChangeSet;
+    fn mode(&self) -> pbps_model::PlanMode;
+}
+
+/// Certified emission, separate from dynamically dispatched semantic queries.
+/// Each real engine fixes `Plan` to diff's sealed view branded by that engine,
+/// so erasing a semantic dialect cannot erase execution authority (DEC-1959.5).
+pub trait PlanDialect: Dialect {
+    type Plan: ?Sized;
+
+    /// Emits one position of the engine's certified input. The associated type
+    /// avoids a dialect -> diff dependency; concrete engines cannot substitute
+    /// an unsealed user-defined view (DEC-1959.5).
+    fn emit_ordered(
+        &self,
+        _plan: &Self::Plan,
+        _position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        Err(DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "ordered SQL generation".to_owned(),
+        })
+    }
+
+    fn emit_staged_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        self.emit_ordered(plan, position)
+    }
+}
+
 /// Dialect knowledge that needs no database connection.
 pub trait Dialect {
+    /// Pure engine-specific evidence validation at saved-artifact admission.
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if matches!(
+            &plan.analysis,
+            pbps_model::resolver::PlanAnalysis::Resolved(_)
+        ) {
+            return Err(PlanAnalysisError::Unsupported(plan.dialect.clone()));
+        }
+        Ok(())
+    }
+
     /// Expands only declarations into the permissions compared and planned.
     /// Reads and recorded snapshots must retain the access actually observed.
     fn implied_grants(&self, _schema: &mut Schema) {}
@@ -3205,7 +3264,7 @@ pub trait Dialect {
 /// signature — and on an engine that keeps them in one namespace per schema
 /// that is a pair of objects it cannot have. Removing the reason for a
 /// guarantee is not the same as replacing it.
-pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_module_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     let mut problems = Vec::new();
     // Only the kinds the engine keeps beside tables: the rest have namespaces
     // of their own, where `ModuleId` is already the whole identity.
@@ -3494,7 +3553,7 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
 /// [`Dialect::generated_constraint_names`] gives, `CREATE TABLE` takes the
 /// first and only a later rename the fallback, so reserving both refuses a
 /// valid plan. A default already parked at either is the connected walk's.
-pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_history_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     // Every name the declaration puts in that namespace, with what holds it.
     let mut held: BTreeMap<TableName, String> = BTreeMap::new();
     for name in schema.tables.keys() {
@@ -3567,7 +3626,7 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
 /// Offline, a name is the history only as written: the collation that says
 /// which spellings are one is the server's, not the file's (DEC-1243.1). The
 /// connected plan asks it, through [`history_references_under`] (#1625).
-pub fn check_history_references(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_history_references(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     history_references_under(schema, dialect, |a, b| a == b)
 }
 
@@ -3577,7 +3636,7 @@ pub fn check_history_references(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
 /// `dbo.T_History`, and the engine refuses it as it would the exact spelling.
 pub fn history_references_under(
     schema: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     same: impl Fn(&TableName, &TableName) -> bool,
 ) -> Vec<String> {
     let histories: Vec<(&TableName, &TableName)> = schema
@@ -3628,7 +3687,10 @@ pub fn history_references_under(
 /// either kind on a table with a period alone (measured on 17.0). The
 /// trigger's timing is the first of `FOR`, `AFTER` or `INSTEAD` in its code,
 /// which is where a definition starts after any `WITH` options.
-pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_system_time_triggers(
+    schema: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+) -> Vec<String> {
     let mut problems = Vec::new();
     for (id, module) in &schema.modules {
         let ModuleId::Trigger { on, name } = id else {
@@ -3665,7 +3727,7 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
 /// does; a statement trigger is not cloned, and its name is free. A
 /// constraint trigger's clone has a `pg_constraint` row under that name too,
 /// where an own check or foreign key under it fails the same way.
-pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_partition_triggers(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     let mut problems = Vec::new();
     for (name, table) in &schema.tables {
         let Some(of) = &table.partition_of else {
@@ -3722,7 +3784,7 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
 /// baseline's unnamed sequence may be one an earlier table generated. The
 /// differ compares a name only where both sides give one, so a base that is
 /// a read is named in full first, and one that is a declaration is not.
-pub fn name_read_sequences(schema: &mut Schema, dialect: &dyn Dialect) {
+pub fn name_read_sequences(schema: &mut Schema, dialect: &(impl Dialect + ?Sized)) {
     for (name, table) in &mut schema.tables {
         for (column, spec) in &mut table.columns {
             if let pbps_model::ValueSource::Sequence(sequence) = &mut spec.value_source
@@ -3768,7 +3830,7 @@ pub fn name_read_sequences(schema: &mut Schema, dialect: &dyn Dialect) {
 /// *different* tables are each still reported here — the last because no
 /// table-local rule can see across tables — and a check or foreign key sharing
 /// a name is still the table-local rule's alone.
-pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_index_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     check_index_names_with_sources(schema, dialect, &Default::default())
 }
 
@@ -3776,7 +3838,7 @@ pub fn check_index_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> 
 /// supplied sources through both initial name claims and fallback simulation.
 pub fn check_index_names_with_sources(
     schema: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     conflicts: &pbps_model::diagnostic::SourceConflicts,
 ) -> Vec<String> {
     if !dialect.indexes_share_namespace_with_tables() {
@@ -4021,7 +4083,7 @@ fn fallback_reach(
     claimants: &[Claimant<'_>],
     without: Option<usize>,
     constraint_names: &BTreeSet<ObjectName>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Vec<ObjectName>> {
     let live: Vec<usize> = (0..claimants.len())
         .filter(|k| Some(*k) != without)
@@ -4151,7 +4213,7 @@ fn augment(
 /// collation folds is still refused by the engine, loudly and before anything
 /// else of the statement runs; this rule exists so that the exact pair, which
 /// no collation separates, is refused before a plan is written.
-pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+pub fn check_constraint_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -> Vec<String> {
     if !dialect.constraints_share_namespace_with_tables() {
         return Vec::new();
     }
@@ -4243,7 +4305,7 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
 /// `zone` is the target's session time zone, pinned with the rest (DEC-1916.1).
 pub fn render_script(
     statements: &[Statement],
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     zone: &SessionZone,
 ) -> String {
     let Some(pins) = dialect

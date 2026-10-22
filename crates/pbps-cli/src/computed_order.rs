@@ -38,6 +38,7 @@
 //! two-part names it spells are also compared with the functions the plan
 //! changes under the collation (`refuse_added_calls`, DEC-1459.1).
 
+use pbps_diff::order::PlanningPlan;
 use std::collections::BTreeSet;
 
 use pbps_model::{
@@ -163,7 +164,7 @@ fn input_change(
 /// edges say the engine will not do (DEC-1431.1). Returns how many changes
 /// moved.
 pub(crate) fn order_by_edges(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,
@@ -589,7 +590,7 @@ pub(crate) fn drop_precedence(
 /// fixpoint once moved one drop at a time and read them again after each
 /// move, bounded by the square of the plan's length.
 fn release(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,
@@ -636,7 +637,7 @@ mod tests {
         alike: &Alike,
     ) -> Result<usize, String> {
         let ids = crate::plan_fixture::ids(cs);
-        super::order_by_edges(cs, &ids, edges, alike)
+        crate::test_planning(cs, |plan| super::order_by_edges(plan, &ids, edges, alike))
     }
     fn drop_precedence(
         cs: &ChangeSet,
@@ -1128,6 +1129,14 @@ mod tests {
 #[cfg(test)]
 mod plan_name_tests {
     use super::*;
+    fn order_by_edges(
+        cs: &mut ChangeSet,
+        ids: &IdsFile,
+        edges: &[ExpressionEdge],
+        alike: &Alike,
+    ) -> Result<usize, String> {
+        crate::test_planning(cs, |plan| super::order_by_edges(plan, ids, edges, alike))
+    }
 
     #[test]
     fn a_computed_reader_keeps_its_input_through_table_and_column_rename_chains() {

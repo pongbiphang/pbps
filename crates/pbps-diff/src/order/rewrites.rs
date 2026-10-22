@@ -2,18 +2,18 @@
 
 use super::{Baseline, Because, Checks, Schedule, analyse, graph};
 use pbps_dialect::Dialect;
+use pbps_model::ModuleDeps;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Requirement, Snapshot};
-use pbps_model::{ChangeSet, ModuleDeps};
 
 /// Settle BeforeRewrite and the dependencies of its participants. Unrelated
 /// steps retain their relative order, and later stages keep their own edges.
 pub fn before_rewrites(
-    changes: ChangeSet,
+    changes: super::PlanningPlan,
     before: crate::Side<'_>,
     after: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
-) -> Result<ChangeSet, String> {
+) -> Result<super::PlanningPlan, String> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
         .map_err(|error| error.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);

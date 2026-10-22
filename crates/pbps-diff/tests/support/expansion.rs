@@ -3,10 +3,16 @@
 //! new, empty tail; existing rules must never send it any additional parts.
 
 use super::order::Schedule;
-use super::order::expand::{Added, Anchor, Expanded, Expansion, Order, Rewrite, Step};
+use super::order::expand::{Added, Anchor, Expansion, Order, Rewrite, Step};
 use pbps_model::operation::{Origin, Source as LogicalSource};
 use pbps_model::{AddedRole, ChangeSet, PlannedChange, Provenance};
 use std::fmt;
+
+#[derive(Debug)]
+pub struct Expanded {
+    pub changes: ChangeSet,
+    pub rewrites: usize,
+}
 
 pub fn expand<E: Expansion>(
     plan: ChangeSet,
@@ -260,7 +266,7 @@ impl State {
             changes: std::mem::take(&mut self.changes),
         };
         let settled = schedule
-            .settle(changes.clone())
+            .settle(super::order::propose(changes.clone()))
             .map_err(|r| r.describe(&changes))?;
         let mut origins: Vec<Option<Origin>> = std::mem::take(&mut self.origins)
             .into_iter()
@@ -271,7 +277,7 @@ impl State {
             .iter()
             .map(|&i| origins[i].take().expect("a sequence is a permutation"))
             .collect();
-        self.changes = settled.changes.changes;
+        self.changes = settled.changes.changes.clone();
         Ok(())
     }
 

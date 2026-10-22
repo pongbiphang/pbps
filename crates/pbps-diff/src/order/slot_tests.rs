@@ -144,7 +144,7 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
             "an unsatisfied handover is enforced after scheduling"
         );
     }
-    let ordered = ops.reordered(&[1, 0]);
+    let ordered = crate::order::reordered_operations(&ops, &[1, 0]);
     assert!(
         !judge_slots(
             ordered.as_slice(),
@@ -194,7 +194,7 @@ impl Plan {
     fn run(
         &self,
         order: &[usize],
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         facts: Option<&CatalogFacts>,
     ) -> (Vec<SlotViolation>, Vec<Skipped>, usize) {
         let logical = Operations::of_plan(&self.logical, ModuleEdits::InPlace);
@@ -208,7 +208,7 @@ impl Plan {
             schema: &self.after,
             ids: &self.after_ids,
         };
-        let ops = logical.reordered(order);
+        let ops = crate::order::reordered_operations(&logical, order);
         let slots = analyse(ops.as_slice(), &owners, before, dialect);
         let (violations, skipped) = verify(ops.as_slice(), &slots, dialect, facts, &owners, before);
         // The effects' replay on the same order: what the slots add to it.
@@ -230,7 +230,7 @@ impl Plan {
 impl Plan {
     /// The handover edges over the plan in its own order, the catalog's
     /// occupants included as holders (#1957).
-    fn handovers(&self, dialect: &dyn Dialect, facts: &CatalogFacts) -> Vec<SlotEdge> {
+    fn handovers(&self, dialect: &(impl Dialect + ?Sized), facts: &CatalogFacts) -> Vec<SlotEdge> {
         let logical = Operations::of_plan(&self.logical, ModuleEdits::InPlace);
         let names = PlanNames::of(&self.logical, &self.after_ids).unwrap();
         let owners = PlanOwners::new(names, &self.before_ids, &self.after_ids);
@@ -335,7 +335,7 @@ fn a_claim_on_an_intermediate_name_held_at_that_statement_is_refused() {
         schema: &plan.before,
         ids: &plan.before_ids,
     };
-    let ops = logical.reordered(&[1, 0]);
+    let ops = crate::order::reordered_operations(&logical, &[1, 0]);
     let mut slots = analyse(ops.as_slice(), &owners, before, &exact);
     for fx in &mut slots.effects {
         fx.intermediate.clear();

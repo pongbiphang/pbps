@@ -214,6 +214,8 @@ pub fn diff(
         hints,
     )
     .expect("diff")
+    .changes()
+    .clone()
 }
 
 /// [`diff`], with the zero-statement changes `plan` carries beside it: the

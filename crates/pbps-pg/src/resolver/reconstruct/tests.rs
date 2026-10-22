@@ -414,6 +414,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
         )
         .unwrap()
         .changes
+        .clone()
         .into_iter()
         .map(|planned| planned.change)
         .collect::<Vec<_>>()
@@ -540,6 +541,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     )
     .unwrap()
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect();
@@ -706,6 +708,7 @@ fn split_generated_tables_expose_names_before_either_function() {
     )
     .unwrap()
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect();
@@ -827,6 +830,7 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
     )
     .unwrap()
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect();
@@ -960,6 +964,7 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
     )
     .unwrap()
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect();

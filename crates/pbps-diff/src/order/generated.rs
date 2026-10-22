@@ -164,7 +164,7 @@ fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
 fn module_dependencies(
     modules: &[ModuleStep<'_>],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<(usize, usize)> {
     let mut edges = Vec::new();
     for (i, id, module) in modules {
@@ -193,7 +193,7 @@ pub fn parts(
     ids: &IdsFile,
     changes: &[PlannedChange],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
@@ -267,7 +267,11 @@ pub fn parts(
 /// Derive creation-part risks from typed ownership, never diagnostic provenance.
 /// Generated-column installations identify this family after serialization;
 /// an earlier CREATE of that identity proves its context (DEC-1503.3).
-pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeSet<RiskClass>> {
+pub fn risks(
+    cs: &ChangeSet,
+    ids: &IdsFile,
+    dialect: &(impl Dialect + ?Sized),
+) -> Vec<BTreeSet<RiskClass>> {
     use pbps_model::plan_names::{At, Holder, PlanNames};
 
     let names = cs
@@ -392,11 +396,14 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
         .collect()
 }
 
-pub fn expand(
+/// Transitional scratch draft adapter, removed when PR5b migrates the
+/// source-mapped blueprint. It grants no plan/emission certificate.
+#[doc(hidden)]
+pub fn legacy_expand(
     cs: &mut ChangeSet,
     ids: &IdsFile,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<usize, String> {
     let mut expanded = Vec::new();
     let mut added = 0;
@@ -410,6 +417,41 @@ pub fn expand(
         }
     }
     cs.changes = expanded;
+    Ok(added)
+}
+
+/// The same generated-part expansion, retaining each part's logical source.
+pub fn expand(
+    plan: &mut super::PlanningPlan,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<usize, String> {
+    let mut expanded = Vec::new();
+    let mut origins = Vec::new();
+    let mut added = 0;
+    for (p, origin) in plan.changes.iter().zip(&plan.origins) {
+        match parts(p, ids, &plan.changes, deps, dialect)? {
+            Some(parts) => {
+                added += parts.len() - 1;
+                let part_origin = match origin.source() {
+                    pbps_model::operation::Source::Change(at) => {
+                        pbps_model::operation::Origin::SplitPart(at)
+                    }
+                    pbps_model::operation::Source::Rebinding(_) => origin.clone(),
+                };
+                origins.extend(std::iter::repeat_n(part_origin, parts.len()));
+                expanded.extend(parts);
+            }
+            None => {
+                expanded.push(p.clone());
+                origins.push(origin.clone());
+            }
+        }
+    }
+    plan.payload.changes = expanded;
+    plan.origins = origins;
+    plan.invalidate();
     Ok(added)
 }
 
@@ -533,7 +575,7 @@ pub fn constraints(
     cs: &ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
@@ -706,11 +748,13 @@ pub fn constraints(
     out.constraints().iter().cloned().collect()
 }
 
-pub fn settle(
+/// Transitional counterpart of legacy_expand for the existing scratch route.
+#[doc(hidden)]
+pub fn legacy_settle(
     cs: &mut ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), String> {
     let edges = constraints(cs, declared, deps, dialect);
     if edges.is_empty() {
@@ -720,8 +764,32 @@ pub fn settle(
     for c in edges {
         schedule.edge(c.before, c.after, c.source, c.reason);
     }
-    let settled = schedule.settle(cs.clone()).map_err(|r| r.describe(cs))?;
+    let settled = schedule
+        .settle_raw(cs.clone())
+        .map_err(|r| r.describe(cs))?;
     *cs = settled.changes;
+    Ok(())
+}
+
+/// The generated schedule consumes and returns only an owned intermediate.
+pub fn settle(
+    plan: &mut super::PlanningPlan,
+    declared: &Schema,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), String> {
+    let edges = constraints(plan, declared, deps, dialect);
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let mut schedule = Schedule::new(plan.changes.len());
+    for c in edges {
+        schedule.edge(c.before, c.after, c.source, c.reason);
+    }
+    let settled = schedule
+        .settle(plan.clone())
+        .map_err(|r| r.describe(plan))?;
+    *plan = settled.changes;
     Ok(())
 }
 

@@ -112,7 +112,7 @@ pub(super) fn weave(
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let (before, before_ids, after) = inputs(cs, found, declared, ids, &Partitions::default());
-    super::weave(
+    super::test_adapters::weave(
         cs,
         found,
         declared,

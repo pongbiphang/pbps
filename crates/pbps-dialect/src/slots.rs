@@ -110,7 +110,7 @@ pub struct Occupant {
 /// A constraint trigger's companion and clones belong to the trigger, not
 /// to independently declared constraints (DEC-2100.1).
 fn constraint_names(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     id: &ModuleId,
     module: &Module,
     before: Snapshot<'_>,
@@ -189,7 +189,7 @@ fn preceding<'a>(operations: &'a [Operation], op: &Operation) -> &'a [Operation]
 /// Creating or attaching a partition clones the parent's trigger as it
 /// stands then, not as it stood at baseline or will stand in the declaration.
 fn arriving_clones(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     op: &Operation,
     owners: &dyn Owners,
     before: Snapshot<'_>,
@@ -270,7 +270,7 @@ fn arriving_clones(
 /// `operations` is the order containing `op`, so arrivals read the kind in
 /// force at their position rather than guessing it from the final schema.
 pub fn names(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     op: &Operation,
     owners: &dyn Owners,
     before: Snapshot<'_>,
@@ -335,7 +335,7 @@ pub fn names(
 /// The same companion names seed the replay and identify managed catalog
 /// occupants, so a kept constraint trigger cannot be mistaken for absence.
 pub fn baseline_names(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     owners: &dyn Owners,
     before: Snapshot<'_>,
 ) -> Vec<Named> {
@@ -363,7 +363,7 @@ pub fn baseline_names(
 /// The slots `address` takes, by the dialect's namespace answers: one, or
 /// two for a named key, which is a constraint backed by an index and holds its
 /// name in both namespaces.
-pub fn slots(dialect: &dyn Dialect, address: &Address) -> Vec<SlotKey> {
+pub fn slots(dialect: &(impl Dialect + ?Sized), address: &Address) -> Vec<SlotKey> {
     let schema = || Namespace::Relations(address.schema.clone());
     // A per-table name whose table no identity records has no table to be
     // scoped by; its schema is the narrowest scope there is.
@@ -419,7 +419,12 @@ pub fn slots(dialect: &dyn Dialect, address: &Address) -> Vec<SlotKey> {
 
 /// Whether `a` and `b` are one name: equal slots are; otherwise the engine's
 /// rule, or the catalog's answer where the rule is a collation.
-pub fn same(dialect: &dyn Dialect, facts: Option<&CatalogFacts>, a: &SlotKey, b: &SlotKey) -> Same {
+pub fn same(
+    dialect: &(impl Dialect + ?Sized),
+    facts: Option<&CatalogFacts>,
+    a: &SlotKey,
+    b: &SlotKey,
+) -> Same {
     if a == b {
         return Same::Yes;
     }

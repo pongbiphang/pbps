@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+pbps-diff.workspace = true
 pbps-model.workspace = true
 pbps-dialect.workspace = true
 pbps-db.workspace = true
@@ -23,7 +24,7 @@ thiserror.workspace = true
 tiberius.workspace = true
 
 [dev-dependencies]
-pbps-diff.workspace = true
+pbps-diff = { workspace = true, features = ["test-fixtures"] }
 # The commutation suite (#1965) declares its scenarios in YAML and loads them
 # the way `plan` loads a schema directory.
 pbps-load.workspace = true

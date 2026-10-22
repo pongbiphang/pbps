@@ -12,7 +12,7 @@
 use pbps_model::operation::{Operation, OperationId, Operations};
 use pbps_model::{Strategy, TableName};
 
-use crate::{Dialect, DialectError, Released, Statement};
+use crate::{Dialect, DialectError, PlanDialect, Released, Statement};
 
 /// Whether a statement can run inside the plan's transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +139,7 @@ fn intermediate<'s, A: PartialEq + 's>(renames: impl Iterator<Item = &'s [(A, A)
 pub fn lower(
     operation: &Operation,
     strategy: Strategy,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Lowered, DialectError> {
     Ok(Lowered {
         operation: operation.id(),
@@ -151,12 +151,95 @@ pub fn lower(
 /// change carries.
 pub fn lower_all(
     operations: &Operations,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Vec<Lowered>, DialectError> {
     operations
         .iter()
         .map(|op| lower(op, op.planned().strategy, dialect))
         .collect()
+}
+
+/// A complete sequence of statements tied to the engine's associated plan
+/// input. Construction stays here; a caller cannot replace or permute it.
+#[derive(Debug, Clone)]
+pub struct LoweredPlan<P: ?Sized> {
+    statements: Vec<Statement>,
+    input: std::marker::PhantomData<fn(&P)>,
+}
+
+impl<P: ?Sized> std::ops::Deref for LoweredPlan<P> {
+    type Target = [Statement];
+    fn deref(&self) -> &[Statement] {
+        &self.statements
+    }
+}
+impl<'a, P: ?Sized> IntoIterator for &'a LoweredPlan<P> {
+    type Item = &'a Statement;
+    type IntoIter = std::slice::Iter<'a, Statement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.statements.iter()
+    }
+}
+
+impl<P: ?Sized> LoweredPlan<P> {
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
+    }
+}
+
+/// One certified position, preserving the operation's statement group.
+pub fn lower_ordered<D: PlanDialect + ?Sized>(
+    plan: &D::Plan,
+    position: usize,
+    dialect: &D,
+) -> Result<Lowered, DialectError>
+where
+    D::Plan: crate::PlanPayload,
+{
+    let operations = Operations::of_plan(
+        &crate::PlanPayload::changes(plan).changes,
+        pbps_model::operation::ModuleEdits::InPlace,
+    );
+    Ok(Lowered {
+        operation: operations
+            .iter()
+            .nth(position)
+            .expect("a position of this plan")
+            .id(),
+        statements: dialect.emit_ordered(plan, position)?,
+    })
+}
+
+/// The whole certified sequence, in its execution mode. The generic input
+/// brand prevents a mock dialect's local fixture view reaching a real engine.
+/// A caller cannot replace the mode bound to that input:
+///
+/// ```compile_fail
+/// fn override_mode<D: pbps_dialect::PlanDialect + ?Sized>(plan: &D::Plan, dialect: &D)
+/// where D::Plan: pbps_dialect::PlanPayload {
+///     let _ = pbps_dialect::lower::lower_plan(
+///         plan, dialect, pbps_model::PlanMode::Staged,
+///     );
+/// }
+/// ```
+pub fn lower_plan<D: PlanDialect + ?Sized>(
+    plan: &D::Plan,
+    dialect: &D,
+) -> Result<LoweredPlan<D::Plan>, DialectError>
+where
+    D::Plan: crate::PlanPayload,
+{
+    let mut statements = Vec::new();
+    for position in 0..crate::PlanPayload::changes(plan).changes.len() {
+        statements.extend(match crate::PlanPayload::mode(plan) {
+            pbps_model::PlanMode::Transactional => dialect.emit_ordered(plan, position)?,
+            pbps_model::PlanMode::Staged => dialect.emit_staged_ordered(plan, position)?,
+        });
+    }
+    Ok(LoweredPlan {
+        statements,
+        input: std::marker::PhantomData,
+    })
 }
 
 #[cfg(test)]

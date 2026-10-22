@@ -435,7 +435,7 @@ pub(super) fn ordinary(
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
     extras: &[String],
-) -> Result<pbps_model::ChangeSet, Error> {
+) -> Result<pbps_diff::order::PlanningPlan, Error> {
     match driver {
         Driver::Postgres => postgres::ordinary(base, desired, hints, extras),
         Driver::Mssql => Err(unsupported()),

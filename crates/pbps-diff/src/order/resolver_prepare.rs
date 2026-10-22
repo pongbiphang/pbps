@@ -1,4 +1,4 @@
-use super::Error;
+use crate::resolver::Error;
 use pbps_dialect::Dialect;
 use pbps_model::operation::{Origin, Source};
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
@@ -6,7 +6,7 @@ use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
 
-pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
+pub(crate) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     let mut result = BTreeSet::new();
     for (table, definition) in &schema.tables {
         // Generated expressions use the same binding surface as defaults;
@@ -34,7 +34,7 @@ pub(super) fn surfaces(schema: &Schema) -> BTreeSet<Surface> {
     result
 }
 
-pub(super) fn coverage(
+pub(crate) fn coverage(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     observations: &[SurfaceResolution],
@@ -71,7 +71,7 @@ pub(super) fn coverage(
 /// keeps it), or another base surface, such as a dropped table's whose name
 /// the renamed table takes. A removal named there is covered by that surface,
 /// and two removals are never collapsed onto one spelling.
-pub(super) fn removal_spelling(
+pub(crate) fn removal_spelling(
     surface: &Surface,
     base_names: &IdsIndex<'_>,
     desired_ids: &IdsFile,
@@ -92,7 +92,7 @@ pub(super) fn removal_spelling(
 /// Replacing an input requires tearing down existing dependents even when
 /// recreating them will bind the same logical name. Propagate that requirement
 /// through managed surfaces before invoking the ordinary module restore pass.
-pub(super) fn rebuilds(
+pub(crate) fn rebuilds(
     ordinary: &ChangeSet,
     observations: &[SurfaceResolution],
     rebuilds_modules: bool,
@@ -105,7 +105,7 @@ pub(super) fn rebuilds(
     let parts: Vec<_> = ordinary
         .changes
         .iter()
-        .map(|p| super::part_effects(&p.change))
+        .map(|p| crate::resolver::part_effects(&p.change))
         .collect();
     let before_names = before_ids.index();
     let desired_for = |o: &SurfaceResolution| {
@@ -145,7 +145,7 @@ pub(super) fn rebuilds(
 ///
 /// `from` is indexed by the caller, once for all the surfaces it asks about
 /// (#1870).
-pub(super) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> Surface {
+pub(crate) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> Surface {
     let column = |c: &pbps_model::ColumnRef| {
         from.column_uid(c)
             .and_then(|uid| to.columns.get(uid))
@@ -169,7 +169,7 @@ pub(super) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> S
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(super) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
+pub(crate) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
     parts.iter().any(|fact| match (&fact.part, fact.effect, surface) {
         (DependencyPart::Module { id, .. }, Effect::Removed, Surface::Module(module)) => *id == module,
         (DependencyPart::Table(table), Effect::Removed | Effect::Renamed, Surface::Table(target)) => *table == target,
@@ -184,7 +184,7 @@ pub(super) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
 
 /// The resolver's input before it is ordered: the ordinary plan with its
 /// splits, then the rebuilds its evidence appends.
-pub(super) struct Prepared {
+pub(crate) struct Prepared {
     pub changes: ChangeSet,
     /// Where each of `changes` came from, by position: which change of the
     /// ordinary plan, or which rebinding, and its role in it (#1961). Never
@@ -193,7 +193,7 @@ pub(super) struct Prepared {
 }
 
 #[allow(clippy::wildcard_enum_match_arm, clippy::too_many_arguments)]
-pub(super) fn changes(
+pub(crate) fn changes(
     ordinary: &ChangeSet,
     base: &Schema,
     desired: &Schema,
@@ -201,7 +201,7 @@ pub(super) fn changes(
     before_ids: &IdsFile,
     rebuilds: &BTreeSet<Surface>,
     hints: &pbps_model::Hints,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Prepared, Error> {
     let names = ids.index();
     let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();
@@ -632,7 +632,7 @@ pub(super) fn changes(
     // pass's rebuilds get (#1516 review). Only ordinary changes go, so the
     // ordinary ones still come first.
     let mut all: Vec<(Origin, PlannedChange)> = changes.into_iter().chain(added).collect();
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
+    crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
     let (origins, changes) = all.into_iter().unzip();
     let mut changes = ChangeSet { changes };
     // Preparation may split a creation part again. Derive its risks from

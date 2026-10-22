@@ -2,7 +2,7 @@
 //! catalog holds (#1366).
 //!
 //! The differ orders renames and the drops that free their names from the
-//! declarations alone (`pbps_diff::rename_order`, DEC-981.3). It cannot see
+//! declarations alone (`pbps_diff::order::rename_order`, DEC-981.3). It cannot see
 //! what only the target says: a default adopted under a hand-chosen name,
 //! which of its generated names a default holds, an object the project does
 //! not record, or which spellings the target's collation reads as one name.
@@ -37,6 +37,7 @@
 //! a default at its fallback name can strand a later rename into that name.
 //! Only a whole order the walk clears is kept.
 
+use pbps_diff::order::PlanningPlan;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
@@ -53,7 +54,7 @@ const TRIALS: usize = 20_000;
 /// names the database reads as one (`alike`); refuses the plan where no
 /// order does. A plan the walk clears in its own order is left as it is.
 pub(crate) fn order_occupied_objects_under(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     occupants: &[pbps_mssql::catalog::NameOccupant],
     alike: &[(TableName, TableName)],
     label: &str,
@@ -136,7 +137,7 @@ pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
 /// that wait on one another, such as `a -> B` beside `b -> A` on a
 /// case-insensitive database, are refused (DEC-1366.3).
 pub(crate) fn order_column_renames(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     alike: &[(Column, Column)],
     label: &str,
 ) -> anyhow::Result<()> {
@@ -218,20 +219,7 @@ pub(crate) fn order_column_renames(
     if placed.is_empty() {
         return Ok(());
     }
-    let mut taken: Vec<Option<PlannedChange>> = std::mem::take(&mut cs.changes)
-        .into_iter()
-        .map(Some)
-        .collect();
-    let mut at: Vec<usize> = (0..taken.len()).collect();
-    for (slots, order) in placed {
-        for (slot, from) in slots.into_iter().zip(order) {
-            at[slot] = from;
-        }
-    }
-    cs.changes = at
-        .into_iter()
-        .map(|i| taken[i].take().expect("each change once"))
-        .collect();
+    *cs = pbps_diff::order::writebacks::scatter(cs.clone(), placed);
     Ok(())
 }
 
@@ -610,28 +598,43 @@ impl<'c> Search<'c> {
 
     /// `settled`, each drop on a renamed table addressed for where it now
     /// runs: by the source name before the rename, and the new one after.
-    fn addressed(&self, settled: pbps_diff::order::Settled) -> ChangeSet {
+    fn addressed(&self, settled: pbps_diff::order::Settled) -> PlanningPlan {
         let mut done = BTreeSet::new();
-        let changes = settled
-            .changes
-            .changes
-            .into_iter()
-            .zip(&settled.sequence)
-            .map(|(mut p, &i)| {
-                p.change = self.change(i, &done);
-                if self.moves.contains_key(&i) {
-                    done.insert(i);
-                }
-                p
-            })
-            .collect();
-        ChangeSet { changes }
+        let mut spellings = BTreeMap::new();
+        for &i in &settled.sequence {
+            if let Some(table) = self.change(i, &done).table() {
+                spellings.insert(i, table.clone());
+            }
+            if self.moves.contains_key(&i) {
+                done.insert(i);
+            }
+        }
+        pbps_diff::order::writebacks::addressed(settled, &spellings)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn order_occupied_objects_under(
+        cs: &mut ChangeSet,
+        occupants: &[pbps_mssql::catalog::NameOccupant],
+        alike: &[(TableName, TableName)],
+        label: &str,
+        precedence: &[(Change, Change)],
+    ) -> anyhow::Result<()> {
+        crate::test_planning(cs, |plan| {
+            super::order_occupied_objects_under(plan, occupants, alike, label, precedence)
+        })
+    }
+    fn order_column_renames(
+        cs: &mut ChangeSet,
+        alike: &[(Column, Column)],
+        label: &str,
+    ) -> anyhow::Result<()> {
+        crate::test_planning(cs, |plan| super::order_column_renames(plan, alike, label))
+    }
+
     use pbps_mssql::catalog::NameOccupant;
     use pbps_mssql::emit::{default_constraint_name, fallback_default_constraint_name};
 
@@ -1776,8 +1779,11 @@ mod tests {
         let cs = ChangeSet {
             changes: search.changes.to_vec(),
         };
-        let settled = search.proposal(order).settle(cs).unwrap();
-        search.addressed(settled).changes
+        let settled = search
+            .proposal(order)
+            .settle(pbps_diff::order::propose(cs))
+            .unwrap();
+        search.addressed(settled).changes.clone()
     }
 
     /// A drop on a renamed table names the table as it is called where the

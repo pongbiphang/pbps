@@ -771,7 +771,91 @@ fn default_problems(
     found
 }
 
+/// Admission binds the checker, even when the wire artifact was loaded by a
+/// different crate; neither direction may reach the other engine's lowering.
+///
+/// ```compile_fail
+/// fn pg_admission_cannot_reach_mssql(wire: pbps_model::SavedPlan) {
+///     let checksum = wire.checksum();
+///     let plan = pbps_diff::order::admit(wire, &pbps_pg::Postgres::new(),
+///         std::path::Path::new("plan.json"), &checksum).unwrap();
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(&plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_admission_cannot_reach_pg(wire: pbps_model::SavedPlan) {
+///     let checksum = wire.checksum();
+///     let plan = pbps_diff::order::admit(wire, &pbps_mssql::Mssql,
+///         std::path::Path::new("plan.json"), &checksum).unwrap();
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(&plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+///
+/// Ordered and newly sealed inputs retain that same brand:
+///
+/// ```compile_fail
+/// fn pg_order_cannot_reach_mssql(plan: &pbps_diff::order::OrderedPlan<pbps_pg::Postgres>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_order_cannot_reach_pg(plan: &pbps_diff::order::OrderedPlan<pbps_mssql::Mssql>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn pg_seal_cannot_reach_mssql(plan: &pbps_diff::order::SealedPlan<pbps_pg::Postgres>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_seal_cannot_reach_pg(plan: &pbps_diff::order::SealedPlan<pbps_mssql::Mssql>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+impl pbps_dialect::PlanDialect for Postgres {
+    type Plan = dyn pbps_diff::order::PlanView<Self>;
+
+    fn emit_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit(&planned.change, planned.strategy)
+    }
+
+    fn emit_staged_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit_staged(&planned.change, planned.strategy)
+    }
+}
+
 impl Dialect for Postgres {
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), pbps_dialect::PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+            if plan.dialect != "postgres" {
+                return Err(pbps_dialect::PlanAnalysisError::Unsupported(
+                    plan.dialect.clone(),
+                ));
+            }
+            resolver::validate_evidence(evidence)?;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "postgres"
     }
@@ -3716,7 +3800,8 @@ mod tests {
         );
         diff(&read, &schema("app.u", serial(None)), &rename).expect("no name declared");
         assert!(renamed(
-            diff(&read, &schema("app.u", serial(Some("other_seq"))), &rename),
+            diff(&read, &schema("app.u", serial(Some("other_seq"))), &rename)
+                .map(|plan| plan.changes().clone()),
             "other_seq"
         ));
 
@@ -3730,7 +3815,8 @@ mod tests {
                 &schema("app.u", serial(Some("numbers"))),
                 &schema("app.u", serial(Some("t_id_seq"))),
                 &[]
-            ),
+            )
+            .map(|plan| plan.changes().clone()),
             "t_id_seq"
         ));
     }
@@ -6979,5 +7065,105 @@ mod tests {
                 .is_empty(),
             "a check and an ordinary index may share a name"
         );
+    }
+}
+
+#[cfg(test)]
+mod certified_emission_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, PlanMode, PlannedChange};
+
+    #[test]
+    fn certified_lowering_preserves_statement_bytes_and_mode() {
+        let dialect = Postgres::new();
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.old_name".parse().unwrap(),
+                to: "dbo.new_name".parse().unwrap(),
+                defaults: Vec::new(),
+            })],
+        };
+        let expected = dialect
+            .emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .unwrap();
+        for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode, &dialect);
+            let emitted = pbps_dialect::lower::lower_plan(
+                &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
+                &dialect,
+            )
+            .unwrap();
+            assert_eq!(emitted.statements(), expected);
+        }
+    }
+
+    #[test]
+    fn partition_lowering_uses_each_certified_inputs_bound_mode() {
+        use pbps_diff::order::{PlanView, admit, seal, singleton};
+        use pbps_model::{
+            BoundDatum, IdsFile, PartitionBound, PlanBaseline, PlanOrigin, SavedPlan,
+        };
+
+        let dialect = Postgres::new();
+        let change = PlannedChange::new(Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.child".parse().unwrap(),
+            parent: "app.parent".parse().unwrap(),
+            bound: PartitionBound::Range {
+                from: vec![BoundDatum::Value("1".into())],
+                to: vec![BoundDatum::Value("5".into())],
+            },
+            key: vec!["id".into()],
+            shape: Box::default(),
+        });
+        let transactional = dialect.emit(&change.change, change.strategy).unwrap();
+        let staged = dialect
+            .emit_staged(&change.change, change.strategy)
+            .unwrap();
+        assert_eq!(transactional.len(), 1);
+        assert_eq!(staged.len(), 4);
+        assert_ne!(transactional, staged);
+
+        for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let ordered = singleton(change.clone(), mode, &dialect);
+            let mut wire = SavedPlan::new(
+                PlanOrigin::Database,
+                dialect.name(),
+                "2026-10-22T00:00:00Z",
+                PlanBaseline {
+                    description: "target".into(),
+                    checksum: "baseline".into(),
+                    database_collation: None,
+                    time_zone: None,
+                },
+                ordered.changes().clone(),
+                IdsFile::default(),
+            );
+            wire.mode = mode;
+            let bytes = serde_json::to_string(&wire).unwrap();
+            let checksum = wire.checksum();
+            let admitted = admit(
+                serde_json::from_str(&bytes).unwrap(),
+                &dialect,
+                std::path::Path::new("plan.json"),
+                &checksum,
+            )
+            .unwrap();
+            let sealed = seal(ordered.clone(), wire).unwrap();
+            assert_eq!(serde_json::to_string(admitted.wire()).unwrap(), bytes);
+            assert_eq!(serde_json::to_string(sealed.wire()).unwrap(), bytes);
+            assert_eq!(admitted.checksum(), checksum);
+            assert_eq!(sealed.checksum(), checksum);
+            let expected = match mode {
+                PlanMode::Transactional => &transactional,
+                PlanMode::Staged => &staged,
+            };
+            for input in [&ordered as &dyn PlanView<Postgres>, &sealed, &admitted] {
+                assert_eq!(input.mode(), mode);
+                let lowered = pbps_dialect::lower::lower_plan(input, &dialect).unwrap();
+                assert_eq!(lowered.statements(), expected);
+            }
+        }
     }
 }

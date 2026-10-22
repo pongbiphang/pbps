@@ -25,10 +25,10 @@ fn names(changes: &ChangeSet) -> Vec<&str> {
 fn same_as_before(input: ChangeSet) -> ChangeSet {
     let mut expected = input.clone();
     legacy::legacy_order(&mut expected);
-    let actual = role_drops(input).unwrap();
+    let actual = role_drops(crate::order::propose(input)).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(legacy::checksum(&actual), legacy::checksum(&expected));
-    actual
+    actual.changes().clone()
 }
 
 #[test]
@@ -110,7 +110,7 @@ fn a_role_membership_cycle_is_refused_by_name() {
     let input = ChangeSet {
         changes: vec![drop("a", &["b"], 0), drop("b", &["a"], 0)],
     };
-    let why = role_drops(input).unwrap_err();
+    let why = role_drops(crate::order::propose(input)).unwrap_err();
     assert!(
         why.contains("`role a`") && why.contains("`role b`") && why.contains("authorization"),
         "{why}"
@@ -124,7 +124,7 @@ fn a_same_depth_role_cannot_cross_its_earlier_peer() {
     };
     let mut schedule = constraints(&drops);
     schedule.edge(1, 0, Source::Catalog, OrderReason::Authorization);
-    let why = schedule.settle(drops).unwrap_err();
+    let why = schedule.settle_raw(drops).unwrap_err();
     assert!(matches!(why, super::super::Refusal::Cycle { .. }), "{why}");
 }
 

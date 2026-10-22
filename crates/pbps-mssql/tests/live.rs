@@ -1195,6 +1195,8 @@ fn plan(
         &pbps_model::Hints::default(),
     )
     .expect("diff")
+    .changes()
+    .clone()
 }
 
 /// A schema using every construct the model can express.

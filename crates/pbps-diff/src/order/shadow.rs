@@ -38,7 +38,7 @@ pub fn analyse(
     owners: &dyn Owners,
     before: Snapshot<'_>,
     after: Snapshot<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Shadowed {
     let mut unowned = Vec::new();
     let effects = operations
@@ -88,7 +88,7 @@ impl Shadowed {
 pub(crate) fn observe_plan(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &pbps_model::Hints,
     changes: &pbps_model::ChangeSet,
 ) {
@@ -136,7 +136,7 @@ pub enum Stage {
 pub fn observe_scheduled(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
     changes: &pbps_model::ChangeSet,
     stage: Stage,
@@ -168,7 +168,7 @@ pub fn observe_scheduled(
 pub(crate) fn observe(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
     logical: &pbps_model::ChangeSet,
     operations: &Operations,
@@ -381,7 +381,7 @@ pub(crate) fn judge_slots(
     ops: &[Operation],
     owners: &dyn Owners,
     before: Snapshot<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
     stage: Stage,
 ) -> (Vec<String>, bool) {

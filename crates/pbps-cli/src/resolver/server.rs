@@ -73,7 +73,7 @@ pub struct BindingRequest<'a> {
 /// Complete same-capture qualified plan. It contains only ordered typed
 /// changes and keyed evidence; no raw target or scratch capture escapes.
 pub struct ResolvedPlan {
-    pub changes: pbps_model::ChangeSet,
+    pub changes: pbps_diff::order::PlanningPlan,
     pub evidence: pbps_model::resolver::ResolverEvidence,
 }
 

@@ -58,6 +58,7 @@ fn ordinary_with_dependencies(
     )
     .map(|s| s.changes)
     .map_err(|e| e.to_string())
+    .map(|plan| plan.changes().clone())
 }
 
 #[test]

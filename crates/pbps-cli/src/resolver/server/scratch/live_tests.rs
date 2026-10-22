@@ -5788,7 +5788,7 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                         database_collation: None,
                         time_zone: None,
                     },
-                    plan.changes,
+                    plan.changes.changes().clone(),
                     inputs.desired().ids.clone(),
                 )
                 .with_resolution(plan.evidence)?;

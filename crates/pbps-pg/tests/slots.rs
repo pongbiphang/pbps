@@ -249,7 +249,7 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
             let mut schedule = pbps_diff::order::Schedule::new(changes.len());
             pbps_diff::order::slots::schedule(&mut schedule, &found);
             assert_eq!(schedule.sequence().unwrap(), [1, 0]);
-            let ordered = ops.reordered(&[1, 0]);
+            let ordered = pbps_diff::order::reordered_operations(&ops, &[1, 0]);
             let slots = analyse(ordered.as_slice(), &owners, before, &Postgres::new());
             assert!(
                 verify(
@@ -379,7 +379,7 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
             pbps_diff::order::slots::schedule(&mut order, &found);
             let sequence = order.sequence().unwrap();
             assert_eq!(sequence, if handover { vec![1, 0] } else { vec![0, 1] });
-            let ordered = ops.reordered(&sequence);
+            let ordered = pbps_diff::order::reordered_operations(&ops, &sequence);
             let slots = analyse(ordered.as_slice(), &owners, base, &Postgres::new());
             let (violations, _) = verify(
                 ordered.as_slice(),

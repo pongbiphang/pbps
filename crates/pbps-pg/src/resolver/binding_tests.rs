@@ -134,6 +134,7 @@ fn bootstrap(desired: &Schema, extras: &[&str]) -> Vec<pbps_model::Change> {
     )
     .expect("diff")
     .changes
+    .clone()
     .into_iter()
     .map(|planned| planned.change)
     .collect()

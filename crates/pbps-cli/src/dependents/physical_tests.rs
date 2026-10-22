@@ -1,3 +1,4 @@
+use super::test_adapters::weave;
 use super::*;
 use pbps_model::{Column, Module, PartitionBound, PartitionColumn, PartitionOf, Table, Uid};
 
@@ -242,7 +243,8 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 }
                 let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
                 assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-                crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+                let mut cs = pbps_diff::order::propose(cs);
+    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
                     &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
@@ -267,12 +269,13 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
             CREATE TABLE public.child PARTITION OF public.parent DEFAULT;
             ALTER TABLE public.child ALTER COLUMN n SET DEFAULT public.f(1);").await.unwrap();
         let before = pbps_pg::catalog::introspect(&mut conn).await.unwrap().schema;
-        let (after, after_ids, mut cs) = parent_release(&before);
+        let (after, after_ids, cs) = parent_release(&before);
         let before_ids = ids(true);
         let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
         conn.begin(&framing).await.unwrap();
         assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-        crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+        let mut cs = pbps_diff::order::propose(cs);
+    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
             &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
@@ -477,7 +480,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     } else {
         vec![attach, rebuild]
     };
-    let mut cs = ChangeSet {
+    let cs = ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     };
     let sources = Sources {
@@ -489,6 +492,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     };
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.unwrap();
+    let mut cs = pbps_diff::order::propose(cs);
     crate::engine::account_for_module_dependents(
         &mut conn,
         &mut cs,
