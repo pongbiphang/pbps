@@ -41,11 +41,6 @@ pub enum DiffError {
         column = .column.shown(),
     )]
     PartitionDefault { column: ColumnRef, reason: String },
-    #[error(
-        "{table}: {part} changed on a standing table; RLS alteration planning arrives with #1173",
-        table = .table.shown(),
-    )]
-    RowSecurityPlanningPending { table: TableName, part: String },
     /// In most databases IDENTITY cannot be changed with ALTER; the whole table
     /// has to be rebuilt. That is beyond what declarative automation should do on
     /// its own — a human has to choose the migration strategy.
@@ -827,26 +822,44 @@ pub(crate) fn diff_partial_rebuilding(
         ) else {
             continue;
         };
-        // Compare only matched identities: unchanged adopted policies and
-        // unrelated migrations must remain usable before #1173.
-        if base_table.row_security != declared_table.row_security {
-            errs.push(DiffError::RowSecurityPlanningPending {
-                table: declared_name.clone(),
-                part: "row-security flags".into(),
-            });
-        }
+        // Only a retained identity needs explicit policy teardown. Dropping
+        // the owner removes its policies, while a replacement UID is created
+        // through the ordinary new-table path (DEC-1173.2).
         for name in base_table
             .row_policies
             .keys()
             .chain(declared_table.row_policies.keys())
             .collect::<BTreeSet<_>>()
         {
-            if base_table.row_policies.get(name) != declared_table.row_policies.get(name) {
-                errs.push(DiffError::RowSecurityPlanningPending {
-                    table: declared_name.clone(),
-                    part: format!("row policy `{}`", pbps_model::escape::Escaped(name)),
+            let before = base_table.row_policies.get(name);
+            let after = declared_table.row_policies.get(name);
+            if before == after {
+                continue;
+            }
+            if let Some(policy) = before {
+                changes.push(Change::DropPolicy {
+                    table: base_name.clone(),
+                    name: name.clone(),
+                    policy: policy.clone(),
                 });
             }
+            if let Some(policy) = after {
+                changes.push(Change::CreatePolicy {
+                    table: declared_name.clone(),
+                    name: name.clone(),
+                    policy: policy.clone(),
+                    origin: pbps_model::RowSecurityOrigin::Standing,
+                });
+            }
+        }
+        if base_table.row_security != declared_table.row_security {
+            changes.push(Change::SetRowSecurity {
+                uid: uid.clone(),
+                table: declared_name.clone(),
+                from: base_table.row_security,
+                to: declared_table.row_security,
+                origin: pbps_model::RowSecurityOrigin::Standing,
+            });
         }
         // A partition declared as an ordinary table is detached, and that is
         // all this plan does to it (#1544, DEC-1544.1): its base holds no
@@ -1252,7 +1265,6 @@ pub(crate) fn diff_partial_rebuilding(
     crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
-        p.risks = dialect.change_risks(&p.change);
         // Attached here, not looked up at emit time: the plan file is the
         // artifact the deployment gate reviews, and a hint resolved later
         // against a YAML file the deployment host may not have is a hint
@@ -2067,8 +2079,15 @@ pub(crate) fn diff_partial_rebuilding(
     for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
+    let mut changes = ChangeSet { changes: planned };
+    // Replacement risk belongs to both policy parts, including in partial
+    // reports. Reuse the same UID/name pairing as final plan admission.
+    let risks = crate::order::generated::risks(&changes, declared.ids, dialect);
+    for (part, risks) in changes.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
     Diffed {
-        changes: ChangeSet { changes: planned },
+        changes,
         errors: errs,
     }
 }
@@ -6146,6 +6165,9 @@ fn dependency_rank(
             create_rank.get(id).map_or(0, |r| *r as isize)
         }
         Change::DropModule { id, .. } => -(drop_rank.get(id).map_or(0, |r| *r as isize)),
+        // Module ranks can be arbitrarily deep. A fixed -1 would leave a
+        // policy behind a dropped routine it calls (DEC-1173.2).
+        Change::DropPolicy { .. } => -(drop_rank.len() as isize) - 1,
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
@@ -6157,7 +6179,6 @@ fn dependency_rank(
         | Change::SetColumnDeprecated { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
-        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
         | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
@@ -6899,7 +6920,7 @@ const ROW_DELETIONS: u8 = 12;
 
 fn order_key(c: &Change) -> u8 {
     match c {
-        // Registration only; policy teardown ranks and edges arrive in PR B.
+        // A policy releases its bindings before module and column teardown.
         Change::DropPolicy { .. } => 0,
         // Modules go first and last, and both ends are load-bearing. A
         // SCHEMABINDING view blocks a rename of the column it binds, so every
@@ -7436,60 +7457,492 @@ mod tests {
     }
 
     #[test]
-    fn row_security_standing_changes_refuse_both_additions_and_removals_by_name() {
+    fn row_security_standing_policy_transitions_keep_full_payloads_and_pair_replacements() {
+        use pbps_model::{PolicyCommand, PolicyRoles, RiskClass, RowPolicy, RowSecurityOrigin};
         let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        let name: TableName = "app.t".parse().unwrap();
+        for restrictive in [false, true] {
+            let old = RowPolicy {
+                restrictive,
+                using: Some("id>0".into()),
+                with_check: Some("id<100".into()),
+                ..Default::default()
+            };
+            let mut base = plain.clone();
+            base.tables
+                .get_mut(&name)
+                .unwrap()
+                .row_policies
+                .insert("p".into(), old.clone());
+            // Latent policies still change access intent with both flags off.
+            assert!(base.tables[&name].row_security.is_default());
+            for field in 0..7 {
+                let mut new = old.clone();
+                match field {
+                    0 => new.command = PolicyCommand::Update,
+                    1 => new.restrictive = !restrictive,
+                    2 => new.to = PolicyRoles::Roles(["app_user".into(), "auditor".into()].into()),
+                    3 => new.using = Some("id>5".into()),
+                    4 => new.with_check = Some("id<50".into()),
+                    5 => new.using = None,
+                    _ => new.with_check = None,
+                }
+                let mut declared = plain.clone();
+                declared
+                    .tables
+                    .get_mut(&name)
+                    .unwrap()
+                    .row_policies
+                    .insert("p".into(), new.clone());
+                for (before, after, old, new) in [
+                    (&base, &declared, &old, &new),
+                    (&declared, &base, &new, &old),
+                ] {
+                    let changes = run(before, after, &[]);
+                    assert_eq!(changes.changes.len(), 2, "{restrictive}, field {field}");
+                    assert_eq!(
+                        changes.changes[0].change,
+                        Change::DropPolicy {
+                            table: name.clone(),
+                            name: "p".into(),
+                            policy: old.clone(),
+                        }
+                    );
+                    assert_eq!(
+                        changes.changes[1].change,
+                        Change::CreatePolicy {
+                            table: name.clone(),
+                            name: "p".into(),
+                            policy: new.clone(),
+                            origin: RowSecurityOrigin::Standing,
+                        }
+                    );
+                    assert!(
+                        changes
+                            .changes
+                            .iter()
+                            .all(|p| p.risks == [RiskClass::Revoke, RiskClass::RowSecurity].into())
+                    );
+                }
+                for (before, after, expected) in [
+                    (
+                        &plain,
+                        &declared,
+                        Change::CreatePolicy {
+                            table: name.clone(),
+                            name: "p".into(),
+                            policy: new.clone(),
+                            origin: RowSecurityOrigin::Standing,
+                        },
+                    ),
+                    (
+                        &declared,
+                        &plain,
+                        Change::DropPolicy {
+                            table: name.clone(),
+                            name: "p".into(),
+                            policy: new.clone(),
+                        },
+                    ),
+                ] {
+                    let changes = run(before, after, &[]);
+                    assert_eq!(changes.changes.len(), 1);
+                    assert_eq!(changes.changes[0].change, expected);
+                    assert_eq!(
+                        changes.changes[0].risks,
+                        MinimalDialect.change_risks(&expected)
+                    );
+                }
+                assert!(run(&declared, &declared, &[]).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn row_security_policy_moves_between_names_or_owners_are_not_replacement_pairs() {
+        use pbps_model::{RiskClass, RowPolicy};
+        let a = TableName::new("app", "a");
+        let b = TableName::new("app", "b");
+        let mut base = schema_of("app.a", table(&[("id", Column::new(ty("integer")))]));
+        base.tables.insert(b.clone(), base.tables[&a].clone());
+        base.tables
+            .get_mut(&a)
+            .unwrap()
+            .row_policies
+            .insert("p".into(), RowPolicy::default());
+        for (owner, name) in [(a.clone(), "q"), (b, "p")] {
+            let mut declared = base.clone();
+            declared.tables.get_mut(&a).unwrap().row_policies.clear();
+            declared
+                .tables
+                .get_mut(&owner)
+                .unwrap()
+                .row_policies
+                .insert(name.into(), RowPolicy::default());
+            let changes = run(&base, &declared, &[]);
+            assert_eq!(kinds(&changes), ["DropPolicy", "CreatePolicy"]);
+            assert_eq!(changes.changes[0].risks, [RiskClass::Revoke].into());
+            assert_eq!(changes.changes[1].risks, [RiskClass::RowSecurity].into());
+        }
+    }
+
+    #[test]
+    fn row_security_standing_flags_compare_both_independent_bits_in_all_sixteen_transitions() {
+        use pbps_model::{RowPolicy, RowSecurity, RowSecurityOrigin};
+        let name: TableName = "app.t".parse().unwrap();
+        let flags = [false, true]
+            .into_iter()
+            .flat_map(|enabled| [false, true].map(|forced| RowSecurity { enabled, forced }))
+            .collect::<Vec<_>>();
+        let mut plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        plain
+            .tables
+            .get_mut(&name)
+            .unwrap()
+            .row_policies
+            .insert("latent".into(), RowPolicy::default());
         let ids = crate::resolve(&plain, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
-        for field in 0..8 {
-            let mut secured = plain.clone();
-            let table = secured.tables.values_mut().next().unwrap();
-            if field < 2 {
-                table.row_security = pbps_model::RowSecurity {
-                    enabled: field == 0,
-                    forced: field == 1,
-                };
-            } else {
-                let mut policy = pbps_model::RowPolicy::default();
-                match field {
-                    3 => policy.command = pbps_model::PolicyCommand::Select,
-                    4 => policy.restrictive = true,
-                    5 => policy.to = pbps_model::PolicyRoles::Roles(["app_user".into()].into()),
-                    6 => policy.using = Some("id>0".into()),
-                    7 => policy.with_check = Some("id>0".into()),
-                    _ => {}
-                }
-                table.row_policies.insert("tenant_rows".into(), policy);
-            }
-            for (base, after) in [(&plain, &secured), (&secured, &plain)] {
-                let errors = diff(
+        let uid = ids
+            .tables
+            .iter()
+            .find(|(_, table)| *table == &name)
+            .unwrap()
+            .0;
+        for &from in &flags {
+            for &to in &flags {
+                let mut base = plain.clone();
+                let mut declared = plain.clone();
+                base.tables.get_mut(&name).unwrap().row_security = from;
+                declared.tables.get_mut(&name).unwrap().row_security = to;
+                let changes = diff(
                     Side {
-                        schema: base,
+                        schema: &base,
                         ids: &ids,
                     },
                     Side {
-                        schema: after,
+                        schema: &declared,
                         ids: &ids,
                     },
                     &MinimalDialect,
                     &Hints::default(),
                 )
-                .unwrap_err();
-                let message = errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(";");
-                assert!(
-                    message.contains("app.t") && message.contains("arrives with #1173"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(if field < 2 { "flags" } else { "tenant_rows" }),
-                    "{message}"
-                );
+                .unwrap();
+                if from == to {
+                    assert!(changes.is_empty());
+                } else {
+                    let expected = Change::SetRowSecurity {
+                        uid: uid.clone(),
+                        table: name.clone(),
+                        from,
+                        to,
+                        origin: RowSecurityOrigin::Standing,
+                    };
+                    assert_eq!(changes.changes.len(), 1);
+                    assert_eq!(changes.changes[0].change, expected);
+                    assert_eq!(
+                        changes.changes[0].risks,
+                        MinimalDialect.change_risks(&expected)
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn row_security_replacements_follow_renamed_identity_and_keep_reused_name_creation_separate() {
+        use pbps_model::{RiskClass, RowPolicy, RowSecurity, RowSecurityOrigin};
+        let old_name: TableName = "app.old".parse().unwrap();
+        let new_name: TableName = "app.renamed".parse().unwrap();
+        let mut base = schema_of("app.old", table(&[("id", Column::new(ty("integer")))]));
+        let old = RowPolicy {
+            using: Some("id>0".into()),
+            ..Default::default()
+        };
+        base.tables
+            .get_mut(&old_name)
+            .unwrap()
+            .row_policies
+            .insert("p".into(), old.clone());
+        let mut declared = Schema::default();
+        let mut renamed = base.tables[&old_name].clone();
+        let new = RowPolicy {
+            restrictive: true,
+            ..old.clone()
+        };
+        renamed.row_policies.insert("p".into(), new.clone());
+        renamed.row_security = RowSecurity {
+            enabled: false,
+            forced: true,
+        };
+        declared.tables.insert(new_name.clone(), renamed);
+        declared
+            .tables
+            .insert(old_name.clone(), base.tables[&old_name].clone());
+        let intent = Intent::RenameTable {
+            from: old_name.clone(),
+            to: new_name.clone(),
+        };
+        // Record the rename before reusing the old declaration path. A
+        // source still present cannot also consume a rename intent.
+        let before_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let renamed_only = schema_of("app.renamed", declared.tables[&new_name].clone());
+        let renamed_ids = crate::resolve(
+            &renamed_only,
+            &before_ids,
+            std::slice::from_ref(&intent),
+            &ctx(),
+        )
+        .unwrap()
+        .ids;
+        let after_ids = crate::resolve(&declared, &renamed_ids, &[], &ctx())
+            .unwrap()
+            .ids;
+        let changes = diff(
+            Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &after_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&changes.changes[0].change, Change::DropPolicy { table, policy, .. } if table == &old_name && policy == &old)
+        );
+        assert!(
+            matches!(&changes.changes[1].change, Change::RenameTable { from, to, .. } if from == &old_name && to == &new_name)
+        );
+        let installed = changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::CreatePolicy {
+                    table,
+                    policy,
+                    origin,
+                    ..
+                } = &p.change
+                {
+                    Some((table, policy, origin, &p.risks))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(installed.len(), 2);
+        for (table, policy, origin, risks) in installed {
+            if table == &new_name {
+                assert_eq!(policy, &new);
+                assert_eq!(*origin, RowSecurityOrigin::Standing);
+                assert_eq!(*risks, [RiskClass::Revoke, RiskClass::RowSecurity].into());
+            } else {
+                assert_eq!(table, &old_name);
+                assert_eq!(*origin, RowSecurityOrigin::Created);
+                assert!(risks.is_empty());
+            }
+        }
+        let (table_uid, _) = changes
+            .changes
+            .iter()
+            .find_map(|p| {
+                if let Change::RenameTable { uid, to, .. } = &p.change {
+                    Some((uid, to))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            matches!(&changes.changes.last().unwrap().change, Change::SetRowSecurity { uid, table, origin: RowSecurityOrigin::Standing, .. } if uid == table_uid && table == &new_name)
+        );
+        assert_eq!(
+            changes.changes[0].risks,
+            [RiskClass::Revoke, RiskClass::RowSecurity].into()
+        );
+        // A bare rename of an unchanged policy does not become a replacement.
+        declared.tables.remove(&old_name);
+        declared
+            .tables
+            .insert(new_name, base.tables[&old_name].clone());
+        assert!(
+            matches!(&run(&base, &declared, &[intent]).changes[..], [p] if matches!(p.change, Change::RenameTable { .. }))
+        );
+    }
+
+    #[test]
+    fn row_security_dropped_owners_have_no_policy_drops_and_replacement_uids_use_created_origin() {
+        use pbps_model::{RowPolicy, RowSecurity, RowSecurityOrigin};
+        let name: TableName = "app.t".parse().unwrap();
+        let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        let t = base.tables.get_mut(&name).unwrap();
+        t.row_policies.insert("p".into(), RowPolicy::default());
+        t.row_security = RowSecurity {
+            enabled: true,
+            forced: true,
+        };
+        let dropped = run(
+            &base,
+            &Schema::default(),
+            &[Intent::DropTable {
+                table: name,
+                reason: "retired".parse().unwrap(),
+            }],
+        );
+        assert!(
+            matches!(&dropped.changes[..], [p] if matches!(p.change, Change::DropTable { .. }))
+        );
+        let before_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let after_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        assert_ne!(
+            before_ids.tables.keys().next(),
+            after_ids.tables.keys().next()
+        );
+        let replaced = diff(
+            Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            Side {
+                schema: &base,
+                ids: &after_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            kinds(&replaced),
+            ["DropTable", "CreateTable", "CreatePolicy", "SetRowSecurity"]
+        );
+        assert!(matches!(
+            replaced.changes[2].change,
+            Change::CreatePolicy {
+                origin: RowSecurityOrigin::Created,
+                ..
+            }
+        ));
+        assert!(matches!(
+            replaced.changes[3].change,
+            Change::SetRowSecurity {
+                origin: RowSecurityOrigin::Created,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn row_security_partial_reports_keep_both_replacement_risks_when_other_changes_refuse() {
+        use pbps_model::{RiskClass, RowPolicy};
+        let name: TableName = "app.t".parse().unwrap();
+        let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        base.tables
+            .get_mut(&name)
+            .unwrap()
+            .row_policies
+            .insert("p".into(), RowPolicy::default());
+        let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut declared = base.clone();
+        let t = declared.tables.get_mut(&name).unwrap();
+        t.row_policies.get_mut("p").unwrap().restrictive = true;
+        t.columns.get_mut("id").unwrap().value_source =
+            ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+                options: Default::default(),
+            });
+        let partial = diff_partial(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            Side {
+                schema: &declared,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        );
+        assert!(
+            partial
+                .errors
+                .iter()
+                .any(|e| matches!(e, DiffError::IdentityChangeUnsupported { .. }))
+        );
+        assert_eq!(kinds(&partial.changes), ["DropPolicy", "CreatePolicy"]);
+        assert!(
+            partial
+                .changes
+                .changes
+                .iter()
+                .all(|p| p.risks == [RiskClass::Revoke, RiskClass::RowSecurity].into())
+        );
+    }
+
+    #[test]
+    fn row_security_policy_drops_precede_every_rank_of_a_deep_module_drop_chain() {
+        use pbps_model::{ModuleKind, RowPolicy};
+        let name: TableName = "app.t".parse().unwrap();
+        let mut base = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        base.tables.get_mut(&name).unwrap().row_policies.insert(
+            "p".into(),
+            RowPolicy {
+                using: Some("app.f7(id)>0".into()),
+                ..Default::default()
+            },
+        );
+        for i in 0..8 {
+            base.modules.insert(
+                format!("app.f{i}(integer)").parse().unwrap(),
+                a_module(
+                    ModuleKind::Function,
+                    &if i == 0 {
+                        "SELECT 1".into()
+                    } else {
+                        format!("SELECT app.f{}($1)", i - 1)
+                    },
+                ),
+            );
+        }
+        let mut declared = base.clone();
+        declared.modules.clear();
+        declared.tables.get_mut(&name).unwrap().row_policies.clear();
+        let changes = run(&base, &declared, &[]);
+        assert_eq!(changes.changes.len(), 9);
+        assert!(matches!(
+            changes.changes[0].change,
+            Change::DropPolicy { .. }
+        ));
+        let modules = changes.changes[1..]
+            .iter()
+            .map(|p| {
+                if let Change::DropModule { id, .. } = &p.change {
+                    id.clone()
+                } else {
+                    panic!("unexpected {:?}", p.change)
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modules,
+            (0..8)
+                .rev()
+                .map(|i| format!("app.f{i}(integer)").parse().unwrap())
+                .collect::<Vec<ModuleId>>()
+        );
     }
 
     /// Reproduces the real flow: the base side's identity file is the one from

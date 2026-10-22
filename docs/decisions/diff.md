@@ -8239,3 +8239,47 @@ plain ATTACH and their constraint, a different name retains four steps, and
 same-schema relation names, another table's constraint and a same-table index
 retain four steps. Every case applies, preserves its row, verifies and leaves
 an empty next plan. Removing the occupied-name decision must fail both tests.
+
+<a id="dec-1173-2"></a>
+
+**DEC-1173.2. Standing policy differences are drop/create pairs, with teardown
+before modules and setup before flags in the existing shared schedule.**
+Part of #1173, PR B. Compare policy maps only for retained table UIDs. A new
+name produces `CreatePolicy { origin: Standing }`; a removed name produces
+`DropPolicy`; any unequal definition at the same name produces both, carrying
+the complete old and new definitions. There is no `AlterPolicy` or predicate
+analysis. Unchanged adopted policies are no-ops. A dropped owner needs no
+policy drop, and a new or replacement UID keeps the Created path. Policy
+drops use the base table name before its rename; installs and flags use the
+final name. DEC-1173.1's existing risk calculation pairs replacements by table
+UID and policy name, including in partial differ reports, so both halves
+carry `revoke` and `row-security`, even for mode flips or latent policies.
+
+A flag difference produces one `SetRowSecurity { origin: Standing }` with
+both independent before/after bits. No flag change is inferred from policy
+presence, and a forced-but-disabled table remains representable.
+
+No sort class is added. `DropPolicy` is class 0 with dependency rank
+`-drop_rank.len() - 1`, strictly before every module-drop rank even for deep
+module chains. `CreatePolicy` remains (14, 2), flags (14, 3). The shared
+`order::row_security::edges`, consumed by the CLI schedule and resolver graph,
+places policy drops before module drops, column drops and retypes, including
+in drop-only plans. Structural/table changes and module creates/alters and
+`PublicExecution` precede policy installs and flags; policy drops are also
+setup suppliers. Thus a replacement's drop precedes its create, and all
+policy drops/creates precede flags. Row writes, including deletes, finish
+before flags change so their guards see the earlier flags. These conservative
+phase edges infer no bindings from expression text and add no reorder pass.
+Policy installs with different names on one table and flag changes on
+separate tables commute.
+
+The differ's `RowSecurityPlanningPending` refusal is removed. The PostgreSQL
+emission refusal for standing policy/flag operations remains after the
+approval gate until PR C, as do the existing connected dependent guards and
+RLS/data/partition restrictions. This slice changes no saved-plan field or
+admission contract: plan 47, state 29 and schema set 53 remain unchanged.
+
+Pinned by the standing transition/flag matrices, rename and reused-name UID
+controls, dropped/replaced-owner and partial-risk cases, the deep module-drop
+chain, reversed-input settlement through both shared entry points, the
+independence controls, and Created/Standing fixtures in the ordering audit.

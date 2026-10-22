@@ -70,7 +70,7 @@ The differ sorts every planned change by, in order:
 
    | Class | Changes |
    |---|---|
-   | 0 | `DropModule`, `DropRole`; P: `SetReplicaIdentity` to a target that stands, at (0, 1) |
+   | 0 | `DropPolicy` before every module-drop rank; `DropModule`, `DropRole`; P: `SetReplicaIdentity` to a target that stands, at (0, 1) |
    | 1 | `RenameTable`, `RenameRole` |
    | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`; `DropComputedColumn` at the class's end (2, 4) |
    | 3 | `RenameColumn` |
@@ -101,6 +101,8 @@ The differ sorts every planned change by, in order:
      identity turned into a sequence, goes first, at −3, and any other
      numbering change last, at +2 (DEC-1889.1);
    - modules are ranked by `creation_order_with` (DECISIONS 311, 315);
+     `DropPolicy` has rank `-drop_rank.len() - 1`, before every negative
+     module-drop rank (DEC-1173.2);
    - reference rows by the foreign keys between their tables;
    - role drops by membership, holder before member (`member_depth`,
      DECISIONS 127);
@@ -356,7 +358,7 @@ requirement is common to all of them, so it is listed once,
 
 | Change | Class | Requires before it | Creates, removes or rewrites | Effects (checked) |
 |---|---|---|---|---|
-| `DropModule` | 0 | Its dependents gone. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
+| `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
@@ -364,13 +366,13 @@ requirement is common to all of them, so it is listed once,
 | `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922); a check by its text, lexed | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) | Exists, removes |
 | `RenameColumn` | 3 | The target name free. P: no retained managed policy bound to the column. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: other dependents' text follows the rename | Exists, rewrites |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |
-| `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name | Absent, Exists, removes |
+| `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone; planned policy drops first. P: generated columns reading it gone | Removes the column, frees its name | Absent, Exists, removes |
 | `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name | Absent, Exists, removes |
 | `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) | Exists, removes |
 | `CreateTable` | 7; a partition (7, 2), or (9, 5) under a parent whose columns the plan changes | The name free, its types. Functions its defaults, checks and generated columns call: *content*. Beside a standing DEFAULT partition, P: no row referencing a row it moves, and no delete trigger or rule on the DEFAULT that the move fires (pre-flight) | The table, columns, key, uniques, checks, indexes; beside a standing DEFAULT partition, the DEFAULT's rows of its range move into it (DEC-1547.1) | Exists, creates, rewrites |
 | `AttachPartition` | 7; (11, 1) when its parent's foreign key references a table the plan writes rows into or attaches a table to | The parent standing; the table already its parent's columns, order and parent's checks (refused otherwise). P: no row of the table outside its range, no trigger on it named as a parent's row trigger and not dropped first (DEC-1632.3), no column grant on it, none in the parent's DEFAULT partition inside it; as the DEFAULT, none of its rows another partition takes and no other DEFAULT kept (pre-flight, DEC-1639.1) | The table becomes a partition with its rows; its columns become its parent's, its matching keys and indexes clones, and the rest its own; takes its range (DEC-1545.1). In a staged plan a range or list attach's four statements carry their own temporary CHECK, claimed and released inside the one operation (DEC-1638.1); a HASH or DEFAULT attach stays one statement (DEC-1639.1) | Exists, creates, removes, rewrites |
 | `AddColumn` | 8 | The table, the name free. A generated column's inputs; functions its default or expression calls: *content* | The column, backfilled; appends to the table's column order (DEC-2080.1) | Exists, creates, rewrites |
-| `AlterColumnType` | 9 | What blocks a retype gone. A foreign key the plan drops over the column or into it, first. S: keys, indexes, checks, foreign keys, as the dialect's retype policy names them (DEC-1998.1). P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values | Absent, Exists, creates, rewrites |
+| `AlterColumnType` | 9 | What blocks a retype gone; planned policy drops first. A foreign key the plan drops over the column or into it, first. S: keys, indexes, checks, foreign keys, as the dialect's retype policy names them (DEC-1998.1). P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values | Absent, Exists, creates, rewrites |
 | `AlterColumnNullability` | 9 | Tightening: the values non-null. S: tightening, the indexes and uniques over it and filtered indexes naming it gone; relaxing, filtered indexes naming it gone (#1363, DEC-1998.1) | Accepts or refuses NULL | Exists, creates, removes |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default | Exists, Is, creates, removes |
 | `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. Its parent's column, by the name the step spells: a release before the parent's rename of it, anything else after it (DEC-1968.2). P: after its parent's default set by the plan (`after_their_parents_defaults`); one split from a create beside a DEFAULT, right after the last function its text may call (`split_moving_defaults`, DEC-1547.1) | One partition's default: its own, or its parent's again (DEC-1581.1) | Exists, Is, creates |
@@ -389,23 +391,28 @@ requirement is common to all of them, so it is listed once,
 | `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
-| `DropPolicy` | 0 (registration only; relative ordering arrives in #1173 PR B) | A standing table; SQL delivery arrives in PR C | Removes one table-local policy | Exists, removes |
-| `CreatePolicy` | 14 (14, 2) | P: a matching table created in this plan; all modules, structural changes and bootstrap inserts first. Predicate bindings remain #595's named limitation | One table-local policy, with its own name namespace | Exists, creates |
-| `SetRowSecurity` | 14 (14, 3) | P: its matching created table and all planned policies; modules and bootstrap inserts first | Rewrites the table's independent RLS flags; no standing transitions until #1173 | Exists, rewrites |
+| `DropPolicy` | 0, before every module-drop rank | Its standing owner under the base name; before module drops, column drops and retypes. SQL delivery arrives in #1173 PR C | Removes one table-local policy and frees its name for replacement | Exists, removes |
+| `CreatePolicy` | 14 (14, 2) | P: its standing or matching created table under the final name; all module creates/alters, structural changes, bootstrap inserts and policy drops first. Predicate bindings remain #595's named limitation | One table-local policy, with its own name namespace; a changed definition is drop plus create | Exists, creates |
+| `SetRowSecurity` | 14 (14, 3) | P: its standing or matching created table and all planned policy drops/creates; modules and row writes, deletes included, first | Rewrites both independent RLS flags, carrying the complete before and after values | Exists, rewrites |
 | `CreateRole` | 15 | The name free | A role | creates |
 | `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) | Is, rewrites |
 | `Grant` | 16 | The role and the target exist | A permission | Exists, Is, rewrites |
 | `SetDataMode` | 17 | The table's rows written | The table's data mode | Exists, Reads |
 | `SetEnsureKeys` | 17 | The table's rows written | The table's managed ensure keys | Exists, Reads |
 
-The two created-table RLS kinds share one structural phase rule in
-`pbps_diff::order::row_security::edges`: structural/table changes, module
-creates/alters and their `PublicExecution` decisions precede both kinds;
-every `CreatePolicy` precedes `SetRowSecurity`. The central CLI schedule and
-the resolver graph use the same edges and `Schedule::settle`, preserving
-class 14 without an additional positional reorder pass. These edges express
-the creation boundary, not predicate binding evidence. A policy and check
-may share a name because their table-local namespaces differ.
+The three RLS kinds share phase rules in
+`pbps_diff::order::row_security::edges`: policy drops precede module drops,
+column drops and retypes, including in drop-only plans. Structural/table
+changes, module creates/alters and their `PublicExecution` decisions precede
+policy creation and flag changes; every policy create precedes every flag
+change. Policy drops are setup suppliers too, so replacement creates and
+flags follow them. Row writes, including deletes, finish before flags change.
+The central CLI schedule and resolver graph use the same edges and
+`Schedule::settle`, preserving classes 0 and 14 without another positional
+reorder pass. These edges express phases, not predicate binding evidence.
+Policy installs with different names on one table commute, as do flags on
+separate tables.
+A policy and check may share a name because their namespaces differ.
 
 ## Pairs that interact
 
@@ -418,11 +425,12 @@ tables list:
 - every pair the classes get wrong;
 - the pairs a reviewer is likely to ask about.
 
-Created-table policies interact with module creation/alteration, table and
-column construction, constraints and bootstrap inserts through the setup
-phase above. Flag setup follows every policy setup. Standing policy/flag
-changes refuse with #1173; connected column drop/retype/rename and routine
-rebuild under a retained policy refuse by its catalog-proven name. A table
+Policy creation interacts with module creation/alteration, table and column
+construction, constraints and bootstrap inserts through the setup phase above.
+Flags follow every policy drop/create and every row write. The differ plans
+standing transitions, but PostgreSQL SQL delivery still refuses them until
+#1173 PR C. Connected column drop/retype/rename and routine rebuild under a
+retained policy still refuse by its catalog-proven name. A table
 rename refuses only where it changes a retained policy's deparsed predicate:
 ordinary local scalar predicates and schema-only moves keeping a whole-row
 alias apply cleanly. Table/column renames under unmanaged policy owners also
@@ -430,8 +438,9 @@ apply cleanly and do not enter these rename refusals. Whole owner-table
 drops release their policies before referenced table/column/routine teardown,
 including sequence references reached through column ownership in `pg_depend`.
 Renames and retypes preserve those sequences and need no such release edge;
-cycles still require individual policy planning from #1173. Policies are not
-silently rebuilt or removed by this slice.
+cycles still require PR C's connected handling of individual policy drops.
+Policies are never silently rebuilt or removed: only declared differences
+produce explicit drops and creates.
 
 A pair in no category is independent: neither side's effect meets the
 other's requirement in the table above. Columns:
@@ -503,6 +512,11 @@ name the old name. It runs before every change that names the new one.
 | Constraint and index drops naming a column → its rename | fixed | class 2 before 3; the drops use the old name | ✓ DECISIONS 474 |
 | `RenameRole` → `Revoke` and `Grant` naming the role | fixed | class 1 before 4 and 16. P: performed by hand, and grants follow the role's oid | ✓ ADR-0010 §3 |
 
+Policy teardown names the base table: class-0 `DropPolicy` runs before its
+class-1 rename. Its replacement `CreatePolicy` and `SetRowSecurity` use the
+final table name; pairing uses the retained table UID, so a new table reusing
+the old spelling is independent (DEC-1173.1, DEC-1173.2).
+
 ### Something created before what needs it
 
 **Rule:** a change that creates an object runs in a lower class than every
@@ -537,7 +551,10 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Structural/table changes, module creates/alters and `PublicExecution` → `CreatePolicy` or `SetRowSecurity` | fixed | shared `row_security::edges` setup phase, settled by the CLI schedule and resolver graph; bootstrap inserts finish before either kind | ✓ DEC-1172.2 |
 | `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType`, policy-changing table/column rename or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; a retained owner refuses with #1173 | ✓ DEC-1172.1 |
-| `CreatePolicy` → `SetRowSecurity` | fixed | shared setup phase: policies at (14, 2), flags at (14, 3). Policies on one table commute with each other; flags on separate created tables commute | ✓ DEC-1172.2 |
+| `CreateModule`, `AlterModule` or `PublicExecution` → `CreatePolicy` | fixed | shared setup edges; modules finish before policies at (14, 2) | ✓ DEC-1173.2 |
+| `AddColumn` → `CreatePolicy` | fixed | class 8 before (14, 2), retained by shared setup edges | ✓ DEC-1173.2 |
+| `DropPolicy` → `CreatePolicy` replacing the same owner UID and name | fixed | class 0 before (14, 2), retained by shared setup edges; full old/new payloads, no predicate analysis | ✓ DEC-1173.2 |
+| `DropPolicy` or `CreatePolicy` → `SetRowSecurity` | fixed | shared setup phase: drops in class 0, creates at (14, 2), flags at (14, 3); both Created and Standing origins | ✓ DEC-1173.2 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315); on SQL Server a schema-bound function caller also requires the callee's `Final` definition, so its in-place rewrite orders the pair in the effects. Releasing a baseline schema binding instead precedes the old callee's rewrite through `BeforeRewrite`, settled by the shared schedule | ✓ DEC-2192.1, DEC-2228.1 |
@@ -560,6 +577,7 @@ one class and the dependents a class cannot see.
 
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
+| `DropPolicy` → `DropModule`, `DropColumn` or `AlterColumnType` | fixed | class 0 before every module-drop rank and before classes 5/9; shared teardown edges survive settlement, including drop-only plans | ✓ DEC-1173.2 |
 | Dependent module → its table, column or retyped column | fixed | class 0 first. P: rebuilt around a retype from the catalog | ✓ DECISIONS 311; `to_rebuild` |
 | Catalog dependents of a dropped or rebuilt module | engine | `weave`, an expansion: added steps and `Catalog` edges, settled after each rewrite | ✓ DECISIONS 311, DEC-942.1, DEC-1958.2 |
 | `DropModule` → `DropModule` of a module it names | fixed | `drop_rank`, deepest first inside class 0, from the base's lexed names | ✓ DECISIONS 311, 315 |
@@ -601,6 +619,7 @@ one class and the dependents a class cannot see.
 |---|---|---|---|
 | Retype → probes of later keys, checks and deletes | value | the probe projects through the new type, or the probe is unchecked | ✓ DECISIONS 340, 410 |
 | `AddColumn` backfill → probes | value | a literal is projected; an expression, identity or generated column is unchecked | ✓ DECISIONS 336, 339 |
+| `DeleteRow` → `SetRowSecurity` | value | class 12 before (14, 3), retained by shared setup edges; row guards see the pre-change flags | ✓ DEC-1173.2 |
 | Row writes → probes of keys, foreign keys and checks | value | the probe reads the rows after the plan's writes | ✓ DECISIONS 335 |
 | Row writes setting a column, or deleting the rows that hold its NULLs → tightening it to NOT NULL | fixed, value | (12, 2), after the rows of its table; split from a retype; the probe reads the rows after the plan's writes | ✓ DEC-1367.1 |
 | `AlterColumnExpression` → tightening, keys, checks, filtered indexes, deletes | value | the probe is unchecked; the order is tighten and keys after the recomputation | ✓ DEC-1168.1 |

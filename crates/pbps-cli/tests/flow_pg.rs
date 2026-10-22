@@ -32396,7 +32396,8 @@ fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration
             let name = pbps_model::TableName::new("app", name);
             assert_eq!(snapshot.schema.tables[&name], loaded.tables[&name]);
         }
-        // A declaration edit on that adopted table names the future boundary.
+        // The differ can plan a standing flag edit, but PostgreSQL SQL
+        // delivery still names PR C's boundary (DEC-1173.2).
         let path = d.dir.join("schema/app.disabled.yml");
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("\nrow_security: {enabled: true}\n");
@@ -32404,10 +32405,18 @@ fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration
         let refused = d.run(&["plan", "--db", connection]);
         assert_ne!(code(&refused), 0);
         assert!(
-            stderr(&refused).contains("arrives with #1173"),
+            stderr(&refused).contains(
+                "standing-table row-security SQL delivery arrives with later PRs of #1173"
+            ),
             "{}",
             stderr(&refused)
         );
+        assert!(
+            stderr(&refused).contains("app.disabled"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(text_of(connection, catalog), before);
     }
 }
 
