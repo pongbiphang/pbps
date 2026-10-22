@@ -1087,6 +1087,28 @@ fn differences(
     target: &AuthorizationContext,
     reproduced: &AuthorizationContext,
 ) -> Vec<String> {
+    let mut found = differences_except_schema_owners(map, target, reproduced);
+    for (name, want) in &target.schemas {
+        // Legacy verification has no owner partition to establish equivalence;
+        // the engine's own schemas retain their engine-supplied owners.
+        if !SYSTEM_SCHEMAS.contains(&name.as_str())
+            && let Some(got) = reproduced.schemas.get(name)
+            && map
+                .logical_of(&got.owner)
+                .unwrap_or_else(|| got.owner.clone())
+                != want.owner
+        {
+            found.push(format!("schema:{name}:owner"));
+        }
+    }
+    found
+}
+
+fn differences_except_schema_owners(
+    map: &PrincipalMap,
+    target: &AuthorizationContext,
+    reproduced: &AuthorizationContext,
+) -> Vec<String> {
     let logical =
         |name: &pbps_model::RoleName| map.logical_of(name).unwrap_or_else(|| name.to_owned());
     let mapped = |grants: &[Grant]| -> Vec<Grant> {
@@ -1129,12 +1151,8 @@ fn differences(
         if got.permissions != want.permissions {
             found.push(format!("schema:{name}:permissions"));
         }
-        // The engine's own schemas keep the engine's owner on both sides.
         if SYSTEM_SCHEMAS.contains(&name.as_str()) {
             continue;
-        }
-        if logical(&got.owner) != want.owner {
-            found.push(format!("schema:{name}:owner"));
         }
         if mapped(&got.grants) != want.grants {
             found.push(format!("schema:{name}:grants"));

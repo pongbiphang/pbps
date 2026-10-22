@@ -105,7 +105,85 @@ async fn owners(
     auth::OwnerPartition::from_capture(&captured, context).unwrap()
 }
 
+async fn object_acl(conn: &mut Conn) -> Vec<String> {
+    conn.query(
+        "SELECT CONCAT(major_id,N':',permission_name,N':',state,N':',minor_id,N':',grantee_principal_id,N':',grantor_principal_id) AS permission \
+         FROM sys.database_permissions WHERE class=1 AND major_id IN(OBJECT_ID(N'app.ref'),OBJECT_ID(N'other.owned')) \
+         ORDER BY major_id,permission_name,state,minor_id,grantee_principal_id,grantor_principal_id;",
+    )
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.try_get::<&str>("permission").unwrap().unwrap().to_owned())
+    .collect()
+}
+
 impl Fixture {
+    async fn reassign_owner_to_acl_role(&mut self) -> (Prepared, String, String) {
+        self.target
+            .execute(
+                "CREATE USER app_owner WITHOUT LOGIN; CREATE ROLE zz_acl_role; \
+             GRANT SELECT ON OBJECT::app.ref TO zz_acl_role WITH GRANT OPTION; \
+             GRANT SELECT ON OBJECT::app.ref(i) TO dep AS zz_acl_role;",
+            )
+            .await
+            .unwrap();
+        self.target
+            .execute("CREATE SCHEMA other AUTHORIZATION app_owner;")
+            .await
+            .unwrap();
+        self.target
+            .execute("CREATE TABLE other.owned(i int);")
+            .await
+            .unwrap();
+        let mut p = self
+            .prepare(
+                false,
+                &[TABLE[0], "CREATE TABLE other.owned(i int);"],
+                OWNER_ALIAS_OBJECTS,
+            )
+            .await;
+        let rows = self
+            .scratch
+            .query(
+                "SELECT USER_NAME(s.principal_id) AS old_owner, r.name AS acl_role \
+             FROM sys.schemas s CROSS JOIN sys.database_permissions p \
+             JOIN sys.database_principals r ON r.principal_id=p.grantee_principal_id \
+             WHERE s.name=N'other' AND p.class=1 AND p.major_id=OBJECT_ID(N'app.ref') \
+             AND p.minor_id=0 AND p.permission_name=N'SELECT' AND p.state=N'W' AND r.type=N'R';",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let old_owner = rows[0]
+            .try_get::<&str>("old_owner")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        let acl_role = rows[0]
+            .try_get::<&str>("acl_role")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_ne!(old_owner, acl_role);
+        let acl = object_acl(&mut self.scratch).await;
+        // Reassign every subject in app_owner's group. The existing role's
+        // grantee and grantor rows on app.ref must keep their ACL identities.
+        self.scratch
+            .execute(&format!(
+                "ALTER AUTHORIZATION ON SCHEMA::other TO [{acl_role}]; \
+                 ALTER AUTHORIZATION ON OBJECT::other.owned TO [{acl_role}];",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(object_acl(&mut self.scratch).await, acl);
+        let mut local = p.context.clone();
+        local.principal.effective = p.map.deployer(&p.context).unwrap();
+        p.current_owners = owners(&mut self.scratch, &local, OWNER_ALIAS_OBJECTS).await;
+        assert!(p.target_owners.verify(&p.current_owners).is_ok());
+        (p, old_owner, acl_role)
+    }
+
     async fn prepare(
         &mut self,
         dbo: bool,
@@ -206,6 +284,7 @@ impl Fixture {
 
 const TABLE: &[&str] = &["CREATE TABLE app.ref(i int CONSTRAINT ref_key PRIMARY KEY,j int);"];
 const OBJECTS: &[(&str, &str)] = &[("app", "ref")];
+const OWNER_ALIAS_OBJECTS: &[(&str, &str)] = &[("app", "ref"), ("other", "owned")];
 
 async fn error_code(conn: &mut Conn, sql: &str) -> String {
     conn.execute(sql)
@@ -620,6 +699,56 @@ async fn owner_equality_across_schemas_is_preserved() {
         f.enter(&p).await.unwrap();
         assert!(f.verify(&p).await.is_empty());
     }).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn equivalent_owner_role_keeps_acl_principals_and_still_detects_extra_grants() {
+    case("owner_acl_alias", |mut f| async move {
+        let (p, old_owner, _) = f.reassign_owner_to_acl_role().await;
+        f.enter(&p).await.unwrap();
+        let differences = f.verify(&p).await;
+        assert!(
+            differences.is_empty(),
+            "equivalent ownership must preserve ACL principal identities: {differences:?}"
+        );
+        f.scratch.execute("SELECT i FROM app.ref;").await.unwrap();
+        // This changes the recorded ACL without changing the deployer's
+        // effective permission answers.
+        f.scratch_admin
+            .execute(&format!(
+                "GRANT UPDATE ON OBJECT::app.ref TO [{old_owner}];",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(f.verify(&p).await, ["staged:permissions"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn non_equivalent_owner_role_refuses_with_matching_acl_rows() {
+    case("owner_acl_partition", |mut f| async move {
+        let (mut p, old_owner, _) = f.reassign_owner_to_acl_role().await;
+        let acl = object_acl(&mut f.scratch).await;
+        // Split the schema/object owner group with the recorded ACLs unchanged.
+        f.scratch.execute(&format!(
+            "ALTER AUTHORIZATION ON OBJECT::other.owned TO [{old_owner}];",
+        )).await.unwrap();
+        assert_eq!(object_acl(&mut f.scratch).await, acl);
+        let mut local = p.context.clone();
+        local.principal.effective = p.map.deployer(&p.context).unwrap();
+        p.current_owners = owners(&mut f.scratch, &local, OWNER_ALIAS_OBJECTS).await;
+        assert!(p.target_owners.verify(&p.current_owners).is_err());
+        f.enter(&p).await.unwrap();
+        let error = auth::verify_staged_authorization(
+            &mut f.scratch, &p.map, &p.context, &p.schemas,
+            &p.target_owners, &p.current_owners,
+        ).await.unwrap_err();
+        assert!(matches!(error, DbError::Refused(ref message) if message.contains("staged effective-owner equality differs")));
+    })
+    .await;
 }
 
 #[tokio::test]

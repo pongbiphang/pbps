@@ -1956,6 +1956,8 @@
         "deployer2267::trustworthy_scratch_refuses_before_dbo_entry",
         "deployer2267::dbo_deployer_cannot_leave_scratch",
         "deployer2267::owner_equality_across_schemas_is_preserved",
+        "deployer2267::equivalent_owner_role_keeps_acl_principals_and_still_detects_extra_grants",
+        "deployer2267::non_equivalent_owner_role_refuses_with_matching_acl_rows",
         "deployer2267::different_effective_owner_refuses",
         "deployer2267::ownership_is_replayed_before_object_acl"
       ]

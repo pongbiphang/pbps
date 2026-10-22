@@ -424,29 +424,28 @@ pub async fn verify_staged_authorization(
     target_owners.verify(current_owners)?;
     let mut got = read(conn, schemas).await?;
     read_staged_permissions(conn, &mut got, current_owners).await?;
-    let mut owner_map = map.clone();
-    for (subject, owner) in &target_owners.owners {
-        // Partition equality proves a bijection, including both anchors.
-        // An equivalent file-created owner need not use our generated name.
-        let current = current_owners.owners.get(subject).ok_or_else(|| {
-            DbError::BadRow("an owner subject disappeared after verification".into())
-        })?;
-        owner_map
-            .to_run_local
-            .insert(owner.clone(), current.clone());
-    }
-    let mut found = differences(&owner_map, target, &got);
+    // The partition already compared schema and object ownership. Its owner
+    // aliases cannot normalize ACL principals: an owner may also hold a grant
+    // under a different logical identity in the unchanged principal map.
+    let mut found = differences_except_schema_owners(map, target, &got);
     let logical =
-        |name: &pbps_model::RoleName| owner_map.logical_of(name).unwrap_or_else(|| name.clone());
+        |name: &pbps_model::RoleName| map.logical_of(name).unwrap_or_else(|| name.clone());
     for object in got.staged.values_mut() {
-        object.owner = logical(&object.owner);
         for grant in &mut object.grants {
             grant.grantee = logical(&grant.grantee);
             grant.grantor = logical(&grant.grantor);
         }
         object.grants.sort();
     }
-    if target.staged != got.staged {
+    if !target
+        .staged
+        .iter()
+        .map(|(id, object)| (id, &object.permissions, &object.grants))
+        .eq(got
+            .staged
+            .iter()
+            .map(|(id, object)| (id, &object.permissions, &object.grants)))
+    {
         found.push("staged:permissions".into());
     }
     Ok(found)
