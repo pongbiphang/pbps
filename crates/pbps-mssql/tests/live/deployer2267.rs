@@ -314,6 +314,137 @@ async fn nested_role_denies_and_column_exceptions_are_replayed() {
 
 #[tokio::test]
 #[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn object_grant_option_covers_column_grant_chains_without_extra_acl_rows() {
+    case("object_column_chain", |mut f| async move {
+        // A different upstream grantor keeps SQL Server from normalizing away
+        // a redundant column option incorrectly synthesized under dbo.
+        f.target
+            .execute(
+                "CREATE USER g WITHOUT LOGIN; CREATE USER h WITHOUT LOGIN; \
+                 GRANT SELECT ON OBJECT::app.ref TO h WITH GRANT OPTION; \
+                 GRANT SELECT ON OBJECT::app.ref TO g WITH GRANT OPTION AS h; \
+                 GRANT SELECT ON OBJECT::app.ref(i) TO dep AS g; \
+                 GRANT SELECT ON OBJECT::app.ref(j) TO outer_role AS g;",
+            )
+            .await
+            .unwrap();
+        let p = f.prepare(false, TABLE, OBJECTS).await;
+        let rows = f
+            .scratch_admin
+            .query(
+                "SELECT minor_id,state FROM sys.database_permissions \
+             WHERE class=1 AND major_id=OBJECT_ID(N'app.ref');",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4, "replay must not add an ACL row");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.try_get::<&str>("state").unwrap() == Some("W"))
+                .map(|row| row.try_get::<i32>("minor_id").unwrap().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 0],
+            "only the object-level grant options may remain",
+        );
+        f.enter(&p).await.unwrap();
+        assert!(f.verify(&p).await.is_empty());
+        f.scratch.execute("SELECT i,j FROM app.ref;").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn column_grantors_without_captured_capabilities_get_only_the_needed_column_options() {
+    case("column_chain_roots", |mut f| async move {
+        f.target
+            .execute("CREATE USER g WITHOUT LOGIN;")
+            .await
+            .unwrap();
+        // No object or column grant option means the engine refuses the grant.
+        assert_eq!(
+            error_code(
+                &mut f.target,
+                "GRANT SELECT ON OBJECT::app.ref(i) TO dep AS g;"
+            )
+            .await,
+            "15151",
+        );
+        f.target
+            .execute(
+                "GRANT SELECT ON OBJECT::app.ref(i,j) TO g WITH GRANT OPTION; \
+                 GRANT SELECT ON OBJECT::app.ref(i,j) TO dep AS g;",
+            )
+            .await
+            .unwrap();
+        let mut p = f.prepare(false, TABLE, OBJECTS).await;
+        // Supply only the downstream rows to exercise missing-capability
+        // inference; clear the first replay so no previous ACL can enable it.
+        p.context
+            .staged
+            .get_mut(&capture::object("app", "ref"))
+            .unwrap()
+            .grants
+            .retain(|grant| grant.grantee.raw() == "dep");
+        f.scratch
+            .execute("ALTER AUTHORIZATION ON OBJECT::app.ref TO SCHEMA OWNER;")
+            .await
+            .unwrap();
+        auth::replay_staged_permissions(
+            &mut f.scratch,
+            &p.map,
+            &p.context,
+            &p.target_owners,
+            &p.current_owners,
+        )
+        .await
+        .unwrap();
+        let captured = &p.context.staged[&capture::object("app", "ref")].grants;
+        assert_eq!(captured.len(), 2);
+        assert!(captured.iter().all(|grant| matches!(
+            grant.scope,
+            auth::PermissionScope::Column {
+                state: auth::ColumnPermissionState::Permission(auth::PermissionState::Grant),
+                ..
+            }
+        )));
+        // Neither pass has a captured grant option. Each must infer its own
+        // column option, without borrowing the sibling's or widening to object.
+        let rows = f
+            .scratch_admin
+            .query(
+                "SELECT minor_id,state FROM sys.database_permissions \
+             WHERE class=1 AND major_id=OBJECT_ID(N'app.ref');",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        for column in [1, 2] {
+            assert_eq!(
+                rows.iter()
+                    .filter(
+                        |row| row.try_get::<i32>("minor_id").unwrap() == Some(column)
+                            && row.try_get::<&str>("state").unwrap() == Some("W")
+                    )
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| row.try_get::<i32>("minor_id").unwrap() != Some(0))
+        );
+        f.enter(&p).await.unwrap();
+        // The minimal inferred rows are visible to this deployer, so final
+        // verification refuses rather than accepting extra captured authority.
+        assert!(f.verify(&p).await.contains(&"staged:permissions".into()));
+        f.scratch.execute("SELECT i,j FROM app.ref;").await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
 async fn column_revoke_is_preserved() {
     case("revoke",|mut f| async move {
         f.target.execute("GRANT SELECT ON OBJECT::app.ref TO outer_role; REVOKE SELECT ON OBJECT::app.ref(j) FROM outer_role;").await.unwrap();

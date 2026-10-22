@@ -798,7 +798,15 @@ pub async fn reconstruct_database(
             admin.query(&statement).await?;
         }
         let on = format!(" ON SCHEMA::{}", bracket(name));
-        replay(admin, map, &schema.owner, &schema.grants, &on).await?;
+        replay(
+            admin,
+            map,
+            &schema.owner,
+            &schema.grants,
+            &on,
+            &mut BTreeSet::new(),
+        )
+        .await?;
     }
     replay(
         admin,
@@ -806,6 +814,7 @@ pub async fn reconstruct_database(
         &pbps_model::RoleName::from("dbo"),
         &context.database_grants,
         "",
+        &mut BTreeSet::new(),
     )
     .await?;
     // Grouped by the principal they are on, each group a securable of its
@@ -838,7 +847,7 @@ pub async fn reconstruct_database(
             (None, "ROLE") => &default_owner,
             (None, _) => logical,
         };
-        replay(admin, map, owner, &grants, &on).await?;
+        replay(admin, map, owner, &grants, &on, &mut BTreeSet::new()).await?;
     }
     Ok(())
 }
@@ -874,13 +883,15 @@ enum Step<'a> {
 /// deployer can see is replayed as it is. The added row is as invisible to
 /// the scratch deployer as the target's is to the real one, and `verify`
 /// refuses the reconstruction if it ever is not.
+/// `able` retains both replayed and inferred grant options so object options
+/// can seed column replay without adding a narrower grant the target lacks.
 fn replay_order<'a>(
     owner: &pbps_model::RoleName,
     grants: &'a [Grant],
+    able: &mut BTreeSet<(&'a pbps_model::RoleName, &'a str)>,
 ) -> Result<Vec<Step<'a>>, DbError> {
     let mut steps = Vec::new();
     let mut pending: Vec<&Grant> = grants.iter().collect();
-    let mut able: BTreeSet<(&pbps_model::RoleName, &str)> = BTreeSet::new();
     while !pending.is_empty() {
         let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|grant| {
             &grant.grantor == owner
@@ -941,12 +952,13 @@ fn replay_order<'a>(
 
 /// Replays grant rows in [`replay_order`], each under its own grantor, so
 /// the scratch side records who granted what as the target does.
-async fn replay(
+async fn replay<'a>(
     admin: &mut impl QueryConnection,
     map: &PrincipalMap,
     owner: &pbps_model::RoleName,
-    grants: &[Grant],
+    grants: &'a [Grant],
     on: &str,
+    able: &mut BTreeSet<(&'a pbps_model::RoleName, &'a str)>,
 ) -> Result<(), DbError> {
     // `dbo` owns the database-level securable and is named by no row of a
     // context that grants nothing through it, so it may be absent from the map.
@@ -961,7 +973,7 @@ async fn replay(
             ))
         })
     };
-    for step in replay_order(owner, grants)? {
+    for step in replay_order(owner, grants, able)? {
         let statement = match step {
             Step::Enable {
                 grantor,
@@ -1257,7 +1269,14 @@ mod tests {
             "GRANT",
         )];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &invisible).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &invisible,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             ["enable EXECUTE for wgo", "GRANT EXECUTE to dep by wgo"]
         );
 
@@ -1284,7 +1303,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &visible).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &visible,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "GRANT_WITH_GRANT_OPTION EXECUTE to wgo by app_owner",
                 "DENY SELECT to dep by app_owner",
@@ -1310,7 +1336,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &half).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &half,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "enable EXECUTE for root",
                 "GRANT_WITH_GRANT_OPTION EXECUTE to mid by root",
@@ -1335,7 +1368,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &other).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &other,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "GRANT_WITH_GRANT_OPTION SELECT to wgo by app_owner",
                 "enable EXECUTE for wgo",
@@ -1378,9 +1418,13 @@ mod tests {
                 "GRANT_WITH_GRANT_OPTION",
             ),
         ];
-        let refused = replay_order(&pbps_model::RoleName::from("app_owner"), &cycle)
-            .unwrap_err()
-            .to_string();
+        let refused = replay_order(
+            &pbps_model::RoleName::from("app_owner"),
+            &cycle,
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(refused.contains("name each other"), "{refused}");
     }
 

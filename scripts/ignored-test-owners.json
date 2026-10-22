@@ -1948,6 +1948,8 @@
         "deployer2267::object_references_grant_is_replayed",
         "deployer2267::object_references_deny_is_replayed",
         "deployer2267::nested_role_denies_and_column_exceptions_are_replayed",
+        "deployer2267::object_grant_option_covers_column_grant_chains_without_extra_acl_rows",
+        "deployer2267::column_grantors_without_captured_capabilities_get_only_the_needed_column_options",
         "deployer2267::column_revoke_is_preserved",
         "deployer2267::dbo_deployer_ignores_object_deny_as_on_the_target",
         "deployer2267::ordinary_deployer_obeys_the_same_object_deny",

@@ -368,7 +368,16 @@ pub async fn replay_staged_permissions(
                 state: state.name().into(),
             });
         }
-        for (column, grants) in groups {
+        let mut object_able = BTreeSet::new();
+        for (column, grants) in &groups {
+            // Object grant options also cover its columns. Each column starts
+            // with those capabilities, never with a sibling column's options.
+            let mut column_able = object_able.clone();
+            let able = if column.is_none() {
+                &mut object_able
+            } else {
+                &mut column_able
+            };
             let column = column
                 .map(|name| format!(" ({})", bracket(name)))
                 .unwrap_or_default();
@@ -376,8 +385,9 @@ pub async fn replay_staged_permissions(
                 conn,
                 map,
                 &object.owner,
-                &grants,
+                grants,
                 &format!(" ON OBJECT::{name}{column}"),
+                able,
             )
             .await?;
         }
