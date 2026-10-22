@@ -18,6 +18,9 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/row_security_roundtrip.rs"]
+mod row_security_roundtrip;
+
 #[path = "support/raised_messages.rs"]
 mod raised_messages;
 
