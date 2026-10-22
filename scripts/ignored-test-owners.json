@@ -723,6 +723,7 @@
         "a_restrict_foreign_key_round_trips_and_its_actions_change_on_both_servers",
         "a_dropped_constraint_trigger_frees_its_name_for_a_key",
         "constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach",
+        "unmanaged_constraint_trigger_clones_predict_the_later_key_name_on_both_servers",
         "an_attach_refuses_unmanaged_names_of_planned_parent_row_triggers",
         "a_routine_rebuild_refuses_its_constraint_triggers_own_comment",
         "an_index_follows_its_table_through_a_chain_of_moves",

@@ -8030,8 +8030,14 @@ the new trigger name.
 The catalog holder retains both its actual constraint name and its parent
 trigger identity. Replay frees a clone with that parent, while table
 renames move its owner and the parent's address independently. Baseline
-modules and the shared partition relation seed the clone producers; module
-creation or alteration, partition creation and attach add companions only
+modules and the shared partition relation seed the clone producers. Connected
+plans also seed them from catalog constraint row triggers on partitioned
+tables, including unmanaged triggers under `ignore` or `warn`; declared
+definitions win for the same parent and trigger. The existing holder read
+includes producers by their current trigger name's wanted prefix in any
+schema, even when a rename left their companion under an unrelated name.
+Offline plans retain only the declared baseline. Module creation or
+alteration, partition creation and attach add companions only
 where they stand at that position. Drop and detach remove them. Ordinary
 triggers create no companion. These are schema-wide key candidates, not
 the table-local slots of DEC-2100.1; no ordering pass or change kind is added.
@@ -8042,6 +8048,11 @@ ordinary/unrelated-trigger controls. The connected live
 `constraint_trigger_clones_predict_the_key_name_after_a_drop_or_attach`
 refuses a regclass reference to the actual later index, then applies after
 the reference is removed and verifies its name on both servers.
+`catalog_constraint_trigger_producers_follow_partition_and_parent_changes`
+pins catalog seeding, declared precedence and parent/partition lifetimes.
+`unmanaged_constraint_trigger_clones_predict_the_later_key_name_on_both_servers`
+covers unmanaged, renamed producers across schemas for both attach and create,
+with an ordinary-trigger control, on both servers (#2276).
 
 <a id="dec-2102-1"></a>
 
