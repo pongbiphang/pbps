@@ -1678,7 +1678,7 @@ fn cmd_pull(
 /// calls [`policy_context_at`] (DEC-1943.1).
 fn policy_context(
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     connected: bool,
 ) -> pbps_policy::Context {
     policy_context_at(project, dialect, connected, unix_seconds())
@@ -1693,7 +1693,7 @@ fn policy_context(
 /// what makes two evaluations comparable (DEC-1943.1).
 fn policy_context_at(
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     connected: bool,
     now: i64,
 ) -> pbps_policy::Context {
@@ -1718,7 +1718,7 @@ fn policy_context_at(
 pub fn attach_policy_findings(
     cs: &mut PlanningPlan,
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     connected: bool,
 ) -> Vec<output::Finding> {
     let policies = project.config.policies();
@@ -1755,18 +1755,14 @@ pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
 /// Still a `Result`, though nothing refuses today: every caller threads it
 /// through `or_unanswerable` under `project.unsupported-dialect`, and that is
 /// the finding a third dialect gets while its crate is being built.
-fn dialect(
-    project: &Project,
-) -> anyhow::Result<Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>>> {
+fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
     Ok(dialect_for(project.config.dialect))
 }
 
 /// The dialect implementation for a configured name. One of two places in
 /// this crate that names an engine to choose it; `db::driver_for` is the
 /// other, and `engine` routes by what the connection turned out to be.
-pub(crate) fn dialect_for(
-    name: DialectName,
-) -> Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>> {
+pub(crate) fn dialect_for(name: DialectName) -> Box<dyn Dialect> {
     match name {
         DialectName::Mssql => Box::new(pbps_mssql::Mssql),
         DialectName::Postgres => Box::new(pbps_pg::Postgres::new()),
@@ -1818,7 +1814,7 @@ pub(crate) fn load_quiet(
 pub(crate) fn routine_ids_as_the_dialect_spells_them(
     schema: &mut pbps_model::Schema,
     hints: &mut pbps_model::Hints,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Vec<String> {
     let spell = |id: &pbps_model::ModuleId| -> pbps_model::ModuleId {
         match id {
@@ -1942,10 +1938,7 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
 /// that ask only which schemas and object names a project mentions skip it,
 /// since an argument list is part of neither answer; its grant scope, which
 /// is keyed by routine identity, runs it (#566).
-fn load(
-    project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> anyhow::Result<pbps_load::Loaded> {
+fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
     let mut loaded = load_quiet(project).map_err(|errs| {
         let count = errs.len();
         for e in errs {
@@ -1978,7 +1971,7 @@ fn load(
 /// them (DECISIONS 141).
 pub(crate) fn declaration_problems(
     loaded: &pbps_load::Loaded,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Vec<(&'static str, String)> {
     declaration_problems_with_sources(loaded, dialect, &Default::default())
 }
@@ -1987,7 +1980,7 @@ pub(crate) fn declaration_problems(
 // never escape these sentences whole until #2084 step 5 (DEC-2084.1).
 fn declaration_problems_with_sources(
     loaded: &pbps_load::Loaded,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     conflicts: &pbps_load::SourceConflicts,
 ) -> Vec<(&'static str, String)> {
     let schema = &loaded.schema;
@@ -2205,7 +2198,7 @@ fn context(root: &std::path::Path) -> Context {
 /// (DECISIONS 187).
 fn types_as_the_dialect_spells_them(
     schema: &pbps_model::Schema,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> pbps_model::Schema {
     let mut out = schema.clone();
     for table in out.tables.values_mut() {
@@ -2226,7 +2219,7 @@ fn types_as_the_dialect_spells_them(
 /// looked.
 pub fn validate_findings(
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     since: Option<&str>,
 ) -> (Vec<output::Finding>, ValidateData) {
     let dir = project.schema_dir();
@@ -2250,7 +2243,7 @@ pub fn validate_findings(
 
 fn validate_inspected(
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     since: Option<&str>,
     mut loaded: Result<&mut pbps_load::Loaded, &Vec<pbps_load::LoadError>>,
     source_conflicts: &pbps_load::SourceConflicts,
@@ -2404,7 +2397,7 @@ fn validate_inspected(
 /// spells, which is how a rule is bypassed by an alias.
 pub(crate) fn declaration_policy_findings(
     project: &Project,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     schema: &Schema,
     only: Option<std::collections::BTreeSet<String>>,
     now: i64,
@@ -3669,7 +3662,7 @@ fn rendered_plan(plan: &pbps_model::SavedPlan) -> anyhow::Result<String> {
 /// that escapes into a chat or a ticket still carries its own warning label.
 fn render_sql(
     cs: &pbps_model::ChangeSet,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     baseline: &str,
 ) -> anyhow::Result<String> {
     // An offline plan is never staged: `--staged` needs a target.
@@ -3691,7 +3684,7 @@ fn render_sql(
 /// stops it, and renders once the zone is known (DEC-1916.1).
 pub(crate) fn sql_script(
     statements: &[pbps_dialect::Statement],
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     baseline: &str,
     zone: &pbps_model::SessionZone,
 ) -> String {
@@ -3709,7 +3702,7 @@ pub(crate) fn sql_script(
 /// change at a time.
 pub(crate) fn statements(
     cs: &pbps_model::ChangeSet,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     mode: pbps_model::PlanMode,
 ) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
     let mut statements = Vec::new();
@@ -3724,7 +3717,7 @@ pub(crate) fn statements(
 /// otherwise for it (#1638, DEC-1638.1), so everything that counts a staged
 /// plan's statements per change counts these.
 pub(crate) fn emitted(
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     p: &pbps_model::PlannedChange,
     mode: pbps_model::PlanMode,
 ) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
@@ -3811,7 +3804,7 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
 /// that rebuilds modules makes an `AlterModule` another `CREATE`.
 fn public_execution_decisions_match_their_modules(
     cs: &pbps_model::ChangeSet,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
     use pbps_model::{Change, ModuleId, RoutineOrigin};
 
@@ -3938,7 +3931,7 @@ fn public_execution_decisions_match_their_modules(
 /// plan.
 pub(crate) fn validate_saved_plan(
     plan: &pbps_model::SavedPlan,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> anyhow::Result<()> {
     crate::engine::validate_plan_analysis(plan)?;
     // A matching checksum approves these bytes, not a broader execution mode

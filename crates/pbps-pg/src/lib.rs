@@ -771,24 +771,54 @@ fn default_problems(
     found
 }
 
-impl Dialect for Postgres {
-    type Plan = dyn pbps_diff::order::PlanView;
-
-    fn validate_plan_analysis(
-        &self,
-        plan: &pbps_model::SavedPlan,
-    ) -> Result<(), pbps_dialect::PlanAnalysisError> {
-        plan.validate_analysis()?;
-        if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
-            if plan.dialect != "postgres" {
-                return Err(pbps_dialect::PlanAnalysisError::Unsupported(
-                    plan.dialect.clone(),
-                ));
-            }
-            resolver::validate_evidence(evidence)?;
-        }
-        Ok(())
-    }
+/// Admission binds the checker, even when the wire artifact was loaded by a
+/// different crate; neither direction may reach the other engine's lowering.
+///
+/// ```compile_fail
+/// fn pg_admission_cannot_reach_mssql(wire: pbps_model::SavedPlan) {
+///     let checksum = wire.checksum();
+///     let plan = pbps_diff::order::admit(wire, &pbps_pg::Postgres::new(),
+///         std::path::Path::new("plan.json"), &checksum).unwrap();
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(&plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_admission_cannot_reach_pg(wire: pbps_model::SavedPlan) {
+///     let checksum = wire.checksum();
+///     let plan = pbps_diff::order::admit(wire, &pbps_mssql::Mssql,
+///         std::path::Path::new("plan.json"), &checksum).unwrap();
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(&plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+///
+/// Ordered and newly sealed inputs retain that same brand:
+///
+/// ```compile_fail
+/// fn pg_order_cannot_reach_mssql(plan: &pbps_diff::order::OrderedPlan<pbps_pg::Postgres>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_order_cannot_reach_pg(plan: &pbps_diff::order::OrderedPlan<pbps_mssql::Mssql>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn pg_seal_cannot_reach_mssql(plan: &pbps_diff::order::SealedPlan<pbps_pg::Postgres>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_mssql::Mssql>(plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mssql_seal_cannot_reach_pg(plan: &pbps_diff::order::SealedPlan<pbps_mssql::Mssql>) {
+///     let _ = pbps_dialect::lower::lower_plan::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+impl pbps_dialect::PlanDialect for Postgres {
+    type Plan = dyn pbps_diff::order::PlanView<Self>;
 
     fn emit_ordered(
         &self,
@@ -806,6 +836,24 @@ impl Dialect for Postgres {
     ) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
         self.emit_staged(&planned.change, planned.strategy)
+    }
+}
+
+impl Dialect for Postgres {
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), pbps_dialect::PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+            if plan.dialect != "postgres" {
+                return Err(pbps_dialect::PlanAnalysisError::Unsupported(
+                    plan.dialect.clone(),
+                ));
+            }
+            resolver::validate_evidence(evidence)?;
+        }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -7040,9 +7088,9 @@ mod certified_emission_tests {
             .emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
-            let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode);
+            let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode, &dialect);
             let emitted = pbps_dialect::lower::lower_plan(
-                &ordered as &dyn pbps_diff::order::PlanView,
+                &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
                 &dialect,
             )
             .unwrap();
@@ -7078,7 +7126,7 @@ mod certified_emission_tests {
         assert_ne!(transactional, staged);
 
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
-            let ordered = singleton(change.clone(), mode);
+            let ordered = singleton(change.clone(), mode, &dialect);
             let mut wire = SavedPlan::new(
                 PlanOrigin::Database,
                 dialect.name(),
@@ -7111,7 +7159,7 @@ mod certified_emission_tests {
                 PlanMode::Transactional => &transactional,
                 PlanMode::Staged => &staged,
             };
-            for input in [&ordered as &dyn PlanView, &sealed, &admitted] {
+            for input in [&ordered as &dyn PlanView<Postgres>, &sealed, &admitted] {
                 assert_eq!(input.mode(), mode);
                 let lowered = pbps_dialect::lower::lower_plan(input, &dialect).unwrap();
                 assert_eq!(lowered.statements(), expected);

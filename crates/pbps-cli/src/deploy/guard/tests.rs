@@ -479,8 +479,7 @@ fn touching_a_table_keeps_each_scalar_at_every_read() {
             _ => unreachable!(),
         };
         let pg = pbps_pg::Postgres::new();
-        let dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView> =
-            if field == 3 { &pbps_mssql::Mssql } else { &pg };
+        let dialect: &dyn pbps_dialect::Dialect = if field == 3 { &pbps_mssql::Mssql } else { &pg };
         for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
             refuse_unplanned_movement(
                 dialect,
@@ -2000,8 +1999,7 @@ fn a_rename_into_a_retired_name_carries_untouched_references() {
         ..Default::default()
     };
     for dialect in [
-        &pbps_pg::Postgres::new()
-            as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
     ] {
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
@@ -2069,8 +2067,7 @@ fn a_refilled_rename_source_keeps_the_moved_tables_incoming_reference() {
         ..Default::default()
     };
     for dialect in [
-        &pbps_pg::Postgres::new()
-            as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
     ] {
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
@@ -2132,8 +2129,7 @@ fn closing_reads_keep_untouched_references_after_the_parent_has_moved() {
         defaults: vec![],
     }]);
     for dialect in [
-        &pbps_pg::Postgres::new()
-            as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
     ] {
         super::super::staged_comparison(
@@ -2203,8 +2199,7 @@ fn incoming_references_follow_column_identity_through_a_name_swap() {
         ..Default::default()
     };
     for dialect in [
-        &pbps_pg::Postgres::new()
-            as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
     ] {
         refuse_unplanned_movement(dialect, &changes, &before, &after, "test", Settled::Closing)
@@ -2377,8 +2372,7 @@ fn a_completed_drop_requires_the_table_to_be_absent() {
     }]);
     let before = schema(table());
     for dialect in [
-        &pbps_pg::Postgres::new()
-            as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
         &pbps_mssql::Mssql,
     ] {
         for read in [Settled::Whole, Settled::Closing] {

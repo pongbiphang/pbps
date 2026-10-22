@@ -178,7 +178,7 @@ impl Created<'_> {
 
     pub(crate) fn check(
         &self,
-        dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        dialect: &dyn pbps_dialect::Dialect,
         now_name: &TableName,
         now: &Fields<'_>,
         settled: Settled,

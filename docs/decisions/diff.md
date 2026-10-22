@@ -7904,7 +7904,10 @@ stages consume the owned intermediate and facts, constraints or typed rewrites;
 only a completed canonical route may mint `OrderedPlan`. Its payload, source
 mapping and proof must stay together. No mutable accessor, public downgrade,
 raw conversion, deserialization or unchecked fixture factory grants authority.
-Fixtures use the real singleton or complete production entry points.
+Fixtures use a test-only singleton or complete production entry points.
+The singleton certificate factory exists only under `cfg(test)` or the non-default
+`test-fixtures` feature enabled by engine dev-dependencies, never in ordinary
+CLI or release builds.
 
 Read-only access and a private certificate constructor are insufficient on
 their own. The reproduced external-consumer counterexample first ordered
@@ -7934,6 +7937,9 @@ Admission computes the artifact checksum and checks the approved checksum,
 origin and dialect itself after the version refusal and before payload validation.
 Execution mode is bound to the certified input, checked when sealing metadata,
 and read by lowering rather than supplied by its caller.
+OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
+dialect's invariant type brand through PlanView and PlanDialect, so real engines
+cannot lower another engine's certificate and sealing cannot relabel its dialect.
 RLS policy setup and catalog-owner releases use the same immutable planning
 boundary: order owns their final settlement, generated-table and name-slot
 constraints, and creation-risk write-back, while callers supply catalog facts.
@@ -7941,9 +7947,9 @@ The create-only RLS validator is shared by saved admission and transitional CLI
 consumers; the frozen master RLS settlement pins operations, SQL, checksums and
 refusals without enabling a raw production write-back.
 
-Dialect's associated plan input avoids a dependency cycle: concrete engines
+PlanDialect's associated plan input avoids a dependency cycle: concrete engines
 bind it to the sealed diff view, while pure semantic consumers remain generic.
-The sole new crate edge is a normal `pbps-mssql -> pbps-diff` dependency,
+The sole new production crate edge is a normal `pbps-mssql -> pbps-diff` dependency,
 matching PostgreSQL. Database transport and administrative SQL retain their
 existing responsibilities. Lowering retains immutable operation groups; emit,
 render, writer and execution entry points require the certified input rather
@@ -7968,4 +7974,4 @@ artifact, apply, explain, bootstrap and rehearsal consumers and removes the
 transitional raw entries. Only the completed final head establishes compiler
 enforcement. Snapshot adapters in cfg(test) feed the real logical input and
 stage APIs and return only raw observations for byte oracles; they cannot
-construct execution authority. No shipping test-support feature is added.
+construct execution authority. The fixture feature remains off in shipping builds.

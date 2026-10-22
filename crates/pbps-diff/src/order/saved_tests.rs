@@ -45,7 +45,7 @@ fn admission_accepts_a_matching_plan_without_changing_its_order_or_checksum() {
             &checksum,
         )
         .unwrap();
-        let executable: &dyn PlanView = &admitted;
+        let executable: &dyn PlanView<MinimalDialect> = &admitted;
         assert_eq!(executable.mode(), mode);
         assert_eq!(admitted.wire(), &plan);
         assert_eq!(admitted.checksum(), checksum);
@@ -129,7 +129,7 @@ fn admission_still_refuses_invalid_payloads_after_the_outer_checks_pass() {
 fn sealing_refuses_a_mode_mismatch_in_both_directions_by_name() {
     for mode in [PlanMode::Transactional, PlanMode::Staged] {
         let mut plan = wire();
-        let ordered = singleton(plan.changes.changes[0].clone(), mode);
+        let ordered = singleton(plan.changes.changes[0].clone(), mode, &MinimalDialect);
         plan.mode = match mode {
             PlanMode::Transactional => PlanMode::Staged,
             PlanMode::Staged => PlanMode::Transactional,
@@ -145,10 +145,21 @@ fn sealing_refuses_a_mode_mismatch_in_both_directions_by_name() {
 #[test]
 fn sealing_still_refuses_payload_edits_with_a_matching_mode() {
     let mut plan = wire();
-    let ordered = singleton(plan.changes.changes[0].clone(), plan.mode);
+    let ordered = singleton(plan.changes.changes[0].clone(), plan.mode, &MinimalDialect);
     plan.changes.changes.clear();
     assert_eq!(
         seal(ordered, plan).unwrap_err().to_string(),
         "the resolver ordering proof does not describe this change sequence"
+    );
+}
+
+#[test]
+fn sealing_refuses_relabeling_the_ordered_engine_and_escapes_the_wire_name() {
+    let mut plan = wire();
+    let ordered = singleton(plan.changes.changes[0].clone(), plan.mode, &MinimalDialect);
+    plan.dialect = "another\nengine".into();
+    assert_eq!(
+        seal(ordered, plan).unwrap_err().to_string(),
+        "the saved plan dialect another\\nengine does not match the ordered plan dialect minimal"
     );
 }

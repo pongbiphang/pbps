@@ -22,6 +22,24 @@
 //! computed-column releases (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).
 
+#![cfg_attr(
+    not(feature = "test-fixtures"),
+    doc = r#"
+The emitter fixture constructor is absent from an ordinary external build:
+
+```compile_fail
+let _ = pbps_diff::order::singleton(
+    pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
+        uid: "r_aaaaaa".parse().unwrap(),
+        name: "reader".into(),
+    }),
+    pbps_model::PlanMode::Transactional,
+    &pbps_dialect::MinimalDialect,
+);
+```
+"#
+)]
+
 pub mod commute;
 mod companions;
 pub mod edges;
@@ -46,7 +64,9 @@ pub mod verify;
 pub mod writebacks;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
-pub use plan::{OrderedPlan, PlanView, PlanningPlan, propose, singleton, take};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use plan::singleton;
+pub use plan::{OrderedPlan, PlanView, PlanningPlan, propose, take};
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;
 pub use saved::{AdmissionError, AdmittedPlan, SealedPlan, admit, seal, validate_saved_plan};

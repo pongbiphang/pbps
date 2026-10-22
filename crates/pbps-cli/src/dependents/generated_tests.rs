@@ -14,7 +14,7 @@ mod part_risks;
 pub(crate) fn ordinary(
     schema: &Schema,
     ids: &IdsFile,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<ChangeSet, String> {
     ordinary_with_dependencies(schema, ids, &ModuleDeps::new(), dialect)
 }
@@ -23,7 +23,7 @@ fn ordinary_with_dependencies(
     schema: &Schema,
     ids: &IdsFile,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<ChangeSet, String> {
     let empty = Schema::default();
     let before_ids = IdsFile::default();
@@ -331,7 +331,7 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
             let result: anyhow::Result<()> = async {
                 let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
                 conn.execute("CREATE SCHEMA app").await?;
-                let dialect: Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>> = if case.ends_with("-offline") {
+                let dialect: Box<dyn Dialect> = if case.ends_with("-offline") {
                     Box::new(pbps_pg::Postgres::new())
                 } else {
                     crate::engine::planning_dialect(&mut conn).await?

@@ -7,10 +7,7 @@ use pbps_model::*;
 const NAME: &str = "col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
-fn artifacts(
-    text: &str,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> (Schema, SavedPlan, StateSnapshot) {
+fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnapshot) {
     let parent = TableName::new("app", "parent");
     let name = TableName::new("app", "child");
     let payload = format!("{text}payload");
@@ -222,7 +219,7 @@ fn artifacts(
 #[test]
 fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn Dialect,
         &pbps_mssql::Mssql,
     ] {
         let (schema, mut plan, mut state) = artifacts(NAME, dialect);
@@ -312,7 +309,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
 #[test]
 fn column_validation_preserves_the_whole_message_escape_boundary() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_pg::Postgres::new() as &dyn Dialect,
         &pbps_mssql::Mssql,
     ] {
         let table = Table {

@@ -31,27 +31,38 @@ macro_rules! refuse {
 /// admission neither reorders it nor enables the deferred release verifier.
 ///
 /// ```compile_fail
-/// fn unchecked(wire: pbps_model::SavedPlan) -> pbps_diff::order::AdmittedPlan {
+/// fn unchecked(wire: pbps_model::SavedPlan)
+///     -> pbps_diff::order::AdmittedPlan<pbps_dialect::MinimalDialect> {
 ///     pbps_diff::order::AdmittedPlan { wire }
 /// }
 /// ```
-#[derive(Debug, Clone)]
-pub struct AdmittedPlan {
+#[derive(Debug)]
+pub struct AdmittedPlan<D: ?Sized> {
     wire: SavedPlan,
+    brand: std::marker::PhantomData<fn(&D) -> &D>,
 }
 
-impl AdmittedPlan {
+impl<D: ?Sized> Clone for AdmittedPlan<D> {
+    fn clone(&self) -> Self {
+        Self {
+            wire: self.wire.clone(),
+            brand: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<D: ?Sized> AdmittedPlan<D> {
     pub fn wire(&self) -> &SavedPlan {
         &self.wire
     }
 }
-impl std::ops::Deref for AdmittedPlan {
+impl<D: ?Sized> std::ops::Deref for AdmittedPlan<D> {
     type Target = SavedPlan;
     fn deref(&self) -> &SavedPlan {
         &self.wire
     }
 }
-impl PlanPayload for AdmittedPlan {
+impl<D: ?Sized> PlanPayload for AdmittedPlan<D> {
     fn changes(&self) -> &ChangeSet {
         &self.wire.changes
     }
@@ -59,18 +70,18 @@ impl PlanPayload for AdmittedPlan {
         self.wire.mode
     }
 }
-impl super::plan::sealed::Sealed for AdmittedPlan {}
-impl PlanView for AdmittedPlan {}
+impl<D: ?Sized> super::plan::sealed::Sealed for AdmittedPlan<D> {}
+impl<D: ?Sized> PlanView<D> for AdmittedPlan<D> {}
 
 /// Accepts only checked wire bytes, never granting `OrderedPlan` authority.
 /// The checksum is computed here so the caller cannot substitute an unchecked
 /// fingerprint. Refusals retain apply's version/checksum/origin/dialect order.
-pub fn admit(
+pub fn admit<D: Dialect + ?Sized>(
     plan: SavedPlan,
-    dialect: &(impl Dialect + ?Sized),
+    dialect: &D,
     plan_path: &Path,
     approved_checksum: &str,
-) -> Result<AdmittedPlan, AdmissionError> {
+) -> Result<AdmittedPlan<D>, AdmissionError> {
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         refuse!(
             "`{}` is a version {} plan and this tool understands version {}.\n\
@@ -108,31 +119,42 @@ pub fn admit(
         );
     }
     validate_saved_plan(&plan, dialect)?;
-    Ok(AdmittedPlan { wire: plan })
+    Ok(AdmittedPlan {
+        wire: plan,
+        brand: std::marker::PhantomData,
+    })
 }
 
 /// A newly produced artifact, bound to the exact plan that ordering produced.
 /// Metadata remains the existing wire DTO, with no capability/proof fields.
-#[derive(Debug, Clone)]
-pub struct SealedPlan {
+#[derive(Debug)]
+pub struct SealedPlan<D: ?Sized> {
     wire: SavedPlan,
-    ordered: OrderedPlan,
+    ordered: OrderedPlan<D>,
 }
-impl SealedPlan {
+impl<D: ?Sized> Clone for SealedPlan<D> {
+    fn clone(&self) -> Self {
+        Self {
+            wire: self.wire.clone(),
+            ordered: self.ordered.clone(),
+        }
+    }
+}
+impl<D: ?Sized> SealedPlan<D> {
     pub fn wire(&self) -> &SavedPlan {
         &self.wire
     }
-    pub fn ordered(&self) -> &OrderedPlan {
+    pub fn ordered(&self) -> &OrderedPlan<D> {
         &self.ordered
     }
 }
-impl std::ops::Deref for SealedPlan {
+impl<D: ?Sized> std::ops::Deref for SealedPlan<D> {
     type Target = SavedPlan;
     fn deref(&self) -> &SavedPlan {
         &self.wire
     }
 }
-impl PlanPayload for SealedPlan {
+impl<D: ?Sized> PlanPayload for SealedPlan<D> {
     fn changes(&self) -> &ChangeSet {
         self.ordered.changes()
     }
@@ -140,12 +162,15 @@ impl PlanPayload for SealedPlan {
         self.ordered.mode()
     }
 }
-impl super::plan::sealed::Sealed for SealedPlan {}
-impl PlanView for SealedPlan {}
+impl<D: ?Sized> super::plan::sealed::Sealed for SealedPlan<D> {}
+impl<D: ?Sized> PlanView<D> for SealedPlan<D> {}
 
 /// Metadata cannot replace a single operation, strategy or finding after
 /// ordering: the original proof must still describe the wire payload exactly.
-pub fn seal(ordered: OrderedPlan, wire: SavedPlan) -> Result<SealedPlan, AdmissionError> {
+pub fn seal<D: ?Sized>(
+    ordered: OrderedPlan<D>,
+    wire: SavedPlan,
+) -> Result<SealedPlan<D>, AdmissionError> {
     ordered
         .proof()
         .validate(&wire.changes)
@@ -155,6 +180,13 @@ pub fn seal(ordered: OrderedPlan, wire: SavedPlan) -> Result<SealedPlan, Admissi
             "the saved plan mode {} does not match the ordered plan mode {}",
             wire.mode,
             ordered.mode()
+        );
+    }
+    if ordered.dialect() != wire.dialect {
+        refuse!(
+            "the saved plan dialect {} does not match the ordered plan dialect {}",
+            pbps_model::escape::Escaped(&wire.dialect),
+            ordered.dialect()
         );
     }
     Ok(SealedPlan { wire, ordered })

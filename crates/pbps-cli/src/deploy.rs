@@ -498,7 +498,7 @@ pub(crate) fn order_carried_moves(
     occupants: &[pbps_pg::catalog::NameOccupant],
     relations: &[(TableName, &'static str)],
     sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     catalog: &pbps_dialect::slots::CatalogFacts,
 ) {
     use pbps_model::{Change, ValueSource};
@@ -2743,7 +2743,7 @@ fn cut(
 /// those live in the hints rather than in the model (constraint 8).
 fn declared_scope(
     project: &Project,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
 ) -> anyhow::Result<(BTreeSet<ModuleId>, DataScopes, pbps_load::Loaded)> {
     let loaded = crate::load(project, dialect)?;
     Ok((
@@ -2979,7 +2979,7 @@ fn plan_mode(staged: bool) -> pbps_model::PlanMode {
 /// asks only about the names its remaining statements touch (DECISIONS 119).
 fn role_name_expectations(
     cs: &pbps_model::ChangeSet,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<(Vec<pbps_model::RoleName>, Vec<pbps_model::RoleName>)> {
@@ -4178,7 +4178,7 @@ impl Settled {
 /// nothing here can say anything about, and gets no answer rather than a wrong
 /// one (DECISIONS 186).
 fn same_type(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     a: &pbps_model::ColumnType,
     b: &pbps_model::ColumnType,
 ) -> bool {
@@ -4244,7 +4244,7 @@ fn primary_key_as_declared(
 /// ([`pbps_dialect::Dialect::owned_sequence_name`]), so that two reads compare
 /// the sequence and not the name its column's or table's name would generate.
 fn sequences_named<'a>(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     schema: &'a Schema,
 ) -> std::borrow::Cow<'a, Schema> {
     let any = schema.tables.values().any(|t| {
@@ -4268,7 +4268,7 @@ fn sequences_named<'a>(
 
 #[cfg(test)]
 fn refuse_unplanned_movement(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
@@ -4291,7 +4291,7 @@ fn refuse_unplanned_movement(
 
 #[cfg(test)]
 fn staged_comparison(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
@@ -4314,7 +4314,7 @@ fn staged_comparison(
 
 #[cfg(test)]
 fn staged_movement(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     before: &Schema,
     after: &Schema,
@@ -4335,7 +4335,7 @@ fn staged_movement(
 }
 
 fn refuse_pinned_movement(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     read: guard::Read<'_>,
     before: &Schema,
     after: &Schema,
@@ -5820,7 +5820,7 @@ pub fn cmd_baseline(
 /// declaration to fix (#573).
 fn refuse_invalid_declarations(
     loaded: &pbps_load::Loaded,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     json: bool,
 ) -> anyhow::Result<()> {
     let problems = crate::declaration_problems(loaded, dialect);
@@ -7647,7 +7647,7 @@ fn apply_identified(
     request: &ApplyRequest<'_>,
     plan: &pbps_model::SavedPlan,
     plan_checksum: &str,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     operator: &str,
 ) -> anyhow::Result<Attempt> {
     let ApplyRequest {
@@ -7902,7 +7902,7 @@ struct Deployment<'a> {
     plan_checksum: &'a str,
     statements: &'a [pbps_dialect::Statement],
     rename_targets: &'a [pbps_db::impact::RenameTarget],
-    dialect: &'a dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &'a dyn pbps_dialect::Dialect,
     operator: &'a str,
 }
 
@@ -8245,11 +8245,7 @@ fn rename_snapshot_roles(
 /// Incoming cluster roles belong in the queried and pinned baseline even
 /// before their UIDs have reached the ledger. Existing names keep their
 /// baseline UID; only their post-apply identity changes when a UID is replaced.
-fn role_scope(
-    recorded: &IdsFile,
-    declared: &IdsFile,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> IdsFile {
+fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
     let mut scoped = recorded.clone();
     if !dialect.manages_roles() {
         for (uid, name) in &declared.roles {
@@ -8263,11 +8259,7 @@ fn role_scope(
 
 /// A role removed from a PostgreSQL declaration becomes unmanaged, rather
 /// than being dropped from the cluster. Closing comparisons use that scope.
-fn retain_managed_roles(
-    schema: &mut Schema,
-    ids: &IdsFile,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) {
+fn retain_managed_roles(schema: &mut Schema, ids: &IdsFile, dialect: &dyn Dialect) {
     if !dialect.manages_roles() {
         schema
             .roles
@@ -9042,7 +9034,7 @@ fn refuse_unmet_public_execution(
 }
 
 fn staged_pinned_movement(
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     plan: guard::Staged<'_>,
     before: &Schema,
     after: &Schema,
@@ -9114,7 +9106,7 @@ fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::R
 /// plan left it and not as the plan first saw it (DECISIONS 102).
 fn role_drop_expectations(
     cs: &pbps_model::ChangeSet,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<Vec<(pbps_model::RoleName, Vec<pbps_model::RoleName>)>> {
@@ -9226,10 +9218,7 @@ fn pin_zone(conn: &Conn) -> SessionZone {
 /// Idempotent by construction — it is a list of `SET`s — and issued from more
 /// than one place on purpose. See [`run_probes`], which does not trust its
 /// caller to have called this.
-async fn pin_session(
-    conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> anyhow::Result<()> {
+async fn pin_session(conn: &mut Conn, dialect: &dyn pbps_dialect::Dialect) -> anyhow::Result<()> {
     if let Some(pins) = dialect.session_pins(&pin_zone(conn)) {
         conn.execute(&pins)
             .await
@@ -9240,7 +9229,7 @@ async fn pin_session(
 
 async fn drop_preflight(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     ids: &IdsFile,
     stored: &Schema,
@@ -9259,7 +9248,7 @@ async fn drop_preflight(
 
 async fn preflight(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_db::impact::RenameTarget],
     stored: &pbps_model::Schema,
@@ -9423,7 +9412,7 @@ fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec
 /// read whose checksum matched the plan's baseline (DEC-1699.1).
 async fn run_probes(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     names: &pbps_model::plan_names::PlanNames<'_>,
     partitions: &pbps_model::Partitions,
 ) -> anyhow::Result<()> {
@@ -9536,7 +9525,7 @@ async fn run_probes(
 /// (DECISIONS 537).
 async fn probe_query(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     sql: &str,
 ) -> anyhow::Result<Result<Vec<pbps_db::Row>, pbps_db::DbError>> {
     let Some(framing) = dialect.probe_framing() else {
@@ -9595,7 +9584,7 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
 /// [`finish_transaction`] is what closes it, on both paths.
 async fn execute_transaction_body(
     conn: &mut Conn,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     statements: &[pbps_dialect::Statement],
 ) -> anyhow::Result<()> {
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
@@ -9638,7 +9627,7 @@ async fn execute_statements(
 /// read-back or ledger entry failed has changed nothing (147).
 async fn finish_transaction<T>(
     conn: &mut Conn,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     result: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let framing = dialect.transaction_framing(&pin_zone(conn));
@@ -9730,7 +9719,7 @@ mod tests {
         occupants: &[pbps_pg::catalog::NameOccupant],
         relations: &[(TableName, &'static str)],
         sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
-        dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        dialect: &dyn pbps_dialect::Dialect,
         catalog: &pbps_dialect::slots::CatalogFacts,
     ) {
         crate::test_planning(cs, |plan| {

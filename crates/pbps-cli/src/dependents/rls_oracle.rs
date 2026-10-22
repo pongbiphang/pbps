@@ -6,7 +6,7 @@ pub(super) fn settle(
     mut cs: ChangeSet,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<ChangeSet, Refusal> {
     let mut skipped = Vec::new();
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
@@ -85,7 +85,7 @@ fn policy_release_schedule(
     cs: &ChangeSet,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<pbps_diff::order::Schedule, Refusal> {
     use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
     let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
@@ -152,7 +152,7 @@ fn policy_release_schedule(
 pub(super) fn same(
     actual: &Result<PlanningPlan, Refusal>,
     expected: &Result<ChangeSet, Refusal>,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) {
     match (actual, expected) {
         (Ok(now), Ok(old)) => {

@@ -785,7 +785,7 @@ fn data_tables_of(schema: &pbps_model::Schema) -> pbps_db::doctor::DataTables {
 fn grant_targets(
     project: &Project,
     ids: &pbps_model::IdsFile,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
 ) -> pbps_db::doctor::GrantTargets {
     let Ok(mut loaded) = crate::load_quiet(project) else {
         return pbps_db::doctor::GrantTargets::default();
@@ -1205,7 +1205,7 @@ fn target_arg(d: &EnvDiagnosis) -> String {
 fn env_findings(
     d: &EnvDiagnosis,
     declares_modules: bool,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     driver: pbps_db::Driver,
 ) -> Vec<output::Finding> {
     let mut out = Vec::new();
@@ -2799,13 +2799,11 @@ mod tests {
         d.edition = None;
         for (dialect, driver) in [
             (
-                &pbps_mssql::Mssql
-                    as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+                &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect,
                 pbps_db::Driver::Mssql,
             ),
             (
-                &pbps_pg::Postgres::new()
-                    as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+                &pbps_pg::Postgres::new() as &dyn pbps_dialect::Dialect,
                 pbps_db::Driver::Postgres,
             ),
         ] {

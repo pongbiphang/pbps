@@ -7464,7 +7464,6 @@ mod tests {
     struct Aliases;
 
     impl Dialect for Aliases {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "aliases"
         }
@@ -7527,7 +7526,6 @@ mod tests {
     struct Recollates;
 
     impl Dialect for Recollates {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "recollates"
         }
@@ -11985,27 +11983,26 @@ mod tests {
             declared.tables.insert("app.ev_1".parse().unwrap(), t);
             declared
         };
-        let outcome_in =
-            |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect<Plan = ()>| {
-                let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
-                    .unwrap()
-                    .ids;
-                let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
-                    .unwrap()
-                    .ids;
-                diff(
-                    Side {
-                        schema: &tree,
-                        ids: &base_ids,
-                    },
-                    Side {
-                        schema: declared,
-                        ids: &declared_ids,
-                    },
-                    dialect,
-                    &Hints::default(),
-                )
-            };
+        let outcome_in = |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect| {
+            let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &tree,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                dialect,
+                &Hints::default(),
+            )
+        };
         let outcome =
             |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
         let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
@@ -12575,7 +12572,6 @@ mod tests {
     struct SerialDefaults;
 
     impl Dialect for SerialDefaults {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "serial-defaults"
         }
@@ -16789,10 +16785,7 @@ mod tests {
         let base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
         let intermediate = schema_of("app.old", old_t.clone());
         let declared = schema_of("app.target", old_t);
-        for dialect in [
-            &MinimalDialect as &dyn Dialect<Plan = ()>,
-            &SharesIndexNamespace,
-        ] {
+        for dialect in [&MinimalDialect as &dyn Dialect, &SharesIndexNamespace] {
             let cs = a_dropped_tables_name_reused_by_a_later_rename(
                 dialect,
                 &base,
@@ -19531,7 +19524,6 @@ mod tests {
     struct SharesIndexNamespace;
 
     impl Dialect for SharesIndexNamespace {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "shares-index-namespace"
         }
@@ -19596,7 +19588,6 @@ mod tests {
     struct NamesItsDefaults;
 
     impl Dialect for NamesItsDefaults {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "names-its-defaults"
         }
@@ -22130,7 +22121,6 @@ mod tests {
         struct ClusterRoles;
 
         impl pbps_dialect::Dialect for ClusterRoles {
-            type Plan = ();
             fn name(&self) -> &'static str {
                 "cluster-roles"
             }
@@ -22653,7 +22643,6 @@ mod tests {
         struct Rebuilds;
 
         impl pbps_dialect::Dialect for Rebuilds {
-            type Plan = ();
             fn name(&self) -> &'static str {
                 "rebuilds-modules"
             }
@@ -22778,7 +22767,7 @@ mod tests {
                 a_module(pbps_model::ModuleKind::View, "SELECT a, b FROM app.t"),
             );
 
-            let run = |dialect: &dyn pbps_dialect::Dialect<Plan = ()>| {
+            let run = |dialect: &dyn pbps_dialect::Dialect| {
                 diff(
                     Side {
                         schema: &base.0,
@@ -22931,7 +22920,6 @@ mod tests {
         struct PublicExecutes;
 
         impl pbps_dialect::Dialect for PublicExecutes {
-            type Plan = ();
             fn name(&self) -> &'static str {
                 "public-executes"
             }

@@ -42,7 +42,7 @@ fn plan(changes: Vec<Change>) -> ChangeSet {
 #[test]
 fn deliberately_unbuilt_checks_keep_their_name_and_reason_on_both_engines() {
     for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_mssql::Mssql as &dyn Dialect,
         &pbps_pg::Postgres::new(),
     ] {
         let report = dialect.fixture_preflight(&plan(vec![inserted(), index(true, true)]));
@@ -66,7 +66,7 @@ fn deliberately_unbuilt_checks_keep_their_name_and_reason_on_both_engines() {
 #[test]
 fn ordinary_checks_and_changes_needing_no_check_are_not_unchecked() {
     for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_mssql::Mssql as &dyn Dialect,
         &pbps_pg::Postgres::new(),
     ] {
         let ordinary = dialect.fixture_preflight(&plan(vec![index(true, false)]));
@@ -126,10 +126,7 @@ fn unspellable_constraint_values_and_check_predicates_are_reported() {
         defaults.insert("value".into(), "unpredictable()".into());
     }
     for (dialect, checks_collations) in [
-        (
-            &pbps_mssql::Mssql as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-            false,
-        ),
+        (&pbps_mssql::Mssql as &dyn Dialect, false),
         (&pbps_pg::Postgres::new(), true),
     ] {
         for constraint in &constraints {
@@ -167,7 +164,7 @@ fn an_empty_new_table_has_an_answer_and_is_not_an_unchecked_key() {
         moves_at_most: None,
     };
     for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_mssql::Mssql as &dyn Dialect,
         &pbps_pg::Postgres::new(),
     ] {
         let report = dialect.fixture_preflight(&plan(vec![create.clone(), index(true, false)]));
@@ -224,7 +221,7 @@ fn probes_use_original_table_and_column_names_after_multiple_renames() {
     };
     let names = PlanNames::of(&changes.changes, &ids).unwrap();
     for dialect in [
-        &pbps_mssql::Mssql as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        &pbps_mssql::Mssql as &dyn Dialect,
         &pbps_pg::Postgres::new(),
     ] {
         let report = dialect.preflight(&names);

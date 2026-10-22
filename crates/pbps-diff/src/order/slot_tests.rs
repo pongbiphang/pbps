@@ -25,7 +25,6 @@ struct Slotted {
 }
 
 impl Dialect for Slotted {
-    type Plan = ();
     fn declares_a_constraint(&self, module: &pbps_model::Module) -> bool {
         module.kind == pbps_model::ModuleKind::Trigger && module.definition == "CONSTRAINT"
     }

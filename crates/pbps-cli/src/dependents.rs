@@ -466,10 +466,7 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
     })
 }
 
-fn planned(
-    change: Change,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> PlannedChange {
+fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
     p
@@ -511,11 +508,7 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
 /// Checks and indexes have no column owner to select. Their payload stays
 /// declared while their table follows the physical source at insertion.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn respell(
-    p: &mut PlannedChange,
-    holds: &Holds,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) {
+fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
     let Holds::TablePart { table, .. } = holds else {
         return;
     };
@@ -535,7 +528,7 @@ fn respell_at(
     original: &Holds,
     sources: &PhysicalSources<'_>,
     at: At,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<(), String> {
     let here = named_at(sources, at, original).ok_or_else(|| {
         "the dependent's physical source is unavailable at its insertion boundary".to_owned()
@@ -926,7 +919,7 @@ fn weave(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
@@ -1037,7 +1030,7 @@ fn module_order(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<Vec<Order>, String> {
     Weave {
         roots: dropped_modules(cs)
@@ -1063,7 +1056,7 @@ struct Weave<'a> {
     found: &'a BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &'a Schema,
     sources: Sources<'a>,
-    dialect: &'a dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &'a dyn Dialect,
     partitions: Partitions,
 }
 
@@ -1655,7 +1648,7 @@ fn split_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -1675,7 +1668,7 @@ fn expand_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = pbps_diff::order::generated::expand(
@@ -1746,7 +1739,7 @@ mod expansion_oracle;
 fn before_its_partitions_indexes(
     cs: &mut PlanningPlan,
     declared: &Schema,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<(), String> {
     let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
         let Change::AddIndex {
@@ -2019,11 +2012,7 @@ fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &T
 /// dependency imagined moves a change that could have stayed, one missed
 /// breaks the plan. These are the edges a partition's index that sinks
 /// carries what rests on it with (DEC-1967.2).
-fn rests_on(
-    later: &Change,
-    earlier: &Change,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> bool {
+fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
     let brought = relations_brought(earlier);
     if !brought.is_empty() {
         let names: Vec<String> = expressions_set(later)
@@ -2093,7 +2082,7 @@ fn after_their_parents_defaults(
     cs: &mut PlanningPlan,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -2193,7 +2182,7 @@ fn after_the_rebuilds(
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
     mut schedule: Schedule,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let has_handovers = !schedule.constraints().is_empty();
     // A partition delayed past its trigger's release must take its readers
@@ -2386,11 +2375,7 @@ fn after_the_rebuilds(
 /// Run before [`after_the_rebuilds`], which holds what calls a function. The
 /// create and what is split off it carry the dialect's risks recomputed: a
 /// NOT NULL the create no longer sets is a risk of the change that does.
-fn split_moving_defaults(
-    cs: &mut PlanningPlan,
-    declared: &Schema,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) {
+fn split_moving_defaults(cs: &mut PlanningPlan, declared: &Schema, dialect: &dyn Dialect) {
     let functions = function_creates(cs);
     pbps_diff::order::split_moving_defaults(cs, declared, dialect, &functions);
 }
@@ -2426,7 +2411,7 @@ fn split_moving_defaults(
 /// now, which only the target can say.
 pub(crate) fn names_a_later_relation(
     cs: &ChangeSet,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     holders: Option<&[KeyNameHolder]>,
 ) -> Vec<LaterName> {
     let mut arrivals: Vec<Arrival> = Vec::new();
@@ -2617,10 +2602,7 @@ impl HeaderWord {
 /// are the definition's: `header` blanks byte for byte. A parameter or a
 /// return column is at depth one. Where the header ends is
 /// [`routine_header`]'s to say.
-fn header_words(
-    definition: &str,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> Vec<HeaderWord> {
+fn header_words(definition: &str, dialect: &dyn Dialect) -> Vec<HeaderWord> {
     let header = dialect.lexicon().header(definition);
     let word = dialect.lexicon().identifier_continues;
     let mut words: Vec<HeaderWord> = Vec::new();
@@ -2708,10 +2690,7 @@ struct RoutineHeader {
 /// value named `set`, `begin` or `return` is an entry, never a clause or a
 /// body. The body is the string after `AS`, which clauses may follow, or
 /// starts at `RETURN` or `BEGIN ATOMIC`, which comes last.
-fn routine_header(
-    definition: &str,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> RoutineHeader {
+fn routine_header(definition: &str, dialect: &dyn Dialect) -> RoutineHeader {
     let words = header_words(definition, dialect);
     let mut header = RoutineHeader {
         path: Some(None),
@@ -2774,7 +2753,7 @@ fn routine_header(
 fn setting_value(
     definition: &str,
     after: usize,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     search: bool,
 ) -> Option<(Vec<String>, usize)> {
     // The engine's own lexis throughout (#1599 review): what continues an
@@ -3038,7 +3017,7 @@ pub(crate) fn key_name_prefixes(cs: &ChangeSet) -> Vec<(String, String)> {
 /// relation's, and the key's index is read as numbered past it.
 fn key_arrivals(
     cs: &ChangeSet,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     mut keys: Vec<Arrival>,
     named: &[Arrival],
     holders: Option<&[KeyNameHolder]>,
@@ -3166,10 +3145,7 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
 /// so one the plan drops and creates again holds its name from there on
 /// (#1738).
 #[allow(clippy::wildcard_enum_match_arm)]
-fn constraints_added(
-    change: &Change,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> Vec<TableName> {
+fn constraints_added(change: &Change, dialect: &dyn Dialect) -> Vec<TableName> {
     let in_schema = |table: &TableName, name: &str| TableName::new(table.schema.clone(), name);
     match change {
         Change::CreateModule {
@@ -4148,7 +4124,7 @@ mod tests {
     fn split_new_tables(
         cs: &mut ChangeSet,
         ids: &[&IdsFile],
-        dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        dialect: &dyn Dialect,
     ) -> Result<usize, String> {
         super::test_adapters::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
     }
@@ -4158,7 +4134,7 @@ mod tests {
         released: &BTreeSet<ColumnRef>,
         deps: &ModuleDeps,
         declared: &Schema,
-        dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        dialect: &dyn Dialect,
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
         super::test_adapters::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
@@ -4231,7 +4207,7 @@ mod tests {
         }
     }
 
-    fn pg() -> Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>> {
+    fn pg() -> Box<dyn Dialect> {
         Box::new(pbps_pg::Postgres::new())
     }
 
@@ -8194,10 +8170,7 @@ mod tests {
     }
 
     /// The check with nothing already on the target: every candidate stands.
-    fn refusal_of(
-        cs: &ChangeSet,
-        dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-    ) -> Result<(), String> {
+    fn refusal_of(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
         later_relation_refusal(&names_a_later_relation(cs, dialect, None))
     }
 

@@ -78,7 +78,7 @@ pub struct Pulled {
 pub trait Engine {
     type Db;
     fn name(&self) -> &'static str;
-    fn dialect(&self) -> &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>;
+    fn dialect(&self) -> &dyn Dialect;
     /// A new database with [`SCHEMA`] in it and nothing else.
     async fn database(&self, tag: &str) -> Self::Db;
     async fn drop(&self, db: Self::Db);
@@ -196,7 +196,7 @@ pub fn mint(schema: &Schema, base: &IdsFile, intents: &[pbps_model::Intent]) -> 
 }
 
 pub fn diff(
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     base: (&Schema, &IdsFile),
     desired: (&Schema, &IdsFile),
     hints: &pbps_model::Hints,
@@ -221,7 +221,7 @@ pub fn diff(
 /// [`diff`], with the zero-statement changes `plan` carries beside it: the
 /// keys an `ensure` block manages (DEC-1808.1), which no diff can see.
 pub fn planned(
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     base: (&Schema, &IdsFile),
     desired: (&Schema, &IdsFile),
     hints: &pbps_model::Hints,
@@ -403,12 +403,7 @@ pub struct Prepared {
     pub seeded: Vec<TableName>,
 }
 
-pub fn prepare(
-    engine: &str,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-    scenario: &Scenario,
-    role: &str,
-) -> Prepared {
+pub fn prepare(engine: &str, dialect: &dyn Dialect, scenario: &Scenario, role: &str) -> Prepared {
     let base = load(engine, scenario.name, "base", scenario.base, role);
     let desired = load(engine, scenario.name, "desired", scenario.desired, role);
     let base_ids = mint(&base.schema, &IdsFile::default(), &base.intents);

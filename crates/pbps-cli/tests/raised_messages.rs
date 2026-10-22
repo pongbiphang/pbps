@@ -6,7 +6,7 @@ use pbps_model::{Change, RowKey, TableName};
 const HOSTILE: &str = "name\n\u{1b}[31m\\'_%名前";
 const SHOWN: &str = r"name\n\u{1b}[31m\\'_%名前";
 
-fn sql(dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>, change: &Change) -> String {
+fn sql(dialect: &dyn Dialect, change: &Change) -> String {
     dialect
         .emit(change, Default::default())
         .unwrap()
@@ -26,7 +26,7 @@ fn mssql_raised_row_messages_show_names_once_and_keep_sql_identifiers_raw() {
     row_messages(&pbps_mssql::Mssql);
 }
 
-fn row_messages(dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>) {
+fn row_messages(dialect: &dyn Dialect) {
     let pg = dialect.name() == "postgres";
     for (name, shown) in [(HOSTILE, SHOWN), ("ordinary'_%名前", "ordinary'_%名前")] {
         let table = TableName::new("app", name);

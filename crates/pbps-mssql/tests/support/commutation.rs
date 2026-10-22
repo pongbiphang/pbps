@@ -1117,7 +1117,7 @@ impl Engine for Ms {
         "mssql"
     }
 
-    fn dialect(&self) -> &dyn Dialect<Plan = dyn pbps_diff::order::PlanView> {
+    fn dialect(&self) -> &dyn Dialect {
         &pbps_mssql::Mssql
     }
 

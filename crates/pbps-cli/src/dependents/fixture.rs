@@ -109,7 +109,7 @@ pub(super) fn weave(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let (before, before_ids, after) = inputs(cs, found, declared, ids, &Partitions::default());
     super::test_adapters::weave(

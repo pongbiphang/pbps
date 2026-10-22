@@ -2233,25 +2233,11 @@ pub trait PlanPayload {
     fn mode(&self) -> pbps_model::PlanMode;
 }
 
-/// Dialect knowledge that needs no database connection. Each real engine
-/// fixes `Plan` to pbps-diff's sealed `order::PlanView` (DEC-1959.5).
-pub trait Dialect {
+/// Certified emission, separate from dynamically dispatched semantic queries.
+/// Each real engine fixes `Plan` to diff's sealed view branded by that engine,
+/// so erasing a semantic dialect cannot erase execution authority (DEC-1959.5).
+pub trait PlanDialect: Dialect {
     type Plan: ?Sized;
-
-    /// Pure engine-specific evidence validation at saved-artifact admission.
-    fn validate_plan_analysis(
-        &self,
-        plan: &pbps_model::SavedPlan,
-    ) -> Result<(), PlanAnalysisError> {
-        plan.validate_analysis()?;
-        if matches!(
-            &plan.analysis,
-            pbps_model::resolver::PlanAnalysis::Resolved(_)
-        ) {
-            return Err(PlanAnalysisError::Unsupported(plan.dialect.clone()));
-        }
-        Ok(())
-    }
 
     /// Emits one position of the engine's certified input. The associated type
     /// avoids a dialect -> diff dependency; concrete engines cannot substitute
@@ -2273,6 +2259,24 @@ pub trait Dialect {
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
         self.emit_ordered(plan, position)
+    }
+}
+
+/// Dialect knowledge that needs no database connection.
+pub trait Dialect {
+    /// Pure engine-specific evidence validation at saved-artifact admission.
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if matches!(
+            &plan.analysis,
+            pbps_model::resolver::PlanAnalysis::Resolved(_)
+        ) {
+            return Err(PlanAnalysisError::Unsupported(plan.dialect.clone()));
+        }
+        Ok(())
     }
 
     /// Expands only declarations into the permissions compared and planned.
@@ -5002,7 +5006,6 @@ mod tests {
     struct OverloadingDialect;
 
     impl Dialect for OverloadingDialect {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "overloading"
         }
@@ -6028,7 +6031,6 @@ pub struct TransactionFraming {
 pub struct MinimalDialect;
 
 impl Dialect for MinimalDialect {
-    type Plan = ();
     fn name(&self) -> &'static str {
         "minimal"
     }

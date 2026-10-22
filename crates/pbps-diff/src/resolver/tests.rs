@@ -4341,7 +4341,6 @@ mod generated_surface_coverage {
 struct Candidates;
 
 impl pbps_dialect::Dialect for Candidates {
-    type Plan = ();
     fn name(&self) -> &'static str {
         "candidates"
     }

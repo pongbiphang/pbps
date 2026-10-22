@@ -134,7 +134,7 @@ pub(crate) fn check_policy_releases(
 pub(crate) fn validate(
     changes: &ChangeSet,
     ids: &IdsFile,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
 ) -> anyhow::Result<()> {
     Ok(pbps_diff::order::row_security::validate(
         changes, ids, dialect,

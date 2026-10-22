@@ -107,11 +107,7 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
     (cs, schema, ids, before, before_ids)
 }
 
-fn scheduled(
-    placeholder: bool,
-    generated: bool,
-    pg: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
-) -> (ChangeSet, IdsFile) {
+fn scheduled(placeholder: bool, generated: bool, pg: &dyn Dialect) -> (ChangeSet, IdsFile) {
     let (cs, schema, ids, before, before_ids) = fixture(placeholder, generated);
     let scheduled = super::super::schedule::schedule(
         pbps_diff::order::propose(cs),
@@ -199,7 +195,7 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                 let result: anyhow::Result<()> = async {
                     let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
                     conn.execute("CREATE SCHEMA app; CREATE TABLE app.child (id integer, g integer GENERATED ALWAYS AS (id * 3) STORED, z integer); INSERT INTO app.child(id,z) VALUES (2,5)").await?;
-                    let pg: Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>> = if offline { Box::new(pbps_pg::Postgres::new()) }
+                    let pg: Box<dyn Dialect> = if offline { Box::new(pbps_pg::Postgres::new()) }
                         else { crate::engine::planning_dialect(&mut conn).await? };
                     let (cs, ids) = scheduled(placeholder, true, pg.as_ref());
                     for part in &cs.changes {

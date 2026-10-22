@@ -2,7 +2,7 @@
 
 use pbps_dialect::PlanPayload;
 use pbps_model::resolver::OrderingProof;
-use pbps_model::{ChangeSet, PlanMode, PlannedChange};
+use pbps_model::{ChangeSet, PlanMode};
 
 pub(super) mod sealed {
     pub trait Sealed {}
@@ -17,16 +17,16 @@ pub(super) mod sealed {
 ///     fn changes(&self) -> &pbps_model::ChangeSet { &self.0 }
 ///     fn mode(&self) -> pbps_model::PlanMode { pbps_model::PlanMode::Transactional }
 /// }
-/// impl pbps_diff::order::PlanView for Unordered {}
+/// impl pbps_diff::order::PlanView<pbps_dialect::MinimalDialect> for Unordered {}
 /// ```
-pub trait PlanView: PlanPayload + sealed::Sealed {}
+pub trait PlanView<D: ?Sized>: PlanPayload + sealed::Sealed {}
 
 /// An immutable intermediate result. Ordering another stage may replace it,
 /// but neither it nor a cloned payload can be passed to an engine.
 ///
 /// ```compile_fail
 /// fn execute(plan: &pbps_diff::order::PlanningPlan) {
-///     let _: &dyn pbps_diff::order::PlanView = plan;
+///     let _: &dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect> = plan;
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -140,41 +140,70 @@ pub fn take(plan: &mut PlanningPlan) -> PlanningPlan {
 ///
 /// ```compile_fail
 /// use pbps_diff::order::{OrderedPlan, PlanView, Schedule, propose};
-/// fn recertify(ordered: &OrderedPlan) {
+/// fn recertify(ordered: &OrderedPlan<pbps_dialect::MinimalDialect>) {
 ///     let mut external_copy = ordered.changes().clone();
 ///     external_copy.changes.reverse();
 ///     let recertified = Schedule::new(external_copy.changes.len())
 ///         .settle(propose(external_copy)).unwrap().into_planning();
-///     let _: &dyn PlanView = &recertified;
+///     let _: &dyn PlanView<pbps_dialect::MinimalDialect> = &recertified;
 /// }
 /// ```
 ///
 /// ```compile_fail
 /// use pbps_diff::order::OrderedPlan;
-/// let plan = OrderedPlan::new(todo!());
+/// let plan = OrderedPlan::new(todo!(), pbps_model::PlanMode::Transactional,
+///                             &pbps_dialect::MinimalDialect);
 /// ```
 ///
 /// ```compile_fail
-/// fn edit(plan: &mut pbps_diff::order::OrderedPlan) {
+/// fn edit(plan: &mut pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect>) {
 ///     plan.changes().changes.reverse();
 /// }
 /// ```
-#[derive(Debug, Clone)]
-pub struct OrderedPlan {
+#[derive(Debug)]
+pub struct OrderedPlan<D: ?Sized> {
     changes: ChangeSet,
     origins: Vec<pbps_model::operation::Origin>,
     proof: OrderingProof,
     mode: PlanMode,
+    dialect: &'static str,
+    // Invariance prevents erasing or substituting the checker type.
+    brand: std::marker::PhantomData<fn(&D) -> &D>,
 }
 
-impl OrderedPlan {
-    pub(super) fn new(plan: PlanningPlan, mode: PlanMode) -> Self {
+impl<D: ?Sized> Clone for OrderedPlan<D> {
+    fn clone(&self) -> Self {
+        Self {
+            changes: self.changes.clone(),
+            origins: self.origins.clone(),
+            proof: self.proof.clone(),
+            mode: self.mode,
+            dialect: self.dialect,
+            brand: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<D: ?Sized> OrderedPlan<D> {
+    // PR5a's production stages still return PlanningPlan. The complete route
+    // adds its private call here when the stacked consumer migration lands.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub(super) fn new(plan: PlanningPlan, mode: PlanMode, dialect: &D) -> Self
+    where
+        D: pbps_dialect::Dialect,
+    {
         Self {
             changes: plan.payload,
             origins: plan.origins,
             proof: plan.proof,
             mode,
+            dialect: dialect.name(),
+            brand: std::marker::PhantomData,
         }
+    }
+
+    pub(super) fn dialect(&self) -> &'static str {
+        self.dialect
     }
 
     pub fn changes(&self) -> &ChangeSet {
@@ -193,7 +222,7 @@ impl OrderedPlan {
     }
 }
 
-impl PlanPayload for OrderedPlan {
+impl<D: ?Sized> PlanPayload for OrderedPlan<D> {
     fn changes(&self) -> &ChangeSet {
         &self.changes
     }
@@ -201,19 +230,23 @@ impl PlanPayload for OrderedPlan {
         self.mode
     }
 }
-impl sealed::Sealed for OrderedPlan {}
-impl PlanView for OrderedPlan {}
+impl<D: ?Sized> sealed::Sealed for OrderedPlan<D> {}
+impl<D: ?Sized> PlanView<D> for OrderedPlan<D> {}
 
-/// The real single-operation route used by emitter fixtures. A singleton has
-/// no inter-operation permutation; the same schedule still checks its shape.
-/// This cannot recertify a caller-reordered collection of operations.
-pub fn singleton(change: PlannedChange, mode: PlanMode) -> OrderedPlan {
+/// A single-operation fixture, available only in test builds or through the
+/// non-default `test-fixtures` feature used by engine dev-dependencies.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn singleton<D: pbps_dialect::Dialect + ?Sized>(
+    change: pbps_model::PlannedChange,
+    mode: PlanMode,
+    dialect: &D,
+) -> OrderedPlan<D> {
     let settled = super::Schedule::new(1)
         .settle(propose(ChangeSet {
             changes: vec![change],
         }))
         .expect("a single operation has no ordering cycle");
-    OrderedPlan::new(settled.changes, mode)
+    OrderedPlan::new(settled.changes, mode, dialect)
 }
 
 #[cfg(test)]

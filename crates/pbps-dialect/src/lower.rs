@@ -12,7 +12,7 @@
 use pbps_model::operation::{Operation, OperationId, Operations};
 use pbps_model::{Strategy, TableName};
 
-use crate::{Dialect, DialectError, Released, Statement};
+use crate::{Dialect, DialectError, PlanDialect, Released, Statement};
 
 /// Whether a statement can run inside the plan's transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +188,7 @@ impl<P: ?Sized> LoweredPlan<P> {
 }
 
 /// One certified position, preserving the operation's statement group.
-pub fn lower_ordered<D: Dialect + ?Sized>(
+pub fn lower_ordered<D: PlanDialect + ?Sized>(
     plan: &D::Plan,
     position: usize,
     dialect: &D,
@@ -215,14 +215,14 @@ where
 /// A caller cannot replace the mode bound to that input:
 ///
 /// ```compile_fail
-/// fn override_mode<D: pbps_dialect::Dialect + ?Sized>(plan: &D::Plan, dialect: &D)
+/// fn override_mode<D: pbps_dialect::PlanDialect + ?Sized>(plan: &D::Plan, dialect: &D)
 /// where D::Plan: pbps_dialect::PlanPayload {
 ///     let _ = pbps_dialect::lower::lower_plan(
 ///         plan, dialect, pbps_model::PlanMode::Staged,
 ///     );
 /// }
 /// ```
-pub fn lower_plan<D: Dialect + ?Sized>(
+pub fn lower_plan<D: PlanDialect + ?Sized>(
     plan: &D::Plan,
     dialect: &D,
 ) -> Result<LoweredPlan<D::Plan>, DialectError>
@@ -254,7 +254,6 @@ mod tests {
     struct Parking;
 
     impl Dialect for Parking {
-        type Plan = ();
         fn name(&self) -> &'static str {
             "parking"
         }

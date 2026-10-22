@@ -325,7 +325,7 @@ mod tests {
         })
         .unwrap();
         for dialect in [
-            &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+            &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect,
             &pbps_pg::Postgres::new(),
         ] {
             let statements =

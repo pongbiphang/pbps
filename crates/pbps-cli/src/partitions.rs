@@ -236,7 +236,7 @@ pub fn cmd_extend(
 /// and the series is refused for an error it did not add (#1943, DEC-1943.1).
 fn errors_the_series_adds(
     project: &Project,
-    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn pbps_dialect::Dialect,
     before: &pbps_model::Schema,
     after: &pbps_model::Schema,
     now: i64,

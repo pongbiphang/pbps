@@ -117,7 +117,7 @@ pub fn rehearse(
     declared: &Schema,
     declared_ids: &IdsFile,
     plan: &[Statement],
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
     // The scratch-database lifecycle and container setup below are SQL
@@ -214,7 +214,7 @@ async fn run(
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
     // SQL Server, named rather than threaded through: the rehearsal runs
@@ -268,7 +268,7 @@ async fn rehearse_in(
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,
-    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+    dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
     conn.execute(&format!("USE [{name}];")).await?;
