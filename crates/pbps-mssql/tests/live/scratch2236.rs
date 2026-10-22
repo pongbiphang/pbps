@@ -878,31 +878,40 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
             );
         }
     }
-    db.conn
-        .execute("DENY SELECT ON sys.database_ledger_digest_locations TO public;")
-        .await
-        .unwrap();
-    let denied = inventory::read(&mut db.conn, Some("catalog_owner"))
-        .await
-        .unwrap_err()
-        .to_string();
-    db.conn
-        .execute("REVERT; REVOKE SELECT ON sys.database_ledger_digest_locations FROM public;")
-        .await
-        .unwrap();
-    db.conn
-        .execute("EXECUTE AS USER=N'catalog_owner';")
-        .await
-        .unwrap();
-    assert!(
-        denied.contains("sys.database_ledger_digest_locations"),
-        "{denied}"
-    );
+    let mut denied_reads = Vec::new();
+    for catalog in [
+        "database_ledger_digest_locations",
+        "key_encryptions",
+        "crypt_properties",
+        "assembly_references",
+        "column_type_usages",
+    ] {
+        db.conn
+            .execute(&format!("DENY SELECT ON sys.{catalog} TO public;"))
+            .await
+            .unwrap();
+        let denied = inventory::read(&mut db.conn, Some("catalog_owner")).await;
+        db.conn
+            .execute(&format!(
+                "REVERT; REVOKE SELECT ON sys.{catalog} FROM public;"
+            ))
+            .await
+            .unwrap();
+        db.conn
+            .execute("EXECUTE AS USER=N'catalog_owner';")
+            .await
+            .unwrap();
+        denied_reads.push((catalog, denied));
+    }
     db.conn
         .execute("REVERT; DROP USER catalog_owner;")
         .await
         .unwrap();
     db.drop().await;
+    for (catalog, denied) in denied_reads {
+        let denied = denied.unwrap_err().to_string();
+        assert!(denied.contains(&format!("sys.{catalog}")), "{denied}");
+    }
 }
 
 #[tokio::test]
@@ -930,4 +939,156 @@ async fn ledger_soft_deletion_refuses_with_the_retained_object_names() {
             .iter()
             .any(|name| name.contains("MSSQL_DroppedLedger"))
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn assembly_references_drop_dependents_before_providers_as_owner() {
+    let mut db = TestDb::create("assembly2236").await;
+    let binaries = [
+        include_str!("scratch2236-provider.hex").trim(),
+        include_str!("scratch2236-consumer.hex").trim(),
+    ];
+    let mut owned_trust = Vec::new();
+    let mut entered = false;
+    let result: Result<_, pbps_db::DbError> = async {
+        for binary in binaries {
+            let found = db
+                .conn
+                .query(&format!(
+                    "SELECT COUNT_BIG(*) AS count FROM sys.trusted_assemblies \
+                 WHERE hash=HASHBYTES('SHA2_512',0x{binary});",
+                ))
+                .await?;
+            if found[0].try_get::<i64>("count")? == Some(0) {
+                db.conn
+                    .execute(&format!(
+                        "DECLARE @hash varbinary(64)=HASHBYTES('SHA2_512',0x{binary}); \
+                     EXEC sys.sp_add_trusted_assembly @hash=@hash, \
+                     @description=N'pbps2236 dependency fixture';",
+                    ))
+                    .await?;
+                owned_trust.push(binary);
+            }
+        }
+        db.conn
+            .execute(
+                "CREATE USER assembly_owner WITHOUT LOGIN; \
+             ALTER ROLE db_owner ADD MEMBER assembly_owner; EXECUTE AS USER=N'assembly_owner';",
+            )
+            .await?;
+        entered = true;
+        for (name, binary) in ["provider", "consumer"].into_iter().zip(binaries) {
+            db.conn
+                .execute(&format!(
+                    "CREATE ASSEMBLY [{name}] FROM 0x{binary} WITH PERMISSION_SET=SAFE;",
+                ))
+                .await?;
+        }
+        let references = db
+            .conn
+            .query(
+                "SELECT COUNT_BIG(*) AS count FROM sys.assembly_references r \
+             JOIN sys.assemblies a ON a.assembly_id=r.assembly_id \
+             JOIN sys.assemblies p ON p.assembly_id=r.referenced_assembly_id \
+             WHERE a.name=N'consumer' AND p.name=N'provider';",
+            )
+            .await?;
+        let count = references[0].try_get::<i64>("count")?;
+        let names = inventory::read(&mut db.conn, Some("assembly_owner"))
+            .await?
+            .names();
+        let cleanup = inventory::cleanup(&mut db.conn, Some("assembly_owner")).await;
+        let fresh = inventory::read(&mut db.conn, Some("assembly_owner"))
+            .await?
+            .names();
+        Ok((count, names, cleanup, fresh))
+    }
+    .await;
+    if entered {
+        db.conn.execute("REVERT;").await.unwrap();
+    }
+    db.drop().await;
+    // Exact-hash trust is only a fixture prerequisite. Preserve pre-existing
+    // entries and restore the ones this case added even when cleanup fails.
+    let mut admin = connect_live(&std::env::var("PBPS_TEST_DB").unwrap())
+        .await
+        .unwrap();
+    for binary in owned_trust {
+        admin
+            .execute(&format!(
+                "DECLARE @hash varbinary(64)=HASHBYTES('SHA2_512',0x{binary}); \
+             EXEC sys.sp_drop_trusted_assembly @hash=@hash;",
+            ))
+            .await
+            .unwrap();
+    }
+    let (count, names, cleanup, fresh) = result.unwrap();
+    assert_eq!(count, Some(1));
+    assert!(
+        names
+            .iter()
+            .any(|name| name.contains("ASSEMBLY [consumer]")),
+        "{names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name.contains("ASSEMBLY [provider]")),
+        "{names:?}"
+    );
+    assert!(cleanup.is_ok(), "{cleanup:?}");
+    assert!(fresh.is_empty(), "{fresh:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys() {
+    let mut db = TestDb::create("keycycle2236").await;
+    db.conn
+        .execute(
+            "CREATE USER cycle_owner WITHOUT LOGIN; ALTER ROLE db_owner ADD MEMBER cycle_owner; \
+         EXECUTE AS USER=N'cycle_owner'; \
+         CREATE SYMMETRIC KEY ka WITH ALGORITHM=AES_256 \
+         ENCRYPTION BY PASSWORD='Pbps!Probe2236Secret'; \
+         OPEN SYMMETRIC KEY ka DECRYPTION BY PASSWORD='Pbps!Probe2236Secret'; \
+         CREATE SYMMETRIC KEY kb WITH ALGORITHM=AES_256 ENCRYPTION BY SYMMETRIC KEY ka; \
+         OPEN SYMMETRIC KEY kb DECRYPTION BY SYMMETRIC KEY ka; \
+         ALTER SYMMETRIC KEY ka ADD ENCRYPTION BY SYMMETRIC KEY kb; CLOSE ALL SYMMETRIC KEYS;",
+        )
+        .await
+        .unwrap();
+    let refused = inventory::cleanup(&mut db.conn, Some("cycle_owner")).await;
+    let retained = inventory::read(&mut db.conn, Some("cycle_owner"))
+        .await
+        .unwrap()
+        .names();
+    // Only the fixture knows this password. Cleanup must not guess one or
+    // weaken protection to turn an actual dependency cycle into a sort order.
+    db.conn
+        .execute(
+            "OPEN SYMMETRIC KEY ka DECRYPTION BY PASSWORD='Pbps!Probe2236Secret'; \
+         OPEN SYMMETRIC KEY kb DECRYPTION BY SYMMETRIC KEY ka; \
+         ALTER SYMMETRIC KEY ka DROP ENCRYPTION BY SYMMETRIC KEY kb; CLOSE ALL SYMMETRIC KEYS;",
+        )
+        .await
+        .unwrap();
+    let cleanup = inventory::cleanup(&mut db.conn, Some("cycle_owner")).await;
+    let fresh = inventory::read(&mut db.conn, Some("cycle_owner"))
+        .await
+        .unwrap()
+        .names();
+    db.conn.execute("REVERT;").await.unwrap();
+    db.drop().await;
+    let refused = refused.unwrap_err();
+    for name in ["SYMMETRIC KEY [ka]", "SYMMETRIC KEY [kb]"] {
+        assert!(refused.iter().any(|entry| entry == name), "{refused:?}");
+        assert!(retained.iter().any(|entry| entry == name), "{retained:?}");
+    }
+    assert!(
+        refused.iter().all(|entry| retained.contains(entry)),
+        "{refused:?}"
+    );
+    assert!(cleanup.is_ok(), "{cleanup:?}");
+    assert!(fresh.is_empty(), "{fresh:?}");
 }

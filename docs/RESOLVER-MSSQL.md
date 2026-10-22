@@ -516,6 +516,15 @@ refuses by name, rather than being left behind:
   Partition schemes precede their functions, and encryption keys precede
   their master keys. A role owned by another role or user goes before its
   owner; that ownership chain is a dependency too (15421).
+  Catalog-ID edges also order references within a rank: symmetric-key
+  encryptors, assembly references and table types using alias types.
+  Certificate/key-mapped users precede their matching key by SID (15559);
+  signatures and counter-signatures precede their signer. Keys precede
+  their owners and master-key protectors, and external models precede
+  their credentials. Bound types or columns precede standalone defaults
+  and rules; standalone defaults use `DROP DEFAULT`. A dependency cycle
+  refuses with the retained names. Cleanup does not acquire passwords or
+  alter encryption to break a cycle.
 - **Roles.** A role sheds its members first. Its schemas go before it,
   since `DROP ROLE` refuses a role that has a member (15144) or owns a
   schema (15138)

@@ -3913,6 +3913,15 @@ reverse-dependency cleanup (#2236).**
   and memberships; schema-bound dependents precede their dependencies;
   foreign keys precede the keys they reference. Owned roles precede their
   owning roles or users (dropping an owner first is engine error 15421).
+  Catalog-ID dependency edges, without changing ranks, put mapped users
+  before their certificate or asymmetric key by SID (15559), signatures
+  and counter-signatures before their signer, and keys before their owners
+  and master-key protectors. They also order symmetric-key encryption
+  chains, assembly references, table types using alias types and external
+  models using credentials. Bound types/columns precede standalone rules
+  and defaults; standalone defaults use `DROP DEFAULT`. Dependency cycles
+  retain their named refusal; cleanup gains no password or encryption
+  change to break them.
   Modules, tables and types
   precede schemas, which precede owning roles/users. Partition schemes
   precede functions, and encryption keys precede master keys. Conversations
@@ -3955,6 +3964,8 @@ reverse-dependency cleanup (#2236).**
 `supplied_options_compare_every_column_and_allow_log_backup_status`,
 `inherited_model_objects_refuse_and_the_model_is_restored_before_assertions`,
 `scratch_inventory_reads_every_catalog_and_cleans_contained_dependencies`,
+`assembly_references_drop_dependents_before_providers_as_owner`,
+`cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys`,
 `system_catalog_selects_are_creation_independent_and_other_system_permissions_refuse`,
 `sandbox_checks_all_database_names_and_the_complete_system_contract`,
 `system_database_permissions_follow_fixed_rules_and_restore_each_change`,

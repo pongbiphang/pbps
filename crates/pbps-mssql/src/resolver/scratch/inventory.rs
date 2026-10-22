@@ -84,7 +84,16 @@ pub struct Entry {
 enum Securable {
     Object(i32),
     Principal(i32),
+    Certificate(i32),
+    AsymmetricKey(i32),
+    SymmetricKey(i32),
+    Type(i32),
+    Credential(i32),
+    ExternalModel(i32),
+    Assembly(i32),
 }
+
+type Identity = fn(i32) -> Securable;
 
 #[derive(Debug, Default)]
 pub struct Inventory {
@@ -320,14 +329,18 @@ pub async fn read(
             "C" | "D" | "F" | "PK" | "UQ" | "EC" => {
                 let parent = row.try_get::<&str>("parent_name")?;
                 (
-                    parent.map(|parent| {
-                        format!(
-                            "ALTER TABLE {}.{} DROP CONSTRAINT {};",
-                            ident(&schema),
-                            ident(parent),
-                            ident(&name)
-                        )
-                    }),
+                    if kind.trim() == "D" && parent.is_none() {
+                        Some(format!("DROP DEFAULT {qualified};"))
+                    } else {
+                        parent.map(|parent| {
+                            format!(
+                                "ALTER TABLE {}.{} DROP CONSTRAINT {};",
+                                ident(&schema),
+                                ident(parent),
+                                ident(&name)
+                            )
+                        })
+                    },
                     if kind.trim() == "F" { 18 } else { 20 },
                 )
             }
@@ -509,6 +522,27 @@ pub async fn read(
         } else {
             "name"
         };
+        let identity: Option<(&str, Identity)> = match catalog {
+            "types" => Some(("user_type_id", Securable::Type)),
+            "assemblies" => Some(("assembly_id", Securable::Assembly)),
+            "certificates" => Some(("certificate_id", Securable::Certificate)),
+            "asymmetric_keys" => Some(("asymmetric_key_id", Securable::AsymmetricKey)),
+            "symmetric_keys" => Some(("symmetric_key_id", Securable::SymmetricKey)),
+            "database_scoped_credentials" => Some(("credential_id", Securable::Credential)),
+            "external_models" => Some(("external_model_id", Securable::ExternalModel)),
+            _ => None,
+        };
+        let crypto = matches!(
+            catalog,
+            "certificates" | "asymmetric_keys" | "symmetric_keys"
+        );
+        let mut projection = projection.to_owned();
+        if let Some((column, _)) = identity {
+            projection.push_str(&format!(",{column} AS inventory_id"));
+        }
+        if crypto {
+            projection.push_str(",principal_id");
+        }
         for row in rows(
             conn,
             catalog,
@@ -545,7 +579,20 @@ pub async fn read(
                 } else {
                     rank
                 };
-            result.add(format!("{kind} {name}"), drop, rank, None);
+            let key = identity
+                .map(|(_, make)| {
+                    row.try_get::<i32>("inventory_id")?
+                        .map(make)
+                        .ok_or_else(|| DbError::BadRow(format!("sys.{catalog} has no identity")))
+                })
+                .transpose()?;
+            if crypto && let (Some(key), Some(owner)) = (key, row.try_get::<i32>("principal_id")?) {
+                // A mapped user can hold this key past another user's rank.
+                result
+                    .dependencies
+                    .insert((key, Securable::Principal(owner)));
+            }
+            result.add(format!("{kind} {name}"), drop, rank, key);
         }
     }
     rows(
@@ -631,6 +678,7 @@ pub async fn read(
             None,
         );
     }
+    references(conn, &mut result).await?;
     nonsecurables(conn, &mut result).await?;
     properties(conn, &mut result).await?;
     permissions(
@@ -640,6 +688,156 @@ pub async fn read(
     )
     .await?;
     Ok(result)
+}
+
+// A reference can hold a low-rank parent until after a high-rank child.
+// IDs keep that order independent of catalog iteration and object names.
+async fn references(
+    conn: &mut impl QueryConnection,
+    result: &mut Inventory,
+) -> Result<(), DbError> {
+    use Securable::*;
+    let relations: &[(&str, &str, Identity, Identity)] = &[
+        (
+            "certificates",
+            "SELECT p.principal_id AS dependent_id,c.certificate_id AS provider_id \
+          FROM sys.database_principals p JOIN sys.certificates c ON p.sid=c.sid WHERE p.type='C';",
+            Principal,
+            Certificate,
+        ),
+        (
+            "asymmetric_keys",
+            "SELECT p.principal_id AS dependent_id,a.asymmetric_key_id AS provider_id \
+          FROM sys.database_principals p JOIN sys.asymmetric_keys a ON p.sid=a.sid WHERE p.type='K';",
+            Principal,
+            AsymmetricKey,
+        ),
+        (
+            "key_encryptions",
+            "SELECT e.key_id AS dependent_id,c.certificate_id AS provider_id FROM sys.key_encryptions e \
+          JOIN sys.certificates c ON e.thumbprint=c.thumbprint WHERE e.crypt_type IN('EPUC','C256');",
+            SymmetricKey,
+            Certificate,
+        ),
+        (
+            "key_encryptions",
+            "SELECT e.key_id AS dependent_id,a.asymmetric_key_id AS provider_id FROM sys.key_encryptions e \
+          JOIN sys.asymmetric_keys a ON e.thumbprint=a.thumbprint WHERE e.crypt_type IN('EPUA','A256');",
+            SymmetricKey,
+            AsymmetricKey,
+        ),
+        (
+            "key_encryptions",
+            "SELECT e.key_id AS dependent_id,s.symmetric_key_id AS provider_id FROM sys.key_encryptions e \
+          JOIN sys.symmetric_keys s ON e.thumbprint=CONVERT(varbinary(32),s.key_guid) \
+          WHERE e.crypt_type='ESKS';",
+            SymmetricKey,
+            SymmetricKey,
+        ),
+        (
+            "certificates",
+            "SELECT c.certificate_id AS dependent_id,m.symmetric_key_id AS provider_id \
+          FROM sys.certificates c CROSS JOIN sys.symmetric_keys m \
+          WHERE c.pvt_key_encryption_type='MK' AND m.name=N'##MS_DatabaseMasterKey##';",
+            Certificate,
+            SymmetricKey,
+        ),
+        (
+            "asymmetric_keys",
+            "SELECT a.asymmetric_key_id AS dependent_id,m.symmetric_key_id AS provider_id \
+          FROM sys.asymmetric_keys a CROSS JOIN sys.symmetric_keys m \
+          WHERE a.pvt_key_encryption_type='MK' AND m.name=N'##MS_DatabaseMasterKey##';",
+            AsymmetricKey,
+            SymmetricKey,
+        ),
+        (
+            "database_scoped_credentials",
+            "SELECT c.credential_id AS dependent_id,m.symmetric_key_id AS provider_id \
+          FROM sys.database_scoped_credentials c CROSS JOIN sys.symmetric_keys m \
+          WHERE m.name=N'##MS_DatabaseMasterKey##';",
+            Credential,
+            SymmetricKey,
+        ),
+        (
+            "crypt_properties",
+            "SELECT p.major_id AS dependent_id,c.certificate_id AS provider_id FROM sys.crypt_properties p \
+          JOIN sys.certificates c ON p.thumbprint=c.thumbprint \
+          WHERE p.class=1 AND p.crypt_type IN('SPVC','CPVC');",
+            Object,
+            Certificate,
+        ),
+        (
+            "crypt_properties",
+            "SELECT p.major_id AS dependent_id,a.asymmetric_key_id AS provider_id \
+          FROM sys.crypt_properties p JOIN sys.asymmetric_keys a ON p.thumbprint=a.thumbprint \
+          WHERE p.class=1 AND p.crypt_type IN('SPVA','CPVA');",
+            Object,
+            AsymmetricKey,
+        ),
+        (
+            "column_type_usages",
+            "SELECT t.user_type_id AS dependent_id,c.user_type_id AS provider_id \
+          FROM sys.column_type_usages c JOIN sys.table_types t ON t.type_table_object_id=c.object_id \
+          WHERE t.user_type_id<>c.user_type_id;",
+            Type,
+            Type,
+        ),
+        (
+            "types",
+            "SELECT user_type_id AS dependent_id,default_object_id AS provider_id FROM sys.types \
+          WHERE is_user_defined=1 AND default_object_id<>0;",
+            Type,
+            Object,
+        ),
+        (
+            "types",
+            "SELECT user_type_id AS dependent_id,rule_object_id AS provider_id FROM sys.types \
+          WHERE is_user_defined=1 AND rule_object_id<>0;",
+            Type,
+            Object,
+        ),
+        (
+            "columns",
+            "SELECT c.object_id AS dependent_id,d.object_id AS provider_id FROM sys.columns c \
+          JOIN sys.objects d ON d.object_id=c.default_object_id \
+          WHERE d.type='D' AND d.parent_object_id=0;",
+            Object,
+            Object,
+        ),
+        (
+            "columns",
+            "SELECT c.object_id AS dependent_id,r.object_id AS provider_id FROM sys.columns c \
+          JOIN sys.objects r ON r.object_id=c.rule_object_id WHERE r.type='R';",
+            Object,
+            Object,
+        ),
+        (
+            "external_models",
+            "SELECT external_model_id AS dependent_id,credential_id AS provider_id FROM sys.external_models \
+          WHERE credential_id IS NOT NULL;",
+            ExternalModel,
+            Credential,
+        ),
+        (
+            "assembly_references",
+            "SELECT assembly_id AS dependent_id,referenced_assembly_id AS provider_id \
+          FROM sys.assembly_references;",
+            Assembly,
+            Assembly,
+        ),
+    ];
+    for (catalog, sql, dependent, provider) in relations {
+        for row in rows(conn, catalog, sql).await? {
+            let id = |name| {
+                row.try_get::<i32>(name)?
+                    .ok_or_else(|| DbError::BadRow(format!("sys.{catalog} has no {name}")))
+            };
+            result
+                .dependencies
+                .insert((dependent(id("dependent_id")?), provider(id("provider_id")?)));
+        }
+    }
+    Ok(())
 }
 
 // These persistent database settings and broker/Query Store records have no

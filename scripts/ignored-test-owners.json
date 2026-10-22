@@ -1866,7 +1866,9 @@
         "scratch2236::failed_database_creation_and_failed_reference_reads_release_every_recorded_resource",
         "scratch2236::system_database_permissions_follow_fixed_rules_and_restore_each_change",
         "scratch2236::independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner",
-        "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names"
+        "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names",
+        "scratch2236::assembly_references_drop_dependents_before_providers_as_owner",
+        "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys"
       ]
     },
     {
