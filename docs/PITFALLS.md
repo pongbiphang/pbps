@@ -2256,6 +2256,17 @@ permissive ALL policy and explicit TRUE policy admitted different rows.
   it looks resource-shaped (`errno 11`, core dump, 2-CPU runner), not
   image-shaped. That step now prints the container's own log on failure, which
   the raw job output otherwise buries under teardown noise.
+- The Windows runner's Docker service can stay stopped after its boot-time
+  Hyper-V switch creation fails
+  ([actions/runner-images#13729](https://github.com/actions/runner-images/issues/13729)).
+  In `release-windows`, a missing `//./pipe/docker_engine` at `docker build`,
+  or a `docker info` timeout, has ejected merge groups before any artifact was
+  qualified; re-queueing passed (#1937). Print the service status, start
+  `docker` if it is not Running, then wait for a successful `docker version`
+  with bounded attempts and timeouts before building the consumer. The
+  readiness step names a Windows runner Docker engine fault if this fails.
+  Read the failing step and log before treating an ejection as transient
+  infrastructure; this startup fault says nothing about the release build.
 - A successful SQL Server login does not prove that `MSSQL_COLLATION` has
   finished applying. On the pinned SQL Server 2025 Express image, a fresh
   container answered queries with `SQL_Latin1_General_CP1_CI_AS` for several

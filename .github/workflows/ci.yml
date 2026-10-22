@@ -751,6 +751,25 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - run: cargo build --locked --release --target x86_64-pc-windows-msvc -p pbps-cli --bin pbps
         if: steps.scope.outputs.run == 'true'
+      - name: Start the runner Docker engine and wait for readiness
+        if: steps.scope.outputs.run == 'true'
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Runner boot can leave Docker stopped (actions/runner-images#13729).
+          $service = Get-Service -Name docker
+          Write-Host "Docker service status: $($service.Status)"
+          if ($service.Status -ne 'Running') {
+            Start-Service -Name docker
+          }
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Write-Host "docker version attempt $attempt/12"
+            docker version
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 5
+          }
+          throw 'Windows runner Docker engine fault (#1937; actions/runner-images#13729): Docker did not become ready after 12 attempts'
       - name: Build a clean native Windows consumer with only Git added
         if: steps.scope.outputs.run == 'true'
         shell: pwsh
