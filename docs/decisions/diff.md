@@ -7941,6 +7941,13 @@ and read by lowering rather than supplied by its caller.
 OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
 dialect's invariant type brand through PlanView and PlanDialect, so real engines
 cannot lower another engine's certificate and sealing cannot relabel its dialect.
+Lowering an OrderedPlan uses its retained logical origins and operation IDs;
+a newly SealedPlan delegates to that same ordered collection. Admission is the
+saved-artifact exception: DEC-1958.3 omits origins from serialized changes, so
+AdmittedPlan treats each reviewed wire step as a logical input with wire-local
+IDs. It never guesses lost planning provenance from subjects, UIDs or optional
+in-memory annotations. These IDs need not equal the original planning IDs;
+SQL, saved-plan bytes, checksums and versions remain unchanged.
 RLS policy setup and catalog-owner releases use the same immutable planning
 boundary: order owns their final settlement, generated-table and name-slot
 constraints, and creation-risk write-back, while callers supply catalog facts.

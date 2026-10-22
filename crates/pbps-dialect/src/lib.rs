@@ -2255,7 +2255,9 @@ pub enum PlanAnalysisError {
 pub trait PlanPayload {
     fn changes(&self) -> &pbps_model::ChangeSet;
     fn mode(&self) -> pbps_model::PlanMode;
-    /// Original operation identities, supplied by source-mapped routes.
+    /// One whole operation per genuinely unsplit logical input. Source-mapped
+    /// routes override this with their retained identities; a final position
+    /// must not replace the source of an expanded or reordered operation.
     fn operations(&self) -> pbps_model::operation::Operations {
         pbps_model::operation::Operations::of_plan(
             &self.changes().changes,

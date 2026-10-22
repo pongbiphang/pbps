@@ -162,6 +162,7 @@ pub fn take(plan: &mut PlanningPlan) -> PlanningPlan {
 /// ```
 #[derive(Debug)]
 pub struct OrderedPlan<D: ?Sized> {
+    identities: pbps_model::operation::Operations,
     changes: ChangeSet,
     origins: Vec<pbps_model::operation::Origin>,
     proof: OrderingProof,
@@ -174,6 +175,7 @@ pub struct OrderedPlan<D: ?Sized> {
 impl<D: ?Sized> Clone for OrderedPlan<D> {
     fn clone(&self) -> Self {
         Self {
+            identities: self.identities.clone(),
             changes: self.changes.clone(),
             origins: self.origins.clone(),
             proof: self.proof.clone(),
@@ -193,6 +195,14 @@ impl<D: ?Sized> OrderedPlan<D> {
         D: pbps_dialect::Dialect,
     {
         Self {
+            identities: pbps_model::operation::Operations::expanded(
+                plan.logical,
+                plan.origins
+                    .iter()
+                    .cloned()
+                    .zip(plan.payload.changes.iter().cloned()),
+                pbps_model::operation::ModuleEdits::InPlace,
+            ),
             changes: plan.payload,
             origins: plan.origins,
             proof: plan.proof,
@@ -223,6 +233,9 @@ impl<D: ?Sized> OrderedPlan<D> {
 }
 
 impl<D: ?Sized> PlanPayload for OrderedPlan<D> {
+    fn operations(&self) -> pbps_model::operation::Operations {
+        self.identities.with_steps(&self.changes.changes)
+    }
     fn changes(&self) -> &ChangeSet {
         &self.changes
     }

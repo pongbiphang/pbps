@@ -1408,6 +1408,7 @@ dependencies = [
  "indexmap",
  "pbps-dialect",
  "pbps-model",
+ "serde_json",
  "thiserror",
 ]
 

@@ -80,6 +80,8 @@ mod benchmark;
 #[cfg(test)]
 mod expand_tests;
 #[cfg(test)]
+mod payload_tests;
+#[cfg(test)]
 mod saved_tests;
 #[cfg(test)]
 mod schedule_tests;
