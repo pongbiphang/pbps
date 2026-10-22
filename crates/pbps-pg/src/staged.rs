@@ -9,6 +9,37 @@
 
 use pbps_db::{Conn, DbError};
 use pbps_dialect::{IndexBuild, ScanCheck, ScanCheckStep, Statement};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Names that can block an attaching table's temporary CHECK (DEC-2126.1).
+/// A CHECK shares only its table's constraint namespace, not the schema's
+/// relation namespace. Keep every contype, including keys adopted at attach.
+pub async fn attach_constraint_names(
+    conn: &mut Conn,
+    tables: &BTreeMap<pbps_model::Uid, pbps_model::TableName>,
+) -> Result<BTreeMap<pbps_model::Uid, BTreeSet<pbps_model::ObjectLocalName>>, DbError> {
+    let mut names = BTreeMap::new();
+    for (uid, table) in tables {
+        let rows = conn
+            .query_with(
+                "SELECT k.conname FROM pg_catalog.pg_constraint k \
+             JOIN pg_catalog.pg_class t ON t.oid = k.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
+             WHERE n.nspname = $1 AND t.relname = $2",
+                &[table.schema.as_str().into(), table.name.as_str().into()],
+            )
+            .await?;
+        let mut held = BTreeSet::new();
+        for row in rows {
+            let name = row
+                .try_get::<&str>("conname")?
+                .ok_or_else(|| missing("conname"))?;
+            held.insert(name.into());
+        }
+        names.insert(uid.clone(), held);
+    }
+    Ok(names)
+}
 
 /// Execute a staged statement and attach its recovery outcome to the original
 /// error, so the failure ledger retains both the SQLSTATE and our own account.

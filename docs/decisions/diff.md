@@ -6200,8 +6200,10 @@ the plan format to 42), and
 Its name is `pbps_attach_<uid>`, the table's own identity. Nothing finds it by
 prefix, and no declared constraint of any kind may start with
 `pbps_attach_`: the name is pbps's, so a CHECK that stands under it is the
-run's to remove, not a user's, and no key or foreign key fails its `ADD` in
-the namespace a table's constraints share.
+run's to remove, not a user's. This declaration check cannot see a live key
+or foreign key that the attach adopts as its parent's clone. Connected staged
+planning also reads the attaching table's constraint names and keeps the
+single statement when the exact temporary name is held (DEC-2126.1).
 
 **What runs beside the plan.**
 - *No checkpoint after the `ADD`.* Measured, a `NOT VALID` check makes every
@@ -8176,3 +8178,53 @@ stays before the execution connection and lock, while rendering still waits
 for the target zone; the guard, session pins and DDL keep their existing bytes. Per-statement
 bootstrap prerequisite checks select a position from the certified collection,
 never an arbitrary statement slice (DEC-2181.1, DEC-2181.2).
+
+<a id="dec-2126-1"></a>
+
+**DEC-2126.1. A staged attach keeps the ordinary ATTACH when its table already
+holds the temporary CHECK's exact name.** The declaration prefix check cannot
+see a live primary key, unique constraint or foreign key that the attach
+adopts as its parent's clone: the desired partition does not declare it.
+
+Measured on PostgreSQL 16.15 and 18.6, `ADD CONSTRAINT x CHECK (...) NOT VALID`
+fails with SQLSTATE `42710` when the same table holds a primary key, unique,
+foreign key, CHECK or exclusion constraint named `x`. An ordinary index named
+`x` on that table does not block it. Neither does another table's primary key,
+unique, foreign key or CHECK named `x`, nor a table, index or sequence named
+`x` in the same schema. The CHECK claims only the table's constraint namespace;
+an index-backed constraint's additional relation name does not widen it.
+
+The staged planning read therefore collects every constraint name on each
+attaching table, without a `contype` filter or a schema relation-name read.
+The names travel by table uid beside the dialect's existing planning facts,
+using the current catalog name even when declarations rename the table.
+Dialect selection still follows the project configuration; this read adds no
+server-version capability. The read retains the selected concrete engine type
+through certified planning; emission needs only the saved key.
+The differ omits the optional `AttachPartition::key` scan proof only when
+`scan_check_name(uid)` is held. An empty key already emits the ordinary ATTACH;
+the saved plan therefore pins that choice for explain, apply and resume,
+without a new format version, change kind, sort class or ordering pass.
+Re-derivations consume the same observed names. A different name, an occupied
+name on another table, and a relation-only occupant retain the four steps.
+Offline `plan --staged` still refuses without `--db` or `--env`: there is no
+offline staged artifact whose optimization needs a catalog guess.
+
+The scratch-name sweep found detach's `pbps_t<k>_<n>` names, which already
+probe both constraint and relation namespaces and choose a free name inside
+the detach batch (DEC-1565.1). Concurrent index builds use the declared index
+name and preserve pre-existing indexes during recovery; they introduce no
+other scratch index name. No additional fixed PostgreSQL scratch constraint
+or index name needs this fallback. A same-named CHECK cannot survive baseline's
+cleanup as a user's declared constraint, and exclusion constraints are outside
+the readable model; their namespace behavior is covered by the measurements.
+
+Tests: `an_occupied_attach_check_name_keeps_the_single_statement` checks the
+exact name and identity, different names and prefixes, and certified singleton
+emission by a fresh dialect after the choice is sealed. The live
+`a_staged_attach_uses_a_plain_attach_only_for_its_own_occupied_constraint_name`
+runs on both servers: adoptable primary, unique and foreign keys keep the
+plain ATTACH and their constraint, a different name retains four steps, and
+same-schema relation names, another table's constraint and a same-table index
+retain four steps. Every case applies, preserves its row, verifies and leaves
+an empty next plan. Removing the occupied-name decision must fail both tests.

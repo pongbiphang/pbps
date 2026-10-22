@@ -4168,7 +4168,8 @@ pub const SCAN_CHECK_PREFIX: &str = "pbps_attach_";
 
 /// A CHECK expression on the parent's `key` that implies `bound`, or `None`
 /// where the staged form does not apply: a HASH or DEFAULT bound, an empty
-/// key (a plan from before #1638), or a range end the engine reads as empty.
+/// key (an older plan or a held CHECK name, DEC-2126.1), or a range end the
+/// engine reads as empty.
 fn bound_check(
     bound: &pbps_model::PartitionBound,
     key: &[ColumnName],

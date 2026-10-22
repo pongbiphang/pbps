@@ -275,8 +275,8 @@ pub enum Change {
         /// The parent's key columns, in order, as the plan was made against
         /// them. A staged attach writes a CHECK on them that implies the
         /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
-        /// a plan made before it, which then attaches by the single
-        /// statement.
+        /// a plan made before it, or when live constraint names prevent the
+        /// temporary CHECK (DEC-2126.1); either uses the single statement.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         key: Vec<ColumnName>,
         /// The partition as declared: what the apply holds the read-back to

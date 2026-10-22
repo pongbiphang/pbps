@@ -34,6 +34,7 @@
 #[cfg(test)]
 use pbps_dialect::PlanDialect;
 use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Dialect, DialectError, Lexicon, Statement, TransactionFraming, TypeChangeRisk};
 use pbps_model::{
@@ -684,6 +685,7 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 pub struct Postgres {
     write_path_extras: Vec<String>,
     server_version_num: Option<i64>,
+    attach_constraint_names: BTreeMap<pbps_model::Uid, BTreeSet<pbps_model::ObjectLocalName>>,
 }
 
 impl Postgres {
@@ -705,8 +707,18 @@ impl Postgres {
     pub fn with_write_path_extras(extras: Vec<String>) -> Self {
         Self {
             write_path_extras: extras,
-            server_version_num: None,
+            ..Self::default()
         }
+    }
+
+    /// Table-local constraint names observed for this plan's attaching identities.
+    #[must_use]
+    pub fn with_attach_constraint_names(
+        mut self,
+        names: BTreeMap<pbps_model::Uid, BTreeSet<pbps_model::ObjectLocalName>>,
+    ) -> Self {
+        self.attach_constraint_names = names;
+        self
     }
 
     /// A connected planner's observed capability. Unknown callers use the
@@ -1049,6 +1061,22 @@ impl Dialect for Postgres {
             }
         }
         .map(|statements| statements.len())
+    }
+
+    fn attach_scan_key(
+        &self,
+        uid: &pbps_model::Uid,
+        key: &[pbps_model::ColumnName],
+    ) -> Vec<pbps_model::ColumnName> {
+        if self
+            .attach_constraint_names
+            .get(uid)
+            .is_some_and(|names| names.contains(&emit::scan_check_name(uid)))
+        {
+            Vec::new()
+        } else {
+            key.to_vec()
+        }
     }
 
     fn validate_plan_analysis(
@@ -2590,6 +2618,49 @@ mod tests {
         }
         check(&super::Postgres::new());
         check(&pbps_mssql::Mssql);
+    }
+
+    #[test]
+    fn an_occupied_attach_check_name_keeps_the_single_statement() {
+        use pbps_dialect::Dialect;
+        use pbps_model::{BoundDatum, Change, ColumnName, PartitionBound, Uid};
+        let uid: Uid = "t_aaaaaa".parse().unwrap();
+        let other: Uid = "t_bbbbbb".parse().unwrap();
+        let key: Vec<ColumnName> = vec!["id".into()];
+        let scratch = super::emit::scan_check_name(&uid);
+        for (owner, held, occupied) in [
+            (uid.clone(), scratch.clone(), true),
+            (uid.clone(), "pbps_attach_t_aaaaaa_other".into(), false),
+            (uid.clone(), "another_constraint".into(), false),
+            (other, scratch, false),
+        ] {
+            let pg = super::Postgres::new()
+                .with_attach_constraint_names([(owner, [held].into())].into());
+            let change = Change::AttachPartition {
+                uid: uid.clone(),
+                table: "app.t".parse().unwrap(),
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Range {
+                    from: vec![BoundDatum::Value("1".into())],
+                    to: vec![BoundDatum::Value("10".into())],
+                },
+                key: pg.attach_scan_key(&uid, &key),
+                shape: Box::default(),
+            };
+            // Only the optional proof key is sealed. A fresh emitter at apply
+            // must reproduce the planning choice without another catalog read.
+            let sql = super::Postgres::new()
+                .fixture_emit_staged(&change, Default::default())
+                .unwrap();
+            assert_eq!(sql.len(), if occupied { 1 } else { 4 });
+            if occupied {
+                assert_eq!(sql, pg.fixture_emit(&change, Default::default()).unwrap());
+                assert!(sql[0].scan_check.is_none());
+            } else {
+                assert!(sql[0].scan_check.is_some());
+            }
+        }
+        assert_eq!(super::Postgres::new().attach_scan_key(&uid, &key), key);
     }
 
     fn partitioned(columns: &[&str], key: &[&str]) -> pbps_model::Table {

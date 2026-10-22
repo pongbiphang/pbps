@@ -6605,7 +6605,7 @@ pub fn cmd_plan_db(
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
-    pbps_cli::with_plan_dialect!(dialect, |dialect| {
+    pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let mut loaded = crate::load(project, dialect.as_ref())?;
         let ids = crate::read_ids(project)?;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
@@ -6900,6 +6900,17 @@ pub fn cmd_plan_db(
             &recorded_data,
             &declared_live,
         )?;
+        // Observe the attaching identities under their current names before
+        // the differ chooses their optional scan CHECK (DEC-2126.1). Its key
+        // carries that choice through re-derivation, sealing, apply and resume.
+        if staged {
+            dialect = crate::engine::staged_attach_dialect(
+                &mut conn,
+                &dialect,
+                pbps_diff::Side { schema: &read_back, ids: &recorded_ids },
+                pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+            ).await?;
+        }
         // The engine respells every expression and module body it stores —
         // measured on SQL Server, a check declared `n > 0` reads back
         // `([n]>(0))` — so compared against the read-back an unchanged check

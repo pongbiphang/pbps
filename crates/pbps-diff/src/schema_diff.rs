@@ -934,13 +934,16 @@ pub(crate) fn diff_partial_rebuilding(
                         table: declared_name.clone(),
                         parent: of.parent.clone(),
                         bound: of.bound.clone(),
-                        key: declared
-                            .schema
-                            .tables
-                            .get(&of.parent)
-                            .and_then(|parent| parent.partition_by.as_ref())
-                            .map(|by| by.columns.clone())
-                            .unwrap_or_default(),
+                        key: dialect.attach_scan_key(
+                            uid,
+                            &declared
+                                .schema
+                                .tables
+                                .get(&of.parent)
+                                .and_then(|parent| parent.partition_by.as_ref())
+                                .map(|by| by.columns.clone())
+                                .unwrap_or_default(),
+                        ),
                         shape: Box::new(declared_table.clone()),
                     });
                     // Compared as this plan leaves them: an own foreign key
