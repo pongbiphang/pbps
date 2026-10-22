@@ -848,6 +848,11 @@ pub async fn refuse_created_name_occupants(
             }
             let mut at_names = carried;
             at_names.extend(crate::deploy::rename_claims(cs));
+            at_names.extend(cs.changes.iter().flat_map(|p| {
+                crate::deploy::sequence_names_claimed(&p.change)
+                    .into_iter()
+                    .map(|(name, _)| name)
+            }));
             at_names.extend(
                 cs.changes
                     .iter()

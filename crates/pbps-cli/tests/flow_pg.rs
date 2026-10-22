@@ -3329,6 +3329,276 @@ fn duplicate_declared_serial_sequence_names_are_refused_before_planning_on_both_
     }
 }
 
+/// Serial creations and sequence renames have fixed targets, including names
+/// generated only for columns this plan actually creates (DEC-1899.1).
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn connected_serial_sequence_claims_refuse_occupants_before_ddl_on_both_servers() {
+    for (version, server) in [(16, old_server()), (18, server())] {
+        let own = OwnDatabase::new(&server, "serial-measure1899");
+        let conn = own.connection();
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(
+            conn,
+            "CREATE SCHEMA app; CREATE TABLE app.probe (id serial, n int);
+            CREATE SEQUENCE app.held_sequence; CREATE TABLE app.held_table (n int);
+            CREATE INDEX held_index ON app.held_table (n);",
+        );
+        // Only 42P07 is caught; success or any other SQLSTATE fails the test.
+        for held in ["held_sequence", "held_table", "held_index"] {
+            for sql in [
+                format!("CREATE SEQUENCE app.{held}"),
+                format!("ALTER SEQUENCE app.probe_id_seq RENAME TO {held}"),
+            ] {
+                on_server(
+                    conn,
+                    &format!(
+                        "DO $$ BEGIN
+                    BEGIN {sql}; RAISE EXCEPTION 'a held name was accepted';
+                    EXCEPTION WHEN SQLSTATE '42P07' THEN NULL; END;
+                    END $$;"
+                    ),
+                );
+            }
+        }
+        on_server(
+            conn,
+            "ALTER TABLE app.probe RENAME TO moved;
+            ALTER TABLE app.moved RENAME COLUMN id TO renamed;
+            DO $$ BEGIN
+                IF pg_get_serial_sequence('app.moved', 'renamed') IS DISTINCT FROM 'app.probe_id_seq' THEN
+                    RAISE EXCEPTION 'a table/column rename changed the sequence name';
+                END IF;
+            END $$;",
+        );
+        // Measure truncation against native serial, including UTF-8 boundaries.
+        for (table, column) in [
+            ("x".repeat(60), "id".to_owned()),
+            ("表".repeat(20), "欄".repeat(15)),
+        ] {
+            let expected = pbps_dialect::Dialect::owned_sequence_name(
+                &pbps_pg::Postgres::new(),
+                &pbps_model::TableName::new("app", &table),
+                &column,
+                &pbps_model::OwnedSequence::serial(),
+            )
+            .unwrap();
+            on_server(conn, &format!("CREATE TABLE app.\"{table}\" (\"{column}\" serial);
+                DO $$ BEGIN
+                    IF pg_get_serial_sequence('app.\"{table}\"', '{column}')::regclass IS DISTINCT FROM 'app.\"{expected}\"'::regclass THEN
+                        RAISE EXCEPTION 'generated sequence name differs';
+                    END IF;
+                END $$;"));
+        }
+
+        for adding in [false, true] {
+            for scenario in ["loose", "declared", "unrelated", "explicit"] {
+                let own = OwnDatabase::new(&server, "serial-claim1899");
+                let conn = own.connection();
+                on_server(conn, "CREATE SCHEMA app");
+                let d = Demo::new("serial-claim1899");
+                if adding {
+                    on_server(conn, "CREATE TABLE app.t (n int NOT NULL)");
+                    d.table("table: app.t\ncolumns:\n  n: {type: integer, nullable: false}\n");
+                }
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                succeeds(d.run(&["baseline", "--db", conn, "--reason", "adopt initial state"]));
+                let loose = if scenario == "unrelated" {
+                    "elsewhere"
+                } else {
+                    "t_id_seq"
+                };
+                if scenario != "declared" {
+                    on_server(conn, &format!("CREATE SEQUENCE app.{loose}"));
+                } else {
+                    std::fs::write(
+                        d.dir.join("schema/app.t_id_seq.yml"),
+                        "table: app.t_id_seq\ncolumns:\n  n: {type: integer}\n",
+                    )
+                    .unwrap();
+                }
+                let source = if scenario == "explicit" {
+                    "{type: serial, sequence: {name: other}}"
+                } else {
+                    "{type: serial}"
+                };
+                d.table(&format!(
+                    "table: app.t\ncolumns:\n{}  id: {source}\n",
+                    if adding {
+                        "  n: {type: integer, nullable: false}\n"
+                    } else {
+                        ""
+                    }
+                ));
+                let plan = d.dir.join("serial-plan.json");
+                let sql = d.dir.join("serial-plan.sql");
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                if matches!(scenario, "loose" | "declared") {
+                    let out = d.run(&[
+                        "plan",
+                        "--db",
+                        conn,
+                        "--out",
+                        plan.to_str().unwrap(),
+                        "--sql",
+                        sql.to_str().unwrap(),
+                    ]);
+                    let message = format!("{}{}", stdout(&out), stderr(&out));
+                    assert_eq!(code(&out), 1, "{scenario}, adding={adding}: {message}");
+                    for name in ["app.t_id_seq", "app.t.id"] {
+                        assert!(message.contains(name), "{message}");
+                    }
+                    assert!(
+                        !plan.exists() && !sql.exists(),
+                        "a refused plan wrote artifacts"
+                    );
+                    assert_eq!(
+                        scalar(
+                            conn,
+                            "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = to_regclass('app.t') AND attname = 'id' AND NOT attisdropped"
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        scalar(
+                            conn,
+                            "SELECT count(*) FROM pg_catalog.pg_class WHERE oid = to_regclass('app.t_id_seq') AND relkind = 'r'"
+                        ),
+                        0
+                    );
+                    if scenario == "declared" {
+                        continue;
+                    }
+                    on_server(conn, "DROP SEQUENCE app.t_id_seq");
+                }
+                // Both a different loose name and an explicit serial name
+                // plan and apply, as does freeing the exact name first.
+                succeeds(d.run(&["plan", "--db", conn, "--out", plan.to_str().unwrap()]));
+                succeeds(approved_apply(&d, conn, &plan, &[]));
+                on_server(
+                    conn,
+                    if adding {
+                        "INSERT INTO app.t (n) VALUES (1)"
+                    } else {
+                        "INSERT INTO app.t DEFAULT VALUES"
+                    },
+                );
+                assert_eq!(scalar(conn, "SELECT id::bigint FROM app.t LIMIT 1"), 1);
+            }
+        }
+
+        // Replay must honor a release in this very plan, rather than reject
+        // a fixed target just because the catalog still holds it initially.
+        for owned_sequence in [false, true] {
+            let own = OwnDatabase::new(&server, "serial-release1899");
+            let conn = own.connection();
+            on_server(conn, "CREATE SCHEMA app");
+            let d = Demo::new("serial-release1899");
+            let holder = if owned_sequence { "old" } else { "t_id_seq" };
+            if owned_sequence {
+                on_server(
+                    conn,
+                    "CREATE TABLE app.old (id serial);
+                    ALTER SEQUENCE app.old_id_seq RENAME TO t_id_seq",
+                );
+                d.table(
+                    "table: app.old\ncolumns:\n  id: {type: serial, sequence: {name: t_id_seq}}\n",
+                );
+            } else {
+                on_server(conn, "CREATE TABLE app.t_id_seq (n int)");
+                d.table("table: app.t_id_seq\ncolumns:\n  n: {type: integer}\n");
+            }
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", conn, "--reason", "adopt name holder"]));
+            d.table("table: app.t\ncolumns:\n  id: {type: serial}\n");
+            succeeds(d.run(&[
+                "drop-table",
+                &format!("app.{holder}"),
+                "--reason",
+                "release sequence name",
+            ]));
+            let plan = connected_artifact(&d, conn, false);
+            succeeds(approved_apply(&d, conn, &plan, &["--allow", "destructive"]));
+            on_server(conn, "INSERT INTO app.t DEFAULT VALUES");
+            assert_eq!(scalar(conn, "SELECT id::bigint FROM app.t"), 1);
+        }
+
+        for installing in [false, true] {
+            let own = OwnDatabase::new(&server, "serial-numbering1899");
+            let conn = own.connection();
+            on_server(
+                conn,
+                "CREATE SCHEMA app; CREATE TABLE app.t (id int NOT NULL)",
+            );
+            if !installing {
+                on_server(
+                    conn,
+                    "CREATE SEQUENCE app.a_seq AS integer OWNED BY app.t.id;
+                    ALTER TABLE app.t ALTER COLUMN id SET DEFAULT nextval('app.a_seq'::regclass)",
+                );
+            }
+            let d = Demo::new("serial-numbering1899");
+            let before = if installing {
+                "{type: integer, nullable: false}"
+            } else {
+                "{type: serial, sequence: {name: a_seq}}"
+            };
+            d.table(&format!("table: app.t\ncolumns:\n  id: {before}\n"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                conn,
+                "--reason",
+                "adopt numbering source",
+            ]));
+            // The holder is outside the declarations, but is still a relation.
+            on_server(conn, "CREATE TABLE app.b_seq (n int)");
+            d.table("table: app.t\ncolumns:\n  id: {type: serial, sequence: {name: b_seq}}\n");
+            let path = d.dir.join("refused.json");
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let out = d.run(&["plan", "--db", conn, "--out", path.to_str().unwrap()]);
+            let message = format!("{}{}", stdout(&out), stderr(&out));
+            assert_eq!(code(&out), 1, "{message}");
+            for name in ["app.b_seq", "app.t.id"] {
+                assert!(message.contains(name), "{message}");
+            }
+            assert!(!path.exists());
+            assert_eq!(
+                scalar(
+                    conn,
+                    "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.a_seq')"
+                ),
+                i64::from(!installing)
+            );
+            on_server(conn, "DROP TABLE app.b_seq");
+            let plan = path;
+            succeeds(d.run(&["plan", "--db", conn, "--out", plan.to_str().unwrap()]));
+            succeeds(approved_apply(&d, conn, &plan, &["--allow", "rename"]));
+            on_server(conn, "INSERT INTO app.t DEFAULT VALUES");
+            assert_eq!(scalar(conn, "SELECT id::bigint FROM app.t"), 1);
+            assert_eq!(
+                scalar(
+                    conn,
+                    "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.b_seq') AND relkind = 'S'"
+                ),
+                1
+            );
+        }
+    }
+}
+
 /// A connected plan's base is a read, which knows the name the engine
 /// generated for a `serial`'s sequence: a declaration naming another one
 /// renames it, gated as `rename` (#1889). The same name a git baseline

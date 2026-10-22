@@ -2559,3 +2559,72 @@ duplicate indexes previewable offline and refused by connected planning.
 covers mixed index/sequence collisions and identical, unduplicated diagnostics.
 `two_tables_with_one_index_name_are_refused` keeps the offline-preview boundary
 covered without a live server.
+
+<a id="dec-1899-1"></a>
+
+**DEC-1899.1. A connected plan claims every serial sequence it creates or
+renames at its exact emitted name, without fallback.** An unnamed serial
+claims nothing in the declarations (DEC-1631.1, DEC-1898.1), since a kept
+column can still own a sequence named before its table or column was
+renamed. A `CreateTable` or `AddColumn`, however, always emits a new
+`CREATE SEQUENCE`, so its name is known and fixed.
+
+Measured on PostgreSQL 16 and 18: both `CREATE SEQUENCE` and
+`ALTER SEQUENCE ... RENAME TO` fail with `42P07` when a sequence, table or
+index holds the target name. A table rename followed by a column rename
+leaves the owned sequence's name unchanged. Native `serial` creation agrees
+with the emitter's generated name at the 63-byte limit, including UTF-8
+character boundaries. Once a held target is freed, the same serial creation,
+sequence installation or rename plans and applies; a differently named
+loose sequence and an explicit alternative sequence name also succeed.
+
+`sequence_names_claimed` uses the existing PostgreSQL
+`Dialect::owned_sequence_name`, which calls `emit::owned_sequence`: an
+explicit name or the generated name, in the change's table schema, using
+the table and column names at that step. `AlterColumnNumbering` claims a
+sequence it puts on, including a conversion from identity, and a rename
+whose old and new sequence names are both known and differ. A retune, an
+omitted name on either side of a kept sequence, a removal and a conversion
+to identity claim no fixed sequence target, matching the emitter.
+
+The connected inventory asks for these names among sequences, indexes and
+composite types, and separately among tables and views, managed or not.
+The namespace replay checks each fixed claim against the occupants still
+present and names earlier steps created, naming the sequence and its column.
+Later table and index creations meet an earlier sequence claim too. Drops
+and moves that already release a name in the replay keep releasing it
+before the claim is checked. No new change kind, sort class or reordering
+pass is introduced.
+
+The callers retain distinct responsibilities:
+
+- `created_relation_names` combines `relation_names_created` with fixed
+  sequence claims for `engine::refuse_created_name_occupants`'s `asked`
+  inventory. The existing rebuilt-view exclusion still applies.
+- The identity-release loop in `order_carried_moves` keeps using
+  `relation_names_created` without sequences: adding them would introduce
+  new explicit identity handover edges beyond DEC-1986.1's existing callers.
+- The detach effect-closure selection in `order_carried_moves` also keeps
+  the existing relation creations; numbering changes and added serial
+  columns do not become new participants in that ordering rule.
+- `name_clashes` retains those relation creations and separately replays
+  fixed sequence claims, including collisions within one plan. Its result
+  remains the existing ordering pass's refusal evidence, not a new edge rule.
+- The `DetachPartition`-filtered `at_names` call in
+  `engine::refuse_created_name_occupants` keeps its existing clone targets.
+  A separate extension adds fixed sequence targets to `at_names`, so a
+  loose table or view at a sequence target is read even when no schema
+  move or detach occurs.
+
+Tests: `serial_claims_use_the_emitted_name_and_leave_ordering_names_unchanged`
+compares create/add claims with emitted SQL, including long ASCII and UTF-8
+names and renamed spellings; identity is a negative.
+`fixed_sequence_claims_meet_catalog_and_planned_relations_after_releases`
+covers create/add, installation, identity conversion and rename targets,
+catalog and planned occupants, both creation orders, releases, different
+schemas, explicit alternatives and kept-source negatives.
+`connected_serial_sequence_claims_refuse_occupants_before_ddl_on_both_servers`
+measures both servers, requires create/add refusals against loose sequences
+and declared generated-name tables before artifacts or DDL, checks numbering
+rename/installation against a loose table, and applies the free-name,
+alternative-name and same-plan release cases.
