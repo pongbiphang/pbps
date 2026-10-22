@@ -587,10 +587,11 @@ AUDITED_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include
 YAML_QUOTED = r""""(?:\\[\s\S]|[^"\\])*"|'(?:''|[^'])*'"""
 YAML_QUOTED_SCALAR = re.compile(YAML_QUOTED)
 YAML_KEY = re.compile(r"(" + YAML_QUOTED + r"|[^\s{}\[\],:'\"#]+)([ \t]*):")
-# A `#` starts a comment only after whitespace or at the start of a line, as
-# YAML requires; `https://x/#frag` and `build#1` are scalar text.
-YAML_COMMENT = r"(?<![^\s])#[^\n]*"
-YAML_FLOW_SCALAR = re.compile(r"(?:" + YAML_QUOTED + r"|" + YAML_COMMENT + r"|[^,}\]\"'#\s]|\s(?!#)|(?<=\S)#)*")
+# A `#` starts a comment only at a line start or after whitespace or a flow
+# indicator (`{`, `[`, `,`), as the YAML reader takes it; `https://x/#frag`
+# and `build#1` are scalar text.
+YAML_COMMENT = r"(?<![^\s{\[,])#[^\n]*"
+YAML_FLOW_SCALAR = re.compile(r"(?:" + YAML_QUOTED + r"|" + YAML_COMMENT + r"|[^,}\]\"'#\s]|\s(?!#)|(?<=[^\s{\[,])#)*")
 YAML_FLOW_DELIMITER = re.compile(YAML_QUOTED + r"|" + YAML_COMMENT + r"|[{}\[\]]")
 
 

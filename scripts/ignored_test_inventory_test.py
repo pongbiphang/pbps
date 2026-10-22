@@ -430,7 +430,11 @@ class WorkflowKeySpellings(unittest.TestCase):
                        "    steps:\n      - { name: build#1, run: echo }\n",
                        "    steps: [{ name: a#b, run: echo }]\n",
                        "    strategy: { matrix: { cell: [a#1, b#2] } }\n",
-                       "    env: { A: x # a comment\n      }\n"):
+                       "    env: { A: x # a comment\n      }\n",
+                       # A comment may follow a flow indicator directly.
+                       "    env: {# [ text\n      A: value}\n",
+                       "    env: { A: x,# [ text\n      B: y }\n",
+                       "    env: { A: [# { text\n      a] }\n"):
             with self.subTest(source=source):
                 audit.check_workflow_key_spellings(source, "live")
         # A separated comment still hides nothing: the key after it is read.
