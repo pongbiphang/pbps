@@ -2476,3 +2476,24 @@ key duplicate still refused INSERT. Owner bypass, FORCE and NOINHERIT owner
 membership make the session's effective answer necessary, rather than the
 catalog's enabled flag. The engine enforces constraints transactionally when
 pre-flight cannot prove them (SPEC §7.5).
+
+<a id="dec-1523-1"></a>
+
+**DEC-1523.1. PostgreSQL columns reference existing enums, domains and standalone composites, scalar or array.** pbps manages no type lifecycle and refuses retypes, row data and partition keys over references. Measured on 16 and 18, ADD COLUMN evaluates domain CHECKs on NULL but no attributes, elements or bounds of a NULL container. Its gate judges potential input code and requires trusted owners throughout the path, including code-free enums; `trusted_roles` extends owner trust only (#2046).
+
+<a id="dec-1523-4"></a>
+
+**DEC-1523.4. Added reference columns are checked regardless of row presence.** Measured on 16 and 18, ADD COLUMN evaluates a non-volatile domain default even on an empty table and stores its value in `attmissingval`. Planning, apply, staged steps and resume therefore validate the input path without an emptiness exemption. An empty table whose added column has no default anywhere would run no type code, but the gate refuses it anyway for one rule independent of row presence; `trusted_roles` admits an untrusted owner when the input code is built in.
+
+
+<a id="dec-2181-1"></a>
+
+**DEC-2181.1. Eligibility belongs to every referenced type's potential input path.** Check construction and the declared type's own DEFAULT for every reference in the baseline, desired schema and carried change types, including inherited partition columns. This covers every change kind, probes, rewrites, generated-expression changes, rebuilds, staged execution and settle without a per-kind execution list. On PostgreSQL 16 and 18 fast defaults evaluate even without rows; PostgreSQL 18 also evaluates domain CHECKs when a generated expression is replaced. Fill shape, row presence and a no-op plan grant no exemption; code-free paths still require trusted owners (DEC-2181.3). Apply requires each recorded baseline reference's pin even when its change carries no type; an omitted pin list cannot erase that reference. `bootstrap --sql` refuses declarations containing references, connected or offline: generation cannot certify the replay target; use connected bootstrap or target-specific plan/apply. This deliberately refuses safe NULL and empty-container cases unless their potential path is eligible; #2155 still classifies fills for default erasure, not admission.
+
+Pinned by `potential_type_paths_are_checked_even_without_an_added_column`, `an_existing_reference_cannot_be_unpinned_from_a_saved_default_change`, `bootstrap_scripts_refuse_type_references_on_postgres_16`, `bootstrap_scripts_refuse_type_references_on_postgres_18` and the live type-reference regressions on 16 and 18.
+
+<a id="dec-2181-4"></a>
+
+**DEC-2181.4. An input-path node needs an execution proof as well as a known layout.** The semantic node match refuses by default. Measured on 16 and 18, I/O coercions reconstruct the target's nested domains, while stored typed constants and relabels do not; array coercions execute their explicit element expression. PostgreSQL 18 SQL/JSON return coercions also run domain checks without an explicit coercion child and remain unreadable until qualified.
+
+Pinned by `io_coercions_execute_nested_checks_and_require_trust_on_postgres_16`, `io_coercions_execute_nested_checks_and_require_trust_on_postgres_18`, `json_return_coercion_runs_a_domain_check_and_is_unreadable_on_postgres_18` and `a_known_node_layout_without_an_execution_proof_is_refused`.

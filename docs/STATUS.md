@@ -14,6 +14,8 @@ policies permit no-op and unrelated migrations; standing-table changes arrive
 with #1173. Policy predicate binding proof remains #595's named limitation.
 RLS partition trees and reference data beside RLS remain refused.
 
+Referenced PostgreSQL types use potential-path eligibility and opt-in reviewed routine source pins (DEC-2181.1–3).
+
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
@@ -66,8 +68,11 @@ limitations.
 
 A PostgreSQL column of a built-in element type may be an array, `T[]`. It is
 pulled, rebuilt, and widened element-wise by a rewrite. Element narrowing,
-scalar-to-array changes and `data:` beside an array are refused by name. User-defined
-element types are #1523 (#1167, DEC-1167.1).
+scalar-to-array changes and `data:` beside an array are refused by name.
+Existing enums, domains and standalone composites are referenced as
+`schema.type`, scalar or array; their lifecycle stays unmanaged. References are
+pinned at replay; retypes, row data and partition keys over them are refused
+(#1523, DEC-1523.1).
 
 A SQL Server table declares `system_time:`, its period and its system
 versioning into a history table that is part of it. `pull` reads a pair whose

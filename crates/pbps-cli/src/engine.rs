@@ -53,6 +53,22 @@ pub async fn execute_staged_statement(
     }
 }
 
+/// Recover validation after a staged step's caller has rolled its transaction back.
+pub async fn recover_failed_staged_validation(
+    conn: &mut Conn,
+    statement: &pbps_dialect::Statement,
+) -> Option<String> {
+    let check = statement
+        .scan_check
+        .as_ref()
+        .filter(|check| check.step == pbps_dialect::ScanCheckStep::Validate)?;
+    match conn.driver() {
+        // SQL Server does not emit a staged attach's temporary CHECK.
+        Driver::Mssql => None,
+        Driver::Postgres => Some(pbps_pg::staged::recover_failed_validation(conn, check).await),
+    }
+}
+
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub async fn operational_cost(
@@ -728,10 +744,13 @@ pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &CatalogNames,
+    type_routines_need_review: bool,
 ) -> Result<Spellings, RowsError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::catalog::misspelt(conn, schema, at).await,
-        Driver::Postgres => pbps_pg::catalog::misspelt(conn, schema, at).await,
+        Driver::Postgres => {
+            pbps_pg::catalog::misspelt(conn, schema, at, type_routines_need_review).await
+        }
     }
 }
 
@@ -5461,4 +5480,143 @@ async fn refuse_policy_dependents(
         crate::row_security::check_policy_releases(changes, ids, &found)?;
     }
     Ok(())
+}
+
+/// Read prerequisites before probes can rely on a referenced type.
+pub async fn seal_type_pins(
+    conn: &mut Conn,
+    schemas: &[&Schema],
+    changes: &ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    pin_routines: bool,
+) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let pins = pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?;
+            type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
+            Ok(pins)
+        }
+        Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
+        Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+    }
+}
+
+/// Refuse changed type prerequisites and owner trust before replay proceeds.
+pub async fn check_type_pins(
+    conn: &mut Conn,
+    plan: &pbps_model::SavedPlan,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    required: &BTreeSet<pbps_model::TypeRef>,
+    within_transaction: bool,
+) -> anyhow::Result<()> {
+    if &plan.trusted_roles != trusted {
+        anyhow::bail!("trusted_roles changed since planning; plan again against the database");
+    }
+    for reference in required {
+        if !plan
+            .type_pins
+            .iter()
+            .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
+        {
+            anyhow::bail!(
+                "plan has no type pin for `{reference}`; plan again against the database"
+            );
+        }
+    }
+    match conn.driver() {
+        Driver::Postgres => {
+            let within = if within_transaction {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
+            pbps_pg::type_refs::check(conn, within, &plan.type_pins, &plan.changes).await?;
+        }
+        Driver::Mssql if plan.type_pins.is_empty() && trusted.is_empty() => {}
+        Driver::Mssql => {
+            anyhow::bail!("this SQL Server plan carries PostgreSQL type prerequisites")
+        }
+    }
+    Ok(())
+}
+
+/// Read the potential path of every pinned type, including unchanged columns.
+pub async fn type_input_routines(
+    conn: &mut Conn,
+    pins: &[pbps_model::TypePin],
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    pin_routines: bool,
+    inside: bool,
+) -> anyhow::Result<BTreeSet<i64>> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let references = pins
+                .iter()
+                .map(|p| pbps_model::TypeRef::new(&p.schema, &p.name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let within = if inside {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            Ok(
+                pbps_pg::type_refs::input_routines(
+                    conn,
+                    within,
+                    &references,
+                    trusted,
+                    pin_routines,
+                )
+                .await?,
+            )
+        }
+        Driver::Mssql if !pin_routines && pins.is_empty() => Ok(BTreeSet::new()),
+        Driver::Mssql => anyhow::bail!("pin_type_routines is supported only on PostgreSQL"),
+    }
+}
+
+/// Assert offline type prerequisites before bootstrap creates any object.
+pub fn bootstrap_type_guard(
+    dialect: &str,
+    schema: &Schema,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+) -> anyhow::Result<Option<pbps_dialect::Statement>> {
+    match dialect {
+        "postgres" => {
+            Ok(pbps_pg::type_refs::bootstrap_guard(schema, trusted)?
+                .map(pbps_dialect::Statement::new))
+        }
+        _ if trusted.is_empty() => Ok(None),
+        _ => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+    }
+}
+
+/// Keep bootstrap's prerequisite reads valid through execution and recording.
+pub async fn recheck_type_prerequisites(
+    conn: &mut Conn,
+    expected: &[pbps_model::TypePin],
+    changes: &ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    inside: bool,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let within = if inside {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            pbps_pg::type_refs::check(conn, within, expected, changes).await?;
+            type_input_routines(conn, expected, trusted, false, inside).await?;
+        }
+        Driver::Mssql if expected.is_empty() => {}
+        Driver::Mssql => anyhow::bail!("SQL Server does not support type references"),
+    }
+    Ok(())
+}
+
+/// Column references in a recorded or declared schema.
+pub fn type_references(schema: &Schema) -> BTreeSet<pbps_model::TypeRef> {
+    pbps_pg::type_refs::references(&[schema], &ChangeSet::default())
 }

@@ -285,6 +285,7 @@ async fn rehearse_in(
         declared,
         &crate::deploy::catalogued_as(declared, declared_ids, baseline_ids),
         &mut unasked,
+        false, // SQL Server-only; PostgreSQL is refused before connecting.
     )
     .await;
     // Before the refusal, beside it, as the plan prints them (DEC-1726.1).

@@ -14,13 +14,15 @@
 //!
 //! ADR-0011 Amendment 3: normalization is idempotent, **and its output is what
 //! introspection reads back for a column declared that way**. A spelling for
-//! which that is impossible is an error, not something to normalize. Two
-//! families of spelling are refused for exactly that reason, each measured on
+//! which that is impossible is an error, not something to normalize. Such
+//! spellings are refused for exactly that reason, measured on
 //! PostgreSQL 18.6:
 //!
 //! - the `serial` family, which is a macro and not a type — see
 //!   [`refuse_serial`];
-//! - **arrays**, which the model has nowhere to put (ADR-0012 §1).
+//!
+//! Arrays retain their element spelling and one marker (#1167). Existing user
+//! types retain their qualified identity (#1523); connected reads judge their kind.
 //!
 //! Time precision is positioned after the first name word, so its canonical
 //! spelling parses and renders identically to the catalog's spelling.
@@ -347,21 +349,12 @@ fn refuse_overlong_reference(ty: &ColumnType, user: &TypeRef) -> Result<(), Dial
 /// Expands aliases, fills in the arguments PostgreSQL fills in itself, and
 /// resolves the spellings the engine resolves.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
-    // A user-defined type named as `schema.name` parses (#1523) and is refused
-    // here, before the array rule so that the message names `app.mood[]` and
-    // not its element. The catalogue is closed, and a reference needs what a
-    // catalogue cannot give it: the kind of the type, read from the database.
+    // References normalize syntactically; the connected prerequisite read
+    // determines existence, privileges and kind before any DDL (DEC-1523.1).
     if let Some(user) = ty.type_ref() {
-        // The length comes first: it is the more specific refusal, and it is the
-        // one that stays when references are admitted.
+        // PostgreSQL truncates these names instead of refusing them.
         refuse_overlong_reference(ty, user)?;
-        return Err(DialectError::Invalid {
-            dialect: DIALECT,
-            message: format!(
-                "`{ty}` names a user-defined type, and references to user-defined types are \
-                 not supported yet; declare a type from the catalogue"
-            ),
-        });
+        return Ok(ty.clone());
     }
     // An array is its element, normalized, with the marker kept (#1167): the
     // engine reads every array back as its element's spelling and `[]`.
@@ -2183,7 +2176,13 @@ const ROUTINE_ALIASES: &[(&str, &str)] = &[
 ];
 
 fn folded(text: &str) -> Option<ColumnType> {
-    normalize(&text.parse::<ColumnType>().ok()?).ok()
+    normalize(
+        &text
+            .parse::<ColumnType>()
+            .ok()
+            .filter(|ty| ty.type_ref().is_none())?,
+    )
+    .ok()
 }
 
 /// `timestamp(3) with time zone` -> `timestamp with time zone`.

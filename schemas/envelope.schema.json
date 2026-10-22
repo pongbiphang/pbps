@@ -165,6 +165,18 @@
             "$ref": "#/$defs/ConnectedCheck"
           }
         },
+        "type_routines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeRoutine"
+          }
+        },
+        "type_routine_approval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "origins": {
           "description": "Each step a planning rule added, with what it serves and why\n(DEC-1958.3). Reported, never sealed: the saved plan does not carry\nit. Absent when no rule added a step.",
           "type": "array",
@@ -236,6 +248,39 @@
         "engine",
         "status",
         "message"
+      ]
+    },
+    "TypeRoutine": {
+      "description": "Complete catalog source of a reviewed input-path root (DEC-2181.2).",
+      "type": "object",
+      "properties": {
+        "oid": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "definition": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "oid",
+        "schema",
+        "name",
+        "arguments",
+        "definition"
       ]
     },
     "StepOrigin": {
@@ -1074,6 +1119,18 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "type_routines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TypeRoutine"
+          }
+        },
+        "type_routine_approval": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "table_count": {
           "type": "integer",
@@ -2312,6 +2369,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 52,
+  "x-pbps-schema-version": 53,
   "x-pbps-tool-version": "0.0.0"
 }

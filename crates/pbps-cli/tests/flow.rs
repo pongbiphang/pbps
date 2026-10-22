@@ -5862,12 +5862,10 @@ fn a_postgres_project_is_validated_against_the_postgres_catalogue() {
     assert_eq!(v["data"]["dialect"], "postgres", "{v}");
 }
 
-/// A `schema.name` type (#1523) used to fail to load, as a base name with a
-/// dot in it. It loads now, and `validate` refuses it with the dialect's own
-/// message: a reference to a user-defined type is not supported yet, naming the
-/// type as written. A built-in beside it is left alone.
+/// The loader holds a qualified reference; its dialect decides whether that
+/// capability exists. SQL Server's refusal names the type (#1523).
 #[test]
-fn a_user_type_reference_is_refused_by_the_dialect_and_not_the_loader() {
+fn references_are_admitted_on_postgres_and_refused_by_name_on_sql_server() {
     let d = Demo::new("user-type-reference");
     std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
     std::fs::write(
@@ -5876,17 +5874,7 @@ fn a_user_type_reference_is_refused_by_the_dialect_and_not_the_loader() {
     )
     .unwrap();
     let o = d.run(&["validate"]);
-    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
-    let err = stderr(&o);
-    assert!(
-        err.contains("postgres: `app.mood` names a user-defined type")
-            && err.contains("references to user-defined types are not supported yet"),
-        "{err}"
-    );
-    assert!(err.contains("`\"App\".\"Mood\"[]`"), "{err}");
-    assert!(!err.contains("not a valid identifier"), "{err}");
-    assert!(!err.contains("not a user-defined type reference"), "{err}");
-    assert!(!err.contains("column `id`"), "{err}");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 
     // SQL Server refuses the same declaration with its own wording.
     std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();

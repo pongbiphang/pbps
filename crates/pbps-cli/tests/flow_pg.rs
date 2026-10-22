@@ -16,6 +16,9 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/type_refs.rs"]
+mod type_refs;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 #[path = "support/row_security_roundtrip.rs"]
@@ -12838,17 +12841,43 @@ fn a_table_is_attached_as_the_default_partition_through_the_cli() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
-    let server = server();
-    let own = OwnDatabase::new(&server, "attach-1638");
+    staged_attach_recovery(&server(), false);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn staged_attach_type_pins_preserve_check_recovery_on_postgres_18() {
+    staged_attach_recovery(&server(), true);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn staged_attach_type_pins_preserve_check_recovery_on_postgres_16() {
+    staged_attach_recovery(
+        &std::env::var("PBPS_TEST_PG_OLD_DB").expect("set PBPS_TEST_PG_OLD_DB"),
+        true,
+    );
+}
+
+fn staged_attach_recovery(server: &str, referenced: bool) {
+    let own = OwnDatabase::new(server, "attach-1638");
     let connection = own.connection().to_owned();
     on_server(&connection, "CREATE SCHEMA app");
+    if referenced {
+        on_server(&connection, "CREATE TYPE app.tag AS ENUM ('x')");
+    }
+    let extra_column = if referenced {
+        "  tag: {type: app.tag}\n"
+    } else {
+        ""
+    };
     let d = Demo::new("attach-1638");
     let tree = |partitions: &str| {
         std::fs::write(
             d.dir.join("schema/app.ev.yml"),
             format!(
                 "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
-                 ts: {{type: date, nullable: false}}\nprimary_key: [id, ts]\n\
+                 ts: {{type: date, nullable: false}}\n{extra_column}primary_key: [id, ts]\n\
                  partition_by: [ts]\npartitions:\n  \
                  ev_2025: {{from: [\"2025-01-01\"], to: [\"2026-01-01\"]}}\n{partitions}"
             ),
@@ -12860,7 +12889,7 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
             d.dir.join(format!("schema/app.{name}.yml")),
             format!(
                 "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
-                 ts: {{type: date, nullable: false}}\nprimary_key: [id, ts]\n"
+                 ts: {{type: date, nullable: false}}\n{extra_column}primary_key: [id, ts]\n"
             ),
         )
         .unwrap();
@@ -12874,9 +12903,9 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
     succeeds(d.run(&["bootstrap", "--db", &connection]));
     on_server(
         &connection,
-        "INSERT INTO app.t SELECT g, DATE '2024-01-01' + g % 300 FROM generate_series(1, 1000) g; \
-         INSERT INTO app.u_st SELECT g, DATE '2023-01-01' + g % 300 FROM generate_series(1, 1000) g; \
-         INSERT INTO app.u_tx SELECT g, DATE '2022-01-01' + g % 300 FROM generate_series(1, 1000) g",
+        "INSERT INTO app.t (id, ts) SELECT g, DATE '2024-01-01' + g % 300 FROM generate_series(1, 1000) g; \
+         INSERT INTO app.u_st (id, ts) SELECT g, DATE '2023-01-01' + g % 300 FROM generate_series(1, 1000) g; \
+         INSERT INTO app.u_tx (id, ts) SELECT g, DATE '2022-01-01' + g % 300 FROM generate_series(1, 1000) g",
     );
     let temporaries = || {
         scalar(
@@ -12930,6 +12959,7 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
         &["--staged", "--allow", "constraint"],
     );
     let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert_eq!((temporaries(), attached("t")), (0, 0), "{said}");
     assert!(
         code(&o) != 0
             && said.contains("statement 1 of 4 done (checkpointed with the next)")
@@ -12937,7 +12967,6 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
             && said.contains("start this plan again with `pbps apply --staged` without `--resume`"),
         "{said}"
     );
-    assert_eq!((temporaries(), attached("t")), (0, 0), "{said}");
     unstop("stop_validate");
 
     // B: the attach fails after the VALIDATE's checkpoint. `baseline` takes

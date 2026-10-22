@@ -79,6 +79,23 @@ const AGGREGATE_ROW: &str = "
      WHERE a.aggfnoid = p.oid";
 
 fn pinned_routines_query() -> String {
+    routines_query(None)
+}
+
+fn routines_query(selected: Option<&[i64]>) -> String {
+    let columns = if selected.is_some() {
+        "p.oid::int8 AS oid, pg_catalog.pg_get_functiondef(p.oid) AS definition,"
+    } else {
+        ""
+    };
+    let predicate = match selected {
+        Some(oids) => format!("p.oid = ANY({})", crate::user_types::oid_array(oids)),
+        None => "p.proowner NOT IN (SELECT oid FROM super_only)
+                 OR EXISTS (SELECT 1 FROM member_of m
+                             WHERE m.objid = p.oid
+                               AND m.extowner NOT IN (SELECT oid FROM super_only))"
+            .to_owned(),
+    };
     format!(
         "WITH super_only AS ({HELD_ONLY_BY_SUPERUSERS}),
               member_of AS (
@@ -88,7 +105,7 @@ fn pinned_routines_query() -> String {
                  WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
                    AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
                    AND d.deptype = 'e')
-         SELECT p.pronamespace::int8 AS namespace,
+         SELECT {columns} p.pronamespace::int8 AS namespace,
                 n.nspname AS schema_name,
                 p.proname AS name,
                 pg_catalog.to_jsonb(ARRAY(
@@ -112,12 +129,19 @@ fn pinned_routines_query() -> String {
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
           WHERE NOT pg_catalog.pg_is_other_temp_schema(p.pronamespace)
             AND p.pronamespace IS DISTINCT FROM pg_catalog.pg_my_temp_schema()
-            AND (p.proowner NOT IN (SELECT oid FROM super_only)
-                 OR EXISTS (SELECT 1 FROM member_of m
-                             WHERE m.objid = p.oid
-                               AND m.extowner NOT IN (SELECT oid FROM super_only)))
+            AND ({predicate})
           ORDER BY p.pronamespace, p.oid"
     )
+}
+
+/// Read selected roots even when only superusers can replace them. The
+/// catalog input is exactly DEC-319.1's; source is exposed separately for review.
+pub async fn selected(
+    conn: &mut Conn,
+    within: Within,
+    oids: &[i64],
+) -> Result<(Read, Vec<pbps_model::TypeRoutine>), DbError> {
+    read_query(conn, within, &routines_query(Some(oids)), true).await
 }
 
 /// `format_type` qualifies a name only when it is not visible on the path, so
@@ -145,10 +169,21 @@ pub enum Within {
 
 /// Reads every routine in the pin set, managed ones included.
 pub async fn read(conn: &mut Conn, within: Within) -> Result<Read, DbError> {
+    Ok(read_query(conn, within, &pinned_routines_query(), false)
+        .await?
+        .0)
+}
+
+async fn read_query(
+    conn: &mut Conn,
+    within: Within,
+    query: &str,
+    selected: bool,
+) -> Result<(Read, Vec<pbps_model::TypeRoutine>), DbError> {
     match within {
         Within::OwnTransaction => {
             conn.begin(&OWN_TRANSACTION).await?;
-            let result = read_under_canonical_path(conn).await;
+            let result = read_under_canonical_path(conn, query, selected).await;
             let closed = conn.rollback(&OWN_TRANSACTION).await;
             let read = result?;
             closed?;
@@ -156,7 +191,7 @@ pub async fn read(conn: &mut Conn, within: Within) -> Result<Read, DbError> {
         }
         Within::CallersTransaction => {
             conn.execute("SAVEPOINT pbps_routine_pins").await?;
-            let read = read_under_canonical_path(conn).await?;
+            let read = read_under_canonical_path(conn, query, selected).await?;
             conn.execute("ROLLBACK TO SAVEPOINT pbps_routine_pins")
                 .await?;
             conn.execute("RELEASE SAVEPOINT pbps_routine_pins").await?;
@@ -165,7 +200,11 @@ pub async fn read(conn: &mut Conn, within: Within) -> Result<Read, DbError> {
     }
 }
 
-async fn read_under_canonical_path(conn: &mut Conn) -> Result<Read, DbError> {
+async fn read_under_canonical_path(
+    conn: &mut Conn,
+    query: &str,
+    selected: bool,
+) -> Result<(Read, Vec<pbps_model::TypeRoutine>), DbError> {
     conn.query(CANONICAL_PATH).await?;
     let version = conn
         .query("SELECT pg_catalog.current_setting('server_version_num') AS version")
@@ -175,16 +214,33 @@ async fn read_under_canonical_path(conn: &mut Conn) -> Result<Read, DbError> {
         .map(|row| text(row, "version"))
         .transpose()?
         .ok_or_else(|| DbError::BadRow("`server_version_num` returned no row".to_owned()))?;
-    let routines = conn
-        .query(&pinned_routines_query())
-        .await?
-        .iter()
-        .map(routine)
-        .collect::<Result<_, _>>()?;
-    Ok(Read {
-        server_version,
-        routines,
-    })
+    let rows = conn.query(query).await?;
+    let routines: Vec<_> = rows.iter().map(routine).collect::<Result<_, _>>()?;
+    let sources = if selected {
+        rows.iter()
+            .zip(&routines)
+            .map(|(row, routine)| {
+                Ok(pbps_model::TypeRoutine {
+                    oid: row
+                        .try_get::<i64>("oid")?
+                        .ok_or_else(|| null_column("oid"))?,
+                    schema: routine.schema.clone(),
+                    name: routine.name.clone(),
+                    arguments: routine.args.clone(),
+                    definition: text(row, "definition")?,
+                })
+            })
+            .collect::<Result<_, DbError>>()?
+    } else {
+        Vec::new()
+    };
+    Ok((
+        Read {
+            server_version,
+            routines,
+        },
+        sources,
+    ))
 }
 
 fn routine(row: &Row) -> Result<Routine, DbError> {

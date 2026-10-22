@@ -157,6 +157,8 @@ pub struct RawColumn {
     pub name: String,
     /// `format_type(atttypid, atttypmod)`: the engine's own spelling.
     pub ty: String,
+    /// Identity and kind of a type created after initdb, or its array element.
+    pub user_type: Option<RawUserType>,
     pub nullable: bool,
     /// `pg_get_expr(adbin, adrelid)`, verbatim, cast and all.
     pub default: Option<String>,
@@ -183,6 +185,37 @@ pub struct RawColumn {
     pub default_sequences: Option<String>,
     /// The column's collation, when it is not the one its type carries.
     pub collation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawUserType {
+    pub schema: String,
+    pub name: String,
+    pub kind: String,
+    pub defined: bool,
+    pub relkind: Option<String>,
+    pub array: bool,
+}
+
+impl RawUserType {
+    fn held(&self) -> Option<ColumnType> {
+        if !self.defined
+            || !(matches!(self.kind.as_str(), "e" | "d")
+                || self.kind == "c" && self.relkind.as_deref() == Some("c"))
+        {
+            return None;
+        }
+        let reference = pbps_model::TypeRef::new(&self.schema, &self.name).ok()?;
+        let ty = ColumnType::reference(reference);
+        Some(if self.array { ty.into_array() } else { ty })
+    }
+}
+
+fn column_type(raw: &RawColumn) -> Result<ColumnType, ColumnType> {
+    match &raw.user_type {
+        Some(info) => info.held().ok_or_else(|| ColumnType::simple(&raw.ty)),
+        None => stored_type(&raw.ty),
+    }
 }
 
 /// A sequence a column owns and its default uses (#1631): its own facts,
@@ -898,7 +931,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             table.columns = raw_columns
                 .iter()
                 .map(|c| {
-                    let ty = stored_type(&c.ty).unwrap_or_else(|opaque| opaque);
+                    let ty = column_type(c).unwrap_or_else(|opaque| opaque);
                     (c.name.clone().into(), pbps_model::Column::new(ty))
                 })
                 .collect();
@@ -2230,10 +2263,21 @@ fn group<T, K: Ord + Copy>(items: &[T], key: impl Fn(&T) -> K) -> BTreeMap<K, Ve
 /// and an ids file address, and a table whose column cannot be written is no
 /// more usable than one whose own name cannot.
 fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn]) -> Option<String> {
+    if let Some(column) = columns
+        .iter()
+        .find(|c| c.user_type.as_ref().is_some_and(|t| t.held().is_none()))
+    {
+        return Some(format!(
+            "`{name}` has column `{}` of type `{}`, which is not a defined enum, domain or standalone composite; the whole table is left out",
+            column.name,
+            column.ty,
+            name = name.shown()
+        ));
+    }
+
     // The same question of a column's *type*. A spelling the catalogue cannot
-    // read is kept as the engine wrote it — `app.money_amount` is written out
-    // as itself and refused on the way back because of the dot.
-    // Carrying it produces exactly the failure the name
+    // read is kept as the engine wrote it. Carrying a spelling that changes
+    // meaning on reload produces exactly the failure the name
     // check exists to prevent, one field over.
     // The question is whether the type comes back as **the same value**, not
     // whether it parses: `bit(3)` stored opaque writes out as `bit(3)` and
@@ -2244,7 +2288,7 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
     // about the guard.
     let unwritable: Vec<String> = columns
         .iter()
-        .filter(|c| !survives_the_declaration(&stored_type(&c.ty).unwrap_or_else(|opaque| opaque)))
+        .filter(|c| !survives_the_declaration(&column_type(c).unwrap_or_else(|opaque| opaque)))
         .map(|c| format!("`{}` (`{}`)", c.name, c.ty))
         .collect();
     if !unwritable.is_empty() {
@@ -2303,7 +2347,9 @@ fn stored_type(ty: &str) -> Result<ColumnType, ColumnType> {
     // read is not a column with no type.
     ty.parse::<ColumnType>()
         .ok()
-        .filter(|t| types::normalize(t).is_ok_and(|normalized| &normalized == t))
+        .filter(|t| {
+            t.type_ref().is_none() && types::normalize(t).is_ok_and(|normalized| &normalized == t)
+        })
         .ok_or_else(|| ColumnType::new(ty.to_owned(), Vec::new()))
 }
 
@@ -2580,7 +2626,7 @@ fn sequence_options(
 }
 
 fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
-    let ty = match stored_type(&raw.ty) {
+    let ty = match column_type(raw) {
         Ok(ty) => ty,
         Err(opaque) => {
             note(
@@ -5682,6 +5728,7 @@ mod tests {
             attnum,
             name: name.to_owned(),
             ty: ty.to_owned(),
+            user_type: None,
             nullable: true,
             default: None,
             identity: None,
@@ -8175,5 +8222,34 @@ mod tests {
                 .owners
                 .contains_key(&"app.unowned_seq".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn reference_identity_comes_from_catalog_parts_and_only_admitted_kinds_are_held() {
+        let mut raw = col(1, 1, "v", "Mood[]");
+        raw.user_type = Some(RawUserType {
+            schema: "App".into(),
+            name: "Mood".into(),
+            kind: "e".into(),
+            defined: true,
+            relkind: None,
+            array: true,
+        });
+        assert_eq!(column_type(&raw).unwrap().to_string(), "\"App\".\"Mood\"[]");
+        for kind in ["b", "r", "m", "p"] {
+            raw.user_type.as_mut().unwrap().kind = kind.into();
+            assert!(column_type(&raw).is_err(), "{kind}");
+            assert!(
+                a_name_the_declaration_cannot_write(&TableName::new("app", "t"), &[&raw]).is_some()
+            );
+        }
+        let info = raw.user_type.as_mut().unwrap();
+        info.kind = "c".into();
+        info.relkind = Some("r".into());
+        assert!(column_type(&raw).is_err());
+        raw.user_type.as_mut().unwrap().relkind = Some("c".into());
+        assert!(column_type(&raw).is_ok());
+        raw.user_type.as_mut().unwrap().defined = false;
+        assert!(column_type(&raw).is_err());
     }
 }

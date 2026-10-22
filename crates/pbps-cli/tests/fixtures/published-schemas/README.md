@@ -62,3 +62,4 @@ DECISIONS 465).
 - `49/` adds a partition's own `foreign_keys:` to a `partitions:` entry (issue #1632).
 - `51/` adds table `row_security:` and `row_policies:` (issue #1172 PR A).
 - `52/` publishes created-table policy and row-security planning (issue #1172 PR C).
+- `53/` adds trusted roles and reviewed input-path routines for existing PostgreSQL type references (#1523, #2181).

@@ -6,6 +6,18 @@
     "dialect": {
       "$ref": "#/$defs/DialectName"
     },
+    "trusted_roles": {
+      "description": "Roles the organization trusts to change evaluated user-type code (#2046).",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "pin_type_routines": {
+      "description": "Review and pin user-written routines on referenced type input paths (DEC-2181.2).",
+      "type": "boolean"
+    },
     "schema_dir": {
       "type": "string",
       "pattern": "^(?!(?:\\.\\.?(?:[/\\\\]+|$))*$)",
@@ -763,6 +775,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 52,
+  "x-pbps-schema-version": 53,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -41,6 +41,10 @@ pub(crate) struct Bound {
     pub row_compares: BTreeSet<(u32, u32)>,
     /// Every type: the type a coercion or a literal names.
     pub types: BTreeSet<u32>,
+    /// Domain coercions execute CHECKs; a CONST merely holds an already typed value.
+    pub domain_coercions: BTreeSet<u32>,
+    /// I/O coercions run the target's input function, including nested CHECKs.
+    pub input_coercions: BTreeSet<u32>,
 }
 
 /// Where in the tree a row comparison's operator or family sits: the path to
@@ -84,7 +88,12 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
         match reference.class {
             nodes::ReferenceClass::Routine => bound.routines.insert(reference.oid),
             nodes::ReferenceClass::Operator => bound.operators.insert(reference.oid),
-            nodes::ReferenceClass::Type => bound.types.insert(reference.oid),
+            nodes::ReferenceClass::Type => {
+                if reference.node == "COERCETODOMAIN" {
+                    bound.domain_coercions.insert(reference.oid);
+                }
+                bound.types.insert(reference.oid)
+            }
             nodes::ReferenceClass::Relation
             | nodes::ReferenceClass::Collation
             | nodes::ReferenceClass::Role
@@ -105,7 +114,68 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
             }
         }
     }
+    input_coercions(&tree, &mut bound.input_coercions)?;
     Ok(bound)
+}
+
+/// Knowing a node's layout does not prove what it executes (DEC-2181.4).
+/// Keep the input-path proof closed independently of the resolver's decoder.
+fn input_coercions(value: &nodes::Value, inputs: &mut BTreeSet<u32>) -> Result<(), String> {
+    use nodes::Value;
+    match value {
+        Value::Node(node) => {
+            match node.tag.as_str() {
+                // These hold values which have already passed conversion.
+                "CONST" | "COERCETODOMAINVALUE" | "CASETESTEXPR" => return Ok(()),
+                "COERCEVIAIO" => {
+                    inputs.insert(
+                        node.number("resulttype").map_err(|_| {
+                            "an I/O coercion has no readable target type".to_owned()
+                        })?,
+                    );
+                }
+                // Calls and cast functions are bound by OID above. Domain
+                // coercions add their CHECK path; array coercions execute the
+                // explicit elemexpr, not an implicit target input conversion.
+                "FUNCEXPR" | "OPEXPR" | "DISTINCTEXPR" | "NULLIFEXPR" | "SCALARARRAYOPEXPR"
+                | "ROWCOMPAREEXPR" | "COERCETODOMAIN" | "ARRAYCOERCEEXPR" => {}
+                // These copy, extract, rearrange or assemble already typed
+                // values. Any conversion is in a child expression.
+                "RELABELTYPE" | "CONVERTROWTYPEEXPR" | "FIELDSELECT" | "FIELDSTORE" | "ROWEXPR"
+                | "ARRAYEXPR" | "COLLATEEXPR" | "NAMEDARGEXPR" | "BOOLEXPR" | "BOOLEANTEST"
+                | "NULLTEST" | "CASEEXPR" | "CASEWHEN" | "COALESCEEXPR" => {}
+                // C1's superuser-installed base-type/operator-class support
+                // boundary applies to these dispatchers (input_path's module
+                // docs). Neither performs an implicit domain input conversion.
+                "MINMAXEXPR" | "SUBSCRIPTINGREF" => {}
+                // Fixed engine operations. JSON constructors expose RETURNING
+                // conversions as children; JSONEXPR does not, so it is refused
+                // below rather than treated as another constructor.
+                "SQLVALUEFUNCTION"
+                | "XMLEXPR"
+                | "JSONCONSTRUCTOREXPR"
+                | "JSONFORMAT"
+                | "JSONRETURNING"
+                | "JSONISPREDICATE" => {}
+                _ => {
+                    return Err(format!(
+                        "node `{}` has no audited input-path code proof",
+                        node.tag
+                    ));
+                }
+            }
+            for child in node.fields.values() {
+                input_coercions(child, inputs)?;
+            }
+        }
+        Value::List(values) => {
+            for child in values {
+                input_coercions(child, inputs)?;
+            }
+        }
+        Value::Null | Value::Atom(_) | Value::Datum => {}
+    }
+    Ok(())
 }
 
 /// A complete set of candidates sharing a name, or all names in a namespace.

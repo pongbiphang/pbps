@@ -474,6 +474,24 @@ struct AddedColumn {
     serial: bool,
 }
 
+impl AddedColumn {
+    fn of(column: &pbps_model::Column) -> Self {
+        let (default, identity, serial) = match &column.value_source {
+            ValueSource::None => (None, false, false),
+            ValueSource::Default(default) => (Some(default.clone()), false, false),
+            ValueSource::Identity(_) | ValueSource::Generated(_) => (None, true, false),
+            // A `serial`'s sequence numbers every stored row as an identity's does.
+            ValueSource::Sequence(_) => (None, true, true),
+        };
+        Self {
+            default,
+            ty: column.ty.clone(),
+            identity,
+            serial,
+        }
+    }
+}
+
 /// A foreign key this plan adds, in the plan's own names.
 #[derive(Debug)]
 struct Added {
@@ -643,23 +661,8 @@ impl<'v, 'p> AsStored<'v, 'p> {
                     column,
                     ..
                 } => {
-                    let (default, identity, serial) = match &column.value_source {
-                        ValueSource::None => (None, false, false),
-                        ValueSource::Default(default) => (Some(default.clone()), false, false),
-                        ValueSource::Identity(_) | ValueSource::Generated(_) => (None, true, false),
-                        // A `serial`'s sequence numbers every stored row as an
-                        // identity's does (#1631).
-                        ValueSource::Sequence(_) => (None, true, true),
-                    };
-                    this.columns_added.insert(
-                        table.column(name),
-                        AddedColumn {
-                            default,
-                            ty: column.ty.clone(),
-                            identity,
-                            serial,
-                        },
-                    );
+                    this.columns_added
+                        .insert(table.column(name), AddedColumn::of(column));
                 }
                 Event::AlterColumnType {
                     column, from, to, ..
@@ -690,7 +693,11 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 WrittenCell::Default(default) => {
                     constant_default(default).map(|e| format!("({e})"))
                 }
-                WrittenCell::OmittedNull => Some("NULL".to_owned()),
+                // The raw plan records omission of a column DEFAULT. A domain
+                // may still supply its own; use the same answer as ADD COLUMN.
+                WrittenCell::OmittedNull => assignment.ty.and_then(|ty| {
+                    backfill_of(&AddedColumn::of(&pbps_model::Column::new(ty.clone())))
+                }),
                 WrittenCell::EngineAssigned => None,
             },
             |cell| match cell {
@@ -1762,9 +1769,9 @@ fn unprobeable_probe(
 /// plan: every stored row of the
 /// child holds the default in the new column and its stored cell in every
 /// other column of the key, and the count is of the rows whose tuple, spelled
-/// that way, is the deleted row's. `DEFAULT NULL`, or no default, is a NULL in
-/// the tuple and references nothing (`MATCH SIMPLE`, DECISIONS 334) — the
-/// engine says so, `p.code = (NULL)` being UNKNOWN, and no branch here repeats
+/// that way, is the deleted row's. `DEFAULT NULL`, or no default on a built-in
+/// type, is a NULL in the tuple and references nothing (`MATCH SIMPLE`,
+/// DECISIONS 334) — the engine says so, `p.code = (NULL)` being UNKNOWN, and no branch here repeats
 /// it. The rows this plan itself moves are the same exclusions and arrivals
 /// the catalog keys get, spelled statically because the key's columns are
 /// known here (DECISIONS 336).
@@ -1816,32 +1823,10 @@ fn planned_key_probes(
             }
         };
         let child_sql = qualified(&stored_child)?;
-        // What a column this plan adds holds in every stored row once the
-        // `ADD COLUMN` has run: `None` for a backfill no probe can evaluate —
-        // an expression, or the value an identity sequence hands out. A
-        // literal is compared through the column's declared type, as every
-        // other default comparison in this crate is (DECISIONS 329, 339),
-        // and a NULL stays a bare NULL so that it reads as one.
+        // Share the projection with `rows_after` and the NOT NULL probe: no
+        // column DEFAULT can still run a domain's own DEFAULT (DEC-1523.1).
         let backfill = |column: &ColumnRef| -> Option<Option<String>> {
-            names.columns_added.get(column).map(|added| {
-                if added.identity {
-                    return None;
-                }
-                match &added.default {
-                    Some(d) => constant_default(d).map(|literal| {
-                        if is_null(literal) {
-                            "NULL".to_owned()
-                        } else {
-                            format!(
-                                "CAST(({literal}) AS {})",
-                                crate::types::normalize(&added.ty)
-                                    .unwrap_or_else(|_| added.ty.clone())
-                            )
-                        }
-                    }),
-                    None => Some("NULL".to_owned()),
-                }
-            })
+            names.columns_added.get(column).map(backfill_of)
         };
         // The key, column by column: the child's column in the plan's name,
         // the parent side as SQL over an alias of the parent row, and the
@@ -2895,7 +2880,10 @@ fn backfill_of(added: &AddedColumn) -> Option<String> {
                 crate::types::normalize(&added.ty).unwrap_or_else(|_| added.ty.clone())
             ))
         }
-        // A column added with no default arrives at NULL in every stored row.
+        // A scalar reference may be a domain whose own DEFAULT fills the row.
+        // This projection cannot guess or evaluate that value.
+        None if added.ty.type_ref().is_some() && !added.ty.is_array() => None,
+        // Other columns added with no default arrive at NULL in every stored row.
         None => Some("NULL".to_owned()),
     }
 }
@@ -2917,7 +2905,7 @@ fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
             column = column.raw()
         ),
         format!(
-            "SELECT {} AS n FROM {from} WHERE {reads} IS NULL;",
+            "SELECT {} AS n FROM {from} WHERE {reads} IS NOT DISTINCT FROM NULL;",
             saturated_count("count(*)")
         ),
     )
@@ -3095,8 +3083,8 @@ fn build<'v, 'p: 'v>(
             // alone refuses the first.
             //
             // The count is therefore kept only where the value is one this
-            // module can read *without running anything*: no default at all,
-            // or a default that is the literal `NULL`. An expression is the
+            // module can read *without running anything*: a built-in type with
+            // no default, or a default that is the literal `NULL`. An expression is the
             // case DECISIONS 124 already answers with no probe rather than a
             // guess, and the alternative is worse than silence — asking the
             // engine `(expr) IS NULL` would run the operator's own function
@@ -3115,13 +3103,11 @@ fn build<'v, 'p: 'v>(
                     unchecked,
                 ));
             }
-            if let Some(default) = match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => None } {
-                let Some(literal) = constant_default(default) else {
-                    return Ok(skip(change, "the default cannot be evaluated before apply", unchecked));
-                };
-                if !crate::rows::unwrapped(literal).eq_ignore_ascii_case("null") {
-                    return Ok(Vec::new());
-                }
+            let Some(fill) = backfill_of(&AddedColumn::of(column)) else {
+                return Ok(skip(change, "the column's fill cannot be evaluated before apply", unchecked));
+            };
+            if !crate::rows::unwrapped(&fill).eq_ignore_ascii_case("null") {
+                return Ok(Vec::new());
             }
             Ok(vec![Probe::new(
                 format!(

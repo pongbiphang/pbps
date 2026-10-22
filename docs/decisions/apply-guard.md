@@ -1513,3 +1513,14 @@ results, including diagnostic ordering, and is removed after qualification.
 Runtime predicate reversions establish the retained negative coverage. Table
 presence/renames and exhaustive field/read-mode integration now complete #1774's
 five slices; module, grant and row policy stays with its existing owner.
+
+<a id="dec-1523-3"></a>
+
+**DEC-1523.3. Saved plans pin referenced types by identity, OID, kind and an unkeyed canonical-definition digest.** Measured on 16 and 18, enum labels and domain constraints can change without a column's type identity changing. Recheck at DEC-319.1's points, including staged checkpoints, and refuse a changed trust list. Offline reference bootstrap refuses without a catalog proof; connected bootstrap reads type prerequisites first (DEC-2181.1).
+
+
+<a id="dec-2181-2"></a>
+
+**DEC-2181.2. User-written input-path roots require explicit source review and pins.** Plan 46 and schema set 53 carry them; referenced-type state is 29 (DEC-1523.2). `pin_type_routines` defaults false, is saved and must match at apply. Any language is eligible only with complete catalog source in the saved plan and human/JSON output; selected roots, including superuser-held ones, reuse DEC-319.1's canonical catalog HMAC (including `prosqlbody`, `proconfig`, `prosecdef`, owner and signature). Unreadable nodes, audited SQL-running built-ins and owner/actor trust remain unchanged. Immediate bootstrap and pre-review resolver execution refuse roots requiring review; plan-time probes remain unchecked. A referenced input path containing any non-immutable routine, including built-ins classified by `pg_proc.provolatile`, also leaves plan-time probes unchecked; rollback cannot undo `nextval`, measured on 16 and 18. Apply verifies eligibility and pins around probes, before statements and settle, and before commit; transactional staged steps check before commit, nontransactional steps before and after committing, before checkpoint, including resume. PostgreSQL cannot lock routine definitions against replacement, so nontransactional checks detect changes rather than prevent execution (DEC-319.1).
+
+Pinned by `any_language_roots_require_source_review_and_the_saved_opt_in`, `superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees`, `partition_default_parsing_runs_domain_checks_only_after_source_approval`, `bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence`, `plan_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths`, `bootstrap_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths` and the staged type-routine regressions, live on 16 and 18.
