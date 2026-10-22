@@ -226,6 +226,12 @@ ALLOWED = {
         1,
         "writes a trigger's fixture YAML; serialization remains raw after #2084 step 5",
     ),
+    "crates/pbps-diff/src/order/deployment.rs": (
+        3,
+        "Relocated Provenance.reason stays shared plan JSON and is escaped whole "
+        "by report::changes until #2084 step 5; the CLI copy is cfg(test) only "
+        "(DEC-1959.5)",
+    ),
     "crates/pbps-cli/src/dependents.rs": (
         9,
         "three Provenance.reason operands are shared plan JSON escaped whole by "

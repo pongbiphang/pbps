@@ -13,6 +13,9 @@
 //! Script tests use `PBPS_TEST_PSQL`, the psql inside `PBPS_TEST_PG_CONTAINER`
 //! (set by the local script and CI), or local `psql`, in that order.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -657,7 +660,7 @@ fn plan_checksum(path: &std::path::Path) -> String {
     let raw = std::fs::read_to_string(path).unwrap();
     serde_json::from_str::<pbps_model::SavedPlan>(&raw)
         .unwrap()
-        .checksum()
+        .wire_fingerprint()
 }
 
 const ONE_COLUMN: &str = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n\
@@ -1673,8 +1676,8 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
             serde_json::from_str(&std::fs::read_to_string(&again).unwrap()).unwrap();
         next.created_at = saved.created_at.clone();
         assert_eq!(
-            next.checksum(),
-            saved.checksum(),
+            next.wire_fingerprint(),
+            saved.wire_fingerprint(),
             "changed advisory statistics cannot alter the saved plan apart from its timestamp"
         );
         let denied = apply_plan(&d, connection, &path, false);
@@ -17686,7 +17689,6 @@ fn drop_blockers_are_named_in_planning_and_rechecked_before_apply_writes() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
-    use pbps_dialect::Dialect;
     let db = OwnDatabase::new(&server(), "drop_resume");
     let connection = db.connection();
     on_server(connection, "CREATE SCHEMA app");
@@ -17712,7 +17714,7 @@ fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
     assert_eq!(plan.changes.changes.len(), 1);
     let pg = pbps_pg::Postgres::new();
     let p = &plan.changes.changes[0];
-    let statements = pg.legacy_emit(&p.change, p.strategy).unwrap();
+    let statements = pg.fixture_emit(&p.change, p.strategy).unwrap();
     assert_eq!(
         statements.len(),
         1,
@@ -17741,7 +17743,7 @@ fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
             .shift_remove("label");
         checkpoint.ids = plan.ids.clone();
         checkpoint.kind = pbps_model::StateKind::Staged;
-        checkpoint.plan_checksum = Some(plan.checksum());
+        checkpoint.plan_checksum = Some(plan.wire_fingerprint());
         checkpoint.staged = Some(pbps_model::StagedProgress {
             completed: 1,
             total: 1,
@@ -17758,7 +17760,7 @@ fn drop_blockers_do_not_refuse_a_closing_resume_after_the_drop_completed() {
         "--plan",
         artifact.to_str().unwrap(),
         "--checksum",
-        &plan.checksum(),
+        &plan.wire_fingerprint(),
         "--allow",
         "destructive",
         "--staged",
@@ -32858,5 +32860,55 @@ fn row_security_owned_sequence_removals_follow_policy_owner_drops() {
                 assert_eq!(next["data"]["changes"], 0, "{next}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
+}
+
+#[test]
+fn bootstrap_scripts_keep_the_guard_and_session_pin_bytes_from_before_certification() {
+    for (table, trusted, expected) in [
+        (
+            false,
+            false,
+            include_str!("fixtures/bootstrap-certification/0-0.sql"),
+        ),
+        (
+            false,
+            true,
+            include_str!("fixtures/bootstrap-certification/0-2.sql"),
+        ),
+        (
+            true,
+            false,
+            include_str!("fixtures/bootstrap-certification/1-0.sql"),
+        ),
+        (
+            true,
+            true,
+            include_str!("fixtures/bootstrap-certification/1-2.sql"),
+        ),
+    ] {
+        let demo = Demo::new(&format!("bootstrap-certified-{table}-{trusted}"));
+        if table {
+            demo.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n");
+        }
+        if trusted {
+            std::fs::write(
+                demo.dir.join("pbps.yml"),
+                "dialect: postgres\ntrusted_roles: [owner, \"a'quoted\"]\n",
+            )
+            .unwrap();
+        }
+        succeeds(demo.run(&["plan"]));
+        let path = demo.dir.join("bootstrap.sql");
+        succeeds(demo.run(&["bootstrap", "--sql", path.to_str().unwrap()]));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
     }
 }

@@ -9,24 +9,34 @@
 //! it has read from a catalog, and gets back the plan in the order `plan --db`
 //! would give it from the same facts.
 //!
-//! The passes themselves are private to [`super`], so the compiler refuses a
-//! call from any other module of this crate. Role drops are ordered inside
-//! `pbps-diff::order` once their memberships are supplied (DEC-1959.1).
+//! This module adapts CLI facts to `pbps_diff::order::deployment::schedule`,
+//! which owns the pure passes and completed-plan authority (DEC-1959.5).
+//! The former CLI implementation remains only as a frozen test oracle.
 //!
 //! This changes which call sites order a plan, not how a plan is ordered: the
 //! passes run in `plan --db`'s order, and a caller that supplies the same
 //! facts gets the order it always got.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use pbps_diff::order::PlanningPlan;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::fmt;
 
+#[cfg(test)]
 use pbps_dialect::Dialect;
-use pbps_model::{Change, ChangeSet, ModuleDeps, ModuleId, Schema};
+#[cfg(test)]
+use pbps_model::{Change, ChangeSet};
+use pbps_model::{ModuleDeps, ModuleId, Schema};
 use pbps_pg::modules::Dependent;
 
+use super::Sources;
+#[cfg(test)]
 use super::{
-    Sources, after_the_rebuilds, after_the_rows_that_leave, after_their_parents_defaults,
+    after_the_rebuilds, after_the_rows_that_leave, after_their_parents_defaults,
     before_its_partitions_indexes, dropped_modules, released, settle_public_execution,
     split_moving_defaults, split_new_tables, standing_partitions, take_public_execution, weave,
 };
@@ -92,56 +102,13 @@ impl<'a> Facts<'a> {
     }
 }
 
-/// A pass that did not run because the fact it needs was not supplied.
-/// Reported, so that an order made without a catalog is not read as one made
-/// with it. Its words are the preview's, the one caller that has no catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Skipped {
-    /// `weave` needs the dependents of every module the plan drops or
-    /// rebuilds. With it goes the set of columns it leaves released, which is
-    /// read from what it found: where it does not run, no module drop waits
-    /// for a release.
-    Weave,
-    /// Role-drop ordering needs the members of every role the plan drops.
-    RoleDrops,
-    /// Referenced edits and table drops wait for policy owners the plan drops.
-    PolicyDependents,
-}
-
-impl Skipped {
-    /// The stable id of the note a JSON report carries for it (SPEC §9.8:
-    /// offline uncertainty is the same evidence in both reports).
-    pub(crate) fn id(&self) -> &'static str {
-        match self {
-            Self::Weave => "plan.module-dependents-unread",
-            Self::RoleDrops => "plan.role-members-unread",
-            Self::PolicyDependents => "plan.policy-dependents-unread",
-        }
-    }
-}
-
-impl fmt::Display for Skipped {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Weave => {
-                "What depends on a dropped or rebuilt module is removed before it and put back \
-                 after; `pbps plan --db` lists it for the target, this preview cannot."
-            }
-            Self::PolicyDependents => {
-                "A policy's table drop precedes changes to tables or columns it references; `pbps plan --db` \
-                 reads those policy dependencies for the target, this preview cannot."
-            }
-            Self::RoleDrops => {
-                "A dropped role's members are removed first; `pbps plan --db` lists them for \
-                 the target, this preview cannot."
-            }
-        })
-    }
-}
+#[cfg(test)]
+use pbps_diff::order::deployment::schedule::Skipped;
 
 /// The plan in its final order, and what it took to get there.
+#[cfg(test)]
 #[derive(Debug)]
-pub(crate) struct Scheduled {
+struct OracleScheduled {
     pub changes: PlanningPlan,
     /// Changes the passes added: a dependent put back around a module, a
     /// partition's own default set again.
@@ -161,6 +128,7 @@ pub(crate) struct Refusal(String);
 impl Refusal {
     /// A refusal of the PostgreSQL module passes, worded as `plan --db` always
     /// worded it.
+    #[cfg(test)]
     fn module_passes(why: impl fmt::Display) -> Self {
         Self(format!("module_dependents (PostgreSQL): {why}"))
     }
@@ -181,12 +149,136 @@ impl std::error::Error for Refusal {}
 ///
 /// The plan is taken and returned rather than edited, so a refusal leaves no
 /// half-ordered plan behind.
-pub(crate) fn schedule(
+pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::Engine>(
+    cs: PlanningPlan<S>,
+    declared: &Declarations<'_>,
+    facts: &Facts<'_>,
+    dialect: &D,
+) -> Result<pbps_diff::order::deployment::schedule::Scheduled<S, D>, Refusal> {
+    use pbps_diff::order::deployment as owned;
+    let declarations = owned::schedule::Declarations {
+        schema: declared.schema,
+        sources: owned::Sources {
+            before: declared.sources.before,
+            after: declared.sources.after,
+        },
+        module_deps: declared.module_deps,
+    };
+    let mut read = owned::schedule::Facts::default();
+    if let Some(found) = facts.module_dependents {
+        read = read.with_module_dependents(found);
+    }
+    if let Some(found) = facts.role_members {
+        read = read.with_role_members(found);
+    }
+    if let Some(found) = facts.policy_dependents {
+        read = read.with_policy_dependents(found);
+    }
+    #[cfg(test)]
+    let expected = oracle_schedule(
+        pbps_diff::order::propose(cs.changes().clone()),
+        declared,
+        facts,
+        dialect,
+    );
+    let actual = owned::schedule::schedule(cs, &declarations, &read, dialect)
+        .map_err(|why| Refusal(why.to_string()));
+    #[cfg(test)]
+    match (&actual, &expected) {
+        (Ok(actual), Ok(expected)) => {
+            assert_eq!(actual.changes.changes(), expected.changes.changes());
+            assert_eq!(
+                (actual.added, actual.split, actual.moved),
+                (expected.added, expected.split, expected.moved)
+            );
+            assert_eq!(
+                actual
+                    .skipped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                expected
+                    .skipped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            );
+        }
+        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        _ => panic!("canonical route and frozen schedule disagree: {actual:?} / {expected:?}"),
+    }
+    actual
+}
+
+#[cfg(test)]
+pub(crate) fn schedule_fixture<S: pbps_diff::order::RouteState<dyn Dialect>>(
+    cs: PlanningPlan<S>,
+    declared: &Declarations<'_>,
+    facts: &Facts<'_>,
+    dialect: &(dyn crate::certified_fixture::FixtureEmission + 'static),
+) -> Result<pbps_diff::order::deployment::schedule::Scheduled<S, dyn Dialect>, Refusal> {
+    use pbps_diff::order::deployment as owned;
+    let declarations = owned::schedule::Declarations {
+        schema: declared.schema,
+        sources: owned::Sources {
+            before: declared.sources.before,
+            after: declared.sources.after,
+        },
+        module_deps: declared.module_deps,
+    };
+    let mut read = owned::schedule::Facts::default();
+    if let Some(found) = facts.module_dependents {
+        read = read.with_module_dependents(found);
+    }
+    if let Some(found) = facts.role_members {
+        read = read.with_role_members(found);
+    }
+    if let Some(found) = facts.policy_dependents {
+        read = read.with_policy_dependents(found);
+    }
+    #[cfg(test)]
+    let expected = oracle_schedule(
+        pbps_diff::order::propose(cs.changes().clone()),
+        declared,
+        facts,
+        dialect,
+    );
+    let actual = owned::schedule::schedule_semantic(cs, &declarations, &read, dialect)
+        .map_err(|why| Refusal(why.to_string()));
+    #[cfg(test)]
+    match (&actual, &expected) {
+        (Ok(actual), Ok(expected)) => {
+            assert_eq!(actual.changes.changes(), expected.changes.changes());
+            assert_eq!(
+                (actual.added, actual.split, actual.moved),
+                (expected.added, expected.split, expected.moved)
+            );
+            assert_eq!(
+                actual
+                    .skipped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                expected
+                    .skipped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            );
+        }
+        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        _ => panic!("canonical route and frozen schedule disagree: {actual:?} / {expected:?}"),
+    }
+    actual
+}
+
+#[cfg(test)]
+fn oracle_schedule(
     mut cs: PlanningPlan,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
-    dialect: &dyn Dialect,
-) -> Result<Scheduled, Refusal> {
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<OracleScheduled, Refusal> {
     let (mut added, mut split, mut moved) = (0, 0, 0);
     let mut skipped = Vec::new();
     if dialect.name() == "postgres" {
@@ -375,7 +467,7 @@ pub(crate) fn schedule(
         pbps_diff::order::shadow::Stage::Differ,
         None,
     );
-    Ok(Scheduled {
+    Ok(OracleScheduled {
         changes: cs,
         added,
         split,
@@ -387,10 +479,11 @@ pub(crate) fn schedule(
 /// A sinking claimer must take its dependents with it. Read those edges from
 /// the effects rather than listing FK/key pairs: the same requirement can
 /// belong to another operation, or itself have readers (DEC-2100.3).
+#[cfg(test)]
 fn keep_handover_dependents(
     cs: &ChangeSet,
     declared: &Declarations<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
     handovers: &mut pbps_diff::order::Schedule,
 ) -> Result<(), Refusal> {
     use pbps_diff::order::{Schedule, edges, shadow};
@@ -452,11 +545,12 @@ mod role_order_oracle;
 
 /// Existing structural constraints remain true when catalog policy releases
 /// require a different teardown order. This graph is used only for that case.
+#[cfg(test)]
 fn policy_release_schedule(
     cs: &PlanningPlan,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<pbps_diff::order::Schedule, Refusal> {
     let mut schedule = pbps_diff::order::row_security::release_schedule(
         cs,
@@ -484,6 +578,7 @@ mod rls_oracle;
 
 #[cfg(test)]
 mod tests {
+    use super::schedule_fixture as schedule;
     use super::*;
     use pbps_model::{
         Column, ColumnRef, Generated, IdsFile, Module, ModuleKind, PlannedChange, Table, TableName,
@@ -567,7 +662,7 @@ mod tests {
         (schema, ids)
     }
 
-    fn differ_order(schema: &Schema, ids: &IdsFile) -> PlanningPlan {
+    fn differ_order(schema: &Schema, ids: &IdsFile) -> pbps_diff::order::DiffPlan {
         pbps_diff::diff(
             pbps_diff::Side {
                 schema: &Schema::default(),
@@ -580,12 +675,12 @@ mod tests {
         .unwrap()
     }
 
-    fn scheduled(
-        cs: PlanningPlan,
+    fn scheduled<S: pbps_diff::order::RouteState<dyn Dialect>>(
+        cs: PlanningPlan<S>,
         schema: &Schema,
         ids: &IdsFile,
         facts: &Facts<'_>,
-    ) -> Result<Scheduled, Refusal> {
+    ) -> Result<pbps_diff::order::deployment::schedule::Scheduled<S, dyn Dialect>, Refusal> {
         schedule(
             cs,
             &Declarations {
@@ -792,10 +887,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [2, 0, 1, 3].map(|i| &changes.changes[i].change)
             );
-            crate::row_security::check_policy_releases(&ordered.changes, &final_ids, &found)
+            pbps_diff::order::row_security::check_releases(&ordered.changes, &final_ids, &found)
                 .unwrap();
             assert!(
-                crate::row_security::check_policy_releases(&changes, &final_ids, &found)
+                pbps_diff::order::row_security::check_releases(&changes, &final_ids, &found)
                     .unwrap_err()
                     .to_string()
                     .contains("must precede")
@@ -875,8 +970,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [&tables[1], &tables[2], &tables[0]]
         );
-        crate::row_security::check_policy_releases(&ordered.changes, &final_ids, &found).unwrap();
-        assert!(crate::row_security::check_policy_releases(&changes, &final_ids, &found).is_err());
+        pbps_diff::order::row_security::check_releases(&ordered.changes, &final_ids, &found)
+            .unwrap();
+        assert!(
+            pbps_diff::order::row_security::check_releases(&changes, &final_ids, &found).is_err()
+        );
         let mut retained = changes.clone();
         retained.changes.remove(1);
         let error = schedule(
@@ -1244,7 +1342,7 @@ mod tests {
             released: &BTreeSet<super::ColumnRef>,
             deps: &ModuleDeps,
             schema: &Schema,
-            dialect: &dyn Dialect,
+            dialect: &dyn crate::certified_fixture::FixtureEmission,
         ) -> Result<usize, String> {
             let order = pbps_diff::order::Schedule::new(cs.changes.len());
             crate::dependents::after_the_rebuilds(cs, released, deps, schema, order, dialect)
@@ -1283,7 +1381,11 @@ mod tests {
     fn the_schedule_orders_as_bootstrap_and_plan_db_did() {
         let (schema, ids) = declarations();
         let differ = differ_order(&schema, &ids);
-        let moved = before_the_schedule::bootstrap(differ.clone(), &schema, &ids);
+        let moved = before_the_schedule::bootstrap(
+            pbps_diff::order::propose(differ.changes().clone()),
+            &schema,
+            &ids,
+        );
         assert_ne!(moved, differ, "the reference moves something");
         let now = scheduled(differ.clone(), &schema, &ids, &Facts::default()).unwrap();
         assert_eq!(now.changes, moved);
@@ -1297,7 +1399,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             connected.changes,
-            before_the_schedule::connected(differ, &schema, &ids)
+            before_the_schedule::connected(
+                pbps_diff::order::propose(differ.changes().clone()),
+                &schema,
+                &ids
+            )
         );
     }
 
@@ -1473,10 +1579,9 @@ mod tests {
             super::role_order_oracle::checksum(&expected)
         );
         let sql = |plan: &ChangeSet| {
-            use pbps_dialect::Dialect;
             plan.changes
                 .iter()
-                .flat_map(|p| sql_server.legacy_emit(&p.change, p.strategy).unwrap())
+                .flat_map(|p| sql_server.fixture_emit(&p.change, p.strategy).unwrap())
                 .map(|s| s.sql)
                 .collect::<Vec<_>>()
         };
@@ -1522,7 +1627,6 @@ mod tests {
 
     #[test]
     fn role_drop_scripts_and_checksums_match_the_legacy_sort_for_interleaved_branches() {
-        use pbps_dialect::Dialect;
         for salt in 0..32 {
             let drop = |name: &str, members: &[&str]| {
                 PlannedChange::new(Change::DropRole {
@@ -1571,7 +1675,7 @@ mod tests {
                         .iter()
                         .flat_map(|p| {
                             pbps_mssql::Mssql
-                                .legacy_emit(&p.change, p.strategy)
+                                .fixture_emit(&p.change, p.strategy)
                                 .unwrap()
                         })
                         .map(|s| s.sql)

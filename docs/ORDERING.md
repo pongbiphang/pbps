@@ -23,18 +23,44 @@ each existing settlement records its own edges, without a constraint union.
 `OrderedPlan` has a private constructor and no public downgrade or generic
 empty-schedule finalizer (DEC-1959.5).
 
-S7 PR5a establishes this producer boundary. PR5b settles an engine-owned,
-SQL-free scratch blueprint before lowering. Function/phase compatibility and
+Scratch settles an engine-owned, SQL-free blueprint before lowering.
+Function/phase compatibility and
 generated constraints retain their separate settlements. The real engine's
 opaque associated input prevents a caller-defined engine from manufacturing
 its scratch result. LoweredPlan keeps immutable operation groups, source IDs
 and statements and is branded by the emitter, so a mock emitter cannot supply
 a real engine's executable collection. Planning probes return metadata only.
-Artifact/apply migration and deletion of named legacy raw consumer entries
-follow in PR5c. Only the completed family establishes end-to-end compiler
-enforcement. Loaded artifacts use the separate checked `AdmittedPlan` trust
-contract, never a claim that admission ordered them. The release verifier stays
-off, and no rank, tie-break or ordering pass is added.
+The completed shared declaration/catalog route lives in `order::deployment`.
+A successful differ result retains its preceding sort/rename provenance;
+raw proposals remain non-executable even after all shared stages. Existing
+connected continuations take only immutable typed results and order applies
+their proposals. The resolver's complete route and final ordinal remap retain
+its original expansion IDs and exact proof. No stage unions its constraints.
+
+New artifacts require `order::seal(OrderedPlan, metadata)`; loaded wire DTOs
+require checked `order::admit` and retain their reviewed order as-is.
+`ArtifactView` gates writing and executable checksums. The DTO exposes only
+an unchecked `wire_fingerprint` for admission and attempt identity. SQL bytes,
+saved fields, checksum bytes, version and refusal priority are unchanged.
+Admission owns apply's version/checksum/origin/dialect and payload checks;
+request-mode, resume and risk gates follow it. Lowering reads the input's
+bound mode, and sealing rejects metadata with a different mode. Explain
+reviews wire data and obtains only count metadata, so previews remain
+explainable without becoming executable.
+CLI lowering retains concrete PostgreSQL/SQL Server variants and immutable
+operation groups through scripts, bootstrap, dev rehearsal, transactional,
+staged and resume execution. No public raw emit/render entry, mutable plan or
+statement-vector conversion grants execution authority. Compiler-negative
+doctests cover these boundaries and run explicitly in CI. The release
+verifier remains off (DEC-1959.5).
+
+The canonical deployment route also consumes RLS policy-dependent facts before
+certification. The final policy/flag setup and catalog-owner release settlement
+remain after the existing rewrite schedule and before creation-risk refresh.
+`order::row_security` selects the same opening-UID releases and retains the
+existing combined effect, generated, slot and module-catalog graph only for
+those releases. PostgreSQL reads the facts; the CLI cannot write back a raw
+permutation or mint authority by running this intermediate stage alone.
 
 ## The mechanism
 
@@ -138,10 +164,11 @@ Then, in this order:
   passes. It runs again, over the same catalog reads, after the last pass
   that reorders, because a module pass may plan the revision again in the
   differ's order (DEC-1767.1).
-- **One entry point finishes the order after the differ**: `schedule`
-  (`crates/pbps-cli/src/dependents/schedule.rs`, DEC-1955.1). `plan --db`,
-  bootstrap, the offline `plan` preview and the dev rehearsal's baseline all
-  call it, and the PostgreSQL passes below are private to its module. It runs each pass
+- **One entry point finishes the order after the differ**:
+  `order::deployment::schedule` (DEC-1955.1, DEC-1959.5). The CLI's
+  `dependents::schedule` adapts facts for `plan --db`, bootstrap, the offline
+  `plan` preview and the dev rehearsal's baseline. Pure passes below are
+  owned by order. It runs each pass
   in `plan --db`'s order and skips a pass that needs a catalog fact its caller
   does not hold, reporting the skip: a fact read and empty is not a fact not
   read. Offline, `weave` and the member ordering of role drops are skipped and
@@ -693,9 +720,29 @@ decision or the issue named in its row.
   column the code disagrees with.
 - A new sort class, rank or reordering pass updates [the mechanism](#the-mechanism)
   and re-reads the pairs its changes appear in. A pass that reorders a plan
-  after the differ is added to `schedule` and nowhere else; one that must be
-  `pub` for it to reach is added to the list in DEC-1955.1 and to
-  `no_pass_is_called_outside_the_schedule`.
+  after the differ belongs inside order's existing scheduled routes;
+  CLI supplies observations and proposals. Preserve the completed route's
+  authority and add compiler-negative coverage when changing that boundary
+  (DEC-1959.5).
 - A new interacting pair found in review goes into the matching table with its
   verdict. It is not fixed in isolation: decide whether it is fixed or
   content-dependent first.
+
+The completed canonical result retains its planner's invariant type brand.
+The sealed route-state/dialect pair permits re-scheduling only with that same
+engine, including semantic fixture observation. Zero-SQL scope additions carry
+the brand in a non-executable Continuing state until shared scheduling finishes;
+scratch preparation also requires the input's original engine. These compile-time
+restrictions add no pass, constraints, rank or runtime refusal.
+`OrderedPlan<D>`, `AdmittedPlan<D>` and `SealedPlan<D>` implement only
+`PlanView<D>`; `PlanDialect` fixes each real engine's input to its own view.
+CLI dispatch preserves the concrete engine before certification, and
+`LoweredPlan` retains that emitter's invariant brand. Semantic `dyn Dialect`
+queries and test-only observations cannot erase or substitute this authority.
+Singleton support is absent from ordinary and release builds (DEC-1959.5).
+
+Bootstrap's prerequisite script guard is prepared from the engine's declared
+schema/trust context with a certified lowered plan. Its immutable script keeps
+that engine and the existing guard-before-DDL bytes; it adds no ordering stage
+or executable operation. Bootstrap's per-statement prerequisite checks select
+positions from the certified collection (DEC-1959.5, DEC-2181.1).

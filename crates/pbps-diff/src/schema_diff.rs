@@ -404,7 +404,7 @@ pub fn diff(
     declared: Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
-) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
     diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
 }
 
@@ -428,7 +428,7 @@ pub fn diff_rebuilding(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -482,7 +482,7 @@ pub fn diff_read_back(
     also: &BTreeSet<ModuleId>,
     screen: Screen,
     read_back: &Schema,
-) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -503,7 +503,7 @@ pub fn diff_connected(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -526,7 +526,7 @@ pub(crate) fn rebuilding_by(
     rebinding: Rebinding,
     screen: Screen,
     read_back: Option<&Schema>,
-) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
     let d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
@@ -537,7 +537,7 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        Ok(crate::order::propose(d.changes))
+        Ok(crate::order::differ(crate::order::propose(d.changes)))
     } else {
         Err(d.errors)
     }
@@ -7539,12 +7539,12 @@ mod tests {
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: pbps_model::Strategy,
-        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-            MinimalDialect.legacy_emit(change, strategy)
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
         }
         fn normalize_type(
             &self,
@@ -7617,12 +7617,12 @@ mod tests {
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: pbps_model::Strategy,
-        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-            MinimalDialect.legacy_emit(change, strategy)
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
         }
         fn normalize_type(
             &self,
@@ -12695,12 +12695,12 @@ mod tests {
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: pbps_model::Strategy,
-        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-            MinimalDialect.legacy_emit(change, strategy)
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
         }
         fn normalize_type(
             &self,
@@ -19677,12 +19677,12 @@ mod tests {
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: pbps_model::Strategy,
-        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-            MinimalDialect.legacy_emit(change, strategy)
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
         }
         fn normalize_type(
             &self,
@@ -19761,12 +19761,12 @@ mod tests {
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
             MinimalDialect.quote_ident(ident)
         }
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: pbps_model::Strategy,
-        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-            MinimalDialect.legacy_emit(change, strategy)
+        ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(change, strategy)
         }
         fn normalize_type(
             &self,
@@ -22581,12 +22581,12 @@ mod tests {
             fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
                 MinimalDialect.quote_ident(ident)
             }
-            fn legacy_emit(
+            fn intermediate_tables(
                 &self,
                 change: &Change,
                 strategy: pbps_model::Strategy,
-            ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-                MinimalDialect.legacy_emit(change, strategy)
+            ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+                MinimalDialect.intermediate_tables(change, strategy)
             }
             fn normalize_type(
                 &self,
@@ -23100,12 +23100,12 @@ mod tests {
             fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
                 MinimalDialect.quote_ident(ident)
             }
-            fn legacy_emit(
+            fn intermediate_tables(
                 &self,
                 change: &Change,
                 strategy: pbps_model::Strategy,
-            ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-                MinimalDialect.legacy_emit(change, strategy)
+            ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+                MinimalDialect.intermediate_tables(change, strategy)
             }
             fn normalize_type(
                 &self,
@@ -23380,12 +23380,12 @@ mod tests {
             fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
                 MinimalDialect.quote_ident(ident)
             }
-            fn legacy_emit(
+            fn intermediate_tables(
                 &self,
                 change: &Change,
                 strategy: pbps_model::Strategy,
-            ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-                MinimalDialect.legacy_emit(change, strategy)
+            ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+                MinimalDialect.intermediate_tables(change, strategy)
             }
             fn normalize_type(
                 &self,

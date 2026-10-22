@@ -92,7 +92,7 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     // default-omitted table fields must preserve every fixture byte (#1172).
     state.version = 25;
     state.declared = Declared::from_schema(&schema);
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, ids, plan, state)
 }
 
@@ -108,7 +108,7 @@ fn every_value_source_keeps_approved_bytes_and_fingerprints() {
             serde_json::to_string(&state.declared).unwrap(),
         ),
         ("state.sha256", state_checksum(&schema, &ids)),
-        ("plan.sha256", plan.checksum()),
+        ("plan.sha256", plan.wire_fingerprint()),
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/value-source");
     for (name, actual) in outputs {

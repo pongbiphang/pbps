@@ -247,7 +247,14 @@ impl Run<'_> {
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
         hints: &Hints,
-    ) -> Result<(pbps_diff::resolver::Ordered, Sealing, Opening), Error> {
+    ) -> Result<
+        (
+            pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>,
+            Sealing,
+            Opening,
+        ),
+        Error,
+    > {
         let driver = self.driver;
         let request = self.request;
         let db = |what: &'static str| {
@@ -555,7 +562,19 @@ mod tests {
         let provenance = Provenance::server();
         for disagrees in [false, true] {
             let binding = BindingRequest {
-                bootstrap: &pbps_diff::order::propose(pbps_model::ChangeSet::default()),
+                bootstrap: &pbps_diff::diff(
+                    pbps_diff::Side {
+                        schema: &pbps_model::Schema::default(),
+                        ids: &pbps_model::IdsFile::default(),
+                    },
+                    pbps_diff::Side {
+                        schema: &pbps_model::Schema::default(),
+                        ids: &pbps_model::IdsFile::default(),
+                    },
+                    &pbps_dialect::MinimalDialect,
+                    &pbps_model::Hints::default(),
+                )
+                .unwrap(),
                 base: if disagrees { &different } else { &schema },
                 desired: &schema,
             };

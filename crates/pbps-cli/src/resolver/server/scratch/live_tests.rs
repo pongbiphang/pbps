@@ -6,6 +6,9 @@
 //! measured producer's motivating pair (`qualified_evidence_cases`): an
 //! arriving integer overload rebinds one view and leaves the other alone.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use super::super::{Error, ProduceError, ResolvedPlan};
 use super::fixtures::{self as cases, ENVIRONMENT, Inputs, ProjectKey, view};
 use pbps_db::{Conn, Driver};
@@ -5712,7 +5715,6 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes() {
     use crate::resolver::generated_fixtures::shape;
-    use pbps_dialect::Dialect;
     for server in SERVERS {
         for case in [
             "plain",
@@ -5827,7 +5829,7 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                 guard.before_statements(&mut conn).await?;
                 let pg = pbps_pg::Postgres::new();
                 for p in &saved.changes.changes {
-                    for statement in pg.legacy_emit(&p.change, p.strategy)? {
+                    for statement in pg.fixture_emit(&p.change, p.strategy)? {
                         conn.execute(&statement.sql).await?;
                     }
                 }

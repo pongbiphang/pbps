@@ -1,4 +1,7 @@
 //! Creation parts must retain the column and stored-value effects (#1503).
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use pbps_dialect::Dialect;
 use pbps_diff::order::{Baseline, analyse, generated, verify};
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
@@ -70,7 +73,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         let empty = Schema::default();
         let no_ids = IdsFile::default();
         let pg = Postgres::new().with_server_version(180_000);
-        let mut cs = pbps_diff::diff(
+        let cs = pbps_diff::diff(
             pbps_diff::Side {
                 schema: &empty,
                 ids: &no_ids,
@@ -83,6 +86,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
             &Default::default(),
         )
         .unwrap();
+        let mut cs = pbps_diff::order::propose(cs.changes().clone());
         generated::expand(&mut cs, &ids, &Default::default(), &pg).unwrap();
         cs =
             pbps_diff::order::writebacks::PlanningInput::new(vec![pbps_model::PlannedChange::new(
@@ -162,7 +166,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         let sql = cs
             .changes
             .iter()
-            .flat_map(|p| pg.legacy_emit(&p.change, p.strategy).unwrap())
+            .flat_map(|p| pg.fixture_emit(&p.change, p.strategy).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");
@@ -239,7 +243,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         .unwrap();
     assert!(!index.strategy.online);
     assert!(
-        !pg.legacy_emit(&index.change, index.strategy)
+        !pg.fixture_emit(&index.change, index.strategy)
             .unwrap()
             .iter()
             .any(|s| s.sql.contains("CONCURRENTLY"))
@@ -260,7 +264,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         .is_none()
     );
     assert!(
-        pg.legacy_emit(&standing.change, standing.strategy)
+        pg.fixture_emit(&standing.change, standing.strategy)
             .unwrap()
             .iter()
             .any(|s| s.sql.contains("CONCURRENTLY"))
@@ -524,7 +528,7 @@ fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape
         matches!(&parts[1], Change::AlterColumnExpression { column, to, .. } if column.name.raw() == "g" && to == "app.f(id)")
     );
     let sql = Postgres::new()
-        .legacy_emit(&parts[0], Default::default())
+        .fixture_emit(&parts[0], Default::default())
         .unwrap();
     assert!(sql.iter().any(|s| s.sql.contains("b * 2")));
     assert!(!sql.iter().any(|s| s.sql.contains("app.f(id)")));
@@ -974,4 +978,12 @@ fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
     let mut safe = ChangeSet { changes: parts };
     safe.changes.push(attach);
     assert!(!generated::risks(&safe, &ids, &pg)[install].contains(&RiskClass::Narrowing));
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

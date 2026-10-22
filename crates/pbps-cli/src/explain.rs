@@ -22,7 +22,6 @@
 //! for the reason above.
 
 use anyhow::Context as _;
-use pbps_dialect::Dialect;
 use pbps_model::escape::Escaped;
 use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
@@ -232,12 +231,15 @@ pub fn cmd_explain(
     )?;
     // Now that the plan has named its engine, a bare `--db` becomes a target.
     let target = target.resolve(driver);
+    // A preview must still be reviewable, but execution admission refuses
+    // its origin. Keep descriptive validation and count-only observations;
+    // this command never needs an executable certificate.
     output::or_unanswerable_at(
         "explain",
         json,
         "plan.inconsistent",
         path,
-        crate::validate_saved_plan(&plan, dialect.as_ref()),
+        pbps_diff::order::validate_saved_plan(&plan, dialect.as_ref()).map_err(anyhow::Error::from),
     )?;
 
     // The third failure the envelope has to survive, and the least obvious: a
@@ -248,7 +250,7 @@ pub fn cmd_explain(
         "explain",
         json,
         "plan.unexplainable",
-        explain(&plan, dialect.as_ref(), path, &target, env),
+        explain(&plan, &dialect, path, &target, env),
     )?;
     let findings = findings(&plan, &explanation);
 
@@ -291,7 +293,9 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
 /// A plan names its own engine (`SavedPlan::dialect`) precisely so a plan
 /// computed for one and applied to another is nonsense the file can catch;
 /// reading it here is the same check, made earlier and without a connection.
-fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dialect>)> {
+fn dialect_of(
+    plan: &SavedPlan,
+) -> anyhow::Result<(pbps_db::Driver, crate::emission::SelectedDialect)> {
     // Deserialize the shared name, so another configured dialect must receive
     // an answer in both exhaustive selectors (DECISIONS 417), including here.
     let name: pbps_config::DialectName =
@@ -306,11 +310,12 @@ fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dial
 
 fn explain(
     plan: &SavedPlan,
-    dialect: &dyn Dialect,
+    selected: &crate::emission::SelectedDialect,
     path: &std::path::Path,
     target: &Resolved,
     env: Option<&str>,
 ) -> anyhow::Result<Explanation> {
+    let dialect = selected.as_ref();
     let cs = &plan.changes;
     let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &plan.ids)?;
     let (table_count, module_count) = report::touched(&names);
@@ -372,7 +377,7 @@ fn explain(
                 None => placeholder("environment"),
             },
             plan_arg,
-            plan.checksum()
+            plan.wire_fingerprint()
         );
         // The gated classes only: `grant-widen` is listed above for the
         // reviewer and never asked for by `apply` (ADR-0005).
@@ -421,7 +426,7 @@ fn explain(
             PlanMode::Transactional => "transactional",
             PlanMode::Staged => "staged",
         },
-        checksum: plan.checksum(),
+        checksum: plan.wire_fingerprint(),
         change_count: cs.changes.len(),
         table_count,
         module_count,
@@ -442,7 +447,7 @@ fn explain(
                 reason: u.reason,
             })
             .collect(),
-        statement_count: crate::statements(cs, dialect, plan.mode)?.len(),
+        statement_count: crate::emission::statement_count(&plan.changes, dialect, plan.mode)?,
         target: match target {
             Resolved::None => None,
             Resolved::Reachable(t) => Some(target_state(t)?),

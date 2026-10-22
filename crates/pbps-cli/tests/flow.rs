@@ -4,6 +4,9 @@
 //! what happens when a command runs: the exit code, the message, and whether a
 //! file was written. CI depends entirely on exit codes, so they are pinned here.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -505,7 +508,7 @@ fn plan_checksum(path: &std::path::Path) -> String {
     let raw = std::fs::read_to_string(path).unwrap();
     serde_json::from_str::<pbps_model::SavedPlan>(&raw)
         .unwrap()
-        .checksum()
+        .wire_fingerprint()
 }
 
 /// The command ran correctly and found something the user must act on.
@@ -5071,7 +5074,7 @@ fn a_staged_resume_rechecks_the_pinned_default_collation() {
         .staged();
         let path = d.dir.join(format!("{view}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-        let checksum = plan.checksum();
+        let checksum = plan.wire_fingerprint();
         rt.block_on(async {
             let mut conn = connect_live(&connection).await.unwrap();
             let mut checkpoint = latest.snapshot.clone();
@@ -6695,7 +6698,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
         pbps_model::IdsFile::default(),
     );
     std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
 
     let o = d.run(&[
         "apply",
@@ -6760,7 +6763,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         pbps_model::IdsFile::default(),
     );
     std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
 
     let o = d.run(&[
         "apply",
@@ -6815,7 +6818,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         pbps_model::IdsFile::default(),
     );
     std::fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
 
     let o = d.run(&[
         "apply",
@@ -7259,7 +7262,7 @@ fn saved_staged_cardinality_is_refused_before_connection() {
         for count in [0, 2] {
             let plan = staged_cardinality_plan(dialect, count, true);
             std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-            let checksum = plan.checksum();
+            let checksum = plan.wire_fingerprint();
             for resume in [false, true] {
                 let mut args = vec![
                     "apply",
@@ -7323,7 +7326,7 @@ fn saved_staged_cardinality_is_refused_before_connection() {
             let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
             assert_eq!(report["data"]["statement_count"], statements, "{report}");
             if count > 0 {
-                let checksum = plan.checksum();
+                let checksum = plan.wire_fingerprint();
                 let mut args = vec![
                     "apply",
                     "--db",
@@ -14128,19 +14131,18 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
         serde_json::to_vec(&actual).unwrap(),
         serde_json::to_vec(&expected).unwrap()
     );
-    assert_eq!(actual.checksum(), expected.checksum());
+    assert_eq!(actual.wire_fingerprint(), expected.wire_fingerprint());
     assert_eq!(
         role_order_oracle::checksum(&actual.changes),
         role_order_oracle::checksum(&expected.changes)
     );
     let sql = |changes: &pbps_model::ChangeSet| {
-        use pbps_dialect::Dialect;
         changes
             .changes
             .iter()
             .flat_map(|p| {
                 pbps_mssql::Mssql
-                    .legacy_emit(&p.change, p.strategy)
+                    .fixture_emit(&p.change, p.strategy)
                     .unwrap()
             })
             .map(|statement| statement.sql)
@@ -17431,7 +17433,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
     )
     .staged();
     std::fs::write(&plan_path, serde_json::to_string_pretty(&plan_b).unwrap()).unwrap();
-    let attempted_checksum = plan_b.checksum();
+    let attempted_checksum = plan_b.wire_fingerprint();
     assert_ne!(attempted_checksum, interrupted_checksum);
 
     for _ in 0..2 {
@@ -23085,4 +23087,12 @@ fn forced_pull_distinguishes_dangling_identity_links_from_absent_history() {
 #[ignore = "needs live SQL Server"]
 fn forced_pull_preserves_applied_column_rename_and_drop_history() {
     pull_identity::column_history(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

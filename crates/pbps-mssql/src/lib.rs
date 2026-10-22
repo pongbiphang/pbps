@@ -13,7 +13,7 @@
 //! - [`types`] — what a type *is* ([`Dialect::normalize_type`]) and what changing
 //!   one *costs* ([`Dialect::type_change_risk`]).
 //! - [`validate`] — what the engine will refuse ([`Dialect::validate_table`]).
-//! - [`emit`] — the SQL ([`Dialect::legacy_emit`]). The only place in the codebase that
+//! - [`emit`] — the SQL ([`Dialect::emit`]). The only place in the codebase that
 //!   writes the SQL of a *change*.
 //! - [`preflight`] — the questions a change implies about the data
 //!   ([`Dialect::preflight`]), asked before the first statement runs.
@@ -139,6 +139,16 @@ impl pbps_dialect::PlanDialect for Mssql {
 }
 
 impl Dialect for Mssql {
+    fn statement_count(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+        mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        let _ = mode;
+        emit::emit(change, strategy).map(|statements| statements.len())
+    }
+
     fn name(&self) -> &'static str {
         types::DIALECT
     }
@@ -569,14 +579,6 @@ impl Dialect for Mssql {
         )?))
     }
 
-    fn legacy_emit(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        emit::emit(change, strategy)
-    }
-
     fn preflight(&self, names: &pbps_model::plan_names::PlanNames<'_>) -> pbps_dialect::Preflight {
         preflight::probes(names)
     }
@@ -956,6 +958,7 @@ mod tests {
 
 #[cfg(test)]
 mod certified_emission_tests {
+    use pbps_diff::order::ArtifactView;
     // Existing emitter fixtures compare their frozen raw result with the real
     // singleton route, including complete Statement metadata and wire bytes.
     pub(crate) fn compare_fixture(
@@ -1013,7 +1016,7 @@ mod certified_emission_tests {
                 );
                 assert_eq!(
                     pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
-                    pbps_dialect::legacy_render_script(
+                    script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,
                         &pbps_model::SessionZone::utc()
@@ -1049,19 +1052,14 @@ mod certified_emission_tests {
             bytes
         };
         assert_eq!(bytes(&before), bytes(after.wire()));
-        assert_eq!(before.checksum(), after.wire().checksum());
+        assert_eq!(
+            before.wire_fingerprint(),
+            pbps_diff::order::ArtifactView::checksum(&after)
+        );
         if let (Ok(actual), Ok(expected)) = (&actual, &expected) {
             assert_eq!(
-                pbps_dialect::legacy_render_script(
-                    actual,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                ),
-                pbps_dialect::legacy_render_script(
-                    expected,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                )
+                script_oracle::render(actual, dialect, &pbps_model::SessionZone::utc()),
+                script_oracle::render(expected, dialect, &pbps_model::SessionZone::utc())
             );
         }
         actual
@@ -1085,7 +1083,7 @@ mod certified_emission_tests {
             })],
         };
         let expected = dialect
-            .legacy_emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .fixture_emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let ordered = singleton(changes.changes[0].clone(), mode, &dialect);
@@ -1104,7 +1102,7 @@ mod certified_emission_tests {
             );
             wire.mode = mode;
             let bytes = serde_json::to_string(&wire).unwrap();
-            let checksum = wire.checksum();
+            let checksum = wire.wire_fingerprint();
             let admitted = admit(
                 serde_json::from_str(&bytes).unwrap(),
                 &dialect,
@@ -1130,7 +1128,7 @@ mod certified_emission_tests {
 // the private emitter and the engine-associated certified input.
 #[cfg(test)]
 impl Mssql {
-    pub(crate) fn legacy_emit(
+    pub(crate) fn fixture_emit(
         &self,
         change: &Change,
         strategy: Strategy,
@@ -1142,4 +1140,12 @@ impl Mssql {
             emit::emit(change, strategy),
         )
     }
+}
+
+#[cfg(test)]
+mod script_oracle {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/script_oracle.rs"
+    ));
 }

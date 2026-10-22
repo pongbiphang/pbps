@@ -163,8 +163,8 @@ fn input_change(
 /// them, with what each is schema-bound to after it, and refuses what the
 /// edges say the engine will not do (DEC-1431.1). Returns how many changes
 /// moved.
-pub(crate) fn order_by_edges(
-    cs: &mut PlanningPlan,
+pub(crate) fn order_by_edges<S: Clone>(
+    cs: &mut PlanningPlan<S>,
     ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,
@@ -589,8 +589,8 @@ pub(crate) fn drop_precedence(
 /// read once over the plan as it stands and settled (DEC-1956.3), where a
 /// fixpoint once moved one drop at a time and read them again after each
 /// move, bounded by the square of the plan's length.
-fn release(
-    cs: &mut PlanningPlan,
+fn release<S: Clone>(
+    cs: &mut PlanningPlan<S>,
     ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,

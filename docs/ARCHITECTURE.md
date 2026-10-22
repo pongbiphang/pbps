@@ -55,6 +55,10 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
   crate names either. A third engine is a compile error in every `engine`
   function until it has an answer for each.
 - `spikes/` is workspace-`exclude`d: evaluation crates, not product code.
+- Pure module and RLS policy dependency facts live in `pbps-diff::order::catalog`.
+  PostgreSQL owns their reads and re-exports the shared value types. The
+  canonical order route selects and settles policy-owner releases before
+  granting execution authority; this adds no crate dependency (DEC-1959.5).
 - Schema semantics and typed read reports reach the synchronous UI only through
   `current_exe()` run with `--no-input`. CLI supplies its launch token and the
   documentation style hash. The shipped viewer reads no project files itself;
@@ -63,6 +67,26 @@ pbps-cli       clap, diagnostic output, the deployment commands, exec hooks.
 - The dialect supplies transaction statements; `pbps-db` owns the transaction
   framing. See [ADR-0014 §2](ADR-0014-driver-seam-tested.md#2-begin-holds-t-sql-in-the-crate-that-is-documented-to-hold-none)
   for the boundary correction.
+
+The deployment compiler boundary (DEC-1959.5) retains the successful differ's
+sort/rename provenance and the completed resolver/shared scheduling routes.
+`order::deployment` owns their pure declaration/catalog scheduling policy;
+`order::catalog` holds neutral facts re-exported by the PostgreSQL read seam.
+CLI retains catalog I/O, re-diff timing, planning probes and refusal reporting.
+It cannot replace an executable payload with a raw draft. The shared stages,
+connected continuations and resolver remap keep their existing sequence.
+
+`SavedPlan` remains an untrusted model wire DTO. Its `wire_fingerprint` names
+bytes for admission/attempt identity; order's sealed `ArtifactView` supplies
+the writer and executable checksum. Admission preserves the approved wire
+order without reordering it. Metadata/proof capabilities are never serialized.
+Explain keeps descriptive validation separate from execution admission:
+preview statement counts are engine metadata observations, never lowered SQL.
+Certified inputs bind their mode; lowering reads it and sealing checks it.
+CLI keeps concrete engine variants through immutable lowering and all apply
+modes, so a caller-defined emitter cannot substitute an executable collection.
+The normal `pbps-mssql -> pbps-diff` edge remains the only added workspace
+crate dependency; no transport/engine dependency enters diff or dialect.
 
 ## Isolated compose
 
@@ -109,8 +133,9 @@ environment queries, compatibility rules, scratch DDL and binding extraction;
 through `pbps-cli::engine`, not I/O on the pure `Dialect` trait or in the differ.
 
 Shared deterministic plan evidence belongs beside semantic `Schema`, never in
-its equality or as driver-specific types. The final typed ChangeSet remains the
-only input to deployment SQL emission. Target reads and scratch writes use
+its equality or as driver-specific types. Only order's immutable OrderedPlan
+or a separately admitted, reviewed wire artifact reaches deployment SQL
+emission (DEC-1959.5). Target reads and scratch writes use
 separate connections and credentials. The resolver needs only another
 database, empty, behind another credential variable, or a container it starts
 through the runner's `docker` command; the operator vouches for its isolation
@@ -164,6 +189,15 @@ in DECISIONS 417. SQL Server capture refuses by name until implemented. The
 measured runtime layer — Docker API ownership, native process and channel
 leases, kernel containment and executable identity — was removed by #1636
 (DEC-1636.1).
+
+Certified emission uses `PlanDialect`, while object-safe `Dialect` remains the
+semantic interface. Ordered, admitted and sealed inputs retain the actual
+planner/checker type; canonical completion cannot relabel that type. The CLI
+dispatches to its selected concrete engine at the existing selection point and
+keeps that type through sealing, lowering and execution. Its lowered collection
+retains the engine and immutable configuration. Singleton fixture support is a
+non-default diff feature enabled only by dev-dependencies; shipping builds have
+no unchecked certificate factory (DEC-1959.5).
 
 ## Inviolable constraints
 

@@ -21,22 +21,32 @@
 //! Pure over the dependents already read, so the ordering is testable without
 //! an engine; the reads are `engine::module_dependents`'.
 
+#[cfg(test)]
 use pbps_diff::order::PlanningPlan;
 pub(crate) mod schedule;
+#[cfg(not(test))]
+pub(crate) use pbps_diff::order::deployment::{
+    Sources, dropped_modules, standing_partitions, unaccounted, untouched_module_dependents,
+};
 
 use pbps_model::ValueSource;
+#[cfg(test)]
 use pbps_model::part_effects::{DefaultChange, Effect, Origin, Part as DependencyPart, PartEffect};
+#[cfg(test)]
 use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
+#[cfg(test)]
 use pbps_model::plan_names::{At, PlanNames};
 
 /// Each rebuild of the projection borrows the current immutable order. A
 /// splice must release that view; the next lookup then sees the new boundary.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(crate) struct Sources<'a> {
     pub before: pbps_diff::Side<'a>,
     pub after: &'a IdsFile,
 }
 
+#[cfg(test)]
 impl Sources<'_> {
     pub(crate) fn project<'p>(
         &'p self,
@@ -50,6 +60,7 @@ impl Sources<'_> {
 // The regression counts actual classifier calls through the dependent walk.
 // A cache constructed but then ignored must not appear to save work.
 #[inline]
+#[cfg(test)]
 fn part_effects(change: &Change) -> Vec<PartEffect<'_>> {
     #[cfg(test)]
     part_effect_tests::record_projection();
@@ -58,10 +69,12 @@ fn part_effects(change: &Change) -> Vec<PartEffect<'_>> {
 
 // A cache borrows the same immutable slice as the physical-source view.
 // Every splice releases both; the next view projects the new steps (DEC-1981.1).
+#[cfg(test)]
 fn projected_parts(changes: &[PlannedChange]) -> Vec<Vec<PartEffect<'_>>> {
     changes.iter().map(|p| part_effects(&p.change)).collect()
 }
 
+#[cfg(test)]
 fn boundary(changes: &[PlannedChange], i: usize) -> At {
     if i == changes.len() {
         At::End
@@ -70,17 +83,22 @@ fn boundary(changes: &[PlannedChange], i: usize) -> At {
     }
 }
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use pbps_dialect::Dialect;
+#[cfg(test)]
 use pbps_diff::order::expand::{self, Added, Addition, Anchor, Expansion, Order, Rewrite, expand};
+#[cfg(test)]
 use pbps_diff::order::{Schedule, Source};
+#[cfg(test)]
 use pbps_model::resolver::OrderReason;
-use pbps_model::{
-    Change, ChangeSet, ColumnRef, IdsFile, ModuleDeps, ModuleId, ModuleKind, Partitions,
-    PlannedChange, Schema, TableName,
-};
+use pbps_model::{Change, ChangeSet, ModuleId, ModuleKind, Partitions, Schema, TableName};
+#[cfg(test)]
+use pbps_model::{ColumnRef, IdsFile, ModuleDeps, PlannedChange};
 use pbps_pg::catalog::KeyNameHolder;
+#[cfg(test)]
 use pbps_pg::modules::{Dependent, Holds, Part};
 
 /// Every module this plan drops, rebuilt or not, in plan order: an
@@ -92,6 +110,7 @@ use pbps_pg::modules::{Dependent, Holds, Part};
 /// whether or not a `CREATE` follows it.
 // The complement is every change that does not drop a module.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 pub(crate) fn dropped_modules(changes: &ChangeSet) -> Vec<(ModuleId, ModuleKind)> {
     let mut out: Vec<(ModuleId, ModuleKind)> = Vec::new();
     for p in &changes.changes {
@@ -114,6 +133,7 @@ pub(crate) fn dropped_modules(changes: &ChangeSet) -> Vec<(ModuleId, ModuleKind)
 /// ask the differ to, so their grants and `PUBLIC` execute are restated with
 /// them (`pbps_diff::diff_rebuilding`).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 pub(crate) fn untouched_module_dependents(
     changes: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -197,12 +217,14 @@ pub(crate) fn untouched_module_dependents(
 }
 
 /// Where a dropped module leaves the plan and where it comes back.
+#[cfg(test)]
 struct Span {
     drop_at: usize,
     create_at: Option<usize>,
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
     let mut drop_at = None;
     let mut create_at = None;
@@ -227,6 +249,7 @@ fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
 // These callers ask different questions of the same part address. Parent
 // reach belongs to removal above, never to exact restoration (DEC-1699.1).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
     match (part, holds) {
         (DependencyPart::Module { id, .. }, Holds::Module(module)) => *id == module,
@@ -272,6 +295,7 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
 
 /// Whether `change` removes exactly this dependent.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn removes(parts: &[PartEffect<'_>], holds: &Holds, partitions: &Partitions) -> bool {
     parts.iter().any(|fact| {
         if fact.effect != Effect::Removed
@@ -316,6 +340,7 @@ fn removes(parts: &[PartEffect<'_>], holds: &Holds, partitions: &Partitions) -> 
 /// the parent's default, and a partition's own comes back only through its
 /// own change, which has to be the one placed after the module (#1699).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn restores(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bool {
     parts.iter().any(|fact| {
         fact.origin == Origin::Direct
@@ -330,6 +355,7 @@ fn restores(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bool {
 /// removal before the module's drop, but a dependent it takes away this way
 /// is one the declarations let go of, not one they fail to hold.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn removes_with_its_owner(
     parts: &[PartEffect<'_>],
     holds: &Holds,
@@ -359,6 +385,7 @@ fn removes_with_its_owner(
 /// parent's change is taken to reach only a partition it reaches wherever it
 /// runs (DEC-1699.1).
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 pub(crate) fn standing_partitions(schema: &Schema, cs: &ChangeSet) -> Partitions {
     let moving: Vec<&TableName> = cs
         .changes
@@ -382,6 +409,7 @@ pub(crate) fn standing_partitions(schema: &Schema, cs: &ChangeSet) -> Partitions
 /// table itself, or the parent of a partition, whose column changes the
 /// engine recurses into every partition. A partition's part names the
 /// partition, and the parent's change names the parent alone (DEC-1699.1).
+#[cfg(test)]
 fn reaches(changed: &TableName, table: &TableName, partitions: &Partitions) -> bool {
     changed == table || partitions.parent(table) == Some(changed)
 }
@@ -390,6 +418,7 @@ fn reaches(changed: &TableName, table: &TableName, partitions: &Partitions) -> b
 /// it: a view's `AlterModule`, or a default changed from one expression to
 /// another.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn edits_in_place(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bool {
     parts.iter().any(|fact| {
         fact.effect == Effect::Rewritten
@@ -406,6 +435,7 @@ fn edits_in_place(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bo
 /// view's `AlterModule` is one step that drops and creates, and a default
 /// changed from one expression to another is one statement.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
     Some(match change.clone() {
         Change::AlterModule { id, module } => (
@@ -466,7 +496,11 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
     })
 }
 
-fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
+#[cfg(test)]
+fn planned(
+    change: Change,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
     p
@@ -479,6 +513,7 @@ fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
 /// renames after a `DropModule` and before an `AlterModule`, so one dependent
 /// has two names in one plan, and each change must be matched, and each
 /// synthesized one written, with the name that holds at its own position.
+#[cfg(test)]
 fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Holds> {
     let Holds::TablePart { table, part } = holds else {
         return Some(holds.clone());
@@ -508,7 +543,12 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
 /// Checks and indexes have no column owner to select. Their payload stays
 /// declared while their table follows the physical source at insertion.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
+#[cfg(test)]
+fn respell(
+    p: &mut PlannedChange,
+    holds: &Holds,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     let Holds::TablePart { table, .. } = holds else {
         return;
     };
@@ -523,12 +563,13 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn respell_at(
     p: &mut PlannedChange,
     original: &Holds,
     sources: &PhysicalSources<'_>,
     at: At,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     let here = named_at(sources, at, original).ok_or_else(|| {
         "the dependent's physical source is unavailable at its insertion boundary".to_owned()
@@ -585,6 +626,7 @@ fn respell_at(
 
 /// Synthesis and movement share the boundary's typed ownership. A desired
 /// name cannot identify an earlier holder, especially across attach/detach.
+#[cfg(test)]
 fn default_change(
     located: Option<ColumnAt>,
     from: Option<String>,
@@ -632,6 +674,7 @@ fn default_change(
 
 /// The first change matching `test` against the dependent's name at that
 /// change's own position.
+#[cfg(test)]
 fn find(
     sources: &PhysicalSources<'_>,
     parts: &[Vec<PartEffect<'_>>],
@@ -653,6 +696,7 @@ fn find(
 }
 
 /// A retired source is never the declarations' next holder of the same name.
+#[cfg(test)]
 fn as_declared(sources: &PhysicalSources<'_>, d: &Dependent) -> Option<Dependent> {
     Some(Dependent {
         described: d.described.clone(),
@@ -661,6 +705,7 @@ fn as_declared(sources: &PhysicalSources<'_>, d: &Dependent) -> Option<Dependent
 }
 
 /// The partition `table` is, as declared.
+#[cfg(test)]
 fn partition_of<'a>(
     declared: &'a Schema,
     table: &TableName,
@@ -671,6 +716,7 @@ fn partition_of<'a>(
 /// The declared default of the column a partition's `column` is, on its
 /// parent: what the engine copies into the partition and what it takes back
 /// without one of its own.
+#[cfg(test)]
 fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<String> {
     let of = partition_of(declared, table)?;
     match &declared
@@ -689,6 +735,7 @@ fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<
 }
 
 /// The change that removes a dependent the plan does not remove yet.
+#[cfg(test)]
 fn removal_of(
     d: &Dependent,
     declared: &Schema,
@@ -756,6 +803,7 @@ fn removal_of(
 }
 
 /// The change that puts a declared dependent back.
+#[cfg(test)]
 fn restoration_of(
     d: &Dependent,
     declared: &Schema,
@@ -821,6 +869,7 @@ fn restoration_of(
 
 /// Only defaults need a column owner when synthesizing a table part. A
 /// missing source remains an error in `default_change`, never a new holder.
+#[cfg(test)]
 fn default_location(sources: &PhysicalSources<'_>, original: &Holds, at: At) -> Option<ColumnAt> {
     let Holds::TablePart {
         table,
@@ -842,6 +891,7 @@ fn default_location(sources: &PhysicalSources<'_>, original: &Holds, at: At) -> 
 /// attached it is the parent's inherited copy, which the engine refuses to
 /// drop on its own and the parent's drop takes with it; only before the
 /// attach is it the table's to remove (#1642 review).
+#[cfg(test)]
 fn its_parents_once_attached(changes: &[PlannedChange], holds: &Holds) -> bool {
     attached_at(changes, holds).is_some()
 }
@@ -849,6 +899,7 @@ fn its_parents_once_attached(changes: &[PlannedChange], holds: &Holds) -> bool {
 /// Whether a check of a table this plan attaches goes with its parent's
 /// before `drop_at`: attached first, and the parent's check of its name
 /// dropped after the attach and before `drop_at`.
+#[cfg(test)]
 fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize) -> bool {
     let (
         Some(attach),
@@ -877,6 +928,7 @@ fn taken_by_its_parent(changes: &[PlannedChange], holds: &Holds, drop_at: usize)
 /// partition declaration does not keep as its own. One it keeps stays the
 /// table's across the attach, is no copy of the parent's, and is woven around
 /// the rebuild as any declared check (#1642 review).
+#[cfg(test)]
 fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
     let Holds::TablePart {
         table,
@@ -914,12 +966,13 @@ fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
 /// obligation at a time, with [`Weave`] as its expansion: nothing here moves
 /// a change itself, `settle` does, over the edges each rewrite states
 /// (DEC-1958.2).
-fn weave(
+#[cfg(test)]
+fn oracle_weave(
     cs: &mut PlanningPlan,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
@@ -1025,12 +1078,13 @@ fn weave(
 
 /// Re-state the catalog ordering after other connected edges have been read;
 /// a policy's owner can itself be another policy's referenced table.
+#[cfg(test)]
 fn module_order(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<Vec<Order>, String> {
     Weave {
         roots: dropped_modules(cs)
@@ -1049,6 +1103,7 @@ fn module_order(
 /// [`weave`] as an expansion (#1958): for each dependent of each module the
 /// plan drops, the steps that put it on the right side of the drop, one
 /// obligation at a time in `found`'s order.
+#[cfg(test)]
 struct Weave<'a> {
     /// The modules the plan dropped before any rewrite: a split leaves a
     /// dependent view's drop behind, which is not a root of its own.
@@ -1056,12 +1111,13 @@ struct Weave<'a> {
     found: &'a BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &'a Schema,
     sources: Sources<'a>,
-    dialect: &'a dyn Dialect,
+    dialect: &'a dyn crate::certified_fixture::FixtureEmission,
     partitions: Partitions,
 }
 
 /// What a dependent of a dropped module still needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 enum Need {
     /// One change edits it in place, which cannot be on both sides.
     Split { root: ModuleId, k: usize },
@@ -1073,11 +1129,13 @@ enum Need {
 
 /// A need, with the dependent named.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct Named {
     need: Need,
     described: String,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for Named {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.need {
@@ -1105,6 +1163,7 @@ impl std::fmt::Display for Named {
     }
 }
 
+#[cfg(test)]
 impl Weave<'_> {
     /// The dependents of `root`, in the order they are answered: a
     /// partitioned parent's index last, so that it is restored first. Each
@@ -1212,6 +1271,7 @@ impl Weave<'_> {
     }
 }
 
+#[cfg(test)]
 impl Expansion for Weave<'_> {
     type Obligation = Named;
 
@@ -1465,6 +1525,7 @@ impl Expansion for Weave<'_> {
 }
 
 /// What the catalog says depends on what, with the order it sets.
+#[cfg(test)]
 fn catalog(before: expand::Step, after: expand::Step) -> Order {
     Order {
         before,
@@ -1475,6 +1536,7 @@ fn catalog(before: expand::Step, after: expand::Step) -> Order {
 }
 
 /// A restoration after what it is restored around.
+#[cfg(test)]
 fn restoring(before: expand::Step, after: expand::Step) -> Order {
     Order {
         before,
@@ -1484,6 +1546,7 @@ fn restoring(before: expand::Step, after: expand::Step) -> Order {
     }
 }
 
+#[cfg(test)]
 fn is_generated(holds: &Holds) -> bool {
     matches!(
         holds,
@@ -1500,6 +1563,7 @@ fn is_generated(holds: &Holds) -> bool {
 /// Any other write, an update of another column or an insert that spells this
 /// one, leaves the default free to move after a rebuilt function.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn defaults_taken_by_rows(cs: &ChangeSet) -> std::collections::BTreeSet<ColumnRef> {
     let mut out = std::collections::BTreeSet::new();
     for p in &cs.changes {
@@ -1527,6 +1591,7 @@ fn defaults_taken_by_rows(cs: &ChangeSet) -> std::collections::BTreeSet<ColumnRe
 /// Where the last function create is, when the plan creates or rebuilds a
 /// function; `None` when it does neither, and nothing has to follow a create.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn last_function_create(cs: &ChangeSet) -> Option<usize> {
     // A function new to the database binds what calls it exactly as a rebuilt
     // one does: a check, default or generation expression the differ put
@@ -1565,6 +1630,7 @@ fn last_function_create(cs: &ChangeSet) -> Option<usize> {
 /// Every function this plan creates or rebuilds, by the bare name a call
 /// spells, with the position of its create.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
     cs.changes
         .iter()
@@ -1588,6 +1654,7 @@ fn function_creates(cs: &ChangeSet) -> Vec<(String, usize)> {
 /// schema, or a column, field or word of the same name, counts too. A false
 /// yes costs a later position; a false no would put the call ahead of the
 /// create the engine needs.
+#[cfg(test)]
 fn calls_one_of(text: &str, functions: &[(String, usize)]) -> bool {
     functions
         .iter()
@@ -1644,11 +1711,12 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// after it (#1588).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn split_new_tables(
+#[cfg(test)]
+fn oracle_split_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -1664,11 +1732,12 @@ fn split_new_tables(
     result
 }
 
+#[cfg(test)]
 fn expand_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = pbps_diff::order::generated::expand(
@@ -1736,10 +1805,11 @@ mod expansion_oracle;
 /// index the parent's rests on is a cycle no order satisfies, refused by name,
 /// as is one that would carry a change that could create a table, a column
 /// or a module: what rests on that is not read.
-fn before_its_partitions_indexes(
+#[cfg(test)]
+fn oracle_before_its_partitions_indexes(
     cs: &mut PlanningPlan,
     declared: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
         let Change::AddIndex {
@@ -1913,7 +1983,11 @@ fn before_its_partitions_indexes(
 /// over its range, a name it frees taken again, a row written into its
 /// parent: any of them in the stretch keeps the class order, and the
 /// pre-flight refuses the referencing rows by name, as before.
-fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result<(), String> {
+#[cfg(test)]
+fn oracle_after_the_rows_that_leave(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+) -> Result<(), String> {
     let referencing = |parent: &TableName| -> BTreeSet<&TableName> {
         declared
             .tables
@@ -1986,6 +2060,7 @@ fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result
 /// may take its range or a name it frees, and a numbering source names a
 /// sequence: none of them is passed.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &TableName) -> bool {
     let other = |table: &TableName| table != partition && table != parent;
     match c {
@@ -2013,7 +2088,12 @@ fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &T
 /// dependency imagined moves a change that could have stayed, one missed
 /// breaks the plan. These are the edges a partition's index that sinks
 /// carries what rests on it with (DEC-1967.2).
-fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
+#[cfg(test)]
+fn rests_on(
+    later: &Change,
+    earlier: &Change,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> bool {
     let brought = relations_brought(earlier);
     if !brought.is_empty() {
         let names: Vec<String> = expressions_set(later)
@@ -2079,11 +2159,12 @@ fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
     takes_a_name(later).is_some_and(|t| frees_a_name(earlier) == Some(t))
 }
 
-fn after_their_parents_defaults(
+#[cfg(test)]
+fn oracle_after_their_parents_defaults(
     cs: &mut PlanningPlan,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -2127,6 +2208,7 @@ mod parent_defaults_oracle;
 /// routine's create to another routine's revoke: a cycle where none exists.
 /// A decision depends only on its routine existing, so it is set aside and
 /// put back by [`settle_public_execution`] once the order is final.
+#[cfg(test)]
 fn take_public_execution(cs: &mut PlanningPlan) -> pbps_diff::order::PublicDecisions {
     pbps_diff::order::take_public_execution(cs)
 }
@@ -2135,6 +2217,7 @@ fn take_public_execution(cs: &mut PlanningPlan) -> pbps_diff::order::PublicDecis
 /// `ALTER` of its routine, which is where DEC-687.1 orders it. A decision
 /// on a routine this plan does not create or rebuild goes ahead of the roles
 /// and grants, where its class leaves it.
+#[cfg(test)]
 fn settle_public_execution(cs: &mut PlanningPlan, decisions: pbps_diff::order::PublicDecisions) {
     pbps_diff::order::settle_public_execution(cs, decisions)
 }
@@ -2177,13 +2260,14 @@ fn settle_public_execution(cs: &mut PlanningPlan, decisions: pbps_diff::order::P
 /// A column added with a default or a generation expression that names a
 /// function the plan creates or rebuilds is placed by [`after_their_functions`].
 #[allow(clippy::wildcard_enum_match_arm)]
-fn after_the_rebuilds(
+#[cfg(test)]
+fn oracle_after_the_rebuilds(
     cs: &mut PlanningPlan,
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
     mut schedule: Schedule,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let has_handovers = !schedule.constraints().is_empty();
     // A partition delayed past its trigger's release must take its readers
@@ -2376,7 +2460,12 @@ fn after_the_rebuilds(
 /// Run before [`after_the_rebuilds`], which holds what calls a function. The
 /// create and what is split off it carry the dialect's risks recomputed: a
 /// NOT NULL the create no longer sets is a risk of the change that does.
-fn split_moving_defaults(cs: &mut PlanningPlan, declared: &Schema, dialect: &dyn Dialect) {
+#[cfg(test)]
+fn split_moving_defaults(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     let functions = function_creates(cs);
     pbps_diff::order::split_moving_defaults(cs, declared, dialect, &functions);
 }
@@ -3675,7 +3764,8 @@ fn truncated(mut part: String) -> String {
 /// cannot fire on them. Such a plan is refused, naming the column and the
 /// functions, with the two-plan remedy.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn after_their_functions(
+#[cfg(test)]
+fn oracle_after_their_functions(
     cs: &mut PlanningPlan,
     deps: &ModuleDeps,
     partitions: &Partitions,
@@ -3698,6 +3788,7 @@ fn after_their_functions(
 mod function_oracle;
 
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn function_edges(
     cs: &mut PlanningPlan,
     deps: &ModuleDeps,
@@ -3863,6 +3954,7 @@ fn function_edges(
 /// Why [`after_their_functions`] found no order: the first column it could
 /// not place, the functions it calls, and what may need the column.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn cycle(
     cs: &ChangeSet,
     start: usize,
@@ -3960,6 +4052,7 @@ fn cycle(
 /// - A row write: everything after it. A trigger the plan creates must not
 ///   fire on a row the plan writes before the modules.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Partitions) -> bool {
     match earlier {
         Change::AddColumn { table, name, .. } => match later {
@@ -4027,6 +4120,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
 /// literal counts too: an OID-alias literal such as `'app.a'::regclass` is
 /// resolved as the default or check is installed (measured on 16 and 18),
 /// as `may_call` reads a function's (DEC-1364.1).
+#[cfg(test)]
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
     let named = |text: &str| pbps_pg::Postgres::new().generation_names_table(text, made);
     let typed = |base: &str| base == made.name || base == made.raw().to_string();
@@ -4068,12 +4162,14 @@ fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
 /// hold: measured on 18.6, a view's or an atomic body's `*`, a `NATURAL` join,
 /// and a positional `INSERT INTO t VALUES (…)`, atomic or not, are all bound
 /// to the columns there when the module is created (DEC-1364.1).
+#[cfg(test)]
 fn reads_column(id: &ModuleId, definition: &str, table: &TableName, column: &str) -> bool {
     pbps_pg::generated::may_read(definition, column) || names_table(id, definition, table)
 }
 
 /// Whether a module may name `table`: its definition holds the table's bare
 /// name, or it is a trigger on it.
+#[cfg(test)]
 fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
     id.attached_to()
         .is_some_and(|on| on.schema == table.schema && on.name == table.name)
@@ -4084,6 +4180,7 @@ fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
 /// A change of another table names it only as a foreign key's target, or as
 /// a new partition's own entry on its parent's column.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn names_column(change: &Change, table: &TableName, column: &str, partitions: &Partitions) -> bool {
     let named = |text: &str| pbps_pg::generated::may_read(text, column);
     let listed = |columns: &[pbps_model::ColumnName]| columns.iter().any(|c| c.raw() == column);
@@ -4164,6 +4261,7 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
 /// Whether a change acts on `table`, or on a table referencing it. A change
 /// that names no table is held to anything.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 fn touches(change: &Change, table: &TableName) -> bool {
     if pbps_diff::order::generated::needs_complete(change, table) {
         return true;
@@ -4187,6 +4285,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
 /// this plan drops, named as that change names them (DEC-1168.1). `weave`
 /// puts the module's drop after each such change; this is how
 /// [`after_the_rebuilds`] knows not to move it past that drop.
+#[cfg(test)]
 fn released(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -4219,6 +4318,7 @@ fn released(
 ///
 /// `partitions` is the relation of the schema the plan was made over: a
 /// parent's column change releases its partitions' parts (DEC-1699.1).
+#[cfg(test)]
 pub(crate) fn unaccounted(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -4246,6 +4346,154 @@ pub(crate) fn unaccounted(
         }
     }
     out
+}
+
+#[cfg(test)]
+fn weave(
+    cs: &mut PlanningPlan,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &Schema,
+    sources: Sources<'_>,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_weave(&mut expected, found, declared, sources, dialect);
+    let actual = pbps_diff::order::deployment::weave(
+        cs,
+        found,
+        declared,
+        pbps_diff::order::deployment::Sources {
+            before: sources.before,
+            after: sources.after,
+        },
+        dialect,
+    );
+    assert_eq!(actual, old, "relocated weave refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn split_new_tables(
+    cs: &mut PlanningPlan,
+    ids: &[&IdsFile],
+    deps: &ModuleDeps,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_split_new_tables(&mut expected, ids, deps, dialect);
+    let actual = pbps_diff::order::deployment::split_new_tables(cs, ids, deps, dialect);
+    assert_eq!(actual, old, "relocated split_new_tables refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn before_its_partitions_indexes(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<(), String> {
+    let mut expected = cs.clone();
+    let old = oracle_before_its_partitions_indexes(&mut expected, declared, dialect);
+    let actual = pbps_diff::order::deployment::before_its_partitions_indexes(cs, declared, dialect);
+    assert_eq!(
+        actual, old,
+        "relocated before_its_partitions_indexes refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result<(), String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_the_rows_that_leave(&mut expected, declared);
+    let actual = pbps_diff::order::deployment::after_the_rows_that_leave(cs, declared);
+    assert_eq!(
+        actual, old,
+        "relocated after_the_rows_that_leave refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_their_parents_defaults(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    ids: &[&IdsFile],
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_their_parents_defaults(&mut expected, declared, ids, dialect);
+    let actual =
+        pbps_diff::order::deployment::after_their_parents_defaults(cs, declared, ids, dialect);
+    assert_eq!(
+        actual, old,
+        "relocated after_their_parents_defaults refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_the_rebuilds(
+    cs: &mut PlanningPlan,
+    released: &BTreeSet<ColumnRef>,
+    deps: &ModuleDeps,
+    declared: &Schema,
+    schedule: Schedule,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_the_rebuilds(
+        &mut expected,
+        released,
+        deps,
+        declared,
+        schedule.clone(),
+        dialect,
+    );
+    let actual = pbps_diff::order::deployment::after_the_rebuilds(
+        cs, released, deps, declared, schedule, dialect,
+    );
+    assert_eq!(actual, old, "relocated after_the_rebuilds refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_their_functions(
+    cs: &mut PlanningPlan,
+    deps: &ModuleDeps,
+    partitions: &Partitions,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_their_functions(&mut expected, deps, partitions);
+    let actual = pbps_diff::order::deployment::after_their_functions(
+        cs,
+        deps,
+        partitions,
+        &pbps_pg::Postgres::new(),
+    );
+    assert_eq!(actual, old, "relocated after_their_functions refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
+    }
+    actual
 }
 
 #[cfg(test)]
@@ -4295,7 +4543,7 @@ mod tests {
     fn split_new_tables(
         cs: &mut ChangeSet,
         ids: &[&IdsFile],
-        dialect: &dyn Dialect,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
     ) -> Result<usize, String> {
         super::test_adapters::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
     }
@@ -4305,7 +4553,7 @@ mod tests {
         released: &BTreeSet<ColumnRef>,
         deps: &ModuleDeps,
         declared: &Schema,
-        dialect: &dyn Dialect,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
         super::test_adapters::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
@@ -4378,7 +4626,7 @@ mod tests {
         }
     }
 
-    fn pg() -> Box<dyn Dialect> {
+    fn pg() -> Box<dyn crate::certified_fixture::FixtureEmission> {
         Box::new(pbps_pg::Postgres::new())
     }
 
@@ -8378,7 +8626,10 @@ mod tests {
     }
 
     /// The check with nothing already on the target: every candidate stands.
-    fn refusal_of(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
+    fn refusal_of(
+        cs: &ChangeSet,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
+    ) -> Result<(), String> {
         later_relation_refusal(&names_a_later_relation(cs, dialect, None))
     }
 

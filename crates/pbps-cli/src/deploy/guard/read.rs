@@ -325,11 +325,12 @@ mod tests {
         })
         .unwrap();
         for dialect in [
-            &pbps_mssql::Mssql as &dyn pbps_dialect::Dialect,
+            &pbps_mssql::Mssql as &dyn crate::certified_fixture::FixtureEmission,
             &pbps_pg::Postgres::new(),
         ] {
-            let statements =
-                crate::statements(&planned, dialect, pbps_model::PlanMode::Staged).unwrap();
+            let statements = dialect
+                .fixture_emit_staged(&planned.changes[0].change, planned.changes[0].strategy)
+                .unwrap();
             assert_eq!(statements.len(), 2, "a transfer and a rename");
             let mut before = baseline.clone();
             for (i, statement) in statements.iter().enumerate() {

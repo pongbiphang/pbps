@@ -30,7 +30,7 @@ use anyhow::{Context as _, bail};
 
 use pbps_config::Project;
 use pbps_db::Conn;
-use pbps_dialect::{Dialect, Statement};
+use pbps_dialect::Dialect;
 use pbps_model::{Change, ChangeSet, IdsFile, Schema};
 
 use crate::db;
@@ -109,17 +109,18 @@ impl Rehearsal {
 
 /// Builds the baseline, applies the plan, and compares against the declarations.
 #[allow(clippy::too_many_arguments)]
-pub fn rehearse(
+pub fn rehearse<D: crate::emission::Engine>(
     spec: &Spec,
     baseline: &Schema,
     baseline_ids: &IdsFile,
     baseline_hints: &pbps_model::Hints,
     declared: &Schema,
     declared_ids: &IdsFile,
-    plan: &[Statement],
-    dialect: &dyn Dialect,
+    plan: &crate::emission::LoweredPlan,
+    selected: &D,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
+    let dialect = selected.as_ref();
     // The scratch-database lifecycle and container setup below are SQL
     // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
     // cannot make that lifecycle safe for another dialect.
@@ -176,7 +177,10 @@ pub fn rehearse(
         dialect,
     )?
     .changes;
-    let build = crate::statements(&build, dialect, pbps_model::PlanMode::Transactional)?;
+    let build = crate::statements(
+        &build.ordered(pbps_model::PlanMode::Transactional, dialect),
+        selected,
+    )?;
 
     let container = match spec {
         Spec::Docker(image) => Some(Container::start(image)?),
@@ -209,8 +213,8 @@ pub fn rehearse(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     connection: &str,
-    build: &[Statement],
-    plan: &[Statement],
+    build: &crate::emission::LoweredPlan,
+    plan: &crate::emission::LoweredPlan,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,
@@ -263,8 +267,8 @@ async fn run(
 async fn rehearse_in(
     conn: &mut Conn,
     name: &str,
-    build: &[Statement],
-    plan: &[Statement],
+    build: &crate::emission::LoweredPlan,
+    plan: &crate::emission::LoweredPlan,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,

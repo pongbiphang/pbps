@@ -7,7 +7,7 @@ pub(super) fn after_their_parents_defaults(
     cs: &mut ChangeSet,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let mut added = 0;
     let mut i = 0;
@@ -85,7 +85,11 @@ pub(super) fn after_their_parents_defaults(
     Ok(added)
 }
 
-pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn Dialect) {
+pub(super) fn same_plan(
+    actual: &ChangeSet,
+    expected: &ChangeSet,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     let mut comparable = actual.clone();
     for (now, old) in comparable.changes.iter_mut().zip(&expected.changes) {
         if let Some(origin) = &now.provenance
@@ -235,7 +239,10 @@ fn free(name: &str, salt: u32) -> Change {
     }
 }
 
-fn plan(changes: Vec<Change>, dialect: &dyn Dialect) -> ChangeSet {
+fn plan(
+    changes: Vec<Change>,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> ChangeSet {
     ChangeSet {
         changes: changes
             .into_iter()

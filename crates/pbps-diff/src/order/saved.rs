@@ -26,6 +26,20 @@ macro_rules! refuse {
     ($($arg:tt)*) => { return Err(AdmissionError::message(format!($($arg)*))) };
 }
 
+/// Only a newly sealed or checked artifact may be written or used for an
+/// executable checksum. The model DTO remains readable untrusted wire data.
+/// ```compile_fail
+/// fn raw(plan: &pbps_model::SavedPlan) {
+///     let _: &dyn pbps_diff::order::ArtifactView = plan;
+/// }
+/// ```
+pub trait ArtifactView: super::plan::sealed::Sealed {
+    fn wire(&self) -> &SavedPlan;
+    fn checksum(&self) -> String {
+        self.wire().wire_fingerprint()
+    }
+}
+
 /// A reviewed wire artifact accepted by the existing artifact checks. Its
 /// checksum-pinned sequence is trusted under SPEC's saved-plan contract;
 /// admission neither reorders it nor enables the deferred release verifier.
@@ -59,6 +73,11 @@ impl<D: ?Sized> AdmittedPlan<D> {
 impl<D: ?Sized> std::ops::Deref for AdmittedPlan<D> {
     type Target = SavedPlan;
     fn deref(&self) -> &SavedPlan {
+        &self.wire
+    }
+}
+impl<D: ?Sized> ArtifactView for AdmittedPlan<D> {
+    fn wire(&self) -> &SavedPlan {
         &self.wire
     }
 }
@@ -100,7 +119,7 @@ pub fn admit<D: Dialect + ?Sized>(
             pbps_model::plan::CURRENT_VERSION
         );
     }
-    let plan_checksum = plan.checksum();
+    let plan_checksum = plan.wire_fingerprint();
     if plan_checksum != approved_checksum {
         refuse!(
             "`{}` no longer matches the artifact approved at the deployment gate.\n\
@@ -149,6 +168,11 @@ impl<D: ?Sized> Clone for SealedPlan<D> {
         }
     }
 }
+impl<D: ?Sized> ArtifactView for SealedPlan<D> {
+    fn wire(&self) -> &SavedPlan {
+        &self.wire
+    }
+}
 impl<D: ?Sized> SealedPlan<D> {
     pub fn wire(&self) -> &SavedPlan {
         &self.wire
@@ -179,6 +203,11 @@ impl<D: ?Sized> PlanView<D> for SealedPlan<D> {}
 
 /// Metadata cannot replace a single operation, strategy or finding after
 /// ordering: the original proof must still describe the wire payload exactly.
+/// ```compile_fail
+/// fn raw(changes: pbps_model::ChangeSet, wire: pbps_model::SavedPlan) {
+///     let _ = pbps_diff::order::seal(changes, wire);
+/// }
+/// ```
 pub fn seal<D: ?Sized>(
     ordered: OrderedPlan<D>,
     wire: SavedPlan,
@@ -374,10 +403,11 @@ pub fn validate_saved_plan(
              revision; use a transactional plan for multiple changes."
         );
     }
-    plan.ids.validate().map_err(|error| {
-        AdmissionError::message(format!(
-            "the plan's post-apply identity mapping is inconsistent: {error}"
-        ))
+    plan.ids.validate().map_err(|source| {
+        #[derive(Debug, thiserror::Error)]
+        #[error("the plan's post-apply identity mapping is inconsistent")]
+        struct Identity(#[source] Box<dyn std::error::Error + Send + Sync>);
+        AdmissionError::from_error(Identity(Box::new(source)))
     })?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
@@ -404,4 +434,82 @@ pub fn validate_saved_plan(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Change, PlannedChange};
+    fn role(name: &str) -> PlannedChange {
+        PlannedChange::new(Change::CreateRole {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Role, name, 0),
+            name: name.into(),
+        })
+    }
+    fn wire(changes: ChangeSet) -> SavedPlan {
+        SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            "minimal",
+            "2026-10-22T00:00:00Z",
+            pbps_model::PlanBaseline {
+                description: "fixed artifact oracle".into(),
+                checksum: "baseline".into(),
+                database_collation: None,
+                time_zone: None,
+            },
+            changes,
+            Default::default(),
+        )
+    }
+    #[test]
+    fn admission_keeps_the_reviewed_wire_order_and_fingerprint() {
+        let wire = wire(ChangeSet {
+            changes: vec![role("z"), role("a")],
+        });
+        let before = wire.wire_fingerprint();
+        let admitted = admit(
+            wire.clone(),
+            &pbps_dialect::MinimalDialect,
+            Path::new("plan.json"),
+            &before,
+        )
+        .unwrap();
+        assert_eq!(admitted.wire(), &wire);
+        assert_eq!(admitted.checksum(), before);
+        let again = admit(
+            admitted.wire().clone(),
+            &pbps_dialect::MinimalDialect,
+            Path::new("plan.json"),
+            &before,
+        )
+        .unwrap();
+        assert_eq!(again.wire(), admitted.wire());
+        let mut wrong = wire;
+        wrong.version += 1;
+        assert!(
+            admit(
+                wrong,
+                &pbps_dialect::MinimalDialect,
+                Path::new("plan.json"),
+                &before
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn sealing_rejects_replaced_operations_and_post_order_payload_edits() {
+        let ordered = crate::order::singleton(
+            role("a"),
+            pbps_model::PlanMode::Transactional,
+            &pbps_dialect::MinimalDialect,
+        );
+        let exact = wire(ordered.changes().clone());
+        assert!(seal(ordered.clone(), exact.clone()).is_ok());
+        let mut replaced = exact.clone();
+        replaced.changes.changes[0] = role("b");
+        assert!(seal(ordered.clone(), replaced).is_err());
+        let mut strategy = exact;
+        strategy.changes.changes[0].strategy.online = true;
+        assert!(seal(ordered, strategy).is_err());
+    }
 }

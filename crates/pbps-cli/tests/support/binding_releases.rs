@@ -83,7 +83,7 @@ pub fn check() {
             "--plan",
             path.to_str().unwrap(),
             "--checksum",
-            &saved.checksum(),
+            &saved.wire_fingerprint(),
             "--allow",
             &allowed,
         ]));
@@ -181,7 +181,7 @@ pub fn check_independent_connected_release() {
         "--plan",
         path.to_str().unwrap(),
         "--checksum",
-        &saved.checksum(),
+        &saved.wire_fingerprint(),
         "--allow",
         &allowed,
     ]));

@@ -136,7 +136,7 @@ pub fn matching(server: &str, pg: bool) {
         // This is a recording-only plan: no row or schema change hides the
         // failure to carry an otherwise empty takeover into apply.
         assert_eq!(saved.changes.changes.len(), 1);
-        ok(apply(&d, connection, &saved.checksum(), false));
+        ok(apply(&d, connection, &saved.wire_fingerprint(), false));
         let after = history(&d, connection);
         assert_eq!(
             after.as_array().unwrap().len(),
@@ -146,7 +146,7 @@ pub fn matching(server: &str, pg: bool) {
         ok(d.run(&["verify", "--db", connection]));
         let noop = plan(&d, connection);
         assert!(noop.changes.is_empty());
-        ok(apply(&d, connection, &noop.checksum(), false));
+        ok(apply(&d, connection, &noop.wire_fingerprint(), false));
         assert_eq!(history(&d, connection), after);
         if mode == "ensure" {
             let values = if key_only {
@@ -191,7 +191,7 @@ pub fn refusals(server: &str, pg: bool) {
             schema(pg)
         ),
     );
-    let out = apply(&d, connection, &saved.checksum(), false);
+    let out = apply(&d, connection, &saved.wire_fingerprint(), false);
     assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
     assert!(stderr(&out).contains("baseline"), "{}", stderr(&out));
     let failed = history(&d, connection);
@@ -209,7 +209,7 @@ pub fn refusals(server: &str, pg: bool) {
             schema(pg)
         ),
     );
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     ok(d.run(&["verify", "--db", connection]));
 }
 
@@ -233,7 +233,7 @@ pub fn renamed(server: &str, pg: bool) {
     let saved = plan(&d, connection);
     assert_takeover(&saved, &new, DataMode::Exact);
     assert_eq!(saved.changes.changes.len(), 2);
-    let out = apply(&d, connection, &saved.checksum(), false);
+    let out = apply(&d, connection, &saved.wire_fingerprint(), false);
     assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
     assert!(
         stderr(&out).contains("risks that were not approved: rename"),
@@ -241,7 +241,7 @@ pub fn renamed(server: &str, pg: bool) {
         stderr(&out)
     );
     assert_eq!(history(&d, connection), before);
-    ok(apply(&d, connection, &saved.checksum(), true));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), true));
     ok(d.run(&["verify", "--db", connection]));
     assert!(plan(&d, connection).changes.is_empty());
     on_server(
@@ -267,7 +267,7 @@ fn managed_ensure(d: &Demo, connection: &str, pg: bool) -> String {
     prepare(d, connection, pg, false, false);
     declare(d, pg, "ensure", false, false);
     let saved = plan(d, connection);
-    ok(apply(d, connection, &saved.checksum(), false));
+    ok(apply(d, connection, &saved.wire_fingerprint(), false));
     format!("{}.country", schema(pg))
 }
 
@@ -319,7 +319,7 @@ pub fn ensure_scope(server: &str, pg: bool) {
     assert_keys(&saved, &table, &["TW"], &["TW", "JP"]);
     assert_eq!(saved.changes.changes.len(), 1);
     let before = history(&d, connection);
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     let recorded = history(&d, connection);
     assert_eq!(
         recorded.as_array().unwrap().len(),
@@ -337,14 +337,14 @@ pub fn ensure_scope(server: &str, pg: bool) {
     );
     let noop = plan(&d, connection);
     assert!(noop.changes.is_empty());
-    ok(apply(&d, connection, &noop.checksum(), false));
+    ok(apply(&d, connection, &noop.wire_fingerprint(), false));
     assert_eq!(history(&d, connection), recorded);
 
     ensure_rows(&d, &table, "\n    JP: {label: Japan}");
     let saved = plan(&d, connection);
     assert_keys(&saved, &table, &["TW", "JP"], &["JP"]);
     assert_eq!(saved.changes.changes.len(), 1);
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     on_server(
         connection,
         &format!("UPDATE {table} SET label = 'Changed' WHERE code = 'TW'"),
@@ -364,7 +364,7 @@ pub fn ensure_scope(server: &str, pg: bool) {
     let saved = plan(&d, connection);
     assert_keys(&saved, &table, &["JP"], &[]);
     assert_eq!(saved.changes.changes.len(), 1);
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     on_server(
         connection,
         &format!("UPDATE {table} SET label = 'Changed' WHERE code = 'JP'"),
@@ -381,7 +381,7 @@ pub fn ensure_scope(server: &str, pg: bool) {
     let saved = plan(&d, connection);
     assert_keys(&saved, &table, &[], &["TW", "JP"]);
     assert_eq!(saved.changes.changes.len(), 1);
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     ok(d.run(&["verify", "--db", connection]));
 }
 
@@ -410,7 +410,7 @@ pub fn ensure_refusals(server: &str, pg: bool) {
         connection,
         &format!("UPDATE {table} SET label = 'Changed' WHERE code = 'JP'"),
     );
-    let refused = apply(&d, connection, &saved.checksum(), false);
+    let refused = apply(&d, connection, &saved.wire_fingerprint(), false);
     assert_eq!(code(&refused), 1);
     assert!(
         stderr(&refused).contains("baseline"),
@@ -425,7 +425,7 @@ pub fn ensure_refusals(server: &str, pg: bool) {
         connection,
         &format!("UPDATE {table} SET label = 'Japan' WHERE code = 'JP'"),
     );
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     // A removed key is still part of the union pinned by this plan.
     ensure_rows(&d, &table, "\n    TW: {label: Taiwan}");
     let saved = plan(&d, connection);
@@ -433,7 +433,7 @@ pub fn ensure_refusals(server: &str, pg: bool) {
         connection,
         &format!("UPDATE {table} SET label = 'Changed' WHERE code = 'JP'"),
     );
-    let refused = apply(&d, connection, &saved.checksum(), false);
+    let refused = apply(&d, connection, &saved.wire_fingerprint(), false);
     assert_eq!(code(&refused), 1);
     assert!(
         stderr(&refused).contains("baseline"),
@@ -445,7 +445,7 @@ pub fn ensure_refusals(server: &str, pg: bool) {
         connection,
         &format!("UPDATE {table} SET label = 'Japan' WHERE code = 'JP'"),
     );
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
 }
 
 pub fn ensure_writes_and_rename(server: &str, pg: bool) {
@@ -468,7 +468,7 @@ pub fn ensure_writes_and_rename(server: &str, pg: bool) {
             .iter()
             .any(|p| matches!(&p.change, Change::InsertRow { .. }))
     );
-    ok(apply(&d, connection, &saved.checksum(), false));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), false));
     ensure_rows(
         &d,
         &table,
@@ -488,7 +488,7 @@ pub fn ensure_writes_and_rename(server: &str, pg: bool) {
         "--plan",
         path.to_str().unwrap(),
         "--checksum",
-        &saved.checksum(),
+        &saved.wire_fingerprint(),
         "--allow",
         "data-update",
     ]));
@@ -506,9 +506,12 @@ pub fn ensure_writes_and_rename(server: &str, pg: bool) {
     assert_keys(&saved, &renamed, &["TW", "JP"], &["JP"]);
     assert_eq!(saved.changes.changes.len(), 2);
     let before = history(&d, connection);
-    assert_eq!(code(&apply(&d, connection, &saved.checksum(), false)), 1);
+    assert_eq!(
+        code(&apply(&d, connection, &saved.wire_fingerprint(), false)),
+        1
+    );
     assert_eq!(history(&d, connection), before);
-    ok(apply(&d, connection, &saved.checksum(), true));
+    ok(apply(&d, connection, &saved.wire_fingerprint(), true));
     ok(d.run(&["verify", "--db", connection]));
     assert!(plan(&d, connection).changes.is_empty());
     on_server(

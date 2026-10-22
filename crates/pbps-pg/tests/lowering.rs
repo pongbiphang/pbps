@@ -3,7 +3,9 @@
 //! Lowering is `emit` regrouped, so a plan's statements are byte-identical
 //! whether they are read per change or per operation.
 
-use pbps_dialect::Dialect;
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use pbps_dialect::Released;
 use pbps_dialect::lower::{Batch, Execution, Lowered, Transaction, lower};
 use pbps_model::{
@@ -240,7 +242,7 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
     let changes = corpus();
     let emitted: Vec<_> = changes
         .iter()
-        .flat_map(|p| pg.legacy_emit(&p.change, p.strategy).unwrap())
+        .flat_map(|p| pg.fixture_emit(&p.change, p.strategy).unwrap())
         .collect();
     let lowered: Vec<_> = changes
         .iter()
@@ -267,4 +269,12 @@ fn lowering_a_plan_writes_exactly_the_statements_emit_writes() {
         .flat_map(|p| one(p.change.clone(), Strategy::default()).into_statements())
         .collect();
     assert_ne!(offline, emitted);
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

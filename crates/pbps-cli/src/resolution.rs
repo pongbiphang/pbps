@@ -14,6 +14,37 @@
 use pbps_config::resolver::ResolverSelection;
 use pbps_diff::resolver::{Answer, Assessment};
 
+// Resolution returns a PostgreSQL-only opaque result. The concrete CLI
+// dispatch must retain that brand when ordinary and resolved plans meet;
+// ScopeInput cannot erase it back to an engine-free differ result.
+pub(crate) trait Continuation: crate::emission::Engine {
+    fn with_scope(
+        &self,
+        scope: &pbps_diff::order::writebacks::ScopeInput,
+        resolved: &pbps_cli::resolver::server::Unsealed,
+    ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>>;
+}
+impl Continuation for pbps_pg::Postgres {
+    fn with_scope(
+        &self,
+        scope: &pbps_diff::order::writebacks::ScopeInput,
+        resolved: &pbps_cli::resolver::server::Unsealed,
+    ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>> {
+        scope.append_to(resolved.changes().clone(), self)
+    }
+}
+impl Continuation for pbps_mssql::Mssql {
+    fn with_scope(
+        &self,
+        _scope: &pbps_diff::order::writebacks::ScopeInput,
+        _resolved: &pbps_cli::resolver::server::Unsealed,
+    ) -> pbps_diff::order::PlanningPlan<pbps_diff::order::Continuing<Self>> {
+        // resolve refuses this engine before it can return Unsealed. Keep
+        // that refusal at its existing point, without a cross-engine cast.
+        unreachable!("SQL Server resolution was refused before returning a plan")
+    }
+}
+
 /// Which case a connected plan is in.
 pub enum Case<'a> {
     Fallback,
@@ -318,7 +349,7 @@ mod producer {
     pub(super) async fn produce(
         request: &Request<'_>,
         driver: pbps_db::Driver,
-        bootstrap: &pbps_diff::order::PlanningPlan,
+        bootstrap: &pbps_diff::order::DiffPlan,
     ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
             bootstrap,
@@ -806,7 +837,19 @@ mod tests {
         let refusal = |target_identity| match rt.block_on(producer::produce(
             &request(target_identity),
             pbps_db::Driver::Postgres,
-            &pbps_diff::order::propose(pbps_model::ChangeSet::default()),
+            &pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &pbps_model::Schema::default(),
+                    ids: &pbps_model::IdsFile::default(),
+                },
+                pbps_diff::Side {
+                    schema: &pbps_model::Schema::default(),
+                    ids: &pbps_model::IdsFile::default(),
+                },
+                &pbps_dialect::MinimalDialect,
+                &pbps_model::Hints::default(),
+            )
+            .unwrap(),
         )) {
             Err(Refused::Unanswerable(error)) => error.to_string(),
             Err(Refused::Finding(finding)) => panic!("not answered: {}", finding.id),

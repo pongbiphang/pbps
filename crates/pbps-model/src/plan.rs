@@ -8,11 +8,11 @@
 //!   differs: that is the drift check, and it is what makes a flag as coarse as
 //!   `--allow rename,destructive` safe — what gets approved is exactly the plan
 //!   approved at the gate, no more and no less.
-//! - [`plan_checksum`] fingerprints the **plan**. It goes into the ledger so the
+//! - [`wire_fingerprint`] fingerprints the **plan**. It goes into the ledger so the
 //!   record can answer "which plan ran here" without storing the plan twice.
 //!
 //! Neither checksum is stored inside the file it describes: a self-referential
-//! digest is a digest of nothing. `plan_checksum` is computed from the file as
+//! digest is a digest of nothing. `wire_fingerprint` is computed from the file as
 //! read, and the state checksum in [`PlanBaseline`] describes the database, not
 //! the plan.
 //!
@@ -575,9 +575,13 @@ impl SavedPlan {
         }
     }
 
-    /// This plan's own fingerprint. See [`plan_checksum`].
-    pub fn checksum(&self) -> String {
-        plan_checksum(self)
+    /// Untrusted wire fingerprint for admission and attempt identity. This
+    /// is not permission to emit, save or apply a plan (DEC-1959.5).
+    /// ```compile_fail
+    /// fn unchecked(plan: &pbps_model::SavedPlan) { let _ = plan.checksum(); }
+    /// ```
+    pub fn wire_fingerprint(&self) -> String {
+        wire_fingerprint(self)
     }
 
     pub fn staged(mut self) -> Self {
@@ -633,7 +637,7 @@ pub fn state_checksum(schema: &Schema, ids: &IdsFile) -> String {
 /// The whole file is hashed, `created_at` included: two plans that differ only
 /// in when they were computed are still two different artifacts, and the ledger
 /// entry should name the one that actually ran.
-pub fn plan_checksum(plan: &SavedPlan) -> String {
+pub fn wire_fingerprint(plan: &SavedPlan) -> String {
     digest_of(plan)
 }
 
@@ -816,10 +820,10 @@ mod tests {
         });
         let text = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<SavedPlan>(&text).unwrap(), pinned);
-        assert_ne!(plan.checksum(), pinned.checksum());
+        assert_ne!(plan.wire_fingerprint(), pinned.wire_fingerprint());
         let mut other = pinned.clone();
         other.routine_pins.as_mut().unwrap().schemas[0].digest = "cd".repeat(32);
-        assert_ne!(pinned.checksum(), other.checksum());
+        assert_ne!(pinned.wire_fingerprint(), other.wire_fingerprint());
         // An unknown field in a pin is a broken file, not an ignorable extra.
         let tampered = text.replace("\"routines\":1", "\"routines\":1,\"extra\":true");
         assert!(serde_json::from_str::<SavedPlan>(&tampered).is_err());
@@ -865,7 +869,7 @@ mod tests {
                     moves_at_most: None,
                 })],
             })
-            .checksum()
+            .wire_fingerprint()
         };
         assert_ne!(created(&["id", "note"]), created(&["note", "id"]));
     }
@@ -892,8 +896,11 @@ mod tests {
                 detach_from: None,
             })],
         });
-        assert_ne!(empty.checksum(), one.checksum());
-        assert_eq!(empty.checksum(), plan_over(ChangeSet::default()).checksum());
+        assert_ne!(empty.wire_fingerprint(), one.wire_fingerprint());
+        assert_eq!(
+            empty.wire_fingerprint(),
+            plan_over(ChangeSet::default()).wire_fingerprint()
+        );
     }
 
     /// The recorded state after an apply pairs the new schema with the new
@@ -920,7 +927,7 @@ mod tests {
         let plan = plan_over(ChangeSet::default());
         let back: SavedPlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(plan, back);
-        assert_eq!(plan.checksum(), back.checksum());
+        assert_eq!(plan.wire_fingerprint(), back.wire_fingerprint());
     }
 
     /// The version field exists so a later format change can be detected rather
@@ -1065,7 +1072,7 @@ mod tests {
         let staged = plan_over(ChangeSet::default()).staged();
         assert_eq!(plain.mode, PlanMode::Transactional);
         assert!(staged.mode.is_staged());
-        assert_ne!(plain.checksum(), staged.checksum());
+        assert_ne!(plain.wire_fingerprint(), staged.wire_fingerprint());
     }
 
     /// Plans written before staged apply existed carry no `mode` at all, and
@@ -1088,14 +1095,14 @@ mod tests {
                 .get("pin_type_routines")
                 .is_none()
         );
-        let before = plan.checksum();
+        let before = plan.wire_fingerprint();
         plan.pin_type_routines = true;
         assert_eq!(
             serde_json::to_value(&plan).unwrap()["pin_type_routines"],
             true
         );
-        assert_ne!(before, plan.checksum());
-        let before = plan.checksum();
+        assert_ne!(before, plan.wire_fingerprint());
+        let before = plan.wire_fingerprint();
         plan.type_routines.push(TypeRoutine {
             oid: 40001,
             schema: "app".into(),
@@ -1105,14 +1112,14 @@ mod tests {
                 "CREATE FUNCTION app.checked(integer) RETURNS boolean LANGUAGE sql RETURN true"
                     .into(),
         });
-        assert_ne!(before, plan.checksum());
-        let before = plan.checksum();
+        assert_ne!(before, plan.wire_fingerprint());
+        let before = plan.wire_fingerprint();
         plan.type_routine_pins = Some(RoutinePins {
             key_id: "key".into(),
             server_version: "180006".into(),
             schemas: Vec::new(),
         });
-        assert_ne!(before, plan.checksum());
+        assert_ne!(before, plan.wire_fingerprint());
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
         assert!(
@@ -1126,7 +1133,7 @@ mod tests {
     #[test]
     fn type_pins_and_declared_trust_survive_serialization_and_change_the_approved_checksum() {
         let mut plan = plan_over(ChangeSet::default());
-        let unpinned = plan.checksum();
+        let unpinned = plan.wire_fingerprint();
         plan.type_pins.push(TypePin {
             schema: "app".into(),
             name: "mood".into(),
@@ -1137,13 +1144,13 @@ mod tests {
         plan.trusted_roles.insert("platform_owner".into());
         let json = serde_json::to_string(&plan).unwrap();
         assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
-        assert_ne!(plan.checksum(), unpinned);
-        let before = plan.checksum();
+        assert_ne!(plan.wire_fingerprint(), unpinned);
+        let before = plan.wire_fingerprint();
         plan.type_pins[0].oid += 1;
-        assert_ne!(plan.checksum(), before);
-        let before = plan.checksum();
+        assert_ne!(plan.wire_fingerprint(), before);
+        let before = plan.wire_fingerprint();
         plan.trusted_roles.clear();
-        assert_ne!(plan.checksum(), before);
+        assert_ne!(plan.wire_fingerprint(), before);
         assert!(
             serde_json::from_str::<SavedPlan>(
                 &json.replace("\"oid\":40000", "\"oid\":40000,\"invented\":true")

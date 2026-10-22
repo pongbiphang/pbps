@@ -1,4 +1,7 @@
 //! Creation parts expose relation names before generation binds (DEC-1503.1).
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use super::*;
 use pbps_model::Generated;
 #[path = "../resolver/generated_fixtures.rs"]
@@ -14,7 +17,7 @@ mod part_risks;
 pub(crate) fn ordinary(
     schema: &Schema,
     ids: &IdsFile,
-    dialect: &dyn Dialect,
+    dialect: &(dyn crate::certified_fixture::FixtureEmission + 'static),
 ) -> Result<ChangeSet, String> {
     ordinary_with_dependencies(schema, ids, &ModuleDeps::new(), dialect)
 }
@@ -23,7 +26,7 @@ fn ordinary_with_dependencies(
     schema: &Schema,
     ids: &IdsFile,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(dyn crate::certified_fixture::FixtureEmission + 'static),
 ) -> Result<ChangeSet, String> {
     let empty = Schema::default();
     let before_ids = IdsFile::default();
@@ -40,7 +43,7 @@ fn ordinary_with_dependencies(
         },
     )
     .unwrap();
-    super::schedule::schedule(
+    super::schedule::schedule_fixture(
         cs,
         &super::schedule::Declarations {
             schema,
@@ -331,17 +334,17 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
             let result: anyhow::Result<()> = async {
                 let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
                 conn.execute("CREATE SCHEMA app").await?;
-                let dialect: Box<dyn Dialect> = if case.ends_with("-offline") {
-                    Box::new(pbps_pg::Postgres::new())
+                let dialect: pbps_pg::Postgres = if case.ends_with("-offline") {
+                    pbps_pg::Postgres::new()
                 } else {
                     crate::engine::planning_dialect(&mut conn).await?
                 };
                 let shape_case = case.strip_suffix("-offline").unwrap_or(case);
                 let schema = shape(shape_case);
-                let cs = ordinary(&schema, &identities(&schema), dialect.as_ref()).map_err(anyhow::Error::msg)?;
+                let cs = ordinary(&schema, &identities(&schema), &dialect).map_err(anyhow::Error::msg)?;
                 conn.execute("BEGIN").await?;
                 for p in &cs.changes {
-                    for statement in dialect.legacy_emit(&p.change, p.strategy)? {
+                    for statement in dialect.fixture_emit(&p.change, p.strategy)? {
                         conn.execute(&statement.sql).await?;
                     }
                 }
@@ -421,7 +424,7 @@ async fn called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold(
                 let schema = shape(case);
                 let ids = identities(&schema);
                 assert!(ordinary(&schema, &ids, &pbps_pg::Postgres::new()).is_err(), "offline keeps the named hold");
-                let result = ordinary(&schema, &ids, pg.as_ref());
+                let result = ordinary(&schema, &ids, &pg);
                 if !modern {
                     let why = result.unwrap_err();
                     assert!(why.contains("app.a") && why.contains("app.f"), "{why}");
@@ -430,7 +433,7 @@ async fn called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold(
                 let cs = result.map_err(anyhow::Error::msg)?;
                 assert!(cs.changes.iter().any(|p| matches!(p.change, Change::AlterColumnExpression { .. })));
                 assert!(!cs.changes.iter().any(|p| matches!(p.change, Change::AddColumn { .. })));
-                for p in &cs.changes { for sql in pg.legacy_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; } }
+                for p in &cs.changes { for sql in pg.fixture_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; } }
                 let count = conn.query("SELECT count(*)::int4 AS n FROM information_schema.columns WHERE table_schema='app' AND table_name='v'").await?;
                 assert_eq!(count[0].try_get::<i32>("n")?, Some(3));
                 Ok(())
@@ -537,7 +540,7 @@ async fn transitive_table_readers_apply_placeholders_or_keep_the_named_hold() {
                     let offline = ordinary(&schema, &ids, &pbps_pg::Postgres::new());
                     assert_eq!(offline.is_ok(), case == "chain-pure");
                 }
-                let result = ordinary(&schema, &ids, pg.as_ref());
+                let result = ordinary(&schema, &ids, &pg);
                 if case == "chain-cycle" || (case == "chain" && !modern) {
                     let why = result.unwrap_err();
                     assert!(why.contains("app.f") && why.contains("app.g"), "{why}");
@@ -551,7 +554,7 @@ async fn transitive_table_readers_apply_placeholders_or_keep_the_named_hold() {
                     case == "chain"
                 );
                 for p in &cs.changes {
-                    for sql in pg.legacy_emit(&p.change, p.strategy)? {
+                    for sql in pg.fixture_emit(&p.change, p.strategy)? {
                         conn.execute(&sql.sql).await?;
                     }
                 }

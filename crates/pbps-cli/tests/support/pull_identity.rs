@@ -111,7 +111,7 @@ pub fn unchanged(server: &str, pg: bool) {
                 "--plan",
                 plan.to_str().unwrap(),
                 "--checksum",
-                &saved.checksum(),
+                &saved.wire_fingerprint(),
                 "--allow",
                 "destructive",
             ]));
@@ -294,7 +294,7 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
                     "--plan",
                     plan.to_str().unwrap(),
                     "--checksum",
-                    &saved.checksum(),
+                    &saved.wire_fingerprint(),
                 ]);
                 assert_ne!(code(&refused), 0);
                 assert_eq!(rows(connection, pg), 3);
@@ -311,7 +311,7 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
                 "--plan",
                 plan.to_str().unwrap(),
                 "--checksum",
-                &saved.checksum(),
+                &saved.wire_fingerprint(),
                 "--allow",
                 "rename",
             ]));
@@ -450,7 +450,7 @@ pub fn column_history(server: &str, pg: bool) {
             "--plan",
             plan.to_str().unwrap(),
             "--checksum",
-            &saved.checksum(),
+            &saved.wire_fingerprint(),
             "--allow",
             if rename { "rename" } else { "destructive" },
         ]));

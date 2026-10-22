@@ -732,7 +732,7 @@ mod tests {
         let restored: SavedPlan =
             serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         restored.validate_analysis().unwrap();
-        assert_eq!(restored.checksum(), plan.checksum());
+        assert_eq!(restored.wire_fingerprint(), plan.wire_fingerprint());
     }
 
     #[test]
@@ -790,7 +790,11 @@ mod tests {
             *edited.pointer_mut(pointer).unwrap() = value;
             if let Ok(parsed) = serde_json::from_value::<SavedPlan>(edited) {
                 assert!(parsed.validate_analysis().is_err(), "{pointer}");
-                assert_ne!(parsed.checksum(), plan.checksum(), "{pointer}");
+                assert_ne!(
+                    parsed.wire_fingerprint(),
+                    plan.wire_fingerprint(),
+                    "{pointer}"
+                );
             }
         }
     }
@@ -821,13 +825,13 @@ mod tests {
                 .limitations
                 .contains_key("build:server_version")
         );
-        assert_eq!(restored.checksum(), plan.checksum());
+        assert_eq!(restored.wire_fingerprint(), plan.wire_fingerprint());
 
         let mut removed = serde_json::to_value(&plan).unwrap();
         removed["analysis"]["evidence"]["qualification"]["limitations"] = json!({});
         let removed: SavedPlan = serde_json::from_value(removed).unwrap();
         removed.validate_analysis().unwrap();
-        assert_ne!(removed.checksum(), plan.checksum());
+        assert_ne!(removed.wire_fingerprint(), plan.wire_fingerprint());
     }
 
     #[test]

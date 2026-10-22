@@ -1,4 +1,5 @@
 //! Attachments consume complete shapes and can introduce standing rows.
+
 use super::*;
 use pbps_model::{Column, Module, PartitionBound, PartitionBy, PartitionOf, RiskClass, Table};
 
@@ -107,9 +108,13 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
     (cs, schema, ids, before, before_ids)
 }
 
-fn scheduled(placeholder: bool, generated: bool, pg: &dyn Dialect) -> (ChangeSet, IdsFile) {
+fn scheduled(
+    placeholder: bool,
+    generated: bool,
+    pg: &(dyn crate::certified_fixture::FixtureEmission + 'static),
+) -> (ChangeSet, IdsFile) {
     let (cs, schema, ids, before, before_ids) = fixture(placeholder, generated);
-    let scheduled = super::super::schedule::schedule(
+    let scheduled = super::super::schedule::schedule_fixture(
         pbps_diff::order::propose(cs),
         &super::super::schedule::Declarations {
             schema: &schema,
@@ -195,11 +200,11 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                 let result: anyhow::Result<()> = async {
                     let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
                     conn.execute("CREATE SCHEMA app; CREATE TABLE app.child (id integer, g integer GENERATED ALWAYS AS (id * 3) STORED, z integer); INSERT INTO app.child(id,z) VALUES (2,5)").await?;
-                    let pg: Box<dyn Dialect> = if offline { Box::new(pbps_pg::Postgres::new()) }
+                    let pg: pbps_pg::Postgres = if offline { pbps_pg::Postgres::new() }
                         else { crate::engine::planning_dialect(&mut conn).await? };
-                    let (cs, ids) = scheduled(placeholder, true, pg.as_ref());
+                    let (cs, ids) = scheduled(placeholder, true, &pg);
                     for part in &cs.changes {
-                        for sql in pg.legacy_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
+                        for sql in pg.fixture_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
                     }
                     let rows = conn.query("SELECT g FROM app.a").await?;
                     assert_eq!(rows[0].try_get::<i32>("g")?, Some(6), "installation before attachment leaves standing values alone");
@@ -216,14 +221,14 @@ async fn attached_generated_partitions_use_complete_shapes_and_preserve_recomput
                             time_zone: None, description: "attachment before expression".into(), checksum: "a".repeat(64), database_collation: None,
                         }, reordered, ids);
                         saved = serde_json::from_slice(&serde_json::to_vec(&saved)? )?;
-                        let why = crate::validate_saved_plan(&saved, pg.as_ref()).unwrap_err().to_string();
+                        let why = crate::validate_saved_plan(&saved, &pg).unwrap_err().to_string();
                         assert!(why.contains("inconsistent risks"), "{why}");
-                        let risks = pbps_diff::order::generated::risks(&saved.changes, &saved.ids, pg.as_ref());
+                        let risks = pbps_diff::order::generated::risks(&saved.changes, &saved.ids, &pg);
                         assert!(risks[install + 1].contains(&RiskClass::Narrowing));
                         for (part, risks) in saved.changes.changes.iter_mut().zip(risks) { part.risks = risks; }
-                        crate::validate_saved_plan(&saved, pg.as_ref())?;
+                        crate::validate_saved_plan(&saved, &pg)?;
                         for part in &saved.changes.changes {
-                            for sql in pg.legacy_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
+                            for sql in pg.fixture_emit(&part.change, part.strategy)? { conn.execute(&sql.sql).await?; }
                         }
                         let rows = conn.query("SELECT g FROM app.a").await?;
                         assert_eq!(rows[0].try_get::<i32>("g")?, Some(10), "SET EXPRESSION recomputes attached standing rows");

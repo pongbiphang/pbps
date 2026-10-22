@@ -74,5 +74,5 @@ pub fn checksum(changes: &ChangeSet) -> String {
         changes.clone(),
         Default::default(),
     )
-    .checksum()
+    .wire_fingerprint()
 }

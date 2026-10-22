@@ -1,5 +1,8 @@
 #![cfg(test)]
 //! Frozen 160d16f5 table split, before its S7 conversion (DEC-1959.2).
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use super::*;
 
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -7,7 +10,7 @@ pub(super) fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = generated_parts(cs, ids.first().copied().unwrap_or(&empty), deps, dialect)?;
@@ -101,7 +104,11 @@ pub(super) fn split_new_tables(
     Ok(added)
 }
 
-pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn Dialect) {
+pub(super) fn same_plan(
+    actual: &ChangeSet,
+    expected: &ChangeSet,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     assert_eq!(actual, expected);
     assert_eq!(
         serde_json::to_vec(actual).unwrap(),
@@ -112,7 +119,7 @@ pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn 
             .iter()
             .map(|p| {
                 dialect
-                    .legacy_emit(&p.change, p.strategy)
+                    .fixture_emit(&p.change, p.strategy)
                     .map(|statements| statements.into_iter().map(|s| s.sql).collect::<Vec<_>>())
                     .map_err(|e| e.to_string())
             })
@@ -134,7 +141,10 @@ pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn 
             Default::default(),
         )
     };
-    assert_eq!(saved(actual).checksum(), saved(expected).checksum());
+    assert_eq!(
+        saved(actual).wire_fingerprint(),
+        saved(expected).wire_fingerprint()
+    );
     // Only this rule's new diagnostic origins may differ. In particular the
     // generated-new-table marker must survive unchanged for its own schedule.
     for (now, old) in actual.changes.iter().zip(&expected.changes) {
@@ -157,7 +167,7 @@ pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn 
 pub(super) fn same_expansion(
     actual: &Result<expand::Expanded, String>,
     expected: &Result<expansion_oracle::Expanded, String>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) {
     match (actual, expected) {
         (Ok(now), Ok(old)) => {
@@ -400,7 +410,7 @@ fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
         .insert(SHOWN.into(), table.indexes["ix_plain"].clone());
     let ids = super::generated_tests::identities(&schema);
     let dialect = pbps_pg::Postgres::new();
-    let mut changes = pbps_diff::diff(
+    let changes = pbps_diff::diff(
         pbps_diff::Side {
             schema: &Schema::default(),
             ids: &IdsFile::default(),
@@ -413,6 +423,7 @@ fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
         &Hints::default(),
     )
     .unwrap();
+    let mut changes = pbps_diff::order::propose(changes.changes().clone());
     let mut expected = changes.changes().clone();
     let count = split_new_tables(&mut expected, &[&ids], &ModuleDeps::new(), &dialect).unwrap();
     assert_eq!(
@@ -468,7 +479,7 @@ async fn expanded_table_checks_indexes_and_defaults_execute_on_both_servers() {
             let dialect = crate::engine::planning_dialect(&mut conn).await?;
             let schema = schema();
             let ids = super::generated_tests::identities(&schema);
-            let cs = super::generated_tests::ordinary(&schema, &ids, dialect.as_ref())
+            let cs = super::generated_tests::ordinary(&schema, &ids, &dialect)
                 .map_err(anyhow::Error::msg)?;
             assert_eq!(
                 cs.changes
@@ -480,7 +491,7 @@ async fn expanded_table_checks_indexes_and_defaults_execute_on_both_servers() {
             );
             conn.execute("BEGIN").await?;
             for p in &cs.changes {
-                for statement in dialect.legacy_emit(&p.change, p.strategy)? {
+                for statement in dialect.fixture_emit(&p.change, p.strategy)? {
                     conn.execute(&statement.sql).await?;
                 }
             }

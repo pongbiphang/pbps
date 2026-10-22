@@ -78,7 +78,7 @@ fn row_security_apply_requires_approval_before_the_temporary_delivery_refusal() 
         let plan = fixture(changes);
         let path = d.dir.join("standing.json");
         std::fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
-        let checksum = plan.checksum();
+        let checksum = plan.wire_fingerprint();
         let invoke = |allow: Option<&str>| {
             let mut args = vec![
                 "apply",
@@ -149,7 +149,7 @@ fn standing_policy_plans_require_the_current_plan_version() {
             "--plan",
             path.to_str().unwrap(),
             "--checksum",
-            &plan.checksum(),
+            &plan.wire_fingerprint(),
             "--allow",
             "revoke,row-security",
         ]);

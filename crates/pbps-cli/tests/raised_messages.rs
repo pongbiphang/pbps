@@ -1,14 +1,16 @@
 //! Engine-raised prose escapes names independently of SQL identifiers (#2161).
 
-use pbps_dialect::Dialect;
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission;
+
 use pbps_model::{Change, RowKey, TableName};
 
 const HOSTILE: &str = "name\n\u{1b}[31m\\'_%名前";
 const SHOWN: &str = r"name\n\u{1b}[31m\\'_%名前";
 
-fn sql(dialect: &dyn Dialect, change: &Change) -> String {
+fn sql(dialect: &dyn FixtureEmission, change: &Change) -> String {
     dialect
-        .legacy_emit(change, Default::default())
+        .fixture_emit(change, Default::default())
         .unwrap()
         .into_iter()
         .map(|s| s.sql)
@@ -26,7 +28,7 @@ fn mssql_raised_row_messages_show_names_once_and_keep_sql_identifiers_raw() {
     row_messages(&pbps_mssql::Mssql);
 }
 
-fn row_messages(dialect: &dyn Dialect) {
+fn row_messages(dialect: &dyn FixtureEmission) {
     let pg = dialect.name() == "postgres";
     for (name, shown) in [(HOSTILE, SHOWN), ("ordinary'_%名前", "ordinary'_%名前")] {
         let table = TableName::new("app", name);
@@ -235,4 +237,12 @@ fn explain_shows_the_shared_movement_description_exactly_once() {
             "{text:?}"
         );
     }
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

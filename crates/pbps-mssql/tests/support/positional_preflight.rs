@@ -1,6 +1,6 @@
 use super::*;
 
-fn positional_dialect() -> impl pbps_dialect::Dialect {
+fn positional_dialect() -> impl crate::certified_fixture::FixtureEmission {
     Mssql
 }
 fn positional_schema() -> &'static str {

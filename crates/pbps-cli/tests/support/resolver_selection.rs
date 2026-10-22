@@ -321,7 +321,7 @@ pub fn connected(server: &str, dialect: &str) {
             "--plan",
             artifact.to_str().unwrap(),
             "--checksum",
-            &saved.checksum(),
+            &saved.wire_fingerprint(),
         ],
         None,
     ));

@@ -53,8 +53,8 @@ const TRIALS: usize = 20_000;
 /// when it runs, over what the catalog read found (`occupants`) and which
 /// names the database reads as one (`alike`); refuses the plan where no
 /// order does. A plan the walk clears in its own order is left as it is.
-pub(crate) fn order_occupied_objects_under(
-    cs: &mut PlanningPlan,
+pub(crate) fn order_occupied_objects_under<S: Clone>(
+    cs: &mut PlanningPlan<S>,
     occupants: &[pbps_mssql::catalog::NameOccupant],
     alike: &[(TableName, TableName)],
     label: &str,
@@ -136,8 +136,8 @@ pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
 /// them, so an order the differ already got right stays as it is. Renames
 /// that wait on one another, such as `a -> B` beside `b -> A` on a
 /// case-insensitive database, are refused (DEC-1366.3).
-pub(crate) fn order_column_renames(
-    cs: &mut PlanningPlan,
+pub(crate) fn order_column_renames<S: Clone>(
+    cs: &mut PlanningPlan<S>,
     alike: &[(Column, Column)],
     label: &str,
 ) -> anyhow::Result<()> {
@@ -598,7 +598,7 @@ impl<'c> Search<'c> {
 
     /// `settled`, each drop on a renamed table addressed for where it now
     /// runs: by the source name before the rename, and the new one after.
-    fn addressed(&self, settled: pbps_diff::order::Settled) -> PlanningPlan {
+    fn addressed<S>(&self, settled: pbps_diff::order::Settled<S>) -> PlanningPlan<S> {
         let mut done = BTreeSet::new();
         let mut spellings = BTreeMap::new();
         for &i in &settled.sequence {

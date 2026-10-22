@@ -259,9 +259,11 @@ async fn check(connection: String, owner: String) {
         };
         let mut final_ids = ids.clone();
         final_ids.columns.remove(&column_uid(name));
-        let result = crate::engine::check_module_dependents(
+        let result = crate::engine::check_module_dependents_fixture(
             &mut conn,
-            &drop,
+            &pbps_diff::order::propose(pbps_model::ChangeSet {
+                changes: drop.changes.clone(),
+            }),
             &Default::default(),
             &final_ids,
             &ids,
@@ -325,9 +327,11 @@ async fn check(connection: String, owner: String) {
         .map(PlannedChange::new)
         .collect(),
     };
-    let error = crate::engine::check_module_dependents(
+    let error = crate::engine::check_module_dependents_fixture(
         &mut conn,
-        &renamed_change,
+        &pbps_diff::order::propose(pbps_model::ChangeSet {
+            changes: renamed_change.changes.clone(),
+        }),
         &Default::default(),
         &renamed_ids,
         &ids,
@@ -399,9 +403,11 @@ async fn policy_sequence_bindings(conn: &mut Conn) {
                 column,
             })],
         };
-        let error = crate::engine::check_module_dependents(
+        let error = crate::engine::check_module_dependents_fixture(
             conn,
-            &changes,
+            &pbps_diff::order::propose(pbps_model::ChangeSet {
+                changes: changes.changes.clone(),
+            }),
             &Default::default(),
             &final_ids,
             &ids,
@@ -572,14 +578,22 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
             }),
         ],
     };
-    let wrong = crate::engine::check_module_dependents(conn, &changes, &before, &final_ids, &ids)
-        .await
-        .unwrap_err();
-    assert!(wrong.to_string().contains("cross_table"));
-    let mut changes = pbps_diff::order::propose(changes);
-    crate::engine::account_for_module_dependents(
+    let wrong = crate::engine::check_module_dependents_fixture(
         conn,
-        &mut changes,
+        &pbps_diff::order::propose(pbps_model::ChangeSet {
+            changes: changes.changes.clone(),
+        }),
+        &before,
+        &final_ids,
+        &ids,
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong.to_string().contains("cross_table"));
+    let changes = pbps_diff::order::propose(changes);
+    let (changes, _) = crate::engine::account_for_module_dependents(
+        conn,
+        changes,
         &after,
         crate::dependents::Sources {
             before: pbps_diff::Side {
@@ -604,9 +618,17 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
         &changes.changes[2].change,
         Change::DropModule { .. }
     ));
-    crate::engine::check_module_dependents(conn, &changes, &before, &final_ids, &ids)
-        .await
-        .unwrap();
+    crate::engine::check_module_dependents_fixture(
+        conn,
+        &pbps_diff::order::propose(pbps_model::ChangeSet {
+            changes: changes.changes.clone(),
+        }),
+        &before,
+        &final_ids,
+        &ids,
+    )
+    .await
+    .unwrap();
     for step in &changes.changes {
         for statement in pbps_pg::Postgres::new()
             .emit(
@@ -733,20 +755,28 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
             after.modules = before.modules.clone();
         }
         let final_ids = IdsFile::default();
-        let wrong = crate::engine::check_module_dependents(conn, &plan, &before, &final_ids, &ids)
-            .await
-            .unwrap_err();
+        let wrong = crate::engine::check_module_dependents_fixture(
+            conn,
+            &pbps_diff::order::propose(pbps_model::ChangeSet {
+                changes: plan.changes.clone(),
+            }),
+            &before,
+            &final_ids,
+            &ids,
+        )
+        .await
+        .unwrap_err();
         assert!(
             wrong
                 .to_string()
                 .contains(if routine { "calls_gate" } else { "reads_a" }),
             "{wrong}"
         );
-        let mut plan = pbps_diff::order::propose(plan);
+        let plan = pbps_diff::order::propose(plan);
         let result: anyhow::Result<()> = async {
-            crate::engine::account_for_module_dependents(
+            let (plan, _) = crate::engine::account_for_module_dependents(
                 conn,
-                &mut plan,
+                plan,
                 &after,
                 crate::dependents::Sources {
                     before: pbps_diff::Side {
@@ -761,7 +791,16 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                 &|_| panic!("no retained module needs a rediff"),
             )
             .await?;
-            crate::engine::check_module_dependents(conn, &plan, &before, &final_ids, &ids).await?;
+            crate::engine::check_module_dependents_fixture(
+                conn,
+                &pbps_diff::order::propose(pbps_model::ChangeSet {
+                    changes: plan.changes.clone(),
+                }),
+                &before,
+                &final_ids,
+                &ids,
+            )
+            .await?;
             crate::engine::check_drop_blockers(conn, &plan, &final_ids, &before, &ids).await?;
             let order: Vec<_> = plan
                 .changes

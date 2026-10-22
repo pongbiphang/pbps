@@ -88,8 +88,9 @@ pub struct OperationId {
 }
 
 impl OperationId {
-    /// The number of the logical change: its position in the logical plan,
-    /// or, for a rebinding, a number after every change of it.
+    /// The allocated source number. Initial logical changes use their positions;
+    /// rebindings and later planning additions take unused numbers. Origin
+    /// retains the logical reference when additions follow existing rebindings.
     pub fn source(self) -> u32 {
         self.source
     }
@@ -942,6 +943,47 @@ impl Operations {
             let mut operation = old.clone();
             operation.step = step.clone();
             operation
+        }))
+    }
+
+    /// Allocate identities for later observations beside an existing plan.
+    /// Existing source/part numbers remain reserved, including rebindings
+    /// before a later scope tail adds logical changes (DEC-1959.5).
+    pub fn additional(
+        &self,
+        steps: impl IntoIterator<Item = (Origin, PlannedChange)>,
+        modules: ModuleEdits,
+    ) -> Self {
+        let mut sources: BTreeMap<Source, (u32, u32)> = BTreeMap::new();
+        let mut next = 0;
+        for operation in &self.operations {
+            next = next.max(operation.id.source + 1);
+            let source = sources
+                .entry(operation.source())
+                .or_insert((operation.id.source, 0));
+            source.1 = source.1.max(operation.id.part + 1);
+        }
+        let modules = self
+            .operations
+            .first()
+            .map_or(modules, |operation| operation.modules);
+        Self::from_operations(steps.into_iter().map(|(origin, step)| {
+            let source = sources.entry(origin.source()).or_insert_with(|| {
+                let source = next;
+                next += 1;
+                (source, 0)
+            });
+            let id = OperationId {
+                source: source.0,
+                part: source.1,
+            };
+            source.1 += 1;
+            Operation {
+                id,
+                origin,
+                step,
+                modules,
+            }
         }))
     }
 

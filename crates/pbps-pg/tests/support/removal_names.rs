@@ -115,7 +115,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
                 .await
                 .unwrap();
             for p in &cs.changes[..cs.changes.len() - 1] {
-                for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
+                for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                     db.conn.execute(&statement.sql).await.unwrap();
                 }
             }
@@ -132,7 +132,7 @@ async fn a_removal_keeps_its_stored_table_when_names_change_hands() {
                     .await
                     .unwrap();
                 for p in &cs.changes {
-                    for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
+                    for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                         db.conn.execute(&statement.sql).await.unwrap();
                     }
                 }

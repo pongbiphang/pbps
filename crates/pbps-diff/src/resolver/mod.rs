@@ -79,8 +79,8 @@ pub fn removal_spelling(
 
 /// Output for the evidence seal. The final emitter receives `changes` exactly
 /// as ordered here; it has no reason to choose another order.
-pub struct Ordered {
-    pub changes: crate::order::PlanningPlan,
+pub struct Ordered<S = crate::order::Draft> {
+    pub changes: crate::order::PlanningPlan<S>,
     /// Proof observation retained for existing evidence consumers;
     /// the immutable plan holds its own matching proof inside order.
     pub proof: pbps_model::resolver::OrderingProof,
@@ -95,7 +95,7 @@ pub fn ordinary(
     desired: crate::Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     hints: &pbps_model::Hints,
-) -> Result<crate::order::PlanningPlan, Vec<crate::DiffError>> {
+) -> Result<crate::order::DiffPlan, Vec<crate::DiffError>> {
     crate::schema_diff::rebuilding_by(
         base,
         desired,
@@ -115,38 +115,38 @@ pub fn ordinary(
 /// A module ADR-0013's candidate test would rebuild is rebuilt here only
 /// when the evidence says its binding changes or one of its managed inputs
 /// is replaced (DEC-1515.1).
-pub fn plan(
+pub fn plan<D: Dialect + ?Sized>(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
-    dialect: &(impl Dialect + ?Sized),
-) -> Result<Ordered, Error> {
+    dialect: &D,
+) -> Result<Ordered<crate::order::Canonical<D>>, Error> {
     plan_operations(base, desired, hints, resolution, dialect).map(|planned| planned.ordered)
 }
 
 /// [`plan`], with the operations its steps are (#1961) and the logical plan
 /// they came from.
-pub struct Planned {
-    pub ordered: Ordered,
+pub struct Planned<D: ?Sized> {
+    pub ordered: Ordered<crate::order::Canonical<D>>,
     /// One per step of `ordered`, in its order.
     pub operations: Operations,
     /// The ordinary plan the resolver started from: what an operation's
     /// [`pbps_model::operation::Source::Change`] counts positions in, and the
     /// order a step's names are in force in.
-    pub logical: crate::order::PlanningPlan,
+    pub logical: crate::order::DiffPlan,
 }
 
 /// [`plan`] and the operations it orders. [`plan`] is this, so the order and
 /// the changes are the same: the operations are built beside them from where
 /// each step came from, and are never part of the sealed plan.
-pub fn plan_operations(
+pub fn plan_operations<D: Dialect + ?Sized>(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
-    dialect: &(impl Dialect + ?Sized),
-) -> Result<Planned, Error> {
+    dialect: &D,
+) -> Result<Planned<D>, Error> {
     let (logical, prepared) = prepare(base, desired, hints, resolution, dialect)?;
     let module_edits = if dialect.rebuilds_modules() {
         ModuleEdits::Rebuilt
@@ -329,7 +329,7 @@ fn prepare(
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
     dialect: &(impl Dialect + ?Sized),
-) -> Result<(crate::order::PlanningPlan, prepare::Prepared), Error> {
+) -> Result<(crate::order::DiffPlan, prepare::Prepared), Error> {
     prepare::coverage(base, desired, resolution)?;
     let ordinary = ordinary(base, desired, dialect, hints)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;

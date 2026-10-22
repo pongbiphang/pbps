@@ -4,10 +4,10 @@ use pbps_dialect::Dialect;
 use pbps_model::{Change, Finding, IdsFile, PlannedChange, RoleName, TableName};
 use std::collections::BTreeMap;
 
-pub fn scatter(
-    mut changes: super::PlanningPlan,
+pub fn scatter<S>(
+    mut changes: super::PlanningPlan<S>,
     placed: Vec<(Vec<usize>, Vec<usize>)>,
-) -> super::PlanningPlan {
+) -> super::PlanningPlan<S> {
     let mut taken: Vec<Option<PlannedChange>> = std::mem::take(&mut changes.payload.changes)
         .into_iter()
         .map(Some)
@@ -17,6 +17,9 @@ pub fn scatter(
         for (slot, from) in slots.into_iter().zip(order) {
             at[slot] = from;
         }
+    }
+    if let Some(identities) = &changes.identities {
+        changes.identities = Some(super::reordered_operations(identities, &at));
     }
     let origins = changes.origins.clone();
     changes.origins = at.iter().map(|&i| origins[i].clone()).collect();
@@ -28,10 +31,10 @@ pub fn scatter(
     changes
 }
 
-pub fn addressed(
-    mut settled: super::Settled,
+pub fn addressed<S>(
+    mut settled: super::Settled<S>,
     spellings: &BTreeMap<usize, TableName>,
-) -> super::PlanningPlan {
+) -> super::PlanningPlan<S> {
     for (part, from) in settled
         .changes
         .payload
@@ -92,7 +95,7 @@ pub fn creation_risks(
     changes.refresh();
 }
 
-pub fn findings(changes: &mut super::PlanningPlan, findings: &[(usize, Finding)]) {
+pub fn findings<S>(changes: &mut super::PlanningPlan<S>, findings: &[(usize, Finding)]) {
     for (at, finding) in findings {
         if let Some(part) = changes.payload.changes.get_mut(*at) {
             part.findings.push(finding.clone());
@@ -111,7 +114,9 @@ impl PlanningInput {
     pub fn new(changes: Vec<PlannedChange>) -> Self {
         Self { changes }
     }
-    pub fn append_to(&self, mut draft: super::PlanningPlan) -> super::PlanningPlan {
+    pub fn append_to<S>(&self, draft: super::PlanningPlan<S>) -> super::PlanningPlan {
+        let mut draft =
+            super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof);
         for part in &self.changes {
             draft
                 .origins
@@ -124,5 +129,38 @@ impl PlanningInput {
     }
 }
 
-/// The connected scope input is the same non-executable logical builder.
-pub type ScopeInput = PlanningInput;
+/// Only the existing zero-SQL scope transitions may retain producer provenance.
+/// Arbitrary logical additions restart an unqualified draft through PlanningInput.
+/// Scope additions still need the shared stages; they cannot directly finalize.
+/// ```compile_fail
+/// fn skip_stages(plan: pbps_diff::order::CanonicalPlan<pbps_dialect::MinimalDialect>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let pending = scope.append_to(plan, &pbps_dialect::MinimalDialect);
+///     let _ = pending.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScopeInput {
+    changes: Vec<PlannedChange>,
+}
+impl ScopeInput {
+    pub fn new(changes: Vec<PlannedChange>) -> Option<Self> {
+        changes
+            .iter()
+            .all(|p| {
+                matches!(
+                    p.change,
+                    Change::SetDataMode { .. } | Change::SetEnsureKeys { .. }
+                )
+            })
+            .then_some(Self { changes })
+    }
+    pub fn append_to<S: super::RouteState<D>, D: Dialect + ?Sized>(
+        &self,
+        plan: super::PlanningPlan<S>,
+        _dialect: &D,
+    ) -> super::PlanningPlan<S::Input> {
+        let input = PlanningInput::new(self.changes.clone()).append_to(plan);
+        super::plan::state(input)
+    }
+}

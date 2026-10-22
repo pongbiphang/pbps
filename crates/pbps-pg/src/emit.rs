@@ -5630,7 +5630,7 @@ mod tests {
         };
         let detach = |table: &str, names: Vec<DetachedName>| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::DetachPartition {
                         uid: "t_aaaaaa".parse().unwrap(),
                         table: table.parse().unwrap(),
@@ -5744,7 +5744,7 @@ mod tests {
     fn a_partition_is_detached_and_dropped_in_one_statement() {
         let drop = |detach_from: Option<&str>| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::DropTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
@@ -5781,7 +5781,7 @@ mod tests {
     #[test]
     fn a_table_is_attached_in_one_unscoped_statement() {
         let sql: Vec<String> = Postgres::new()
-            .legacy_emit(
+            .fixture_emit(
                 &Change::AttachPartition {
                     uid: "t_aaaaaa".parse().unwrap(),
                     table: "app.t".parse().unwrap(),
@@ -5829,7 +5829,7 @@ mod tests {
         };
         let staged = |change: &Change| -> Vec<pbps_dialect::Statement> {
             Postgres::new()
-                .legacy_emit_staged(change, Default::default())
+                .fixture_emit_staged(change, Default::default())
                 .expect("emit")
         };
         let v = |s: &str| D::Value(s.into());
@@ -5922,7 +5922,7 @@ mod tests {
         single(
             &range,
             Postgres::new()
-                .legacy_emit(&range, Default::default())
+                .fixture_emit(&range, Default::default())
                 .unwrap(),
         );
         for change in [
@@ -5974,7 +5974,7 @@ mod tests {
         };
         let emitted = |moves_at_most: Option<u64>| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
@@ -6057,7 +6057,7 @@ mod tests {
         );
         let emitted = |beside_default: Option<&str>| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: "app.ev_2025".parse().unwrap(),
@@ -6156,7 +6156,7 @@ mod tests {
         use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
         let create = |name: &str, table: &pbps_model::Table| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: name.parse().unwrap(),
@@ -6245,7 +6245,7 @@ mod tests {
         });
         let create = |name: &str, table: &pbps_model::Table| {
             Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::CreateTable {
                         uid: "t_aaaaaa".parse().unwrap(),
                         name: name.parse().unwrap(),
@@ -6511,7 +6511,7 @@ mod tests {
         );
 
         let added = Postgres::new()
-            .legacy_emit(
+            .fixture_emit(
                 &Change::AddColumn {
                     uid: Uid::generate(UidKind::Column),
                     table: name("app", "t"),
@@ -6664,7 +6664,7 @@ mod tests {
     }
 
     fn sql_of(pg: &Postgres, change: &Change) -> Vec<String> {
-        pg.legacy_emit(change, Strategy::default())
+        pg.fixture_emit(change, Strategy::default())
             .expect("emit")
             .into_iter()
             .map(|s| s.sql)
@@ -6809,7 +6809,7 @@ mod tests {
             ("int[]", "int", "USING"),
         ] {
             let e = pg
-                .legacy_emit(&change(from, to), Strategy::default())
+                .fixture_emit(&change(from, to), Strategy::default())
                 .expect_err("refused")
                 .to_string();
             assert!(e.contains(says), "{from} -> {to}: {e}");
@@ -6856,7 +6856,7 @@ mod tests {
             },
         ] {
             let e = pg
-                .legacy_emit(&change, Strategy::default())
+                .fixture_emit(&change, Strategy::default())
                 .expect_err("a SQL Server collation");
             assert!(e.to_string().contains("SQL Server only"), "{e}");
         }
@@ -6905,7 +6905,7 @@ mod tests {
         );
         index.storage_parameters = [("fastupdate".to_owned(), "true".to_owned())].into();
         assert!(
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::AddIndex {
                     table: table.clone(),
                     name: "ix".into(),
@@ -7023,7 +7023,7 @@ mod tests {
         );
         assert_eq!(sql_of(&pg, &change(&[], &["fillfactor"])).len(), 1);
         let e = pg
-            .legacy_emit(
+            .fixture_emit(
                 &change(&[("fillfactor = 1); DROP TABLE x; --", "1")], &[]),
                 Strategy::default(),
             )
@@ -7275,7 +7275,7 @@ mod tests {
             ),
         ] {
             let e = pg
-                .legacy_emit(&layout, Strategy::default())
+                .fixture_emit(&layout, Strategy::default())
                 .expect_err("a SQL Server layout");
             assert!(e.to_string().contains("SQL Server"), "{e}");
             assert!(!sql_of(&pg, &plain).is_empty(), "{plain:?}");
@@ -7345,7 +7345,7 @@ mod tests {
                         permissions,
                     }
                 };
-                let emitted = pg.legacy_emit(&change, Strategy::default()).unwrap();
+                let emitted = pg.fixture_emit(&change, Strategy::default()).unwrap();
                 assert_eq!(
                     emitted.len(),
                     if mixed { if revoke { 3 } else { 2 } } else { 1 }
@@ -7388,7 +7388,7 @@ mod tests {
             }
         }
         assert!(
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Schema("app".into()),
@@ -7399,7 +7399,7 @@ mod tests {
             .is_err()
         );
         let ordinary = pg
-            .legacy_emit(
+            .fixture_emit(
                 &Change::Grant {
                     role: "writer".into(),
                     target: GrantTarget::Schema("app".into()),
@@ -7619,7 +7619,7 @@ mod tests {
         ];
         for (change, statement) in cases {
             let refusal = pg
-                .legacy_emit(&change, Strategy::default())
+                .fixture_emit(&change, Strategy::default())
                 .expect_err("the principal is not this tool's")
                 .to_string();
             assert!(refusal.contains(statement), "{refusal}");
@@ -7635,7 +7635,7 @@ mod tests {
         let pg = Postgres::new();
         for permission in [Permission::Alter, Permission::ViewDefinition] {
             let refusal = pg
-                .legacy_emit(
+                .fixture_emit(
                     &Change::Grant {
                         role: "app_reader".to_owned().into(),
                         target: target("app.customer"),
@@ -7655,7 +7655,7 @@ mod tests {
     #[test]
     fn a_grant_with_no_permission_is_refused_rather_than_rendered_empty() {
         let refusal = Postgres::new()
-            .legacy_emit(
+            .fixture_emit(
                 &Change::Grant {
                     role: "app_reader".to_owned().into(),
                     target: target("app.customer"),
@@ -8487,7 +8487,7 @@ mod tests {
             "{}",
             found[0]
         );
-        let refused = Postgres::new().legacy_emit(
+        let refused = Postgres::new().fixture_emit(
             &Change::CreateModule {
                 id: id("app.v"),
                 module: Box::new(empty),
@@ -8580,7 +8580,7 @@ mod tests {
     #[test]
     fn the_one_schema_a_path_cannot_name_is_refused_from_either_end() {
         let drop_it = |pg: &Postgres, schema: &str| {
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
@@ -8619,7 +8619,7 @@ mod tests {
     #[test]
     fn the_one_schema_a_path_must_leave_out_is_refused_wherever_it_is_written() {
         let drop_it = |pg: &Postgres, schema: &str| {
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name(schema, "t"),
@@ -8665,7 +8665,7 @@ mod tests {
     fn an_extra_that_cannot_be_an_identifier_refuses_the_statement() {
         let pg = Postgres::with_write_path_extras(vec![String::new()]);
         let refusal = pg
-            .legacy_emit(
+            .fixture_emit(
                 &Change::DropTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "t"),
@@ -8713,7 +8713,7 @@ mod tests {
             ("character varying(10)", "integer", "USING"),
         ] {
             let refusal = pg
-                .legacy_emit(&retype(from, to), Strategy::default())
+                .fixture_emit(&retype(from, to), Strategy::default())
                 .expect_err("neither conversion is pbps's to choose");
             let DialectError::Invalid { message, .. } = &refusal else {
                 panic!("`{from}` -> `{to}`: {refusal}");
@@ -9134,7 +9134,7 @@ mod tests {
         for change in [deprecated, mode] {
             assert!(
                 Postgres::new()
-                    .legacy_emit(&change, Strategy::default())
+                    .fixture_emit(&change, Strategy::default())
                     .expect("emit")
                     .is_empty()
             );
@@ -9399,7 +9399,7 @@ mod tests {
             "{offline}"
         );
         let online = Postgres::new()
-            .legacy_emit(&change, Strategy { online: true })
+            .fixture_emit(&change, Strategy { online: true })
             .expect("emit")
             .remove(0);
         assert_eq!(
@@ -9521,7 +9521,7 @@ mod tests {
     #[test]
     fn a_table_with_no_columns_is_refused_by_name() {
         let refusal = Postgres::new()
-            .legacy_emit(
+            .fixture_emit(
                 &Change::CreateTable {
                     uid: Uid::generate(UidKind::Table),
                     name: name("app", "empty"),
@@ -9673,7 +9673,7 @@ mod tests {
             types: BTreeMap::new(),
         };
         let e = Postgres::new()
-            .legacy_emit(&change, Strategy::default())
+            .fixture_emit(&change, Strategy::default())
             .expect_err("an identity key is refused on this engine");
         assert!(e.to_string().contains("OVERRIDING SYSTEM VALUE"), "{e}");
         assert!(e.to_string().contains("pbps baseline"), "{e}");
@@ -9813,7 +9813,7 @@ mod tests {
                     permissions,
                 }
             };
-            let statements = pg.legacy_emit(&change, Strategy::default()).unwrap();
+            let statements = pg.fixture_emit(&change, Strategy::default()).unwrap();
             assert_eq!(statements.len(), if revoke { 3 } else { 1 });
             for stmt in statements {
                 let sql = stmt.sql;
@@ -9835,12 +9835,12 @@ mod tests {
                 permissions: [permission].into(),
             };
             assert_eq!(
-                pg.legacy_emit(&change, Strategy::default()).is_ok(),
+                pg.fixture_emit(&change, Strategy::default()).is_ok(),
                 [Permission::Usage, Permission::Select, Permission::Update].contains(&permission)
             );
         }
         assert!(
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::Grant {
                     role: "reader".into(),
                     target: "sequence::app.t.id".parse().unwrap(),

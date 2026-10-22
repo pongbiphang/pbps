@@ -1,4 +1,5 @@
 //! The binding-release stage must leave a separate computed rebuild for later.
+
 use super::*;
 use pbps_diff::{
     Side,
@@ -11,7 +12,7 @@ use pbps_model::{Change, ChangeSet, ModuleId, PlannedChange};
 mod plan;
 
 async fn execute(conn: &mut Conn, change: &Change) {
-    for statement in Mssql.legacy_emit(change, Default::default()).unwrap() {
+    for statement in Mssql.fixture_emit(change, Default::default()).unwrap() {
         conn.execute(&statement.sql).await.unwrap();
     }
 }
@@ -38,7 +39,7 @@ async fn binding_release_and_an_independent_computed_rebuild_both_apply() {
         .unwrap();
     let z = ModuleId::Named(TableName::new("app", "z"));
     let sql = Mssql
-        .legacy_emit(
+        .fixture_emit(
             &Change::AlterModule {
                 id: z.clone(),
                 module: Box::new(after.modules[&z].clone()),

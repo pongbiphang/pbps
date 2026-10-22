@@ -6,7 +6,7 @@ pub(super) fn weave(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     crate::test_planning(cs, |plan| {
         super::weave(plan, found, declared, sources, dialect)
@@ -16,14 +16,14 @@ pub(super) fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     crate::test_planning(cs, |plan| super::split_new_tables(plan, ids, deps, dialect))
 }
 pub(super) fn before_its_partitions_indexes(
     cs: &mut ChangeSet,
     declared: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     crate::test_planning(cs, |plan| {
         super::before_its_partitions_indexes(plan, declared, dialect)
@@ -39,7 +39,7 @@ pub(super) fn after_their_parents_defaults(
     cs: &mut ChangeSet,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     crate::test_planning(cs, |plan| {
         super::after_their_parents_defaults(plan, declared, ids, dialect)
@@ -51,13 +51,17 @@ pub(super) fn after_the_rebuilds(
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
     schedule: Schedule,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     crate::test_planning(cs, |plan| {
         super::after_the_rebuilds(plan, released, deps, declared, schedule, dialect)
     })
 }
-pub(super) fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Dialect) {
+pub(super) fn split_moving_defaults(
+    cs: &mut ChangeSet,
+    declared: &Schema,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     crate::test_planning(cs, |plan| {
         super::split_moving_defaults(plan, declared, dialect)
     })

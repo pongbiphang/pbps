@@ -147,14 +147,14 @@ fn a_binding_edge_is_respected_where_the_effects_allow_the_other_order() {
         Surface::Module(view.clone()),
         BTreeSet::from([Surface::Table(table.clone())]),
     )];
-    let steps = |ordered: &Ordered| {
+    fn steps(ordered: &Ordered<impl Sized>) -> Vec<String> {
         ordered
             .changes
             .changes
             .iter()
             .map(|p| p.change.subject())
             .collect::<Vec<_>>()
-    };
+    }
     let ordered = plan(
         base_side,
         desired_side,
@@ -1321,7 +1321,10 @@ mod generated_surface_coverage {
     }
 
     impl Fixture {
-        fn plan(&self, resolution: &[SurfaceResolution]) -> Result<Ordered, Error> {
+        fn plan(
+            &self,
+            resolution: &[SurfaceResolution],
+        ) -> Result<Ordered<crate::order::Canonical<pbps_dialect::MinimalDialect>>, Error> {
             super::plan(
                 crate::Side {
                     schema: &self.base,
@@ -1590,7 +1593,11 @@ mod generated_surface_coverage {
         }
     }
 
-    fn sided(base: &Schema, desired: &Schema, observations: &[SurfaceResolution]) -> Ordered {
+    fn sided(
+        base: &Schema,
+        desired: &Schema,
+        observations: &[SurfaceResolution],
+    ) -> Ordered<crate::order::Canonical<pbps_dialect::MinimalDialect>> {
         let before_ids = ids(base, &IdsFile::default());
         let after_ids = ids(desired, &before_ids);
         super::plan(
@@ -1670,7 +1677,7 @@ mod generated_surface_coverage {
         ordered.proof.validate(&ordered.changes).unwrap();
     }
 
-    fn at(ordered: &Ordered, f: &dyn Fn(&Change) -> bool) -> usize {
+    fn at(ordered: &Ordered<impl Sized>, f: &dyn Fn(&Change) -> bool) -> usize {
         ordered
             .changes
             .changes
@@ -2221,7 +2228,7 @@ mod generated_surface_coverage {
             )
             .unwrap()
         };
-        let rewritten = |ordered: &Ordered| -> Vec<pbps_model::ColumnRef> {
+        let rewritten = |ordered: &Ordered<_>| -> Vec<pbps_model::ColumnRef> {
             ordered
                 .changes
                 .changes
@@ -2914,14 +2921,14 @@ mod generated_surface_coverage {
             )
             .unwrap()
         };
-        let removal = |ordered: &Ordered| {
+        let removal = |ordered: &Ordered<_>| {
             ordered
                 .changes
                 .changes
                 .iter()
                 .position(|p| matches!(p.change, Change::AlterColumnDefault { to: None, .. }))
         };
-        let renames = |ordered: &Ordered| -> Vec<usize> {
+        let renames = |ordered: &Ordered<_>| -> Vec<usize> {
             ordered
                 .changes
                 .changes
@@ -3012,7 +3019,7 @@ mod generated_surface_coverage {
             )
             .unwrap_or_else(|error| panic!("{label}: {error:?}"))
         };
-        let position = |ordered: &Ordered, f: &dyn Fn(&Change) -> bool| {
+        let position = |ordered: &Ordered<_>, f: &dyn Fn(&Change) -> bool| {
             ordered
                 .changes
                 .changes
@@ -3550,7 +3557,8 @@ mod generated_surface_coverage {
         desired: &Schema,
         after_ids: &IdsFile,
         observations: &[SurfaceResolution],
-    ) -> Result<Ordered, super::super::Error> {
+    ) -> Result<Ordered<crate::order::Canonical<pbps_dialect::MinimalDialect>>, super::super::Error>
+    {
         super::plan(
             crate::Side {
                 schema: base,
@@ -3884,7 +3892,7 @@ mod generated_surface_coverage {
     /// The plan's names resolve at every step, as the CLI checks before it
     /// renders a plan: a change addressed by a UID the plan has not made, or
     /// one sharing an address with another UID, is refused there.
-    fn names_resolve(ordered: &Ordered, after: &IdsFile) {
+    fn names_resolve(ordered: &Ordered<impl Sized>, after: &IdsFile) {
         if let Err(error) = pbps_model::plan_names::PlanNames::of(&ordered.changes.changes, after) {
             panic!("{error:?}: {:?}", ordered.changes.changes);
         }
@@ -3899,7 +3907,7 @@ mod generated_surface_coverage {
     fn a_replaced_default_owner_gets_no_rebuild_pair() {
         let p: pbps_model::TableName = "app.p".parse().unwrap();
         let t: pbps_model::TableName = "app.t".parse().unwrap();
-        let added = |ordered: &Ordered| {
+        let added = |ordered: &Ordered<_>| {
             ordered
                 .changes
                 .changes
@@ -4366,12 +4374,12 @@ impl pbps_dialect::Dialect for Candidates {
     fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
         pbps_dialect::MinimalDialect.quote_ident(ident)
     }
-    fn legacy_emit(
+    fn intermediate_tables(
         &self,
         change: &Change,
         strategy: pbps_model::Strategy,
-    ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
-        pbps_dialect::MinimalDialect.legacy_emit(change, strategy)
+    ) -> Result<Vec<pbps_model::TableName>, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.intermediate_tables(change, strategy)
     }
     fn normalize_type(
         &self,
@@ -4774,12 +4782,12 @@ mod operations {
             .collect()
     }
 
-    fn planned(
+    fn planned<D: pbps_dialect::Dialect + ?Sized>(
         base: &Schema,
         desired: &Schema,
         observations: &[SurfaceResolution],
-        dialect: &(impl pbps_dialect::Dialect + ?Sized),
-    ) -> (Planned, IdsFile, IdsFile) {
+        dialect: &D,
+    ) -> (Planned<D>, IdsFile, IdsFile) {
         let old_ids = ids(base, &IdsFile::default());
         let new_ids = ids(desired, &old_ids);
         let planned = plan_operations(
@@ -4799,7 +4807,11 @@ mod operations {
         (planned, old_ids, new_ids)
     }
 
-    fn owners<'p>(planned: &'p Planned, old: &'p IdsFile, new: &'p IdsFile) -> PlanOwners<'p> {
+    fn owners<'p, D: ?Sized>(
+        planned: &'p Planned<D>,
+        old: &'p IdsFile,
+        new: &'p IdsFile,
+    ) -> PlanOwners<'p> {
         PlanOwners::new(
             PlanNames::of(&planned.logical.changes, new).unwrap(),
             old,
@@ -4807,7 +4819,10 @@ mod operations {
         )
     }
 
-    fn find<'o>(planned: &'o Planned, f: &dyn Fn(&Change) -> bool) -> (usize, &'o Operation) {
+    fn find<'o, D: ?Sized>(
+        planned: &'o Planned<D>,
+        f: &dyn Fn(&Change) -> bool,
+    ) -> (usize, &'o Operation) {
         planned
             .operations
             .iter()
@@ -4929,7 +4944,7 @@ mod operations {
             || plan_operations(base, desired, &Hints::default(), &observations, dialect).unwrap();
         let first = run();
         let second = run();
-        let ids = |p: &Planned| {
+        let ids = |p: &Planned<pbps_dialect::MinimalDialect>| {
             p.operations
                 .iter()
                 .map(|op| op.id().to_string())
@@ -4940,6 +4955,46 @@ mod operations {
         let ordered = plan(base, desired, &Hints::default(), &observations, dialect).unwrap();
         assert_eq!(first.ordered.changes, ordered.changes);
         assert_eq!(first.ordered.proof, ordered.proof);
+        let certified = ordered.changes.clone().ordered(
+            pbps_model::PlanMode::Transactional,
+            &pbps_dialect::MinimalDialect,
+        );
+        let certified_operations = pbps_dialect::PlanPayload::operations(&certified);
+        assert_eq!(certified_operations.as_slice(), first.operations.as_slice());
+        // A later existing order stage keeps the expansion IDs, rather than
+        // numbering the same operations again from their new positions.
+        let mut later = crate::order::Schedule::new(5);
+        later.edge(
+            4,
+            0,
+            crate::order::Source::Search,
+            pbps_model::resolver::OrderReason::Identity,
+        );
+        let continued = later
+            .settle(ordered.changes.clone())
+            .unwrap()
+            .into_planning()
+            .ordered(
+                pbps_model::PlanMode::Transactional,
+                &pbps_dialect::MinimalDialect,
+            );
+        let continued_operations = pbps_dialect::PlanPayload::operations(&continued);
+        assert_eq!(
+            continued_operations.as_slice()[3].id(),
+            first.operations.as_slice()[4].id()
+        );
+        assert_eq!(
+            continued_operations.as_slice()[4].id(),
+            first.operations.as_slice()[0].id()
+        );
+        assert_eq!(
+            continued_operations
+                .iter()
+                .map(|op| op.planned())
+                .collect::<Vec<_>>(),
+            continued.changes().changes.iter().collect::<Vec<_>>()
+        );
+
         // One operation per sealed step, carrying that step's change.
         let steps: Vec<&PlannedChange> = first.operations.iter().map(|op| op.planned()).collect();
         let sealed: Vec<&PlannedChange> = ordered.changes.changes.iter().collect();

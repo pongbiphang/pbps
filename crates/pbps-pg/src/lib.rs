@@ -635,14 +635,12 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 /// The middle line is the one that decides the shape. A path of the object's
 /// own schema alone is not enough — an extension installed in `public` is the
 /// ordinary case — so the extras have to come from somewhere, and the only
-/// honest somewhere is the project. They are held here rather than passed to
-/// [`Dialect::legacy_emit`] because the trait takes a change and a strategy, and a
-/// strategy says how to get there and never where (ADR-0003).
+/// honest somewhere is the project. The selected dialect retains these extras
+/// throughout certified emission; a strategy chooses how, and never the write
+/// namespace (ADR-0003).
 ///
-/// Empty is the value every caller has today: `pbps.yml` has no key for this
-/// yet, because the CLI cannot select this dialect at all (`main.rs`'s
-/// `dialect()` refuses it) and a configuration key nothing reads is worse than
-/// none. The key arrives with the step that can read it.
+/// Ordinary CLI selection has no extras. Resolver reconstruction supplies the
+/// qualified write-path extras from its captured inputs (ADR-0013 section 3).
 /// Raw changes, immutable intermediates and caller-defined views are not
 /// the real PostgreSQL emitter's associated input (DEC-1959.5).
 ///
@@ -669,6 +667,17 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 /// fn another_emitter(plan: &pbps_dialect::lower::LoweredPlan<pbps_dialect::MinimalDialect>,
 ///                    pg: &pbps_pg::Postgres) {
 ///     pbps_dialect::render_script(plan, pg, &pbps_model::SessionZone::utc());
+/// }
+/// ```
+/// A prepared bootstrap script retains the lowered engine in both directions.
+/// ```compile_fail
+/// fn pg(script: &pbps_dialect::BootstrapScript<pbps_pg::Postgres>) {
+///     script.render(&pbps_mssql::Mssql, &pbps_model::SessionZone::utc());
+/// }
+/// ```
+/// ```compile_fail
+/// fn ms(script: &pbps_dialect::BootstrapScript<pbps_mssql::Mssql>) {
+///     script.render(&pbps_pg::Postgres::new(), &pbps_model::SessionZone::utc());
 /// }
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -838,7 +847,7 @@ fn default_problems(
 ///
 /// ```compile_fail
 /// fn pg_admission_cannot_reach_mssql(wire: pbps_model::SavedPlan) {
-///     let checksum = wire.checksum();
+///     let checksum = wire.wire_fingerprint();
 ///     let plan = pbps_diff::order::admit(wire, &pbps_pg::Postgres::new(),
 ///         std::path::Path::new("plan.json"), &checksum).unwrap();
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_mssql::Mssql>(&plan, &pbps_mssql::Mssql);
@@ -847,7 +856,7 @@ fn default_problems(
 ///
 /// ```compile_fail
 /// fn mssql_admission_cannot_reach_pg(wire: pbps_model::SavedPlan) {
-///     let checksum = wire.checksum();
+///     let checksum = wire.wire_fingerprint();
 ///     let plan = pbps_diff::order::admit(wire, &pbps_mssql::Mssql,
 ///         std::path::Path::new("plan.json"), &checksum).unwrap();
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(&plan, &pbps_pg::Postgres::new());
@@ -879,7 +888,135 @@ fn default_problems(
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(plan, &pbps_pg::Postgres::new());
 /// }
 /// ```
+/// Canonical completion also keeps its planner: the final constructor cannot
+/// relabel a completed PostgreSQL route as SQL Server, or the reverse.
+///
+/// ```compile_fail
+/// fn pg_canonical_cannot_reach_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>) {
+///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_mssql::Mssql);
+/// }
+/// ```
+/// ```compile_fail
+/// fn mssql_canonical_cannot_reach_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>) {
+///     let _ = plan.ordered(pbps_model::PlanMode::Transactional, &pbps_pg::Postgres::new());
+/// }
+/// ```
+/// Re-scheduling cannot substitute another engine for an already completed
+/// route. Both directions remain invalid even before the final emitter call.
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn rescheduling_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let dialect = pbps_mssql::Mssql;
+///     let scheduled = schedule(plan, declared, facts, &dialect).unwrap();
+///     let ordered = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+///     let _ = pbps_dialect::lower::lower_all::<pbps_mssql::Mssql>(&ordered, &dialect);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scope_continuation_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let pending = scope.append_to(plan, &pbps_pg::Postgres::new());
+///     let dialect = pbps_mssql::Mssql;
+///     let scheduled = schedule(pending, declared, facts, &dialect).unwrap();
+///     let _ = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scope_input_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let _ = scope.append_to(plan, &pbps_mssql::Mssql);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scratch_preparation_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let _ = pbps_diff::order::scratch::prepare(
+///         &plan, &pbps_model::IdsFile::default(), &pbps_model::ModuleDeps::default(), &pbps_mssql::Mssql,
+///     );
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn semantic_erasure_pg_to_mssql(plan: pbps_diff::order::CanonicalPlan<pbps_pg::Postgres>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let _ = pbps_diff::order::deployment::schedule::schedule_semantic(
+///         plan, declared, facts, &pbps_mssql::Mssql,
+///     );
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn rescheduling_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let dialect = pbps_pg::Postgres::new();
+///     let scheduled = schedule(plan, declared, facts, &dialect).unwrap();
+///     let ordered = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(&ordered, &dialect);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scope_continuation_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let pending = scope.append_to(plan, &pbps_mssql::Mssql);
+///     let dialect = pbps_pg::Postgres::new();
+///     let scheduled = schedule(pending, declared, facts, &dialect).unwrap();
+///     let _ = scheduled.changes.ordered(pbps_model::PlanMode::Transactional, &dialect);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scope_input_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let _ = scope.append_to(plan, &pbps_pg::Postgres::new());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn scratch_preparation_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let _ = pbps_diff::order::scratch::prepare(
+///         &plan, &pbps_model::IdsFile::default(), &pbps_model::ModuleDeps::default(), &pbps_pg::Postgres::new(),
+///     );
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use pbps_diff::order::deployment::schedule::{schedule, Declarations, Facts};
+/// fn semantic_erasure_mssql_to_pg(plan: pbps_diff::order::CanonicalPlan<pbps_mssql::Mssql>,
+///     declared: &Declarations<'_>, facts: &Facts<'_>) {
+///     let _ = pbps_diff::order::deployment::schedule::schedule_semantic(
+///         plan, declared, facts, &pbps_pg::Postgres::new(),
+///     );
+/// }
+/// ```
+///
 impl pbps_dialect::PlanDialect for Postgres {
+    fn bootstrap_guard(
+        &self,
+        schema: &Schema,
+        trusted: &std::collections::BTreeSet<pbps_model::RoleName>,
+    ) -> Result<Option<Statement>, DialectError> {
+        Ok(type_refs::bootstrap_guard(schema, trusted)?.map(Statement::new))
+    }
+
     type Plan = dyn pbps_diff::order::PlanView<Self>;
 
     fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
@@ -899,6 +1036,21 @@ impl pbps_dialect::PlanDialect for Postgres {
 }
 
 impl Dialect for Postgres {
+    fn statement_count(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+        mode: pbps_model::PlanMode,
+    ) -> Result<usize, DialectError> {
+        match mode {
+            pbps_model::PlanMode::Transactional => emit::emit(self, change, strategy),
+            pbps_model::PlanMode::Staged => {
+                emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
+            }
+        }
+        .map(|statements| statements.len())
+    }
+
     fn validate_plan_analysis(
         &self,
         plan: &pbps_model::SavedPlan,
@@ -2237,24 +2389,6 @@ impl Dialect for Postgres {
         )?))
     }
 
-    fn legacy_emit(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        emit::emit(self, change, strategy)
-    }
-
-    /// An attach validates a CHECK that implies its bound first, so that it
-    /// skips its scan (#1638, DEC-1638.1); every other change is [`emit`]'s.
-    fn legacy_emit_staged(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
-    }
-
     /// What this plan implies about the data, asked before its first
     /// statement (SPEC §7.5).
     ///
@@ -2352,6 +2486,112 @@ pub(crate) fn generated_name(name1: &str, name2: Option<&str>, label: &str) -> S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_engine_continuations_keep_payload_sources_sql_and_checksum() {
+        use pbps_dialect::{PlanDialect, PlanPayload};
+        use pbps_diff::order::deployment::{
+            Sources,
+            schedule::{Declarations, Facts, schedule},
+        };
+        use pbps_diff::order::{CanonicalPlan, PlanView};
+        use pbps_model::{IdsFile, PlanMode, SavedPlan, Schema};
+
+        fn check<D: PlanDialect<Plan = dyn PlanView<D>> + 'static>(dialect: &D) {
+            let before = Schema::default();
+            let before_ids = IdsFile::default();
+            let mut after = Schema::default();
+            let name = pbps_model::TableName::new("app", "thing");
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                "n".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            after.tables.insert(name.clone(), table);
+            let mut ids = IdsFile::default();
+            ids.tables.insert("t_aaaaaa".parse().unwrap(), name.clone());
+            ids.columns
+                .insert("c_aaaaaa".parse().unwrap(), name.column("n"));
+            let declarations = Declarations {
+                schema: &after,
+                sources: Sources {
+                    before: pbps_diff::Side {
+                        schema: &before,
+                        ids: &before_ids,
+                    },
+                    after: &ids,
+                },
+                module_deps: &Default::default(),
+            };
+            let diff = pbps_diff::diff(
+                declarations.sources.before,
+                pbps_diff::Side {
+                    schema: &after,
+                    ids: &ids,
+                },
+                dialect,
+                &Default::default(),
+            )
+            .unwrap();
+            let first = schedule(diff, &declarations, &Facts::default(), dialect)
+                .unwrap()
+                .changes;
+            assert!(!first.is_empty());
+            let fingerprint = |plan: &CanonicalPlan<D>| {
+                SavedPlan::new(
+                    pbps_model::PlanOrigin::Database,
+                    dialect.name(),
+                    "2026-10-22",
+                    pbps_model::PlanBaseline {
+                        description: "continuation".into(),
+                        checksum: String::new(),
+                        database_collation: None,
+                        time_zone: None,
+                    },
+                    plan.changes().clone(),
+                    ids.clone(),
+                )
+                .wire_fingerprint()
+            };
+            let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+            // Empty scope input used to erase a canonical engine just as a
+            // nonempty scope tail did; neither may become a fresh Differ.
+            let scoped = scope.append_to(first.clone(), dialect);
+            let continued = [
+                schedule(first.clone(), &declarations, &Facts::default(), dialect)
+                    .unwrap()
+                    .changes,
+                schedule(scoped, &declarations, &Facts::default(), dialect)
+                    .unwrap()
+                    .changes,
+            ];
+            for actual in continued {
+                assert_eq!(actual.changes(), first.changes());
+                assert_eq!(actual.origins(), first.origins());
+                assert_eq!(actual.logical(), first.logical());
+                assert_eq!(actual.proof(), first.proof());
+                assert_eq!(fingerprint(&actual), fingerprint(&first));
+                for mode in [PlanMode::Transactional, PlanMode::Staged] {
+                    let expected = first.clone().ordered(mode, dialect);
+                    let ordered = actual.clone().ordered(mode, dialect);
+                    assert_eq!(
+                        ordered.operations().as_slice(),
+                        expected.operations().as_slice()
+                    );
+                    assert_eq!(
+                        pbps_dialect::lower::lower_all::<D>(&ordered, dialect)
+                            .unwrap()
+                            .statements(),
+                        pbps_dialect::lower::lower_all::<D>(&expected, dialect)
+                            .unwrap()
+                            .statements()
+                    );
+                }
+            }
+        }
+        check(&super::Postgres::new());
+        check(&pbps_mssql::Mssql);
+    }
+
     fn partitioned(columns: &[&str], key: &[&str]) -> pbps_model::Table {
         let mut table = pbps_model::Table::default();
         for c in columns {
@@ -3806,7 +4046,7 @@ mod tests {
     #[test]
     fn an_empty_postgres_script_does_not_change_session_settings() {
         assert!(
-            pbps_dialect::legacy_render_script(
+            script_oracle::render(
                 &[],
                 &super::Postgres::new(),
                 &pbps_model::SessionZone::utc()
@@ -4560,7 +4800,7 @@ mod tests {
         let column = TableName::new("app", "t").column("id");
         let emit = |from: ValueSource, to: ValueSource| {
             super::Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
@@ -4634,7 +4874,7 @@ mod tests {
         // Negative: generated is refused, never emitted.
         assert!(
             super::Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
@@ -4872,7 +5112,7 @@ mod tests {
         // plans do about undeclared rows, and the row changes it implies are
         // separate entries in this same plan.
         assert!(
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::SetDataMode {
                     table: "app.t".parse().expect("a table name parses"),
                     from: None,
@@ -4903,7 +5143,7 @@ mod tests {
                 to: "reader".to_owned().into(),
             },
         ] {
-            pg.legacy_emit(&change, Strategy::default())
+            pg.fixture_emit(&change, Strategy::default())
                 .expect_err("the principal is the cluster's");
         }
     }
@@ -7285,7 +7525,7 @@ mod certified_emission_tests {
                 );
                 assert_eq!(
                     pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
-                    pbps_dialect::legacy_render_script(
+                    script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,
                         &pbps_model::SessionZone::utc()
@@ -7321,19 +7561,14 @@ mod certified_emission_tests {
             bytes
         };
         assert_eq!(bytes(&before), bytes(after.wire()));
-        assert_eq!(before.checksum(), after.wire().checksum());
+        assert_eq!(
+            before.wire_fingerprint(),
+            pbps_diff::order::ArtifactView::checksum(&after)
+        );
         if let (Ok(actual), Ok(expected)) = (&actual, &expected) {
             assert_eq!(
-                pbps_dialect::legacy_render_script(
-                    actual,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                ),
-                pbps_dialect::legacy_render_script(
-                    expected,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                )
+                script_oracle::render(actual, dialect, &pbps_model::SessionZone::utc()),
+                script_oracle::render(expected, dialect, &pbps_model::SessionZone::utc())
             );
         }
         actual
@@ -7354,7 +7589,7 @@ mod certified_emission_tests {
             })],
         };
         let expected = dialect
-            .legacy_emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .fixture_emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode, &dialect);
@@ -7369,7 +7604,7 @@ mod certified_emission_tests {
 
     #[test]
     fn partition_lowering_uses_each_certified_inputs_bound_mode() {
-        use pbps_diff::order::{PlanView, admit, seal, singleton};
+        use pbps_diff::order::{ArtifactView, PlanView, admit, seal, singleton};
         use pbps_model::{
             BoundDatum, IdsFile, PartitionBound, PlanBaseline, PlanOrigin, SavedPlan,
         };
@@ -7409,7 +7644,7 @@ mod certified_emission_tests {
             );
             wire.mode = mode;
             let bytes = serde_json::to_string(&wire).unwrap();
-            let checksum = wire.checksum();
+            let checksum = wire.wire_fingerprint();
             let admitted = admit(
                 serde_json::from_str(&bytes).unwrap(),
                 &dialect,
@@ -7426,6 +7661,12 @@ mod certified_emission_tests {
                 PlanMode::Transactional => &transactional,
                 PlanMode::Staged => &staged,
             };
+            assert_eq!(
+                dialect
+                    .statement_count(&change.change, change.strategy, mode)
+                    .unwrap(),
+                expected.len()
+            );
             for input in [&ordered as &dyn PlanView<Postgres>, &sealed, &admitted] {
                 assert_eq!(input.mode(), mode);
                 let lowered = pbps_dialect::lower::lower_all(input, &dialect).unwrap();
@@ -7439,7 +7680,26 @@ mod certified_emission_tests {
 // the private emitter and the engine-associated certified input.
 #[cfg(test)]
 impl Postgres {
-    pub(crate) fn legacy_emit(
+    pub(crate) fn fixture_emit_staged(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let mut part = pbps_model::PlannedChange::new(change.clone());
+        part.strategy = strategy;
+        let expected =
+            emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy));
+        let actual = self.emit_staged(
+            &pbps_diff::order::singleton(part, pbps_model::PlanMode::Staged, self),
+            0,
+        );
+        assert_eq!(
+            actual.as_ref().map_err(ToString::to_string),
+            expected.as_ref().map_err(ToString::to_string)
+        );
+        actual
+    }
+    pub(crate) fn fixture_emit(
         &self,
         change: &Change,
         strategy: Strategy,
@@ -7451,4 +7711,12 @@ impl Postgres {
             emit::emit(self, change, strategy),
         )
     }
+}
+
+#[cfg(test)]
+mod script_oracle {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/script_oracle.rs"
+    ));
 }

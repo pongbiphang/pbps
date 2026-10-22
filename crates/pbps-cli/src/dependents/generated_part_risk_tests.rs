@@ -1,4 +1,7 @@
 //! Every creation-risk recipient must precede the owner's writes (DEC-1503.4).
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use pbps_dialect::Dialect;
 use pbps_model::*;
 
@@ -379,7 +382,7 @@ async fn creation_parts_after_rows_keep_their_risks_on_both_servers() {
                 let mut plan = fixture(kind, "insert", late);
                 if late {
                     assert!(
-                        crate::validate_saved_plan(&plan, pg.as_ref())
+                        crate::validate_saved_plan(&plan, &pg)
                             .unwrap_err()
                             .to_string()
                             .contains("inconsistent risks")
@@ -387,10 +390,10 @@ async fn creation_parts_after_rows_keep_their_risks_on_both_servers() {
                     plan.changes.changes[3].risks =
                         pg.change_risks(&plan.changes.changes[3].change);
                 }
-                crate::validate_saved_plan(&plan, pg.as_ref()).unwrap();
+                crate::validate_saved_plan(&plan, &pg).unwrap();
                 let result: anyhow::Result<()> = async {
                     for part in &plan.changes.changes {
-                        for sql in pg.legacy_emit(&part.change, part.strategy)? {
+                        for sql in pg.fixture_emit(&part.change, part.strategy)? {
                             conn.execute(&sql.sql).await?;
                         }
                     }

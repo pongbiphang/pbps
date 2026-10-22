@@ -1,5 +1,8 @@
 //! Baseline schema bindings must be released before a callee is rewritten.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use pbps_diff::{
     Side,
     order::{self, Baseline, Violation},
@@ -264,7 +267,6 @@ fn binding_release_settle_keeps_unrelated_steps_outside_its_scope() {
 
 #[test]
 fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
-    use pbps_dialect::Dialect;
     let table = TableName::new("app", "t");
     let mut ids = IdsFile::default();
     ids.tables
@@ -330,7 +332,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
     let sql = |plan: &ChangeSet| {
         plan.changes
             .iter()
-            .flat_map(|p| Mssql.legacy_emit(&p.change, p.strategy).unwrap())
+            .flat_map(|p| Mssql.fixture_emit(&p.change, p.strategy).unwrap())
             .collect::<Vec<_>>()
     };
     assert_eq!(sql(&result), sql(&original));
@@ -354,7 +356,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
         serde_json::to_vec(&old).unwrap(),
         serde_json::to_vec(&new).unwrap()
     );
-    assert_eq!(old.checksum(), new.checksum());
+    assert_eq!(old.wire_fingerprint(), new.wire_fingerprint());
 }
 
 #[test]
@@ -438,4 +440,12 @@ fn binding_release_dependents_follow_the_rewrite_transitively() {
         order::verify(ops.as_slice(), &effects, &base, &Default::default()),
         []
     );
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

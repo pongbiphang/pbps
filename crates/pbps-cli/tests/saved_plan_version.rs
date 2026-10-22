@@ -195,7 +195,7 @@ fn ordinary_current_artifacts_keep_their_checksum_and_approval_gate() {
         ChangeSet::default(),
         IdsFile::default(),
     );
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     let artifact = Artifact::new(&serde_json::to_string_pretty(&plan).unwrap());
     let out = artifact.run("json", &checksum);
     assert!(out.status.success(), "{out:?}");

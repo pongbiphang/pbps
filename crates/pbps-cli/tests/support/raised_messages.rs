@@ -127,7 +127,7 @@ pub fn check(server: &str, pg: bool) {
             ok(d.run(&args));
             let plan: pbps_model::SavedPlan =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let checksum = plan.checksum();
+            let checksum = plan.wire_fingerprint();
             let mut args = vec![
                 "apply",
                 "--db",

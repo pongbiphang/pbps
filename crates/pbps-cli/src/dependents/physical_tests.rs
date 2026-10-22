@@ -1,3 +1,6 @@
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use super::test_adapters::weave;
 use super::*;
 use pbps_model::{Column, Module, PartitionBound, PartitionColumn, PartitionOf, Table, Uid};
@@ -242,15 +245,15 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                     after_ids.columns.insert(uid("c_bbbbbb"), table("parent").column("n2"));
                 }
                 let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
-                assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-                let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+                assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
+                let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
                     &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
-                crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
+                crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.unwrap();
                 for p in &cs.changes {
-                    for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
+                    for statement in pg.fixture_emit(&p.change, p.strategy).unwrap() {
                         conn.execute(&statement.sql).await.unwrap();
                     }
                 }
@@ -273,15 +276,15 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         let before_ids = ids(true);
         let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
         conn.begin(&framing).await.unwrap();
-        assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
-        let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
+        assert!(crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.is_err());
+        let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(&mut conn, cs, &after, sources,
             &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
-        crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
+        crate::engine::check_module_dependents_fixture(&mut conn, &pbps_diff::order::propose(pbps_model::ChangeSet { changes: cs.changes.clone() }), &before, &after_ids, &before_ids).await.unwrap();
         for p in &cs.changes {
-            for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
+            for statement in pg.fixture_emit(&p.change, p.strategy).unwrap() {
                 conn.execute(&statement.sql).await.unwrap();
             }
         }
@@ -492,10 +495,10 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     };
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.unwrap();
-    let mut cs = pbps_diff::order::propose(cs);
-    crate::engine::account_for_module_dependents(
+    let cs = pbps_diff::order::propose(cs);
+    let (cs, _) = crate::engine::account_for_module_dependents(
         &mut conn,
-        &mut cs,
+        cs,
         &after,
         sources,
         &ModuleDeps::default(),
@@ -505,11 +508,19 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
     )
     .await
     .unwrap();
-    crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids)
-        .await
-        .unwrap();
+    crate::engine::check_module_dependents_fixture(
+        &mut conn,
+        &pbps_diff::order::propose(pbps_model::ChangeSet {
+            changes: cs.changes.clone(),
+        }),
+        &before,
+        &after_ids,
+        &before_ids,
+    )
+    .await
+    .unwrap();
     for p in &cs.changes {
-        for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
+        for statement in pg.fixture_emit(&p.change, p.strategy).unwrap() {
             conn.execute(&statement.sql)
                 .await
                 .unwrap_or_else(|e| panic!("{e}\n{:?}\n{}", p.change, statement.sql));

@@ -1215,7 +1215,7 @@ pub(super) fn dropped_signatures(
 pub(in crate::resolver::server) fn reconstruction(
     driver: Driver,
     extras: &[String],
-    bootstrap: &pbps_diff::order::PlanningPlan,
+    bootstrap: &pbps_diff::order::DiffPlan,
     ids: &pbps_model::IdsFile,
     dependencies: &pbps_model::ModuleDeps,
     version: i64,
@@ -1801,7 +1801,7 @@ pub(super) fn ordinary(
     desired: pbps_diff::Side<'_>,
     hints: &pbps_model::Hints,
     extras: &[String],
-) -> Result<pbps_diff::order::PlanningPlan, Error> {
+) -> Result<pbps_diff::order::DiffPlan, Error> {
     let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
     pbps_diff::resolver::ordinary(base, desired, &dialect, hints).map_err(|errors| {
         Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
@@ -1816,7 +1816,8 @@ impl Binding {
         hints: &pbps_model::Hints,
         extras: &[String],
         surfaces: &[pbps_model::resolver::SurfaceResolution],
-    ) -> Result<pbps_diff::resolver::Ordered, Error> {
+    ) -> Result<pbps_diff::resolver::Ordered<pbps_diff::order::Canonical<pbps_pg::Postgres>>, Error>
+    {
         let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec())
             .with_server_version(self.generation_version);
         pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
