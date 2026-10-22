@@ -630,7 +630,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                 "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
                 quote(column.name.raw())?,
-                normalized,
+                normalized.raw(),
                 collate_clause(to_collation.as_ref())?,
                 null_clause(*to_nullable),
                 online(strategy)
@@ -662,7 +662,9 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                         "column `{column}` has type `{ty}`, which SQL Server refuses to name in \
                          ALTER COLUMN; its nullability cannot be changed",
                         // raw: whole-message escaped until #2084 step 5
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        ty = ty.raw(),
                     ),
                 });
             }
@@ -671,7 +673,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                 "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
                 quote(column.name.raw())?,
-                normalized,
+                normalized.raw(),
                 collate_clause(collation.as_ref())?,
                 null_clause(*to_nullable),
                 online(strategy)
@@ -1306,7 +1308,7 @@ impl<'a> Held<'a> {
             true => {
                 let now = self.now();
                 let value = crate::rows::in_column_collation(stored, value, &now.base);
-                format!("TRY_CONVERT({now}, {value})")
+                format!("TRY_CONVERT({now}, {value})", now = now.raw())
             }
         }
     }
@@ -1439,7 +1441,10 @@ fn defaulted_cell(
     // Both under the column's collation, which a literal default does not
     // carry (#1247 review).
     let lent = crate::rows::in_column_collation(&quoted, &default, &now.base);
-    let at_default = ty.converted(&format!("CONVERT({read}, {lent})"), &quoted);
+    let at_default = ty.converted(
+        &format!("CONVERT({read}, {lent})", read = read.raw()),
+        &quoted,
+    );
     // A default of `NULL` references nothing and compares to nothing; both
     // halves are spelled so the one predicate covers it.
     Ok(Some(format!(
@@ -1675,7 +1680,7 @@ fn generated_column_definition(
     let mut s = format!(
         "{} {}{}",
         quote(name)?,
-        types::normalize(&column.ty)?,
+        types::normalize(&column.ty)?.raw(),
         collate_clause(column.collation.as_ref())?
     );
     let default = match &column.value_source {

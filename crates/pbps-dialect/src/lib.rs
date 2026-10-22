@@ -2905,11 +2905,16 @@ pub trait Dialect {
         }
         let spelled = self.normalize_type(&ty)?;
         spelled
+            .raw()
             .to_string()
             .parse()
             .map_err(|_| DialectError::Unsupported {
                 dialect: self.name(),
-                feature: format!("`{spelled}` as a routine argument type"),
+                feature: format!(
+                    "`{spelled}` as a routine argument type",
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    spelled = spelled.raw(),
+                ),
             })
     }
 
@@ -6986,5 +6991,26 @@ UESCAPE '!' AS s";
             ["x"]
         );
         assert!(lexicon.string_literals("a * 2 -- 'x'").is_empty());
+    }
+
+    #[test]
+    fn routine_argument_keys_keep_raw_type_arguments_and_references_distinct() {
+        for spelling in [
+            "kind(\"arg\n\\\u{1b}\u{9b}\u{200b}名前\")",
+            "app.\"type\n\\\u{1b}\u{9b}\u{200b}名前\"",
+        ] {
+            let arg: RoutineArg = spelling.parse().unwrap();
+            let shown: RoutineArg = pbps_model::escape::Escaped(spelling)
+                .to_string()
+                .parse()
+                .unwrap();
+            assert_ne!(arg, shown);
+            let normalized = MinimalDialect.normalize_routine_arg(&arg).unwrap();
+            assert_eq!(normalized, arg);
+            assert_ne!(normalized, shown);
+            let keys = std::collections::BTreeMap::from([(normalized, "raw"), (shown, "shown")]);
+            assert_eq!(keys.len(), 2);
+            assert_eq!(keys.get(&arg), Some(&"raw"));
+        }
     }
 }

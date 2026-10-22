@@ -707,7 +707,9 @@ pub(crate) fn refuse_an_unresolved_default(
          a `date` stores 2026-01-02 under `DateStyle` MDY and 2026-02-01 under DMY, with no error \
          either way -- so this column would default to February in one environment and January in \
          another. Write it the way the engine renders it, with the cast it welds on and a \
-         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 section 3, section 4)."
+         spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 section 3, section 4).",
+        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+        ty = ty.raw(),
     )))
 }
 
@@ -1143,7 +1145,7 @@ fn sql_type(ty: &ColumnType) -> Result<String, DialectError> {
             quote(reference.name())?,
             if normalized.is_array() { "[]" } else { "" }
         )),
-        None => Ok(normalized.to_string()),
+        None => Ok(normalized.raw().to_string()),
     }
 }
 
@@ -3239,8 +3241,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                          user-defined type reference is not supported. Add the new column, fill \
                          it in a declared step, and drop the old one.",
                         column.name.shown(),
-                        pbps_model::escape::Escaped(&was.to_string()),
-                        pbps_model::escape::Escaped(&normalized.to_string()),
+                        was.shown(),
+                        normalized.shown(),
                     ),
                 });
             }
@@ -3270,7 +3272,11 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      declared step, and drop the old one.",
 
                     // raw: whole-message escaped until #2084 step 5.
-column.name.raw()
+                    column.name.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    was = was.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    normalized = normalized.raw(),
                 )));
             }
             if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
@@ -3284,11 +3290,14 @@ column.name.raw()
                      old one.",
 
                     // raw: whole-message escaped until #2084 step 5.
-column.name.raw(),
-                    types::normalize(from)?,
+                    column.name.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    types::normalize(from)?.raw(),
 
                     // raw: whole-message escaped until #2084 step 5.
-column.name.raw()
+                    column.name.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    normalized = normalized.raw(),
                 )));
             }
             // The same refusal, for the same reason, on a change the risk
@@ -3317,7 +3326,11 @@ column.name.raw()
                      written out (`AT TIME ZONE \'...\'`), and drop the old one.",
 
                     // raw: whole-message escaped until #2084 step 5.
-column.name.raw()
+                    column.name.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    was = was.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    normalized = normalized.raw(),
                 )));
             }
             // One `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1),
@@ -3327,7 +3340,8 @@ column.name.raw()
             // nothing.
             let mut parts = vec![format!(
                 "ALTER COLUMN {} TYPE {normalized}",
-                quote(column.name.raw())?
+                quote(column.name.raw())?,
+                normalized = normalized.raw(),
             )];
             if from_nullable != to_nullable {
                 parts.push(format!(
@@ -5068,7 +5082,7 @@ impl<'a> Held<'a> {
     fn converted(self, value: &str) -> String {
         match self.now {
             None => value.to_owned(),
-            Some(_) => format!("CAST({value} AS {})", self.now()),
+            Some(_) => format!("CAST({value} AS {})", self.now().raw()),
         }
     }
 
@@ -5091,7 +5105,7 @@ impl<'a> Held<'a> {
         if self.now.is_none() {
             return recorded.to_owned();
         }
-        self.converted(&format!("CAST({recorded} AS {})", self.read()))
+        self.converted(&format!("CAST({recorded} AS {})", self.read().raw()))
     }
 }
 
@@ -5185,7 +5199,7 @@ fn defaulted_cell(
     // written correctly, and the update's and the delete's preconditions
     // would call an untouched row stale. The cast is the same one the
     // engine made, asked of the engine (DECISIONS 329).
-    let typed = format!("CAST({expr} AS {})", ty.read());
+    let typed = format!("CAST({expr} AS {})", ty.read().raw());
     Ok(Some(format!(
         "({} = {} OR ({quoted} IS NULL AND {expr} IS NULL))",
         binary(&crate::rows::read_expr(&quoted)),
@@ -5594,7 +5608,7 @@ fn row_statement(
 /// Keep the complete declared type, including modifiers and array dimensions,
 /// when temporarily creating a generated column (DEC-1503.1).
 pub(crate) fn generation_placeholder(ty: &pbps_model::ColumnType) -> Result<String, DialectError> {
-    Ok(format!("NULL::{}", types::normalize(ty)?))
+    Ok(format!("NULL::{}", types::normalize(ty)?.raw()))
 }
 
 #[cfg(test)]
@@ -6796,7 +6810,7 @@ mod tests {
             assert!(
                 sql.contains(&format!(
                     "TYPE {}",
-                    crate::types::normalize(&ty(to)).unwrap()
+                    crate::types::normalize(&ty(to)).unwrap().raw()
                 )),
                 "{from} -> {to}: {sql}"
             );

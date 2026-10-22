@@ -237,8 +237,11 @@ pub fn query(
                 // Under the column's own collation, which a literal default
                 // does not carry (#1247 review).
                 let lent = in_column_collation(&quoted, &default, &ty.base);
-                let at_default =
-                    same_value(&quoted, &format!("TRY_CONVERT({ty}, {lent})"), &ty.base);
+                let at_default = same_value(
+                    &quoted,
+                    &format!("TRY_CONVERT({ty}, {lent})", ty = ty.raw()),
+                    &ty.base,
+                );
                 select.push(format!(
                     // A failed assignment is unknown, not a NULL default.
                     // Keep that third answer local to this query/decode wire
@@ -246,7 +249,8 @@ pub fn query(
                     "CASE WHEN ({default}) IS NOT NULL AND TRY_CONVERT({ty}, {default}) IS NULL THEN -1 \
                      WHEN {at_default} \
                        OR ({quoted} IS NULL AND ({default}) IS NULL) \
-                     THEN 1 ELSE 0 END"
+                     THEN 1 ELSE 0 END",
+                    ty = ty.raw(),
                 ));
                 Some(select.len() - 1)
             }
@@ -428,7 +432,7 @@ pub fn spelling_queries(name: &TableName, table: &Table) -> Result<Vec<SpellingQ
             table: name.clone(),
             why: e.to_string(),
         })?;
-        Ok((ty.base.clone(), ty.to_string()))
+        Ok((ty.base.clone(), ty.raw().to_string()))
     };
     // The key's collation, as a clause: validated here, where an error can
     // be returned, rather than defaulted inside the closure below.
@@ -705,11 +709,13 @@ pub(crate) fn read_expr(quoted: &str, base: &str) -> String {
 pub(crate) fn from_text(literal: &str, ty: &ColumnType) -> Option<String> {
     Some(match ty.base.as_str() {
         "date" | "time" | "datetime" | "datetime2" | "datetimeoffset" | "smalldatetime" => {
-            format!("TRY_CONVERT({ty}, {literal}, 126)")
+            format!("TRY_CONVERT({ty}, {literal}, 126)", ty = ty.raw())
         }
-        "binary" | "varbinary" | "timestamp" => format!("TRY_CONVERT({ty}, {literal}, 1)"),
+        "binary" | "varbinary" | "timestamp" => {
+            format!("TRY_CONVERT({ty}, {literal}, 1)", ty = ty.raw())
+        }
         "image" | "geometry" | "geography" => return None,
-        _ => format!("TRY_CONVERT({ty}, {literal})"),
+        _ => format!("TRY_CONVERT({ty}, {literal})", ty = ty.raw()),
     })
 }
 
@@ -1347,6 +1353,8 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
             name = name.raw(),
             // raw: whole-message escaped until #2084 step 5.
             key = key.raw(),
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            ty = ty.raw(),
         ));
     }
     out

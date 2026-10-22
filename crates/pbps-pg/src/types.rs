@@ -264,14 +264,16 @@ fn canonical_base(base: &str) -> &str {
 fn unknown(ty: &ColumnType) -> DialectError {
     DialectError::UnknownType {
         dialect: DIALECT,
-        ty: ty.to_string(),
+        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+        ty: ty.raw().to_string(),
     }
 }
 
 fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     DialectError::BadTypeArity {
         dialect: DIALECT,
-        ty: ty.to_string(),
+        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+        ty: ty.raw().to_string(),
         detail: detail.into(),
     }
 }
@@ -312,6 +314,8 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
              {declared}`). Here it is `{ty}`, which the engine has no column for. Declare \
              `type: {declared}`, or `{reads_back}` with an `identity:`.",
             declared = ty.base,
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            ty = ty.raw(),
         ),
     })
 }
@@ -338,7 +342,9 @@ fn refuse_overlong_reference(ty: &ColumnType, user: &TypeRef) -> Result<(), Dial
                      keeps {} bytes of an identifier, truncating the rest without an error, so \
                      the reference would name a different type from the one written",
                     part.len(),
-                    crate::MAX_IDENT_BYTES
+                    crate::MAX_IDENT_BYTES,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    ty = ty.raw(),
                 ),
             });
         }
@@ -2256,7 +2262,7 @@ mod tests {
             ("numeric(10,2)[]", "numeric(10, 2)[]"),
         ] {
             assert_eq!(
-                normalize(&ty(declared)).unwrap().to_string(),
+                normalize(&ty(declared)).unwrap().raw().to_string(),
                 read_back,
                 "{declared}"
             );
@@ -2591,6 +2597,7 @@ mod tests {
     fn norm(s: &str) -> String {
         normalize(&ty(s))
             .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
+            .raw()
             .to_string()
     }
 
@@ -2624,8 +2631,13 @@ mod tests {
         let predicate = |from: &str, to: &str| {
             let from = normalize(&ty(from)).expect("a source type normalizes");
             let to = normalize(&ty(to)).expect("a target type normalizes");
-            cannot_become(&from, &to, "\"v\"")
-                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+            cannot_become(&from, &to, "\"v\"").unwrap_or_else(|| {
+                panic!(
+                    "`{from}` -> `{to}` should have a predicate to count",
+                    from = from.shown(),
+                    to = to.shown()
+                )
+            })
         };
         for (from, to) in [
             ("double precision", "bigint"),
@@ -2669,8 +2681,13 @@ mod tests {
         let predicate = |from: &str, to: &str| {
             let from = normalize(&ty(from)).expect("a source type normalizes");
             let to = normalize(&ty(to)).expect("a target type normalizes");
-            cannot_become(&from, &to, "\"v\"")
-                .unwrap_or_else(|| panic!("`{from}` -> `{to}` should have a predicate to count"))
+            cannot_become(&from, &to, "\"v\"").unwrap_or_else(|| {
+                panic!(
+                    "`{from}` -> `{to}` should have a predicate to count",
+                    from = from.shown(),
+                    to = to.shown()
+                )
+            })
         };
         for (from, to) in [
             ("date", "timestamp without time zone"),
@@ -2915,7 +2932,7 @@ mod tests {
                     .unwrap();
                 let got = normalize(&ty(&format!("{alias}({precision})"))).unwrap();
                 assert_eq!(got, expected);
-                assert_eq!(normalize(&ty(&got.to_string())).unwrap(), got);
+                assert_eq!(normalize(&ty(&got.raw().to_string())).unwrap(), got);
             }
             for arguments in ["-1", "7", "max", "3, 2"] {
                 assert!(normalize(&ty(&format!("{alias}({arguments})"))).is_err());

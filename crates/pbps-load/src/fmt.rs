@@ -645,7 +645,7 @@ fn scalar(s: &str) -> String {
 /// raw on one line takes `scalar`'s escapes instead. A type with no `"` is
 /// `scalar`'s, exactly as before.
 fn type_scalar(ty: &pbps_model::ColumnType) -> String {
-    let text = ty.to_string();
+    let text = ty.raw().to_string();
     let raw_ok = !text.chars().any(|c| {
         c.is_control()
             || matches!(
@@ -1976,7 +1976,7 @@ indexes:
         round_trip(yaml);
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
         let id = &t.table.columns["id"];
-        assert_eq!(id.ty.to_string(), "integer");
+        assert_eq!(id.ty.raw().to_string(), "integer");
         assert!(
             !id.nullable,
             "a serial is NOT NULL unless it says otherwise"
@@ -1986,7 +1986,7 @@ indexes:
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial())
         );
         let big = &t.table.columns["big"];
-        assert_eq!(big.ty.to_string(), "bigint");
+        assert_eq!(big.ty.raw().to_string(), "bigint");
         assert_eq!(
             big.value_source,
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
@@ -2828,7 +2828,7 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
         assert!(t.table.columns["tags"].ty.is_array());
         assert_eq!(
-            t.table.columns["stamps"].ty.to_string(),
+            t.table.columns["stamps"].ty.raw().to_string(),
             "timestamp(3) with time zone[]"
         );
         for spelling in ["integer[3]", "integer[][]", "integer ARRAY"] {
@@ -2849,9 +2849,12 @@ indexes:
         let yaml = "table: app.t\ncolumns:\n  a:\n    type: '\"App\".\"Mood\"'\n  b:\n    type: '\"App\".\"Mood\"[]'\n  c:\n    type: APP.Mood\n  d:\n    type: '\"it''s\".\"a\"\"b\"'\n  e:\n    type: \"app.\\\"x\\ty\\\"\"\n";
         round_trip(yaml);
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
-        assert_eq!(t.table.columns["a"].ty.to_string(), "\"App\".\"Mood\"");
+        assert_eq!(
+            t.table.columns["a"].ty.raw().to_string(),
+            "\"App\".\"Mood\""
+        );
         assert!(t.table.columns["b"].ty.is_array());
-        assert_eq!(t.table.columns["c"].ty.to_string(), "app.mood");
+        assert_eq!(t.table.columns["c"].ty.raw().to_string(), "app.mood");
         assert_eq!(
             t.table.columns["d"]
                 .ty

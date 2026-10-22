@@ -127,7 +127,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         let _ = writeln!(
             s,
             "| {label} | `{}` | {} | {} | {} |",
-            c.ty,
+            c.ty.raw(),
             if c.nullable { "yes" } else { "no" },
             match &c.value_source {
                 pbps_model::ValueSource::Default(text) => code_cell(text),

@@ -298,7 +298,8 @@ fn identity_problems(
             "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
              identity column type must be smallint, integer, or bigint. A `numeric` is refused \
              here even with a scale of zero, where SQL Server admits one.",
-            declared.ty
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            declared.ty.raw()
         ))),
         // The seed is checked against the sequence's bounds, not the column's:
         // see [`types::identity_seed_range`] for why those are not the same
@@ -308,7 +309,8 @@ fn identity_problems(
              counting by {} starts somewhere in {}..={}: the engine refuses the table with START \
              value ({}) out of the sequence's own bounds.",
             identity.seed,
-            declared.ty,
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            declared.ty.raw(),
             identity.increment,
             accepted.start(),
             accepted.end(),
@@ -326,7 +328,8 @@ fn identity_problems(
                      but no valid seed can produce a second value; use an increment magnitude \
                      at most {span}.",
                     identity.increment,
-                    declared.ty,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    declared.ty.raw(),
                     accepted.start(),
                     accepted.end()
                 )));
@@ -380,14 +383,16 @@ fn sequence_problems(
         None => found.push(invalid(format!(
             "column `{column}` has an owned sequence on `{}`; a `serial` column is a smallint, \
              an integer or a bigint",
-            declared.ty
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            declared.ty.raw()
         ))),
         Some(accepted) if !accepted.contains(&sequence.start) => found.push(invalid(format!(
             "column `{column}`'s sequence starts at {}, and a sequence on `{}` counting by {} \
              starts somewhere in {}..={}: the engine refuses START value ({}) out of the \
              sequence's own bounds.",
             sequence.start,
-            declared.ty,
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            declared.ty.raw(),
             sequence.increment,
             accepted.start(),
             accepted.end(),
@@ -399,7 +404,9 @@ fn sequence_problems(
                 found.push(invalid(format!(
                     "column `{column}`'s sequence has an increment of {} whose magnitude \
                      exceeds its span {span} for `{}`, so no start can produce a second value",
-                    sequence.increment, declared.ty
+                    sequence.increment,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    declared.ty.raw()
                 )));
             }
         }
@@ -482,12 +489,16 @@ fn options_problems(
                 "column `{column}`: {what} has `{name}: {value}`, outside `{ty}`'s \
                  {}..={}: the engine refuses it",
                 held.start(),
-                held.end()
+                held.end(),
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                ty = ty.raw(),
             )));
         } else if value == own {
             found.push(invalid(format!(
                 "column `{column}`: {what} has `{name}: {value}`, which is already the \
-                 engine's {name} for `{ty}` counting by {increment}; leave out `{name}:`"
+                 engine's {name} for `{ty}` counting by {increment}; leave out `{name}:`",
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                ty = ty.raw(),
             )));
         }
     }
@@ -1636,7 +1647,7 @@ impl Dialect for Postgres {
                         dialect: types::DIALECT,
                         message: format!(
                             "`data:` cannot be declared on a table with the user-defined type reference `{}` on column `{column}`",
-                            pbps_model::escape::Escaped(&spec.ty.to_string()),
+                            spec.ty.shown(),
                             column = column.shown(),
                         ),
                     });
@@ -1650,7 +1661,8 @@ impl Dialect for Postgres {
                             "`data:` cannot be declared on a table with an array column, and \
                              `{column}` is `{}`; declare the rows elsewhere, or leave the block \
                              out",
-                            spec.ty,
+                            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                            spec.ty.raw(),
                             // raw: whole-message escaped until #2084 step 5.
                             column = column.raw(),
                         ),
@@ -4596,7 +4608,7 @@ mod tests {
         assert!(
             retyped.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::AlterColumnNumbering { ty, .. } if ty.to_string() == "bigint"
+                Change::AlterColumnNumbering { ty, .. } if ty.raw().to_string() == "bigint"
             )),
             "{retyped:#?}"
         );

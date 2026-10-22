@@ -6751,7 +6751,7 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert_eq!(
-            only(&pulled).columns["when"].ty.to_string(),
+            only(&pulled).columns["when"].ty.raw().to_string(),
             "timestamp with time zone"
         );
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
@@ -7423,7 +7423,7 @@ mod tests {
             ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
-        assert_eq!(only(&pulled).columns["name"].ty.to_string(), "text");
+        assert_eq!(only(&pulled).columns["name"].ty.raw().to_string(), "text");
         assert_eq!(pulled.limitations.len(), 1);
         assert!(pulled.warnings[0].contains("COLLATE"));
     }
@@ -8284,7 +8284,10 @@ mod tests {
             relkind: None,
             array: true,
         });
-        assert_eq!(column_type(&raw).unwrap().to_string(), "\"App\".\"Mood\"[]");
+        assert_eq!(
+            column_type(&raw).unwrap().raw().to_string(),
+            "\"App\".\"Mood\"[]"
+        );
         for kind in ["b", "r", "m", "p"] {
             raw.user_type.as_mut().unwrap().kind = kind.into();
             assert!(column_type(&raw).is_err(), "{kind}");
@@ -8414,5 +8417,21 @@ mod tests {
         assert!(pulled.warnings.iter().any(|w| w == &format!(
             "foreign key `fk{SHOWN}` on `app.child` has the match type `?`, which this dialect does not know. It is left out rather than read back as the default one."
         )), "{:?}", pulled.warnings);
+    }
+
+    #[test]
+    fn declaration_type_round_trips_compare_raw_reference_identity() {
+        let user = pbps_model::TypeRef::new("app", "type\n\\\u{1b}\"名前").unwrap();
+        let ty = ColumnType::reference(user.clone());
+        assert!(survives_the_declaration(&ty));
+        assert!(survives_the_declaration(&ty.clone().into_array()));
+        let visible = ColumnType::reference(
+            pbps_model::TypeRef::new("app", r#"type\n\\\u{1b}"名前"#).unwrap(),
+        );
+        assert!(survives_the_declaration(&visible));
+        assert_ne!(visible, ty);
+        let opaque = ColumnType::simple(ty.raw().to_string());
+        assert!(!survives_the_declaration(&opaque));
+        assert_ne!(opaque, ty);
     }
 }

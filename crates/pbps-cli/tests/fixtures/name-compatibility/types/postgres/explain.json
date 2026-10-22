@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [],
+  "data": {
+    "applyable": true,
+    "dialect": "postgres",
+    "created_at": "2026-10-22T00:00:00Z",
+    "baseline": "type-name master fixture",
+    "mode": "transactional",
+    "checksum": "365c38329dac9e406cdac8f5cdf71b67cbab531ceb2a9e2406f33e69577a54c5",
+    "change_count": 3,
+    "type_routines": [
+      {
+        "oid": 40002,
+        "schema": "app",
+        "name": "checked",
+        "arguments": [
+          "integer"
+        ],
+        "definition": "CREATE FUNCTION app.checked(integer) RETURNS boolean LANGUAGE sql RETURN $1 > 0; -- type\nline\r\"'\u001b[31m\\‮名前domain"
+      }
+    ],
+    "type_routine_approval": "Approving this plan approves the shown routines, whatever they call as those routines stand at plan time, and any SQL they build from data that pbps cannot show.",
+    "table_count": 1,
+    "module_count": 0,
+    "role_count": 0,
+    "risks": [],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 365c38329dac9e406cdac8f5cdf71b67cbab531ceb2a9e2406f33e69577a54c5",
+    "probes": [],
+    "unchecked": [
+      {
+        "check": "type conversion of app.typed.id",
+        "reason": "the column does not exist before apply"
+      }
+    ],
+    "statement_count": 3
+  }
+}

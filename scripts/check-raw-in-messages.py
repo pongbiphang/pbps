@@ -4,8 +4,8 @@
 A name or a free text that can come from an artifact has no `Display`: it is
 used as text only through `.shown()`, which escapes it, or `.raw()`, which does
 not (`pbps_model::Text`, `TableName`/`ObjectName`, `ColumnRef`, `RoutineArg`,
-`RoutineId`, `ModuleId`, `ColumnName`, `RoleName`, `ObjectLocalName` and `GrantTarget` today; the
-remaining name types follow in #2084). The compiler forces that choice but cannot
+`RoutineId`, `ModuleId`, `ColumnName`, `RoleName`, `ObjectLocalName`, `GrantTarget`,
+`TypeRef`, `ColumnType` and `TypeArg`). The compiler forces that choice but cannot
 stop `.raw()` being the one chosen for a message, and an unescaped line break in
 a message starts a line the tool never wrote. This is the one hole the types
 leave, so this check closes it.
@@ -67,6 +67,26 @@ SQL_BUILDERS = {
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
+    "crates/pbps-model/src/types.rs": (
+        4,
+        "three shown adapters escape canonical raw spelling and the column type's "
+        "canonical formatter renders its argument raw; these remain after #2084 step 5",
+    ),
+    "crates/pbps-mssql/src/types.rs": (
+        2,
+        "type-reference and array refusals feed whole-escaped DialectError fields "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-pg/src/types.rs": (
+        2,
+        "serial and overlong-reference refusals feed whole-escaped DialectError fields "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-pg/src/type_refs.rs": (
+        2,
+        "one type name in a SQL RAISE literal retained until #2084 step 5 "
+        "and one test cast expression that keeps raw SQL bytes",
+    ),
     "crates/pbps-cli/src/baseline.rs": (
         2,
         "role subjects are raw grouping keys, which remain raw after #2084 step 5",
@@ -134,7 +154,7 @@ ALLOWED = {
     # adapters and fixture builders are counted too, so a new raw message in
     # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        67,
+        70,
         "Canonical shell arguments and describe() names stay raw: the latter is "
         "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",
@@ -145,7 +165,7 @@ ALLOWED = {
         "#2084 step 5 removes the shared-sentence boundary",
     ),
     "crates/pbps-dialect/src/lib.rs": (
-        27,
+        28,
         "Unchecked::for_change labels are shared JSON/explain prose, and column "
         "validation feeds whole-escaped DialectError fields until #2084 step 5",
     ),
@@ -155,14 +175,14 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        69,
+        73,
         "validation sentences, including the #2084 routine-argument refusal, "
         "feed whole-escaped DialectError fields; the #1450 declaration note "
         "feeds the whole-escaped `dialect.not-checked` note "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/lib.rs": (
-        29,
+        38,
         "schema/table/column validation feeds whole-escaped DialectError::Invalid "
         "and cycling-expression declaration notes feed whole-escaped dialect.not-checked "
         "until #2084 step 5",
@@ -173,12 +193,12 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/partition_series.rs": (
-        24,
+        25,
         "series refusals and frontier descriptions feed whole-escaped "
         "DialectError::Invalid until #2084 step 5",
     ),
     "crates/pbps-policy/src/evaluate.rs": (
-        10,
+        15,
         "policy sentences are shared JSON and findings that report::changes "
         "escapes whole until #2084 step 5; subjects remain raw identity keys",
     ),
@@ -219,7 +239,7 @@ ALLOWED = {
         "builds fixture SQL, whose identifiers remain raw after #2084 step 5",
     ),
     "crates/pbps-pg/tests/live.rs": (
-        3,
+        5,
         "builds a routine's fixture SQL; SQL remains raw after #2084 step 5",
     ),
     "crates/pbps-cli/tests/flow_pg.rs": (
@@ -268,7 +288,7 @@ ALLOWED = {
         'removal descriptions are recorded state and logical-slot/numbered-column labels are connected-check JSON; text boundaries escape once until #2084 step 5',
     ),
     "crates/pbps-mssql/src/estimate.rs": (
-        3,
+        4,
         'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
     ),
     "crates/pbps-mssql/src/introspect.rs": (
@@ -276,7 +296,7 @@ ALLOWED = {
         'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
     ),
     "crates/pbps-pg/src/estimate.rs": (
-        35,
+        36,
         'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
     ),
     "crates/pbps-pg/src/impact.rs": (
@@ -307,7 +327,7 @@ ALLOWED = {
         "quotes a raw foreign-key name into catalog probe SQL; SQL remains raw after #2084 step 5",
     ),
     "crates/pbps-docs/src/erd.rs": (
-        1,
+        2,
         "writes a Mermaid document label through its own quoted() escaping; document bytes remain raw after #2084 step 5",
     ),
 }

@@ -374,7 +374,9 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     about: format!(
                         "changing {column} to {to} {}",
                         if to_nullable { "NULL" } else { "NOT NULL" },
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     ),
                     table: column.table.clone(),
                     rewrite,

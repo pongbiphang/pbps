@@ -48,6 +48,19 @@ pub enum TypeParseError {
 }
 
 /// A type argument.
+///
+/// Rendering requires an explicit choice between canonical data and human text.
+///
+/// ```compile_fail,E0277
+/// let value = pbps_model::TypeArg::Max;
+/// let _ = format!("{}", value);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let value = pbps_model::TypeArg::Max;
+/// let _ = value.to_string();
+/// ```
+///
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -63,9 +76,37 @@ pub enum TypeArg {
     Ident(String),
 }
 
-impl fmt::Display for TypeArg {
+impl TypeArg {
+    /// The canonical spelling for SQL, serialization and identity comparisons.
+    #[must_use]
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawTypeArg(self)
+    }
+
+    /// The canonical spelling for a person, escaped exactly once.
+    #[must_use]
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownTypeArg(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawTypeArg<'a>(&'a TypeArg);
+
+#[derive(Clone, Copy)]
+struct ShownTypeArg<'a>(&'a TypeArg);
+
+impl fmt::Display for ShownTypeArg<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        // Escape one value's canonical spelling, keeping its quoting and
+        // punctuation identical to the data formatter (DEC-2084.1).
+        write!(f, "{}", crate::escape::Escaped(&self.0.raw().to_string()))
+    }
+}
+
+impl fmt::Display for RawTypeArg<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
             TypeArg::Int(n) => write!(f, "{n}"),
             TypeArg::Max => f.write_str("max"),
             TypeArg::Ident(s) => f.write_str(s),
@@ -85,6 +126,19 @@ impl fmt::Display for TypeArg {
 /// therefore always contains a `.` and never equals a catalogue name, so a
 /// check such as `ty.base == "jsonb"` fails closed for it. The model only
 /// holds the reference: whether the dialect admits one is the dialect's call.
+///
+/// Rendering requires an explicit choice between canonical data and human text.
+///
+/// ```compile_fail,E0277
+/// let value = "integer".parse::<pbps_model::ColumnType>().unwrap();
+/// let _ = format!("{}", value);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let value = "integer".parse::<pbps_model::ColumnType>().unwrap();
+/// let _ = value.to_string();
+/// ```
+///
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -122,7 +176,7 @@ impl ColumnType {
     /// catalogue name.
     pub fn reference(user: TypeRef) -> Self {
         Self {
-            base: user.to_string(),
+            base: user.raw().to_string(),
             args: Vec::new(),
             args_after_word: None,
             array: false,
@@ -166,7 +220,9 @@ impl ColumnType {
     /// remains after the complete name, preserving existing serialized types.
     pub fn with_args_after_word(mut self, words: usize) -> Result<Self, TypeParseError> {
         if self.args.is_empty() || words == 0 || words >= self.base.split_whitespace().count() {
-            return Err(TypeParseError::BadArgumentPosition(self.to_string()));
+            return Err(TypeParseError::BadArgumentPosition(
+                self.shown().to_string(),
+            ));
         }
         self.base = self.base.split_whitespace().collect::<Vec<_>>().join(" ");
         self.args_after_word = Some(words);
@@ -193,25 +249,58 @@ impl ColumnType {
     }
 }
 
-impl fmt::Display for ColumnType {
+impl ColumnType {
+    /// The canonical spelling for SQL, serialization and identity comparisons.
+    #[must_use]
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawColumnType(self)
+    }
+
+    /// The canonical spelling for a person, escaped exactly once.
+    #[must_use]
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownColumnType(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawColumnType<'a>(&'a ColumnType);
+
+#[derive(Clone, Copy)]
+struct ShownColumnType<'a>(&'a ColumnType);
+
+impl fmt::Display for ShownColumnType<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let boundary = self
-            .args_after_word
-            .and_then(|words| self.base.match_indices(' ').nth(words - 1).map(|(i, _)| i));
-        let (before, after) = boundary.map_or((self.base.as_str(), ""), |i| self.base.split_at(i));
+        // Escape one value's canonical spelling, keeping its quoting and
+        // punctuation identical to the data formatter (DEC-2084.1).
+        write!(f, "{}", crate::escape::Escaped(&self.0.raw().to_string()))
+    }
+}
+
+impl fmt::Display for RawColumnType<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let boundary = self.0.args_after_word.and_then(|words| {
+            self.0
+                .base
+                .match_indices(' ')
+                .nth(words - 1)
+                .map(|(i, _)| i)
+        });
+        let (before, after) =
+            boundary.map_or((self.0.base.as_str(), ""), |i| self.0.base.split_at(i));
         f.write_str(before)?;
-        if !self.args.is_empty() {
+        if !self.0.args.is_empty() {
             f.write_str("(")?;
-            for (i, a) in self.args.iter().enumerate() {
+            for (i, a) in self.0.args.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                write!(f, "{a}")?;
+                write!(f, "{}", a.raw())?;
             }
             f.write_str(")")?;
         }
         f.write_str(after)?;
-        if self.array {
+        if self.0.array {
             f.write_str("[]")?;
         }
         Ok(())
@@ -335,6 +424,19 @@ fn names_a_type_reference(s: &str) -> bool {
 /// - a temporary schema (`pg_temp`, `pg_temp_3`), whose types belong to one
 ///   session;
 /// - `U&"…"` escapes, three-part names and a part that is empty.
+///
+/// Rendering requires an explicit choice between canonical data and human text.
+///
+/// ```compile_fail,E0277
+/// let value = pbps_model::TypeRef::new("app", "mood").unwrap();
+/// let _ = format!("{}", value);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let value = pbps_model::TypeRef::new("app", "mood").unwrap();
+/// let _ = value.to_string();
+/// ```
+///
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeRef {
     schema: String,
@@ -347,7 +449,7 @@ impl TypeRef {
     pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Result<Self, TypeParseError> {
         let user = Self::unchecked(schema.into(), name.into());
         match user.problem() {
-            Some(reason) => Err(bad_reference(&user.to_string(), reason)),
+            Some(reason) => Err(bad_reference(&user.shown().to_string(), reason)),
             None => Ok(user),
         }
     }
@@ -379,11 +481,39 @@ impl TypeRef {
 /// The canonical text: a part is bare when it would read back as itself
 /// unquoted, and double-quoted (with `"` doubled) otherwise, so one reference
 /// has one spelling.
-impl fmt::Display for TypeRef {
+impl TypeRef {
+    /// The canonical spelling for SQL, serialization and identity comparisons.
+    #[must_use]
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawTypeRef(self)
+    }
+
+    /// The canonical spelling for a person, escaped exactly once.
+    #[must_use]
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownTypeRef(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawTypeRef<'a>(&'a TypeRef);
+
+#[derive(Clone, Copy)]
+struct ShownTypeRef<'a>(&'a TypeRef);
+
+impl fmt::Display for ShownTypeRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_part(f, &self.schema)?;
+        // Escape one value's canonical spelling, keeping its quoting and
+        // punctuation identical to the data formatter (DEC-2084.1).
+        write!(f, "{}", crate::escape::Escaped(&self.0.raw().to_string()))
+    }
+}
+
+impl fmt::Display for RawTypeRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_part(f, &self.0.schema)?;
         f.write_str(".")?;
-        write_part(f, &self.name)
+        write_part(f, &self.0.name)
     }
 }
 
@@ -548,7 +678,7 @@ impl TryFrom<String> for ColumnType {
 
 impl From<ColumnType> for String {
     fn from(v: ColumnType) -> String {
-        v.to_string()
+        v.raw().to_string()
     }
 }
 
@@ -592,7 +722,7 @@ mod tests {
         let t = p("nvarchar(MAX)");
         assert!(t.is_max());
         assert_eq!(t.first_int_arg(), None, "max is not a length of zero");
-        assert_eq!(t.to_string(), "nvarchar(max)");
+        assert_eq!(t.raw().to_string(), "nvarchar(max)");
     }
 
     #[test]
@@ -607,7 +737,7 @@ mod tests {
     #[test]
     fn display_round_trips() {
         for s in ["bigint", "nvarchar(100)", "decimal(18, 2)", "nvarchar(max)"] {
-            assert_eq!(p(s).to_string(), s, "{s} did not round-trip");
+            assert_eq!(p(s).raw().to_string(), s, "{s} did not round-trip");
         }
     }
 
@@ -619,8 +749,8 @@ mod tests {
                 let ty = p(&spelling);
                 assert_eq!(ty.base, format!("{name} {zone} time zone"));
                 assert_eq!(ty.args_after_word(), Some(1));
-                assert_eq!(ty.to_string(), spelling);
-                assert_eq!(p(&ty.to_string()), ty);
+                assert_eq!(ty.raw().to_string(), spelling);
+                assert_eq!(p(&ty.raw().to_string()), ty);
                 let json = serde_json::to_string(&ty).unwrap();
                 assert_eq!(json, format!("\"{spelling}\""));
                 assert_eq!(serde_json::from_str::<ColumnType>(&json).unwrap(), ty);
@@ -660,7 +790,7 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|e| panic!("{spelling}: {e}"));
             assert!(ty.is_array(), "{spelling}");
-            assert_eq!(ty.to_string(), written, "{spelling}");
+            assert_eq!(ty.raw().to_string(), written, "{spelling}");
             assert_eq!(written.parse::<ColumnType>().unwrap(), ty, "{spelling}");
             assert!(!ty.element().is_array());
             assert_ne!(ty.element(), ty, "{spelling}");
@@ -747,7 +877,7 @@ mod tests {
             ("app.\u{c4}type", "app.\"\u{c4}type\""),
         ] {
             let ty = reference(spelling);
-            assert_eq!(ty.to_string(), canonical, "{spelling}");
+            assert_eq!(ty.raw().to_string(), canonical, "{spelling}");
             assert_eq!(reference(canonical), ty, "{spelling}");
             assert!(ty.type_ref().is_some(), "{spelling}");
             assert!(ty.args.is_empty() && ty.args_after_word().is_none());
@@ -799,9 +929,9 @@ mod tests {
     fn a_type_reference_built_from_parts_keeps_them_unfolded() {
         let user = TypeRef::new("App", "Mood").unwrap();
         let ty = ColumnType::reference(user.clone());
-        assert_eq!(ty.to_string(), "\"App\".\"Mood\"");
+        assert_eq!(ty.raw().to_string(), "\"App\".\"Mood\"");
         assert_eq!(ty.type_ref(), Some(&user));
-        assert_eq!(reference(&ty.to_string()), ty);
+        assert_eq!(reference(&ty.raw().to_string()), ty);
         assert!(TypeRef::new("app", "").is_err());
         assert!(TypeRef::new("", "mood").is_err());
         assert!(TypeRef::new("pg_temp", "mood").is_err());
@@ -897,8 +1027,8 @@ mod tests {
                 assert!(user.schema() == part || user.name() == part, "{spelling}");
                 // The whole part survives, uncut, and the canonical text reads
                 // back as the same value.
-                assert!(ty.to_string().contains(&part), "{spelling}");
-                assert_eq!(reference(&ty.to_string()), ty, "{spelling}");
+                assert!(ty.raw().to_string().contains(&part), "{spelling}");
+                assert_eq!(reference(&ty.raw().to_string()), ty, "{spelling}");
                 assert_eq!(
                     serde_json::from_str::<ColumnType>(&serde_json::to_string(&ty).unwrap())
                         .unwrap(),
@@ -910,7 +1040,7 @@ mod tests {
             // will.
             let user = TypeRef::new(part.clone(), part.clone()).unwrap();
             assert_eq!((user.schema(), user.name()), (part.as_str(), part.as_str()));
-            assert_eq!(reference(&user.to_string()).type_ref(), Some(&user));
+            assert_eq!(reference(&user.raw().to_string()).type_ref(), Some(&user));
         }
         // The other rules do not depend on length: a long temporary schema and a
         // long `_` name are still refused, and so is an empty part.
@@ -967,7 +1097,7 @@ mod tests {
         ] {
             let ty = reference(spelling);
             assert!(ty.type_ref().is_none(), "{spelling}");
-            assert_eq!(ty.to_string(), written, "{spelling}");
+            assert_eq!(ty.raw().to_string(), written, "{spelling}");
             assert_eq!(
                 serde_json::to_string(&ty).unwrap(),
                 format!("\"{written}\""),
@@ -985,5 +1115,104 @@ mod tests {
     #[test]
     fn aliases_are_left_alone() {
         assert_ne!(p("integer"), p("int"));
+    }
+
+    const HOSTILE: &str = "type\nline\r\t\u{1b}\u{9b}\\\u{202e}\"名前";
+    const VISIBLE: &str = r#"type\nline\r\t\u{1b}\u{9b}\\\u{202e}"名前"#;
+
+    #[test]
+    fn type_adapters_preserve_canonical_syntax_and_escape_only_the_human_spelling() {
+        let user = TypeRef::new("app", HOSTILE).unwrap();
+        let canonical = "app.\"type\nline\r\t\u{1b}\u{9b}\\\u{202e}\"\"名前\"";
+        let visible = r#"app."type\nline\r\t\u{1b}\u{9b}\\\u{202e}""名前""#;
+        assert_eq!(user.raw().to_string(), canonical);
+        assert_eq!(user.shown().to_string(), visible);
+        assert_ne!(user.raw().to_string(), user.shown().to_string());
+        let scalar = ColumnType::reference(user.clone());
+        let array = scalar.clone().into_array();
+        assert_eq!(scalar.raw().to_string(), canonical);
+        assert_eq!(scalar.shown().to_string(), visible);
+        assert_eq!(array.raw().to_string(), format!("{canonical}[]"));
+        assert_eq!(array.shown().to_string(), format!("{visible}[]"));
+        for (ty, spelling) in [
+            (TypeArg::Int(i64::MIN), i64::MIN.to_string()),
+            (TypeArg::Max, "max".into()),
+        ] {
+            assert_eq!(ty.raw().to_string(), spelling);
+            assert_eq!(ty.shown().to_string(), spelling);
+        }
+        let arg = TypeArg::Ident(HOSTILE.into());
+        assert_eq!(arg.raw().to_string(), HOSTILE);
+        assert_eq!(arg.shown().to_string(), VISIBLE);
+        for text in [
+            "integer",
+            "decimal(18, 4)",
+            "nvarchar(max)",
+            "timestamp(3) with time zone[]",
+        ] {
+            let ty: ColumnType = text.parse().unwrap();
+            assert_eq!(ty.raw().to_string(), text);
+            assert_eq!(ty.shown().to_string(), text);
+        }
+    }
+
+    #[test]
+    fn canonical_type_keys_keep_raw_controls_distinct_from_their_shown_lookalikes() {
+        let user = TypeRef::new("app", HOSTILE).unwrap();
+        let lookalike = TypeRef::new("app", VISIBLE).unwrap();
+        let ty = ColumnType::reference(user.clone());
+        assert_eq!(
+            ty.base,
+            "app.\"type\nline\r\t\u{1b}\u{9b}\\\u{202e}\"\"名前\""
+        );
+        assert_ne!(ty.base, user.shown().to_string());
+        let other = ColumnType::reference(lookalike.clone());
+        assert_ne!(ty, other);
+        assert_eq!(std::collections::BTreeSet::from([user, lookalike]).len(), 2);
+        for ty in [ty, other] {
+            let raw = String::from(ty.clone());
+            assert_eq!(raw, ty.raw().to_string());
+            assert_eq!(raw.parse::<ColumnType>().unwrap(), ty);
+            let json = serde_json::to_string(&ty).unwrap();
+            assert_eq!(json, serde_json::to_string(&raw).unwrap());
+            assert_eq!(serde_json::from_str::<ColumnType>(&json).unwrap(), ty);
+        }
+    }
+
+    #[test]
+    fn named_argument_keys_serialize_canonical_text_without_showing_it() {
+        let raw = "\"arg\n\\\u{1b}\u{9b}\u{200b}名前\"";
+        let ty = ColumnType::new("timestamp with time zone", vec![TypeArg::Ident(raw.into())])
+            .with_args_after_word(1)
+            .unwrap()
+            .into_array();
+        let canonical = format!("timestamp({raw}) with time zone[]");
+        let shown = r#"timestamp("arg\n\\\u{1b}\u{9b}\u{200b}名前") with time zone[]"#;
+        assert_eq!(ty.raw().to_string(), canonical);
+        assert_eq!(String::from(ty.clone()), canonical);
+        assert_eq!(ty.shown().to_string(), shown);
+        assert_ne!(canonical, shown);
+        assert_eq!(canonical.parse::<ColumnType>().unwrap(), ty);
+        assert_ne!(shown.parse::<ColumnType>().unwrap(), ty);
+        assert_eq!(
+            serde_json::to_string(&ty).unwrap(),
+            serde_json::to_string(&canonical).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_parse_error_operands_are_shown_once() {
+        let error = ColumnType::new("integer", vec![TypeArg::Ident("line\n\\x".into())])
+            .with_args_after_word(0)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r"the argument position in type `integer(line\n\\x)` must be between name words"
+        );
+        let error = TypeRef::new("", "line\n\\x").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r#"`""."line\n\\x"` is not a user-defined type reference pbps can hold: a name part is empty. Write `schema.name`, each part optionally in double quotes, optionally followed by `[]`"#
+        );
     }
 }

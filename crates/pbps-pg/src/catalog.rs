@@ -2959,7 +2959,7 @@ async fn ask_about_partition_defaults(
             // change after the read below. Only a superuser reaches one,
             // and only by naming it: a non-superuser is refused `USAGE`
             // and no path searches one, measured on 16 and 18 (#1706).
-            let declared_ty = theirs.ty.to_string();
+            let declared_ty = theirs.ty.raw().to_string();
             if [own, parents, declared_ty.as_str()]
                 .into_iter()
                 .any(may_name_a_temporary_schema)
@@ -2981,12 +2981,13 @@ async fn ask_about_partition_defaults(
                     column,
                     own,
                     parents,
-                    ty: ty.to_string(),
+                    ty: ty.raw().to_string(),
                 }),
                 Err(_) => out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its type `{}` is not one this \
                      check can create a column of",
-                    theirs.ty,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    theirs.ty.raw(),
                     // raw: shared warning is escaped by its human writers until #2084 step 5.
                     partition = partition.raw(),
                     // raw: shared warning is escaped by its human writers until #2084 step 5.
@@ -5293,5 +5294,18 @@ mod tests {
             OURS.len() * 2 + 4,
             "the schema, two names, and the `r` that says which kind: {not_one_of_our_tables}"
         );
+    }
+
+    #[test]
+    fn temporary_schema_type_scans_keep_canonical_raw_spelling() {
+        for (schema, temporary) in [("app", false), ("app_pg_temp", true)] {
+            let user = pbps_model::TypeRef::new(schema, "type\n\\\u{1b}\"名前").unwrap();
+            let ty = pbps_model::ColumnType::reference(user.clone());
+            let raw = String::from(ty.clone());
+            assert_eq!(raw, user.raw().to_string());
+            assert_ne!(raw, ty.shown().to_string());
+            assert_eq!(may_name_a_temporary_schema(&raw), temporary);
+            assert_eq!(raw.parse::<pbps_model::ColumnType>().unwrap(), ty);
+        }
     }
 }

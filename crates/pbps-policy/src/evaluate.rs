@@ -212,7 +212,8 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                         Some(&subject),
                         format!(
                             "{name}.{column}: `{}` {advice}",
-                            spec.ty,
+                            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                            spec.ty.raw(),
                             name = name.raw(),
                             // raw: whole-message escaped until #2084 step 5.
                             column = column.raw(),
@@ -441,14 +442,22 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                         "{column}: {from} -> {to} narrows or converts an array's elements, \
                          which pbps does not do: the plan is refused when it is computed \
                          against a database",
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        from = from.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     )
                 } else {
                     format!(
                         "{column}: {from} -> {to} depends on what is already stored; the \
                          pre-flight probe counts the rows that would not fit before the \
                          first statement runs",
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        from = from.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     )
                 };
                 out.extend(live.finding(Some(&subject), message).map(|f| (i, f)));
@@ -1244,5 +1253,54 @@ mod tests {
         assert!(parse_window("mon 17:00-09:00").is_err());
         assert!(parse_window("weekdays").is_err());
         assert!(parse_window("mon-fri 9-17").is_err());
+    }
+
+    #[test]
+    fn policy_type_messages_keep_raw_saved_plan_data() {
+        let raw = "type\n\\\u{1b}\"名前";
+        let canonical = "app.\"type\n\\\u{1b}\"\"名前\"";
+        for array in [false, true] {
+            let from = ColumnType::simple("integer");
+            let to = ColumnType::reference(pbps_model::TypeRef::new("app", raw).unwrap());
+            let (from, to, suffix) = if array {
+                (from.into_array(), to.into_array(), "[]")
+            } else {
+                (from, to, "")
+            };
+            let mut change = PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table().column("n"),
+                from,
+                to,
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            });
+            change.risks.insert(RiskClass::Narrowing);
+            let findings = plan(&cs(vec![change.clone()]), &Policies::default(), &ctx());
+            let finding = &findings
+                .iter()
+                .find(|(_, f)| f.id == "change.narrowing-on-data")
+                .unwrap()
+                .1;
+            let reason = if array {
+                "narrows or converts an array's elements, which pbps does not do: the plan is refused when it is computed against a database"
+            } else {
+                "depends on what is already stored; the pre-flight probe counts the rows that would not fit before the first statement runs"
+            };
+            assert_eq!(
+                finding.message,
+                format!("dbo.customer.n: integer{suffix} -> {canonical}{suffix} {reason}")
+            );
+            assert!(finding.message.contains('\n'));
+            change.risks.remove(&RiskClass::Narrowing);
+            assert!(
+                !plan(&cs(vec![change]), &Policies::default(), &ctx())
+                    .iter()
+                    .any(|(_, f)| f.id == "change.narrowing-on-data")
+            );
+        }
     }
 }

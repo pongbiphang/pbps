@@ -335,7 +335,7 @@ impl InputPath {
     /// or `None` when it can. Each refusal says which case it is.
     #[must_use]
     pub fn refusal(&self, reference: &TypeRef) -> Option<String> {
-        let name = reference.to_string();
+        let name = reference.shown().to_string();
         Some(match self {
             Self::Admitted(_) => return None,
             Self::Refused(reasons) => {

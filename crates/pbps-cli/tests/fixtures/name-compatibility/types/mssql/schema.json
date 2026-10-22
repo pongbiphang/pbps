@@ -1,0 +1,1 @@
+{"tables":{"app.typed":{"columns":{"id":{"type":"int","nullable":false},"amount":{"type":"decimal(18, 4)","nullable":true},"body":{"type":"nvarchar(max)","nullable":true},"at":{"type":"datetime2(3)","nullable":true},"added":{"type":"nvarchar(max)","nullable":true}}}}}

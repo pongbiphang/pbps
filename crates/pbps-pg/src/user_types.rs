@@ -167,7 +167,7 @@ impl TypeRead {
     /// refusal says which of the cases it is.
     #[must_use]
     pub fn refusal(&self, reference: &TypeRef) -> Option<String> {
-        let name = reference.to_string();
+        let name = reference.shown().to_string();
         Some(match self {
             Self::Present(_) => return None,
             Self::Absent => format!(

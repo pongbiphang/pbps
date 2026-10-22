@@ -572,6 +572,8 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
             parent = parent.raw(),
             // raw: whole-message escaped until #2084 step 5.
             column = column.raw(),
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            ty = ty.raw(),
         ))
     })?;
 

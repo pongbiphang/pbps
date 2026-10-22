@@ -5563,7 +5563,8 @@ pub async fn check_type_pins(
             .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
         {
             anyhow::bail!(
-                "plan has no type pin for `{reference}`; plan again against the database"
+                "plan has no type pin for `{reference}`; plan again against the database",
+                reference = reference.shown(),
             );
         }
     }

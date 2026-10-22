@@ -170,7 +170,7 @@ pub fn query(
             table: name.clone(),
             why: format!(
                 "its column `{column}` is `{}`, a user-defined type reference, and pbps reads no rows of this type",
-                spec.ty,
+                spec.ty.shown(),
                 column = column.shown()
             ),
         });
@@ -185,7 +185,7 @@ pub fn query(
             why: format!(
                 "its column `{column}` is `{}`, an array, and pbps reads no rows of a table \
                  with an array column",
-                spec.ty,
+                spec.ty.shown(),
                 column = column.shown(),
             ),
         });
@@ -287,7 +287,9 @@ pub fn query(
                 let default_expr = format!("({})", crate::emit::verbatim(default));
                 let declared = crate::emit::binary(&read_expr(&format!(
                     "CAST({default_expr} AS {})",
-                    crate::types::normalize(&spec.ty).unwrap_or_else(|_| spec.ty.clone())
+                    crate::types::normalize(&spec.ty)
+                        .unwrap_or_else(|_| spec.ty.clone())
+                        .raw()
                 )));
                 select.push(format!(
                     // Both halves, because `=` is UNKNOWN for a NULL on either
@@ -1260,7 +1262,7 @@ pub fn spelling_queries(
             table: name.clone(),
             why: e.to_string(),
         })?;
-        Ok((ty.base.clone(), ty.to_string()))
+        Ok((ty.base.clone(), ty.raw().to_string()))
     };
     let query = |column: Option<ColumnName>,
                  base: &str,
@@ -1456,7 +1458,7 @@ pub fn bound_spelling_queries(
                     table: name.clone(),
                     why: e.to_string(),
                 })?;
-            let ty = normalized.to_string();
+            let ty = normalized.raw().to_string();
             let readable = format!("pg_catalog.pg_input_is_valid(v.s, {})", value_literal(&ty));
             let rendered = read_expr(&format!("CAST(v.s AS {ty})"));
             let list = values
@@ -1548,6 +1550,7 @@ pub fn list_collision_queries(
                 table: parent.clone(),
                 why: e.to_string(),
             })?
+            .raw()
             .to_string();
         let readable = format!("pg_catalog.pg_input_is_valid(v.s, {})", value_literal(&ty));
         let list = entries
@@ -1935,6 +1938,8 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
             name = name.raw(),
             // raw: whole-message escaped until #2084 step 5.
             key = key.raw(),
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            ty = ty.raw(),
         ));
     }
     out
