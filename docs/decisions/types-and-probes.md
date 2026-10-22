@@ -2456,3 +2456,23 @@ parent-routed writers, restores own defaults, continues beyond rows in the
 attached and external partitions, confirms source and column removal, and
 refuses an identity conversion by name and a sequence dependency outside
 the partition tree.
+
+<a id="dec-1172-3"></a>
+
+**DEC-1172.3. A row count filtered by active row security is unchecked.**
+(#1172 PR C.) PostgreSQL counting probes ask `row_security_active` in the
+executing session for every relation they read; a foreign-key count asks both
+ends. An active filter returns a NULL count, which the existing pre-flight
+reader reports as unchecked, never passed. The count SQL stays text until the
+guard permits it: a plain CASE subquery is still planned and can constant-fold
+an immutable policy function even when its count is skipped. Measured on both
+versions, the plain form advanced a sequence from such a function; delayed
+compilation through query_to_xml did not. Catalog compatibility questions
+remain checkable. Existing hidden-child delete refusals remain stronger than
+this fallback. pbps never sets `row_security = off` or changes principal to
+make a count look complete. Measured on PostgreSQL 16.15 and 18.6: a hidden
+NULL gave a zero count, while SET NOT NULL still refused it; a hidden primary
+key duplicate still refused INSERT. Owner bypass, FORCE and NOINHERIT owner
+membership make the session's effective answer necessary, rather than the
+catalog's enabled flag. The engine enforces constraints transactionally when
+pre-flight cannot prove them (SPEC §7.5).

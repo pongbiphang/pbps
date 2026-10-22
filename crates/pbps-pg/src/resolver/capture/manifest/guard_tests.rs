@@ -448,3 +448,141 @@ fn a_serials_sequence_and_default_belong_to_its_column() {
         assert_eq!(plain[&attrdef], ObjectOwnership::Unqualified, "PG{major}");
     }
 }
+
+#[test]
+fn declared_policies_and_their_edges_have_exact_table_ownership() {
+    for major in [16, 18] {
+        let (mut captured, mut schema, ids) = generated_attrdef_fixture(major);
+        let table = TableName::new("app", "t");
+        let relation = relation_identity(&table);
+        schema.tables.get_mut(&table).unwrap().row_policies.insert(
+            "visible".into(),
+            pbps_model::RowPolicy {
+                using: Some("app.external(a) > 0".into()),
+                ..Default::default()
+            },
+        );
+        let policy = identity("pg_policy", &["visible"], vec![relation.clone()]);
+        let stray = identity("pg_policy", &["stray"], vec![relation.clone()]);
+        for (object, name) in [(&policy, "visible"), (&stray, "stray")] {
+            captured.inputs.insert(
+                object.clone(),
+                input(BTreeMap::from([
+                    ("polrelid".into(), json!(&relation)),
+                    ("polname".into(), json!(name)),
+                ])),
+            );
+        }
+        let external = identity("pg_proc", &["app", "external"], vec![]);
+        captured.inputs.insert(
+            external.clone(),
+            input(BTreeMap::from([("prokind".into(), json!("f"))])),
+        );
+        let column = identity("column", &["a"], vec![relation.clone()]);
+        let edges = [
+            identity("pg_depend", &["a"], vec![policy.clone(), relation.clone()]),
+            identity("pg_depend", &["n"], vec![policy.clone(), column]),
+            identity("pg_depend", &["n"], vec![policy.clone(), external.clone()]),
+        ];
+        for edge in &edges {
+            captured.inputs.insert(edge.clone(), input(BTreeMap::new()));
+        }
+        let stray_edge = identity("pg_depend", &["a"], vec![stray.clone(), relation]);
+        captured
+            .inputs
+            .insert(stray_edge.clone(), input(BTreeMap::new()));
+        let other = identity("pg_class", &["app", "other"], vec![]);
+        let same_name_elsewhere = identity("pg_policy", &["visible"], vec![other.clone()]);
+        captured.inputs.insert(
+            other.clone(),
+            input(BTreeMap::from([("relkind".into(), json!("r"))])),
+        );
+        captured.inputs.insert(
+            same_name_elsewhere.clone(),
+            input(BTreeMap::from([
+                ("polrelid".into(), json!(other)),
+                ("polname".into(), json!("visible")),
+            ])),
+        );
+        let foreign_reference = identity(
+            "pg_depend",
+            &["n"],
+            vec![
+                same_name_elsewhere.clone(),
+                identity("column", &["a"], vec![relation_identity(&table)]),
+            ],
+        );
+        captured
+            .inputs
+            .insert(foreign_reference.clone(), input(BTreeMap::new()));
+        let found = classify_attrdefs(&captured, &schema, &ids).unwrap();
+        let owner = ObjectOwnership::Surface(Surface::Table(table));
+        assert_eq!(found.get(&policy), Some(&owner));
+        for edge in &edges {
+            assert_eq!(found.get(edge), Some(&owner));
+        }
+        for unowned in [
+            &stray,
+            &stray_edge,
+            &external,
+            &same_name_elsewhere,
+            &foreign_reference,
+        ] {
+            assert_eq!(found.get(unowned), Some(&ObjectOwnership::Unqualified));
+        }
+    }
+}
+
+#[test]
+fn policy_ownership_refuses_unreadable_or_mismatched_catalog_provenance() {
+    for major in [16, 18] {
+        for broken in [
+            "missing-parent",
+            "wrong-parent",
+            "missing-name",
+            "wrong-name",
+            "missing-root",
+        ] {
+            let (mut captured, mut schema, ids) = generated_attrdef_fixture(major);
+            let table = TableName::new("app", "t");
+            let relation = relation_identity(&table);
+            schema
+                .tables
+                .get_mut(&table)
+                .unwrap()
+                .row_policies
+                .insert("visible".into(), Default::default());
+            let policy = identity("pg_policy", &["visible"], vec![relation.clone()]);
+            let mut properties = BTreeMap::from([
+                ("polrelid".into(), json!(&relation)),
+                ("polname".into(), json!("visible")),
+            ]);
+            match broken {
+                "missing-parent" => {
+                    properties.remove("polrelid");
+                }
+                "wrong-parent" => {
+                    properties.insert(
+                        "polrelid".into(),
+                        json!(identity("pg_class", &["app", "other"], vec![])),
+                    );
+                }
+                "missing-name" => {
+                    properties.remove("polname");
+                }
+                "wrong-name" => {
+                    properties.insert("polname".into(), json!("stray"));
+                }
+                "missing-root" => {
+                    captured.inputs.remove(&relation);
+                }
+                _ => unreachable!(),
+            }
+            captured.inputs.insert(policy, input(properties));
+            assert!(
+                classify_attrdefs(&captured, &schema, &ids).is_err(),
+                "PG{major}: {broken}"
+            );
+        }
+    }
+}

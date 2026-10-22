@@ -185,9 +185,18 @@ impl Created<'_> {
         moved: &mut Vec<String>,
     ) {
         let declared = self.declared;
-        // No policy operation can own these fields yet (DEC-1172.1).
-        if &declared.row_security != now.row_security || &declared.row_policies != now.row_policies
-        {
+        // The policy predicates are deparsed, as checks are. Their presence
+        // and every non-expression field still have to match (SPEC §7.6).
+        let flags_match = &declared.row_security == now.row_security
+            || (!settled.whole() && now.row_security.is_default());
+        let policies_match = now.row_policies.iter().all(|(name, policy)| {
+            declared
+                .row_policies
+                .get(name)
+                .is_some_and(|p| p.agrees_when_written(policy))
+        }) && (!settled.whole()
+            || declared.row_policies.len() == now.row_policies.len());
+        if !flags_match || !policies_match {
             moved.push(format!(
                 "{} row-security flags or policies are not what this plan declares",
                 now_name.shown()

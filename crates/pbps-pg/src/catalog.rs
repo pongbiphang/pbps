@@ -120,8 +120,8 @@ fn not_one_of_our_tables() -> String {
     format!("(c.relkind <> 'r' OR {})", not_one_of_ours())
 }
 
-/// Structurally representable tables, including RLS metadata not yet adopted
-/// until PR C (DEC-1172.4), and every member of a supported partition tree.
+/// Structurally representable ordinary tables, including row security,
+/// and every member of a supported partition tree.
 fn tables_query() -> String {
     let not_one_of_ours = not_one_of_ours();
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
@@ -354,9 +354,7 @@ macro_rules! identity_names_no_index {
 }
 const IDENTITY_NAMES_NO_INDEX: &str = identity_names_no_index!();
 
-/// The structural ordinary-table shape. RLS is represented in the raw read;
-/// [`adoptable_ordinary_table`] keeps adoption and trigger selection narrower
-/// until reconstruction and planning arrive (DEC-1172.4).
+/// The structural ordinary-table shape, shared by adoption and trigger selection.
 const ORDINARY_TABLE: &str = concat!(
     "c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
@@ -370,7 +368,7 @@ const ORDINARY_TABLE: &str = concat!(
         AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')"
 );
 
-/// The same RLS boundary for ordinary-table adoption and each partition-tree
+/// The RLS exclusion for each unsupported partition-tree
 /// member. A disabled policy is still state; checking only the flags loses it.
 fn no_row_security(rel: &str) -> String {
     format!(
@@ -381,7 +379,7 @@ fn no_row_security(rel: &str) -> String {
 }
 
 fn adoptable_ordinary_table() -> String {
-    format!("({ORDINARY_TABLE} AND {})", no_row_security("c"))
+    ORDINARY_TABLE.to_owned()
 }
 
 /// `pg_get_viewdef` omits these options. Only the two boolean options set to
@@ -4384,7 +4382,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs both live PostgreSQL versions"]
-    async fn row_security_is_read_coherently_but_adoption_waits_for_planning() {
+    async fn row_security_is_read_and_adopted_coherently() {
         for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
             let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
             let database = format!("pbps_catalog1172_{}", probe_token().replace('-', "_"));
@@ -4483,19 +4481,8 @@ mod tests {
             );
         }
         let pulled = introspect_within_transaction(&mut conn).await.unwrap();
-        assert_eq!(
-            pulled.schema.tables.keys().cloned().collect::<Vec<_>>(),
-            vec![TableName::new("app", "ordinary")]
-        );
-        for name in [
-            "enabled",
-            "forced",
-            "disabled",
-            "parent",
-            "child",
-            "other_parent",
-            "other_child",
-        ] {
+        assert_eq!(pulled.schema.tables.len(), 4);
+        for name in ["parent", "child", "other_parent", "other_child"] {
             assert!(
                 pulled
                     .limitations
@@ -4505,34 +4492,41 @@ mod tests {
                 pulled.limitations
             );
         }
-        for name in ["enabled", "forced", "disabled"] {
-            let limitations: Vec<_> = pulled
-                .limitations
-                .iter()
-                .filter(|l| l.target == LimitationTarget::Relation(TableName::new("app", name)))
-                .collect();
-            assert_eq!(limitations.len(), 1, "{name}: {limitations:?}");
-            assert!(limitations[0].detail.contains("#1172's later PRs"));
+        for name in ["enabled", "forced", "disabled", "ordinary"] {
+            let table_name = TableName::new("app", name);
+            assert!(pulled.schema.tables.contains_key(&table_name));
+            assert!(
+                !pulled
+                    .limitations
+                    .iter()
+                    .any(|l| l.target == LimitationTarget::Relation(table_name.clone()))
+            );
             let trigger = pbps_model::ModuleId::Trigger {
-                on: TableName::new("app", name),
+                on: table_name,
                 name: "audit".into(),
             };
-            assert!(!pulled.schema.modules.contains_key(&trigger));
+            assert!(pulled.schema.modules.contains_key(&trigger));
             assert!(
-                pulled
+                !pulled
                     .unmanaged_modules
                     .iter()
                     .any(|m| m.target == LimitationTarget::Module(trigger.clone()))
             );
         }
-        assert!(
-            pulled
-                .schema
-                .modules
-                .contains_key(&pbps_model::ModuleId::Trigger {
-                    on: TableName::new("app", "ordinary"),
-                    name: "audit".into()
-                })
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("app", "disabled")]
+                .row_policies
+                .len(),
+            raw.row_policies
+                .iter()
+                .filter(|p| p.table_oid
+                    == raw
+                        .tables
+                        .iter()
+                        .find(|t| t.name == "disabled")
+                        .unwrap()
+                        .oid)
+                .count()
         );
         // Direct catalog privilege is required even when a display view can
         // still show policies. A failed batch must never become empty metadata.
@@ -4570,7 +4564,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(number(&ordinary[0], "n").unwrap(), 1);
+        assert_eq!(number(&ordinary[0], "n").unwrap(), 4);
         let count = conn
             .query("SELECT count(*)::int8 AS n FROM pg_catalog.pg_policy")
             .await

@@ -511,6 +511,22 @@ pub enum Change {
         reset: BTreeSet<String>,
     },
 
+    /// Policies are separate from CREATE TABLE so their routines already exist.
+    CreatePolicy {
+        table: TableName,
+        name: String,
+        policy: crate::RowPolicy,
+        origin: RowSecurityOrigin,
+    },
+    /// Created tables only; standing-table transitions arrive with #1173.
+    SetRowSecurity {
+        uid: Uid,
+        table: TableName,
+        from: crate::RowSecurity,
+        to: crate::RowSecurity,
+        origin: RowSecurityOrigin,
+    },
+
     // Constraints and indexes are always drop + add, never modified in place —
     // that is how the database itself implements it, and pretending otherwise
     // would only give the emitter one more path that can fail.
@@ -952,6 +968,14 @@ impl<'a> From<&'a Cell> for CellAfter<'a> {
     }
 }
 
+/// A creation decision is valid only beside its matching table creation.
+/// #1173 adds standing-table transitions and their risks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowSecurityOrigin {
+    Created,
+}
+
 /// Which attribute of a column a change moves.
 ///
 /// A caller excluding what a plan does from a before/after comparison has to
@@ -997,6 +1021,7 @@ pub enum Part {
     /// added and dropped whole by name, never altered in place, and outside
     /// `columns`, as an index is.
     Computed,
+    Policy,
 }
 
 /// Drops each `SetIndexStorageParameters` whose part the same plan creates
@@ -1107,6 +1132,7 @@ pub enum PartDefinition<'a> {
     Check(&'a CheckConstraint),
     Index(&'a Index, bool),
     Computed(&'a ComputedColumn),
+    Policy(&'a crate::RowPolicy),
 }
 
 impl PartDefinition<'_> {
@@ -1118,6 +1144,7 @@ impl PartDefinition<'_> {
             PartDefinition::Check(_) => Part::Check,
             PartDefinition::Index(..) => Part::Index,
             PartDefinition::Computed(_) => Part::Computed,
+            PartDefinition::Policy(_) => Part::Policy,
         }
     }
 }
@@ -1347,6 +1374,8 @@ impl Change {
             | Change::SetStorageParameters { table, .. }
             | Change::SetPartitionDefault { table, .. }
             | Change::SetPartitionNotNull { table, .. }
+            | Change::CreatePolicy { table, .. }
+            | Change::SetRowSecurity { table, .. }
             | Change::SetReplicaIdentity { table, .. }
             | Change::AddUnique { table, .. }
             | Change::DropUnique { table, .. }
@@ -1434,6 +1463,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1550,6 +1581,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1621,6 +1654,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1737,6 +1772,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1803,6 +1840,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1887,6 +1926,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -1948,6 +1989,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2007,6 +2050,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2109,6 +2154,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2177,6 +2224,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2222,6 +2271,12 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
+            Change::CreatePolicy {
+                table,
+                name,
+                policy,
+                ..
+            } => it(table, Some(name), standing(PartDefinition::Policy(policy))),
             Change::SetPrimaryKey {
                 table,
                 to,
@@ -2330,6 +2385,7 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. } => None,
         }
     }
@@ -2365,6 +2421,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2428,6 +2486,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2479,6 +2539,8 @@ impl Change {
             | Change::SetStorageParameters { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -2767,6 +2829,8 @@ impl Change {
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it
             // (DEC-1444.1).
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             // Nor do storage parameters, which change how the engine stores
             // and vacuums the rows, not the rows: none rewrites the table

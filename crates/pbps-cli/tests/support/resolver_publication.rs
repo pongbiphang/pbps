@@ -1473,3 +1473,201 @@ pub fn applied(server: &str) {
     let value: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
     assert_eq!(value["data"]["changes"], 0, "{value}");
 }
+
+/// RLS is carried by deployment, not scratch's binding namespace (#595).
+/// The recipient need not exist on a separate scratch cluster.
+pub fn row_security(server: &str, scratch_server: &str) {
+    let recipient = ClusterRole::new(server);
+    let new_recipient = ClusterRole::new(server);
+    let own = OwnDatabase::new(server, "rls_resolver1172");
+    let connection = own.connection();
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t (id integer); \
+         CREATE TABLE app.held (id integer); \
+         CREATE POLICY retained ON app.held TO {} USING (id > 0); \
+         ALTER TABLE app.held ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE app.held FORCE ROW LEVEL SECURITY",
+            recipient.name
+        ),
+    );
+    let catalog = "SELECT pg_catalog.jsonb_build_array(c.relrowsecurity,c.relforcerowsecurity, \
+        p.polname,p.polcmd,p.polpermissive,p.polroles, \
+        pg_catalog.pg_get_expr(p.polqual,p.polrelid), \
+        pg_catalog.pg_get_expr(p.polwithcheck,p.polrelid))::text \
+        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_policy p ON p.polrelid=c.oid \
+        WHERE c.oid='app.held'::regclass";
+    let before = text_of(connection, catalog);
+    let d = Demo::new("rls-resolver1172");
+    successful(run(&d, &["pull", "--db", connection], None));
+    d.commit();
+    successful(run(
+        &d,
+        &["baseline", "--db", connection, "--reason", "adopt RLS"],
+        None,
+    ));
+    configure(&d);
+    successful(run(
+        &d,
+        &[
+            "key",
+            "generate",
+            "--out",
+            d.dir.join("key").to_str().unwrap(),
+        ],
+        None,
+    ));
+    let scratch = Confined::new(scratch_server);
+    if server != scratch_server {
+        assert_eq!(
+            scalar(
+                &scratch.connection,
+                &format!(
+                    "SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname IN ('{}','{}')",
+                    recipient.name, new_recipient.name
+                )
+            ),
+            0,
+            "the separate scratch cluster has no policy recipient"
+        );
+    }
+    let targets = Targets {
+        target: connection,
+        scratch: &scratch.connection,
+    };
+    let artifact = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let apply = || {
+        successful(run(
+            &d,
+            &[
+                "apply",
+                "--env",
+                "prod",
+                "--plan",
+                artifact.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&artifact),
+                "--allow",
+                "grant-widen,destructive",
+            ],
+            Some(&targets),
+        ));
+    };
+
+    // A pulled RLS table must not refuse an unrelated column migration.
+    let plain = d.dir.join("schema/app.t.yml");
+    let original = std::fs::read_to_string(&plain).unwrap();
+    std::fs::write(
+        &plain,
+        original.replace("columns:\n", "columns:\n  label: {type: text}\n"),
+    )
+    .unwrap();
+    // A retained caller gives the arriving integer overload a real
+    // resolver question in the next revision.
+    write_declarations(
+        &d,
+        &[
+            (
+                "app.visible%28numeric%29.function.yml",
+                "function: app.visible(numeric)\npublic_execute: true\ndefinition: |-\n  \
+          (numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1\n",
+            ),
+            (
+                "app.v.view.yml",
+                "view: app.v\ndefinition: SELECT app.visible(1) AS n\n",
+            ),
+        ],
+    );
+    successful(run(&d, &["plan"], None));
+    d.commit();
+    let planned = successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&planned)).unwrap();
+    assert!(value["findings"].to_string().contains("#595"), "{value}");
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
+    assert!(saved.changes.changes.iter().any(|step| matches!(
+        &step.change, pbps_model::Change::AddColumn { table, name, .. }
+        if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"
+    )));
+    assert!(!saved.changes.changes.iter().any(|step| matches!(
+        step.change,
+        pbps_model::Change::CreatePolicy { .. } | pbps_model::Change::SetRowSecurity { .. }
+    )));
+    apply();
+    assert_eq!(text_of(connection, catalog), before);
+
+    // New policies and flags remain real deployment steps while scratch
+    // compiles their table/routine namespace without claiming policy proof.
+    write_declarations(
+        &d,
+        &[(
+            "app.visible%28integer%29.function.yml",
+            "function: app.visible(integer)\npublic_execute: true\ndefinition: |-\n  \
+         (integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1\n",
+        )],
+    );
+    std::fs::write(
+        d.dir.join("schema/app.docs.yml"),
+        format!(
+            r#"table: app.docs
+columns:
+  id: {{type: integer}}
+row_security: {{enabled: true, forced: true}}
+row_policies:
+  visible:
+    to: [{}]
+    using: app.visible(id) > 0
+"#,
+            new_recipient.name
+        ),
+    )
+    .unwrap();
+    successful(run(&d, &["plan"], None));
+    d.commit();
+    let planned = successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&planned)).unwrap();
+    assert!(value["findings"].to_string().contains("#595"), "{value}");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
+    assert_eq!(saved["origin"], "resolved_database", "{saved}");
+    let saved: pbps_model::SavedPlan = serde_json::from_value(saved).unwrap();
+    assert!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::CreatePolicy { .. }))
+    );
+    assert!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::SetRowSecurity { .. }))
+    );
+    apply();
+    successful(run(&d, &["verify", "--env", "prod"], Some(&targets)));
+    assert_eq!(text_of(connection, catalog), before);
+    let noop = successful(run(
+        &d,
+        &["plan", "--env", "prod", "--format", "json"],
+        Some(&targets),
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+    assert_eq!(value["data"]["changes"], 0, "{value}");
+    assert!(value["findings"].to_string().contains("#595"), "{value}");
+
+    // Resolver selection does not bypass the standing-policy boundary.
+    let held = d.dir.join("schema/app.held.yml");
+    let original = std::fs::read_to_string(&held).unwrap();
+    let edited = original.replace("id > 0", "id > 1");
+    assert_ne!(edited, original);
+    std::fs::write(&held, edited).unwrap();
+    write_prior(&artifact, &sql);
+    let refused = run(&d, &plan_args(&artifact, &sql), Some(&targets));
+    assert_ne!(code(&refused), 0);
+    assert!(format!("{}{}", stdout(&refused), stderr(&refused)).contains("#1173"));
+    assert_prior(&artifact, &sql);
+}

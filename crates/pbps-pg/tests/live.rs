@@ -2327,11 +2327,6 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "NULLS NOT DISTINCT",
         // An index the planner will not use.
         "indisvalid = false",
-        // A table whose rows are not all a reader's to see, one whose
-        // policies are not in force, and one whose owner is not exempt.
-        "row-level security",
-        "not in force",
-        "FORCE ROW LEVEL SECURITY",
         // A collation that decides which values compare equal. Named down to
         // the column and out to the collation itself: the operator-class
         // message says `COLLATE` too, and the table is named schema-qualified,
@@ -2401,6 +2396,23 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             "no warning mentions `{expected}`:\n{all}"
         );
     }
+
+    // Ordinary RLS state is carried rather than reported as an omission.
+    assert!(
+        pulled.schema.tables[&TableName::new(&s, "guarded")]
+            .row_security
+            .enabled
+    );
+    assert!(
+        pulled.schema.tables[&TableName::new(&s, "forced")]
+            .row_security
+            .forced
+    );
+    assert!(
+        pulled.schema.tables[&TableName::new(&s, "dormant")]
+            .row_policies
+            .contains_key("dormant_p")
+    );
 
     // An extension's own objects are left out **silently** (DECISIONS 305),
     // and that holds for the limitation reader as much as for the ordinary
@@ -2666,8 +2678,11 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "cached"),
             pbps_model::TableName::new(&s, "collated"),
             pbps_model::TableName::new(&s, "covering"),
+            pbps_model::TableName::new(&s, "dormant"),
             pbps_model::TableName::new(&s, "dotting"),
+            pbps_model::TableName::new(&s, "forced"),
             pbps_model::TableName::new(&s, "full_match"),
+            pbps_model::TableName::new(&s, "guarded"),
             pbps_model::TableName::new(&s, "half_built"),
             pbps_model::TableName::new(&s, "leaning"),
             pbps_model::TableName::new(&s, "narrowed"),
@@ -2690,9 +2705,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "unchecked"),
             pbps_model::TableName::new(&s, "unenforced"),
         ],
-        "the partitioned table, the inheritance child, the row-level-secured \
-         table and this tool's own tables are not in the \
-         pull"
+        "unsupported partition/inheritance shapes stay out; ordinary RLS tables are adopted"
     );
 
     // Every limitation names its table, so a caller can tell drift inside the
@@ -2712,10 +2725,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         vec![
             pbps_model::TableName::new(&s, "ancestor"),
             pbps_model::TableName::new(&s, "descendant"),
-            pbps_model::TableName::new(&s, "dormant"),
             pbps_model::TableName::new(&s, "dotted"),
-            pbps_model::TableName::new(&s, "forced"),
-            pbps_model::TableName::new(&s, "guarded"),
             pbps_model::TableName::new(&s, "parted"),
             pbps_model::TableName::new(&s, "published"),
             pbps_model::TableName::new(&s, "rewritten"),
@@ -18830,16 +18840,14 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.part FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),
-        // Row-level security keeps it out of the pull; an unlogged table did
-        // until #1443 held it.
+        // Ordinary RLS tables and their triggers are adopted together (#1172).
         format!("CREATE TABLE {s}.scratch (id int)"),
         format!("ALTER TABLE {s}.scratch ENABLE ROW LEVEL SECURITY"),
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.scratch FOR EACH ROW EXECUTE FUNCTION \
              {s}.tg()"
         ),
-        // PR B reads RLS metadata but keeps adoption out until PR C. Neither
-        // FORCE by itself nor a policy with both flags off can admit a trigger.
+        // FORCE alone and dormant policies also remain complete table state.
         format!("CREATE TABLE {s}.forced_scratch (id int)"),
         format!("ALTER TABLE {s}.forced_scratch FORCE ROW LEVEL SECURITY"),
         format!(
@@ -18887,7 +18895,12 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         .collect();
     assert_eq!(
         triggers,
-        vec![format!("{s}.t.audit")],
+        vec![
+            format!("{s}.dormant_scratch.audit"),
+            format!("{s}.forced_scratch.audit"),
+            format!("{s}.scratch.audit"),
+            format!("{s}.t.audit")
+        ],
         "only the trigger whose table the pull holds"
     );
 
@@ -18900,11 +18913,8 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     assert_eq!(
         inventory,
         [
-            format!("{s}.dormant_scratch.audit"),
-            format!("{s}.forced_scratch.audit"),
             format!("{s}.part.audit"),
             format!("{s}.pg_buffercache.user_tg"),
-            format!("{s}.scratch.audit"),
             format!("{s}.theirs.user_tg")
         ]
     );
@@ -18943,12 +18953,6 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     for left_out in [
         "part",
         "part.audit",
-        "scratch",
-        "scratch.audit",
-        "forced_scratch",
-        "forced_scratch.audit",
-        "dormant_scratch",
-        "dormant_scratch.audit",
         "pg_buffercache.user_tg",
         "theirs.user_tg",
     ] {
@@ -18958,6 +18962,11 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         );
     }
     assert!(!named.contains(&"t.audit".to_owned()), "{named:?}");
+    for adopted in ["scratch", "forced_scratch", "dormant_scratch"] {
+        assert!(!named.contains(&adopted.to_owned()), "{named:?}");
+        assert!(!named.contains(&format!("{adopted}.audit")), "{named:?}");
+        assert!(ours.tables.contains_key(&TableName::new(&s, adopted)));
+    }
     assert!(
         !named.contains(&"pg_buffercache".to_owned()) && !named.contains(&"theirs".to_owned()),
         "the extension's view and table are left out silently, and only the user's triggers on \

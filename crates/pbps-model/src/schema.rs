@@ -575,6 +575,16 @@ pub struct RowPolicy {
 }
 
 impl RowPolicy {
+    /// A freshly written predicate is held to presence: PostgreSQL deparses
+    /// its text. Untouched policies still use exact equality (SPEC §7.6).
+    pub fn agrees_when_written(&self, now: &Self) -> bool {
+        self.command == now.command
+            && self.restrictive == now.restrictive
+            && self.to == now.to
+            && self.using.is_some() == now.using.is_some()
+            && self.with_check.is_some() == now.with_check.is_some()
+    }
+
     /// Shared by YAML conversion and validation of programmatically built state.
     pub fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();

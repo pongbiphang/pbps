@@ -177,6 +177,28 @@ pub(super) fn classify(
         if owned.get(&table_id) == Some(&table_owner) {
             physical_attributes(capture, &mut owned, &table_id, &table_owner, true)?;
         }
+        // A policy is an exact declared child of this UID-proven table,
+        // not a new binding surface (#1172, #595). Its dependency rows
+        // inherit this owner below; the objects it references never do.
+        for policy in table.row_policies.keys() {
+            let object = identity("pg_policy", vec![policy.clone()], vec![table_id.clone()]);
+            if let Some(input) = capture.inputs.get(&object) {
+                let fail =
+                    || Uncovered::object(&object, "declared policy provenance is unreadable");
+                let parent: ObjectIdentity = serde_json::from_value(
+                    input.properties.get("polrelid").cloned().ok_or_else(fail)?,
+                )
+                .map_err(|_| fail())?;
+                if owned.get(&table_id) != Some(&table_owner)
+                    || parent != table_id
+                    || input.properties.get("polname").and_then(Value::as_str)
+                        != Some(policy.as_str())
+                {
+                    return Err(fail());
+                }
+                assign(&mut owned, object, table_owner.clone())?;
+            }
+        }
         for (column, declaration) in &table.columns {
             let reference = name.column(column);
             if recorded_names.column_uid(&reference).is_none() {

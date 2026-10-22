@@ -569,6 +569,7 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
                     of_key(key)
                 }
             }
+            Because::RowSecurity => OrderReason::Structural,
             Because::Writes(_) => OrderReason::Data,
             // Two writes of one object are a question of which instance
             // stands; two writes of values or rows, of which values do.

@@ -33,6 +33,7 @@ pub enum NameKind {
     Key,
     /// A check or a foreign key.
     Constraint,
+    Policy,
     Column,
     Role,
 }
@@ -149,7 +150,7 @@ impl Nx<'_> {
 
 /// Every declared name `table` holds under `name`, owned by `owner`: what its
 /// creation claims and its drop releases.
-fn whole_table(name: &TableName, owner: &Recorded, table: &Table) -> Vec<Named> {
+fn whole_table(name: &TableName, owner: &Recorded, table: &Table, policies: bool) -> Vec<Named> {
     let scope = Some(ObjectKey::Table(owner.clone()));
     let part = |kind: NameKind, key: PartKey, part_name: &str| Named {
         address: Address {
@@ -182,6 +183,11 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table) -> Vec<Named> 
     }
     for n in table.indexes.keys() {
         out.push(part(NameKind::Index, PartKey::Index(n.clone()), n));
+    }
+    if policies {
+        for n in table.row_policies.keys() {
+            out.push(part(NameKind::Policy, PartKey::Policy(n.clone()), n));
+        }
     }
     for n in table.checks.keys() {
         out.push(part(NameKind::Constraint, PartKey::Check(n.clone()), n));
@@ -255,7 +261,7 @@ pub fn names(
             uid, name, table, ..
         } => {
             let owner = Recorded(uid.clone());
-            for named in whole_table(name, &owner, table) {
+            for named in whole_table(name, &owner, table, false) {
                 nx.names.claims.push(named);
             }
             for (column, _) in &table.columns {
@@ -285,7 +291,7 @@ pub fn names(
                 .and_then(|base| before.schema.tables.get(base));
             match base {
                 Some(table) => {
-                    for named in whole_table(name, &owner, table) {
+                    for named in whole_table(name, &owner, table, true) {
                         nx.names.releases.push(named);
                     }
                 }
@@ -339,7 +345,7 @@ pub fn names(
             if from.schema != to.schema
                 && let Some(base) = super::base_table(op, owners, before, from)?
             {
-                for named in whole_table(from, &owner, base.table) {
+                for named in whole_table(from, &owner, base.table, true) {
                     if named.address.kind == NameKind::Table {
                         continue;
                     }
@@ -430,6 +436,15 @@ pub fn names(
                 name,
             )?;
         }
+        Change::CreatePolicy { table, name, .. } => {
+            nx.part(
+                true,
+                table,
+                NameKind::Policy,
+                PartKey::Policy(name.clone()),
+                name,
+            )?;
+        }
         Change::AddCheck { table, name, .. } => {
             nx.part(
                 true,
@@ -496,6 +511,7 @@ pub fn names(
         | Change::AlterColumnExpression { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::SetRowSecurity { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetTablePersistence { .. }
@@ -533,7 +549,7 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
         let Some(owner) = table(name) else {
             continue;
         };
-        out.extend(whole_table(name, &owner, t));
+        out.extend(whole_table(name, &owner, t, true));
         for column in t.columns.keys() {
             if let Ok(uid) = owners.column(&name.column(column), Spelling::Base) {
                 out.push(Named {

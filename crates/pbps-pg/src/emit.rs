@@ -3019,6 +3019,29 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
 
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
+        Change::CreatePolicy { table, name, policy, .. } => {
+            let targets = match &policy.to {
+                pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
+                pbps_model::PolicyRoles::Roles(roles) => roles.iter().map(|r| quote(r.raw())).collect::<Result<Vec<_>, _>>()?.join(", "),
+            };
+            let mut sql = format!("CREATE POLICY {} ON {} AS {} FOR {} TO {}",
+                quote(name)?, qualified(table)?, if policy.restrictive { "RESTRICTIVE" } else { "PERMISSIVE" },
+                policy.command.as_str().to_ascii_uppercase(), targets);
+            if let Some(text) = &policy.using { sql.push_str(&format!(" USING ({})", verbatim(text.raw()))); }
+            if let Some(text) = &policy.with_check { sql.push_str(&format!(" WITH CHECK ({})", verbatim(text.raw()))); }
+            sql.push(';');
+            one(pg, table, sql)
+        }
+        Change::SetRowSecurity { table, from, to, .. } => {
+            let mut statements = Vec::new();
+            if from.enabled != to.enabled {
+                statements.extend(one(pg, table, format!("ALTER TABLE {} {} ROW LEVEL SECURITY;", qualified(table)?, if to.enabled { "ENABLE" } else { "DISABLE" }))?);
+            }
+            if from.forced != to.forced {
+                statements.extend(one(pg, table, format!("ALTER TABLE {} {} ROW LEVEL SECURITY;", qualified(table)?, if to.forced { "FORCE" } else { "NO FORCE" }))?);
+            }
+            Ok(statements)
+        }
         // The first statement is the one that brings the table into being; it
         // says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable {

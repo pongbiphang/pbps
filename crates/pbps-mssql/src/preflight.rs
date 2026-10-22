@@ -872,7 +872,9 @@ fn build<'v, 'p: 'v>(
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
+        | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
+            | Change::SetReplicaIdentity { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
 
         // Except for the one thing a permission change can fail on that is

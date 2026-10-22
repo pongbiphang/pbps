@@ -739,28 +739,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .iter()
         .filter(|t| {
             let name = TableName::new(&t.schema, &t.name);
-            // Reading RLS must not adopt a table the differ still refuses:
-            // that would block unrelated plans until PR C (DEC-1172.4).
-            // Refuse before building lookups, so no foreign key can retain it.
-            if !t.row_security.is_default() || policies_by_table.contains_key(&t.oid) {
-                let state = if t.row_security.enabled {
-                    "row-level security enabled"
-                } else if t.row_security.forced {
-                    "FORCE ROW LEVEL SECURITY"
-                } else {
-                    "row-level security policies that are not in force"
-                };
-                note(
-                    &mut pulled,
-                    &name,
-                    format!(
-                        "{} has {state}. Its row-security metadata was read, but adoption and RLS \
-                     planning arrive with #1172's later PRs. It is left out of the pull entirely.",
-                        name.shown()
-                    ),
-                );
-                return true;
-            }
             let columns = columns_by_table.get(&t.oid).map_or(&[][..], Vec::as_slice);
             match a_name_the_declaration_cannot_write(&name, columns) {
                 Some(detail) => {
@@ -965,6 +943,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         };
 
         let mut table = Table {
+            row_security: raw_table.row_security,
+            row_policies: policies_by_table
+                .get(&raw_table.oid)
+                .into_iter()
+                .flatten()
+                .map(|p| (p.name.clone(), p.policy.clone()))
+                .collect(),
             columns: raw_columns
                 .iter()
                 .map(|c| (c.name.clone().into(), column(c, &parts, &mut pulled)))
@@ -5494,7 +5479,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn row_security_tables_stay_out_of_adoption_even_with_both_flags_off() {
+    fn row_security_tables_are_adopted_even_with_both_flags_off() {
         let mut enabled = table(1, "enabled");
         enabled.row_security.enabled = true;
         let mut forced = table(2, "forced");
@@ -5510,24 +5495,26 @@ mod tests {
             ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
-        assert_eq!(
-            pulled.schema.tables.keys().cloned().collect::<Vec<_>>(),
-            vec![TableName::new("app", "ordinary")]
+        assert_eq!(pulled.schema.tables.len(), 4);
+        assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "enabled")]
+                .row_security
+                .enabled
         );
-        assert_eq!(pulled.limitations.len(), 3, "{:?}", pulled.limitations);
-        for name in ["enabled", "forced", "disabled"] {
-            let detail = &pulled
-                .limitations
-                .iter()
-                .find(|l| l.target == LimitationTarget::Relation(TableName::new("app", name)))
-                .unwrap()
-                .detail;
-            assert!(detail.contains("#1172's later PRs"), "{detail}");
-        }
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "forced")]
+                .row_security
+                .forced
+        );
+        assert_eq!(
+            pulled.schema.tables[&TableName::new("app", "disabled")].row_policies["bare"],
+            pbps_model::RowPolicy::default()
+        );
     }
 
     #[test]
-    fn row_security_refusal_precedes_foreign_key_target_lookup() {
+    fn row_security_adoption_keeps_foreign_key_targets() {
         let mut fk = constraint(1, "c_fk", 'f');
         fk.columns = vec![1];
         fk.ref_columns = vec![1];
@@ -5544,13 +5531,14 @@ mod tests {
             ..RawCatalog::default()
         };
         let pulled = assemble(&raw);
-        assert_eq!(pulled.schema.tables.len(), 1);
-        assert!(
+        assert_eq!(pulled.schema.tables.len(), 2);
+        assert_eq!(
             pulled.schema.tables[&TableName::new("app", "c")]
                 .foreign_keys
-                .is_empty()
+                .len(),
+            1
         );
-        assert!(pulled.warnings.iter().any(|w| w.contains("c_fk")));
+        assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
         // The same key retains an ordinary target.
         let mut ordinary = raw;
         ordinary.row_policies.clear();

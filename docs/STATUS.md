@@ -6,12 +6,12 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
-#1172 PRs A and B add the PostgreSQL row-security model, YAML format
-(`row_security:`, `row_policies:`) and coherent catalog read. Adoption and
-deployment remain pending: introspection names and excludes RLS tables until
-PR C can plan them, so unrelated ordinary tables still plan normally
-(DEC-1172.4). Planning and saved-plan replay refuse declared RLS meanwhile
-(DEC-1172.1).
+#1172 PRs A–C support PostgreSQL ordinary-table row-security declarations,
+coherent catalog adoption and created-table policy/flag deployment. Unchanged
+adopted policies permit no-op and unrelated migrations; standing-table changes
+arrive with #1173. Policy predicate binding proof remains #595's named
+limitation. RLS partition trees and reference data beside RLS remain refused.
+PR D retains the complete round-trip/enforcement matrix and final documentation.
 
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0

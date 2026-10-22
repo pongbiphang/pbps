@@ -85,7 +85,9 @@ fn table_use(change: &Change) -> TableUse<'_> {
         | Change::AddCheck { table, .. }
         | Change::DropCheck { table, .. }
         | Change::AddIndex { table, .. }
-        | Change::DropIndex { table, .. } => complete(table),
+        | Change::DropIndex { table, .. }
+        | Change::CreatePolicy { table, .. }
+        | Change::SetRowSecurity { table, .. } => complete(table),
         Change::DropColumn { column, .. }
         | Change::AlterColumnType { column, .. }
         | Change::AlterColumnNullability { column, .. }
@@ -450,6 +452,12 @@ fn texts(change: &Change) -> Vec<&str> {
         }
         Change::AlterColumnType { from, to, .. } => vec![&from.base, &to.base],
         Change::AddCheck { constraint, .. } => vec![&constraint.expression],
+        Change::CreatePolicy { policy, .. } => policy
+            .using
+            .iter()
+            .chain(&policy.with_check)
+            .map(pbps_model::Text::raw)
+            .collect(),
         Change::AddIndex { index, .. } => index
             .filter
             .as_deref()
@@ -505,6 +513,7 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::DropIndex { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
+        | Change::SetRowSecurity { .. }
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }

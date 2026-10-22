@@ -521,6 +521,12 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 table = table.raw()
             ),
         }),
+        Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: "PostgreSQL row-security operations".into(),
+            })
+        }
         Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(

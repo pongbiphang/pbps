@@ -18,6 +18,93 @@ const SCENARIOS: &[Scenario] = &[
     // `AddIndex` and `AddCheck` each have pairs of their own below; the
     // first pair is a foreign key added, which no other pair plans (#1965).
     Scenario {
+        name: "two_policies_created_in_their_own_namespace",
+        pair: ["CreatePolicy", "CreatePolicy"],
+        gap: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+
+---
+table: app.u
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+checks:
+  visible: (id > 0)
+row_security: {enabled: true, forced: true}
+row_policies:
+  visible:
+    command: all
+    using: (id > 0)
+    with_check: (id > 0)
+  bounded:
+    command: update
+    restrictive: true
+    using: (id < 100)
+    with_check: (id < 100)
+"#,
+    },
+    Scenario {
+        name: "independent_flags_on_two_created_tables",
+        pair: ["SetRowSecurity", "SetRowSecurity"],
+        gap: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+
+---
+table: app.u
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+row_security: {enabled: true, forced: false}
+row_policies:
+  visible: {command: select, using: (id > 0)}
+
+---
+table: app.v
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+row_security: {enabled: false, forced: true}
+row_policies:
+  writable: {command: insert, with_check: (id < 100)}
+"#,
+    },
+    Scenario {
         name: "a_foreign_key_added_beside_an_index",
         pair: ["AddForeignKey", "AddIndex"],
         gap: None,

@@ -1630,6 +1630,8 @@ pub enum Part {
     /// expression releases the dependency instead, when that change runs
     /// before the module's drop (DEC-1168.1).
     Generated(pbps_model::ColumnName),
+    /// Never automatically rebuilt until #1173. A whole table drop owns it.
+    Policy(String),
 }
 
 /// One object that depends on a module, established by the catalog.
@@ -1686,7 +1688,7 @@ impl Dependent {
                     }
                     // Nothing can put it back, so it is never kept across a
                     // rebuild; only an expression change releases it.
-                    Part::Generated(_) => false,
+                    Part::Generated(_) | Part::Policy(_) => false,
                 }
             }),
             Holds::Unrepresentable(_) => false,
@@ -1950,6 +1952,10 @@ async fn direct_dependents(
                     on: ObjectName::new(&dep_schema, &dep_name),
                     name: part.clone(),
                 }),
+                "policy" => Holds::TablePart {
+                    table: TableName::new(&dep_schema, &dep_name),
+                    part: Part::Policy(part.clone()),
+                },
                 "check" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Check(part.clone()),
@@ -2162,6 +2168,14 @@ fn dependents_query(refclass: &str) -> String {
            LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_class'::regclass
           UNION ALL
+         SELECT 'policy', {described}, n2.nspname, c2.relname, p2.polname, 0::int8,
+                ''
+           FROM pg_catalog.pg_depend d
+           JOIN pg_catalog.pg_policy p2 ON p2.oid = d.objid
+           JOIN pg_catalog.pg_class c2 ON c2.oid = p2.polrelid
+           JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
+          WHERE {edge} AND d.classid = 'pg_catalog.pg_policy'::regclass
+          UNION ALL
          SELECT 'other', {described}, '', '', '', 0::int8,
                 'a dependent in `' || d.classid::regclass::text
                   || '`, which this reader has no rule for'
@@ -2227,13 +2241,14 @@ fn reverse_edge(refclass: &str) -> String {
 /// named and refused rather than silently absent.
 ///
 /// Pinned to the arms by `every_known_class_has_an_arm_and_the_rest_fall_through`.
-const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
+const KNOWN_DEPENDENT_CLASSES: [&str; 7] = [
     "pg_catalog.pg_rewrite",
     "pg_catalog.pg_proc",
     "pg_catalog.pg_trigger",
     "pg_catalog.pg_constraint",
     "pg_catalog.pg_attrdef",
     "pg_catalog.pg_class",
+    "pg_catalog.pg_policy",
 ];
 
 /// A deadlock taking the rebuild's lock, said in words.
@@ -2288,6 +2303,13 @@ pub fn unmanaged_refusal(
         .filter(|d| !d.managed(declared))
         .map(|d| match &d.holds {
             Holds::Unrepresentable(why) => format!("- {} -- {why}", d.described),
+            Holds::TablePart {
+                part: Part::Policy(_),
+                ..
+            } => format!(
+                "- {} -- planning policy removal and recreation arrives with #1173",
+                d.described
+            ),
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
@@ -3424,4 +3446,207 @@ mod definer_path_tests {
         // A schema literally named "pg_temp, x" is not pg_temp.
         assert!(definer_path_problem(Some("\"x, pg_temp\"")).is_some());
     }
+}
+
+/// Catalog-proven policy dependents. Relation-only edges (including EXISTS
+/// SELECT FROM) do not block a column alteration, measured on 16 and 18, and
+/// must not be expanded into every attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDependent {
+    pub table: TableName,
+    pub name: String,
+}
+
+impl PolicyDependent {
+    /// Named membership in the already scoped schema, not binding proof.
+    pub fn is_declared_in(&self, schema: &Schema) -> bool {
+        schema
+            .tables
+            .get(&self.table)
+            .is_some_and(|table| table.row_policies.contains_key(&self.name))
+    }
+}
+
+/// Direct attribute bindings, for edits that preserve its owned sequences.
+pub async fn policies_on_column(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    policies_on_relation(conn, &column.table, Some(&column.name), false).await
+}
+
+/// Column removal also removes every sequence it owns. Policies bind those
+/// sequences, not the owning attribute; renames and retypes keep them alive.
+pub async fn policies_on_column_removal(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    policies_on_relation(conn, &column.table, Some(&column.name), true).await
+}
+
+/// All policy references to a stored table or its owned sequences, including
+/// relation-only and attribute edges. Its own policies disappear with it.
+pub async fn policies_on_table(
+    conn: &mut Conn,
+    table: &TableName,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    policies_on_relation(conn, table, None, true).await
+}
+
+async fn policies_on_relation(
+    conn: &mut Conn,
+    table: &TableName,
+    column: Option<&pbps_model::ColumnName>,
+    removal: bool,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    let mut params = vec![Param::Str(&table.schema), Param::Str(&table.name)];
+    let (attribute, subid, selected, external) = if let Some(column) = column {
+        params.push(Param::Str(column.raw()));
+        (
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid",
+            "a.attnum",
+            "AND a.attname=$3 AND a.attnum>0 AND NOT a.attisdropped",
+            "",
+        )
+    } else {
+        (
+            "",
+            "0",
+            "",
+            "WHERE p.polrelid NOT IN (SELECT oid FROM target)",
+        )
+    };
+    // Follow ownership from pg_depend, never a generated sequence spelling
+    // or a default expression. Both serial (a) and identity (i) sequences
+    // disappear with their owning column, including a whole-table removal.
+    let owned = if removal {
+        "UNION
+         SELECT s.oid, 0 FROM target t
+         JOIN pg_catalog.pg_depend ownership
+           ON ownership.refclassid='pg_catalog.pg_class'::regclass
+          AND ownership.refobjid=t.oid AND ownership.refobjsubid>0
+          AND (t.subid=0 OR ownership.refobjsubid=t.subid)
+          AND ownership.classid='pg_catalog.pg_class'::regclass
+          AND ownership.objsubid=0 AND ownership.deptype IN ('a','i')
+         JOIN pg_catalog.pg_class s ON s.oid=ownership.objid AND s.relkind='S'"
+    } else {
+        ""
+    };
+    let rows = conn.query_with(
+        &format!("WITH target AS (
+            SELECT t.oid, {subid} AS subid FROM pg_catalog.pg_class t
+            JOIN pg_catalog.pg_namespace tn ON tn.oid=t.relnamespace
+            {attribute}
+            WHERE tn.nspname=$1 AND t.relname=$2 {selected}
+         ), referenced AS (
+            SELECT oid, subid FROM target {owned}
+         )
+         SELECT DISTINCT p.polname, n.nspname, own.relname
+           FROM referenced r
+           JOIN pg_catalog.pg_depend d ON d.refclassid='pg_catalog.pg_class'::regclass
+                AND d.refobjid=r.oid AND (r.subid=0 OR d.refobjsubid=r.subid)
+           JOIN pg_catalog.pg_policy p ON d.classid='pg_catalog.pg_policy'::regclass AND p.oid=d.objid
+           JOIN pg_catalog.pg_class own ON own.oid=p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid=own.relnamespace
+          {external}
+          ORDER BY 2,3,1"), &params).await?;
+    rows.iter()
+        .map(|row| {
+            Ok(PolicyDependent {
+                name: text(row, "polname")?,
+                table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
+            })
+        })
+        .collect()
+}
+
+/// Only policies whose catalog-deparsed predicates a table rename changes.
+/// Local scalar columns stay bare. Whole rows and correlated references use
+/// the owner alias; relation literals, FROM entries and explicit row-type
+/// casts carry catalog names. A schema-only move keeps the owner alias.
+pub async fn policies_affected_by_table_rename(
+    conn: &mut Conn,
+    table: &TableName,
+    to: &TableName,
+    managed: &Schema,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    let rows = conn
+        .query_with(
+            "SELECT p.polname,n.nspname,own.relname,
+                t.oid::text AS relation,t.reltype::text AS row_type,
+                rt.typarray::text AS array_type,
+                (pg_catalog.current_setting('server_version_num')::int / 10000)::text AS major,
+                p.polrelid=t.oid AS local,
+                EXISTS (SELECT FROM pg_catalog.pg_depend d
+                    WHERE d.classid='pg_catalog.pg_policy'::regclass AND d.objid=p.oid
+                      AND d.refclassid='pg_catalog.pg_class'::regclass
+                      AND d.refobjid=t.oid AND d.refobjsubid=0 AND d.deptype='n') AS regclass,
+                p.polqual::text AS using_tree,p.polwithcheck::text AS check_tree
+           FROM pg_catalog.pg_class t
+           JOIN pg_catalog.pg_namespace tn ON tn.oid=t.relnamespace
+           JOIN pg_catalog.pg_type rt ON rt.oid=t.reltype
+           JOIN pg_catalog.pg_policy p ON p.polrelid=t.oid OR EXISTS (
+               SELECT FROM pg_catalog.pg_depend d
+                WHERE d.classid='pg_catalog.pg_policy'::regclass AND d.objid=p.oid
+                  AND ((d.refclassid='pg_catalog.pg_class'::regclass AND d.refobjid=t.oid)
+                    OR (d.refclassid='pg_catalog.pg_type'::regclass
+                        AND d.refobjid IN (t.reltype,rt.typarray))))
+           JOIN pg_catalog.pg_class own ON own.oid=p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid=own.relnamespace
+          WHERE tn.nspname=$1 AND t.relname=$2
+          ORDER BY 2,3,1",
+            &[Param::Str(&table.schema), Param::Str(&table.name)],
+        )
+        .await?;
+    let mut found = Vec::new();
+    for row in &rows {
+        let policy = PolicyDependent {
+            name: text(row, "polname")?,
+            table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
+        };
+        // Unmanaged owners follow a rename without entering the typed
+        // closing comparison. Do not require their trees to be decodable.
+        if !policy.is_declared_in(managed) {
+            continue;
+        }
+        let number = |field| -> Result<u32, DbError> {
+            text(row, field)?.parse().map_err(|_| {
+                DbError::BadRow(format!("policy rename {field} is not an oid or version"))
+            })
+        };
+        let boolean = |field| -> Result<bool, DbError> {
+            row.try_get::<bool>(field)?
+                .ok_or_else(|| DbError::BadRow(format!("policy rename {field} is NULL")))
+        };
+        let rename = crate::resolver::capture::policy_names::Rename {
+            relation: number("relation")?,
+            row_types: [number("row_type")?, number("array_type")?],
+            owner: boolean("local")?,
+            alias_changes: table.name != to.name,
+            regclass: boolean("regclass")?,
+        };
+        let mut affected = false;
+        for field in ["using_tree", "check_tree"] {
+            if let Some(tree) = row.try_get::<&str>(field)? {
+                affected |= crate::resolver::capture::policy_names::affected(
+                    tree,
+                    number("major")?,
+                    &rename,
+                )
+                .map_err(|why| {
+                    DbError::Refused(format!(
+                        "policy `{}` on {}: {why}",
+                        pbps_model::escape::Escaped(&policy.name),
+                        policy.table.shown()
+                    ))
+                })?;
+            }
+        }
+        if affected {
+            found.push(policy);
+        }
+    }
+    Ok(found)
 }

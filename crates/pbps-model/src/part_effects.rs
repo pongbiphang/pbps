@@ -188,6 +188,9 @@ impl Change {
             Change::AlterColumnExpression { column, .. } => {
                 vec![direct(Part::Generated(column.clone()), Effect::Rewritten)]
             }
+            Change::CreatePolicy { table, name, .. } => {
+                named(table, crate::Part::Policy, name, Effect::Created)
+            }
             Change::AddCheck { table, name, .. } => {
                 named(table, crate::Part::Check, name, Effect::Created)
             }
@@ -255,6 +258,7 @@ impl Change {
             | Change::SetColumnDeprecated { .. }
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }

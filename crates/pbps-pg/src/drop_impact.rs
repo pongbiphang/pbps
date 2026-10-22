@@ -238,6 +238,8 @@ pub async fn drop_blockers(
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }

@@ -515,6 +515,9 @@ pub(super) fn derive(
             Change::DetachPartition { table, .. } | Change::AttachPartition { table, .. } => {
                 (Surface::Table(table.clone()), true, true, true, None)
             }
+            // #1172 permits policy predicates with a named #595 coverage
+            // limitation. Do not claim a policy binding transition here.
+            Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => continue,
             Change::AddCheck { table, name, .. } => (
                 Surface::Check {
                     table: table.clone(),

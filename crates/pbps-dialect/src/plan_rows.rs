@@ -218,6 +218,8 @@ impl<'p> PlanFacts<'p> {
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }

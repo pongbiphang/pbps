@@ -58,6 +58,7 @@ pub(crate) type RoleMembers = BTreeMap<pbps_model::RoleName, Vec<pbps_model::Rol
 pub(crate) struct Facts<'a> {
     module_dependents: Option<&'a ModuleDependents>,
     role_members: Option<&'a RoleMembers>,
+    policy_dependents: Option<&'a crate::row_security::PolicyDependents>,
 }
 
 impl<'a> Facts<'a> {
@@ -65,6 +66,17 @@ impl<'a> Facts<'a> {
     pub(crate) fn with_module_dependents(self, found: &'a ModuleDependents) -> Self {
         Self {
             module_dependents: Some(found),
+            ..self
+        }
+    }
+
+    /// Exact policies on each edited column, including successful empty reads.
+    pub(crate) fn with_policy_dependents(
+        self,
+        policies: &'a crate::row_security::PolicyDependents,
+    ) -> Self {
+        Self {
+            policy_dependents: Some(policies),
             ..self
         }
     }
@@ -91,6 +103,8 @@ pub(crate) enum Skipped {
     Weave,
     /// Role-drop ordering needs the members of every role the plan drops.
     RoleDrops,
+    /// Referenced edits and table drops wait for policy owners the plan drops.
+    PolicyDependents,
 }
 
 impl Skipped {
@@ -100,6 +114,7 @@ impl Skipped {
         match self {
             Self::Weave => "plan.module-dependents-unread",
             Self::RoleDrops => "plan.role-members-unread",
+            Self::PolicyDependents => "plan.policy-dependents-unread",
         }
     }
 }
@@ -110,6 +125,10 @@ impl fmt::Display for Skipped {
             Self::Weave => {
                 "What depends on a dropped or rebuilt module is removed before it and put back \
                  after; `pbps plan --db` lists it for the target, this preview cannot."
+            }
+            Self::PolicyDependents => {
+                "A policy's table drop precedes changes to tables or columns it references; `pbps plan --db` \
+                 reads those policy dependencies for the target, this preview cannot."
             }
             Self::RoleDrops => {
                 "A dropped role's members are removed first; `pbps plan --db` lists them for \
@@ -304,6 +323,73 @@ pub(crate) fn schedule(
         declared.module_deps,
     )
     .map_err(Refusal)?;
+    let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
+    let releases = if dialect.name() == "postgres" {
+        match facts.policy_dependents {
+            Some(found) => crate::row_security::policy_releases(&cs, declared.sources.after, found)
+                .map_err(Refusal::module_passes)?,
+            None => {
+                if cs
+                    .changes
+                    .iter()
+                    .any(|p| crate::row_security::policy_target_uid(&p.change).is_some())
+                {
+                    skipped.push(Skipped::PolicyDependents);
+                }
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !edges.is_empty() || !releases.is_empty() {
+        let mut schedule = if releases.is_empty() {
+            pbps_diff::order::Schedule::new(cs.changes.len())
+        } else {
+            // Catalog policy edges can move a column release past a routine
+            // drop or a name handover. Settle them with the existing effect,
+            // name-slot and module-catalog constraints, not a positional move
+            // that invents dependencies between unrelated table drops.
+            policy_release_schedule(&cs, declared, facts, dialect)?
+        };
+        for release in &releases {
+            schedule.edge(
+                release.before,
+                release.after,
+                pbps_diff::order::Source::Catalog,
+                pbps_model::resolver::OrderReason::Structural,
+            );
+        }
+        for (before, after) in edges {
+            schedule.edge(
+                before,
+                after,
+                pbps_diff::order::Source::Effect,
+                pbps_model::resolver::OrderReason::Structural,
+            );
+        }
+        cs = schedule
+            .settle(cs.clone())
+            .map_err(|why| {
+                Refusal(format!(
+                    "{}{}",
+                    why.describe(&cs),
+                    if releases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\n{}",
+                            releases
+                                .iter()
+                                .map(|r| r.refusal.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
+                    }
+                ))
+            })?
+            .changes;
+    }
     // The complete typed plan proves which additions finish a newly
     // generated table, even if an older lowering added them separately.
     let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
@@ -404,6 +490,75 @@ fn keep_handover_dependents(
 #[cfg(test)]
 #[path = "../../../pbps-diff/tests/support/role_order.rs"]
 mod role_order_oracle;
+
+/// Existing structural constraints remain true when catalog policy releases
+/// require a different teardown order. This graph is used only for that case.
+fn policy_release_schedule(
+    cs: &ChangeSet,
+    declared: &Declarations<'_>,
+    facts: &Facts<'_>,
+    dialect: &dyn Dialect,
+) -> Result<pbps_diff::order::Schedule, Refusal> {
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)
+        .map_err(|why| Refusal(why.to_string()))?;
+    let owners = PlanOwners::new(names, declared.sources.before.ids, declared.sources.after);
+    let before = Snapshot {
+        schema: declared.sources.before.schema,
+        ids: declared.sources.before.ids,
+    };
+    let after = Snapshot {
+        schema: declared.schema,
+        ids: declared.sources.after,
+    };
+    let effects = pbps_diff::order::analyse(&operations, &owners, before, after, dialect);
+    if let Some((id, why)) = effects.unowned.first() {
+        return Err(Refusal(format!(
+            "policy release operation {id} has unread effects: {why}"
+        )));
+    }
+    let graph = pbps_diff::order::graph(
+        operations.as_slice(),
+        &effects.effects,
+        &pbps_diff::order::Baseline::of(before, &owners),
+        declared.module_deps,
+        pbps_diff::order::Checks::ALL,
+    );
+    let mut schedule = pbps_diff::order::Schedule::of_graph(&graph, operations.as_slice());
+    for edge in
+        pbps_diff::order::generated::constraints(cs, declared.schema, declared.module_deps, dialect)
+    {
+        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
+    }
+    let slots = pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
+    if !slots.unowned.is_empty() || !slots.unlowered.is_empty() {
+        return Err(Refusal(
+            "policy release has unread name-slot effects".into(),
+        ));
+    }
+    pbps_diff::order::slots::schedule(
+        &mut schedule,
+        &pbps_diff::order::slots::edges(&slots, None, &[]),
+    );
+    if let Some(found) = facts.module_dependents {
+        for edge in super::module_order(cs, found, declared.schema, declared.sources, dialect)
+            .map_err(Refusal::module_passes)?
+        {
+            let (
+                pbps_diff::order::expand::Step::Plan(before),
+                pbps_diff::order::expand::Step::Plan(after),
+            ) = (edge.before, edge.after)
+            else {
+                return Err(Refusal(
+                    "module catalog edge names an unexpanded operation".into(),
+                ));
+            };
+            schedule.edge(before, after, edge.source, edge.reason);
+        }
+    }
+    Ok(schedule)
+}
 
 #[cfg(test)]
 mod tests {
@@ -525,6 +680,349 @@ mod tests {
             facts,
             &pg(),
         )
+    }
+
+    #[test]
+    fn policy_owner_drops_preserve_column_name_handovers_and_distinguish_unread_facts() {
+        let input = TableName::new("app", "input");
+        let renamed = TableName::new("app", "renamed");
+        let owner = TableName::new("app", "owner");
+        let input_uid = Uid::derived(UidKind::Table, "input", 0);
+        let owner_uid = Uid::derived(UidKind::Table, "owner", 0);
+        let replacement_uid = Uid::derived(UidKind::Table, "replacement", 0);
+        let target_uid = Uid::derived(UidKind::Column, "target", 0);
+        let mut before = Schema::default();
+        before.tables.insert(
+            input.clone(),
+            Table {
+                columns: [("target".into(), column(ValueSource::None))].into(),
+                ..Default::default()
+            },
+        );
+        before.tables.insert(
+            owner.clone(),
+            Table {
+                row_policies: [(
+                    "cross_table".into(),
+                    pbps_model::RowPolicy {
+                        using: Some("EXISTS(SELECT FROM app.input WHERE target > 0)".into()),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let mut ids = IdsFile::default();
+        ids.tables.insert(input_uid.clone(), input.clone());
+        ids.tables.insert(owner_uid.clone(), owner.clone());
+        ids.columns
+            .insert(target_uid.clone(), input.column("target"));
+        for retype in [false, true] {
+            let edit = if retype {
+                Change::AlterColumnType {
+                    uid: target_uid.clone(),
+                    column: input.column("target"),
+                    from: "integer".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    through_external_partitions: false,
+                    from_nullable: true,
+                    to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
+                }
+            } else {
+                Change::DropColumn {
+                    uid: target_uid.clone(),
+                    column: input.column("target"),
+                }
+            };
+            let changes = ChangeSet {
+                changes: vec![
+                    edit,
+                    Change::RenameTable {
+                        uid: input_uid.clone(),
+                        from: input.clone(),
+                        to: renamed.clone(),
+                        defaults: vec![],
+                    },
+                    Change::DropTable {
+                        uid: owner_uid.clone(),
+                        name: owner.clone(),
+                        detach_from: None,
+                    },
+                    Change::CreateTable {
+                        uid: replacement_uid.clone(),
+                        name: input.clone(),
+                        table: Box::default(),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                ]
+                .into_iter()
+                .map(PlannedChange::new)
+                .collect(),
+            };
+            let mut after = Schema::default();
+            let mut shape = before.tables[&input].clone();
+            if retype {
+                shape.columns["target"].ty = "bigint".parse().unwrap();
+            } else {
+                shape.columns.shift_remove("target");
+            }
+            after.tables.insert(renamed.clone(), shape);
+            after.tables.insert(input.clone(), Table::default());
+            let mut final_ids = ids.clone();
+            final_ids.tables.remove(&owner_uid);
+            final_ids.tables.insert(input_uid.clone(), renamed.clone());
+            final_ids
+                .tables
+                .insert(replacement_uid.clone(), input.clone());
+            if retype {
+                final_ids
+                    .columns
+                    .insert(target_uid.clone(), renamed.column("target"));
+            } else {
+                final_ids.columns.remove(&target_uid);
+            }
+            let declared = Declarations {
+                schema: &after,
+                sources: Sources {
+                    before: pbps_diff::Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    after: &final_ids,
+                },
+                module_deps: &ModuleDeps::new(),
+            };
+            let offline = schedule(changes.clone(), &declared, &Facts::default(), &pg()).unwrap();
+            assert_eq!(offline.skipped, [Skipped::PolicyDependents]);
+            assert_eq!(offline.skipped[0].id(), "plan.policy-dependents-unread");
+            assert_eq!(offline.changes, changes);
+            assert!(
+                schedule(
+                    changes.clone(),
+                    &declared,
+                    &Facts::default().with_policy_dependents(&BTreeMap::new()),
+                    &pg()
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("were not read")
+            );
+            let empty = [
+                (target_uid.clone(), vec![]),
+                (input_uid.clone(), vec![]),
+                (owner_uid.clone(), vec![]),
+            ]
+            .into();
+            let no_policy = schedule(
+                changes.clone(),
+                &declared,
+                &Facts::default().with_policy_dependents(&empty),
+                &pg(),
+            )
+            .unwrap();
+            assert!(no_policy.skipped.is_empty());
+            assert_eq!(no_policy.changes, changes);
+            let found = [
+                (
+                    target_uid.clone(),
+                    vec![pbps_pg::modules::PolicyDependent {
+                        table: owner.clone(),
+                        name: "cross_table".into(),
+                    }],
+                ),
+                // The same external policy also changes its deparse when
+                // the referenced table is renamed, so its owner releases
+                // both catalog bindings before either edit.
+                (
+                    input_uid.clone(),
+                    vec![pbps_pg::modules::PolicyDependent {
+                        table: owner.clone(),
+                        name: "cross_table".into(),
+                    }],
+                ),
+                (owner_uid.clone(), vec![]),
+            ]
+            .into();
+            let facts = Facts::default().with_policy_dependents(&found);
+            let ordered = schedule(changes.clone(), &declared, &facts, &pg()).unwrap();
+            assert_eq!(
+                ordered
+                    .changes
+                    .changes
+                    .iter()
+                    .map(|p| &p.change)
+                    .collect::<Vec<_>>(),
+                [2, 0, 1, 3].map(|i| &changes.changes[i].change)
+            );
+            crate::row_security::check_policy_releases(&ordered.changes, &final_ids, &found)
+                .unwrap();
+            assert!(
+                crate::row_security::check_policy_releases(&changes, &final_ids, &found)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must precede")
+            );
+        }
+    }
+
+    #[test]
+    fn whole_table_policy_chains_are_ordered_and_cycles_are_named() {
+        let tables: Vec<_> = ["a", "m", "z"]
+            .map(|name| TableName::new("app", name))
+            .into();
+        let uids: Vec<_> = ["a", "m", "z"]
+            .map(|name| Uid::derived(UidKind::Table, name, 0))
+            .into();
+        let before = Schema {
+            tables: tables
+                .iter()
+                .map(|t| (t.clone(), Table::default()))
+                .collect(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            tables: uids.iter().cloned().zip(tables.iter().cloned()).collect(),
+            ..Default::default()
+        };
+        let changes = ChangeSet {
+            changes: uids
+                .iter()
+                .zip(&tables)
+                .map(|(uid, table)| {
+                    PlannedChange::new(Change::DropTable {
+                        uid: uid.clone(),
+                        name: table.clone(),
+                        detach_from: None,
+                    })
+                })
+                .collect(),
+        };
+        let after = Schema::default();
+        let final_ids = IdsFile::default();
+        let deps = ModuleDeps::new();
+        let declared = Declarations {
+            schema: &after,
+            sources: Sources {
+                before: pbps_diff::Side {
+                    schema: &before,
+                    ids: &ids,
+                },
+                after: &final_ids,
+            },
+            module_deps: &deps,
+        };
+        let policy = |owner: usize, name: &str| pbps_pg::modules::PolicyDependent {
+            table: tables[owner].clone(),
+            name: name.into(),
+        };
+        let mut found: crate::row_security::PolicyDependents = [
+            (uids[0].clone(), vec![policy(2, "reads_a")]),
+            (uids[1].clone(), vec![policy(1, "own_predicate")]),
+            (uids[2].clone(), vec![policy(1, "reads_z")]),
+        ]
+        .into();
+        let ordered = schedule(
+            changes.clone(),
+            &declared,
+            &Facts::default().with_policy_dependents(&found),
+            &pg(),
+        )
+        .unwrap();
+        assert_eq!(
+            ordered
+                .changes
+                .changes
+                .iter()
+                .map(|p| p.change.table().unwrap())
+                .collect::<Vec<_>>(),
+            [&tables[1], &tables[2], &tables[0]]
+        );
+        crate::row_security::check_policy_releases(&ordered.changes, &final_ids, &found).unwrap();
+        assert!(crate::row_security::check_policy_releases(&changes, &final_ids, &found).is_err());
+        let mut retained = changes.clone();
+        retained.changes.remove(1);
+        let error = schedule(
+            retained,
+            &declared,
+            &Facts::default().with_policy_dependents(&found),
+            &pg(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("reads_z") && error.contains("arrives with #1173"),
+            "{error}"
+        );
+        found
+            .get_mut(&uids[1])
+            .unwrap()
+            .push(policy(0, "closes_cycle"));
+        let error = schedule(
+            changes,
+            &declared,
+            &Facts::default().with_policy_dependents(&found),
+            &pg(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("wait on one another") && error.contains("closes_cycle"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn row_security_setup_follows_modules_after_scheduling() {
+        let (mut schema, ids) = declarations();
+        let table = schema
+            .tables
+            .get_mut(&TableName::new("app", "a_plain"))
+            .unwrap();
+        table.row_security.enabled = true;
+        table.row_policies.insert(
+            "p".into(),
+            pbps_model::RowPolicy {
+                using: Some("app.zz() > 0".into()),
+                ..Default::default()
+            },
+        );
+        let mut changes = differ_order(&schema, &ids);
+        // The module passes can move suppliers after the initial class sort.
+        // Start with that adverse order to pin the final scheduling boundary.
+        changes.changes.sort_by_key(|p| {
+            matches!(
+                p.change,
+                Change::CreateModule { .. } | Change::PublicExecution { .. }
+            )
+        });
+        let result = scheduled(changes, &schema, &ids, &Facts::default())
+            .unwrap()
+            .changes;
+        let policy = result
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreatePolicy { .. }))
+            .unwrap();
+        let flags = result
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::SetRowSecurity { .. }))
+            .unwrap();
+        for (at, step) in result.changes.iter().enumerate() {
+            if matches!(
+                step.change,
+                Change::CreateModule { .. } | Change::PublicExecution { .. }
+            ) {
+                assert!(at < policy);
+            }
+        }
+        assert!(policy < flags);
+        let again = scheduled(result.clone(), &schema, &ids, &Facts::default()).unwrap();
+        assert_eq!(again.changes, result);
     }
 
     // A test rendering: what each change is, in the plan's order.

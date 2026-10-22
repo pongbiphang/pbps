@@ -30,6 +30,7 @@ pub mod new_tables;
 pub mod parent_defaults;
 mod rewrites;
 pub(crate) mod roles;
+pub mod row_security;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;

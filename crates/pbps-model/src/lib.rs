@@ -58,13 +58,13 @@ pub use change::{
     AddedRole, CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, DetachedKind,
     DetachedName, Dropped, IndexPart, ModuleAfter, NumberingKind, Part, PartAfter, PartChange,
     PartDefinition, PermissionChange, PlannedChange, Presence, Provenance, PublicAccess, RiskClass,
-    RoutineOrigin, RowAfter,
+    RoutineOrigin, RowAfter, RowSecurityOrigin,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
     RowConflict, RowKey, RowScope, TableData, Value,
 };
-pub use declared::{Binding, Bindings, Declared, DeclaredExpressions};
+pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, IdsIndex, Move, Tombstone, ValidIds};

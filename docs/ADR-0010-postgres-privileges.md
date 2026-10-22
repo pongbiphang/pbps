@@ -458,9 +458,10 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
   This protects that rebuild; it does not make column grants declarable.
 - **Row-level security is represented by table flags and policies** (#1172
   PR A, DEC-1172.1). Loading, formatting and the catalog read are available.
-  Adoption and deployment await PR C: RLS tables remain named limitations,
-  preserving planning for unrelated tables (DEC-1172.4). Planning and saved-plan
-  replay refuse declared RLS state meanwhile. `SET ROLE` chaining,
+  Ordinary RLS tables are adopted; new tables receive explicit policies and
+  independent flags after modules and data inserts. Unchanged policies allow
+  unrelated plans; standing alterations arrive with #1173. RLS partition trees
+  stay limitations. Policy predicate binding proof remains #595's boundary. `SET ROLE` chaining,
   `pg_hba.conf`, `CONNECT` and database-level privileges remain outside the
   declaration model as cluster or connection concerns.
 - **Sequence, type, domain and foreign-data-wrapper grants remain unmodelled.**

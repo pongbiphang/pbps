@@ -1152,3 +1152,62 @@ fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
         }
     }
 }
+
+#[test]
+fn row_security_bootstraps_keep_the_namespace_without_claiming_policy_bindings() {
+    use pbps_model::{PolicyRoles, RowPolicy, RowSecurity, RowSecurityOrigin};
+    let dialect = crate::Postgres::new();
+    let plain = build_reconstruction(&dialect, &bootstrap()).unwrap();
+    let statements = |recipe: &Reconstruction| {
+        recipe
+            .steps
+            .iter()
+            .flat_map(|step| step.statements.clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = statements(&plain);
+    for (enabled, forced, with_policy) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let mut changes = bootstrap();
+        let Change::CreateTable {
+            uid, name, table, ..
+        } = &mut changes[0]
+        else {
+            panic!("the fixture starts with a table");
+        };
+        let uid = uid.clone();
+        let name = name.clone();
+        let flags = RowSecurity { enabled, forced };
+        table.row_security = flags;
+        let policy = RowPolicy {
+            to: PolicyRoles::Roles(["recipient_not_reproduced_on_scratch".into()].into()),
+            using: Some("app.f(c::integer) > 0".into()),
+            ..Default::default()
+        };
+        if with_policy {
+            table.row_policies.insert("visible".into(), policy.clone());
+            changes.push(Change::CreatePolicy {
+                table: name.clone(),
+                name: "visible".into(),
+                policy,
+                origin: RowSecurityOrigin::Created,
+            });
+        }
+        if !flags.is_default() {
+            changes.push(Change::SetRowSecurity {
+                uid,
+                table: name,
+                from: RowSecurity::default(),
+                to: flags,
+                origin: RowSecurityOrigin::Created,
+            });
+        }
+        let recipe = build_reconstruction(&dialect, &changes).unwrap();
+        assert_eq!(statements(&recipe), expected);
+        assert_eq!(recipe.len(), plain.len());
+    }
+}

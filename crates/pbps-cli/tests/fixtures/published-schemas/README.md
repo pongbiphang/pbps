@@ -61,3 +61,4 @@ DECISIONS 465).
 - `34/` adds a partition's own `unlogged:` and `storage_parameters:` to a `partitions:` entry (issue #1580).
 - `49/` adds a partition's own `foreign_keys:` to a `partitions:` entry (issue #1632).
 - `51/` adds table `row_security:` and `row_policies:` (issue #1172 PR A).
+- `52/` publishes created-table policy and row-security planning (issue #1172 PR C).

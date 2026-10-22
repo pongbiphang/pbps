@@ -262,6 +262,8 @@ pub enum PartKey {
     Unique(String),
     ForeignKey(String),
     Check(String),
+    Policy(String),
+    RowSecurity,
     Index(String),
     /// A SQL Server computed column, added and dropped whole by name.
     Computed(ColumnName),
@@ -622,6 +624,11 @@ impl Operation {
             Change::AddForeignKey { table, name, .. } | Change::DropForeignKey { table, name } => {
                 part(table, PartKey::ForeignKey(name.clone()))?
             }
+            Change::CreatePolicy { table, name, .. } => part(table, PartKey::Policy(name.clone()))?,
+            Change::SetRowSecurity { uid, .. } => ObjectKey::Part {
+                table: recorded(uid),
+                part: PartKey::RowSecurity,
+            },
             Change::AddCheck { table, name, .. } | Change::DropCheck { table, name } => {
                 part(table, PartKey::Check(name.clone()))?
             }
@@ -709,6 +716,7 @@ impl Operation {
                     })
                 };
                 let mut out = vec![produces(ObjectKey::Table(owner.clone()))];
+                if table.has_row_security() { out.push(part(PartKey::RowSecurity)); }
                 for c in table.columns.keys() {
                     out.push(produces(ObjectKey::Column(column(c)?)));
                 }
@@ -772,6 +780,7 @@ impl Operation {
             Change::AddComputedColumn { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }
+            | Change::CreatePolicy { .. }
             | Change::AddCheck { .. }
             | Change::AddIndex { .. }
             | Change::InsertRow { .. }
@@ -803,6 +812,7 @@ impl Operation {
             // an instance the declaration holds (#1889).
             | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetTablePersistence { .. }

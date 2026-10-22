@@ -2312,6 +2312,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 51,
+  "x-pbps-schema-version": 52,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -6830,6 +6830,53 @@ excluded until PR C (DEC-1172.4). Declared expression tracking, create-only
 change kinds, emission, dependent refusals and filtered-probe wrapping belong
 to PR C.
 
+
+PR C of #1172 implements DEC-1172.1's created-table planning boundary with
+CreatePolicy and SetRowSecurity, checked against their table creation. Policies
+follow modules and bootstrap inserts, then independent ENABLE/FORCE flags.
+Standing-table differences name #1173; unchanged adopted policies do not block
+unrelated migrations. Authored predicates overlay only matching presence;
+untouched catalog predicates remain exact drift state. Predicate binding proof
+is still #595's named limitation, not a reason to omit an otherwise supported
+table. Resolver reconstruction explicitly leaves policy/flag setup to the
+deployment plan: neither operation adds a nameable lookup candidate, policy
+predicates are not captured surfaces, and scratch need not reproduce their
+recipient roles. The connected role check reads every named recipient of each
+policy creation, including recipients outside the managed role declarations,
+and refuses a missing one by policy and role name before producing an artifact.
+PUBLIC is its own target and needs no role lookup. Bootstrap and saved-plan
+apply share that check. Exact declared policy catalog rows and their dependency rows
+belong to the UID-proven table for closing ownership; this grants no predicate
+binding proof or ownership of referenced objects. The created-only operations
+have no intrinsic risk. A catalog-proven policy dependency is released by a
+whole owner-table drop in the same plan, before the referenced column edit,
+table drop or routine removal. Relation-only edges block table drops without
+being mistaken for references to every column. The central schedule settles
+these catalog edges with existing structural, name-slot and module-catalog
+constraints, rather than inventing positional edges between table drops.
+This preserves routine releases and name handovers, accepts dependency chains,
+and refuses cycles that need individual policy removal. A retained owner still
+refuses by policy name with #1173. Apply reads dependencies again and refuses
+a saved plan whose owner removal follows the dependent change; it never
+repairs the approved order.
+Column renames with managed policy bindings join that named #1173 refusal: offering a
+plan the closing guard must roll back is not useful. A table rename refuses
+only the policies whose catalog deparse changes: relation references, explicit
+row-type casts, and owner whole-row or correlated aliases. Ordinary local
+scalar predicates remain valid, as does a schema-only move of a whole-row
+predicate whose owner alias stays the same. This reads engine node trees with
+the existing versioned decoder, without parsing authored SQL or certifying
+policy bindings for #595. Renaming a routine's declaration is a drop/create,
+and a retained policy caller already refuses it, just like a routine rebuild;
+unbound column renames and unrelated routine changes remain applicable.
+Policies on unmanaged owners also follow table and column renames cleanly:
+those predicates are outside the typed closing comparison. Only rename facts
+are scoped to the managed policy names; drops, retypes and routine rebuilds
+still read every physical policy dependency. The table-rename reader skips
+unmanaged policy trees before decoding, so unrelated expression coverage
+cannot become a refusal.
+
+
 <a id="dec-2104-1"></a>
 
 **DEC-2104.1. The commutation suite lists no exception for a plan whose
@@ -7669,6 +7716,7 @@ prefix (DEC-1503.4).
 | `CreateModule`, `AlterModule` | Trigger's `on` table and tables/types named by the definition | No at installation; a trigger or routine body is installed, not invoked. Its execution belongs to the invoking row operation |
 | `DropModule` | No | No; dropping a trigger or routine does not execute it |
 | `SetReplicaIdentity`, `SetStorageParameters`, `SetTablePersistence`, `SetIndexStorageParameters` | No; existing object identities suffice | No; physical storage rewrites preserve an empty row set |
+| `CreatePolicy`, `SetRowSecurity` | Owner; policies bind complete columns before flags activate them | No; installing or activating policies does not introduce rows |
 | `SetDataMode`, `SetEnsureKeys` | No; recorded declaration metadata | No; their DML is represented separately |
 | `CreateRole`, `DropRole`, `RenameRole`, `Grant`, `Revoke`, `PublicExecution` | No; name/permission operations | No |
 

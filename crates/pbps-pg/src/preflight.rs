@@ -3020,6 +3020,33 @@ fn moved_bounds(
     ((was.min, was.max) != (now.min, now.max)).then_some((increment, now))
 }
 
+/// A conversion carries the counter only while it keeps the direction.
+/// Shared with probe classification: this catalog read is not filtered by RLS.
+fn carried_counter(from: &ValueSource, to: &ValueSource) -> Option<i64> {
+    match (from, to) {
+        (ValueSource::Identity(was), ValueSource::Sequence(now))
+            if (was.increment < 0) == (now.increment < 0) =>
+        {
+            Some(was.increment)
+        }
+        (ValueSource::Sequence(was), ValueSource::Identity(now))
+            if (was.increment < 0) == (now.increment < 0) =>
+        {
+            Some(was.increment)
+        }
+        (ValueSource::Identity(_) | ValueSource::Sequence(_), _)
+        | (ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_), _) => None,
+    }
+}
+
+/// Numbering emits its catalog counter check first, then its table-row check.
+/// Active RLS leaves the former checkable just like FK collation metadata.
+fn counter_probe(change: &Change, ordinal: usize) -> bool {
+    matches!(change, Change::AlterColumnNumbering { from, to, .. }
+        if ordinal == 0 && (moved_bounds(from, to).is_some()
+            || carried_counter(from, to).is_some()))
+}
+
 /// The probes one change implies, using facts before that statement.
 fn build<'v, 'p: 'v>(
     change: &Change,
@@ -3483,15 +3510,7 @@ fn build<'v, 'p: 'v>(
             // then refuses it mid-apply (#2005). Counted in `numeric`, as the
             // block computes it; a counter this login cannot read counts too,
             // as an unreadable counter does for a bound moved in place.
-            let carried = match (from, to) {
-                (ValueSource::Identity(was), ValueSource::Sequence(_)) => Some(was.increment),
-                (ValueSource::Sequence(was), ValueSource::Identity(_)) => Some(was.increment),
-                (ValueSource::Identity(_) | ValueSource::Sequence(_), _)
-                | (ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_), _) => {
-                    None
-                }
-            }
-            .filter(|was| (*was < 0) == (increment < 0));
+            let carried = carried_counter(from, to);
             let mut probes = Vec::new();
             if carried.is_some() {
                 let read = |field: &str| {
@@ -3615,7 +3634,9 @@ fn build<'v, 'p: 'v>(
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
+        | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
+            | Change::SetReplicaIdentity { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
         | Change::PublicExecution { .. } => Ok(Vec::new()),
@@ -3795,6 +3816,58 @@ fn key_collation_probe(
     ))
 }
 
+/// A zero from a filtered relation is not proof that its constraint is safe.
+/// The engine still enforces it at apply; NULL uses the existing unchecked
+/// result channel (DEC-1172.3). Metadata probes are appended separately.
+fn without_filtered_rows(
+    sql: &str,
+    change: &Change,
+    names: &AsStored<'_, '_>,
+) -> Result<String, DialectError> {
+    let mut relations = BTreeSet::new();
+    if let Some(table) = change.table() {
+        relations.insert(table.clone());
+    }
+    if let Change::AddForeignKey { constraint, .. } = change {
+        relations.insert(constraint.references_table.clone());
+    }
+    if let Change::CreateTable { table, .. } = change {
+        relations.extend(
+            table
+                .foreign_keys
+                .values()
+                .map(|fk| fk.references_table.clone()),
+        );
+    }
+    let active: Vec<String> = relations
+        .iter()
+        .filter_map(|table| names.view().table(table))
+        .map(|table| {
+            qualified(&table).map(|name| {
+                format!(
+                    "pg_catalog.row_security_active({}::regclass)",
+                    value_literal(&name)
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    if active.is_empty() {
+        return Ok(sql.to_owned());
+    }
+    // A plain CASE subquery is still planned under RLS: constant folding can
+    // execute an immutable policy function even when CASE skips its count.
+    // Keep the SQL as text until the guard admits it (measured, DEC-1172.3).
+    let query = format!(
+        "SELECT probe.n AS n FROM (\n{}\n) AS probe(n)",
+        sql.trim().trim_end_matches(';')
+    );
+    Ok(format!(
+        "SELECT CASE WHEN {} THEN NULL::integer ELSE (pg_catalog.xpath('/row/n/text()', pg_catalog.query_to_xml({}, false, true, '')))[1]::text::integer END AS n;",
+        active.join(" OR "),
+        value_literal(&query)
+    ))
+}
+
 /// Every probe this dialect asks before a plan runs.
 ///
 /// Per `DeleteRow`, the count of what still references the row and the
@@ -3853,7 +3926,23 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
                      before it, so the rows it keeps cannot be counted before apply",
                 ));
             }
-            Ok(probes) => out.extend(probes),
+            Ok(probes) => {
+                for (ordinal, mut probe) in probes.into_iter().enumerate() {
+                    if counter_probe(&p.change, ordinal) {
+                        out.push(probe);
+                        continue;
+                    }
+                    match without_filtered_rows(&probe.sql, &p.change, &names) {
+                        Ok(sql) => {
+                            probe.sql = sql;
+                            out.push(probe);
+                        }
+                        Err(error) => {
+                            unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                        }
+                    }
+                }
+            }
             Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
         }
         if let Change::CreateTable {
@@ -3895,6 +3984,8 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }
@@ -6233,7 +6324,11 @@ mod tests {
             );
             for probe in counts {
                 assert!(
-                    probe.sql.starts_with("SELECT LEAST("),
+                    probe.sql.starts_with("SELECT LEAST(")
+                        || (probe
+                            .sql
+                            .starts_with("SELECT CASE WHEN pg_catalog.row_security_active(")
+                            && probe.sql.contains("\nSELECT LEAST(")),
                     "{kind}: {}",
                     probe.sql
                 );
