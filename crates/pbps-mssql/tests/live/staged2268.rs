@@ -591,3 +591,398 @@ async fn type_defaults_are_skipped_and_type_owner_equality_is_preserved() {
     })
     .await;
 }
+
+fn spelling_refused(result: Result<capture::Staged, StageError>, target: &str, scratch: &str) {
+    let Err(StageError::Refused(findings)) = result else {
+        panic!("expected a named spelling refusal: {result:?}");
+    };
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.contains("the externals file spells")
+                && f.contains(target)
+                && f.contains(scratch)),
+        "{findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.contains("does not have") || f.contains(" lacks ")),
+        "{findings:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn resolved_object_type_and_schema_spellings_refuse_by_both_names() {
+    for (tag, collation, class, a, b, target_sql, scratch_sql, restore_sql) in [
+        (
+            "ci_name",
+            "Latin1_General_100_CI_AS",
+            capture::class::OBJECT,
+            "T",
+            "t",
+            "CREATE TABLE dbo.T(a int);",
+            "CREATE TABLE dbo.t(a int);",
+            "DROP TABLE dbo.t; CREATE TABLE dbo.T(a int);",
+        ),
+        (
+            "ai_name",
+            "Latin1_General_100_CI_AI",
+            capture::class::OBJECT,
+            "Café",
+            "cafe",
+            "CREATE TABLE dbo.[Café](a int);",
+            "CREATE TABLE dbo.cafe(a int);",
+            "DROP TABLE dbo.cafe; CREATE TABLE dbo.[Café](a int);",
+        ),
+        (
+            "type_name",
+            "Latin1_General_100_CI_AS",
+            capture::class::TYPE,
+            "T",
+            "t",
+            "CREATE TYPE dbo.T FROM int;",
+            "CREATE TYPE dbo.t FROM int;",
+            "DROP TYPE dbo.t; CREATE TYPE dbo.T FROM int;",
+        ),
+        (
+            "schema_name",
+            "Latin1_General_100_CI_AS",
+            capture::class::SCHEMA,
+            "Ext",
+            "ext",
+            "CREATE SCHEMA Ext;",
+            "CREATE SCHEMA ext;",
+            "DROP SCHEMA ext; EXEC(N'CREATE SCHEMA Ext;');",
+        ),
+    ] {
+        case(tag, move |mut f| async move {
+            f.both(&format!("ALTER DATABASE CURRENT COLLATE {collation};"))
+                .await;
+            f.target.execute(target_sql).await.unwrap();
+            f.scratch.execute(scratch_sql).await.unwrap();
+            let root = |name: &str| capture::ObjectIdentity {
+                class: class.into(),
+                name: if class == capture::class::SCHEMA {
+                    vec![name.into()]
+                } else {
+                    vec!["dbo".into(), name.into()]
+                },
+                signature: vec![],
+            };
+            spelling_refused(
+                capture::compare_staged(
+                    &mut f.scratch,
+                    &mut f.target,
+                    &BTreeSet::from([root(b)]),
+                    &[],
+                )
+                .await,
+                a,
+                b,
+            );
+            f.scratch.execute(restore_sql).await.unwrap();
+            capture::compare_staged(
+                &mut f.scratch,
+                &mut f.target,
+                &BTreeSet::from([root(a)]),
+                &[],
+            )
+            .await
+            .unwrap();
+            if class == capture::class::OBJECT {
+                f.scratch
+                    .execute(&format!("ALTER TABLE dbo.[{a}] ALTER COLUMN a bigint;"))
+                    .await
+                    .unwrap();
+                refused(
+                    capture::compare_staged(
+                        &mut f.scratch,
+                        &mut f.target,
+                        &BTreeSet::from([root(a)]),
+                        &[],
+                    )
+                    .await,
+                    "a",
+                );
+            }
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn case_sensitive_root_difference_remains_named_absence() {
+    case("cs_name", |mut f| async move {
+        f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CS_AS;")
+            .await;
+        f.target
+            .execute("CREATE TABLE dbo.T(a int);")
+            .await
+            .unwrap();
+        f.scratch
+            .execute("CREATE TABLE dbo.t(a int);")
+            .await
+            .unwrap();
+        let Err(StageError::Refused(findings)) = f.compare(&["t"]).await else {
+            panic!("case-sensitive absence must refuse");
+        };
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("the target does not have") && f.contains("\"t\"")),
+            "{findings:?}"
+        );
+        assert!(
+            !findings.iter().any(|f| f.contains("spells")),
+            "{findings:?}"
+        );
+        f.scratch
+            .execute("DROP TABLE dbo.t; CREATE TABLE dbo.T(a int);")
+            .await
+            .unwrap();
+        f.compare(&["T"]).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn column_index_and_constraint_spellings_are_compared() {
+    for (tag, target_sql, scratch_sql, class, root, a, b) in [
+        (
+            "column_name",
+            "CREATE TABLE dbo.t(C int);",
+            "CREATE TABLE dbo.t(c int);",
+            capture::class::OBJECT,
+            "t",
+            "\"C\"",
+            "\"c\"",
+        ),
+        (
+            "index_name",
+            "CREATE TABLE dbo.t(a int); CREATE UNIQUE INDEX IX ON dbo.t(a);",
+            "CREATE TABLE dbo.t(a int); CREATE UNIQUE INDEX ix ON dbo.t(a);",
+            capture::class::OBJECT,
+            "t",
+            "\"IX\"",
+            "\"ix\"",
+        ),
+        (
+            "constraint_name",
+            "CREATE TABLE dbo.t(a int CONSTRAINT PK PRIMARY KEY);",
+            "CREATE TABLE dbo.t(a int CONSTRAINT pk PRIMARY KEY);",
+            capture::class::OBJECT,
+            "t",
+            "\"PK\"",
+            "\"pk\"",
+        ),
+        (
+            "type_column_name",
+            "CREATE TYPE dbo.tt AS TABLE(C int);",
+            "CREATE TYPE dbo.tt AS TABLE(c int);",
+            capture::class::TYPE,
+            "tt",
+            "\"C\"",
+            "\"c\"",
+        ),
+    ] {
+        case(tag, move |mut f| async move {
+            f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS;")
+                .await;
+            f.target.execute(target_sql).await.unwrap();
+            f.scratch.execute(scratch_sql).await.unwrap();
+            let created = BTreeSet::from([capture::ObjectIdentity {
+                class: class.into(),
+                name: vec!["dbo".into(), root.into()],
+                signature: vec![],
+            }]);
+            spelling_refused(
+                capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[]).await,
+                a,
+                b,
+            );
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn managed_aliases_are_rejected_as_overlap() {
+    case("managed_name", |mut f| async move {
+        f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS;")
+            .await;
+        f.both("CREATE SCHEMA Ext;").await;
+        f.both("CREATE TABLE Ext.t(a int CONSTRAINT t_pk PRIMARY KEY);")
+            .await;
+        f.both("CREATE VIEW Ext.v AS SELECT a FROM Ext.t;").await;
+        let mut managed = pbps_model::Schema::default();
+        managed.tables.insert(
+            pbps_model::TableName::new("ext", "T"),
+            pbps_model::Table::default(),
+        );
+        let actual = capture::object("Ext", "t");
+        let Err(StageError::Refused(findings)) = capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &BTreeSet::from([actual]),
+            &[&managed],
+        )
+        .await
+        else {
+            panic!("managed alias must overlap");
+        };
+        assert!(
+            findings.iter().any(|f| f.contains("managed set")),
+            "{findings:?}"
+        );
+        managed.modules.insert(
+            pbps_model::ModuleId::Named(pbps_model::ObjectName::new("ext", "V")),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: "SELECT a FROM Ext.t".into(),
+            },
+        );
+        let Err(StageError::Refused(findings)) = capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &BTreeSet::from([capture::object("Ext", "v")]),
+            &[&managed],
+        )
+        .await
+        else {
+            panic!("managed module alias must overlap");
+        };
+        assert!(
+            findings.iter().any(|f| f.contains("managed set")),
+            "{findings:?}"
+        );
+        // Constraint aliases share the same object namespace as tables/modules.
+        managed
+            .tables
+            .get_mut(&pbps_model::TableName::new("ext", "T"))
+            .unwrap()
+            .primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("T_PK".into()),
+            columns: vec!["a".into()],
+            storage_parameters: Default::default(),
+        });
+        let Err(StageError::Refused(findings)) = capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &BTreeSet::from([capture::object("Ext", "t_pk")]),
+            &[&managed],
+        )
+        .await
+        else {
+            panic!("managed constraint alias must overlap");
+        };
+        assert!(
+            findings.iter().any(|f| f.contains("managed set")),
+            "{findings:?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn cascade_seeds_resolve_to_catalog_spelling() {
+    for update in [false, true] {
+        case(if update {"update_seed_name"} else {"delete_seed_name"}, move |mut f| async move {
+            f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS;").await;
+            f.both("CREATE TABLE dbo.A(a int CONSTRAINT a_pk PRIMARY KEY); CREATE TABLE dbo.B(a int CONSTRAINT b_pk PRIMARY KEY); CREATE TABLE dbo.Managed(a int);").await;
+            let event = if update { "UPDATE" } else { "DELETE" };
+            f.target.execute(&format!("ALTER TABLE dbo.B ADD CONSTRAINT ba FOREIGN KEY(a) REFERENCES dbo.A(a) ON {event} CASCADE;")).await.unwrap();
+            f.target.execute(&format!("CREATE TRIGGER dbo.barrier ON dbo.Managed INSTEAD OF {event} AS RETURN;")).await.unwrap();
+            let alias = cascading(pbps_model::ReferentialAction::Cascade, update, &["a"]);
+            let mut canonical = cascading(pbps_model::ReferentialAction::Cascade, update, &["A"]);
+            let table = canonical.tables.remove(&pbps_model::TableName::new("dbo", "managed")).unwrap();
+            canonical.tables.insert(pbps_model::TableName::new("dbo", "Managed"), table);
+            let a = capture::cascade_scope(&mut f.target, &[&alias]).await.unwrap();
+            let b = capture::cascade_scope(&mut f.target, &[&canonical]).await.unwrap();
+            assert_eq!(a, b, "YAML aliases must retain the same canonical closure");
+            assert!(a.retained.contains(&capture::object("dbo", "ba")));
+            assert!(a.retained.contains(&capture::object("dbo", "barrier")));
+            assert!(a.retained.contains(&capture::object("dbo", "A")));
+            assert!(!a.retained.contains(&capture::object("dbo", "a")));
+            refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias]).await, "ba");
+            f.scratch.execute(&format!("ALTER TABLE dbo.B ADD CONSTRAINT ba FOREIGN KEY(a) REFERENCES dbo.A(a) ON {event} CASCADE;")).await.unwrap();
+            f.scratch.execute(&format!("CREATE TRIGGER dbo.barrier ON dbo.Managed INSTEAD OF {event} AS RETURN;")).await.unwrap();
+            let accepted = capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias]).await.unwrap();
+            let current = capture::capture(&mut f.target, accepted.scope()).await.unwrap();
+            assert!(accepted.changed_since(&current).is_empty());
+            // A managed FK is excluded even when its declaration uses an alias.
+            f.both("DROP TRIGGER dbo.barrier;").await;
+            f.both(&format!("ALTER TABLE dbo.Managed ADD CONSTRAINT to_a FOREIGN KEY(a) REFERENCES dbo.A(a) ON {event} CASCADE;")).await;
+            let mut named_alias = alias.clone();
+            let table = named_alias.tables.get_mut(&pbps_model::TableName::new("dbo", "managed")).unwrap();
+            let fk = table.foreign_keys.remove("to_a").unwrap();
+            table.foreign_keys.insert("TO_A".into(), fk);
+            let scope = capture::cascade_scope(&mut f.target, &[&named_alias]).await.unwrap();
+            assert!(!scope.retained.contains(&capture::object("dbo", "to_a")));
+            assert!(scope.retained.contains(&capture::object("dbo", "ba")));
+        }).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn managed_schema_aliases_preserve_owner_anchors() {
+    case("schema_anchor_name", |mut f| async move {
+        f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS;")
+            .await;
+        f.both("CREATE USER u WITHOUT LOGIN; CREATE USER other_owner WITHOUT LOGIN;")
+            .await;
+        f.both("CREATE SCHEMA ext AUTHORIZATION u;").await;
+        f.both("CREATE SCHEMA app AUTHORIZATION u;").await;
+        f.both("CREATE TABLE ext.t(a int);").await;
+        let mut managed = pbps_model::Schema::default();
+        managed.tables.insert(
+            pbps_model::TableName::new("APP", "future"),
+            pbps_model::Table::default(),
+        );
+        let created = BTreeSet::from([capture::object("ext", "t")]);
+        capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed])
+            .await
+            .unwrap();
+        f.scratch
+            .execute("ALTER AUTHORIZATION ON SCHEMA::app TO other_owner;")
+            .await
+            .unwrap();
+        refused(
+            capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed]).await,
+            "owner_group",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn accepted_handoff_keeps_exact_target_spelling() {
+    case("handoff_name", |mut f| async move {
+        f.both("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS;")
+            .await;
+        f.both("CREATE TABLE dbo.T(a int);").await;
+        let accepted = f.compare(&["T"]).await.unwrap();
+        assert!(accepted.compared().contains(&capture::object("dbo", "T")));
+        let current = capture::capture(&mut f.target, accepted.scope())
+            .await
+            .unwrap();
+        assert!(accepted.changed_since(&current).is_empty());
+        f.target
+            .execute("EXEC sys.sp_rename N'dbo.T', N't';")
+            .await
+            .unwrap();
+        let current = capture::capture(&mut f.target, accepted.scope())
+            .await
+            .unwrap();
+        assert!(!accepted.changed_since(&current).is_empty());
+    })
+    .await;
+}

@@ -4083,3 +4083,11 @@ objects leave no dependency row, an accepted residual under build equality.
 Dynamic SQL is outside creation-time binding. Keep this one named check for
 #2280 to relax for declared dependencies; no parser or source heuristic tries
 to close the documented residual.
+
+Names are resolved by the engine under the database collation, including
+managed declarations and cascade seeds; stored spelling is still a compared
+property, since measured `SELECT *` result columns and recorded bound names
+carry it. A root resolved on both sides refuses by its two spellings rather
+than being reported absent; case-sensitive absence remains absence. The
+accepted handoff retains exact target catalog identities, with no case or
+accent normalization.

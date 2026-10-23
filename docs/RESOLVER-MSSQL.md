@@ -622,6 +622,7 @@ refuses by name, rather than being left behind:
 compared with the target on **every property the engine reports for it and
 its children**, minus a short skip list. A property or class no rule names is
 compared, not passed.
+Names resolve under the engine's database collation, but stored spelling remains compared: a resolved spelling difference refuses by both names, while a genuinely absent object refuses as absent.
 
 - **What is read:**
   - the object: `sys.objects`, `sys.sql_modules`' flags and the

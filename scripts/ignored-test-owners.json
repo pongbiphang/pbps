@@ -1986,7 +1986,14 @@
         "staged2268::parent_or_other_action_trigger_does_not_block",
         "staged2268::view_and_table_function_result_columns_are_compared",
         "staged2268::owner_names_can_differ_but_equality_with_managed_schemas_cannot",
-        "staged2268::type_defaults_are_skipped_and_type_owner_equality_is_preserved"
+        "staged2268::type_defaults_are_skipped_and_type_owner_equality_is_preserved",
+        "staged2268::resolved_object_type_and_schema_spellings_refuse_by_both_names",
+        "staged2268::case_sensitive_root_difference_remains_named_absence",
+        "staged2268::column_index_and_constraint_spellings_are_compared",
+        "staged2268::managed_aliases_are_rejected_as_overlap",
+        "staged2268::cascade_seeds_resolve_to_catalog_spelling",
+        "staged2268::managed_schema_aliases_preserve_owner_anchors",
+        "staged2268::accepted_handoff_keeps_exact_target_spelling"
       ]
     },
     {

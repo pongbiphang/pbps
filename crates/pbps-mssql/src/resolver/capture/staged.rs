@@ -8,6 +8,10 @@ use pbps_model::{ReferentialAction, Schema};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod names;
+
+use names::Names;
+
 type Shapes = BTreeMap<ObjectIdentity, BTreeMap<String, Value>>;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -15,7 +19,7 @@ pub struct Staged {
     compared: BTreeSet<ObjectIdentity>,
     accepted: Shapes,
     scope: CaptureScope,
-    managed: Vec<Schema>,
+    managed: Managed,
 }
 
 impl std::fmt::Debug for Staged {
@@ -76,7 +80,25 @@ pub async fn compare_staged(
                 "the externals file created {}, which the comparison does not cover",
                 named(root)
             ));
-        } else if is_managed(root, &managed) {
+        }
+    }
+    if !refused.is_empty() {
+        return Err(StageError::Refused(refused));
+    }
+    let target_managed = Managed::read(target, &managed)
+        .await
+        .map_err(StageError::Capture)?;
+    let scratch_managed = Managed::read(scratch, &managed)
+        .await
+        .map_err(StageError::Capture)?;
+    let created_names = Names::read(scratch, created)
+        .await
+        .map_err(StageError::Capture)?;
+    for root in created {
+        if created_names
+            .get(root)
+            .is_some_and(|id| scratch_managed.objects.contains(id))
+        {
             refused.push(format!(
                 "the externals file created {}, which is in the managed set",
                 named(root)
@@ -86,46 +108,69 @@ pub async fn compare_staged(
     if !refused.is_empty() {
         return Err(StageError::Refused(refused));
     }
-    let mut scope = cascade_scope(target, &managed.iter().collect::<Vec<_>>())
+    let mut scope = cascade_scope_for(target, &target_managed)
         .await
         .map_err(StageError::Capture)?;
-    scope.retained.extend(
-        created
-            .iter()
-            .filter(|id| id.class != class::SCHEMA)
-            .cloned(),
-    );
+    scope.retained.extend(created.iter().cloned());
     let on_target = super::capture(target, &scope)
         .await
         .map_err(StageError::Capture)?;
     let staged = super::capture(scratch, &scope)
         .await
         .map_err(StageError::Capture)?;
-    // Roots come from catalog inventory, never guessed from source text.
-    let mut roots = created.clone();
-    for id in &scope.retained {
-        if !is_managed(id, &managed) {
-            roots.insert(id.clone());
-        }
-    }
-    for root in &roots {
-        for (label, inputs) in [("target", &on_target.inputs), ("scratch", &staged.inputs)] {
-            if !inputs.contains_key(root) {
-                refused.push(format!("the {label} does not have {}", named(root)));
+    let requested: BTreeSet<_> = created
+        .iter()
+        .cloned()
+        .chain(
+            scope
+                .retained
+                .iter()
+                .filter(|id| !target_managed.objects.contains(*id))
+                .cloned(),
+        )
+        .collect();
+    let target_names = Names::read(target, &requested)
+        .await
+        .map_err(StageError::Capture)?;
+    let scratch_names = Names::read(scratch, &requested)
+        .await
+        .map_err(StageError::Capture)?;
+    let mut roots = BTreeSet::new();
+    for root in &requested {
+        let a = target_names.get(root);
+        let b = scratch_names.get(root);
+        for (label, actual, inputs) in [
+            ("target", a, &on_target.inputs),
+            ("scratch", b, &staged.inputs),
+        ] {
+            match actual {
+                None => refused.push(format!("the {label} does not have {}", named(root))),
+                Some(id) if !inputs.contains_key(id) => {
+                    return Err(StageError::Capture(CaptureError::Changed));
+                }
+                _ => {}
             }
+        }
+        if let (Some(a), Some(b)) = (a, b) {
+            if a != b {
+                refused.push(spelling(a, b));
+            }
+            roots.insert(a.clone());
         }
     }
     if !refused.is_empty() {
         return Err(StageError::Refused(refused));
     }
-    let target_barriers = barriers(&on_target.inputs, &managed);
-    let scratch_barriers = barriers(&staged.inputs, &managed);
-    let accepted = shapes(&on_target.inputs, &roots, &target_barriers, &managed);
-    let findings = differences(
-        &accepted,
-        &shapes(&staged.inputs, &roots, &scratch_barriers, &managed),
-        "the externals file",
-    );
+    let target_barriers = barriers(&on_target.inputs, &target_managed);
+    let scratch_barriers = barriers(&staged.inputs, &scratch_managed);
+    let accepted = shapes(&on_target.inputs, &roots, &target_barriers, &target_managed);
+    let scratch_shapes = shapes(&staged.inputs, &roots, &scratch_barriers, &scratch_managed);
+    let mut findings = spelling_differences(scratch, &accepted, &scratch_shapes)
+        .await
+        .map_err(StageError::Capture)?;
+    if findings.is_empty() {
+        findings = differences(&accepted, &scratch_shapes, "the externals file");
+    }
     if !findings.is_empty() {
         return Err(StageError::Refused(findings));
     }
@@ -133,28 +178,74 @@ pub async fn compare_staged(
         compared: roots,
         accepted,
         scope,
-        managed,
+        managed: target_managed,
     })
 }
 
-fn is_managed(id: &ObjectIdentity, managed: &[Schema]) -> bool {
-    managed.iter().any(|schema| {
-        schema
-            .tables
-            .keys()
-            .any(|n| id == &super::object(&n.schema, &n.name))
-            || schema
-                .modules
-                .keys()
-                .any(|n| id == &super::object(n.schema(), n.name()))
-            || schema.tables.iter().any(|(table, t)| {
-                t.foreign_keys
-                    .keys()
-                    .chain(t.unique.keys())
-                    .chain(t.primary_key.iter().filter_map(|p| p.name.as_ref()))
-                    .any(|name| id == &super::object(&table.schema, name.raw()))
+// Every identity from YAML is resolved in the catalog where it will be used.
+// A declaration not present yet retains its requested identity, not a guessed
+// fold; the engine may create it later. The accepted handoff keeps target names.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Managed {
+    objects: BTreeSet<ObjectIdentity>,
+    seeds: Vec<(ObjectIdentity, ObjectIdentity, &'static str)>,
+    schemas: BTreeSet<String>,
+}
+
+impl Managed {
+    async fn read(
+        conn: &mut impl QueryConnection,
+        managed: &[Schema],
+    ) -> Result<Self, CaptureError> {
+        let mut objects = BTreeSet::new();
+        let mut schemas = BTreeSet::from(["dbo".to_owned()]);
+        for schema in managed {
+            for (table, t) in &schema.tables {
+                schemas.insert(table.schema.clone());
+                objects.insert(super::object(&table.schema, &table.name));
+                objects.extend(
+                    t.foreign_keys
+                        .keys()
+                        .chain(t.unique.keys())
+                        .chain(t.primary_key.iter().filter_map(|p| p.name.as_ref()))
+                        .map(|name| super::object(&table.schema, name.raw())),
+                );
+            }
+            for name in schema.modules.keys() {
+                schemas.insert(name.schema().into());
+                objects.insert(super::object(name.schema(), name.name()));
+            }
+        }
+        let seeds = seeds(managed);
+        let schema_ids: BTreeSet<_> = schemas
+            .iter()
+            .map(|name| ObjectIdentity {
+                class: class::SCHEMA.into(),
+                name: vec![name.clone()],
+                signature: vec![],
             })
-    })
+            .collect();
+        let requested = objects
+            .iter()
+            .cloned()
+            .chain(schema_ids.iter().cloned())
+            .chain(seeds.iter().flat_map(|(a, b, _)| [a.clone(), b.clone()]))
+            .collect();
+        let names = Names::read(conn, &requested).await?;
+        let resolve = |id: ObjectIdentity| names.get(&id).cloned().unwrap_or(id);
+        Ok(Self {
+            objects: objects.into_iter().map(resolve).collect(),
+            seeds: seeds
+                .into_iter()
+                .map(|(a, b, action)| (resolve(a), resolve(b), action))
+                .collect(),
+            schemas: schema_ids
+                .into_iter()
+                .map(resolve)
+                .map(|id| id.name[0].clone())
+                .collect(),
+        })
+    }
 }
 
 /// Identities a renderer must reproduce for cascade legality. Traverse external
@@ -166,15 +257,23 @@ pub async fn cascade_scope(
     managed: &[&Schema],
 ) -> Result<CaptureScope, CaptureError> {
     let managed: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
+    let managed = Managed::read(target, &managed).await?;
+    cascade_scope_for(target, &managed).await
+}
+
+async fn cascade_scope_for(
+    target: &mut impl QueryConnection,
+    managed: &Managed,
+) -> Result<CaptureScope, CaptureError> {
     let mut scope = CaptureScope::default();
     // Capturing the seeds follows their children and every incoming cascade,
     // so paths not directly adjacent to a managed table are present too.
-    for (a, b, _) in seeds(&managed) {
-        scope.retained.extend([a, b]);
+    for (a, b, _) in &managed.seeds {
+        scope.retained.extend([a.clone(), b.clone()]);
     }
     let catalog = super::read::read(target, &super::select::lookups(&scope)).await?;
     let selected = super::select::select(&catalog, &scope)?;
-    let relevant = barriers(&selected.inputs, &managed);
+    let relevant = barriers(&selected.inputs, managed);
     scope.retained.extend(relevant);
     for id in scope.retained.clone() {
         if let Some(input) = selected.inputs.get(&id) {
@@ -220,18 +319,22 @@ fn reference(input: &Input, key: &str) -> Option<ObjectIdentity> {
 
 fn barriers(
     inputs: &BTreeMap<ObjectIdentity, Input>,
-    managed: &[Schema],
+    managed: &Managed,
 ) -> BTreeSet<ObjectIdentity> {
     let mut kept = BTreeSet::new();
     for action in ["on_delete", "on_update"] {
-        let mut nodes: BTreeSet<_> = seeds(managed)
-            .into_iter()
+        let mut nodes: BTreeSet<_> = managed
+            .seeds
+            .iter()
             .filter(|(_, _, a)| *a == action)
+            .cloned()
             .flat_map(|(a, b, _)| [a, b])
             .collect();
-        let mut referencing: BTreeSet<_> = seeds(managed)
-            .into_iter()
+        let mut referencing: BTreeSet<_> = managed
+            .seeds
+            .iter()
             .filter(|(_, _, a)| *a == action)
+            .cloned()
             .map(|(a, _, _)| a)
             .collect();
         loop {
@@ -241,7 +344,7 @@ fn barriers(
                     continue;
                 };
                 if fk.get(action).and_then(Value::as_str) != Some("CASCADE")
-                    || is_managed(id, managed)
+                    || managed.objects.contains(id)
                 {
                     continue;
                 }
@@ -291,7 +394,7 @@ fn shapes(
     inputs: &BTreeMap<ObjectIdentity, Input>,
     roots: &BTreeSet<ObjectIdentity>,
     barriers: &BTreeSet<ObjectIdentity>,
-    managed: &[Schema],
+    managed: &Managed,
 ) -> Shapes {
     let mut included = roots.clone();
     loop {
@@ -334,13 +437,7 @@ fn shapes(
         .iter()
         .filter(|i| i.class == class::OBJECT || i.class == class::TYPE)
         .filter_map(|i| i.name.first().cloned())
-        .chain(["dbo".into()])
-        .chain(managed.iter().flat_map(|s| {
-            s.tables
-                .keys()
-                .map(|n| n.schema.clone())
-                .chain(s.modules.keys().map(|n| n.schema().to_owned()))
-        }))
+        .chain(managed.schemas.iter().cloned())
         .collect();
     included.extend(
         inputs
@@ -476,7 +573,69 @@ fn project_indexes(properties: &mut BTreeMap<String, Value>) {
 }
 
 fn named(id: &ObjectIdentity) -> String {
-    format!("{} {:?}", id.class, id.name)
+    let parent = id
+        .signature
+        .first()
+        .map(|p| format!(" of {}", named(p)))
+        .unwrap_or_default();
+    format!("{} {:?}{parent}", id.class, id.name)
+}
+
+fn spelling(target: &ObjectIdentity, scratch: &ObjectIdentity) -> String {
+    format!(
+        "the externals file spells {} as {}",
+        named(target),
+        named(scratch)
+    )
+}
+
+fn shape_names(shapes: &Shapes) -> BTreeSet<ObjectIdentity> {
+    let mut out: BTreeSet<_> = shapes.keys().cloned().collect();
+    for (id, properties) in shapes {
+        if let Some(indexes) = properties.get("sys.indexes").and_then(Value::as_array) {
+            for index in indexes {
+                if let Some(name) = index.get("name").and_then(Value::as_str) {
+                    out.insert(names::member(names::INDEX, id, name));
+                }
+            }
+        }
+        if id.class == class::TYPE
+            && let Some(columns) = properties.get("columns").and_then(Value::as_array)
+        {
+            for column in columns {
+                if let Some(name) = column
+                    .get("sys.columns")
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    out.insert(names::member(class::COLUMN, id, name));
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn spelling_differences(
+    scratch: &mut impl QueryConnection,
+    target: &Shapes,
+    staged: &Shapes,
+) -> Result<Vec<String>, CaptureError> {
+    if target == staged {
+        return Ok(vec![]);
+    }
+    let a = shape_names(target);
+    let b = shape_names(staged);
+    let requested = a.difference(&b).cloned().collect();
+    let resolved = Names::read(scratch, &requested).await?;
+    Ok(a.difference(&b)
+        .filter_map(|id| {
+            resolved
+                .get(id)
+                .filter(|actual| b.contains(*actual))
+                .map(|actual| spelling(id, actual))
+        })
+        .collect())
 }
 
 fn differences(target: &Shapes, staged: &Shapes, label: &str) -> Vec<String> {
@@ -591,7 +750,7 @@ mod tests {
             compared: BTreeSet::from([id.clone()]),
             accepted: BTreeMap::from([(id, BTreeMap::from([("private".into(), json!("secret"))]))]),
             scope: CaptureScope::default(),
-            managed: vec![],
+            managed: Managed::default(),
         };
         let shown = format!("{staged:?}");
         assert!(shown.contains("compared"));
@@ -629,7 +788,7 @@ mod tests {
                 target: policy.clone(),
             });
         let roots = BTreeSet::from([table.clone()]);
-        let target = shapes(&inputs, &roots, &BTreeSet::new(), &[]);
+        let target = shapes(&inputs, &roots, &BTreeSet::new(), &Managed::default());
         assert!(target.contains_key(&policy));
         let mut changed = inputs.clone();
         changed
@@ -637,9 +796,14 @@ mod tests {
             .unwrap()
             .properties
             .insert("sys.security_policies".into(), json!({"is_enabled":"0"}));
-        assert_ne!(target, shapes(&changed, &roots, &BTreeSet::new(), &[]));
+        assert_ne!(
+            target,
+            shapes(&changed, &roots, &BTreeSet::new(), &Managed::default())
+        );
         // A module's ordinary reference is not ownership of its callee.
         inputs.get_mut(&table).unwrap().bindings.clear();
-        assert!(!shapes(&inputs, &roots, &BTreeSet::new(), &[]).contains_key(&policy));
+        assert!(
+            !shapes(&inputs, &roots, &BTreeSet::new(), &Managed::default()).contains_key(&policy)
+        );
     }
 }
