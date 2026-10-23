@@ -81,10 +81,12 @@ fn catalog() -> Catalog {
                 execute_as: None,
             },
         )]),
+        object_properties: BTreeMap::new(),
         columns: Vec::new(),
         parameters: Vec::new(),
         types: Vec::new(),
         synonyms: BTreeMap::new(),
+        qualified_synonyms: BTreeSet::new(),
         triggers: BTreeMap::new(),
         whole: BTreeMap::new(),
         table_type_objects: BTreeMap::new(),
@@ -568,6 +570,23 @@ fn the_seal_holds_every_binding_target_and_member_and_no_definition() {
     let manifest = captured
         .seal(&key, &BTreeMap::new())
         .expect("the manifest's own checks pass");
+    assert_eq!(manifest.adapter(), super::RULE);
+    assert!(
+        manifest
+            .prerequisites()
+            .iter()
+            .all(|p| p.canonicalization == super::RULE)
+    );
+    assert!(manifest.opening_differences(&manifest).is_empty());
+    for other_rule in ["mssql-capture-v2", "mssql-capture-future"] {
+        let mut other = serde_json::to_value(&manifest).unwrap();
+        other["adapter"] = serde_json::json!(other_rule);
+        for row in other["prerequisites"].as_array_mut().unwrap() {
+            row["canonicalization"] = serde_json::json!(other_rule);
+        }
+        let other: pbps_model::resolver::InputManifest = serde_json::from_value(other).unwrap();
+        assert!(!manifest.opening_differences(&other).is_empty());
+    }
     let serialized = serde_json::to_string(&manifest).unwrap();
     assert!(
         !serialized.contains("SELECT 1 AS one"),
@@ -579,4 +598,53 @@ fn the_seal_holds_every_binding_target_and_member_and_no_definition() {
             .iter()
             .any(|p| p.object == object("sys", "sp_who"))
     );
+}
+
+#[test]
+fn reported_identity_properties_preserve_the_later_observation() {
+    let mut catalog = catalog();
+    catalog
+        .objects_named
+        .insert(("dbo".into(), "price".into()), BTreeSet::from([PRICE]));
+    let scope = CaptureScope {
+        retained: std::collections::BTreeSet::from([object("dbo", "price")]),
+        ..Default::default()
+    };
+    catalog.object_properties.insert(
+        PRICE,
+        BTreeMap::from([
+            ("OwnerId".into(), serde_json::json!(OTHER_USER)),
+            ("SchemaId".into(), serde_json::json!(APP)),
+        ]),
+    );
+    let selected = select::select(&catalog, &scope).unwrap();
+    let input = &selected.inputs[&object("dbo", "price")];
+    let properties = &input.properties["OBJECTPROPERTYEX"];
+    let owner: super::ObjectIdentity =
+        serde_json::from_value(properties["OwnerId"].clone()).unwrap();
+    let schema: super::ObjectIdentity =
+        serde_json::from_value(properties["SchemaId"].clone()).unwrap();
+    assert_eq!(owner.class, class::PRINCIPAL);
+    assert_eq!(owner.name, ["u_other"]);
+    assert_eq!(schema.class, class::SCHEMA);
+    assert_eq!(schema.name, ["app"]);
+    assert_ne!(properties["OwnerId"], input.properties["owner"]);
+    // Non-applicability remains NULL, and malformed metadata cannot silently
+    // fall back to a different component's earlier value.
+    catalog
+        .object_properties
+        .get_mut(&PRICE)
+        .unwrap()
+        .insert("OwnerId".into(), serde_json::Value::Null);
+    let selected = select::select(&catalog, &scope).unwrap();
+    assert!(
+        selected.inputs[&object("dbo", "price")].properties["OBJECTPROPERTYEX"]["OwnerId"]
+            .is_null()
+    );
+    catalog
+        .object_properties
+        .get_mut(&PRICE)
+        .unwrap()
+        .insert("SchemaId".into(), serde_json::json!("unreadable"));
+    assert!(select::select(&catalog, &scope).is_err());
 }

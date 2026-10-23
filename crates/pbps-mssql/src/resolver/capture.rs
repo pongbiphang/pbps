@@ -27,14 +27,19 @@
 mod catalog;
 mod columns;
 mod manifest;
+mod object_properties;
 mod ownership;
 mod read;
+mod references;
 mod select;
+mod staged;
 mod whole;
 
 pub use manifest::CapturedInputs;
+pub use object_properties::{OBJECT_PROPERTIES, PropertyDisposition, property_disposition};
 pub use ownership::RecordedOwnership;
 pub use pbps_db::resolver::capture::{CaptureError, ObjectIdentity, Uncovered};
+pub use staged::{StageError, Staged, cascade_scope, compare_staged};
 
 use std::collections::BTreeSet;
 
@@ -42,7 +47,7 @@ use std::collections::BTreeSet;
 /// change to what a property means, or to which properties are read, is a
 /// new rule: an old seal then reads as a version difference, never as a
 /// match under different semantics.
-pub const RULE: &str = "mssql-capture-v2";
+pub const RULE: &str = "mssql-capture-v3";
 
 /// The identity classes this capture produces, by the catalog each comes from.
 pub mod class {
@@ -143,7 +148,25 @@ pub async fn capture(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
 ) -> Result<CapturedInputs, CaptureError> {
-    let catalog = read::read(connection, &select::lookups(scope)).await?;
+    let mut catalog = read::read(connection, &select::lookups(scope)).await?;
+    let selected = select::select(&catalog, scope)?;
+    // Only reached objects are asked about: an unrelated broken module must
+    // not turn a scoped capture into a database-wide refusal.
+    let schemas: std::collections::BTreeMap<_, _> = catalog
+        .schemas
+        .iter()
+        .map(|s| (s.id, s.name.as_str()))
+        .collect();
+    let objects: Vec<_> = catalog
+        .objects
+        .iter()
+        .filter(|o| {
+            schemas
+                .get(&o.schema)
+                .is_some_and(|schema| selected.inputs.contains_key(&object(schema, &o.name)))
+        })
+        .collect();
+    catalog.object_properties = object_properties::read(connection, &objects).await?;
     let selected = select::select(&catalog, scope)?;
     Ok(CapturedInputs::new(catalog, selected, scope.clone()))
 }

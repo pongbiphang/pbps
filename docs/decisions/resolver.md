@@ -4051,3 +4051,43 @@ file-supplied contradictory owner refuses without mutation. Final settlement
 re-reads database authority and staged effective permissions and ACL rows.
 The CLI still refuses at the externals boundary; this adds no fabricated
 prepared or binding certificate.
+
+
+<a id="dec-2268-1"></a>
+
+**DEC-2268.1. Staged SQL Server comparison projects a canonical capture with
+an explicit OBJECTPROPERTYEX manifest, and screens multipart references in
+one catalog-based check (#2268).** Semantic function properties cannot be
+recovered from a signature or from skipped module text. Retain them in the
+ordinary target capture, moving its rule to `mssql-capture-v3`, so the final
+capture and later opening/closing checks seal the facts scratch relied on.
+The named API has no property enumeration: every supported manifest name has
+an explicit disposition; future scalar catalog columns still compare by
+default. NULL is a value, whereas an unreadable object or incomplete result
+refuses. Owner and schema IDs, fulltext catalog IDs and key-column IDs become
+logical identities. Data/progress counters never enter the seal.
+
+Projection removes every representation of skipped bodies, defaults and the
+named child summaries. A mixed index-presence summary is redundant too: the
+retained unique indexes are compared directly. Retained properties have no
+build-keyed expected values. Cascade closure follows external CASCADE edges
+in both directions, independently for DELETE and UPDATE, and includes only
+matching INSTEAD OF trigger barriers on referencing tables. It preserves the
+engine's legality decision rather than implementing a second cascade checker.
+
+The maintainer's 2026-10-22 choice supersedes the planning document's source
+parser recommendation. Dependency rows with server/database qualifiers refuse,
+including current-database and deferred-missing references; synonyms use
+`PARSENAME(base_object_name)` at the same boundary. Other-database `sys`
+objects leave no dependency row, an accepted residual under build equality.
+Dynamic SQL is outside creation-time binding. Keep this one named check for
+#2280 to relax for declared dependencies; no parser or source heuristic tries
+to close the documented residual.
+
+Names are resolved by the engine under the database collation, including
+managed declarations and cascade seeds; stored spelling is still a compared
+property, since measured `SELECT *` result columns and recorded bound names
+carry it. A root resolved on both sides refuses by its two spellings rather
+than being reported absent; case-sensitive absence remains absence. The
+accepted handoff retains exact target catalog identities, with no case or
+accent normalization.

@@ -63,6 +63,8 @@ SQL_BUILDERS = {
 } | {
     "crates/pbps-mssql/src/resolver/authorization/sandbox.rs",
     "crates/pbps-mssql/src/resolver/authorization/staged.rs",
+    "crates/pbps-mssql/src/resolver/capture/object_properties.rs",
+    "crates/pbps-mssql/src/resolver/capture/staged/names.rs",
 }
 
 # path -> (count, why). `count` is how many `.raw()` in a message the file may
@@ -144,6 +146,12 @@ ALLOWED = {
     ),
     "crates/pbps-mssql/src/resolver/authorization/staged.rs": (
         None, "quotes raw owner, grantor and grantee names into SQL Server ownership and ACL replay SQL",
+    ),
+    "crates/pbps-mssql/src/resolver/capture/object_properties.rs": (
+        None, "builds OBJECTPROPERTYEX queries from a fixed property manifest and catalog IDs",
+    ),
+    "crates/pbps-mssql/src/resolver/capture/staged/names.rs": (
+        None, "quotes requested identity components into engine-resolved catalog name lookups",
     ),
     # Serialization: the bytes a file or a document holds, in that medium's own
     # escaping, never a message on the terminal.
