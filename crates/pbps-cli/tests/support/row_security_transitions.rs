@@ -2,9 +2,9 @@
 use super::row_security_roundtrip::{Roles, assert_noop, versions};
 use super::*;
 
-const ALLOW: &[&str] = &["--allow", "row-security,revoke,destructive,rename,not-null"];
+pub(super) const ALLOW: &[&str] = &["--allow", "row-security,revoke,destructive,rename,not-null"];
 
-fn adopted(connection: &str, slug: &str) -> Demo {
+pub(super) fn adopted(connection: &str, slug: &str) -> Demo {
     let d = Demo::new(slug);
     succeeds(d.run(&["pull", "--db", connection]));
     d.commit();
@@ -231,7 +231,71 @@ fn row_security_c_explicit_policy_removals_release_columns_and_routine_rebuilds(
             )
             .replace("n: {type: integer}", "n: {type: bigint}"),
         );
-        let saved = apply(&d, connection);
+        let artifact = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+        let mut forged = saved.clone();
+        forged.changes.changes.retain(|step| {
+            !matches!(
+                step.change,
+                pbps_model::Change::DropPolicy { .. } | pbps_model::Change::CreatePolicy { .. }
+            )
+        });
+        let pg = pbps_pg::Postgres::new();
+        let risks = pbps_diff::order::generated::risks(&forged.changes, &forged.ids, &pg);
+        for (step, risks) in forged.changes.changes.iter_mut().zip(risks) {
+            step.risks = risks;
+        }
+        let forged_path = d.dir.join("missing-policy-release.json");
+        std::fs::write(&forged_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+        // Pure admission cannot see catalog bindings. Apply must recheck the
+        // release even for an internally consistent, checksum-approved plan.
+        pbps_diff::order::admit(
+            forged.clone(),
+            &pg,
+            &forged_path,
+            &forged.wire_fingerprint(),
+        )
+        .unwrap();
+        let before = latest_snapshot(connection);
+        // Progress is printed before admission finishes. A nontransactional
+        // sequence records any attempted DDL even if apply rolls it back.
+        on_server(
+            connection,
+            "CREATE SCHEMA rls_d_release; CREATE SEQUENCE rls_d_release.ddl_calls; CREATE FUNCTION rls_d_release.count_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('rls_d_release.ddl_calls'); END $$; CREATE EVENT TRIGGER rls_d_release_ddl ON ddl_command_end WHEN TAG IN ('DROP FUNCTION','ALTER TABLE') EXECUTE FUNCTION rls_d_release.count_ddl()",
+        );
+        let out = approved_apply(&d, connection, &forged_path, ALLOW);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("gate") && stderr(&out).contains("explicitly remove or replace"),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT is_called::int::bigint FROM rls_d_release.ddl_calls"
+            ),
+            0,
+            "{out:?}"
+        );
+        let after = latest_snapshot(connection);
+        assert_eq!(after.schema, before.schema);
+        assert_eq!(after.ids, before.ids);
+        succeeds(approved_apply(&d, connection, &artifact, ALLOW));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT is_called::int::bigint FROM rls_d_release.ddl_calls"
+            ),
+            1
+        );
+        on_server(
+            connection,
+            "DROP EVENT TRIGGER rls_d_release_ddl; DROP FUNCTION rls_d_release.count_ddl(); DROP SEQUENCE rls_d_release.ddl_calls; DROP SCHEMA rls_d_release",
+        );
+        assert_noop(&d, connection);
         let pos = |pred: fn(&pbps_model::Change) -> bool| {
             saved
                 .changes

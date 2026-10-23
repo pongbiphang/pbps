@@ -334,7 +334,7 @@ requirement is common to all of them, so it is listed once,
 | `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
-| `DropPolicy` | 0, before every module-drop rank | Its standing owner under the base name; before module drops, column drops and retypes. SQL delivery arrives in #1173 PR C | Removes one table-local policy and frees its name for replacement | Exists, removes |
+| `DropPolicy` | 0, before every module-drop rank | Its standing owner under the base name; before module drops, column drops and retypes; emitted transactionally | Removes one table-local policy and frees its name for replacement | Exists, removes |
 | `CreatePolicy` | 14 (14, 2) | P: its standing or matching created table under the final name; all module creates/alters, structural changes, bootstrap inserts and policy drops first. Predicate bindings remain #595's named limitation | One table-local policy, with its own name namespace; a changed definition is drop plus create | Exists, creates |
 | `SetRowSecurity` | 14 (14, 3) | P: its standing or matching created table and all planned policy drops/creates; modules and row writes, deletes included, first | Rewrites both independent RLS flags, carrying the complete before and after values | Exists, rewrites |
 | `CreateRole` | 15 | The name free | A role | creates |
@@ -370,10 +370,10 @@ tables list:
 
 Policy creation interacts with module creation/alteration, table and column
 construction, constraints and bootstrap inserts through the setup phase above.
-Flags follow every policy drop/create and every row write. The differ plans
-standing transitions, but PostgreSQL SQL delivery still refuses them until
-#1173 PR C. Connected column drop/retype/rename and routine rebuild under a
-retained policy still refuse by its catalog-proven name. A table
+Flags follow every policy drop/create and every row write. Standing policy
+and flag transitions execute transactionally. Connected column
+drop/retype/rename and routine rebuild under a policy the plan does not
+explicitly remove or replace refuse by its catalog-proven name. A table
 rename refuses only where it changes a retained policy's deparsed predicate:
 ordinary local scalar predicates and schema-only moves keeping a whole-row
 alias apply cleanly. Table/column renames under unmanaged policy owners also
@@ -381,7 +381,7 @@ apply cleanly and do not enter these rename refusals. Whole owner-table
 drops release their policies before referenced table/column/routine teardown,
 including sequence references reached through column ownership in `pg_depend`.
 Renames and retypes preserve those sequences and need no such release edge;
-cycles still require PR C's connected handling of individual policy drops.
+cycles require explicit policy drops settled by the connected dependency checks.
 Policies are never silently rebuilt or removed: only declared differences
 produce explicit drops and creates.
 
@@ -493,7 +493,7 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Structural/table changes, module creates/alters and `PublicExecution` → `CreatePolicy` or `SetRowSecurity` | fixed | shared `row_security::edges` setup phase, settled by the CLI schedule and resolver graph; bootstrap inserts finish before either kind | ✓ DEC-1172.2 |
-| `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType`, policy-changing table/column rename or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; a retained owner refuses with #1173 | ✓ DEC-1172.1 |
+| `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType`, policy-changing table/column rename or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; an unchanged policy on a retained owner refuses unless the plan explicitly removes or replaces it | ✓ DEC-1172.1 |
 | `CreateModule`, `AlterModule` or `PublicExecution` → `CreatePolicy` | fixed | shared setup edges; modules finish before policies at (14, 2) | ✓ DEC-1173.2 |
 | `AddColumn` → `CreatePolicy` | fixed | class 8 before (14, 2), retained by shared setup edges | ✓ DEC-1173.2 |
 | `DropPolicy` → `CreatePolicy` replacing the same owner UID and name | fixed | class 0 before (14, 2), retained by shared setup edges; full old/new payloads, no predicate analysis | ✓ DEC-1173.2 |

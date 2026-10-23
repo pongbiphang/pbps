@@ -2527,7 +2527,7 @@ fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_
             read,
         )
         .unwrap();
-        for field in 0..11 {
+        for field in 0..12 {
             let mut bad = final_table.clone();
             match field {
                 0 => bad.row_policies.get_mut("p").unwrap().command = PolicyCommand::All,
@@ -2545,8 +2545,11 @@ fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_
                 }
                 8 => bad.row_security.enabled = true,
                 9 => bad.row_security.forced = false,
-                _ => {
+                10 => {
                     bad.row_policies.remove("kept");
+                }
+                _ => {
+                    bad.row_policies.remove("p");
                 }
             }
             assert!(
