@@ -1,8 +1,8 @@
 //! Policy admission, dependency releases, and connected ownership targets.
 
-use pbps_model::IdsFile;
+use pbps_model::{Change, IdsFile};
 #[cfg(test)]
-use pbps_model::{Change, ChangeSet, Uid};
+use pbps_model::{ChangeSet, Uid};
 
 pub(crate) use pbps_diff::order::row_security::{PolicyDependents, column_edit, policy_target_uid};
 
@@ -79,6 +79,52 @@ pub(crate) fn standing_owners(
         }
     }
     Ok(tables.into_iter().collect())
+}
+
+/// The opening policy, not an edited artifact, decides a drop's approval
+/// class (DEC-1173.1). Closing part checks can only confirm that it is gone.
+pub(crate) fn check_dropped_policies(
+    changes: &pbps_model::ChangeSet,
+    ids: &IdsFile,
+    before: &pbps_model::Schema,
+) -> anyhow::Result<()> {
+    use pbps_model::plan_names::{At, Holder, PlanNames};
+    if !changes
+        .changes
+        .iter()
+        .any(|step| matches!(step.change, Change::DropPolicy { .. }))
+    {
+        return Ok(());
+    }
+    let names = PlanNames::of(&changes.changes, ids)?;
+    for (at, step) in changes.changes.iter().enumerate() {
+        let Change::DropPolicy {
+            table,
+            name,
+            policy,
+        } = &step.change
+        else {
+            continue;
+        };
+        let opening = match names.holder(table, At::Before(at)) {
+            Holder::Tracked(uid) => names.table_at(uid, At::Start),
+            Holder::Unmanaged | Holder::Vacant => None,
+        };
+        let observed = opening
+            .and_then(|table| before.tables.get(table))
+            .and_then(|table| table.row_policies.get(name));
+        // A previous apply can leave the declaration's predicate spelling in
+        // the payload. The baseline checksum pins stored text; compare the
+        // catalog-stable fields just as policy installation does.
+        if observed.is_none_or(|observed| !policy.agrees_when_written(observed)) {
+            anyhow::bail!(
+                "{} policy `{}`: dropped definition is not the policy in the plan's baseline; regenerate the plan",
+                table.shown(),
+                pbps_model::escape::Escaped(name)
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
@@ -908,5 +954,121 @@ mod transition_tests {
             error.contains("gate") && error.contains("explicitly remove or replace"),
             "{error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dropped_policy_tests {
+    use super::*;
+    use pbps_model::{
+        PlannedChange, PolicyCommand, PolicyRoles, RowPolicy, Schema, Table, TableName,
+    };
+
+    #[test]
+    fn policy_drop_payloads_pin_opening_identity_and_catalog_stable_fields() {
+        let uid: Uid = "t_117310".parse().unwrap();
+        let replacement: Uid = "t_117311".parse().unwrap();
+        let opening = TableName::new("app", "old");
+        let final_name = TableName::new("app", "new");
+        let policy_name = "gate\nraw";
+        let policy = RowPolicy {
+            using: Some("(id > 0)".into()),
+            with_check: Some("(n > 0)".into()),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            tables: [
+                (uid.clone(), final_name.clone()),
+                (replacement.clone(), opening.clone()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                Change::RenameTable {
+                    uid,
+                    from: opening.clone(),
+                    to: final_name.clone(),
+                    defaults: vec![],
+                },
+                Change::CreateTable {
+                    uid: replacement,
+                    name: opening.clone(),
+                    table: Box::default(),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+                Change::DropPolicy {
+                    table: final_name,
+                    name: policy_name.into(),
+                    policy: policy.clone(),
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        let before = Schema {
+            tables: [(
+                opening,
+                Table {
+                    row_policies: [(policy_name.into(), policy)].into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        check_dropped_policies(&changes, &ids, &before).unwrap();
+        let mut declared = changes.clone();
+        let Change::DropPolicy { policy, .. } = &mut declared.changes[2].change else {
+            unreachable!()
+        };
+        policy.using = Some("id > 0".into());
+        policy.with_check = Some("n > 0".into());
+        check_dropped_policies(&declared, &ids, &before).unwrap();
+        for field in 0..5 {
+            let mut changed = changes.clone();
+            let Change::DropPolicy { policy, .. } = &mut changed.changes[2].change else {
+                unreachable!()
+            };
+            match field {
+                0 => policy.command = PolicyCommand::Update,
+                1 => policy.restrictive = true,
+                2 => policy.to = PolicyRoles::Roles(["tenant".into()].into()),
+                3 => policy.with_check = None,
+                _ => policy.using = None,
+            }
+            let message = check_dropped_policies(&changed, &ids, &before)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("app.new")
+                    && message.contains(r"gate\nraw")
+                    && message.contains("baseline"),
+                "{field}: {message}"
+            );
+            assert!(
+                !message.contains(policy_name),
+                "the raw key is escaped only for prose"
+            );
+        }
+        assert!(check_dropped_policies(&changes, &ids, &Schema::default()).is_err());
+        let mut absent = before.clone();
+        absent
+            .tables
+            .values_mut()
+            .next()
+            .unwrap()
+            .row_policies
+            .clear();
+        assert!(check_dropped_policies(&changes, &ids, &absent).is_err());
+        check_dropped_policies(
+            &ChangeSet::default(),
+            &IdsFile::default(),
+            &Schema::default(),
+        )
+        .unwrap();
     }
 }

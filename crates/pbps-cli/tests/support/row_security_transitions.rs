@@ -446,3 +446,105 @@ fn row_security_c_staged_planning_refuses_and_probes_use_forced_owner_preplan_st
         );
     });
 }
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_c_saved_policy_drops_pin_opening_definitions_before_ddl() {
+    versions(|base, _| {
+        for restrictive in [false, true] {
+            let own = OwnDatabase::new(base, "rls_c_drop_payload");
+            let connection = own.connection();
+            on_server(
+                connection,
+                &format!(
+                    "CREATE SCHEMA app; CREATE TABLE app.t(id integer,n integer); CREATE POLICY kept ON app.t USING(id>=0); CREATE POLICY gate ON app.t AS {} FOR SELECT USING(id>0)",
+                    if restrictive {
+                        "RESTRICTIVE"
+                    } else {
+                        "PERMISSIVE"
+                    }
+                ),
+            );
+            let d = adopted(connection, "rls-c-drop-payload");
+            write(&d, &declaration(None, false, false));
+            let artifact = connected_artifact(&d, connection, false);
+            let original: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
+            assert!(
+                matches!(&original.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::DropPolicy { .. }))
+            );
+            let before = latest_snapshot(connection);
+            let mut forged = original.clone();
+            let pbps_model::Change::DropPolicy { policy, .. } =
+                &mut forged.changes.changes[0].change
+            else {
+                unreachable!()
+            };
+            policy.restrictive = !restrictive;
+            let pg = pbps_pg::Postgres::new();
+            let risks = pbps_diff::order::generated::risks(&forged.changes, &forged.ids, &pg);
+            for (step, risks) in forged.changes.changes.iter_mut().zip(risks) {
+                step.risks = risks;
+            }
+            let forged_path = d.dir.join("forged-drop.json");
+            std::fs::write(&forged_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+            // The edited risk list and approved wire checksum are consistent:
+            // only the opening database can disprove the dropped definition.
+            pbps_diff::order::admit(
+                forged.clone(),
+                &pg,
+                &forged_path,
+                &forged.wire_fingerprint(),
+            )
+            .unwrap();
+            let incorrect_allow = if restrictive {
+                "revoke"
+            } else {
+                "row-security"
+            };
+            let out = approved_apply(&d, connection, &forged_path, &["--allow", incorrect_allow]);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            let error = stderr(&out);
+            assert!(
+                error.contains("app.t")
+                    && error.contains("gate")
+                    && error.contains("dropped definition")
+                    && error.contains("baseline"),
+                "{error}"
+            );
+            assert!(
+                !stdout(&out).contains("Applying "),
+                "the refusal precedes DDL"
+            );
+            let after = latest_snapshot(connection);
+            assert_eq!(after.schema, before.schema);
+            assert_eq!(after.ids, before.ids);
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT polpermissive::int::bigint FROM pg_policy WHERE polrelid='app.t'::regclass AND polname='gate'"
+                ),
+                i64::from(!restrictive)
+            );
+            let correct_allow = if restrictive {
+                "row-security"
+            } else {
+                "revoke"
+            };
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &artifact,
+                &["--allow", correct_allow],
+            ));
+            assert_noop(&d, connection);
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_policy WHERE polrelid='app.t'::regclass AND polname='gate'"
+                ),
+                0
+            );
+        }
+    });
+}

@@ -8403,6 +8403,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         );
     }
     refuse_moved_database_collation(conn, plan, &target.label).await?;
+    crate::row_security::check_dropped_policies(&plan.changes, &plan.ids, &scoped.schema)?;
 
     // And the same guard the recording commands use (110): a permission the
     // declarations cannot hold is invisible to the checksum above, so it
