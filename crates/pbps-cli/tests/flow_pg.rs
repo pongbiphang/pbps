@@ -555,6 +555,9 @@ mod row_security_roundtrip;
 #[path = "support/row_security_transitions.rs"]
 mod row_security_transitions;
 
+#[path = "support/row_security_enforcement.rs"]
+mod row_security_enforcement;
+
 #[path = "support/raised_messages.rs"]
 mod raised_messages;
 

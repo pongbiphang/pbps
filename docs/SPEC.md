@@ -317,8 +317,9 @@ indexes:
   trees, are refused. SQL Server refuses non-default flags or a nonempty
   policy map. Ordinary RLS tables are adopted. Created tables receive policies
   after modules and bootstrap inserts, followed by independent ENABLE/FORCE.
-  Unchanged adopted policies are no-ops; standing flag/policy alterations
-  arrive with #1173. Policy predicate bindings remain #595's named limitation.
+  Unchanged adopted policies are no-ops. Standing flags and policies change
+  through transactional plans; every policy replacement is an explicit drop
+  and create. Policy predicate bindings remain #595's named limitation.
 - **`system_time:` gives a SQL Server table its `PERIOD FOR SYSTEM_TIME`**:
   `period: [start, end]` names two `datetime2` columns, not nullable, and
   `hidden: true` hides both. Under `versioning:` it gives the table system
@@ -1308,6 +1309,21 @@ same plan, because a row no declaration names must stay unchanged (7.6) and a
 cascade through a restored key would change it (DECISIONS 55 and 73). A child
 the declarations *do* move or remove goes through as the declared change it is.
 
+PostgreSQL row-security changes are transactional only, including a single
+flag change. Both planning and saved-plan admission refuse `--staged`
+(DEC-1173.3). Standing targets require effective ownership during connected
+planning and again before apply writes: `pg_has_role(current_user, relowner,
+'USAGE')`. An INHERIT member of the owner's role qualifies; a NOINHERIT
+membership alone does not. FORCE changes row visibility, not ownership.
+
+A stale policy or flag state fails the baseline checksum before DDL. Unreadable
+policy metadata refuses the read; it never means that no policies exist.
+Policy recipients must exist, and a surviving policy refuses a dependent
+column drop/retype/rename or routine rebuild by name unless the typed plan
+explicitly removes or replaces it. A later statement failure rolls the policy
+drop and its replacement back together. RLS partition trees and `data:` beside
+RLS remain refused.
+
 Pre-flight also runs **probes derived automatically from the plan itself**.
 The differ's output is a typed `ChangeSet`, so the tool already knows how each
 change can fail, and `Dialect::preflight(change)` turns that knowledge into
@@ -1332,6 +1348,16 @@ with the affected object and the reason, just like a query that fails or
 returns no readable count. It never contributes to the passed count. Changes
 that need no data probe (such as an ordinary index) do not contribute to the
 unchecked count either.
+
+PostgreSQL probes use the applying session's pre-plan RLS context. If
+`row_security_active` says that session's count would be filtered, the count
+is unchecked, even when a later statement disables RLS or removes FORCE.
+The lazy wrapper does not execute the skipped query or its policy routines.
+The tool neither changes to a privileged role nor sets `row_security = off`
+to obtain a count. For non-superuser roles without BYPASSRLS, an owner or
+INHERIT member bypasses enabled RLS without FORCE; FORCE subjects them to
+policies too. The existing delete guards also refuse counts that hide
+referencing rows (DEC-1172.3).
 
 Column type changes can require dependency maintenance specific to the engine.
 SQL Server's required managed key, CHECK, index and FK rebuilds are ordinary
@@ -1367,10 +1393,13 @@ two halves:
    the definition the plan adds it with; a row the plan writes holds the cells
    the plan spelled. Fields the engine rewrites (a default's text, a check's or
    filter's or policy's expression) are compared by presence, not text.
-   A created policy retains its exact name, command, permissive/restrictive mode
-   and targets, with USING and WITH CHECK presence checked independently. An
-   untouched policy keeps its exact catalog predicates; both RLS flags remain
-   independently comparable.
+   An installed policy, including a standing replacement, retains its exact
+   name, command, permissive/restrictive mode and targets, with USING and
+   WITH CHECK presence checked independently. A dropped policy is absent.
+   Untouched policies keep their exact catalog predicates. Both RLS flags
+   match the values the plan leaves, independently of whether any policy exists.
+   A closing mismatch refuses success recording and rolls the transaction back;
+   a failed-attempt entry retains the previously recorded schema and identities.
 
 **Assumption: one deployer at a time.** The guard is a detector, not a lock
 against other writers. It assumes that no other session is changing the

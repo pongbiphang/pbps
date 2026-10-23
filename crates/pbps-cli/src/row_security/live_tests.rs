@@ -8,6 +8,7 @@ use pbps_model::{
 #[tokio::test]
 #[ignore = "needs both live PostgreSQL versions"]
 async fn row_security_filtered_counts_are_unchecked_and_column_refusals_are_exact() {
+    let mut failures = Vec::new();
     for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
         let base = std::env::var(variable).unwrap();
         let stamp = std::time::SystemTime::now()
@@ -30,8 +31,11 @@ async fn row_security_filtered_counts_are_unchecked_and_column_refusals_are_exac
             .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
             .await
             .unwrap();
-        result.expect("policy probe/dependent fixture failed after cleanup");
+        if let Err(error) = result {
+            failures.push(format!("{variable}: {error}"));
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 async fn check(connection: String, owner: String) {
@@ -235,6 +239,8 @@ async fn check(connection: String, owner: String) {
     );
     conn.execute("RESET ROLE").await.unwrap();
 
+    delete_visibility_guards(&mut conn, &owner).await;
+
     // A relation-only dependency is not a dependency on every attribute.
     conn.execute("CREATE POLICY row_presence ON app.parent USING (EXISTS(SELECT FROM app.t))")
         .await
@@ -349,6 +355,129 @@ async fn check(connection: String, owner: String) {
     conn.execute("ALTER TABLE app.t DROP COLUMN extra; ROLLBACK")
         .await
         .unwrap();
+}
+
+// These older delete guards remain beside the lazy constraint-count wrapper.
+// Exercise each relation they ask about so removing one cannot borrow another
+// relation's refusal and keep this test green.
+async fn delete_visibility_guards(conn: &mut Conn, owner: &str) {
+    for (planned, parent_filtered) in [(false, false), (true, false), (false, true)] {
+        conn.execute("SAVEPOINT delete_visibility").await.unwrap();
+        let parent = TableName::new("app", "delete_parent");
+        let child = TableName::new("app", "delete_child");
+        let filtered = if parent_filtered {
+            "app.delete_parent"
+        } else {
+            "app.delete_child"
+        };
+        conn.execute(&format!(
+            "CREATE TABLE app.delete_parent(id integer PRIMARY KEY); \
+             CREATE TABLE app.delete_child(id integer PRIMARY KEY, refid integer); \
+             INSERT INTO app.delete_parent VALUES(1); INSERT INTO app.delete_child VALUES(1,1); \
+             ALTER TABLE app.delete_parent OWNER TO {owner}; \
+             ALTER TABLE app.delete_child OWNER TO {owner}; \
+             CREATE POLICY hidden ON {filtered} USING(false); \
+             ALTER TABLE {filtered} ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE {filtered} FORCE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+        if !planned {
+            conn.execute("ALTER TABLE app.delete_child ADD CONSTRAINT delete_fk FOREIGN KEY(refid) REFERENCES app.delete_parent(id) ON DELETE CASCADE").await.unwrap();
+        }
+        let mut ids = IdsFile::default();
+        for table in [&parent, &child] {
+            ids.tables
+                .insert(Uid::derived(UidKind::Table, &table.name, 0), table.clone());
+            ids.columns.insert(
+                Uid::derived(UidKind::Column, &format!("{}.id", table.name), 0),
+                table.column("id"),
+            );
+        }
+        ids.columns.insert(
+            Uid::derived(UidKind::Column, "delete_child.refid", 0),
+            child.column("refid"),
+        );
+        let mut changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::DeleteRow {
+                table: parent.clone(),
+                key_column: "id".into(),
+                key: "1".into(),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: Default::default(),
+                row: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: None,
+            })],
+        };
+        if planned {
+            changes
+                .changes
+                .push(PlannedChange::new(Change::AddForeignKey {
+                    table: child.clone(),
+                    name: "delete_fk".into(),
+                    constraint: Box::new(ForeignKey {
+                        columns: vec!["refid".into()],
+                        references_table: parent.clone(),
+                        references_columns: vec!["id".into()],
+                        on_delete: pbps_model::ReferentialAction::Cascade,
+                        on_update: Default::default(),
+                    }),
+                }));
+        }
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        let pg = pbps_pg::Postgres::new();
+        let probes = pg.preflight_with(&names, &Default::default());
+        let visibility = probes
+            .probes
+            .iter()
+            .rev()
+            .find(|p| p.description.starts_with("tables with a foreign key into"))
+            .unwrap();
+        conn.execute(&format!("SET LOCAL ROLE {owner}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.query(&visibility.sql).await.unwrap()[0]
+                .try_get_at::<i32>(0)
+                .unwrap(),
+            Some(1),
+            "planned={planned}, parent_filtered={parent_filtered}: {}",
+            visibility.sql
+        );
+        if !planned && !parent_filtered {
+            let delete = pbps_diff::order::singleton(
+                changes.changes[0].clone(),
+                pbps_model::PlanMode::Transactional,
+                &pg,
+            );
+            conn.execute("SAVEPOINT guarded_delete").await.unwrap();
+            let statements = pg.emit(&delete, 0).unwrap();
+            let error = conn.execute(&statements[0].sql).await.unwrap_err();
+            assert!(error.to_string().contains("row-level security"), "{error}");
+            conn.execute("ROLLBACK TO SAVEPOINT guarded_delete")
+                .await
+                .unwrap();
+        }
+        conn.execute(&format!(
+            "ALTER TABLE {filtered} DISABLE ROW LEVEL SECURITY"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            conn.query(&visibility.sql).await.unwrap()[0]
+                .try_get_at::<i32>(0)
+                .unwrap(),
+            Some(0),
+            "the same owner can count the unfiltered relation"
+        );
+        conn.execute(
+            "ROLLBACK TO SAVEPOINT delete_visibility; RELEASE SAVEPOINT delete_visibility",
+        )
+        .await
+        .unwrap();
+    }
 }
 
 async fn policy_sequence_bindings(conn: &mut Conn) {

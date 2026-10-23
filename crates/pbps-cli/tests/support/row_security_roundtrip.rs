@@ -213,12 +213,12 @@ fn row_security_d_pull_bootstrap_pull_preserves_every_policy_shape() {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Outcome {
+pub(super) enum Outcome {
     Rows(Vec<i64>),
     Denied,
 }
 
-async fn attempt(conn: &mut Conn, sql: &str) -> Outcome {
+pub(super) async fn attempt(conn: &mut Conn, sql: &str) -> Outcome {
     conn.execute("SAVEPOINT operation").await.unwrap();
     let result = conn.query(sql).await;
     conn.execute("ROLLBACK TO SAVEPOINT operation; RELEASE SAVEPOINT operation")

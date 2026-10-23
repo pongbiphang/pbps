@@ -6,12 +6,16 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
-#1172 supports PostgreSQL ordinary-table row-security declarations, coherent
-catalog adoption and created-table policy/flag deployment. Live suites on 16
-and 18 cover pull/bootstrap/pull, enforcement for non-owners and owners under
-FORCE, predicate drift and unreadable policy metadata. Unchanged adopted
-policies permit no-op and unrelated migrations; standing-table changes arrive
-with #1173. Policy predicate binding proof remains #595's named limitation.
+#1172/#1173 support PostgreSQL ordinary-table row-security declarations,
+coherent catalog adoption and transactional policy/flag changes on created
+and standing tables. Replacements are explicit drops and creates, widening
+requires `--allow row-security`, and standing targets require effective
+ownership. Live suites on 16 and 18 cover transition enforcement for application
+roles, owners, INHERIT and NOINHERIT members, with FORCE and tenant controls;
+stale/unreadable metadata, closing guards and rollback; and unchecked filtered
+probes. Unchanged adopted policies permit no-op and unrelated migrations.
+Explicit policy removals release dependencies; policies are never silently
+rebuilt. Policy predicate binding proof remains #595's named limitation.
 RLS partition trees and reference data beside RLS remain refused.
 
 Referenced PostgreSQL types use potential-path eligibility and opt-in reviewed routine source pins (DEC-2181.1–3).
