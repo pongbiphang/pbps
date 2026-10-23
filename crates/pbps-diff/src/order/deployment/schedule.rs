@@ -399,6 +399,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     // The complete typed plan proves which additions finish a newly
     // generated table, even if an older lowering added them separately.
     crate::order::writebacks::creation_risks(&mut cs, declared.sources.after, dialect);
+    refuse_type_slots(&cs, declared, dialect)?;
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not
@@ -426,6 +427,56 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         moved,
         skipped,
     })
+}
+
+// Class order has not settled Types handovers yet (DEC-1635.3). Replay only
+// after the shared scheduler has placed releases before their claims.
+fn refuse_type_slots(
+    cs: &ChangeSet,
+    declared: &Declarations<'_>,
+    dialect: &dyn Dialect,
+) -> Result<(), Refusal> {
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+
+    let mode = if dialect.rebuilds_modules() {
+        ModuleEdits::Rebuilt
+    } else {
+        ModuleEdits::InPlace
+    };
+    let operations = Operations::of_plan(&cs.changes, mode);
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)
+        .map_err(|error| Refusal(error.to_string()))?;
+    let owners = PlanOwners::new(names, declared.sources.before.ids, declared.sources.after);
+    let before = Snapshot {
+        schema: declared.sources.before.schema,
+        ids: declared.sources.before.ids,
+    };
+    let slots = crate::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
+    for violation in crate::order::slots::verify(
+        operations.as_slice(),
+        &slots,
+        dialect,
+        None,
+        &owners,
+        before,
+    )
+    .0
+    {
+        if let crate::order::slots::SlotViolation::Contested { slot, .. }
+        | crate::order::slots::SlotViolation::IntermediateHeld { slot, .. } = violation
+            && let pbps_dialect::slots::Namespace::Types(schema) = slot.namespace
+            && let Ok(name) = pbps_model::TypeRef::new(&schema, &slot.name)
+        {
+            return Err(Refusal(
+                crate::DiffError::TypeLifecycleUnsupported {
+                    name,
+                    reason: "pg_type name is already occupied by another declaration".into(),
+                }
+                .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A sinking claimer must take its dependents with it. Read those edges from

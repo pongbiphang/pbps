@@ -450,7 +450,13 @@ pub(crate) fn judge_slots(
         } => pending.iter().any(|e| {
             ops[e.before].id() == *before && ops[e.after].id() == *after && e.slot == *slot
         }),
-        SlotViolation::Contested { .. } | SlotViolation::IntermediateHeld { .. } => false,
+        SlotViolation::Contested { .. } => false,
+        // Even a true collision belongs to the scheduled refusal, so the
+        // differ can return its logical input without a debug-only panic.
+        SlotViolation::IntermediateHeld { slot, .. } => {
+            stage == Stage::BeforeSchedule
+                && matches!(slot.namespace, pbps_dialect::slots::Namespace::Types(_))
+        }
     };
     let name = |id: OperationId| {
         ops.iter().find(|o| o.id() == id).map_or_else(

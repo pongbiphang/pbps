@@ -496,6 +496,8 @@
         "managed_types::type_renames_refuse_default_and_check_edits_inside_the_plan_window",
         "managed_types::staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step",
         "managed_types::pg_type_names_refuse_row_types_and_admit_indexes_and_sequences_before_emission",
+        "managed_types::a_type_move_applies_after_dropping_its_intermediate_holder_and_converges",
+        "managed_types::a_type_move_refuses_kept_and_undeclared_intermediate_holders_without_applying",
         "managed_types::type_drops_follow_the_last_table_and_table_names_can_handoff_to_types",
         "managed_types::missing_managed_types_refuse_pull_before_any_project_write",
         "managed_types::pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql",

@@ -1013,6 +1013,159 @@ fn pg_type_names_refuse_row_types_and_admit_indexes_and_sequences_before_emissio
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_type_move_applies_after_dropping_its_intermediate_holder_and_converges() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let own = OwnDatabase::new(&server, "type_move_release1635");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE SCHEMA dst; CREATE TYPE app.a AS ENUM ('moving'); CREATE TYPE dst.a AS ENUM ('holder')",
+        );
+        let d = Demo::new("type-move-release1635");
+        succeeds(d.run(&["pull", "--db", db]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "adopt both type holders",
+        ]));
+        let moving_oid = scalar(db, "SELECT 'app.a'::regtype::oid::bigint");
+        std::fs::remove_file(d.dir.join("schema/app.a.type.yml")).unwrap();
+        std::fs::remove_file(d.dir.join("schema/dst.a.type.yml")).unwrap();
+        std::fs::write(
+            d.dir.join("schema/dst.b.type.yml"),
+            "enum: dst.b\nrenamed_from: app.a\nvalues: [moving]\n",
+        )
+        .unwrap();
+        succeeds(d.run(&[
+            "intent",
+            "--drop-type",
+            "dst.a",
+            "release the intermediate name",
+        ]));
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("move.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.changes.changes.len(), 2);
+        assert!(matches!(
+            saved.changes.changes[0].change,
+            pbps_model::Change::DropType { .. }
+        ));
+        assert!(matches!(
+            saved.changes.changes[1].change,
+            pbps_model::Change::RenameType { .. }
+        ));
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "rename,destructive",
+        ]));
+        assert_eq!(
+            scalar(db, "SELECT 'dst.b'::regtype::oid::bigint"),
+            moving_oid
+        );
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let after: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(after.changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_type_move_refuses_kept_and_undeclared_intermediate_holders_without_applying() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for declared in [true, false] {
+            let own = OwnDatabase::new(&server, "type_move_held1635");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE SCHEMA dst; CREATE TYPE app.a AS ENUM ('moving')",
+            );
+            if declared {
+                on_server(db, "CREATE TYPE dst.a AS ENUM ('holder')");
+            }
+            let d = Demo::new("type-move-held1635");
+            succeeds(d.run(&["pull", "--db", db]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt managed types"]));
+            if !declared {
+                on_server(db, "CREATE TYPE dst.a AS ENUM ('external')");
+            }
+            let before = latest_snapshot(db);
+            let moving_oid = scalar(db, "SELECT 'app.a'::regtype::oid::bigint");
+            let holder_oid = scalar(db, "SELECT 'dst.a'::regtype::oid::bigint");
+            std::fs::remove_file(d.dir.join("schema/app.a.type.yml")).unwrap();
+            // Each reviewed revision has a free intermediate name. The target
+            // still holds app.a, so the connected plan collapses both renames
+            // and must refuse its held dst.a before producing an artifact.
+            let middle = d.dir.join("schema/app.b.type.yml");
+            std::fs::write(
+                &middle,
+                "enum: app.b\nrenamed_from: app.a\nvalues: [moving]\n",
+            )
+            .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            std::fs::remove_file(&middle).unwrap();
+            std::fs::write(
+                d.dir.join("schema/dst.b.type.yml"),
+                "enum: dst.b\nrenamed_from: app.b\nvalues: [moving]\n",
+            )
+            .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let path = d.dir.join("held.plan.json");
+            let sql = d.dir.join("held.sql");
+            let out = d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--out",
+                path.to_str().unwrap(),
+                "--sql",
+                sql.to_str().unwrap(),
+            ]);
+            assert_ne!(code(&out), 0, "{}", stdout(&out));
+            let message = stderr(&out);
+            assert!(
+                message.contains("dst.a") && message.contains("already occupied"),
+                "{message}"
+            );
+            assert!(!path.exists() && !sql.exists());
+            assert_eq!(
+                scalar(db, "SELECT 'app.a'::regtype::oid::bigint"),
+                moving_oid
+            );
+            assert_eq!(
+                scalar(db, "SELECT 'dst.a'::regtype::oid::bigint"),
+                holder_oid
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='dst' AND t.typname='b'"
+                ),
+                0
+            );
+            assert_eq!(latest_snapshot(db), before);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn type_drops_follow_the_last_table_and_table_names_can_handoff_to_types() {
     for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
         for handoff in [false, true] {

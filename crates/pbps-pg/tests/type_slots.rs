@@ -14,6 +14,89 @@ fn uid(kind: UidKind, seed: &str) -> Uid {
 fn name() -> TableName {
     TableName::new("app", "x")
 }
+
+#[test]
+fn a_type_move_waits_for_its_intermediate_holder_and_refuses_a_kept_holder() {
+    use pbps_diff::order::deployment::{
+        Sources,
+        schedule::{Declarations, Facts, schedule},
+    };
+    let a: pbps_model::TypeRef = "app.a".parse().unwrap();
+    let held: pbps_model::TypeRef = "dst.a".parse().unwrap();
+    let b: pbps_model::TypeRef = "dst.b".parse().unwrap();
+    let moving = uid(UidKind::Type, "moving");
+    let holder = uid(UidKind::Type, "holder");
+    let definition = ManagedType::Enum {
+        values: vec!["ok".into()],
+    };
+    let before = Schema {
+        types: [
+            (a.clone(), definition.clone()),
+            (held.clone(), definition.clone()),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let base_ids = IdsFile {
+        types: [(moving.clone(), a), (holder.clone(), held.clone())].into(),
+        ..Default::default()
+    };
+    for keep in [false, true] {
+        let mut after = Schema {
+            types: [(b.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let mut ids = IdsFile {
+            types: [(moving.clone(), b.clone())].into(),
+            ..Default::default()
+        };
+        if keep {
+            after.types.insert(held.clone(), definition.clone());
+            ids.types.insert(holder.clone(), held.clone());
+        }
+        let base = pbps_diff::Side {
+            schema: &before,
+            ids: &base_ids,
+        };
+        let desired = pbps_diff::Side {
+            schema: &after,
+            ids: &ids,
+        };
+        let dialect = pbps_pg::Postgres::new();
+        let hints = pbps_model::Hints::default();
+        let logical = pbps_diff::diff(base, desired, &dialect, &hints).unwrap();
+        assert!(matches!(
+            logical.changes[0].change,
+            Change::RenameType { .. }
+        ));
+        let result = schedule(
+            logical,
+            &Declarations {
+                schema: &after,
+                sources: Sources {
+                    before: base,
+                    after: &ids,
+                },
+                module_deps: &hints.module_deps,
+            },
+            &Facts::default(),
+            &dialect,
+        );
+        if keep {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "type `dst.a`: pg_type name is already occupied by another declaration"
+            );
+        } else {
+            let settled = result.unwrap().changes;
+            assert!(matches!(settled.changes[0].change, Change::DropType { .. }));
+            assert!(matches!(
+                settled.changes[1].change,
+                Change::RenameType { .. }
+            ));
+        }
+    }
+}
 fn create_type(domain: bool) -> Change {
     Change::CreateType {
         uid: uid(UidKind::Type, "x"),

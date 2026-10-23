@@ -811,6 +811,7 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// object's holder away (#1767, DEC-1957.2). What it read is returned, for
 /// [`NameFacts::order_and_refuse`] again once the module passes, which may
 /// plan the revision afresh in the differ's order, have run.
+/// Type occupants are retained here and refused only by that settled replay.
 #[allow(clippy::wildcard_enum_match_arm)] // Only type creators/renames add pg_type queries.
 pub async fn refuse_created_name_occupants<S: Clone>(
     conn: &mut Conn,
@@ -912,7 +913,7 @@ pub async fn refuse_created_name_occupants<S: Clone>(
                 occupants,
                 detach_releases,
             };
-            facts.order_and_refuse(cs, label, plan)?;
+            facts.order_relations_and_refuse(cs, label, plan)?;
             Ok(Some(facts))
         }
         Driver::Mssql => Ok(None),
@@ -948,6 +949,7 @@ impl NameFacts {
         label: &str,
         plan: Planned<'_>,
     ) -> anyhow::Result<()> {
+        self.order_relations_and_refuse(cs, label, plan)?;
         let slots = self.slots();
         let names = pbps_model::plan_names::PlanNames::of(&cs.changes, plan.desired.ids)?;
         let owners = pbps_model::operation::PlanOwners::new(names, plan.base.ids, plan.desired.ids);
@@ -981,6 +983,18 @@ impl NameFacts {
                 );
             }
         }
+        Ok(())
+    }
+
+    // Catalog reads precede shared scheduling. Only the historical relation
+    // pass runs there; Types claims are judged by order_and_refuse afterwards.
+    fn order_relations_and_refuse<S: Clone>(
+        &self,
+        cs: &mut PlanningPlan<S>,
+        label: &str,
+        plan: Planned<'_>,
+    ) -> anyhow::Result<()> {
+        let slots = self.slots();
         crate::deploy::order_carried_moves(
             cs,
             &self.occupants,
@@ -1018,6 +1032,74 @@ impl NameFacts {
             );
         slots.detach_releases.clone_from(&self.detach_releases);
         slots
+    }
+}
+
+#[cfg(test)]
+mod type_slot_tests {
+    use super::*;
+
+    #[test]
+    fn a_type_move_refuses_an_undeclared_intermediate_catalog_holder_by_name() {
+        use pbps_model::{Change, ChangeSet, IdsFile, ManagedType, PlannedChange, Schema};
+        let from: pbps_model::TypeRef = "app.a".parse().unwrap();
+        let to: pbps_model::TypeRef = "dst.b".parse().unwrap();
+        let uid: pbps_model::Uid = "y_000001".parse().unwrap();
+        let definition = ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let base = Schema {
+            types: [(from.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            types: [(to.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let base_ids = IdsFile {
+            types: [(uid.clone(), from.clone())].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: [(uid.clone(), to.clone())].into(),
+            ..Default::default()
+        };
+        let dialect = pbps_pg::Postgres::new();
+        let plan = Planned {
+            base: pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            desired: pbps_diff::Side {
+                schema: &desired,
+                ids: &ids,
+            },
+            dialect: &dialect,
+        };
+        let mut cs = pbps_diff::order::propose(ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameType {
+                uid,
+                from,
+                to,
+                definition: Box::new(definition),
+            })],
+        });
+        let mut facts = NameFacts {
+            type_occupants: vec![TableName::new("dst", "a")],
+            occupants: vec![],
+            relations: vec![],
+            detach_releases: Default::default(),
+        };
+        let error = facts
+            .order_and_refuse(&mut cs, "target", plan)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "pg_type name `dst.a (type)` is already occupied; rename the declaration or release its holder in the plan"
+        );
+        facts.type_occupants.clear();
+        facts.order_and_refuse(&mut cs, "target", plan).unwrap();
     }
 }
 

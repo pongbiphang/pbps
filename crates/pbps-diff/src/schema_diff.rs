@@ -533,48 +533,9 @@ pub(crate) fn rebuilding_by(
     screen: Screen,
     read_back: Option<&Schema>,
 ) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
-    let mut d = diff_partial_rebuilding(
+    let d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
-    if d.errors.is_empty() {
-        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
-        let mode = if dialect.rebuilds_modules() {
-            ModuleEdits::Rebuilt
-        } else {
-            ModuleEdits::InPlace
-        };
-        let operations = Operations::of_plan(&d.changes.changes, mode);
-        if let Ok(names) = pbps_model::plan_names::PlanNames::of(&d.changes.changes, declared.ids) {
-            let owners = PlanOwners::new(names, base.ids, declared.ids);
-            let before = Snapshot {
-                schema: base.schema,
-                ids: base.ids,
-            };
-            let slots =
-                crate::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
-            for violation in crate::order::slots::verify(
-                operations.as_slice(),
-                &slots,
-                dialect,
-                None,
-                &owners,
-                before,
-            )
-            .0
-            {
-                if let crate::order::slots::SlotViolation::Contested { slot, .. }
-                | crate::order::slots::SlotViolation::IntermediateHeld { slot, .. } = violation
-                    && let pbps_dialect::slots::Namespace::Types(schema) = slot.namespace
-                    && let Ok(name) = pbps_model::TypeRef::new(&schema, &slot.name)
-                {
-                    d.errors.push(DiffError::TypeLifecycleUnsupported {
-                        name,
-                        reason: "pg_type name is already occupied by another declaration".into(),
-                    });
-                }
-            }
-        }
-    }
     if d.errors.is_empty() {
         // The resolver's intermediate plan is not an order anything runs: its
         // final one is observed where it is made.
