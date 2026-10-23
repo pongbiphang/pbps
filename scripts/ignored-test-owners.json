@@ -749,6 +749,7 @@
         "pull_leaves_out_and_names_what_validate_would_refuse",
         "pull_preserves_trigger_definitions_with_yaml_controls",
         "pull_refuses_an_invalid_policies_block_and_writes_once_it_is_valid",
+        "recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree",
         "recorded_triggers_run_but_their_names_cannot_authorize_replacements",
         "reference_data_applies_pulls_defaults_and_refuses_rows_arriving_after_the_plan",
         "referential_action_locks_exclude_plain_children_and_hold_partitions",
