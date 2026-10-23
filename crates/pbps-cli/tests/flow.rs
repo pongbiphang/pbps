@@ -23176,3 +23176,16 @@ fn state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_colum
 fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids() {
     state_history::unrecorded_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_unchanged_snapshots_and_baselines_do_not_restate_authored_sql() {
+    state_history::unchanged_sql(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
+    state_history::non_utf8_paths(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

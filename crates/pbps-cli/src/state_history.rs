@@ -1,7 +1,6 @@
 //! Read recorded states without adopting, applying or rewriting identity intent.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use anyhow::Context as _;
 use pbps_config::Project;
@@ -50,8 +49,9 @@ pub struct ExportData {
     environment: String,
     entry_id: i64,
     state_version: u32,
-    files: Vec<PathBuf>,
-    removed: Vec<PathBuf>,
+    // As output::Location does: serde refuses non-UTF-8 PathBuf values.
+    files: Vec<String>,
+    removed: Vec<String>,
 }
 
 struct Refusal {
@@ -205,6 +205,28 @@ fn render_value(value: &serde_json::Value, indent: usize) -> String {
     }
 }
 
+fn comparison_schemas(
+    from: &StateSnapshot,
+    to: &StateSnapshot,
+) -> (pbps_model::Schema, pbps_model::Schema) {
+    let before = from.declared.overlay(&from.schema);
+    let after = to.declared.overlay(&to.schema);
+    let covered = |snapshot: &StateSnapshot, overlaid: &pbps_model::Schema| {
+        let mut texts = pbps_model::Declared::from_schema(overlaid);
+        // Binding pins carry resolution evidence, not SQL spelling.
+        texts.bindings.clone_from(&snapshot.declared.bindings);
+        texts == snapshot.declared
+    };
+    // Baselines, snapshots and older/partial records can lack authored SQL.
+    // Never compare that catalog spelling against an authored one. Reuse the
+    // model's traversal so a new SQL slot cannot escape this coverage check.
+    if covered(from, &before) && covered(to, &after) {
+        (before, after)
+    } else {
+        (from.schema.clone(), to.schema.clone())
+    }
+}
+
 pub fn cmd_diff(
     project: &Project,
     target: &db::Target,
@@ -235,8 +257,7 @@ pub fn cmd_diff(
             Ok((from, to))
         }),
     )?;
-    let mut before = from.snapshot.declared.overlay(&from.snapshot.schema);
-    let mut after = to.snapshot.declared.overlay(&to.snapshot.schema);
+    let (mut before, mut after) = comparison_schemas(&from.snapshot, &to.snapshot);
     pbps_dialect::name_read_sequences(&mut before, dialect.as_ref());
     pbps_dialect::name_read_sequences(&mut after, dialect.as_ref());
     let mut hints = pbps_model::Hints {
@@ -511,8 +532,14 @@ fn export(
             environment: String::new(),
             entry_id: entry.id,
             state_version: entry.snapshot.version,
-            files: files.into_iter().collect(),
-            removed,
+            files: files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            removed: removed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
         },
         findings,
     ))
@@ -593,7 +620,10 @@ mod tests {
         let (data, _) = export(&project, &entry, true, dialect.as_ref())
             .ok()
             .unwrap();
-        assert_eq!(data.removed, vec![path.clone()]);
+        assert_eq!(
+            serde_json::to_value(&data.removed).unwrap(),
+            serde_json::json!([path])
+        );
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
@@ -673,10 +703,13 @@ mod tests {
         )
         .ok()
         .unwrap();
-        assert_eq!(data.removed, vec![old]);
         assert_eq!(
-            pbps_load::schema_files(&project.schema_dir()).unwrap(),
-            data.files
+            serde_json::to_value(&data.removed).unwrap(),
+            serde_json::json!([old])
+        );
+        assert_eq!(
+            serde_json::to_value(pbps_load::schema_files(&project.schema_dir()).unwrap()).unwrap(),
+            serde_json::to_value(&data.files).unwrap()
         );
         let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
         assert_eq!(loaded.schema, entry.snapshot.schema);
@@ -699,14 +732,114 @@ mod tests {
         )
         .ok()
         .unwrap();
-        assert_eq!(data.removed, vec![old.clone()]);
+        assert_eq!(
+            serde_json::to_value(&data.removed).unwrap(),
+            serde_json::json!([old])
+        );
         assert!(!old.exists());
         assert!(!std::fs::symlink_metadata(&output).unwrap().is_symlink());
         let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
         assert_eq!(loaded.schema, entry.snapshot.schema);
         assert_eq!(
-            pbps_load::schema_files(&project.schema_dir()).unwrap(),
-            data.files
+            serde_json::to_value(pbps_load::schema_files(&project.schema_dir()).unwrap()).unwrap(),
+            serde_json::to_value(&data.files).unwrap()
+        );
+    }
+
+    #[test]
+    fn state_history_uses_read_backs_when_either_sql_record_is_partial() {
+        let (_stage, _project, entry) = fixture("history-partial-sql");
+        let mut from = entry.snapshot;
+        let table = from.schema.tables.values_mut().next().unwrap();
+        table.columns.get_mut("code").unwrap().value_source =
+            pbps_model::ValueSource::Default("7::integer".into());
+        table.columns.insert(
+            "other".into(),
+            pbps_model::Column {
+                value_source: pbps_model::ValueSource::Default("8::integer".into()),
+                ..pbps_model::Column::new("int".parse().unwrap())
+            },
+        );
+        let mut authored = from.schema.clone();
+        for column in authored
+            .tables
+            .values_mut()
+            .next()
+            .unwrap()
+            .columns
+            .values_mut()
+        {
+            let pbps_model::ValueSource::Default(text) = &mut column.value_source else {
+                panic!("fixture default");
+            };
+            *text = text.replace("::integer", "");
+        }
+        from.declared = pbps_model::Declared::from_schema(&authored);
+        let (before, after) = comparison_schemas(&from, &from);
+        assert_eq!(before, authored);
+        assert_eq!(after, authored);
+        let mut to = from.clone();
+        to.declared
+            .expressions
+            .defaults
+            .values_mut()
+            .next()
+            .unwrap()
+            .remove("other");
+        assert!(!to.declared.is_empty());
+        for partial in [to.declared.clone(), Default::default()] {
+            to.declared = partial;
+            let (before, after) = comparison_schemas(&from, &to);
+            assert_eq!(before, from.schema);
+            assert_eq!(after, to.schema);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let (stage, _, entry) = fixture("history-non-utf8");
+        let root = stage
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"project-\xff"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("pbps.yml"), "dialect: mssql\n").unwrap();
+        let project = Project::discover(&root).unwrap();
+        std::fs::create_dir(project.schema_dir()).unwrap();
+        let old = project
+            .schema_dir()
+            .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
+        std::fs::write(&old, "old declaration bytes\n").unwrap();
+        std::fs::write(project.ids_file(), "identity bytes\n").unwrap();
+        let (data, findings) = export(
+            &project,
+            &entry,
+            true,
+            crate::dialect(&project).unwrap().as_ref(),
+        )
+        .ok()
+        .unwrap();
+        let report = output::Report::new("state export", findings, Some(data));
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["data"]["removed"],
+            serde_json::json!([old.display().to_string()])
+        );
+        assert_eq!(
+            value["data"]["files"],
+            serde_json::json!([project
+                .schema_dir()
+                .join("dbo.product.yml")
+                .display()
+                .to_string()])
+        );
+        assert!(!old.exists());
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+        assert_eq!(loaded.schema, entry.snapshot.schema);
+        assert_eq!(
+            std::fs::read_to_string(project.ids_file()).unwrap(),
+            "identity bytes\n"
         );
     }
 

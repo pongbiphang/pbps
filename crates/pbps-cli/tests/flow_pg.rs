@@ -34416,3 +34416,20 @@ fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uid
         state_history::unrecorded_column_ids(&server, true);
     }
 }
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_unchanged_snapshots_and_baselines_do_not_restate_authored_sql() {
+    for server in [server(), old_server()] {
+        state_history::unchanged_sql(&server, true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
+    for server in [server(), old_server()] {
+        state_history::non_utf8_paths(&server, true);
+    }
+}

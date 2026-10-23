@@ -993,3 +993,132 @@ pub fn unrecorded_column_ids(server: &str, pg: bool) {
     assert_eq!(project_bytes(&d.dir), before);
     assert_eq!(records(connection, pg), entries);
 }
+
+pub fn unchanged_sql(server: &str, pg: bool) {
+    let own = OwnDatabase::new(server, "history-sql2289");
+    let connection = own.connection();
+    let schema = if pg { "app" } else { "dbo" };
+    if pg {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = Demo::new("history-sql2289");
+    let declaration = format!(
+        concat!(
+            "table: {schema}.product\ncolumns:\n",
+            "  id: {{type: int, nullable: false}}\n",
+            "  label: {{type: varchar(40), default: \"'unnamed'\"}}\n",
+            "checks:\n  ck_label: \"label <> ''\"\n",
+            "indexes:\n  ix_label: {{columns: [label], where: \"label <> 'none'\"}}\n"
+        ),
+        schema = schema,
+    );
+    std::fs::write(d.dir.join("schema/product.yml"), &declaration).unwrap();
+    ok(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    ok(d.run(&["bootstrap", "--db", connection]));
+    for later in [false, true] {
+        if later {
+            std::fs::write(
+                d.dir.join("schema/product.yml"),
+                declaration.replace("unnamed", "renamed"),
+            )
+            .unwrap();
+            d.commit();
+            let forward = plan(&d, connection, "changed-sql.json");
+            apply(&d, connection, "changed-sql.json", &forward);
+        }
+        let entries = records(connection, pg);
+        let (id, text) = entries.last().unwrap();
+        let original = pbps_model::StateSnapshot::from_json(text).unwrap();
+        assert!(!original.declared.is_empty());
+        assert_ne!(original.declared.overlay(&original.schema), original.schema);
+        let anchor = id.to_string();
+        for recording in ["snapshot", "baseline"] {
+            let args = if recording == "snapshot" {
+                vec!["snapshot", "--db", connection]
+            } else {
+                vec![
+                    "baseline",
+                    "--reason",
+                    "record unchanged SQL",
+                    "--db",
+                    connection,
+                ]
+            };
+            ok(d.run(&args));
+            let entries = records(connection, pg);
+            let (id, text) = entries.last().unwrap();
+            let recorded = pbps_model::StateSnapshot::from_json(text).unwrap();
+            assert_eq!(
+                recorded.schema, original.schema,
+                "fixture changed the database"
+            );
+            assert!(recorded.declared.is_empty());
+            let id = id.to_string();
+            let before = project_bytes(&d.dir);
+            for (from, to) in [(&anchor, &id), (&id, &anchor)] {
+                let compared = json(ok(d.run(&[
+                    "state", "diff", from, to, "--db", connection, "--format", "json",
+                ])));
+                assert!(
+                    compared["data"]["changes"]["changes"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty(),
+                    "{compared}"
+                );
+            }
+            assert_eq!(project_bytes(&d.dir), before);
+            assert_eq!(records(connection, pg), entries);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn non_utf8_paths(server: &str, pg: bool) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let own = OwnDatabase::new(server, "history-paths2289");
+    let connection = own.connection();
+    if pg {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = prepared(pg, "history-paths2289");
+    ok(d.run(&["bootstrap", "--db", connection]));
+    let entries = records(connection, pg);
+    let id = entries[0].0.to_string();
+    let root = d.dir.join(std::ffi::OsStr::from_bytes(b"project-\xff"));
+    std::fs::create_dir_all(root.join("schema")).unwrap();
+    std::fs::copy(d.dir.join("pbps.yml"), root.join("pbps.yml")).unwrap();
+    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    std::fs::write(root.join("schema.ids.json"), &ids).unwrap();
+    let stale = root
+        .join("schema")
+        .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
+    std::fs::write(&stale, "old declaration bytes\n").unwrap();
+    let out = std::process::Command::new(super::BIN)
+        .arg("--project")
+        .arg(&root)
+        .args([
+            "state", "export", &id, "--force", "--db", connection, "--format", "json",
+        ])
+        .output()
+        .unwrap();
+    let exported = json(ok(out));
+    assert_eq!(exported["result"], "ok");
+    assert_eq!(
+        exported["data"]["removed"],
+        serde_json::json!([stale.display().to_string()])
+    );
+    let schema = if pg { "app" } else { "dbo" };
+    assert_eq!(
+        exported["data"]["files"],
+        serde_json::json!([root
+            .join(format!("schema/{schema}.product.yml"))
+            .display()
+            .to_string()])
+    );
+    assert!(!stale.exists());
+    pbps_load::load_schema_dir(&root.join("schema")).unwrap();
+    assert_eq!(std::fs::read(root.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(records(connection, pg), entries);
+}
