@@ -274,7 +274,7 @@ pub async fn baseline_catalog(
 ) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
     match conn.driver() {
         Driver::Mssql => Ok(None),
-        Driver::Postgres => pbps_pg::catalog::baseline_catalog(conn).await.map(Some),
+        Driver::Postgres => pbps_pg::catalog::baseline_catalog(conn).await,
     }
 }
 

@@ -10837,6 +10837,122 @@ fn baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_i
     }
 }
 
+/// Revoking PUBLIC's EXECUTE removes optional evidence, not the ability to
+/// deploy. Without evidence the held partition still keeps its parent refused.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        let role = format!("pbps_catalog2179_{k}_{}", std::process::id());
+        let _roles = ClusterRoles {
+            server: server.clone(),
+            names: vec![role.clone()],
+        };
+        let db = OwnDatabase::new(server, "catalog2179_unreadable");
+        on_server(
+            db.connection(),
+            &format!(
+                "CREATE ROLE {role} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+                 ALTER DATABASE \"{}\" OWNER TO {role}",
+                db.name
+            ),
+        );
+        let connection = as_role(db.connection(), &role);
+        on_server(
+            &connection,
+            "CREATE SCHEMA app;
+             CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts);
+             CREATE TABLE app.ev_2025 PARTITION OF app.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        );
+        let _execute = ControlSystemExecuteRevoked::new(db.connection());
+        let denied = try_on_server(&connection, "SELECT * FROM pg_catalog.pg_control_system()")
+            .expect_err("the non-superuser cannot read the cluster identity");
+        assert!(
+            denied.contains("permission denied for function pg_control_system"),
+            "{denied}"
+        );
+        assert_eq!(
+            text_of(
+                &connection,
+                "SELECT pg_catalog.has_function_privilege('pg_catalog.pg_control_system()', 'EXECUTE')::text"
+            ),
+            "false"
+        );
+        eprintln!(
+            "PostgreSQL {}: direct control read denied; deployment role has no EXECUTE",
+            text_of(&connection, "SHOW server_version")
+        );
+        let d = Demo::new(&format!("catalog2179-unreadable-{k}"));
+        succeeds(d.run(&["pull", "--db", &connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+        let assert_no_evidence = || {
+            assert!(latest_snapshot(&connection).baseline_evidence.is_none());
+            let recorded: serde_json::Value = serde_json::from_str(&text_of(
+                &connection,
+                "SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
+            ))
+            .unwrap();
+            assert!(recorded.get("baseline_evidence").is_none(), "{recorded}");
+        };
+        assert_no_evidence();
+        let path = d.dir.join("schema/app.ev.yml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let changed = text.replace("\ncolumns:\n", "\ncolumns:\n  note: {type: text}\n");
+        assert_ne!(text, changed);
+        std::fs::write(&path, &changed).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, &connection, &plan, &[]));
+        assert_no_evidence();
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.ev'::regclass AND attname = 'note' AND NOT attisdropped"
+            ),
+            1
+        );
+        let held = changed.find("\npartitions:\n").unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\npartitions: external\n", &changed[..held]),
+        )
+        .unwrap();
+        succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+        d.commit();
+        on_server(
+            &connection,
+            "CREATE TABLE app.ev_other PARTITION OF app.ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             ALTER TABLE app.ev DETACH PARTITION app.ev_2025;
+             ALTER TABLE app.ev ATTACH PARTITION app.ev_2025 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')",
+        );
+        let refused = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        let error = stderr(&refused);
+        for expected in [
+            "as a partition of app.ev, whose partitions this baseline would leave external",
+            "which of them it is now cannot be told",
+            "pbps plan",
+            "pbps apply --plan",
+            "git revert <drop-intent-commit>",
+            "DEC-1852.1",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+            2
+        );
+        eprintln!(
+            "PostgreSQL {}: pull, baseline, plan and apply succeed without evidence; handover keeps the parent refusal",
+            text_of(&connection, "SHOW server_version")
+        );
+    }
+}
+
 /// Dump/restore and template copy preserve ledger bytes but change database
 /// identity. Even a missing recorded oid cannot prove a drop there.
 #[test]
@@ -21644,6 +21760,40 @@ fn pull_adopts_a_cluster_role_only_once_this_database_grants_it_something() {
 struct ClusterRoles {
     server: String,
     names: Vec<String>,
+}
+
+/// Shared with the resolver refusal test: restore PUBLIC's privilege even
+/// when a command or assertion panics, before its database is dropped.
+struct ControlSystemExecuteRevoked {
+    connection: String,
+}
+
+impl ControlSystemExecuteRevoked {
+    fn new(connection: &str) -> Self {
+        let guard = Self {
+            connection: connection.to_owned(),
+        };
+        on_server(
+            connection,
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC",
+        );
+        guard
+    }
+}
+
+impl Drop for ControlSystemExecuteRevoked {
+    fn drop(&mut self) {
+        if let Err(error) = try_on_server(
+            &self.connection,
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC",
+        ) {
+            if std::thread::panicking() {
+                eprintln!("cannot restore pg_control_system EXECUTE: {error}");
+            } else {
+                panic!("cannot restore pg_control_system EXECUTE: {error}");
+            }
+        }
+    }
 }
 
 impl Drop for ClusterRoles {

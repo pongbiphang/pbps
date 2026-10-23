@@ -24,6 +24,9 @@ partitions and their parents: the parent's oid lets the check reject a
 replacement parent with the same name. Staged checkpoints and bootstrap use
 the same catalog read-back as apply and baseline. State version 31 adds this optional
 record; versions 6–30 remain readable and supply no evidence.
+An unreadable cluster identity supplies no evidence and keeps the parent
+refusal, because an administrator can revoke `pg_control_system()`'s EXECUTE
+privilege from PUBLIC.
 
 The recorded uid still decides which table a drop intent names. Only when
 both the cluster and database match can the evidence narrow DEC-1852.1:
@@ -67,8 +70,11 @@ remains the human-supplied uid in git; this evidence cannot create a rename
 decision or change a plan.
 
 The recording side reuses the table oids already selected by the catalog
-batch, adding cluster/database identity to that same statement with no extra
-round trip. `Pulled` and `Scoped` carry only opaque evidence, restricted to
+batch, adding cluster/database identity to that same statement after a
+separate EXECUTE privilege query. If that query returns false, the catalog
+SQL substitutes `NULL::text` for the control function call. A revoke between
+the two queries remains an engine error, never absent evidence. The extra
+round trip is accepted. `Pulled` and `Scoped` carry only opaque evidence, restricted to
 the managed tables before it is attached to the closing snapshot. No evidence
 from before the deployment is carried forward as a successful apply result.
 The baseline lookup separately reads every `pg_class` relation, including
@@ -86,6 +92,8 @@ on 2026-10-23, using the already-running test servers:
 | --- | --- | --- |
 | Deployer (`postgres`) can read `pg_control_system()` | yes | yes |
 | Plain LOGIN role with no grants can read it | yes | yes |
+| After PUBLIC's EXECUTE is revoked, a plain role's direct control read is denied | yes | yes |
+| A false `has_function_privilege` CASE branch avoids that denial | no | no |
 | Cluster `system_identifier` | `7697669565946585126` | `7697669565347053611` |
 | One timed control read (server/client timing, not a benchmark) | 0.418 ms | 0.316 ms |
 | Rename preserves the relation oid | yes | yes |
@@ -104,6 +112,15 @@ The other live cases prove a renamed, rebound partition is named alone, and
 a manual drop admits the baseline without changing the drop intent. Apply
 and baseline both write version 31 evidence.
 
+With PUBLIC's EXECUTE revoked, `has_function_privilege` returns false on both
+versions, but CASE expressions using either a scalar subquery or a direct
+composite-field read still fail with `permission denied for function
+pg_control_system`; the materialized baseline CTE fails too. PostgreSQL checks
+the function privilege at plan initialization, before choosing a CASE branch.
+The separate privilege query and SQL without the function call allow pull,
+baseline, plan and apply to succeed, recording no evidence; a subsequent
+held-partition handover retains the parent refusal and both remedies.
+
 ## Limits
 
 - **Oid reuse after wraparound can only over-refuse.** Two live relations
@@ -119,6 +136,6 @@ and baseline both write version 31 evidence.
   is retained relation oids but a new `system_identifier`, hence the parent
   refusal. This is an expectation, not an upgrade compatibility measurement.
 - PostgreSQL only: `partitions: external` is PostgreSQL only (DEC-1533.1).
-- A failed or incomplete identity/catalog read is an error, never empty
+- A malformed or incomplete identity/catalog read is an error, never empty
   evidence or proof that a relation was dropped. No name, bound or catalog
   number supplies human rename intent (SPEC §14.3).

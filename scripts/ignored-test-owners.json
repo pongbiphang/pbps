@@ -484,6 +484,7 @@
         "baseline_catalog_evidence_names_only_the_rebound_held_partition",
         "baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent",
         "baseline_catalog_evidence_keeps_the_parent_refusal_after_database_restore",
+        "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "managed_types::missing_managed_types_refuse_pull_before_any_project_write",
         "managed_types::pulled_type_files_converge_and_each_type_change_is_refused_without_sql",

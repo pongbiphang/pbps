@@ -976,8 +976,14 @@ retained relation oids with a new cluster identifier are expected to fall back.
 
 State version 31 records an opaque sidecar for every managed table, parents
 included, at each PostgreSQL apply and baseline, reusing the closing catalog
-read without another round trip. Versions 6–30 remain readable
+read after a separate EXECUTE privilege query. Versions 6–30 remain readable
 without evidence. DEC-1852.1 still matches drop intent and held tables by uid.
+An unreadable cluster identity supplies no evidence and keeps the parent
+refusal, because an administrator can revoke `pg_control_system()`'s EXECUTE
+privilege from PUBLIC.
+The catalog SQL uses `NULL::text` when the privilege query returns false;
+CASE still fails on both measured versions, and a revoke after the privilege
+query remains an engine error.
 When cluster and database identities both match, a recorded oid still under
 the recorded parent names only that live partition, whatever its name and
 bound; an absent oid permits baseline without reverting intent. A present
@@ -998,5 +1004,9 @@ parent and absent oid); `versions_6_through_30_read_without_catalog_evidence`;
 `baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent`,
 and `baseline_catalog_evidence_keeps_the_parent_refusal_after_database_restore`
 (live, PostgreSQL 16 and 18, the last also covers a template copy and both
-remedy commands). The existing DEC-1852.1 live fixture retains a snapshot
+remedy commands); `a_null_cluster_identifier_supplies_no_baseline_evidence`
+and `missing_or_malformed_baseline_identity_is_never_absent_evidence` (unit);
+`unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal`
+(live, PostgreSQL 16 and 18, revoked EXECUTE and absent ledger evidence).
+The existing DEC-1852.1 live fixture retains a snapshot
 without evidence to pin the historical fallback and checks apply recording.
