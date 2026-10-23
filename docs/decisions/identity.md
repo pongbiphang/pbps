@@ -1007,3 +1007,26 @@ either side of attach. Ordinary own defaults use the boundary's column UID.
 There is no new serialized change or expression rewriting. On both engines,
 calling the child's same-named function instead returns the wrong value;
 with no such function, losing the parent's schema fails execution outright.
+
+<a id="dec-2298-1"></a>
+
+**DEC-2298.1. A partitioned-table rebuild requires recorded identity intent.**
+`pbps rebuild-table <table> --reason <why> --max-rows <N>` records a pending
+blocking rewrite in `schema.ids.json`, like `move-rows`: source identities,
+reserved replacement identities, desired-schema fingerprint, positive row
+cap, reason, date and the project repository's operator. Commit this file
+with the declarations; the command never commits for the user. Repeating the
+same approval preserves its audit fields and reserved identities. The git
+HEAD supplies the source tree; unreadable history is an error. Inherited
+partition columns retain their parent's ownership and receive no extra UIDs.
+No risk word or non-interactive identity inference supplies this permission.
+
+PR1 exposes a typed logical payload but refuses planning and saved-plan
+admission of every pending rebuild. Source identities stay live; reservation
+does not authorize an ordinary drop/create. Only the future order expansion
+may install replacement identities, using effects and settle without another
+pass or rank. Execution remains unavailable until the complete route ships.
+That route must show observed rows and `pg_total_relation_size`, call the plan
+a blocking rewrite, run ANALYZE after copying, and refuse publication trees
+and unmanaged dependents by name. Unreadable catalog facts are refusals, not
+empty sets. These connected requirements have no permissive offline default.

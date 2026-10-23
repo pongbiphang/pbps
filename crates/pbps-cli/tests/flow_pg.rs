@@ -27,6 +27,130 @@ mod type_refs;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[test]
+fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
+    let d = Demo::new("rebuild2298");
+    let before = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(before);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    d.table(&before.replace("partition_by: [k]", "partition_by: [bucket]"));
+    let path = d.dir.join("schema.ids.json");
+    let original = std::fs::read(&path).unwrap();
+    for (target, cap, reason) in [
+        ("app.p", "0", "x"),
+        ("app.p", "1", "\u{3000}"),
+        ("app.missing", "1", "x"),
+        ("not-qualified", "1", "x"),
+    ] {
+        let out = d.run(&[
+            "rebuild-table",
+            target,
+            "--max-rows",
+            cap,
+            "--reason",
+            reason,
+        ]);
+        assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    assert_ne!(
+        code(&d.run(&["plan", "--no-dev"])),
+        0,
+        "risk approval cannot invent intent"
+    );
+    let operator = "Maintainer with an unbounded audit name".repeat(10);
+    d.git(&["config", "user.name", &operator]);
+    let args = [
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        " maintenance window ",
+    ];
+    let out = succeeds(d.run(&args));
+    assert!(stdout(&out).contains("blocking rewrite"));
+    let recorded = std::fs::read(&path).unwrap();
+    let ids: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
+    let intent = &ids.rebuilds[ids.table_uid(&"app.p".parse().unwrap()).unwrap()];
+    assert_eq!(intent.operator, operator);
+    assert_eq!(intent.reason.as_ref(), " maintenance window ");
+    assert_eq!(intent.max_rows, 20);
+    assert_eq!(intent.allowed_at.len(), 10);
+    d.commit();
+    succeeds(d.run(&args));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    let committed = Command::new("git")
+        .arg("-C")
+        .arg(&d.dir)
+        .args(["show", "HEAD:schema.ids.json"])
+        .output()
+        .unwrap();
+    assert!(committed.status.success());
+    assert_eq!(committed.stdout, recorded);
+    let plan = d.run(&["plan", "--no-dev"]);
+    assert_ne!(code(&plan), 0);
+    assert!(format!("{}{}", stdout(&plan), stderr(&plan)).contains("blocking rewrite"));
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    assert!(stderr(&d.run(&args)).contains("only supported for PostgreSQL"));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
+    let own = OwnDatabase::new(&server(), "rebuild2298");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.p(k integer, bucket integer) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p VALUES(1,2)",
+    );
+    let d = Demo::new("rebuild2298-live");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.p.yml");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace("partition_by: [k]", "partition_by: [bucket]"),
+    )
+    .unwrap();
+    succeeds(d.run(&[
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ]));
+    d.commit();
+    let artifact = d.dir.join("refused.json");
+    std::fs::write(&artifact, b"keep existing artifact").unwrap();
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("execution is not available yet"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"keep existing artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.p WHERE k=1 AND bucket=2"
+        ),
+        1
+    );
+}
+
 #[path = "support/row_security_roundtrip.rs"]
 mod row_security_roundtrip;
 

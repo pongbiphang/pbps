@@ -357,6 +357,15 @@ enum Command {
         reason: String,
     },
 
+    /// Record intent for a blocking partitioned-table rewrite (execution is not available yet)
+    RebuildTable {
+        table: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_rows: u64,
+        #[arg(long)]
+        reason: pbps_model::Reason,
+    },
+
     /// Generate the declarations of a partitioned table's next partitions
     Partitions {
         #[command(subcommand)]
@@ -537,6 +546,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::MoveRows { .. }
+            | Command::RebuildTable { .. }
             | Command::Partitions { .. }
             | Command::Resolver { .. }
             | Command::Docs { .. }
@@ -1220,6 +1230,11 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
+        Command::RebuildTable {
+            table,
+            max_rows,
+            reason,
+        } => cmd_rebuild_table(&project, &table.parse()?, max_rows, &reason),
         Command::Partitions {
             command:
                 PartitionsCommand::Extend {
@@ -2944,6 +2959,63 @@ pub struct FmtData {
     /// `check` or `write`. The findings mean different things in each, and a
     /// consumer must not have to infer which ran from their severity.
     mode: &'static str,
+}
+
+/// A rewrite needs the committed source shape as well as names. Keep it out of
+/// name-only inference: an allow word cannot authorize replacement identities.
+fn cmd_rebuild_table(
+    project: &Project,
+    table: &TableName,
+    max_rows: u64,
+    reason: &pbps_model::Reason,
+) -> anyhow::Result<()> {
+    let dialect = dialect(project)?;
+    if dialect.name() != "postgres" {
+        bail!("rebuild-table is only supported for PostgreSQL");
+    }
+    let mut loaded = load(project, dialect.as_ref())?;
+    loaded.schema = types_as_the_dialect_spells_them(&loaded.schema, dialect.as_ref());
+    let problems = declaration_problems(&loaded, dialect.as_ref());
+    if !problems.is_empty() {
+        bail!(
+            "{}",
+            problems
+                .iter()
+                .map(|(_, why)| why.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    if !loaded.intents.is_empty() {
+        bail!("resolve declaration identity annotations before recording a rebuild");
+    }
+    let ids = read_ids(project)?;
+    let mut baseline = baseline::load(
+        project,
+        &baseline::Source::Git { rev: "HEAD".into() },
+        dialect.as_ref(),
+    )?;
+    baseline.schema = types_as_the_dialect_spells_them(&baseline.schema, dialect.as_ref());
+    let updated = pbps_diff::rebuild::record(
+        pbps_diff::Side {
+            schema: &baseline.schema,
+            ids: &baseline.ids,
+        },
+        &loaded.schema,
+        &ids,
+        table,
+        max_rows,
+        reason,
+        &context(project.root()),
+    )?;
+    if updated == ids {
+        println!("The identity file is unchanged; this rebuild intent is already recorded.");
+    } else {
+        write_ids(project, &updated)?;
+        println!("updated {}", project.ids_file().display());
+    }
+    println!("Recorded a blocking rewrite; table rebuild execution is not available yet.");
+    Ok(())
 }
 
 /// Resolves every supplied decision together; only a complete answer is written.

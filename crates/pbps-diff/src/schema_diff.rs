@@ -222,6 +222,12 @@ pub enum DiffError {
     )]
     PartitionedTableChange { table: TableName, what: Vec<String> },
 
+    #[error("cannot plan the blocking rewrite of {table}: {why}", table = .table.shown())]
+    RebuildTable { table: TableName, why: &'static str },
+
+    #[error("the rebuild intent for {uid} has no source parent identity")]
+    RebuildIdentity { uid: Uid },
+
     /// A partition declared as an ordinary table whose shape is not its
     /// parent's, names aside (#1544): the detach gives it the parent's shape,
     /// and anything more is a second change to make in a later revision.
@@ -667,6 +673,41 @@ pub(crate) fn diff_partial_rebuilding(
     read_back: Option<&Schema>,
 ) -> Diffed {
     let mut changes = Vec::new();
+    // Pending identities must never degrade to ordinary DROP/CREATE. PR1
+    // qualifies the logical payload but deliberately grants no execution.
+    if !declared.ids.rebuilds.is_empty() {
+        let errors = declared
+            .ids
+            .rebuilds
+            .iter()
+            .map(|(uid, intent)| {
+                let Some(table) = declared
+                    .ids
+                    .tables
+                    .get(uid)
+                    .or_else(|| intent.source.tables.get(uid))
+                    .cloned()
+                else {
+                    return DiffError::RebuildIdentity { uid: uid.clone() };
+                };
+                let why = if dialect.name() != "postgres" {
+                    "this engine does not support table rebuilds"
+                } else {
+                    match crate::rebuild::qualify(base, declared, &table) {
+                        Ok(_) => {
+                            "recorded intent is valid; table rebuild execution is not available yet"
+                        }
+                        Err(error) => error.why,
+                    }
+                };
+                DiffError::RebuildTable { table, why }
+            })
+            .collect();
+        return Diffed {
+            changes: ChangeSet::default(),
+            errors,
+        };
+    }
     let mut errs: Vec<DiffError> =
         pbps_model::module::dependency_cycles(declared.schema, &hints.module_deps)
             .into_iter()
