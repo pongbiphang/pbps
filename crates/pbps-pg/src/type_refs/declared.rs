@@ -91,9 +91,14 @@ fn current<'a>(
         .filter_map(|s| s.declared_type.as_ref())
         .find(|s| s.uid == pin.uid)
     {
-        step.definition
-            .as_ref()
-            .map(|_| (&step.name, &pin.definition, false))
+        step.definition.as_ref().map(|_| {
+            // A rename writes no expression. Its original catalog definition
+            // remains pinned after the move; only CREATE uses authored text.
+            match &pin.before {
+                Some(before) => (&step.name, &before.definition, true),
+                None => (&step.name, &pin.definition, false),
+            }
+        })
     } else {
         pin.before.as_ref().map(|b| (&b.name, &b.definition, true))
     }
@@ -147,6 +152,15 @@ fn check_definitions(
     changes: &pbps_model::ChangeSet,
     executed: &[pbps_dialect::Statement],
 ) -> Result<(Vec<TypeRef>, Vec<TypeRef>), DbError> {
+    let renames = super::renames::TypeRenames(
+        pins.iter()
+            .filter_map(|p| {
+                let before = p.before.as_ref()?;
+                let (name, _, _) = current(p, executed)?;
+                (name != &before.name).then(|| (before.name.clone(), name.clone()))
+            })
+            .collect(),
+    );
     let mut present = Vec::new();
     let mut absent = Vec::new();
     for pin in pins {
@@ -158,23 +172,21 @@ fn check_definitions(
                 ))
             })?;
             let mut expected = definition.clone();
-            // Both before and declared bases follow their own uid. The name
-            // being vacated can still belong to a different base in a chain.
-            if let ManagedType::Domain { base, .. } = &mut expected
+            if before {
+                // Pins hold only the saved catalog text. Follow exactly the
+                // approved moves already executed, including expression casts.
+                renames.definition(&mut expected);
+            } else if let ManagedType::Domain { base, .. } = &mut expected
                 && let Some(reference) = base.type_ref()
-                && let Some(base_pin) = pins.iter().find(|p| {
-                    if before {
-                        p.before.as_ref().is_some_and(|b| &b.name == reference)
-                    } else {
-                        &p.name == reference
-                    }
-                })
+                && let Some(base_pin) = pins.iter().find(|p| &p.name == reference)
                 && let Some((current, _, _)) = current(base_pin, executed)
             {
                 let ty = pbps_model::ColumnType::reference(current.clone());
                 *base = if base.is_array() { ty.into_array() } else { ty };
             }
-            if (before && actual != &expected)
+            let mut comparable = actual.clone();
+            super::renames::TypeRenames::default().definition(&mut comparable);
+            if (before && comparable != expected)
                 || (!before && !matches_declaration(&expected, actual))
             {
                 return Err(failed(format!(
@@ -374,6 +386,138 @@ mod tests {
             }
         }
         assert!(check_definitions(&live, &pins, true, &Default::default(), &[]).is_err());
+    }
+
+    #[test]
+    fn kept_domain_expressions_follow_executed_type_moves_and_refuse_real_drift() {
+        let domain = ManagedType::Domain {
+            base: "app.mood".parse().unwrap(),
+            not_null: false,
+            default: Some("'ok'::app.mood".into()),
+            checks: [("allowed".into(), "VALUE <> 'sad'::app.mood".into())].into(),
+            collation: None,
+        };
+        let pins = [
+            renamed_pin("mood", "app.mood", "moved.feeling", enumeration("ok")),
+            renamed_pin("kept", "app.kept", "app.kept", domain.clone()),
+        ];
+        let statements = [
+            wrote(&pins[0], "moved.mood"),
+            wrote(&pins[0], "moved.feeling"),
+        ];
+        for completed in 0..=statements.len() {
+            let name = current(&pins[0], &statements[..completed]).unwrap().0;
+            let spelling = ["app.mood", "moved.mood", "moved.feeling"][completed];
+            let actual = ManagedType::Domain {
+                base: pbps_model::ColumnType::reference(name.clone()),
+                not_null: false,
+                default: Some(format!("'ok'::{spelling}")),
+                checks: [("allowed".into(), format!("VALUE <> 'sad'::{spelling}"))].into(),
+                collation: None,
+            };
+            let live = Schema {
+                types: [
+                    (name.clone(), enumeration("ok")),
+                    ("app.kept".parse().unwrap(), actual),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            check_definitions(
+                &live,
+                &pins,
+                completed == 2,
+                &Default::default(),
+                &statements[..completed],
+            )
+            .unwrap();
+            for check in [false, true] {
+                let mut drift = live.clone();
+                let ManagedType::Domain {
+                    default, checks, ..
+                } = drift.types.get_mut(&"app.kept".parse().unwrap()).unwrap()
+                else {
+                    unreachable!()
+                };
+                if check {
+                    checks.insert("allowed".into(), "VALUE IS NOT NULL".into());
+                } else {
+                    *default = Some(format!("'sad'::{spelling}"));
+                }
+                assert!(
+                    check_definitions(
+                        &drift,
+                        &pins,
+                        false,
+                        &Default::default(),
+                        &statements[..completed]
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn renamed_domains_keep_exact_catalog_expressions_after_their_rename() {
+        let domain = ManagedType::Domain {
+            base: "app.mood".parse().unwrap(),
+            not_null: false,
+            default: Some("'ok'::app.mood".into()),
+            checks: [("allowed".into(), "VALUE <> 'sad'::app.mood".into())].into(),
+            collation: None,
+        };
+        let mut pins = [
+            renamed_pin("mood", "app.mood", "app.feeling", enumeration("ok")),
+            renamed_pin("domain", "app.kept", "app.renamed", domain.clone()),
+        ];
+        // The author record can have a different spelling from the catalog;
+        // RENAME preserves the catalog tree rather than installing that text.
+        let ManagedType::Domain { base, default, .. } = &mut pins[1].definition else {
+            unreachable!()
+        };
+        *base = "app.feeling".parse().unwrap();
+        *default = Some("'ok' :: app.mood".into());
+        let statements = [
+            wrote(&pins[0], "app.feeling"),
+            wrote(&pins[1], "app.renamed"),
+        ];
+        let actual = ManagedType::Domain {
+            base: "app.feeling".parse().unwrap(),
+            not_null: false,
+            default: Some("'ok'::app.feeling".into()),
+            checks: [("allowed".into(), "VALUE <> 'sad'::app.feeling".into())].into(),
+            collation: None,
+        };
+        let live = Schema {
+            types: [
+                ("app.feeling".parse().unwrap(), enumeration("ok")),
+                ("app.renamed".parse().unwrap(), actual),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        check_definitions(&live, &pins, true, &Default::default(), &statements).unwrap();
+        for check in [false, true] {
+            let mut drift = live.clone();
+            let ManagedType::Domain {
+                default, checks, ..
+            } = drift
+                .types
+                .get_mut(&"app.renamed".parse().unwrap())
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            if check {
+                checks.insert("allowed".into(), "VALUE IS NOT NULL".into());
+            } else {
+                *default = Some("'sad'::app.feeling".into());
+            }
+            assert!(
+                check_definitions(&drift, &pins, true, &Default::default(), &statements).is_err()
+            );
+        }
     }
 
     #[test]

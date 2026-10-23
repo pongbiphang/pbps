@@ -1559,3 +1559,293 @@ fn fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent() {
         assigned
     );
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn type_renames_forward_bound_expressions_and_the_next_plan_is_clean() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for moved in [false, true] {
+            let own = OwnDatabase::new(&server, "rename_text1635");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app; CREATE SCHEMA moved;
+                CREATE TYPE app.mood AS ENUM ('sad', 'ok');
+                CREATE DOMAIN app.score AS integer CHECK (VALUE > 0);
+                CREATE DOMAIN app.kept AS app.mood DEFAULT 'ok'::app.mood CONSTRAINT kept_check CHECK (VALUE <> 'sad'::app.mood);
+                CREATE DOMAIN app.kept_score AS app.score DEFAULT 1::app.score CONSTRAINT kept_score_check CHECK (VALUE <> 2::app.score);
+                CREATE TABLE app.t (v app.mood DEFAULT 'ok'::app.mood, n app.score DEFAULT 1::app.score,
+                    alias text DEFAULT ('app.mood'::regtype)::text,
+                    g app.mood GENERATED ALWAYS AS ('ok'::app.mood) STORED,
+                    gn app.score GENERATED ALWAYS AS (1::app.score) STORED,
+                    CONSTRAINT allowed CHECK (v <> 'sad'::app.mood), CONSTRAINT allowed_n CHECK (n <> 2::app.score));
+                CREATE POLICY p ON app.t USING (v <> 'sad'::app.mood) WITH CHECK (n <> 2::app.score);
+                CREATE VIEW app.v AS SELECT 'ok'::app.mood AS v, 1::app.score AS n;
+                CREATE INDEX ix ON app.t ((v = 'ok'::app.mood)) WHERE v <> 'sad'::app.mood;
+                CREATE TABLE app.parts (v app.mood) PARTITION BY LIST (v);
+                CREATE TABLE app.part PARTITION OF app.parts FOR VALUES IN ('ok');
+                ALTER TABLE app.part ALTER COLUMN v SET DEFAULT 'ok'::app.mood;
+                CREATE FUNCTION app.f(x boolean DEFAULT ('ok'::app.mood <> 'sad'::app.mood)) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN x AND (1::app.score <> 2::app.score);");
+            if moved {
+                on_server(
+                    db,
+                    "CREATE FUNCTION app.typed(x app.mood DEFAULT 'ok'::app.mood) RETURNS app.score LANGUAGE SQL IMMUTABLE RETURN 1::app.score",
+                );
+            }
+            let d = Demo::new("rename-text1635");
+            succeeds(d.run(&["pull", "--db", db]));
+            d.commit();
+            // Bootstrap the pulled declarations to record their exact spelling,
+            // independently of the engine's reformatting (decisions 207/208).
+            on_server(db, "DROP SCHEMA app CASCADE; CREATE SCHEMA app");
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let before = latest_snapshot(db);
+            let destination = if moved { "moved" } else { "app" };
+            for (old, new, kind) in [("mood", "feeling", "enum"), ("score", "rating", "domain")] {
+                let old_path = d.dir.join(format!("schema/app.{old}.type.yml"));
+                let text = std::fs::read_to_string(&old_path).unwrap();
+                std::fs::remove_file(old_path).unwrap();
+                std::fs::write(
+                    d.dir.join(format!("schema/{destination}.{new}.type.yml")),
+                    text.replace(
+                        &format!("{kind}: app.{old}"),
+                        &format!("{kind}: {destination}.{new}\nrenamed_from: app.{old}"),
+                    ),
+                )
+                .unwrap();
+            }
+            // Change structural references only; each expression keeps exactly
+            // the spelling originally authored, including its old cast names.
+            for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "yml") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let text = text
+                        .replace("type: app.mood", &format!("type: {destination}.feeling"))
+                        .replace("type: app.score", &format!("type: {destination}.rating"));
+                    if moved && text.starts_with("function: app.typed(") {
+                        // Argument types are module identity, so their rename
+                        // is an explicit module replacement (ADR-0009 §1).
+                        let text = text
+                            .replace("app.mood", "moved.feeling")
+                            .replace("app.score", "moved.rating");
+                        std::fs::remove_file(path).unwrap();
+                        std::fs::write(
+                            d.dir
+                                .join("schema/app.typed%28moved.feeling%29.function.yml"),
+                            text,
+                        )
+                        .unwrap();
+                    } else {
+                        std::fs::write(path, text).unwrap();
+                    }
+                }
+            }
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let path = d.dir.join("rename.plan.json");
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let plan: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .filter(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
+                    .count(),
+                2
+            );
+            if !moved {
+                assert_eq!(plan.changes.changes.len(), 2);
+            } else {
+                assert!(
+                    plan.changes
+                        .changes
+                        .iter()
+                        .any(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
+                );
+                assert!(
+                    plan.changes
+                        .changes
+                        .iter()
+                        .any(|p| matches!(p.change, pbps_model::Change::CreateModule { .. }))
+                );
+            }
+            assert!(plan.changes.changes.iter().all(|p| matches!(
+                p.change,
+                pbps_model::Change::RenameType { .. }
+                    | pbps_model::Change::DropModule { .. }
+                    | pbps_model::Change::CreateModule { .. }
+                    | pbps_model::Change::PublicExecution { .. }
+            )));
+            succeeds(d.run(&[
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&path),
+                "--allow",
+                if moved {
+                    "rename,destructive"
+                } else {
+                    "rename"
+                },
+            ]));
+            let after = latest_snapshot(db);
+            assert_eq!(before.declared.expressions, after.declared.expressions);
+            for (id, text) in &before.declared.modules {
+                if id.name() != "typed" {
+                    assert_eq!(after.declared.modules.get(id), Some(text));
+                }
+            }
+            if moved {
+                assert!(
+                    after
+                        .schema
+                        .modules
+                        .contains_key(&"app.typed(moved.feeling)".parse().unwrap())
+                );
+            }
+            for name in ["app.kept", "app.kept_score"] {
+                let name = name.parse().unwrap();
+                assert_eq!(before.declared.types[&name], after.declared.types[&name]);
+                assert_ne!(before.schema.types[&name], after.schema.types[&name]);
+            }
+            succeeds(d.run(&["verify", "--db", db]));
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let next: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(next.changes.is_empty(), "{:?}", next.changes);
+            // A changed post-rename catalog still fails ordinary drift and the
+            // next-plan checksum; the retained authored text cannot hide it.
+            on_server(
+                db,
+                &format!("ALTER DOMAIN app.kept SET DEFAULT 'sad'::{destination}.feeling"),
+            );
+            assert_ne!(code(&d.run(&["verify", "--db", db])), 0);
+            assert_ne!(code(&d.run(&["plan", "--db", db])), 0);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn type_renames_refuse_default_and_check_edits_inside_the_plan_window() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for (rename_domain, edit) in [
+            (
+                false,
+                "ALTER DOMAIN app.kept SET DEFAULT 'sad'::app.feeling",
+            ),
+            (
+                false,
+                "ALTER TABLE app.t ALTER COLUMN v SET DEFAULT 'sad'::app.feeling",
+            ),
+            (
+                false,
+                "ALTER TABLE app.t DROP CONSTRAINT allowed; ALTER TABLE app.t ADD CONSTRAINT allowed CHECK (v = 'sad'::app.feeling)",
+            ),
+            (
+                true,
+                "ALTER DOMAIN app.renamed SET DEFAULT 'sad'::app.feeling",
+            ),
+            (
+                true,
+                "ALTER DOMAIN app.renamed DROP CONSTRAINT kept_check; ALTER DOMAIN app.renamed ADD CONSTRAINT kept_check CHECK (VALUE = 'sad'::app.feeling)",
+            ),
+        ] {
+            let own = OwnDatabase::new(&server, "rename_edit1635");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad', 'ok'); CREATE DOMAIN app.kept AS app.mood DEFAULT 'ok'::app.mood CONSTRAINT kept_check CHECK (VALUE <> 'sad'::app.mood); CREATE TABLE app.t(v app.mood DEFAULT 'ok'::app.mood, CONSTRAINT allowed CHECK (v <> 'sad'::app.mood))",
+            );
+            let d = Demo::new("rename-edit1635");
+            succeeds(d.run(&["pull", "--db", db]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt rename fixture"]));
+            std::fs::rename(
+                d.dir.join("schema/app.mood.type.yml"),
+                d.dir.join("schema/app.feeling.type.yml"),
+            )
+            .unwrap();
+            if rename_domain {
+                let path = d.dir.join("schema/app.kept.type.yml");
+                let text = std::fs::read_to_string(&path).unwrap().replace(
+                    "domain: app.kept",
+                    "domain: app.renamed\nrenamed_from: app.kept",
+                );
+                std::fs::remove_file(path).unwrap();
+                std::fs::write(d.dir.join("schema/app.renamed.type.yml"), text).unwrap();
+            }
+            for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "yml") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap()
+                        .replace(
+                            "enum: app.mood",
+                            "enum: app.feeling\nrenamed_from: app.mood",
+                        )
+                        .replace("type: app.mood", "type: app.feeling");
+                    std::fs::write(path, text).unwrap();
+                }
+            }
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let path = d.dir.join("refuse.plan.json");
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved
+                    .changes
+                    .changes
+                    .iter()
+                    .filter(|p| matches!(p.change, pbps_model::Change::RenameType { .. }))
+                    .count(),
+                if rename_domain { 2 } else { 1 }
+            );
+            let edit = if rename_domain {
+                format!(
+                    "IF EXISTS (SELECT FROM pg_type WHERE typnamespace='app'::regnamespace AND typname='renamed') THEN {edit}; END IF"
+                )
+            } else {
+                edit.to_owned()
+            };
+            on_server(
+                db,
+                &format!(
+                    "CREATE FUNCTION app.edit() RETURNS event_trigger LANGUAGE plpgsql AS $body$ BEGIN IF current_setting('pbps.test_rename_edit', true) IS DISTINCT FROM 'on' THEN PERFORM set_config('pbps.test_rename_edit', 'on', true); {edit}; PERFORM set_config('pbps.test_rename_edit', 'off', true); END IF; END $body$; CREATE EVENT TRIGGER edit ON ddl_command_end WHEN TAG IN ('ALTER TYPE', 'ALTER DOMAIN') EXECUTE FUNCTION app.edit()"
+                ),
+            );
+            let out = d.run(&[
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&path),
+                "--allow",
+                "rename",
+            ]);
+            assert_ne!(code(&out), 0, "hand edit was recorded: {edit}");
+            assert!(
+                stderr(&out).contains("changed since planning")
+                    || stderr(&out).contains("moved while this plan was running"),
+                "{}",
+                stderr(&out)
+            );
+            on_server(db, "DROP EVENT TRIGGER edit; DROP FUNCTION app.edit()");
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_type WHERE typname='mood'"
+                ),
+                1
+            );
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}

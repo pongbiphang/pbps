@@ -4558,28 +4558,12 @@ fn refuse_pinned_movement(
     // This read follows the admitted changes (or one emitted staged step).
     // Map each original reference once: a chain's final names can still be
     // another uid's original names, and cannot certify execution progress.
+    let mut named_after = sequences_named(dialect, after);
     if !renamed_types.is_empty() {
-        let follow = |ty: &mut pbps_model::ColumnType| {
-            if let Some(to) = ty.type_ref().and_then(|r| renamed_types.get(r)) {
-                let reference = pbps_model::ColumnType::reference(to.clone());
-                *ty = if ty.is_array() {
-                    reference.into_array()
-                } else {
-                    reference
-                };
-            }
-        };
-        for definition in named_before.to_mut().types.values_mut() {
-            if let pbps_model::ManagedType::Domain { base, .. } = definition {
-                follow(base);
-            }
-        }
-        for table in named_before.to_mut().tables.values_mut() {
-            for column in table.columns.values_mut() {
-                follow(&mut column.ty);
-            }
-        }
+        pbps_pg::type_refs::renames::TypeRenames(renamed_types).schema(named_before.to_mut());
+        pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
     }
+    let after = named_after.as_ref();
     let before = named_before.as_ref();
     let mut expected_types = BTreeMap::new();
     for step in &changes.changes {
@@ -4635,7 +4619,7 @@ fn refuse_pinned_movement(
     // a column or table across a rename: a held name is `None` where it is
     // the generated one, and a rename changes that without touching the
     // sequence (#1631).
-    let (before, after) = (&named_before, &sequences_named(dialect, after));
+    let (before, after) = (&named_before, &named_after);
     let mut objects: BTreeSet<&TableName> = BTreeSet::new();
     // Modules are counted in their own set, under their own identity: a
     // module is no longer a name in the tables namespace (ADR-0009 §1), and

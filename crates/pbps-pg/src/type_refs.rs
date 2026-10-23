@@ -1,6 +1,7 @@
 //! Prerequisites of columns that reference existing types (DEC-1523.1–3).
 
 pub mod declared;
+pub mod renames;
 
 use std::collections::BTreeSet;
 
