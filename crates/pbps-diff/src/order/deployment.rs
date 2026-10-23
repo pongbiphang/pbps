@@ -70,7 +70,7 @@ fn boundary(changes: &[PlannedChange], i: usize) -> At {
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::catalog::{Dependent, Holds, Part};
+use super::catalog::{Dependent, Holds, Part, graph::ModuleAdapter};
 use crate::order::expand::{self, Added, Addition, Anchor, Expansion, Order, Rewrite, expand};
 use crate::order::{Schedule, Source};
 use pbps_dialect::Dialect;
@@ -228,6 +228,35 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
     match (part, holds) {
         (DependencyPart::Module { id, .. }, Holds::Module(module)) => *id == module,
         (
+            DependencyPart::PrimaryKey(table),
+            Holds::TablePart {
+                table: target,
+                part: Part::PrimaryKey(_),
+            },
+        ) => *table == target,
+        (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Unique,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Unique(target_name),
+            },
+        )
+        | (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::ForeignKey,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::ForeignKey(target_name),
+            },
+        )
+        | (
             DependencyPart::Named {
                 table,
                 kind: pbps_model::Part::Check,
@@ -499,11 +528,21 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
             let part = match part {
                 Part::Default(_) => Part::Default(here.address.name),
                 Part::Generated(_) => Part::Generated(here.address.name),
-                Part::Check(_) | Part::Index(_) | Part::Policy(_) => unreachable!(),
+                Part::PrimaryKey(_)
+                | Part::Unique(_)
+                | Part::ForeignKey(_)
+                | Part::Check(_)
+                | Part::Index(_)
+                | Part::Policy(_) => unreachable!(),
             };
             (here.address.table, part)
         }
-        Part::Check(_) | Part::Index(_) | Part::Policy(_) => {
+        Part::PrimaryKey(_)
+        | Part::Unique(_)
+        | Part::ForeignKey(_)
+        | Part::Check(_)
+        | Part::Index(_)
+        | Part::Policy(_) => {
             let Located::Present(table) = sources.locate_table(table, at) else {
                 return None;
             };
@@ -521,7 +560,12 @@ fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
         return;
     };
     match &mut p.change {
-        Change::DropCheck { table: t, .. }
+        Change::SetPrimaryKey { table: t, .. }
+        | Change::DropUnique { table: t, .. }
+        | Change::AddUnique { table: t, .. }
+        | Change::DropForeignKey { table: t, .. }
+        | Change::AddForeignKey { table: t, .. }
+        | Change::DropCheck { table: t, .. }
         | Change::AddCheck { table: t, .. }
         | Change::DropIndex { table: t, .. }
         | Change::AddIndex { table: t, .. } => *t = table.clone(),
@@ -547,6 +591,21 @@ fn respell_at(
     } = original
     else {
         respell(p, &here, dialect);
+        if let Change::AddForeignKey { constraint, .. } = &mut p.change {
+            let names = sources.names();
+            let target = match names.holder(&constraint.references_table, At::End) {
+                pbps_model::plan_names::Holder::Tracked(uid) => names.table_at(uid, at),
+                pbps_model::plan_names::Holder::Unmanaged
+                | pbps_model::plan_names::Holder::Vacant => None,
+            };
+            let Some(target) = target else {
+                return Err(
+                    "the foreign key target is unavailable at its restoration boundary".into(),
+                );
+            };
+            constraint.references_table = target.clone();
+            p.risks = dialect.change_risks(&p.change);
+        }
         return Ok(());
     };
     let Located::Present(located) = sources.locate(&table.column(column), at) else {
@@ -718,6 +777,20 @@ fn removal_of(
             })
         }
         Holds::TablePart { table, part } => Ok(match part {
+            Part::PrimaryKey(from) => Change::SetPrimaryKey {
+                table: table.clone(),
+                from: Some(from.clone()),
+                to: None,
+                nonclustered: false,
+            },
+            Part::Unique(name) => Change::DropUnique {
+                table: table.clone(),
+                name: name.clone(),
+            },
+            Part::ForeignKey(name) => Change::DropForeignKey {
+                table: table.clone(),
+                name: name.clone(),
+            },
             Part::Check(name) => Change::DropCheck {
                 table: table.clone(),
                 name: name.clone(),
@@ -786,6 +859,23 @@ fn restoration_of(
         Holds::TablePart { table, part } => {
             let t = declared.tables.get(table).ok_or_else(unsupported)?;
             Ok(match part {
+                Part::PrimaryKey(_) => Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(t.primary_key.as_ref().ok_or_else(unsupported)?.clone()),
+                    nonclustered: !t.primary_key_is_clustered(),
+                },
+                Part::Unique(name) => Change::AddUnique {
+                    table: table.clone(),
+                    name: name.clone(),
+                    constraint: t.unique.get(name).ok_or_else(unsupported)?.clone(),
+                    clustered: t.unique_is_clustered(name.raw()),
+                },
+                Part::ForeignKey(name) => Change::AddForeignKey {
+                    table: table.clone(),
+                    name: name.clone(),
+                    constraint: Box::new(t.foreign_keys.get(name).ok_or_else(unsupported)?.clone()),
+                },
                 Part::Check(name) => Change::AddCheck {
                     table: table.clone(),
                     name: name.clone(),
@@ -1009,7 +1099,7 @@ pub fn weave(
     let before = cs.changes.len();
     let weave = Weave {
         roots: roots.iter().map(|(root, _)| root.clone()).collect(),
-        found,
+        found: ModuleAdapter::new(found),
         declared,
         sources,
         dialect,
@@ -1041,7 +1131,7 @@ fn module_order(
             .into_iter()
             .map(|(root, _)| root)
             .collect(),
-        found,
+        found: ModuleAdapter::new(found),
         declared,
         sources,
         dialect,
@@ -1057,7 +1147,7 @@ struct Weave<'a> {
     /// The modules the plan dropped before any rewrite: a split leaves a
     /// dependent view's drop behind, which is not a root of its own.
     roots: Vec<ModuleId>,
-    found: &'a BTreeMap<ModuleId, Vec<Dependent>>,
+    found: ModuleAdapter<'a>,
     declared: &'a Schema,
     sources: Sources<'a>,
     dialect: &'a dyn Dialect,
@@ -3262,3 +3352,7 @@ fn truncated(mut part: String) -> String {
     }
     part
 }
+
+#[cfg(test)]
+#[path = "deployment_tests.rs"]
+mod tests;
