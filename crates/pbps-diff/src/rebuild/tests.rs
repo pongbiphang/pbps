@@ -1,6 +1,35 @@
 use super::*;
 use pbps_model::{BoundDatum, Column, PartitionBound, PartitionBy, PartitionOf};
 
+fn record(
+    base: Side<'_>,
+    desired: &Schema,
+    ids: &IdsFile,
+    table: &TableName,
+    max_rows: u64,
+    reason: &Reason,
+    ctx: &Context,
+) -> Result<IdsFile, RebuildError> {
+    super::record(
+        base,
+        desired,
+        ids,
+        table,
+        max_rows,
+        reason,
+        ctx,
+        &pbps_dialect::MinimalDialect,
+    )
+}
+
+fn qualify(
+    base: Side<'_>,
+    desired: Side<'_>,
+    table: &TableName,
+) -> Result<RebuildPartitionedTable, RebuildError> {
+    super::qualify(base, desired, table, &pbps_dialect::MinimalDialect)
+}
+
 fn side<'a>(schema: &'a Schema, ids: &'a IdsFile) -> Side<'a> {
     Side { schema, ids }
 }

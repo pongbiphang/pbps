@@ -66,8 +66,29 @@ fn identities(ids: &IdsFile, tables: &BTreeMap<TableName, Table>) -> RebuildIden
     }
 }
 
-fn fingerprint(schema: &Schema) -> String {
-    pbps_model::state_checksum(schema, &IdsFile::default())
+/// Only this constructor may prepare a rebuild's shape and fingerprint. Raw
+/// declarations and catalog reads must converge before either is compared.
+struct CanonicalSchema(Schema);
+
+fn canonical_schema(
+    schema: &Schema,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> CanonicalSchema {
+    let mut schema = schema.clone();
+    for table in schema.tables.values_mut() {
+        for column in table.columns.values_mut() {
+            if let Ok(ty) = dialect.normalize_type(&column.ty) {
+                column.ty = ty;
+            }
+        }
+    }
+    CanonicalSchema(schema)
+}
+
+impl CanonicalSchema {
+    fn fingerprint(&self) -> String {
+        pbps_model::state_checksum(&self.0, &IdsFile::default())
+    }
 }
 
 fn source_identities(base: Side<'_>, table: &TableName) -> Result<RebuildIdentities, RebuildError> {
@@ -178,6 +199,7 @@ pub fn record(
     max_rows: u64,
     reason: &Reason,
     ctx: &Context,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> Result<IdsFile, RebuildError> {
     ids.validate()
         .map_err(|_| refused(table, "the identity file is inconsistent"))?;
@@ -187,7 +209,14 @@ pub fn record(
     let uid = ids
         .table_uid(table)
         .ok_or_else(|| refused(table, "the source parent must already have an identity"))?;
-    let checksum = fingerprint(desired);
+    let before = canonical_schema(base.schema, dialect);
+    let after = canonical_schema(desired, dialect);
+    let base = Side {
+        schema: &before.0,
+        ids: base.ids,
+    };
+    let desired = &after.0;
+    let checksum = after.fingerprint();
     let mut out = ids.clone();
     if let Some(old) = ids.rebuilds.get(uid) {
         if old.target_checksum != checksum {
@@ -276,6 +305,7 @@ pub fn qualify(
     base: Side<'_>,
     desired: Side<'_>,
     table: &TableName,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> Result<RebuildPartitionedTable, RebuildError> {
     desired
         .ids
@@ -286,8 +316,18 @@ pub fn qualify(
         .table_uid(table)
         .and_then(|uid| desired.ids.rebuilds.get(uid))
         .ok_or_else(|| refused(table, "no explicit rebuild intent is recorded"))?;
+    let before = canonical_schema(base.schema, dialect);
+    let after = canonical_schema(desired.schema, dialect);
+    let base = Side {
+        schema: &before.0,
+        ids: base.ids,
+    };
+    let desired = Side {
+        schema: &after.0,
+        ids: desired.ids,
+    };
     shape(base.schema, desired.schema, table)?;
-    if intent.target_checksum != fingerprint(desired.schema)
+    if intent.target_checksum != after.fingerprint()
         || base.ids.tables != desired.ids.tables
         || base.ids.columns != desired.ids.columns
         || base.ids.roles != desired.ids.roles

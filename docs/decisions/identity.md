@@ -1047,3 +1047,13 @@ If a snapshot omits any source table or column, its pending rebuild is omitted
 as a whole; retaining only the parent cannot describe a valid lineage. An
 empty managed RANGE parent is still a rebuildable tree: PostgreSQL permits
 it without children, and changing its key still requires replacement.
+
+<a id="dec-2298-3"></a>
+
+**DEC-2298.3. Rebuild approval and qualification fingerprint one canonical schema.**
+The differ owns a shared canonical-schema constructor using the supplied
+dialect's type normalization. Both the recorded target checksum and every
+qualification use this form, including shape comparisons against catalog
+reads. CLI spelling is not an approval boundary: `int` and `integer` must
+agree offline and connected. A different type or modifier still invalidates
+the approval. No alias table or separate CLI fingerprint is maintained.

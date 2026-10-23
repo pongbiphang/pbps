@@ -693,7 +693,7 @@ pub(crate) fn diff_partial_rebuilding(
                 let why = if dialect.name() != "postgres" {
                     "this engine does not support table rebuilds"
                 } else {
-                    match crate::rebuild::qualify(base, declared, &table) {
+                    match crate::rebuild::qualify(base, declared, &table, dialect) {
                         Ok(_) => {
                             "recorded intent is valid; table rebuild execution is not available yet"
                         }

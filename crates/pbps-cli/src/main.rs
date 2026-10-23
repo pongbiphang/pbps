@@ -2979,8 +2979,7 @@ fn cmd_rebuild_table(
     if dialect.name() != "postgres" {
         bail!("rebuild-table is only supported for PostgreSQL");
     }
-    let mut loaded = load(project, dialect.as_ref())?;
-    loaded.schema = types_as_the_dialect_spells_them(&loaded.schema, dialect.as_ref());
+    let loaded = load(project, dialect.as_ref())?;
     let problems = declaration_problems(&loaded, dialect.as_ref());
     if !problems.is_empty() {
         bail!(
@@ -2996,12 +2995,11 @@ fn cmd_rebuild_table(
         bail!("resolve declaration identity annotations before recording a rebuild");
     }
     let ids = read_ids(project)?;
-    let mut baseline = baseline::load(
+    let baseline = baseline::load(
         project,
         &baseline::Source::Git { rev: "HEAD".into() },
         dialect.as_ref(),
     )?;
-    baseline.schema = types_as_the_dialect_spells_them(&baseline.schema, dialect.as_ref());
     let updated = pbps_diff::rebuild::record(
         pbps_diff::Side {
             schema: &baseline.schema,
@@ -3013,6 +3011,7 @@ fn cmd_rebuild_table(
         max_rows,
         reason,
         &context(project.root()),
+        dialect.as_ref(),
     )?;
     if updated == ids {
         println!("The identity file is unchanged; this rebuild intent is already recorded.");

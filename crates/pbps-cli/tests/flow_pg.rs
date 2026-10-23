@@ -27,6 +27,82 @@ mod type_refs;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+const REBUILD_ALIAS_SOURCE: &str = "table: app.p\ncolumns:\n  k: {type: int}\n  bucket: {type: int4}\n  label: {type: varchar(20)}\n  spelled: {type: character varying(30)}\n  stamp: {type: timestamptz}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+
+/// The same assertions run without a database and inside the owned live test.
+fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&str>) {
+    let rev = Command::new("git")
+        .arg("-C")
+        .arg(&d.dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(rev.status.success());
+    let source = String::from_utf8(rev.stdout).unwrap();
+    let desired = REBUILD_ALIAS_SOURCE.replace("partition_by: [k]", "partition_by: [bucket]");
+    let canonical = desired
+        .replace("type: int}", "type: integer}")
+        .replace("type: int4}", "type: integer}")
+        .replace("type: varchar(20)", "type: character varying(20)")
+        .replace("type: timestamptz", "type: timestamp with time zone");
+    let record = [
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ];
+    let ids_path = d.dir.join("schema.ids.json");
+    let mut approved = None;
+    let check = |expected: &str| {
+        let offline = d.run(&["plan", "--no-dev", "--since", source.trim()]);
+        assert_ne!(code(&offline), 0);
+        assert!(stderr(&offline).contains(expected), "{}", stderr(&offline));
+        if let Some(connection) = connection {
+            let connected = d.run(&["plan", "--db", connection]);
+            assert_ne!(code(&connected), 0);
+            assert!(
+                stderr(&connected).contains(expected),
+                "{}",
+                stderr(&connected)
+            );
+        }
+    };
+    for spelling in [&desired, &canonical] {
+        std::fs::write(path, spelling).unwrap();
+        succeeds(d.run(&record));
+        let bytes = std::fs::read(&ids_path).unwrap();
+        if let Some(before) = &approved {
+            assert_eq!(&bytes, before);
+        } else {
+            approved = Some(bytes);
+        }
+        d.commit();
+        check("recorded intent is valid; table rebuild execution is not available yet");
+    }
+    // A real modifier change is not an alias, even inside the same type family.
+    std::fs::write(
+        path,
+        canonical.replace("character varying(20)", "character varying(21)"),
+    )
+    .unwrap();
+    d.commit();
+    check("approved source lineage or desired fingerprint does not match");
+    std::fs::write(path, &canonical).unwrap();
+    d.commit();
+    check("recorded intent is valid; table rebuild execution is not available yet");
+}
+
+#[test]
+fn rebuild_aliases_record_and_plan_from_one_canonical_schema() {
+    let d = Demo::new("rebuild2298-aliases");
+    d.table(REBUILD_ALIAS_SOURCE);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    check_rebuild_aliases(&d, &d.dir.join("schema/app.t.yml"), None);
+}
+
 #[test]
 fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
     let d = Demo::new("rebuild2298");
@@ -104,28 +180,14 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
     let connection = own.connection();
     on_server(
         connection,
-        "CREATE SCHEMA app; CREATE TABLE app.p(k integer, bucket integer) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p VALUES(1,2)",
+        "CREATE SCHEMA app; CREATE TABLE app.p(k integer, bucket integer, label varchar(20), spelled varchar(30), stamp timestamptz) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p(k,bucket) VALUES(1,2)",
     );
     let d = Demo::new("rebuild2298-live");
     succeeds(d.run(&["pull", "--db", connection]));
     d.commit();
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
     let path = d.dir.join("schema/app.p.yml");
-    let source = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(
-        &path,
-        source.replace("partition_by: [k]", "partition_by: [bucket]"),
-    )
-    .unwrap();
-    succeeds(d.run(&[
-        "rebuild-table",
-        "app.p",
-        "--max-rows",
-        "20",
-        "--reason",
-        "maintenance",
-    ]));
-    d.commit();
+    check_rebuild_aliases(&d, &path, Some(connection));
     let artifact = d.dir.join("refused.json");
     std::fs::write(&artifact, b"keep existing artifact").unwrap();
     let out = d.run(&[
