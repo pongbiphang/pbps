@@ -177,7 +177,7 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
     let positions: BTreeMap<_, _> = ops.iter().enumerate().map(|(i, o)| (o.id(), i)).collect();
     let mut writes: BTreeMap<Key, Vec<Write<'_>>> = BTreeMap::new();
     let mut moves = Vec::new();
-    let mut restores: BTreeMap<(Key, Recorded), Vec<Restore<'_>>> = BTreeMap::new();
+    let mut restores: BTreeMap<(Recorded, Property), Vec<Restore<'_>>> = BTreeMap::new();
     for (at, (op, effect)) in ops.iter().zip(fx).enumerate() {
         for (clause, value) in effect.symbolic.iter().enumerate() {
             let position = Position {
@@ -192,7 +192,7 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     .push(Write { position, value: w }),
                 Clause::Move(m) => moves.push((position, m)),
                 Clause::Restore(r) => restores
-                    .entry((r.key.clone(), r.child.clone()))
+                    .entry((r.child.clone(), r.property.clone()))
                     .or_default()
                     .push(Restore { position, value: r }),
                 Clause::Require(fact) => {
@@ -223,33 +223,32 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
         }
     }
     let declared_moves = moves_by_child(fx);
-    for ((key, child), list) in &mut restores {
-        // The existing write/write policy applies to the same physical cell.
-        // Different child properties do not share a restoration dependency.
+    for ((child, property), list) in &mut restores {
+        // Restoration order belongs to the physical cell, not the logical
+        // parent key used to justify reaching that cell (DEC-2296.1).
         list.sort_by_key(|r| (r.position.id, r.position.clause));
-        let mut last = BTreeMap::new();
-        for r in list.iter() {
-            if let Some(previous) = last.insert(&r.value.property, *r) {
-                restore_edge(graph, previous.position, r.position, key);
-            }
+        for pair in list.windows(2) {
+            restore_edge(
+                graph,
+                pair[0].position,
+                pair[1].position,
+                &pair[1].value.key,
+            );
         }
-        for r in list.iter() {
+        for (i, r) in list.iter().enumerate() {
             if let Err(why) = r.value.value.known() {
                 graph.symbolic_unmet.push(problem(r.position.id, why));
             }
-        }
-        // A move's cut below determines whether a recursive write can still
-        // reach its transferred cell. Stationary members use recorded aliases.
-        if !declared_moves.contains_key(child)
-            && let Some(member) = base.members.get(child)
-            && member.parent == key.parent
-            && let Some(property) = member.aliases.get(&key.property)
-            && let Some(chain) = chains.get(key)
-        {
-            for r in list.iter().filter(|r| &r.value.property == property) {
-                let final_value = last[property].position.clause == r.position.clause
-                    && last[property].position.at == r.position.at;
-                match restoration_predecessor(chain, r, 0, final_value) {
+            let key = &r.value.key;
+            // A move's cut below determines whether recursion can still reach
+            // this cell. Stationary members use their recorded aliases.
+            if !declared_moves.contains_key(child)
+                && let Some(member) = base.members.get(child)
+                && member.parent == key.parent
+                && member.aliases.get(&key.property) == Some(property)
+                && let Some(chain) = chains.get(key)
+            {
+                match restoration_predecessor(chain, r, 0, i + 1 == list.len()) {
                     Ok(Some(w)) => restore_edge(graph, w.position, r.position, key),
                     Ok(None) => {}
                     Err(why) => graph.symbolic_unmet.push(problem(r.position.id, why)),
@@ -344,10 +343,14 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     property: t.parent.clone(),
                 };
                 let list = chains.get(&key).map_or(&[][..], Vec::as_slice);
-                let rs = restores
-                    .get(&(key.clone(), m.child.clone()))
-                    .map_or(&[][..], Vec::as_slice);
-                for r in rs {
+                let rs: Vec<_> = restores
+                    .get(&(m.child.clone(), t.to.clone()))
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r.value.key == key)
+                    .copied()
+                    .collect();
+                for r in &rs {
                     let member = if m.kind == MoveKind::Attach {
                         Some(&m.parent)
                     } else {
@@ -362,8 +365,19 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     restore_edge(graph, position, r.position, &key);
                 }
                 let mut admitted = Vec::new();
+                let mut endpoint = None;
                 for cut in 0..=list.len() {
-                    admitted.push(admits(m, t, list, rs, base, cut)?);
+                    let result = boundary_endpoint(m, t, list, &rs, base, cut, id)?;
+                    if let Some(ref state) = result {
+                        if endpoint.as_ref().is_some_and(|previous| previous != state) {
+                            return Err(
+                                "membership cuts have different physical endpoint identities"
+                                    .into(),
+                            );
+                        }
+                        endpoint = result.clone();
+                    }
+                    admitted.push(result.is_some());
                 }
                 let lo = admitted.iter().position(|yes| *yes).ok_or_else(|| {
                     format!("no boundary satisfies {key:?} for child {}", m.child.uid())
@@ -375,8 +389,8 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                         m.child.uid()
                     ));
                 }
-                // Only the final restoration supplies this cell's declared
-                // goal. Earlier restorations may precede a later parent write.
+                // Only the terminal restoration supplies this cell's final
+                // value/event goal. Intermediate ones may precede parent writes.
                 // Cuts describe possible membership, not Sink's chosen order.
                 if m.kind == MoveKind::Attach {
                     for (i, r) in rs.iter().enumerate() {
@@ -412,7 +426,7 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
 fn qualify_interactions(
     graph: &mut Graph,
     chains: &BTreeMap<Key, Vec<Write<'_>>>,
-    restores: &BTreeMap<(Key, Recorded), Vec<Restore<'_>>>,
+    restores: &BTreeMap<(Recorded, Property), Vec<Restore<'_>>>,
     moves: &[(Position, &s::Move)],
     base: &State,
 ) {
@@ -538,9 +552,10 @@ fn qualify_interactions(
                 .push(problem(chain[0].position.id, why));
         }
     }
-    for ((key, child), rs) in restores {
+    for ((child, property), rs) in restores {
         for r in rs {
-            let slot = (child.clone(), r.value.property.clone());
+            let key = &r.value.key;
+            let slot = (child.clone(), property.clone());
             let why = if chains.contains_key(&Key {
                 parent: child.clone(),
                 property: r.value.property.clone(),
@@ -562,11 +577,11 @@ fn qualify_interactions(
         }
     }
 }
-/// Evaluate suffix compositions of the declared parent version chain on the
-/// restored value. A later write can erase an earlier write's effect, so a
-/// pairwise value comparison would still add unnecessary restoration edges.
-/// Restoring changes no physical origin; only creation/retirement's value
-/// preconditions need checking in addition to the resulting value.
+/// Check suffix compositions against the declared restoration goal. Only
+/// the terminal restoration fixes the final value/event; intermediate ones
+/// keep the existing physical-incarnation boundary (DEC-2296.1).
+/// Restoring changes no physical origin. The final restoration also names
+/// the terminal event, so even equal-valued reaching writes must precede it.
 fn restoration_predecessor<'a>(
     chain: &[Write<'a>],
     r: &Restore<'_>,
@@ -619,7 +634,14 @@ fn restoration_predecessor<'a>(
             r.value.child.uid()
         ));
     }
-    Ok((lo > 0).then(|| chain[first_cut + lo - 1]))
+    // The final restoration declares the cell's terminal write event as well
+    // as its value. Even a value-preserving reaching suffix changes Version.
+    // Parent-only and post-detach writes never enter this target's chain.
+    Ok(chain[first_cut..]
+        .iter()
+        .rev()
+        .find(|w| w.value.scope == Scope::MembersAtOperation)
+        .copied())
 }
 fn restore_edge(graph: &mut Graph, before: Position, after: Position, key: &Key) {
     dependency(graph, before, after, Because::Restores(key.clone()));
@@ -690,14 +712,21 @@ fn chain<'a>(key: &Key, list: &[Write<'a>], base: &State) -> Result<Vec<Write<'a
     }
     Ok(out)
 }
-fn admits(
+#[derive(Clone, PartialEq, Eq)]
+struct Endpoint {
+    cell: Option<Cell>,
+}
+// A cut is qualified only if all admitted cuts have the same complete physical
+// endpoint. Equal values alone cannot select a version or physical birth.
+fn boundary_endpoint(
     m: &s::Move,
     t: &Transfer,
     chain: &[Write<'_>],
     rs: &[Restore<'_>],
     base: &State,
     cut: usize,
-) -> Result<bool, String> {
+    move_id: OperationId,
+) -> Result<Option<Endpoint>, String> {
     let mut parent = cell(base, &m.parent, &t.parent)?.value.known()?.clone();
     let mut physical = cell(base, &m.child, &t.from)?.clone();
     let mut child = physical.value.known()?.clone();
@@ -713,19 +742,21 @@ fn admits(
                 &m.child,
                 &t.from,
             ) else {
-                return Ok(false);
+                return Ok(None);
             };
             physical.origin = origin;
             physical.value = Fact::Known(next.clone());
+            physical.version = Version::After(w.position.id);
             child = next;
         }
     }
     if m.kind == MoveKind::Drop {
-        return Ok(true);
+        return Ok(Some(Endpoint { cell: None }));
     }
+    physical.version = Version::After(move_id);
     if m.kind == MoveKind::Attach {
         if !t.check.accepts(&parent, &child) {
-            return Ok(false);
+            return Ok(None);
         }
         child = t.policy.attach(&m.parent, &parent, &child);
         for w in &chain[cut..] {
@@ -739,10 +770,11 @@ fn admits(
                     &m.child,
                     &t.to,
                 ) else {
-                    return Ok(false);
+                    return Ok(None);
                 };
                 physical.origin = origin;
                 physical.value = Fact::Known(next.clone());
+                physical.version = Version::After(w.position.id);
                 child = next;
             }
         }
@@ -751,8 +783,12 @@ fn admits(
     }
     if let Some(last) = rs.last() {
         child = last.value.value.known()?.clone();
+        physical.version = Version::After(last.position.id);
     }
-    Ok(child == *t.goal.known()?)
+    physical.value = Fact::Known(child.clone());
+    Ok((child == *t.goal.known()?).then_some(Endpoint {
+        cell: Some(physical),
+    }))
 }
 
 /// A projection is tied to immutable operations/effects. It is descriptive,

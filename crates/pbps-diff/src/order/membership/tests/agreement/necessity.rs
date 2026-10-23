@@ -12,12 +12,13 @@ enum Justification {
     /// Keep an intermediate restoration on the declared physical incarnation,
     /// rather than using its value equality to cross a birth/retirement.
     PhysicalIncarnationBoundary,
-    /// A stationary member has no transfer goal in project. The declared
-    /// restoration still promises its own final value (DEC-2296.1).
-    StationaryRestorationGoal {
+    /// A terminal restoration promises its event identity as well as its
+    /// value. Concrete replay alone does not check this endpoint declaration.
+    FinalRestorationEvent {
         child: Recorded,
         property: Property,
         value: Value,
+        version: Version,
     },
 }
 struct Observation {
@@ -67,7 +68,6 @@ fn justification(
         for a in &f.fx[e.before].symbolic {
             for b in &f.fx[e.after].symbolic {
                 if let (Clause::Restore(a), Clause::Restore(b)) = (a, b)
-                    && a.key == *key
                     && b.key == *key
                     && a.child == b.child
                     && a.property == b.property
@@ -85,24 +85,27 @@ fn justification(
                     && w.scope == Scope::MembersAtOperation
                     && w.key == *key
                     && r.key == *key
-                    && let Some(member) = f.base.members.get(&r.child)
-                    && member.parent == key.parent
-                    && member.aliases.get(&key.property) == Some(&r.property)
-                    && !moves_by_child(&f.fx).contains_key(&r.child)
+                    && (f.base.members.get(&r.child).is_some_and(|member|
+                        member.parent == key.parent && member.aliases.get(&key.property) == Some(&r.property))
+                        || f.fx.iter().flat_map(|fx| &fx.symbolic).any(|clause|
+                            matches!(clause, Clause::Move(m) if m.kind == MoveKind::Attach
+                                && m.parent == key.parent && m.child == r.child
+                                && transfers(m).is_ok_and(|ts| ts.iter().any(|t| t.parent == key.property && t.to == r.property)))))
                     && final_restoration(f, e.after, clause, r)
                     && let Ok(value) = r.value.known()
                     && violations.iter().any(|o| o.end.is_some())
                     && violations.iter().filter_map(|o| o.end.as_ref()).all(|end| {
                         end.cells
                             .get(&(r.child.clone(), r.property.clone()))
-                            .map(|c| &c.value)
-                            != Some(&r.value)
+                            .map(|c| (&c.value, c.version))
+                            != Some((&r.value, Version::After(f.ops[e.after].id())))
                     })
                 {
-                    return Some(Justification::StationaryRestorationGoal {
+                    return Some(Justification::FinalRestorationEvent {
                         child: r.child.clone(),
                         property: r.property.clone(),
                         value: value.clone(),
+                        version: Version::After(f.ops[e.after].id()),
                     });
                 }
             }
@@ -207,17 +210,18 @@ impl Necessity {
                             .any(|other| other != *e && other.before == p[0] && other.after == p[1])
                     }));
                 }
-                if let Justification::StationaryRestorationGoal {
+                if let Justification::FinalRestorationEvent {
                     child,
                     property,
                     value,
+                    version,
                 } = &why
                 {
                     assert!(violations.iter().filter_map(|o| o.end.as_ref()).all(|end| {
                         end.cells
                             .get(&(child.clone(), property.clone()))
-                            .map(|c| &c.value)
-                            != Some(&Fact::Known(value.clone()))
+                            .map(|c| (&c.value, c.version))
+                            != Some((&Fact::Known(value.clone()), *version))
                     }));
                 }
                 self.justified.push(format!(
@@ -389,7 +393,7 @@ fn only_the_last_restoration_waits_for_a_destructive_parent_suffix() {
     assert!(f.edges().contains(&(f.ops[0].id(), f.ops[3].id())));
 }
 #[test]
-fn value_preserving_suffixes_can_follow_the_final_restoration() {
+fn value_preserving_suffixes_still_change_the_final_restoration_event() {
     let mut own = attach_restore(Scope::MembersAtOperation, WritePolicy::PreserveOwn);
     requires_restoration(&mut own, 2, 0);
     agreement(&own, &[(2, 0)]);
@@ -420,12 +424,19 @@ fn value_preserving_suffixes_can_follow_the_final_restoration() {
     rebuilt.fx[3].symbolic.push(r);
     requires_restoration(&mut rebuilt, 3, 0);
     agreement(&rebuilt, &[(3, 0)]);
-    assert_eq!(
+    assert!(
         Schedule::of_graph(&rebuilt.graph(), &rebuilt.ops)
             .sequence()
-            .unwrap(),
-        [2, 3, 0, 1]
+            .is_err()
     );
+    // Without the opposing ordinary dependency, the declared restoration
+    // event is the terminal version in every accepted order.
+    rebuilt.fx[0].requires.clear();
+    rebuilt.fx[3].creates.clear();
+    sound(&rebuilt);
+    let mut audit = Determinism::default();
+    audit.check("value-preserving-suffix".into(), &rebuilt);
+    assert!(audit.differences.is_empty() && audit.goals.is_empty());
 }
 #[test]
 fn restoration_edges_keep_physical_birth_preconditions() {
@@ -460,9 +471,13 @@ fn restoration_edges_keep_physical_birth_preconditions() {
         r.member_of = Some(tables()[0].clone());
     }
     retirement.fx[1].symbolic.push(r);
-    // Retirement accepts the restored absence and reaches the same final
-    // value/origin in both orders; it needs no preference edge.
-    assert!(retirement.graph().edges.is_empty());
+    // Both orders have the same value/origin, but retirement after restoration
+    // would replace the declared terminal event version.
+    assert!(
+        retirement
+            .edges()
+            .contains(&(retirement.ops[0].id(), retirement.ops[1].id()))
+    );
     sound(&retirement);
 }
 #[test]
@@ -504,7 +519,7 @@ fn restoration_write_order_applies_only_to_the_same_physical_cell() {
     assert!(justification(&f, &f.graph(), &reverse, &[]).is_none());
 }
 #[test]
-fn a_stationary_restoration_reason_requires_a_changed_final_value() {
+fn a_final_restoration_reason_requires_a_changed_value_or_event() {
     let mut f = base(2);
     member(&mut f, 0, 1);
     f.fx[0].symbolic.push(write(0, 0));
@@ -518,7 +533,7 @@ fn a_stationary_restoration_reason_requires_a_changed_final_value() {
     audit.check("stationary-goal".into(), &f);
     assert!(audit.unnecessary.is_empty());
     assert_eq!(audit.justified.len(), 1);
-    assert!(audit.justified[0].contains("StationaryRestorationGoal"));
+    assert!(audit.justified[0].contains("FinalRestorationEvent"));
     let forward = project(&f.ops, &f.fx, &f.base).unwrap();
     assert_eq!(
         forward.state(At::End).unwrap().cells[&(tables()[1].clone(), Property::Address)].value,
@@ -530,7 +545,8 @@ fn a_stationary_restoration_reason_requires_a_changed_final_value() {
         reverse.state(At::End).unwrap().cells[&(tables()[1].clone(), Property::Address)].value,
         Fact::Known(inherited("7"))
     );
-    // Equal values and parent-only writes cannot claim this exception.
+    // Parent-only writes cannot claim this certificate; a reaching write
+    // with equal value still changes the declared event.
     if let Clause::Recurse(w) = &mut f.fx[0].symbolic[0] {
         w.scope = Scope::ParentOnly;
     }
@@ -574,7 +590,10 @@ fn a_stationary_restoration_reason_requires_a_changed_final_value() {
                 .clone(),
         ),
     };
-    assert!(justification(&f, &f.graph(), &e, &[&same_value]).is_none());
+    assert!(matches!(
+        justification(&f, &f.graph(), &e, &[&same_value]),
+        Some(Justification::FinalRestorationEvent { .. })
+    ));
 }
 
 #[test]

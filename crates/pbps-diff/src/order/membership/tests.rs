@@ -956,6 +956,27 @@ fn adoption_preserves_clone_lineage_and_existing_physical_origin() {
         TransferPolicy::Adopt(part),
         goal,
     );
+    // Equal values and clone lineage do not choose a final event identity.
+    assert!(
+        f.refusal()
+            .contains("different physical endpoint identities")
+    );
+    let mut endpoints = Vec::new();
+    for order in permutations(2) {
+        let ordered = f.reordered(&order);
+        let projected = project(&ordered.ops, &ordered.fx, &ordered.base).unwrap();
+        let end = projected.state(At::End).unwrap().cells[&(f.a.clone(), f.member.clone())].clone();
+        assert_eq!(
+            end.origin,
+            f.base.cells[&(f.a.clone(), f.local.clone())].origin
+        );
+        endpoints.push(end);
+    }
+    assert_eq!(endpoints[0].value, endpoints[1].value);
+    assert_ne!(endpoints[0].version, endpoints[1].version);
+    if let Clause::Recurse(w) = &mut f.fx[0].symbolic[0] {
+        w.scope = Scope::ParentOnly;
+    }
     assert!(f.edges().is_empty());
     sound(&f);
     for order in permutations(2) {
@@ -1367,7 +1388,8 @@ fn graph_and_replay_agree(f: &Fixture, g: &Graph, ordinary: &[(usize, usize)]) {
             positions[i] = at;
         }
         let expected = ordinary.iter().all(|&(a, b)| positions[a] < positions[b])
-            && project(&ordered.ops, &ordered.fx, &ordered.base).is_ok();
+            && project(&ordered.ops, &ordered.fx, &ordered.base)
+                .is_ok_and(|p| agreement::declared_goals(f, p.state(At::End).unwrap()).is_empty());
         assert_eq!(permits(g, &order), expected, "order {order:?}");
         any |= expected;
     }
