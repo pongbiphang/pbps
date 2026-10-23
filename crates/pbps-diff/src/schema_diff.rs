@@ -1233,6 +1233,9 @@ pub(crate) fn diff_partial_rebuilding(
     let arriving: Vec<ModuleId> = changes
         .iter()
         .filter_map(|change| match change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. } => Some(id.clone()),
             Change::CreateTable { name, .. } => Some(ModuleId::Named(name.clone())),
             Change::RenameTable { to, .. } => Some(ModuleId::Named(to.clone())),
@@ -1286,6 +1289,9 @@ pub(crate) fn diff_partial_rebuilding(
     let changed: BTreeSet<ModuleId> = changes
         .iter()
         .filter_map(|change| match change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. }
             | Change::AlterModule { id, .. }
             | Change::DropModule { id, .. } => Some(id.clone()),
@@ -1479,6 +1485,9 @@ pub(crate) fn diff_partial_rebuilding(
     let tables_claiming_a_column_name: BTreeSet<TableName> = planned
         .iter()
         .filter_map(|p| match &p.change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::RenameColumn { table, .. } => Some(table.clone()),
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -1534,6 +1543,9 @@ pub(crate) fn diff_partial_rebuilding(
     // column name.
     let frees_a_renamed_column = |c: &Change| -> bool {
         match c {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => false,
             Change::DropColumn { column, .. } => {
                 tables_claiming_a_column_name.contains(&column.table)
             }
@@ -2588,6 +2600,9 @@ fn recreate_referenced_foreign_keys(
     let mut removed = BTreeSet::new();
     for change in changes.iter() {
         let (table, columns) = match change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => continue,
             Change::SetPrimaryKey {
                 table,
                 from: Some(key),
@@ -3132,6 +3147,9 @@ fn recreate_retyped_dependents(
         );
     }
     for (column, dependents) in changes.iter().filter_map(|change| match change {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => None,
         Change::AlterColumnType {
             column,
             from,
@@ -5179,6 +5197,9 @@ fn refuse_computed_dependencies(
                     });
                 }
                 let module = match change {
+                    Change::RebuildPartitionedTable(_)
+                    | Change::CopyTableRows(_)
+                    | Change::AnalyzeTableTree(_) => None,
                     // Standing, or re-added: either way it calls the module
                     // when the module changes. One only dropped is out of the
                     // way first, its module's drop moved after it.
@@ -6262,6 +6283,11 @@ fn dependency_rank(
     role_rank: &BTreeMap<pbps_model::RoleName, usize>,
 ) -> isize {
     match change {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {
+            unreachable!("rebuild operations are expanded by order, never ranked by the differ")
+        }
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
             create_rank.get(id).map_or(0, |r| *r as isize)
         }
@@ -7021,6 +7047,11 @@ const ROW_DELETIONS: u8 = 12;
 
 fn order_key(c: &Change) -> u8 {
     match c {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {
+            unreachable!("rebuild operations are expanded by order, never ranked by the differ")
+        }
         // A policy releases its bindings before module and column teardown.
         Change::DropPolicy { .. } => 0,
         // Modules go first and last, and both ends are load-bearing. A

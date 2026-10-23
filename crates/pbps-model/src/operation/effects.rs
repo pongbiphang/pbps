@@ -314,6 +314,58 @@ impl Cx<'_> {
     fn by_kind(&mut self) -> Result<(), OwnerError> {
         let op = self.op;
         match op.change() {
+            Change::RebuildPartitionedTable(r) => {
+                return Err(OwnerError::Rebuild {
+                    name: r.table.shown().to_string(),
+                    why: "logical root must be expanded before ordering",
+                });
+            }
+            Change::CopyTableRows(c) => {
+                for relation in std::iter::once(&c.source).chain(&c.source_partitions) {
+                    let key = ObjectKey::Table(super::checked_relation(
+                        self.owners,
+                        relation,
+                        Spelling::Base,
+                    )?);
+                    self.requires(Requirement::Is(key.clone(), Incarnation::Base));
+                    self.requires(Requirement::Reads(key));
+                }
+                for relation in std::iter::once(&c.target).chain(&c.target_partitions) {
+                    let key = ObjectKey::Table(super::checked_relation(
+                        self.owners,
+                        relation,
+                        Spelling::Final,
+                    )?);
+                    self.requires(Requirement::Is(key.clone(), Incarnation::Final));
+                    self.rewrites(Resource::Column(key));
+                }
+                for projection in &c.columns {
+                    if let Some(source) = &projection.source {
+                        let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(
+                            self.owners.column(&source.column, Spelling::Base)?,
+                        )));
+                        self.requires(Requirement::Is(key.clone(), Incarnation::Base));
+                        self.requires(Requirement::Reads(key));
+                    }
+                    let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(
+                        self.owners.column(&projection.target, Spelling::Final)?,
+                    )));
+                    self.requires(Requirement::Is(key.clone(), Incarnation::Final));
+                    self.rewrites(Resource::Column(key));
+                }
+            }
+            Change::AnalyzeTableTree(a) => {
+                for relation in std::iter::once(&a.parent).chain(&a.partitions) {
+                    let key = ObjectKey::Table(super::checked_relation(
+                        self.owners,
+                        relation,
+                        Spelling::Final,
+                    )?);
+                    self.requires(Requirement::Is(key.clone(), Incarnation::Final));
+                    self.requires(Requirement::Reads(key));
+                }
+            }
+
             Change::CreateTable {
                 uid,
                 name,

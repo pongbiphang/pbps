@@ -265,6 +265,9 @@ pub fn names(
         names: Names::default(),
     };
     match op.change() {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {}
         Change::CreateTable {
             uid, name, table, ..
         } => {

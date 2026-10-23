@@ -236,6 +236,14 @@ pub(crate) fn planned_schema_grants(
             );
         }
         let statement = match &p.change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => {
+                return Err(format!(
+                    "blocking rewrite for `{}` is unavailable",
+                    p.change.table().unwrap().shown()
+                ));
+            }
             Change::Grant {
                 role,
                 target: GrantTarget::Schema(schema),

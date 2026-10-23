@@ -1966,6 +1966,11 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
         let c = &changes[index];
         assert_eq!(c["change_index"], index);
         match &p.change {
+            pbps_model::Change::RebuildPartitionedTable(_)
+            | pbps_model::Change::CopyTableRows(_)
+            | pbps_model::Change::AnalyzeTableTree(_) => {
+                panic!("cost fixture must not contain a pending rewrite")
+            }
             pbps_model::Change::CreateTable { .. } => {
                 assert_eq!(c["status"], "unavailable");
                 assert!(c["reason"].as_str().unwrap().contains("no measurement"));

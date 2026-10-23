@@ -163,3 +163,24 @@ fn sealing_refuses_relabeling_the_ordered_engine_and_escapes_the_wire_name() {
         "the saved plan dialect another\\nengine does not match the ordered plan dialect minimal"
     );
 }
+
+#[test]
+fn rebuild_parts_without_an_intent_record_are_still_refused_at_admission() {
+    let changes: Vec<Change> = serde_json::from_str(include_str!(
+        "../../../pbps-model/tests/fixtures/rebuild_operations.json"
+    ))
+    .unwrap();
+    for change in changes {
+        let name = change.table().unwrap().shown().to_string();
+        let mut plan = wire();
+        plan.changes = ChangeSet {
+            changes: vec![PlannedChange::new(change)],
+        };
+        let error = refusal(plan.clone(), &plan.wire_fingerprint());
+        assert!(
+            error.contains("cannot be admitted") && error.contains(&name),
+            "{error}"
+        );
+        assert!(refusal(plan, "wrong checksum").contains("approved checksum"));
+    }
+}

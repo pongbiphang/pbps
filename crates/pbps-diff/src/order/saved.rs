@@ -390,6 +390,14 @@ pub fn validate_saved_plan(
     if !plan.ids.rebuilds.is_empty() {
         refuse!("recorded blocking rewrite intent cannot be executed yet");
     }
+    for planned in &plan.changes.changes {
+        if let Some((operation, table)) = planned.change.pending_rebuild() {
+            refuse!(
+                "{operation} for `{}` cannot be admitted before blocking rewrites are enabled",
+                table.shown()
+            );
+        }
+    }
     dialect
         .validate_plan_analysis(plan)
         .map_err(AdmissionError::from_error)?;

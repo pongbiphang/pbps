@@ -396,6 +396,8 @@ pub enum OwnerError {
     /// The step's position is outside the logical plan the owners index.
     #[error("{spelling:?} is outside the indexed plan")]
     Outside { spelling: Spelling },
+    #[error("rebuild of `{name}` is unavailable: {why}")]
+    Rebuild { name: String, why: &'static str },
 }
 
 /// Who owns a name a step spells: ownership, which is all the models supply
@@ -422,6 +424,7 @@ pub struct PlanOwners<'p> {
     names: PlanNames<'p>,
     base: IdsIndex<'p>,
     desired: IdsIndex<'p>,
+    rebuild: Option<rebuild::Bindings>,
 }
 
 impl<'p> PlanOwners<'p> {
@@ -432,6 +435,7 @@ impl<'p> PlanOwners<'p> {
             names,
             base: base.index(),
             desired: desired.index(),
+            rebuild: None,
         }
     }
 
@@ -457,6 +461,14 @@ fn held(holder: Holder<'_>, name: String, spelling: Spelling) -> Result<Uid, Own
 
 impl Owners for PlanOwners<'_> {
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
+        if self.rebuild.is_some() && matches!(spelling, Spelling::At(_)) {
+            self.inside(spelling)?;
+        }
+        if let Some(bindings) = &self.rebuild
+            && let Some(uid) = bindings.table(name, spelling)
+        {
+            return uid;
+        }
         let recorded = |ids: &IdsIndex<'_>| {
             ids.table_uid(name)
                 .cloned()
@@ -480,6 +492,14 @@ impl Owners for PlanOwners<'_> {
     }
 
     fn column(&self, column: &ColumnRef, spelling: Spelling) -> Result<Uid, OwnerError> {
+        if self.rebuild.is_some() && matches!(spelling, Spelling::At(_)) {
+            self.inside(spelling)?;
+        }
+        if let Some(bindings) = &self.rebuild
+            && let Some(uid) = bindings.column(column, spelling)
+        {
+            return uid;
+        }
         let recorded = |ids: &IdsIndex<'_>| {
             ids.column_uid(column)
                 .cloned()
@@ -577,6 +597,16 @@ impl Operation {
         let recorded = |uid: &Uid| Recorded(uid.clone());
         let column = |uid: &Uid| ObjectKey::Column(ColumnKey::Recorded(recorded(uid)));
         Ok(match &self.step.change {
+            Change::RebuildPartitionedTable(r) => {
+                ObjectKey::Table(Recorded(owners.table(&r.table, Spelling::Base)?))
+            }
+            Change::CopyTableRows(c) => {
+                ObjectKey::Table(checked_relation(owners, &c.target, Spelling::Final)?)
+            }
+            Change::AnalyzeTableTree(a) => {
+                ObjectKey::Table(checked_relation(owners, &a.parent, Spelling::Final)?)
+            }
+
             Change::CreateTable { uid, .. }
             | Change::DropTable { uid, .. }
             | Change::DetachPartition { uid, .. }
@@ -701,6 +731,7 @@ impl Operation {
             Ok(out)
         };
         Ok(match &self.step.change {
+Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable {
                 uid, name, table, ..
             } => {
@@ -1150,3 +1181,20 @@ pub use effects::{
 
 #[cfg(test)]
 mod tests;
+
+mod rebuild;
+
+fn checked_relation(
+    owners: &dyn Owners,
+    relation: &crate::RebuildRelation,
+    spelling: Spelling,
+) -> Result<Recorded, OwnerError> {
+    let uid = owners.table(&relation.name, spelling)?;
+    if uid != relation.uid {
+        return Err(OwnerError::Rebuild {
+            name: relation.name.shown().to_string(),
+            why: "address does not hold the recorded UID",
+        });
+    }
+    Ok(Recorded(uid))
+}

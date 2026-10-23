@@ -3036,6 +3036,11 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
 
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
+        Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {
+            let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
+            Err(DialectError::RebuildUnavailable { operation, table: table.clone() })
+        }
+
         Change::DropPolicy { table, name, .. } => one(
             pg, table, format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
@@ -5601,6 +5606,47 @@ fn row_statement(
 /// when temporarily creating a generated column (DEC-1503.1).
 pub(crate) fn generation_placeholder(ty: &pbps_model::ColumnType) -> Result<String, DialectError> {
     Ok(format!("NULL::{}", types::normalize(ty)?.raw()))
+}
+
+#[cfg(test)]
+#[test]
+fn rebuild_parts_are_refused_by_name_before_sql_emission() {
+    let changes: Vec<Change> = serde_json::from_str(include_str!(
+        "../../pbps-model/tests/fixtures/rebuild_operations.json"
+    ))
+    .unwrap();
+    for change in changes {
+        let (operation, table) = change.pending_rebuild().unwrap();
+        let error = emit(&Postgres::default(), &change, Strategy::default()).unwrap_err();
+        assert_eq!(
+            error,
+            DialectError::RebuildUnavailable {
+                operation,
+                table: table.clone()
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rebuild_copy_risk_uses_bound_types_without_calling_a_widening_narrowing() {
+    use pbps_dialect::Dialect;
+    let mut changes: Vec<Change> = serde_json::from_str(include_str!(
+        "../../pbps-model/tests/fixtures/rebuild_operations.json"
+    ))
+    .unwrap();
+    let copy = &mut changes[1];
+    assert!(Postgres::default().change_risks(copy).is_empty());
+    let Change::CopyTableRows(c) = copy else {
+        panic!()
+    };
+    c.columns[0].cast = "smallint".parse().unwrap();
+    assert!(
+        Postgres::default()
+            .change_risks(copy)
+            .contains(&pbps_model::RiskClass::Narrowing)
+    );
 }
 
 #[cfg(test)]

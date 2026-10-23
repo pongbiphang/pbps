@@ -68,6 +68,9 @@ pub async fn key_drop_blockers(
         .enumerate()
         .filter_map(|(index, p)| {
             let (table, kind, name) = match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => return None,
                 Change::SetPrimaryKey {
                     table,
                     from: Some(_),
@@ -242,6 +245,9 @@ pub async fn key_drop_blockers(
     let mut removals = Vec::new();
     for (index, p) in names.changes().iter().enumerate() {
         let (table, fk) = match &p.change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => continue,
             Change::DropForeignKey { table, name } => (table, Some(name)),
             Change::DropTable { name, .. } => (name, None),
             Change::CreateTable { .. }

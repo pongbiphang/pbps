@@ -232,6 +232,15 @@ impl Reconstruction {
             let change = &planned.change;
             let first_step = steps.len();
             match change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => {
+                    return Err(ReconstructError::Unsupported(format!(
+                        "{} for `{}`",
+                        change.pending_rebuild().unwrap().0,
+                        change.table().unwrap().shown()
+                    )));
+                }
                 Change::AddColumn {
                     table,
                     name,

@@ -259,7 +259,11 @@ pub(super) fn constraints(
                 .table()
                 .and_then(|t| match table_owners.table(t, origin.spelling()) {
                     Ok(uid) => Some(uid),
-                    Err(OwnerError::Unmanaged { .. } | OwnerError::Vacant { .. }) => None,
+                    Err(
+                        OwnerError::Unmanaged { .. }
+                        | OwnerError::Vacant { .. }
+                        | OwnerError::Rebuild { .. },
+                    ) => None,
                     Err(e @ OwnerError::Outside { .. }) => {
                         unreachable!("a prepared step outside its logical plan: {e}")
                     }

@@ -124,7 +124,8 @@ pub type CanonicalPlan<D> = PlanningPlan<Canonical<D>>;
 pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     plan: PlanningPlan,
     _dialect: &D,
-) -> CanonicalPlan<D> {
+) -> Result<CanonicalPlan<D>, String> {
+    reject_pending_rebuild(&plan.payload)?;
     let identities = plan.identities.or_else(|| {
         Some(pbps_model::operation::Operations::expanded(
             plan.logical,
@@ -137,7 +138,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     });
     let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
     done.identities = identities;
-    done
+    Ok(done)
 }
 impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
     pub fn ordered(self, mode: PlanMode, dialect: &D) -> OrderedPlan<D> {
@@ -231,6 +232,38 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// Starts a logical planning input, granting no emission authority. External
 /// draft copies can enter planning again, but must still take the complete
 /// canonical route before execution; an empty settlement cannot certify them.
+/// A copied rebuild part remains a draft even after settlement:
+/// ```compile_fail
+/// fn partial(copy: pbps_model::CopyTableRows) {
+///     let draft = pbps_diff::order::propose(pbps_model::ChangeSet {
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::CopyTableRows(Box::new(copy)))],
+///     });
+///     draft.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
+/// }
+/// ```
+/// A model-owned root cannot impersonate a certified input:
+/// ```compile_fail
+/// fn root(root: pbps_model::RebuildPartitionedTable) {
+///     let _: pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect> = root.into();
+/// }
+/// ```
+/// Statistics parts cannot be emitted from a raw proposal:
+/// ```compile_fail
+/// fn partial<E>(analyze: pbps_model::AnalyzeTableTree, emitter: &E)
+/// where E: pbps_dialect::lower::Lowering<Input = dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>> {
+///     let draft = pbps_diff::order::propose(pbps_model::ChangeSet {
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::AnalyzeTableTree(Box::new(analyze)))],
+///     });
+///     pbps_dialect::lower::lower_all(&draft as &dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>, emitter);
+/// }
+/// ```
+/// The same emitter accepts a certified plan (positive control):
+/// ```
+/// fn approved<E>(plan: &pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect>, emitter: &E)
+/// where E: pbps_dialect::lower::Lowering<Input = dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>> {
+///     pbps_dialect::lower::lower_all(plan as &dyn pbps_diff::order::PlanView<pbps_dialect::MinimalDialect>, emitter).unwrap();
+/// }
+/// ```
 pub fn propose(payload: ChangeSet) -> PlanningPlan {
     let logical = payload.changes.len();
     let origins = (0..logical)
@@ -418,6 +451,19 @@ pub fn singleton<D: pbps_dialect::Dialect + ?Sized>(
         }))
         .expect("a single operation has no ordering cycle");
     OrderedPlan::new(settled.changes, mode, dialect)
+}
+
+/// No complete-route marker may carry a root or a partially expanded rewrite.
+pub(super) fn reject_pending_rebuild(changes: &ChangeSet) -> Result<(), String> {
+    for planned in &changes.changes {
+        if let Some((operation, table)) = planned.change.pending_rebuild() {
+            return Err(format!(
+                "{operation} for `{}` cannot be certified before blocking rewrites are enabled",
+                table.shown()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

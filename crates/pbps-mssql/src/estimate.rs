@@ -159,6 +159,9 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
         .enumerate()
         .filter_map(|(index, p)| {
             let (table, work, about) = match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => return None,
                 Change::SetPrimaryKey {
                     table,
                     to: Some(_),
@@ -289,6 +292,9 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
         .enumerate()
         .filter_map(|(index, p)| {
             let (uid, column, from, to, from_nullable, to_nullable) = match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => return None,
                 Change::AlterColumnType {
                     uid,
                     column,

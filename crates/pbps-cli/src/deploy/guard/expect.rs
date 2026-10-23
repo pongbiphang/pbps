@@ -160,6 +160,9 @@ impl<'a> TableChanges<'a> {
         let mut own_effects: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for (at, p) in plan.changes.iter().enumerate() {
             match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => {}
                 Change::RenameTable { uid, from, to, .. } => {
                     tables.entry(uid.clone()).or_default().renamed = Some((from, to));
                 }

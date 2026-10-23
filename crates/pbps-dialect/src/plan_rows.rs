@@ -104,6 +104,9 @@ impl<'p> PlanFacts<'p> {
         let mut removed = BTreeMap::new();
         for (at, p) in names.changes().iter().enumerate() {
             let event = match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => continue,
                 Change::CreateTable { name, table, .. } => Event::CreateTable { name, table },
                 Change::DropTable { name, .. } => Event::DropTable { name },
                 Change::RenameColumn {

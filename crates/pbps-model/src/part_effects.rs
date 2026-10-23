@@ -96,6 +96,7 @@ impl Change {
         let named =
             |table, kind, name, effect| vec![direct(Part::Named { table, kind, name }, effect)];
         let mut out = match self {
+Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable { name, table, .. } => {
                 let mut parts = vec![direct(Part::Table(name), Effect::Created)];
                 let mut contained = |part| {

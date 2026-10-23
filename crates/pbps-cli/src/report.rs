@@ -893,6 +893,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 // summary stops counting it.
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
+Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1254,6 +1255,16 @@ pub fn describe(c: &Change) -> String {
     // Shared JSON prose stays raw until #2084 step 5 (DEC-2084.1): changes() and the
     // approval renderer escape the complete description once.
     match c {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {
+            let (operation, _) = c.pending_rebuild().expect("rebuild variant");
+            // Shared JSON description escapes as a whole until #2084 step 5.
+            format!(
+                "pending blocking rewrite: {operation} for {} (unavailable)",
+                c.subject()
+            )
+        }
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
         Change::CreateTable {

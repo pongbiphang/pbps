@@ -292,6 +292,16 @@ pub fn takes_online(change: &Change) -> bool {
 
 pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
     match change {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {
+            let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
+            Err(DialectError::RebuildUnavailable {
+                operation,
+                table: table.clone(),
+            })
+        }
+
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable { name, table, .. } => {
@@ -2309,6 +2319,26 @@ fn preserve_default_during_retype(
         literal(&format!("ALTER TABLE {q} ADD CONSTRAINT ")),
         literal(&format!(" FOR {};", quote(column)?)),
     ))
+}
+
+#[cfg(test)]
+#[test]
+fn rebuild_parts_are_refused_by_name_before_sql_emission() {
+    let changes: Vec<Change> = serde_json::from_str(include_str!(
+        "../../pbps-model/tests/fixtures/rebuild_operations.json"
+    ))
+    .unwrap();
+    for change in changes {
+        let (operation, table) = change.pending_rebuild().unwrap();
+        let error = emit(&change, Strategy::default()).unwrap_err();
+        assert_eq!(
+            error,
+            DialectError::RebuildUnavailable {
+                operation,
+                table: table.clone()
+            }
+        );
+    }
 }
 
 #[cfg(test)]

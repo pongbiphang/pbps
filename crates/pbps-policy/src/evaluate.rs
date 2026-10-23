@@ -302,6 +302,9 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
             // neither side of the pattern, and a new kind that is (a column
             // drop spelled differently, say) should have to be placed here.
             let contract = match &p.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => None,
                 Change::AddColumn { .. } => {
                     if let Some(id) = id {
                         adds.entry(id).or_insert(i);

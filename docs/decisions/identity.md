@@ -1062,3 +1062,21 @@ qualification use this form, including shape comparisons against catalog
 reads. CLI spelling is not an approval boundary: `int` and `integer` must
 agree offline and connected. A different type or modifier still invalidates
 the approval. No alias table or separate CLI fingerprint is maintained.
+
+
+<a id="dec-2298-4"></a>
+
+**DEC-2298.4. Rebuild parts carry reserved identities without execution authority.**
+The model owns the logical root, typed row-copy projection and ANALYZE-tree
+payloads. PlanOwners accepts intermediate addresses only from a validated
+recorded approval and preserves source/replacement UIDs independently of their
+same final names. An address is naming metadata, not catalog occupancy proof;
+shared slots still decide name claims and releases. Inherited columns receive
+no new identity. Copy requires both trees, reads source rows/columns and writes
+destination values; ANALYZE reads the replacement rows. Existing effects and
+settle derive their order. Completion/swap/restoration obligations belong to
+the later expansion, never fabricated schema keys or another rank/pass.
+Until the complete route ships, a logical root has no physical effects and is
+refused by name. Certification, saved-plan admission and both real emitters
+also refuse roots and partial rebuild parts, even without a pending record.
+Existing operation, SQL, saved wire and checksum behavior is unchanged.
