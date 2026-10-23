@@ -116,6 +116,10 @@ fn refusal<'a>(target: &'a str, scratch: &'a str) -> impl Future<Output = Produc
 }
 
 async fn refusal_inner(target: &str, scratch: &str) -> ProduceError {
+    refusal_file_inner(target, scratch, None).await
+}
+
+async fn refusal_file_inner(target: &str, scratch: &str, externals: Option<&str>) -> ProduceError {
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
@@ -150,13 +154,13 @@ async fn refusal_inner(target: &str, scratch: &str) -> ProduceError {
         &key.project,
         Some(ENVIRONMENT),
         Standard::Mssql,
-        None,
+        externals,
         &Provenance::server(),
     )
     .await
     {
         Err(error) => error,
-        Ok(_) => panic!("SQL Server must refuse at the #2237 externals boundary"),
+        Ok(_) => panic!("SQL Server must refuse at the #2238 reconstruction boundary"),
     }
 }
 
@@ -308,7 +312,7 @@ async fn supplied_contract(target: &str, server: &str) {
     assert!(
         matches!(
             positive,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
         ),
         "{positive}"
     );
@@ -322,7 +326,7 @@ async fn supplied_contract(target: &str, server: &str) {
     assert!(
         matches!(
             full_recovery,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
         ),
         "{full_recovery}"
     );
@@ -407,7 +411,7 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
             let owned=refusal(&target_for_run,url).await;
             assert!(matches!(
             owned,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
         ),"{owned}");
             supplied_contract(&target_for_run, url).await;
             inherited_model_refusal(&target_for_run,url).await;
@@ -446,7 +450,7 @@ async fn mssql_run_owned_acquisition_needs_only_login_and_database_creation_priv
         .await
         .unwrap();
     assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")),
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
         "{outcome}"
     );
     assert!(remaining.is_empty());
@@ -552,7 +556,10 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
         // with the reporting fix reverted.
         drop_database(&primary, &database).await;
         let (prepared, cleanup, sandbox, retained) = outcome.unwrap();
-        assert!(matches!(prepared, Some(Error::Binding(reason)) if reason.contains("#2237")));
+        assert!(
+            prepared.is_none(),
+            "preparation must now succeed: {prepared:?}"
+        );
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].try_get::<i32>("membership").unwrap(), Some(1));
         let failed = cleanup.unwrap_err();
@@ -596,7 +603,7 @@ async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_external
         matches!(
             boundary,
             ProduceError::Run(Error::Binding(ref reason))
-                if reason == "SQL Server resolver externals are not implemented yet (#2237)"
+                if reason == "SQL Server resolver reconstruction is not implemented yet (#2238)"
         ),
         "{boundary}"
     );
@@ -715,7 +722,7 @@ async fn instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans
     }
     for outcome in allowed {
         assert!(
-            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")),
+            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
             "{outcome}"
         );
     }
@@ -745,7 +752,7 @@ async fn mssql_run_owned_acquisition_removes_its_login_database_and_reference_on
     let after = inventory().await;
     inherited_model_refusal(&primary, &scratch).await;
     assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")),
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
         "{outcome}"
     );
     assert_eq!(after, before);
@@ -997,7 +1004,7 @@ async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_reh
                         )))
                     && remaining == names && before == after
             } else {
-                refused.contains("#2237") && names.is_empty() && cleanup.is_ok()
+                refused.contains("#2238") && names.is_empty() && cleanup.is_ok()
                     && remaining.is_empty() && before == after
             };
             if !valid {
@@ -1026,4 +1033,124 @@ async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_reh
         assert!(absent, "fixture database {name} remained");
         result.unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_externals_file_failure_and_partial_commit_release_owned_resources() {
+    let target_server = server("PBPS_TEST_DB");
+    let scratch_server = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (target_database, target) = create_database(&target_server).await;
+    for (script, needle) in [
+        ("CREATE TABLE dbo.absent2269(i int);", "absent2269"),
+        (
+            "BEGIN TRAN; CREATE TABLE dbo.a2269(i int); EXEC(N'COMMIT; CREATE TABLE dbo.b2269(i int); THROW 51001,''committed2269'',1;');",
+            "committed2269",
+        ),
+        (
+            "CREATE TABLE dbo.c2269(i int);\nGO\nTHROW 51001,'batch2269',1;",
+            "batch2269",
+        ),
+        (":r never_run.sql", "sqlcmd"),
+    ] {
+        let outcome = Box::pin(refusal_file_inner(&target, &scratch_server, Some(script))).await;
+        assert!(
+            matches!(&outcome, ProduceError::Run(Error::Externals(reasons)) if reasons.iter().any(|r| r.contains(needle))),
+            "{outcome}"
+        );
+        let mut admin = connection(&scratch_server).await;
+        let rows = admin
+            .query("SELECT name FROM sys.databases WHERE name LIKE N'pbps[_]scratch[_]%';")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "owned database leaked");
+        let rows = admin
+            .query("SELECT name FROM sys.server_principals WHERE name LIKE N'pbps[_]run[_]%';")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "owned login leaked");
+    }
+    drop_database(&target_server, &target_database).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_externals_file_is_compared_then_reaches_reconstruction_refusal() {
+    let target_server = server("PBPS_TEST_DB");
+    let scratch_server = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, target) = create_database(&target_server).await;
+    connection(&target)
+        .await
+        .execute("CREATE SCHEMA unused2269 AUTHORIZATION dbo;")
+        .await
+        .unwrap();
+    connection(&target).await.execute("GRANT SELECT ON SCHEMA::unused2269 TO public; CREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT SELECT ON unused2269.external2269 TO public;").await.unwrap();
+    let outcome = Box::pin(refusal_file_inner(
+        &target,
+        &scratch_server,
+        Some("CREATE SCHEMA unused2269 AUTHORIZATION dbo;\nGO\nCREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT SELECT ON unused2269.external2269 TO public;"),
+    ))
+    .await;
+    let extra_acl = Box::pin(refusal_file_inner(&target,&scratch_server,Some("CREATE SCHEMA unused2269 AUTHORIZATION dbo;\nGO\nCREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT INSERT ON unused2269.external2269 TO public;"))).await;
+    drop_database(&target_server, &name).await;
+    assert!(
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
+        "{outcome}"
+    );
+    assert!(
+        matches!(&extra_acl,ProduceError::Run(Error::Externals(findings)) if findings.iter().any(|f| f.contains("staged:permissions"))),
+        "{extra_acl}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_connection() {
+    use pbps_mssql::resolver::capture;
+    let target_server = server("PBPS_TEST_DB");
+    let scratch_server = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, target_url) = create_database(&target_server).await;
+    let result=tokio::spawn(async move {
+        let mut target=connection(&target_url).await;
+        target.execute("CREATE SCHEMA ext2269 AUTHORIZATION dbo;").await.unwrap();
+        target.execute("CREATE TYPE ext2269.amount FROM decimal(9,2) NOT NULL;").await.unwrap();
+        target.execute("CREATE TABLE dbo.ext2269(i ext2269.amount CONSTRAINT ext2269_pk PRIMARY KEY);").await.unwrap();
+        target.execute("CREATE VIEW dbo.managed2269 AS SELECT i FROM dbo.ext2269;").await.unwrap();
+        let mut schema=Schema::default();
+        schema.modules.insert("dbo.managed2269".parse().unwrap(),pbps_model::Module { kind:pbps_model::ModuleKind::View,description:None,definition:"CREATE VIEW dbo.managed2269 AS SELECT i FROM dbo.ext2269;".into() });
+        let ids=IdsFile::default();
+        let side=pbps_diff::Side { schema:&schema,ids:&ids };
+        let bootstrap=pbps_diff::resolver::ordinary(side,side,&pbps_mssql::Mssql,&Hints::default()).unwrap();
+        let binding=BindingRequest { bootstrap:&bootstrap,base:&schema,desired:&schema };
+        let request=super::super::ScopeRequest { schemas:vec!["dbo".into()],..Default::default() };
+        for file in [None,Some("CREATE SCHEMA ext2269 AUTHORIZATION dbo;\nGO\nCREATE TYPE ext2269.amount FROM decimal(9,2) NOT NULL;\nGO\nCREATE TABLE dbo.ext2269(i ext2269.amount CONSTRAINT ext2269_pk PRIMARY KEY);")] {
+        let tokens=super::Tokens::generate();
+        let provenance=Provenance::server();
+        let identity=sql::cluster_identity(&mut target).await.unwrap();
+        let mut admin=connection(&scratch_server).await;
+        let (provisioning,mut state)=super::engine::scratch(Driver::Mssql,&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&Standard::Mssql,file,&provenance).await.unwrap();
+        let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
+        let prepared=state.prepare(provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[]).await;
+        let verification=tokio::spawn(async move { match prepared {
+            Ok(super::engine::Prepared::Mssql(mut prepared)) => {
+                assert!(matches!(prepared.map,crate::resolver::scope::Principals::Mssql(_)));
+                assert!(format!("{:?}",prepared.inventory).contains("ext2269"));
+                assert!(prepared.staged.compared().contains(&capture::object("dbo","ext2269")));
+                let rows=prepared.compile.query("SELECT USER_NAME() AS principal,ISNULL(OBJECT_ID(N'dbo.ext2269'),0) AS ext;").await.unwrap();
+                assert_eq!(rows[0].try_get::<&str>("principal").unwrap(),Some("dbo"));
+                assert_ne!(rows[0].try_get::<i32>("ext").unwrap(),Some(0));
+                assert!(prepared.compile.execute("REVERT;").await.is_err());
+                Ok(())
+            },
+            Ok(super::engine::Prepared::Postgres(_)) => panic!("wrong engine"),
+            Err(error) => Err(error),
+        }}).await;
+        let cleanup=state.release(&mut admin).await;
+        cleanup.unwrap();
+        verification.map_err(|error| Error::Read(error.to_string()))??;
+        }
+        Ok::<(),Error>(())
+    }).await;
+    drop_database(&target_server, &name).await;
+    result.unwrap().unwrap();
 }

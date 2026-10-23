@@ -8,6 +8,7 @@ pub mod authorization;
 pub mod capture;
 pub mod compatibility;
 pub mod environment;
+pub mod externals;
 pub mod scratch;
 
 use pbps_db::resolver::environment::DatabaseRecipe;

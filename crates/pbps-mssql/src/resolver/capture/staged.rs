@@ -115,6 +115,19 @@ pub async fn compare_staged(
     let on_target = super::capture(target, &scope)
         .await
         .map_err(StageError::Capture)?;
+    let held_managed = Names::read(scratch, &target_managed.objects)
+        .await
+        .map_err(StageError::Capture)?;
+    let missing_managed = target_managed
+        .objects
+        .iter()
+        .filter(|id| held_managed.get(id).is_none())
+        .cloned()
+        .collect();
+    let waiting = managed_dependencies(&on_target, &scope.retained, &missing_managed);
+    if !waiting.is_empty() {
+        return Err(StageError::Refused(waiting));
+    }
     let staged = super::capture(scratch, &scope)
         .await
         .map_err(StageError::Capture)?;
@@ -144,7 +157,22 @@ pub async fn compare_staged(
             ("scratch", b, &staged.inputs),
         ] {
             match actual {
-                None => refused.push(format!("the {label} does not have {}", named(root))),
+                None => {
+                    let waiting = if label == "scratch" {
+                        managed_dependencies(
+                            &on_target,
+                            &BTreeSet::from([root.clone()]),
+                            &target_managed.objects,
+                        )
+                    } else {
+                        vec![]
+                    };
+                    if waiting.is_empty() {
+                        refused.push(format!("the {label} does not have {}", named(root)));
+                    } else {
+                        refused.extend(waiting);
+                    }
+                }
                 Some(id) if !inputs.contains_key(id) => {
                     return Err(StageError::Capture(CaptureError::Changed));
                 }
@@ -164,6 +192,41 @@ pub async fn compare_staged(
     let target_barriers = barriers(&on_target.inputs, &target_managed);
     let scratch_barriers = barriers(&staged.inputs, &scratch_managed);
     let accepted = shapes(&on_target.inputs, &roots, &target_barriers, &target_managed);
+    // A sys.objects row alone does not cover a kind's dedicated catalogs.
+    // The capture deliberately skips Broker, for example; an unreferenced
+    // file-created queue must therefore refuse even when both names exist.
+    for (id, properties) in &accepted {
+        if id.class == class::OBJECT
+            && !matches!(
+                properties.get("type").and_then(Value::as_str),
+                Some(
+                    "U" | "V"
+                        | "P"
+                        | "FN"
+                        | "IF"
+                        | "TF"
+                        | "SO"
+                        | "SN"
+                        | "C"
+                        | "D"
+                        | "F"
+                        | "PK"
+                        | "UQ"
+                        | "TR"
+                        | "SP"
+                        | "EC"
+                )
+            )
+        {
+            refused.push(format!(
+                "{} has an object kind the staged comparison does not cover",
+                named(id)
+            ));
+        }
+    }
+    if !refused.is_empty() {
+        return Err(StageError::Refused(refused));
+    }
     let scratch_shapes = shapes(&staged.inputs, &roots, &scratch_barriers, &scratch_managed);
     let mut findings = spelling_differences(scratch, &accepted, &scratch_shapes)
         .await
@@ -180,6 +243,88 @@ pub async fn compare_staged(
         scope,
         managed: target_managed,
     })
+}
+
+/// A target survey for automatic staging, retaining the exact catalog names
+/// resolved under its collation. This is not accepted scratch evidence.
+pub struct ExternalInputs {
+    pub(crate) captured: CapturedInputs,
+    pub(crate) roots: BTreeSet<ObjectIdentity>,
+    pub(crate) managed: BTreeSet<ObjectIdentity>,
+}
+
+impl ExternalInputs {
+    pub fn captured(&self) -> &CapturedInputs {
+        &self.captured
+    }
+    pub fn roots(&self) -> &BTreeSet<ObjectIdentity> {
+        &self.roots
+    }
+    pub fn waiting(&self) -> Vec<String> {
+        managed_dependencies(&self.captured, &self.roots, &self.managed)
+    }
+}
+
+pub async fn required_externals(
+    target: &mut impl QueryConnection,
+    managed: &[&Schema],
+) -> Result<ExternalInputs, CaptureError> {
+    let schemas: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
+    let managed = Managed::read(target, &schemas).await?;
+    let mut scope = cascade_scope_for(target, &managed).await?;
+    scope.retained.extend(managed.objects.iter().cloned());
+    let captured = super::capture(target, &scope).await?;
+    let roots = captured
+        .inputs
+        .iter()
+        .filter(|(id, input)| {
+            !managed.objects.contains(*id)
+                && input.properties.get("engine") != Some(&Value::Bool(true))
+                && ((id.class == class::TYPE
+                    && input.properties.get("user_defined") == Some(&Value::Bool(true)))
+                    || (id.class == class::OBJECT
+                        && (reference(input, "parent").is_none() || scope.retained.contains(*id))))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    Ok(ExternalInputs {
+        captured,
+        roots,
+        managed: managed.objects,
+    })
+}
+
+fn managed_dependencies(
+    captured: &CapturedInputs,
+    roots: &BTreeSet<ObjectIdentity>,
+    managed: &BTreeSet<ObjectIdentity>,
+) -> Vec<String> {
+    let mut refused = Vec::new();
+    for root in roots.iter().filter(|id| !managed.contains(*id)) {
+        let mut pending = vec![root.clone()];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if managed.contains(&id) {
+                refused.push(format!(
+                    "external {} depends on managed {}; it waits for reconstruction (#2238)",
+                    named(root),
+                    named(&id)
+                ));
+                break;
+            }
+            pending.extend(id.signature.iter().cloned());
+            if let Some(input) = captured.inputs.get(&id) {
+                pending.extend(input.bindings.iter().map(|b| b.target.clone()));
+                // A constraint needs its referencing table as well as its
+                // referenced table; neither may be invented during setup.
+                pending.extend(reference(input, "parent"));
+            }
+        }
+    }
+    refused
 }
 
 // Every identity from YAML is resolved in the catalog where it will be used.
@@ -505,7 +650,26 @@ fn projected(properties: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
     let mut out = properties.clone();
     out.remove("definition");
     out.remove("owner");
-    for key in ["sys.objects", "sys.types", "sys.table_types"] {
+    // These views inherit sys.objects' owner field. ALTER AUTHORIZATION can
+    // make a schema-inherited owner explicit without changing its equality
+    // group; retaining a duplicate would undo the logical owner projection.
+    for key in [
+        "sys.objects",
+        "sys.tables",
+        "sys.views",
+        "sys.procedures",
+        "sys.synonyms",
+        "sys.sequences",
+        "sys.check_constraints",
+        "sys.default_constraints",
+        "sys.key_constraints",
+        "sys.foreign_keys",
+        "sys.triggers",
+        "sys.security_policies",
+        "sys.edge_constraints",
+        "sys.types",
+        "sys.table_types",
+    ] {
         if let Some(row) = out.get_mut(key).and_then(Value::as_object_mut) {
             row.remove("principal_id");
         }

@@ -39,7 +39,9 @@ pub use manifest::CapturedInputs;
 pub use object_properties::{OBJECT_PROPERTIES, PropertyDisposition, property_disposition};
 pub use ownership::RecordedOwnership;
 pub use pbps_db::resolver::capture::{CaptureError, ObjectIdentity, Uncovered};
-pub use staged::{StageError, Staged, cascade_scope, compare_staged};
+pub use staged::{
+    ExternalInputs, StageError, Staged, cascade_scope, compare_staged, required_externals,
+};
 
 use std::collections::BTreeSet;
 

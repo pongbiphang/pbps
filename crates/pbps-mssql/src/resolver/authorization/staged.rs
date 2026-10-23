@@ -88,13 +88,31 @@ pub struct OwnerPartition {
 }
 
 impl OwnerPartition {
+    /// Trusted renderer ownership only. File-supplied subjects are verified,
+    /// never passed through an ownership repair.
+    pub fn restricted_to(&self, objects: &BTreeSet<ObjectIdentity>) -> Self {
+        Self {
+            owners: self
+                .owners
+                .iter()
+                .filter(|(subject, _)| match subject {
+                    Subject::Securable(id) => id.class == class::OBJECT && objects.contains(id),
+                    Subject::Deployer | Subject::DatabaseOwner => true,
+                })
+                .map(|(s, o)| (s.clone(), o.clone()))
+                .collect(),
+        }
+    }
     pub fn from_capture(
         captured: &CapturedInputs,
         context: &AuthorizationContext,
     ) -> Result<Self, Uncovered> {
         let effective = captured.effective_owners()?;
         let mut held_schemas: BTreeSet<String> = context.schemas.keys().cloned().collect();
-        for id in effective.keys().filter(|id| id.class == class::OBJECT) {
+        for id in captured
+            .objects()
+            .filter(|id| id.class == class::OBJECT || id.class == class::TYPE)
+        {
             if let Some(schema) = id.name.first() {
                 held_schemas.insert(schema.clone());
             }
@@ -454,6 +472,27 @@ pub async fn verify_staged_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_rendered_ownership_never_repairs_file_schemas() {
+        let object = crate::resolver::capture::object("dbo", "rendered");
+        let schema = ObjectIdentity {
+            class: class::SCHEMA.into(),
+            name: vec!["dbo".into()],
+            signature: vec![],
+        };
+        let partition = OwnerPartition {
+            owners: BTreeMap::from([
+                (Subject::Securable(object.clone()), "dbo".into()),
+                (Subject::Securable(schema.clone()), "dbo".into()),
+                (Subject::Deployer, "dbo".into()),
+            ]),
+        };
+        let narrowed = partition.restricted_to(&BTreeSet::from([schema.clone(), object.clone()]));
+        assert!(narrowed.owners.contains_key(&Subject::Securable(object)));
+        assert!(!narrowed.owners.contains_key(&Subject::Securable(schema)));
+        assert!(narrowed.owners.contains_key(&Subject::Deployer));
+    }
 
     #[test]
     fn owner_groups_compare_relationships_and_keep_distinct_owners_apart() {

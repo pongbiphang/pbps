@@ -76,9 +76,17 @@ const FIXED: &[&str] = &[
 #[derive(Debug)]
 pub struct Entry {
     pub name: String,
+    pub(crate) staged_root: Option<super::super::capture::ObjectIdentity>,
+    pub(crate) staged_parent: Option<super::super::capture::ObjectIdentity>,
     drop: Option<String>,
     rank: u16,
     key: Option<Securable>,
+}
+
+impl Entry {
+    pub(crate) fn staging_key(&self) -> String {
+        format!("{:?}:{:?}:{}", self.key, self.staged_parent, self.name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,6 +123,8 @@ impl Inventory {
     fn add(&mut self, name: String, drop: Option<String>, rank: u16, key: Option<Securable>) {
         self.entries.push(Entry {
             name,
+            staged_root: None,
+            staged_parent: None,
             drop,
             rank,
             key,
@@ -203,6 +213,12 @@ pub async fn read(
                 90,
                 None,
             );
+            result.entries.last_mut().unwrap().staged_root =
+                Some(super::super::capture::ObjectIdentity {
+                    class: super::super::capture::class::SCHEMA.into(),
+                    name: vec![name.clone()],
+                    signature: vec![],
+                });
         } else if text(&row, "owner")? != name {
             result.add(
                 format!("SCHEMA {name} owner"),
@@ -402,6 +418,11 @@ pub async fn read(
             rank,
             row.try_get::<i32>("object_id")?.map(Securable::Object),
         );
+        let entry = result.entries.last_mut().unwrap();
+        entry.staged_root = Some(super::super::capture::object(&schema, &name));
+        entry.staged_parent = row
+            .try_get::<&str>("parent_name")?
+            .map(|parent| super::super::capture::object(&schema, parent));
     }
     // Child catalogs are read even when sys.objects is empty: a DENY must
     // refuse by catalog name, rather than certify a partial inventory.
@@ -641,6 +662,14 @@ pub async fn read(
                     .insert((key, Securable::Principal(owner)));
             }
             result.add(format!("{kind} {name}"), drop, rank, key);
+            if catalog == "types" {
+                result.entries.last_mut().unwrap().staged_root =
+                    Some(super::super::capture::ObjectIdentity {
+                        class: super::super::capture::class::TYPE.into(),
+                        name: vec![text(&row, "schema_name")?, text(&row, "name")?],
+                        signature: vec![],
+                    });
+            }
         }
     }
     rows(
@@ -1442,6 +1471,22 @@ async fn permissions(
             5,
             None,
         );
+        if class == 1 {
+            // Object and column ACL rows belong to their created root. The
+            // adapter subsequently replays and verifies them as the deployer;
+            // they are not independent catalog objects to silently discard.
+            result.entries.last_mut().unwrap().staged_parent = Some(super::super::capture::object(
+                &text(&row, "schema_name")?,
+                &text(&row, "object_name")?,
+            ));
+        } else if class == 3 {
+            result.entries.last_mut().unwrap().staged_parent =
+                Some(super::super::capture::ObjectIdentity {
+                    class: super::super::capture::class::SCHEMA.into(),
+                    name: vec![text(&row, "on_schema")?],
+                    signature: vec![],
+                });
+        }
     }
     for missing in expected.difference(&database) {
         // A revoked fixed grant is missing built-in state, not a changed

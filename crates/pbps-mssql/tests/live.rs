@@ -44,6 +44,9 @@ mod scratch2236;
 #[path = "live/staged2268.rs"]
 mod staged2268;
 
+#[path = "live/externals2269.rs"]
+mod externals2269;
+
 #[path = "live/deployer2267.rs"]
 mod deployer2267;
 

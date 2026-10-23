@@ -4091,3 +4091,51 @@ carry it. A root resolved on both sides refuses by its two spellings rather
 than being reported absent; case-sensitive absence remains absence. The
 accepted handoff retains exact target catalog identities, with no case or
 accent normalization.
+
+
+<a id="dec-2269-1"></a>
+
+**DEC-2269.1. Externals execute in a dedicated irreversible sandbox session,
+complete inventory deltas pass staged comparison, and managed dependencies
+wait for reconstruction (#2269).** An outer transaction is not containment:
+measured dynamic EXEC commits it and its DDL survives a later error. The CLI
+records owned cleanup before setup, drops file/compile sessions before release,
+and inventories through a separate bounded owner session, so a file's DENY or
+session settings cannot certify an empty inventory. Only generated setup
+identities are excluded; object/column ACL rows belong to their created root
+and are checked by the authorization verifier. Unknown standalone inventory
+classes refuse by name. A sys.objects row alone does not qualify an object
+kind whose dedicated catalog is skipped; file-created Broker queues refuse
+even when both names exist. Ordinary GO
+is a quote/comment-aware client separator; directives and repetition refuse
+before any batch runs. No shell client is involved.
+
+Automatic staging consumes catalog structure, never original module bodies,
+assembly bytes, computed/default expressions, filtered-index predicates or
+cross-database text. Alias types, ordinary table columns and unique B-tree
+keys, nullable shape views, sequences, constant scalar-function templates and
+external CASCADE constraints have bounded templates. Full staged comparison
+still qualifies every produced shape and refuses any unreproduced property;
+semantic properties are never skipped to make a template pass. In particular,
+a non-nullable view column refuses the nullable template. File-supplied owners
+are checked without repair; only renderer-created objects receive trusted
+owner reconstruction, before ACL replay. ACL-only principals discovered after
+the file extend the map without renumbering already-created principals.
+
+The legal DELETE CASCADE chain a -> managed -> x cannot be staged before
+managed reconstruction: creating x_managed then reports 1767, while creating
+the managed table in the externals file is a managed-set overlap. The
+maintainer chose a named refusal in #2269. The missing external root or
+cascade prerequisite names itself and its managed dependency and says it waits
+for reconstruction (#2238); the renderer makes the same refusal before DDL.
+Only initially held schemas are set up before the file. Missing required
+schemas are filled afterwards without changing a file-created schema's owner;
+its target grants are replayed after owner comparison. This lets the file
+create an external schema, including one required by a managed binding.
+The renderer's trusted ALTER AUTHORIZATION also measured a duplicate owner
+representation: sys.tables.principal_id becomes explicit dbo where the target
+inherits dbo from its schema. Project this field from each named sys.objects
+subview as well as sys.objects; effective owner equality remains compared.
+No dependency is removed from comparison and no deferred staging capability
+is fabricated. #2238 lifts the refusal through chained staging, following
+DEC-1778.2, and compares each external after its managed prerequisite exists.

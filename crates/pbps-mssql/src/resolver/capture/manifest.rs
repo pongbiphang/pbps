@@ -22,6 +22,14 @@ pub struct CapturedInputs {
 }
 
 impl CapturedInputs {
+    /// Engine-private rendering facts. Definitions remain inside the engine;
+    /// the renderer consumes structure and never reads a module's source.
+    pub(crate) fn properties(
+        &self,
+        id: &ObjectIdentity,
+    ) -> Option<&std::collections::BTreeMap<String, serde_json::Value>> {
+        self.inputs.get(id).map(|input| &input.properties)
+    }
     /// Effective owners already resolved by `select::Index::owner`: explicit,
     /// then parent, then schema. Only authorization metadata leaves here.
     pub(crate) fn effective_owners(
