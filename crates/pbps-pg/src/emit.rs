@@ -5149,7 +5149,8 @@ fn cell_sql(v: &Value, ty: Option<&ColumnType>) -> Result<String, DialectError> 
             if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(invalid(format!(
                     "the value {t:?} is declared for a `bytea` column and `{hex}` is not hex \
-                     digits"
+                     digits",
+                    hex = pbps_model::escape::Escaped(hex),
                 )));
             }
             format!("pg_catalog.decode({}, 'hex')", value_literal(hex))
@@ -5513,7 +5514,8 @@ fn insert_row(
              the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
              fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place \
              them outside pbps and adopt them with `pbps baseline`.",
-            table = table.shown()
+            table = table.shown(),
+            key_column = pbps_model::escape::Escaped(key_column),
         )));
     }
     let mut columns = vec![quote(key_column)?];

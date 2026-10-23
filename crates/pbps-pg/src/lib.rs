@@ -1618,12 +1618,12 @@ impl Dialect for Postgres {
                 ));
             }
             for (policy_name, policy) in &table.row_policies {
-                found.extend(
-                    policy
-                        .problems()
-                        .into_iter()
-                        .map(|problem| invalid(format!("row policy `{policy_name}`: {problem}"))),
-                );
+                found.extend(policy.problems().into_iter().map(|problem| {
+                    invalid(format!(
+                        "row policy `{policy_name}`: {problem}",
+                        policy_name = pbps_model::escape::Escaped(policy_name),
+                    ))
+                }));
                 if let Err(error) = self.quote_ident(policy_name) {
                     found.push(error);
                 }

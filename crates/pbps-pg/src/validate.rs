@@ -654,6 +654,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                  project declares",
                 target = target.shown(),
                 name = name.shown(),
+                schema_of = pbps_model::escape::Escaped(schema_of),
             )));
             continue;
         }
@@ -706,6 +707,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
 
                         target = target.shown(),
                         name = name.shown(),
+                        s = pbps_model::escape::Escaped(s),
                     )));
                 }
             }
@@ -723,6 +725,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                          `schema::{schema_of}: [usage]` to this role",
                         target = target.shown(),
                         name = name.shown(),
+                        schema_of = pbps_model::escape::Escaped(schema_of),
                     )));
                 }
                 let kind = match target {

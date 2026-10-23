@@ -704,8 +704,13 @@ fn temporal(
             ));
         }
     }
-    let until = parse_civil(key, req.until)
-        .map_err(|r| invalid(format!("--until `{}`, {}", req.until, why(key, &r))))?;
+    let until = parse_civil(key, req.until).map_err(|r| {
+        invalid(format!(
+            "--until `{}`, {}",
+            pbps_model::escape::Escaped(req.until),
+            why(key, &r),
+        ))
+    })?;
     let (start, start_text, origin) = match (frontier, req.from) {
         (Some((_, end, _)), Some(from)) => {
             return Err(invalid(format!(
@@ -880,8 +885,12 @@ fn integers(
             ));
         }
     }
-    let until = parse_integer(int, req.until)
-        .map_err(|why| invalid(format!("--until `{}`, {why}", req.until)))?;
+    let until = parse_integer(int, req.until).map_err(|why| {
+        invalid(format!(
+            "--until `{}`, {why}",
+            pbps_model::escape::Escaped(req.until),
+        ))
+    })?;
     let (start, _origin) = match (frontier, req.from) {
         (Some((v, _)), Some(from)) => {
             return Err(invalid(format!(

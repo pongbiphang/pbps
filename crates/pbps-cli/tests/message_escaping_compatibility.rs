@@ -288,3 +288,201 @@ fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
         }
     }
 }
+
+#[test]
+fn row_policy_refusals_show_names_once_without_changing_the_policy_key() {
+    for (name, shown) in [
+        (
+            "policy\n\u{1b}[31m\u{202e}名前",
+            r"policy\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"policy\n\u{1b}[31m\u{202e}名前",
+            r"policy\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("名前_ünï", "名前_ünï"),
+    ] {
+        let mut table = Table {
+            columns: [("id".into(), Column::new("integer".parse().unwrap()))].into(),
+            row_policies: [(
+                name.to_owned(),
+                RowPolicy {
+                    command: PolicyCommand::Insert,
+                    using: Some("true".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let errors = pbps_pg::Postgres::new().validate_table(&TableName::new("app", "t"), &table);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].to_string(),
+            format!(
+                "postgres: row policy `{shown}`: only WITH CHECK expression allowed for INSERT"
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&table).unwrap()["row_policies"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [&name.to_owned()]
+        );
+        table.row_policies.get_mut(name).unwrap().using = None;
+        assert!(
+            pbps_pg::Postgres::new()
+                .validate_table(&TableName::new("app", "t"), &table)
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn range_until_refusals_show_opaque_values_once_for_dates_and_integers() {
+    for (ty, every, from, valid_until, reason) in [
+        (
+            "date",
+            "1day",
+            "2027-01-01",
+            "2027-01-02",
+            "which is not how the engine prints a date bound (years 1 to 9999, as `2027-01-01`)",
+        ),
+        (
+            "bigint",
+            "10",
+            "0",
+            "10",
+            "which is not how the engine prints a bigint bound, as `1000`",
+        ),
+    ] {
+        let parent = TableName::new("app", "ev");
+        let schema = Schema {
+            tables: [(
+                parent.clone(),
+                Table {
+                    columns: [("ts".into(), Column::new(ty.parse().unwrap()))].into(),
+                    partition_by: Some(PartitionBy {
+                        columns: vec!["ts".into()],
+                        external: false,
+                        strategy: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let ask = |until| {
+            pbps_pg::Postgres::new().range_series(&pbps_dialect::RangeSeriesRequest {
+                schema: &schema,
+                parent: &parent,
+                every,
+                until,
+                from: Some(from),
+            })
+        };
+        for (until, shown) in [
+            (
+                "bad\n\u{1b}[31m\u{202e}名前",
+                r"bad\n\u{1b}[31m\u{202e}名前",
+            ),
+            (
+                r"bad\n\u{1b}[31m\u{202e}名前",
+                r"bad\\n\\u{1b}[31m\\u{202e}名前",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            assert_eq!(
+                ask(until).unwrap_err().to_string(),
+                format!("postgres: --until `{shown}`, {reason}")
+            );
+        }
+        assert_eq!(ask(valid_until).unwrap().partitions.len(), 1);
+    }
+}
+
+#[test]
+fn postgres_grant_refusals_show_schema_operands_once_without_changing_targets() {
+    for (name, shown) in [
+        (
+            "schema\n\u{1b}[31m\u{202e}名前",
+            r"schema\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"schema\n\u{1b}[31m\u{202e}名前",
+            r"schema\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("名前_ünï", "名前_ünï"),
+    ] {
+        for reserved in [false, true] {
+            let prefix = if reserved { "pg_" } else { "" };
+            let schema_name = format!("{prefix}{name}");
+            let shown = format!("{prefix}{shown}");
+            let object = TableName::new(&schema_name, "t");
+            let schema = Schema {
+                tables: [(
+                    object.clone(),
+                    Table {
+                        columns: [("id".into(), Column::new("integer".parse().unwrap()))].into(),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let target = GrantTarget::Object(object);
+            let mut role = Role {
+                grants: [(target.clone(), [Permission::Select].into())].into(),
+                ..Default::default()
+            };
+            let errors = pbps_pg::Postgres::new().validate_role(&"reader".into(), &role, &schema);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let expected = if reserved {
+                format!(
+                    "postgres: role `reader`: `{shown}.t` is in schema `{shown}`, which is the engine's own and not a project's: `pg_catalog`, `information_schema` and every `pg_` schema are left out of the pull, so a grant there reads back as absent and every plan would propose it again (DECISIONS 385). Grant in a schema this project declares"
+                )
+            } else {
+                format!(
+                    "postgres: role `reader`: `{shown}.t` is granted in schema `{shown}`, which this role has no `usage` on -- PostgreSQL checks the schema before the object, so every permission here reaches nothing and the role's own query is `permission denied for schema {shown}` (ADR-0010 section 1, measured). Add `schema::{shown}: [usage]` to this role"
+                )
+            };
+            assert_eq!(errors[0].to_string(), expected);
+            assert_eq!(role.grants.keys().next().unwrap().schema(), schema_name);
+            if !reserved {
+                let schema_target = GrantTarget::Schema(schema_name.clone());
+                let mut schema_role = Role {
+                    grants: [(schema_target.clone(), [Permission::Select].into())].into(),
+                    ..Default::default()
+                };
+                let errors =
+                    pbps_pg::Postgres::new().validate_role(&"reader".into(), &schema_role, &schema);
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(
+                    errors[0].to_string(),
+                    format!(
+                        "postgres: role `reader`: `select` on `schema::{shown}` is not a permission PostgreSQL defines on a schema (`invalid privilege type SELECT for schema`), which takes only usage and create. On this engine a schema grant does not carry to the objects in it: `GRANT ... ON ALL TABLES IN SCHEMA` applies once to what is there now, and `ALTER DEFAULT PRIVILEGES` covers only what one role creates afterwards (ADR-0010 section 2). Grant `select` on each object instead, and keep `schema::{shown}: [usage]` so the role can reach them"
+                    )
+                );
+                assert_eq!(schema_role.grants.keys().next().unwrap(), &schema_target);
+                schema_role
+                    .grants
+                    .insert(schema_target, [Permission::Usage].into());
+                assert!(
+                    pbps_pg::Postgres::new()
+                        .validate_role(&"reader".into(), &schema_role, &schema)
+                        .is_empty()
+                );
+                role.grants
+                    .insert(GrantTarget::Schema(schema_name), [Permission::Usage].into());
+                assert!(
+                    pbps_pg::Postgres::new()
+                        .validate_role(&"reader".into(), &role, &schema)
+                        .is_empty()
+                );
+            }
+        }
+    }
+}

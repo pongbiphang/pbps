@@ -312,7 +312,7 @@ pub async fn rename_impact(
     {
         Some(oid) => oid,
         None => {
-            let raw_table = target.table().raw().to_string();
+            let table = target.table();
             let target = match target {
                 RenameTarget::Table(t) => format!("table {}", t.shown()),
                 RenameTarget::Column(c) => format!("column {}", c.shown()),
@@ -323,7 +323,7 @@ pub async fn rename_impact(
                 message: format!(
                     "{} is not a table this database has, so what a rename of {target} \
                      would affect cannot be read",
-                    raw_table
+                    table.shown()
                 ),
             }));
         }
