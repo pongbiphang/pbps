@@ -3521,8 +3521,14 @@ fn ambiguous_line(a: &pbps_db::catalog::Ambiguous) -> String {
 /// that way — for the message, so the refusal names something the author can
 /// find in a file rather than a bare schema name.
 fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
+    let Schema {
+        tables,
+        types,
+        modules,
+        roles,
+    } = schema;
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for (name, role) in &schema.roles {
+    for (name, role) in roles {
         for target in role.grants.keys() {
             if let pbps_model::GrantTarget::Schema(s) = target {
                 out.entry(s.clone())
@@ -3535,17 +3541,21 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     // scoped by name, so `DBO.customer` on a database whose schema is `dbo`
     // is bootstrapped, recorded as a state holding no tables at all, and
     // reported as drift by the `verify` immediately after.
-    for name in schema.tables.keys() {
+    for name in tables.keys() {
         out.entry(name.schema.clone())
             .or_insert_with(|| format!("the schema of `{name}`", name = name.shown()));
     }
-    for id in schema.modules.keys() {
+    for id in modules.keys() {
         out.entry(id.schema().to_owned())
             .or_insert_with(|| format!("the schema of `{id}`", id = id.shown()));
     }
+    for name in types.keys() {
+        out.entry(name.schema().to_owned())
+            .or_insert_with(|| format!("the schema of type `{}`", name.shown()));
+    }
     // A history is created in its own schema, spelled as declared, and read
     // back as the database spells it (#1176, #1501 review).
-    for (name, table) in &schema.tables {
+    for (name, table) in tables {
         if let Some(v) = table
             .system_time
             .as_ref()
@@ -6184,6 +6194,107 @@ async fn bootstrap_type_pins(
     Ok(pins)
 }
 
+/// A missing uid makes the differ skip an object that the declaration record
+/// still claims. Modules use names rather than uids (ADR-0009 §1).
+fn refuse_unidentified_bootstrap_objects(schema: &Schema, ids: &IdsFile) -> anyhow::Result<()> {
+    // No `..`: a new object family must choose its identity rule here.
+    let Schema {
+        tables,
+        types,
+        modules: _,
+        roles,
+    } = schema;
+    let unidentified: Vec<String> = tables
+        .keys()
+        .filter(|name| ids.table_uid(name).is_none())
+        .map(|name| name.shown().to_string())
+        .chain(
+            roles
+                .keys()
+                .filter(|name| ids.role_uid(name).is_none())
+                .map(|name| format!("role {}", name.shown())),
+        )
+        .chain(
+            types
+                .keys()
+                .filter(|name| ids.type_uid(name).is_none())
+                .map(|name| format!("type {}", name.shown())),
+        )
+        .collect();
+    if !unidentified.is_empty() {
+        bail!(
+            "the identity file does not know {}: {}.\n\
+             Run `pbps plan` first to mint identities for the declarations.",
+            if unidentified.len() == 1 {
+                "a declared object"
+            } else {
+                "these declared objects"
+            },
+            unidentified.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Refuse before attempting a transaction: only a proven empty managed set
+/// justifies the empty snapshot recorded after a rolled-back bootstrap.
+fn refuse_nonempty_bootstrap(
+    schema: &Schema,
+    limitations: &[String],
+    dialect: &dyn Dialect,
+    label: &str,
+) -> anyhow::Result<()> {
+    // Derive emptiness from the diagnostic inventory so the two cannot differ.
+    let Schema {
+        tables,
+        types,
+        modules,
+        roles,
+    } = schema;
+    let names: Vec<String> = tables
+        .keys()
+        .map(|name| name.shown().to_string())
+        .chain(modules.keys().map(|id| id.shown().to_string()))
+        // PostgreSQL cluster roles with no managed grants are prerequisites,
+        // rather than objects bootstrap creates (DECISIONS 211).
+        .chain(
+            roles
+                .iter()
+                .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
+                .map(|(name, _)| format!("role {}", name.shown())),
+        )
+        .chain(types.keys().map(|name| format!("type {}", name.shown())))
+        // Omitted definitions still occupy names in the managed set.
+        .chain(limitations.iter().cloned())
+        .collect();
+    if !names.is_empty() {
+        bail!(
+            "`{label}` already has {} of the declared object(s): {}.\n\
+             Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
+             apply` to migrate it instead.",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Keep the read-back and authored definitions together: the former proves
+/// drift, while the latter preserves expressions the catalog respells.
+fn bootstrap_record(
+    built: pbps_diff::Scoped,
+    held: IdsFile,
+    loaded: &pbps_load::Loaded,
+    operator: &str,
+) -> StateSnapshot {
+    let mut snapshot = StateSnapshot::new(StateKind::Bootstrap, built.schema, held, operator);
+    snapshot.baseline_evidence = built.baseline_evidence;
+    snapshot.module_deps = loaded.hints.module_deps.clone();
+    // Every object was created from these declarations (ADR-0009 §2.2).
+    snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
+    snapshot
+}
+
 pub fn cmd_bootstrap(
     project: &Project,
     target: Option<&Target>,
@@ -6194,6 +6305,7 @@ pub fn cmd_bootstrap(
         let mut loaded = crate::load(project, dialect.as_ref())?;
         let ids = crate::read_ids(project)?;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
+        refuse_unidentified_bootstrap_objects(&loaded.schema, &ids)?;
 
         // A connected generation proves nothing about a later replay target.
         // Keep the input-path proof in connected execution (DEC-2181.1).
@@ -6203,38 +6315,6 @@ pub fn cmd_bootstrap(
         ) {
             bail!(
                 "bootstrap --sql cannot validate referenced type input paths for its replay target; run connected bootstrap without --sql, or use plan/apply against the target (DEC-2181.1)"
-            );
-        }
-
-        // Every declared object needs its identity, not just "some": a role the
-        // ids file does not know is skipped by the differ, and a bootstrap that
-        // skipped it built less than the declarations say and recorded that as
-        // the whole state. `pbps plan` mints what is missing (DECISIONS 109).
-        let unidentified: Vec<String> = loaded
-            .schema
-            .tables
-            .keys()
-            .filter(|t| ids.table_uid(t).is_none())
-            .map(|name| name.shown().to_string())
-            .chain(
-                loaded
-                    .schema
-                    .roles
-                    .keys()
-                    .filter(|r| ids.role_uid(r).is_none())
-                    .map(|r| format!("role {r}", r = r.shown(),)),
-            )
-            .collect();
-        if !unidentified.is_empty() {
-            bail!(
-                "the identity file does not know {}: {}.\n\
-             Run `pbps plan` first to mint identities for the declarations.",
-                if unidentified.len() == 1 {
-                    "a declared object"
-                } else {
-                    "these declared objects"
-                },
-                unidentified.join(", ")
             );
         }
 
@@ -6509,65 +6589,12 @@ pub fn cmd_bootstrap(
                 // instead of refusing (measured on 17.0, #1176).
                 refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
 
-                // A cluster role with no managed grants is not an object this
-                // bootstrap creates. Existing managed grants still make the
-                // target nonempty: bootstrap must not silently adopt them.
-                let existing_roles: Vec<_> = existing
-                    .scoped
-                    .schema
-                    .roles
-                    .iter()
-                    .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
-                    .map(|(name, _)| format!("role {name}", name = name.shown(),))
-                    .collect();
-
-                // Bootstrap means "into an empty database". Running it over an
-                // existing managed set would fail halfway through on the first
-                // CREATE and leave a partly built schema unless the transaction
-                // catches it. Modules count too: `CREATE OR ALTER` would otherwise
-                // replace one without a plan or approval. And so does a role
-                // (ADR-0005): `CREATE ROLE` fails on one already there, after
-                // everything before it in the batch has run. And so does
-                // everything in the managed set that the projection could not
-                // express — a declared module the catalog cannot read back, or a
-                // declared table whose every column is unsupported and which
-                // introspection therefore left out whole. That table is absent
-                // from the scoped schema and present in the database; counting
-                // only the scoped schema called the target empty, the CREATE
-                // failed on it, and the failure audit recorded an empty state as
-                // the newest one, which the next `verify` under `unmanaged:
-                // ignore` believed.
-                if !existing.scoped.schema.tables.is_empty()
-                    || !existing.scoped.schema.modules.is_empty()
-                    || !existing_roles.is_empty()
-                    || !existing.limitations.is_empty()
-                {
-                    let names: Vec<String> = existing
-                        .scoped
-                        .schema
-                        .tables
-                        .keys()
-                        .map(|name| name.shown().to_string())
-                        .chain(
-                            existing
-                                .scoped
-                                .schema
-                                .modules
-                                .keys()
-                                .map(|id| id.shown().to_string()),
-                        )
-                        .chain(existing_roles)
-                        .chain(existing.limitations.iter().cloned())
-                        .collect();
-                    bail!(
-                        "`{}` already has {} of the declared object(s): {}.\n\
-                     Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
-                     apply` to migrate it instead.",
-                        target.label,
-                        names.len(),
-                        names.join(", ")
-                    );
-                }
+                refuse_nonempty_bootstrap(
+                    &existing.scoped.schema,
+                    &existing.limitations,
+                    dialect.as_ref(),
+                    &target.label,
+                )?;
 
                 crate::engine::recheck_type_prerequisites(
                     &mut conn,
@@ -6631,7 +6658,7 @@ pub fn cmd_bootstrap(
                 // records.
                 refuse_unmet_public_execution(&cs, &built, &target.label)?;
                 // Only the uids of what this build made. The ids file may name
-                // tables and roles these declarations do not hold, and recording
+                // tables, types and roles these declarations do not hold; recording
                 // those as held would make the next plan skip them (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
@@ -6647,15 +6674,10 @@ pub fn cmd_bootstrap(
                     true,
                 )
                 .await?;
-                let mut snapshot = with_provenance(
+                let snapshot = with_provenance(
                     project.root(),
-                    StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
+                    bootstrap_record(built, held, &loaded, &operator),
                 );
-                snapshot.baseline_evidence = built.baseline_evidence;
-                snapshot.module_deps = loaded.hints.module_deps.clone();
-                // Every object was created from these declarations, so what was
-                // declared is exactly what bootstrap holds (ADR-0009 §2.2).
-                snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
                 let id = crate::engine::record(&mut conn, &snapshot).await?;
                 write_script(&pin_zone(&conn))?;
                 Ok::<_, anyhow::Error>((id, snapshot))
@@ -6690,7 +6712,7 @@ pub fn cmd_bootstrap(
 }
 
 /// Best-effort audit row for a bootstrap whose transactional work was rolled
-/// back. The empty state was established before the lock was taken, so it is
+/// back. The empty state was established under the lock before the build, so it is
 /// the last trustworthy state to carry forward; the declared identity mapping
 /// has not become an environment mapping until the build succeeds.
 ///
@@ -10431,6 +10453,162 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_requires_each_declared_type_identity() {
+        for yaml in [
+            "enum: app.mood\nvalues: [sad, happy]\n",
+            "domain: app.score\ntype: integer\n",
+        ] {
+            let ty = pbps_load::load_type_str(std::path::Path::new("type.yml"), yaml).unwrap();
+            let mut schema = Schema::default();
+            schema.types.insert(ty.name.clone(), ty.definition);
+            let mut ids = IdsFile::default();
+            // An unrelated identity cannot stand in for this declaration.
+            ids.types.insert(
+                "y_aaaaaa".parse().unwrap(),
+                pbps_model::TypeRef::new("app", "other").unwrap(),
+            );
+            let error = refuse_unidentified_bootstrap_objects(&schema, &ids)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("type {}", ty.name.shown())),
+                "{error}"
+            );
+            assert!(error.contains("pbps plan"), "{error}");
+            ids.types.insert("y_bbbbbb".parse().unwrap(), ty.name);
+            refuse_unidentified_bootstrap_objects(&schema, &ids).unwrap();
+        }
+        refuse_unidentified_bootstrap_objects(&Schema::default(), &IdsFile::default()).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_records_identified_types_created_on_an_empty_target() {
+        for yaml in [
+            "enum: app.mood\nvalues: [ok]\n",
+            "domain: app.score\ntype: integer\nchecks: {positive: 'VALUE > 0'}\n",
+        ] {
+            let ty = pbps_load::load_type_str(std::path::Path::new("type.yml"), yaml).unwrap();
+            let mut loaded = pbps_load::Loaded::default();
+            loaded.schema.types.insert(ty.name.clone(), ty.definition);
+            let mut ids = IdsFile::default();
+            ids.types
+                .insert("y_aaaaaa".parse().unwrap(), ty.name.clone());
+            let dialect = pbps_pg::Postgres::new();
+            refuse_unidentified_bootstrap_objects(&loaded.schema, &ids).unwrap();
+            refuse_nonempty_bootstrap(&Schema::default(), &[], &dialect, "target").unwrap();
+            let changes = pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: &Schema::default(),
+                    ids: &IdsFile::default(),
+                },
+                pbps_diff::Side {
+                    schema: &loaded.schema,
+                    ids: &ids,
+                },
+                &dialect,
+                &loaded.hints,
+            )
+            .unwrap();
+            assert_eq!(changes.changes.len(), 1);
+            assert!(
+                matches!(&changes.changes[0].change, pbps_model::Change::CreateType { name, .. } if name == &ty.name)
+            );
+            // The catalog may respell domain expressions. The recording must
+            // retain both that read-back and the authored definition.
+            let mut read_back = loaded.schema.clone();
+            if let pbps_model::ManagedType::Domain { checks, .. } =
+                read_back.types.get_mut(&ty.name).unwrap()
+            {
+                checks.insert("positive".into(), "(VALUE > 0)".into());
+            }
+            let built =
+                pbps_diff::scope(&read_back, &ids, &Default::default(), &Default::default());
+            let snapshot = bootstrap_record(built, ids.clone(), &loaded, "operator");
+            assert_eq!(snapshot.kind, StateKind::Bootstrap);
+            assert_eq!(snapshot.ids, ids);
+            assert_eq!(snapshot.schema, read_back);
+            assert_eq!(
+                snapshot.declared,
+                pbps_model::Declared::from_schema(&loaded.schema)
+            );
+            assert_eq!(snapshot.declared.overlay(&snapshot.schema), loaded.schema);
+        }
+    }
+
+    #[test]
+    fn bootstrap_schema_spelling_checks_include_unreferenced_types() {
+        for yaml in [
+            "enum: typed.mood\nvalues: [ok]\n",
+            "domain: typed.score\ntype: integer\n",
+        ] {
+            let ty = pbps_load::load_type_str(std::path::Path::new("type.yml"), yaml).unwrap();
+            let mut schema = Schema::default();
+            schema.types.insert(ty.name.clone(), ty.definition);
+            let declared = schemas_declared(&schema);
+            assert_eq!(declared.len(), 1);
+            assert!(declared["typed"].contains(&ty.name.shown().to_string()));
+            let wrong = wrongly_spelt(&[("typed".into(), Some("TYPED".into()))].into(), &declared);
+            assert_eq!(wrong.len(), 1);
+            assert!(wrong[0].contains(&ty.name.shown().to_string()));
+            assert!(
+                wrongly_spelt(&[("typed".into(), Some("typed".into()))].into(), &declared)
+                    .is_empty()
+            );
+            assert!(wrongly_spelt(&[("typed".into(), None)].into(), &declared).is_empty());
+        }
+        assert!(schemas_declared(&Schema::default()).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_refuses_existing_types_and_omitted_definitions_before_building() {
+        let dialect = pbps_pg::Postgres::new();
+        for yaml in [
+            "enum: app.mood\nvalues: [sad, happy]\n",
+            "domain: app.score\ntype: integer\n",
+        ] {
+            let ty = pbps_load::load_type_str(std::path::Path::new("type.yml"), yaml).unwrap();
+            let mut schema = Schema::default();
+            schema.types.insert(ty.name.clone(), ty.definition);
+            let error = refuse_nonempty_bootstrap(&schema, &[], &dialect, "target")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("already has 1"), "{error}");
+            assert!(
+                error.contains(&format!("type {}", ty.name.shown())),
+                "{error}"
+            );
+        }
+        let empty = Schema::default();
+        let error = refuse_nonempty_bootstrap(
+            &empty,
+            &["type app.omitted cannot be read".into()],
+            &dialect,
+            "target",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("type app.omitted"), "{error}");
+        refuse_nonempty_bootstrap(&empty, &[], &dialect, "target").unwrap();
+    }
+
+    #[test]
+    fn bootstrap_admits_only_pg_cluster_roles_without_managed_grants() {
+        let mut schema = Schema::default();
+        let role: pbps_model::RoleName = "reader".into();
+        schema.roles.insert(role.clone(), Default::default());
+        refuse_nonempty_bootstrap(&schema, &[], &pbps_pg::Postgres::new(), "target").unwrap();
+        assert!(refuse_nonempty_bootstrap(&schema, &[], &pbps_mssql::Mssql, "target").is_err());
+        schema.roles.get_mut(&role).unwrap().grants.insert(
+            pbps_model::GrantTarget::Schema("app".into()),
+            [pbps_model::Permission::Select].into(),
+        );
+        let error = refuse_nonempty_bootstrap(&schema, &[], &pbps_pg::Postgres::new(), "target")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("role reader"), "{error}");
+    }
+
     fn order_carried_moves(
         cs: &mut pbps_model::ChangeSet,
         occupants: &[pbps_pg::catalog::NameOccupant],

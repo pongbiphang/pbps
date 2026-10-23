@@ -487,6 +487,8 @@
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "managed_types::declared_type_lifecycles_converge_and_vetting_is_atomic",
+        "managed_types::bootstrap_refuses_existing_declared_types_without_recording_a_failed_state",
+        "managed_types::bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of_them",
         "managed_types::domain_expression_records_converge_without_masking_layout_changes_or_live_drift",
         "managed_types::adopted_domains_and_older_states_keep_engine_expression_text",
         "managed_types::rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks",

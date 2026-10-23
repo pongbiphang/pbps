@@ -1511,6 +1511,179 @@ fn declared_type_bootstrap_scripts_admit_enums_and_refuse_unvetted_domain_code()
 }
 
 #[test]
+fn bootstrap_refuses_unidentified_enums_and_domains_before_connecting_or_writing_sql() {
+    for (name, yaml, create) in [
+        (
+            "mood",
+            "enum: app.mood\nvalues: [ok]\n",
+            "CREATE TYPE \"app\".\"mood\"",
+        ),
+        (
+            "score",
+            "domain: app.score\ntype: integer\n",
+            "CREATE DOMAIN \"app\".\"score\"",
+        ),
+    ] {
+        let d = Demo::new(&format!("bootstrap-unidentified-{name}1635"));
+        std::fs::write(d.dir.join(format!("schema/app.{name}.type.yml")), yaml).unwrap();
+        let script = d.dir.join("bootstrap.sql");
+        std::fs::write(&script, "keep this script").unwrap();
+        // No server can answer at this endpoint: the named identity refusal
+        // must precede every connection, including --sql with a target.
+        let unreachable = "host=127.0.0.1 port=1 user=postgres dbname=unused sslmode=disable";
+        for args in [
+            vec!["bootstrap"],
+            vec!["bootstrap", "--db", unreachable],
+            vec!["bootstrap", "--sql", script.to_str().unwrap()],
+            vec![
+                "bootstrap",
+                "--sql",
+                script.to_str().unwrap(),
+                "--db",
+                unreachable,
+            ],
+        ] {
+            let out = d.run(&args);
+            assert_ne!(code(&out), 0, "{args:?}: {}", stdout(&out));
+            let error = stderr(&out);
+            assert!(error.contains("identity file does not know"), "{error}");
+            assert!(error.contains(&format!("type app.{name}")), "{error}");
+            assert!(error.contains("pbps plan"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(&script).unwrap(),
+                "keep this script"
+            );
+        }
+        // Negative: after minting this type's identity, script generation
+        // emits its CREATE even when no table references it.
+        succeeds(d.run(&["plan", "--no-dev"]));
+        succeeds(d.run(&["bootstrap", "--sql", script.to_str().unwrap()]));
+        assert!(std::fs::read_to_string(&script).unwrap().contains(create));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_refuses_existing_declared_types_without_recording_a_failed_state() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (name, yaml, ddl) in [
+            (
+                "mood",
+                "enum: app.mood\nvalues: [ok]\n",
+                "CREATE TYPE app.mood AS ENUM ('ok')",
+            ),
+            (
+                "score",
+                "domain: app.score\ntype: integer\n",
+                "CREATE DOMAIN app.score AS integer",
+            ),
+        ] {
+            let own = OwnDatabase::new(&server, &format!("bootstrap_nonempty_{name}1635"));
+            let db = own.connection();
+            on_server(db, &format!("CREATE SCHEMA app; {ddl}"));
+            let d = Demo::new(&format!("bootstrap-nonempty-{name}1635"));
+            std::fs::write(d.dir.join(format!("schema/app.{name}.type.yml")), yaml).unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            let script = d.dir.join("bootstrap.sql");
+            for sql in [false, true] {
+                let mut args = vec!["bootstrap", "--db", db];
+                if sql {
+                    args.extend(["--sql", script.to_str().unwrap()]);
+                }
+                let out = d.run(&args);
+                assert_ne!(code(&out), 0, "{}", stdout(&out));
+                let error = stderr(&out);
+                assert!(
+                    error.contains("already has 1 of the declared object(s)"),
+                    "{error}"
+                );
+                assert!(error.contains(&format!("type app.{name}")), "{error}");
+                assert!(
+                    error.contains("Bootstrap builds into an empty database"),
+                    "{error}"
+                );
+                assert!(!error.contains("Bootstrap failure recorded"), "{error}");
+                assert_eq!(
+                    scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        &format!(
+                            "SELECT count(*)::bigint FROM pg_type WHERE typnamespace='app'::regnamespace AND typname='{name}'"
+                        )
+                    ),
+                    1
+                );
+                assert!(!script.exists(), "no script is written on refusal");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of_them() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "bootstrap_types1635");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("bootstrap-types1635");
+        std::fs::write(
+            d.dir.join("schema/app.mood.type.yml"),
+            "enum: app.mood\nvalues: [sad, ok]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.score.type.yml"),
+            "domain: app.score\ntype: integer\nchecks: {positive: 'VALUE > 0'}\n",
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  mood: {type: app.mood}\n  score: {type: app.score}\nprimary_key: [id]\n");
+        succeeds(d.run(&["plan", "--no-dev"]));
+        let ids: pbps_model::IdsFile =
+            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        let snapshot = latest_snapshot(db);
+        let desired = pbps_load::load_schema_dir(&d.dir.join("schema"))
+            .unwrap()
+            .schema;
+        assert_eq!(snapshot.kind, pbps_model::StateKind::Bootstrap);
+        assert_eq!(snapshot.ids, ids);
+        assert_eq!(snapshot.schema.types.len(), 2);
+        assert_eq!(snapshot.schema.tables.len(), 1);
+        assert_eq!(
+            snapshot.declared,
+            pbps_model::Declared::from_schema(&desired)
+        );
+        assert_eq!(
+            snapshot.declared.overlay(&snapshot.schema).types,
+            desired.types
+        );
+        succeeds(d.run(&["verify", "--db", db]));
+        let path = d.dir.join("after-bootstrap.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        let next: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(next.changes.is_empty(), "{:?}", next.changes);
+        on_server(db, "INSERT INTO app.t VALUES (1, 'ok', 1)");
+        assert!(try_on_server(db, "INSERT INTO app.t VALUES (2, 'ok', -1)").is_err());
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+            1
+        );
+    }
+}
+
+#[test]
 fn fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent() {
     let d = Demo::new("type-fmt1635");
     let old = d.dir.join("schema/app.old.type.yml");

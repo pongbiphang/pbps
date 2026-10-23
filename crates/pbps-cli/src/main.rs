@@ -2066,8 +2066,15 @@ fn declaration_problems_with_sources(
     conflicts: &pbps_load::SourceConflicts,
 ) -> Vec<(&'static str, String)> {
     let schema = &loaded.schema;
+    // Every family needs dialect validation before any connected command writes.
+    let Schema {
+        tables,
+        types,
+        modules,
+        roles,
+    } = schema;
     let mut out: Vec<(&'static str, String)> = Vec::new();
-    for (name, definition) in &schema.types {
+    for (name, definition) in types {
         for error in dialect.validate_type(name, definition) {
             out.push((
                 "dialect.rejected",
@@ -2079,7 +2086,7 @@ fn declaration_problems_with_sources(
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the whole-schema checks below see what no
     // single declaration can.
-    for (name, table) in &schema.tables {
+    for (name, table) in tables {
         let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
         for e in dialect.validate_table_sources(name, table, sources) {
             out.push((
@@ -2104,7 +2111,7 @@ fn declaration_problems_with_sources(
             }
         }
     }
-    for (name, module) in &schema.modules {
+    for (name, module) in modules {
         for e in dialect.validate_module(name, module) {
             out.push((
                 "dialect.rejected",
@@ -2175,7 +2182,7 @@ fn declaration_problems_with_sources(
     for problem in pbps_model::role::check(schema) {
         out.push(("schema.grant-target", problem));
     }
-    for (name, role) in &schema.roles {
+    for (name, role) in roles {
         for e in dialect.validate_role(name, role, schema) {
             out.push((
                 "dialect.rejected",
@@ -2196,7 +2203,7 @@ fn declaration_problems_with_sources(
     // Reference data (ADR-0004). Model rules, not engine rules — a row's
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.
-    for (name, table) in &schema.tables {
+    for (name, table) in tables {
         let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
         for problem in pbps_model::data::check_with_sources(name, table, sources) {
             out.push(("schema.data-invalid", problem));
@@ -2664,8 +2671,8 @@ pub struct IdentityCounts {
     pub tombstones: usize,
 }
 
-/// The names `fmt` judges a `renamed_from` against: every table and role any
-/// readable file of the project declares. A file that cannot be read or parsed
+/// The names `fmt` judges a `renamed_from` against: every table, role and type
+/// any readable file of the project declares. An unreadable or unparseable file
 /// contributes nothing here.
 fn fmt_declared(files: &[PathBuf]) -> Schema {
     let mut declared = Schema::default();
