@@ -420,6 +420,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         crate::order::shadow::Stage::Differ,
         None,
     );
+    cs.boundaries.ensure(&cs).map_err(Refusal)?;
     Ok(Scheduled {
         changes: crate::order::plan::state::<_, S::Output>(cs),
         added,

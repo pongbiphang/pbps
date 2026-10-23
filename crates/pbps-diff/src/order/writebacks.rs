@@ -115,14 +115,31 @@ impl PlanningInput {
         Self { changes }
     }
     pub fn append_to<S>(&self, draft: super::PlanningPlan<S>) -> super::PlanningPlan {
-        let mut draft =
-            super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof);
+        let mut draft: super::PlanningPlan = if draft.boundaries.is_empty() {
+            // Preserve the existing re-proposal route for ordinary inputs.
+            super::PlanningPlan::new(draft.payload, draft.origins, draft.logical, draft.proof)
+        } else {
+            super::plan::state(draft)
+        };
+        let prior = draft.payload.changes.len();
         for part in &self.changes {
             draft
                 .origins
                 .push(pbps_model::operation::Origin::Whole(draft.logical));
             draft.logical += 1;
             draft.payload.changes.push(part.clone());
+        }
+        if let Some(identities) = &draft.identities {
+            let added = identities.additional(
+                draft.origins[prior..]
+                    .iter()
+                    .cloned()
+                    .zip(draft.payload.changes[prior..].iter().cloned()),
+                draft.boundaries.module_edits(),
+            );
+            draft.identities = Some(pbps_model::operation::Operations::from_operations(
+                identities.iter().chain(added.iter()).cloned(),
+            ));
         }
         draft.refresh();
         draft

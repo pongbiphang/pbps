@@ -180,7 +180,15 @@ pub(in crate::order::membership::tests) fn declared_goals(f: &Fixture, end: &Sta
                     }
                 }
                 Clause::Recurse(w)
-                    if !inputs.contains(&(w.key.clone(), Version::After(f.ops[at].id()))) =>
+                    if !inputs.contains(&(w.key.clone(), Version::After(f.ops[at].id())))
+                        // ATTACH consumes the standalone managed source. Its
+                        // transfer goal, rather than the source's pre-consume
+                        // version, declares the surviving cell's endpoint.
+                        && !f.fx.iter().flat_map(|fx| &fx.symbolic).any(|clause| {
+                            matches!(clause, Clause::Move(m) if m.kind == MoveKind::Attach
+                                && m.child == w.key.parent
+                                && matches!(&m.boundary, Boundary::All(ts) if ts.iter().any(|t| t.from == w.key.property)))
+                        }) =>
                 {
                     if end
                         .cells

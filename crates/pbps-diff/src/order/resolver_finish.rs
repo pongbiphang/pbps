@@ -9,12 +9,14 @@ use pbps_model::{ChangeSet, IdsFile};
 pub(crate) fn finish<D: Dialect + ?Sized>(
     mut ordered: Ordered,
     sequence: &[usize],
-    logical: usize,
+    logical_plan: &super::DiffPlan,
     origins: Vec<Origin>,
     ids: &IdsFile,
     dialect: &D,
     module_edits: ModuleEdits,
 ) -> Result<(Ordered<super::Canonical<D>>, Operations), Error> {
+    let logical = logical_plan.changes.len();
+    ordered.changes.boundaries = logical_plan.boundaries.clone();
     // Settlement can put a validator after seed rows. Preparation's empty
     // context cannot certify that final position (DEC-1503.4); seal the same
     // risks saved-plan validation will derive, including in operation copies.
@@ -43,6 +45,13 @@ pub(crate) fn finish<D: Dialect + ?Sized>(
     );
     let operations = reordered_operations(&operations, sequence);
     ordered.changes.identities = Some(operations.clone());
+    // A pending membership boundary is an ordering refusal; canonical also
+    // keeps the reserved-rebuild refusal in its existing Names category.
+    ordered
+        .changes
+        .boundaries
+        .ensure(&ordered.changes)
+        .map_err(Error::Cycle)?;
     Ok((
         Ordered {
             changes: super::plan::canonical(ordered.changes, dialect).map_err(Error::Names)?,

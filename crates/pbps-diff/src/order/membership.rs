@@ -364,10 +364,14 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     }
                     restore_edge(graph, position, r.position, &key);
                 }
+                let source = source_chain(m, t, &chains);
+                if let Some(last) = source.last() {
+                    edge(graph, last.position, position, &key);
+                }
                 let mut admitted = Vec::new();
                 let mut endpoint = None;
                 for cut in 0..=list.len() {
-                    let result = boundary_endpoint(m, t, list, &rs, base, cut, id)?;
+                    let result = boundary_endpoint(m, t, list, source, &rs, base, cut, id)?;
                     if let Some(ref state) = result {
                         if endpoint.as_ref().is_some_and(|previous| previous != state) {
                             return Err(
@@ -419,6 +423,57 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
         assert!(positions.contains_key(&issue.operation));
     }
 }
+/// A standalone source's explicit version chain ends where ATTACH consumes
+/// its managed owner. This is not another parent cut or a text-based match.
+fn source_chain<'a>(
+    m: &s::Move,
+    t: &Transfer,
+    chains: &'a BTreeMap<Key, Vec<Write<'a>>>,
+) -> &'a [Write<'a>] {
+    if m.kind != MoveKind::Attach {
+        return &[];
+    }
+    let key = Key {
+        parent: m.child.clone(),
+        property: t.from.clone(),
+    };
+    chains.get(&key).map_or(&[], |chain| {
+        if chain
+            .iter()
+            .all(|w| w.value.scope == Scope::ParentOnly && w.value.lifetime == Lifetime::Retain)
+        {
+            chain.as_slice()
+        } else {
+            &[]
+        }
+    })
+}
+fn bridged_key_pairs(
+    moves: &[(Position, &s::Move)],
+    chains: &BTreeMap<Key, Vec<Write<'_>>>,
+) -> BTreeSet<(Key, Key)> {
+    let mut pairs = BTreeSet::new();
+    for (_, m) in moves {
+        if let Ok(ts) = transfers(m) {
+            for t in ts {
+                if !source_chain(m, t, chains).is_empty() {
+                    let parent = Key {
+                        parent: m.parent.clone(),
+                        property: t.parent.clone(),
+                    };
+                    let source = Key {
+                        parent: m.child.clone(),
+                        property: t.from.clone(),
+                    };
+                    pairs.insert((parent.clone(), source.clone()));
+                    pairs.insert((source, parent));
+                }
+            }
+        }
+    }
+    pairs
+}
+
 /// The cut compiler models one parent version chain and its transferred or
 /// stationary targets. Aliasing another chain's physical input needs an
 /// explicit common version contract; endpoint text cannot supply that chain.
@@ -430,6 +485,7 @@ fn qualify_interactions(
     moves: &[(Position, &s::Move)],
     base: &State,
 ) {
+    let bridges = bridged_key_pairs(moves, chains);
     let mut moving_children: BTreeMap<Recorded, Vec<&s::Move>> = BTreeMap::new();
     let mut moving_parents: BTreeMap<Recorded, Vec<&s::Move>> = BTreeMap::new();
     let mut transfer_inputs = BTreeSet::new();
@@ -482,7 +538,12 @@ fn qualify_interactions(
     }
     let conflicts: BTreeSet<_> = footprints
         .values()
-        .filter(|keys| keys.len() > 1)
+        .filter(|keys| {
+            keys.len() > 1
+                && (keys.len() != 2
+                    || !bridges
+                        .contains(&(keys.first().unwrap().clone(), keys.last().unwrap().clone())))
+        })
         .flatten()
         .collect();
     for (key, chain) in chains {
@@ -494,7 +555,12 @@ fn qualify_interactions(
                             .iter()
                             .any(|t| t.from == key.property || t.to == key.property))
                 {
-                    return Err("recursive input shares a transferred or retired slot without a version chain".into());
+                    let qualified = transfers(m)?
+                        .iter()
+                        .any(|t| key.property == t.from && !source_chain(m, t, chains).is_empty());
+                    if !qualified {
+                        return Err("recursive input shares a transferred or retired slot without a version chain".into());
+                    }
                 }
             }
             if conflicts.contains(key) {
@@ -559,14 +625,25 @@ fn qualify_interactions(
             let why = if chains.contains_key(&Key {
                 parent: child.clone(),
                 property: r.value.property.clone(),
+            }) && !moves.iter().any(|(_, m)| {
+                m.parent == key.parent
+                    && m.child == *child
+                    && transfers(m).is_ok_and(|ts| {
+                        ts.iter().any(|t| {
+                            t.parent == key.property
+                                && t.to == *property
+                                && t.from == *property
+                                && !source_chain(m, t, chains).is_empty()
+                        })
+                    })
             }) {
                 Some("restoration overwrites a recursive input outside its version chain")
             } else if transfer_inputs.contains(&slot) {
                 Some("restoration overwrites a transfer parent input outside its version chain")
-            } else if footprints
-                .get(&slot)
-                .is_some_and(|keys| keys.iter().any(|k| k != key))
-            {
+            } else if footprints.get(&slot).is_some_and(|keys| {
+                keys.iter()
+                    .any(|k| k != key && !bridges.contains(&(k.clone(), key.clone())))
+            }) {
                 Some("restoration key does not identify its recursive physical target")
             } else {
                 None
@@ -718,10 +795,12 @@ struct Endpoint {
 }
 // A cut is qualified only if all admitted cuts have the same complete physical
 // endpoint. Equal values alone cannot select a version or physical birth.
+#[allow(clippy::too_many_arguments)]
 fn boundary_endpoint(
     m: &s::Move,
     t: &Transfer,
     chain: &[Write<'_>],
+    source: &[Write<'_>],
     rs: &[Restore<'_>],
     base: &State,
     cut: usize,
@@ -729,6 +808,10 @@ fn boundary_endpoint(
 ) -> Result<Option<Endpoint>, String> {
     let mut parent = cell(base, &m.parent, &t.parent)?.value.known()?.clone();
     let mut physical = cell(base, &m.child, &t.from)?.clone();
+    for w in source {
+        physical.value = w.value.to.clone();
+        physical.version = Version::After(w.position.id);
+    }
     let mut child = physical.value.known()?.clone();
     for w in &chain[..cut] {
         parent = w.value.to.known()?.clone();

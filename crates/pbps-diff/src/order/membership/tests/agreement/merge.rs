@@ -57,6 +57,7 @@ fn fixture(
     f
 }
 pub(super) fn generated_contracts(mut visit: impl FnMut(String, &Fixture)) {
+    source_contracts(&mut visit);
     not_null_contracts(&mut visit);
     for scope in [Scope::ParentOnly, Scope::MembersAtOperation] {
         for write_policy in [
@@ -248,4 +249,72 @@ fn unavailable_or_overlapping_merge_reads_are_named_instead_of_guessed() {
         assert!(!f.admits());
         assert!(f.refusal().contains(REMEDY));
     }
+}
+
+fn source_contracts(mut visit: impl FnMut(String, &Fixture)) {
+    for parent_scope in [Scope::ParentOnly, Scope::MembersAtOperation] {
+        for before in ["before", "1", "9"] {
+            for after in ["after", "7", "9"] {
+                for goal in [value("9"), value("1"), inherited("7")] {
+                    for restore in [false, true] {
+                        let mut f = fixture(
+                            parent_scope,
+                            WritePolicy::Overwrite,
+                            TransferPolicy::Merge(Merge {
+                                cases: [false, true]
+                                    .into_iter()
+                                    .map(|later| MergeCase {
+                                        parent: value(if later { "7" } else { "1" }),
+                                        candidate: value("released"),
+                                        result: Fact::Known(value(if later {
+                                            after
+                                        } else {
+                                            before
+                                        })),
+                                    })
+                                    .collect(),
+                            }),
+                            goal.clone(),
+                            restore,
+                        );
+                        let at = f.ops.len();
+                        let more = base(at + 1);
+                        f.ops.push(more.ops[at].clone());
+                        f.fx.push(Effects::default());
+                        f.fx[at].symbolic.push(Clause::Recurse(RecursiveWrite {
+                            key: Key {
+                                parent: tables()[1].clone(),
+                                property: Property::Address,
+                            },
+                            input: Version::Base,
+                            from: Fact::Known(value("9")),
+                            to: Fact::Known(value("released")),
+                            scope: Scope::ParentOnly,
+                            policy: WritePolicy::Overwrite,
+                            lifetime: Lifetime::Retain,
+                        }));
+                        for order in permutations(f.ops.len()) {
+                            visit(
+                                format!(
+                                    "source-merge/{parent_scope:?}/{before}/{after}/{restore}/{order:?}"
+                                ),
+                                &f.reordered(&order),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
+fn an_attach_consumes_the_standalone_sources_explicit_version_chain() {
+    let mut examples = Vec::new();
+    source_contracts(|label, f| examples.push((label, f.clone())));
+    assert!(examples.iter().any(|(_, f)| f.admits()));
+    let mut audit = Audit::default();
+    for (label, f) in examples {
+        audit.check(label, &f);
+    }
+    assert!(audit.disagreements.is_empty(), "{:?}", audit.disagreements);
 }

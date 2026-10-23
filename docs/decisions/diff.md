@@ -8470,6 +8470,18 @@ compiler evaluates the merge at every declared version cut against the child
 goal: a unique admitted side creates its boundary edge, both sides create no
 preference edge, and neither creates the named separate-plans obligation.
 Independent replay applies the same merge at the actual ATTACH position.
+A standalone source's explicit parent-only, retained-lifetime property chain
+ends where ATTACH consumes its managed owner. Its terminal event precedes
+ATTACH and supplies the candidate read; the transfer's surviving endpoint
+then replaces the consumed source's pre-boundary goal. This joins declared
+versions, never equal text or a guessed parent cut.
+
+Pending boundary comparisons travel with immutable PlanningPlan values
+through settlement, expansion, state conversion and planning append. Concrete
+replay discharges them against the current changes and retained event/origin
+identities. Reordering, rewriting or respelling makes that receipt stale;
+canonical completion refuses it in every build. Findings/risks alone do not
+change the contract. No receipt or pending comparison is serialized.
 
 PostgreSQL supplies the mapping in `engine_effects`. Native measurements on
 PG18 show that a stronger local NOT NULL survives attachment to a nullable

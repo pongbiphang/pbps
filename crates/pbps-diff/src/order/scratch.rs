@@ -84,6 +84,7 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     let proof = pbps_model::resolver::OrderingProof::new(&payload, Default::default()).unwrap();
     let mut changes =
         super::PlanningPlan::new(payload, input.origins.clone(), input.logical, proof);
+    changes.boundaries = input.boundaries.clone();
     super::generated::expand(&mut changes, ids, dependencies, dialect)?;
     super::generated::settle(&mut changes, &declared, dependencies, dialect)?;
     let edges = super::generated::constraints(&changes, &declared, dependencies, dialect);
