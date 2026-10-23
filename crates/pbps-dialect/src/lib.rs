@@ -213,10 +213,20 @@ pub struct ImplicitRelation {
     pub yields_to_constraints: bool,
 }
 
+/// A type-definition boundary supplied by the emitter, never inferred from SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredTypeStatement {
+    pub uid: pbps_model::Uid,
+    pub name: pbps_model::TypeRef,
+    pub definition: Option<pbps_model::ManagedType>,
+}
+
 /// One executable statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub sql: String,
+    /// The declared type this statement leaves, vetted before its transaction commits.
+    pub declared_type: Option<DeclaredTypeStatement>,
 
     /// Reference-data writes that need an engine-specific execution guard.
     /// Derived by the emitter, never inferred by parsing the SQL.
@@ -371,6 +381,7 @@ impl Statement {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
+            declared_type: None,
             row_write: None,
             index_build: None,
             own_batch: false,
@@ -629,6 +640,9 @@ impl Unchecked {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2717,6 +2731,11 @@ pub trait Dialect {
     /// is routines against tables, ADR-0009 §1): on SQL Server an index name
     /// only has to be unique per table, so the same declaration is valid
     /// there — which is what the default, `false`, says.
+    /// Tables and views also occupy a per-schema type namespace.
+    fn relations_have_row_types(&self) -> bool {
+        false
+    }
+
     fn indexes_share_namespace_with_tables(&self) -> bool {
         false
     }
@@ -3168,6 +3187,16 @@ pub trait Dialect {
         change: &Change,
         strategy: Strategy,
     ) -> Result<Vec<TableName>, DialectError>;
+
+    /// Names held between the statements of a declared type's schema move.
+    /// Engines without declared type DDL have no intermediate names.
+    fn intermediate_types(
+        &self,
+        _change: &Change,
+        _strategy: Strategy,
+    ) -> Result<Vec<pbps_model::TypeRef>, DialectError> {
+        Ok(Vec::new())
+    }
 
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///

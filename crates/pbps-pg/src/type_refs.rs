@@ -1,5 +1,7 @@
 //! Prerequisites of columns that reference existing types (DEC-1523.1–3).
 
+pub mod declared;
+
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
@@ -20,6 +22,20 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .iter()
         .flat_map(|s| s.tables.values())
         .flat_map(|t| t.columns.values().map(|c| &c.ty))
+        .chain(
+            schemas
+                .iter()
+                .flat_map(|s| s.types.values())
+                .filter_map(|t| match t {
+                    pbps_model::ManagedType::Domain { base, .. }
+                        if base.type_ref().is_some_and(|r| r.schema() != "pg_catalog") =>
+                    {
+                        Some(base)
+                    }
+                    pbps_model::ManagedType::Enum { .. }
+                    | pbps_model::ManagedType::Domain { .. } => None,
+                }),
+        )
         .collect();
     for planned in &changes.changes {
         match &planned.change {
@@ -62,6 +78,13 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
                 types.extend(after_types.values());
                 types.extend(key_type);
             }
+            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+                if let pbps_model::ManagedType::Domain { base, .. } = definition.as_ref()
+                    && base.type_ref().is_some_and(|r| r.schema() != "pg_catalog")
+                {
+                    types.push(base);
+                }
+            }
             Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::DropColumn { .. }
@@ -94,6 +117,7 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::DropType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -106,6 +130,27 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .into_iter()
         .filter_map(|ty| ty.type_ref().cloned())
         .collect()
+}
+
+/// Managed definitions are certified by their checksum-pinned declarations.
+#[allow(clippy::wildcard_enum_match_arm)] // Only type lifecycle changes add managed names.
+pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef> {
+    let mut names: BTreeSet<_> = schemas
+        .iter()
+        .flat_map(|s| s.types.keys().cloned())
+        .collect();
+    for planned in &changes.changes {
+        match &planned.change {
+            Change::CreateType { name, .. } | Change::DropType { name, .. } => {
+                names.insert(name.clone());
+            }
+            Change::RenameType { from, to, .. } => {
+                names.extend([from.clone(), to.clone()]);
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 pub(crate) async fn read(
@@ -168,7 +213,11 @@ pub async fn seal(
     trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Vec<TypePin>, DbError> {
     trusted_roles(conn, trusted).await?;
-    let references: Vec<_> = references(schemas, changes).into_iter().collect();
+    let managed = managed_names(schemas, changes);
+    let references: Vec<_> = references(schemas, changes)
+        .into_iter()
+        .filter(|r| !managed.contains(r))
+        .collect();
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
         for (table, definition) in &schema.tables {
@@ -256,14 +305,19 @@ pub async fn check(
     conn: &mut Conn,
     within: Within,
     expected: &[TypePin],
+    declared: &[pbps_model::DeclaredTypePin],
     changes: &ChangeSet,
 ) -> Result<(), DbError> {
     let references: Vec<_> = expected
         .iter()
         .map(|p| TypeRef::new(&p.schema, &p.name).map_err(|e| failed(e.to_string())))
         .collect::<Result<_, _>>()?;
-    for reference in self::references(&[], changes) {
-        if !references.contains(&reference) {
+    let managed = managed_names(&[], changes)
+        .union(&self::declared::names(declared))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for reference in self::references(&[], changes).difference(&managed) {
+        if !references.contains(reference) {
             return Err(failed(format!(
                 "plan has no type pin for `{reference}`; plan again against the database",
                 reference = reference.shown(),
@@ -381,7 +435,10 @@ pub fn bootstrap_guard(
     schema: &Schema,
     trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Option<String>, pbps_dialect::DialectError> {
-    let refs = references(&[schema], &ChangeSet::default());
+    let refs: BTreeSet<_> = references(&[schema], &ChangeSet::default())
+        .into_iter()
+        .filter(|r| !schema.types.contains_key(r))
+        .collect();
     if refs.is_empty() && trusted.is_empty() {
         return Ok(None);
     }

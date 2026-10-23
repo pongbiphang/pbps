@@ -660,7 +660,8 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
             ))
             | Because::WriteWrite(Resource::Column(_)) => OrderReason::Data,
             Because::WriteWrite(Resource::Object(
-                ObjectKey::Table(_)
+                ObjectKey::Type(_)
+                | ObjectKey::Table(_)
                 | ObjectKey::Column(_)
                 | ObjectKey::Role(_)
                 | ObjectKey::Default(_)
@@ -686,7 +687,8 @@ fn of_key(key: &ObjectKey) -> OrderReason {
     match key {
         ObjectKey::Row { .. } | ObjectKey::Rows { .. } => OrderReason::Data,
         ObjectKey::Grant { .. } | ObjectKey::Role(_) => OrderReason::Authorization,
-        ObjectKey::Table(_)
+        ObjectKey::Type(_)
+        | ObjectKey::Table(_)
         | ObjectKey::Column(_)
         | ObjectKey::Default(_)
         | ObjectKey::Module(_)

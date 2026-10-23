@@ -261,7 +261,8 @@ use crate::zone::SessionZone;
 /// including reviewed input-path routine sources and pins (DEC-2181.2).
 /// 47 adds standing policy operations and gated row-security risks (DEC-1173.1).
 /// 48 adds the identity file's `types` map to `SavedPlan.ids` (DEC-1635.1).
-pub const CURRENT_VERSION: u32 = 48;
+/// 49 pins declared type definitions and lifecycle payloads (DEC-1635.4).
+pub const CURRENT_VERSION: u32 = 49;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -440,6 +441,9 @@ pub struct SavedPlan {
     /// Existing user-defined types required by this plan (DEC-1523.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_pins: Vec<TypePin>,
+    /// Declared type evidence follows identity through renames (DEC-1635.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_type_pins: Vec<DeclaredTypePin>,
 
     /// Review and pin user-written roots on referenced types' potential input paths.
     /// Omit false to preserve historical bytes; true remains checksum-pinned.
@@ -466,6 +470,23 @@ pub struct TypeRoutine {
     pub name: String,
     pub arguments: Vec<String>,
     pub definition: String,
+}
+
+/// Definitions are pinned by the plan checksum; a new type has no before-state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredTypePin {
+    pub uid: crate::Uid,
+    pub name: crate::TypeRef,
+    pub definition: crate::ManagedType,
+    pub before: Option<DeclaredTypeBefore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredTypeBefore {
+    pub name: crate::TypeRef,
+    pub definition: crate::ManagedType,
 }
 
 /// A referenced type's identity and unkeyed canonical-definition digest.
@@ -536,6 +557,7 @@ impl SavedPlan {
             data: BTreeMap::new(),
             routine_pins: None,
             type_pins: Vec::new(),
+            declared_type_pins: Vec::new(),
             pin_type_routines: false,
             type_routines: Vec::new(),
             type_routine_pins: None,
@@ -785,7 +807,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 48);
+        assert_eq!(CURRENT_VERSION, 49);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

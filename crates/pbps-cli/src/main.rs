@@ -2856,7 +2856,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
         anyhow::anyhow!("cannot format declarations with unreadable or invalid input")
     })?;
 
-    // A table's or role's rename source may be declared in another file (#404).
+    // A table's, role's or type's rename source may be declared in another file (#404).
     // Use the staged declarations, never a second read with different contents.
     let mut declared = Schema::default();
     for input in &staged {
@@ -2883,7 +2883,21 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
     {
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
             pbps_load::LoadedFile::Type(t) => {
-                (pbps_load::render_type(&t.name, &t.definition), Vec::new())
+                let intents = t.renamed_from.into_iter().map(|from| Intent::RenameType {
+                    from,
+                    to: t.name.clone(),
+                });
+                let (pending, absorbed): (Vec<Intent>, Vec<Intent>) = intents.partition(|intent| {
+                    !pbps_diff::intent_is_absorbed(
+                        intent,
+                        &ids,
+                        RenameSource::of(intent, &declared),
+                    )
+                });
+                (
+                    pbps_load::render_type_with_intents(&t.name, &t.definition, &pending),
+                    absorbed,
+                )
             }
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no

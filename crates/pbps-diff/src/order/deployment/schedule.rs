@@ -256,13 +256,20 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         // (#1763 review).
         split_moving_defaults(&mut cs, declared.schema, dialect);
         let mut handovers = crate::order::Schedule::new(cs.changes.len());
-        if declared
-            .sources
-            .before
-            .schema
-            .modules
-            .values()
-            .any(|m| dialect.declares_a_constraint(m))
+        let type_change = |change: &Change| {
+            matches!(
+                change,
+                Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. }
+            )
+        };
+        if cs.changes.iter().any(|p| type_change(&p.change))
+            || declared
+                .sources
+                .before
+                .schema
+                .modules
+                .values()
+                .any(|m| dialect.declares_a_constraint(m))
         {
             let slots = crate::order::slots::handovers(
                 &cs.changes,
@@ -275,28 +282,31 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                 &Default::default(),
             )
             .map_err(Refusal)?;
-            // Only the new constraint-trigger handovers join this existing
-            // settle. Every other slot keeps its current ordering route;
-            // without a handover the old pass is byte-identical (DEC-2100.1).
+            // Declared type and constraint-trigger handovers join this
+            // existing settlement. Other slots keep their established route
+            // (DEC-1635.3, DEC-2100.1).
             for edge in slots.constraints() {
-                if matches!(
-                    &cs.changes[edge.before].change,
-                    Change::AlterModule {
-                        id: ModuleId::Trigger { .. },
-                        ..
-                    } | Change::DropModule {
-                        id: ModuleId::Trigger { .. },
-                        ..
-                    }
-                ) && matches!(
-                    &cs.changes[edge.after].change,
-                    Change::AddCheck { .. }
-                        | Change::AddForeignKey { .. }
-                        | Change::AddUnique { .. }
-                        | Change::SetPrimaryKey { to: Some(_), .. }
-                        | Change::CreateTable { .. }
-                        | Change::AttachPartition { .. }
-                ) {
+                if type_change(&cs.changes[edge.before].change)
+                    || type_change(&cs.changes[edge.after].change)
+                    || (matches!(
+                        &cs.changes[edge.before].change,
+                        Change::AlterModule {
+                            id: ModuleId::Trigger { .. },
+                            ..
+                        } | Change::DropModule {
+                            id: ModuleId::Trigger { .. },
+                            ..
+                        }
+                    ) && matches!(
+                        &cs.changes[edge.after].change,
+                        Change::AddCheck { .. }
+                            | Change::AddForeignKey { .. }
+                            | Change::AddUnique { .. }
+                            | Change::SetPrimaryKey { to: Some(_), .. }
+                            | Change::CreateTable { .. }
+                            | Change::AttachPartition { .. }
+                    ))
+                {
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }
             }

@@ -19,7 +19,7 @@ use pbps_model::{Hints, Schema, TableName};
 pub use convert::{LoadedModule, LoadedRole, LoadedTable};
 pub use error::{LoadError, Semantic, SourceFile};
 pub use fmt::{render, render_module, render_partitioned, render_role};
-pub use managed_types::{LoadedType, load_type_str, render_type};
+pub use managed_types::{LoadedType, load_type_str, render_type, render_type_with_intents};
 pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
@@ -258,6 +258,12 @@ fn collect_schema_dir(
                     continue;
                 }
                 seen_types.insert(t.name.clone(), path);
+                if let Some(from) = t.renamed_from {
+                    loaded.intents.push(Intent::RenameType {
+                        from,
+                        to: t.name.clone(),
+                    });
+                }
                 loaded.schema.types.insert(t.name, t.definition);
                 continue;
             }

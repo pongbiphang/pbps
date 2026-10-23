@@ -150,6 +150,21 @@ pub async fn check(
     managed: &Managed,
     at: Check,
 ) -> anyhow::Result<()> {
+    if conn.driver() == Driver::Postgres {
+        pbps_pg::type_refs::declared::check(
+            conn,
+            &plan.declared_type_pins,
+            &project.config.trusted_roles,
+            at.within(),
+            matches!(at, Check::BeforeProbes),
+            matches!(
+                at,
+                Check::BeforeRecording | Check::BeforeCommit | Check::BeforeClosing
+            ),
+            &plan.changes,
+        )
+        .await?;
+    }
     crate::engine::check_type_pins(
         conn,
         plan,

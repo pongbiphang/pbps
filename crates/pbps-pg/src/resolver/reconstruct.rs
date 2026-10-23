@@ -561,7 +561,10 @@ impl Reconstruction {
                 Change::SetEnsureKeys { .. } => {}
                 // A bootstrap from an empty schema has no renames, drops or
                 // alterations; one that does is not a bootstrap.
-                Change::DropTable { .. }
+                Change::CreateType { .. }
+                | Change::DropType { .. }
+                | Change::RenameType { .. }
+                | Change::DropTable { .. }
                 | Change::DetachPartition { .. }
                 | Change::AttachPartition { .. }
                 | Change::RenameTable { .. }

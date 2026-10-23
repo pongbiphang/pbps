@@ -1974,7 +1974,10 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | pbps_model::Change::AnalyzeTableTree(_) => {
                 panic!("cost fixture must not contain a pending rewrite")
             }
-            pbps_model::Change::CreateTable { .. } => {
+            pbps_model::Change::CreateType { .. }
+            | pbps_model::Change::DropType { .. }
+            | pbps_model::Change::RenameType { .. }
+            | pbps_model::Change::CreateTable { .. } => {
                 assert_eq!(c["status"], "unavailable");
                 assert!(c["reason"].as_str().unwrap().contains("no measurement"));
                 checked += 1;
@@ -11618,7 +11621,7 @@ fn catalog_handover_fixture(db: &OwnDatabase, k: usize) -> Demo {
         "SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
     ))
     .unwrap();
-    assert_eq!(recorded["version"], 31);
+    assert_eq!(recorded["version"], 32);
     assert_eq!(
         recorded["baseline_evidence"]["tables"]
             .as_object()
@@ -11919,7 +11922,7 @@ fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
         &["--allow", "destructive"],
     ));
     let applied = latest_snapshot(&connection);
-    assert_eq!(applied.version, 31);
+    assert_eq!(applied.version, 32);
     assert!(
         applied.baseline_evidence.is_some(),
         "apply recorded no catalog evidence"

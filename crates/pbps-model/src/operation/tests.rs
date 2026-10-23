@@ -267,6 +267,7 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
             ObjectKey::Grant { .. } => {}
             ObjectKey::Table(_)
             | ObjectKey::Column(_)
+            | ObjectKey::Type(_)
             | ObjectKey::Role(_)
             | ObjectKey::NotNull(_)
             | ObjectKey::Rows { .. }

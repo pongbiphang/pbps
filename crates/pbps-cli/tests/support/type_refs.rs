@@ -95,6 +95,7 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             assert_ne!(managed.digest, external.digest);
         };
         distinct_pins(&saved.type_pins);
+        let external_before = saved.type_pins.clone();
         for name in hostile_names {
             assert!(
                 saved
@@ -129,8 +130,32 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(next).unwrap()).unwrap();
         assert!(saved.changes.is_empty(), "{:?}", saved.changes);
-        assert_eq!(saved.type_pins.len(), 6);
-        distinct_pins(&saved.type_pins);
+        // Adopted enums/domains now carry uid/definition evidence. The
+        // undeclared composite and Ext.Mood retain their exact external pins.
+        assert_eq!(saved.type_pins.len(), 2);
+        assert_eq!(saved.declared_type_pins.len(), 4);
+        for pin in &saved.type_pins {
+            assert!(external_before.contains(pin));
+            let reference = pbps_model::TypeRef::new(&pin.schema, &pin.name).unwrap();
+            assert!(saved.ids.type_uid(&reference).is_none());
+        }
+        assert!(
+            saved
+                .type_pins
+                .iter()
+                .any(|pin| pin.schema == "Ext" && pin.name == "Mood")
+        );
+        assert!(
+            saved
+                .type_pins
+                .iter()
+                .any(|pin| pin.schema == "app" && pin.name == "pair")
+        );
+        for pin in &saved.declared_type_pins {
+            assert_eq!(saved.ids.types.get(&pin.uid), Some(&pin.name));
+            assert_eq!(loaded.schema.types.get(&pin.name), Some(&pin.definition));
+            assert!(pin.before.is_some());
+        }
         assert!(saved.ids.type_uid(&external).is_none());
         assert!(saved.ids.type_uid(&"app.mood".parse().unwrap()).is_some());
         // Explicitly prove schema cleanup on each major, in addition to the

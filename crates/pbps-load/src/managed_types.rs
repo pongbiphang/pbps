@@ -12,6 +12,7 @@ use crate::{
 pub struct LoadedType {
     pub name: TypeRef,
     pub definition: ManagedType,
+    pub renamed_from: Option<TypeRef>,
 }
 
 pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadError>> {
@@ -22,7 +23,7 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
         }]
     };
     let probe: KindProbe = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
-    let (name, definition) = match (probe.enumeration, probe.domain) {
+    let (name, definition, renamed_from) = match (probe.enumeration, probe.domain) {
         (Some(_), None) => {
             let dto: EnumTypeDto = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
             let mut seen = BTreeSet::new();
@@ -35,7 +36,11 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
                     )));
                 }
             }
-            (dto.name, ManagedType::Enum { values: dto.values })
+            (
+                dto.name,
+                ManagedType::Enum { values: dto.values },
+                dto.renamed_from,
+            )
         }
         (None, Some(_)) => {
             let dto: DomainTypeDto =
@@ -63,6 +68,7 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
                     checks,
                     collation,
                 },
+                dto.renamed_from,
             )
         }
         _ => {
@@ -74,15 +80,40 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
     let name = name
         .parse()
         .map_err(|e: pbps_model::TypeParseError| fail(e.to_string()))?;
-    Ok(LoadedType { name, definition })
+    let renamed_from = renamed_from
+        .map(|name| name.parse::<TypeRef>())
+        .transpose()
+        .map_err(|e| fail(e.to_string()))?;
+    Ok(LoadedType {
+        name,
+        definition,
+        renamed_from,
+    })
 }
 
 pub fn render_type(name: &TypeRef, definition: &ManagedType) -> String {
+    render_type_with_intents(name, definition, &[])
+}
+
+/// Pending rename annotations survive formatting until ids absorb them,
+/// using the same one-shot intent rule as tables and roles (SPEC §6.2).
+pub fn render_type_with_intents(
+    name: &TypeRef,
+    definition: &ManagedType,
+    pending: &[pbps_model::Intent],
+) -> String {
     let mut out = format!(
         "{}: {}\n",
         definition.kind(),
         scalar(&name.raw().to_string())
     );
+    for intent in pending {
+        if let pbps_model::Intent::RenameType { from, to } = intent
+            && to == name
+        {
+            let _ = writeln!(out, "renamed_from: {}", scalar(&from.raw().to_string()));
+        }
+    }
     match definition {
         ManagedType::Enum { values } => {
             let values: Vec<_> = values.iter().map(|v| scalar(v)).collect();

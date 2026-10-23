@@ -3634,6 +3634,9 @@ name = name.raw(),
         // Roles and grants are Phase 5 step 6, and `emit` refuses every one of
         // them by name until it lands. The securable probe the other dialect
         // asks for a schema target belongs with that step, not ahead of it.
+        | Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
@@ -4026,6 +4029,9 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }

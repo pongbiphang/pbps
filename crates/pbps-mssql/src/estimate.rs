@@ -247,6 +247,9 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
+                | Change::CreateType { .. }
+                | Change::DropType { .. }
+                | Change::RenameType { .. }
                 | Change::CreateRole { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }
@@ -352,6 +355,9 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
+                | Change::CreateType { .. }
+                | Change::DropType { .. }
+                | Change::RenameType { .. }
                 | Change::CreateRole { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }

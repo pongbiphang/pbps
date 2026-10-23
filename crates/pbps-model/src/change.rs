@@ -227,6 +227,22 @@ pub enum Change {
     RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
     CopyTableRows(Box<crate::CopyTableRows>),
     AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
+    CreateType {
+        uid: Uid,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
+    },
+    DropType {
+        uid: Uid,
+        name: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
+    },
+    RenameType {
+        uid: Uid,
+        from: crate::TypeRef,
+        to: crate::TypeRef,
+        definition: Box<crate::ManagedType>,
+    },
     CreateTable {
         uid: Uid,
         name: TableName,
@@ -1343,6 +1359,10 @@ impl Change {
         // This is a grouping/policy key and shared JSON text. Reports escape
         // it when rendering; #2084 step 5 (DEC-2084.1) removes that interim boundary.
         match self {
+            Change::CreateType { name, .. } | Change::DropType { name, .. } => {
+                name.raw().to_string()
+            }
+            Change::RenameType { from, .. } => from.raw().to_string(),
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
@@ -1442,6 +1462,9 @@ impl Change {
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1540,6 +1563,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1659,6 +1685,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1758,6 +1787,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1880,6 +1912,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1951,6 +1986,9 @@ impl Change {
             | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2042,6 +2080,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. } => None,
@@ -2067,7 +2108,10 @@ impl Change {
             // `PUBLIC` is not a role name; it is every principal at once, and
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
             Change::PublicExecution { .. } => (None, None),
-            Change::CreateTable { .. }
+            Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
+            | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
             | Change::DropTable { .. }
@@ -2174,6 +2218,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2282,6 +2329,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2356,6 +2406,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2491,6 +2544,9 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2521,7 +2577,10 @@ impl Change {
             Change::RenameRole { from, to, .. } => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
-            Change::CreateTable { .. }
+            Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
+            | Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
             | Change::DropTable { .. }
@@ -2629,6 +2688,9 @@ impl Change {
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2686,6 +2748,9 @@ impl Change {
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -2768,14 +2833,14 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // depends on it, not data — so it faces the gate, but needs no
             // tombstone and no reason: the definition is in git history, which
             // is this object family's audit trail (ADR-0002).
-            Change::DropModule { .. } => {
+            Change::DropType { .. } | Change::DropModule { .. } => {
                 r.insert(RiskClass::Destructive);
             }
             // A role rename keeps its membership — which is why it is a
             // rename and not drop + add — but the old name is gone the same
             // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
             // application breaks on the spot. Same gate as the other renames.
-            Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
+            Change::RenameType { .. } | Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
                 r.insert(RiskClass::Rename);
             }
             Change::AlterColumnNullability {
@@ -2983,6 +3048,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             // Creating a role grants nothing by itself.
+            | Change::CreateType { .. }
             | Change::CreateRole { .. }
             // A replica identity changes what logical replication carries to
             // name an old row, not a row or an access: no class here gates it

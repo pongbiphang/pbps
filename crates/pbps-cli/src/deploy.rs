@@ -755,14 +755,22 @@ pub(crate) fn occupant_slots(
     CatalogFacts {
         occupants: occupants
             .iter()
-            .map(|o| Occupant {
-                slot: SlotKey {
-                    namespace: Namespace::Relations(o.name.schema.clone()),
-                    name: o.name.name.clone(),
-                },
-                kind: o.kind.to_owned(),
-                owner: o.owner.clone(),
-                column: o.owner_column.clone(),
+            .flat_map(|o| {
+                let mut slots = vec![Occupant {
+                    slot: SlotKey {
+                        namespace: Namespace::Relations(o.name.schema.clone()),
+                        name: o.name.name.clone(),
+                    },
+                    kind: o.kind.to_owned(),
+                    owner: o.owner.clone(),
+                    column: o.owner_column.clone(),
+                }];
+                if o.kind == "composite type" {
+                    let mut row_type = slots[0].clone();
+                    row_type.slot.namespace = Namespace::Types(o.name.schema.clone());
+                    slots.push(row_type);
+                }
+                slots
             })
             .collect(),
         ..CatalogFacts::default()
@@ -4521,6 +4529,7 @@ fn staged_movement(
     )
 }
 
+#[allow(clippy::wildcard_enum_match_arm)] // Type deltas are checked apart from table/module effects.
 fn refuse_pinned_movement(
     dialect: &dyn pbps_dialect::Dialect,
     read: guard::Read<'_>,
@@ -4528,26 +4537,107 @@ fn refuse_pinned_movement(
     after: &Schema,
     label: &str,
 ) -> anyhow::Result<()> {
-    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
-    for name in types {
-        if before.types.get(name) != after.types.get(name) {
-            bail!(
-                "type `{}` changed during {label}; type lifecycle arrives in later slices of #1635",
-                name.shown()
-            );
-        }
-    }
     let (plan, settled) = read.parts();
     let changes = plan.changes;
+    let mut named_before = sequences_named(dialect, before);
+    for step in &changes.changes {
+        if let pbps_model::Change::RenameType { from, to, .. } = &step.change {
+            let intermediate = pbps_model::TypeRef::new(to.schema(), from.name()).ok();
+            let landed = if after.types.contains_key(to) {
+                Some(to)
+            } else {
+                intermediate
+                    .as_ref()
+                    .filter(|name| after.types.contains_key(*name))
+            };
+            if let Some(landed) = landed {
+                for definition in named_before.to_mut().types.values_mut() {
+                    if let pbps_model::ManagedType::Domain { base, .. } = definition
+                        && (base.type_ref() == Some(from)
+                            || base
+                                .type_ref()
+                                .is_some_and(|r| intermediate.as_ref() == Some(r)))
+                    {
+                        let ty = pbps_model::ColumnType::reference(landed.clone());
+                        *base = if base.is_array() { ty.into_array() } else { ty };
+                    }
+                }
+                for table in named_before.to_mut().tables.values_mut() {
+                    for column in table.columns.values_mut() {
+                        if column.ty.type_ref() == Some(from)
+                            || column
+                                .ty
+                                .type_ref()
+                                .is_some_and(|r| intermediate.as_ref() == Some(r))
+                        {
+                            let ty = pbps_model::ColumnType::reference(landed.clone());
+                            column.ty = if column.ty.is_array() {
+                                ty.into_array()
+                            } else {
+                                ty
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let before = named_before.as_ref();
+    let mut expected_types = BTreeMap::new();
+    for step in &changes.changes {
+        match &step.change {
+            pbps_model::Change::CreateType {
+                name, definition, ..
+            } => {
+                expected_types.insert(name.clone(), Some(definition.as_ref()));
+            }
+            pbps_model::Change::DropType { name, .. } => {
+                expected_types.insert(name.clone(), None);
+            }
+            pbps_model::Change::RenameType {
+                from,
+                to,
+                definition,
+                ..
+            } => {
+                expected_types.insert(from.clone(), None);
+                expected_types.insert(to.clone(), Some(definition.as_ref()));
+                if let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name()) {
+                    expected_types.entry(intermediate).or_insert(None);
+                }
+            }
+            _ => {}
+        }
+    }
+    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
+    for name in types {
+        if before.types.get(name) != after.types.get(name) && !expected_types.contains_key(name) {
+            bail!("type `{}` changed during {label}", name.shown());
+        }
+    }
+    if !matches!(settled, Settled::SoFar) {
+        for (name, expected) in &expected_types {
+            let matches = match (expected, after.types.get(name)) {
+                (Some(wrote), Some(now)) => {
+                    pbps_pg::type_refs::declared::matches_declaration(wrote, now)
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !matches {
+                bail!(
+                    "type `{}` does not match what its plan promised during {label}",
+                    name.shown()
+                );
+            }
+        }
+    }
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, plan.ids)?;
     // Each owned sequence under the name it has, before anything below maps
     // a column or table across a rename: a held name is `None` where it is
     // the generated one, and a rename changes that without touching the
     // sequence (#1631).
-    let (before, after) = (
-        &sequences_named(dialect, before),
-        &sequences_named(dialect, after),
-    );
+    let (before, after) = (&named_before, &sequences_named(dialect, after));
     let mut objects: BTreeSet<&TableName> = BTreeSet::new();
     // Modules are counted in their own set, under their own identity: a
     // module is no longer a name in the tables namespace (ADR-0009 §1), and
@@ -6125,7 +6215,10 @@ pub fn cmd_bootstrap(
 
         // A connected generation proves nothing about a later replay target.
         // Keep the input-path proof in connected execution (DEC-2181.1).
-        if sql_out.is_some() && !crate::engine::type_references(&loaded.schema).is_empty() {
+        if sql_out.is_some() && (
+            crate::engine::type_references(&loaded.schema).iter().any(|r| !loaded.schema.types.contains_key(r))
+            || loaded.schema.types.values().any(|t| matches!(t, pbps_model::ManagedType::Domain { default, checks, .. } if default.is_some() || !checks.is_empty()))
+        ) {
             bail!(
                 "bootstrap --sql cannot validate referenced type input paths for its replay target; run connected bootstrap without --sql, or use plan/apply against the target (DEC-2181.1)"
             );
@@ -6772,26 +6865,6 @@ pub fn cmd_plan_db(
 
         let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        if !resolved.ids.types.is_empty() {
-            let live = crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
-            // An omitted definition is present but unrepresentable. Refuse it
-            // before the lifecycle comparison can misreport it as absent.
-            refuse_managed_limitations(&managed_limitations(
-                &live,
-                &resolved.ids,
-                &managed_modules(None, Some(&loaded.schema)),
-                &pbps_diff::external_parents(&loaded.schema),
-            ))?;
-            let managed = Schema {
-                types: live.schema.types.into_iter()
-                    .filter(|(name, _)| resolved.ids.type_uid(name).is_some()).collect(),
-                ..Default::default()
-            };
-            let errors = pbps_diff::schema_diff::type_differences(&managed, &loaded.schema, dialect.as_ref());
-            if !errors.is_empty() {
-                bail!("{}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
-            }
-        }
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
             &[&loaded.schema],
@@ -7695,6 +7768,7 @@ pub fn cmd_plan_db(
                 })
             }
         };
+        let declared_type_pins = pbps_pg::type_refs::declared::seal(&read_back, &recorded_ids, &declared, &resolved.ids);
         Ok(Connected::Ordinary(Box::new((
             cs,
             // The zone this session started in: what every offset-less
@@ -7722,6 +7796,7 @@ pub fn cmd_plan_db(
             cost,
             routine_pins,
             type_pins,
+            declared_type_pins,
             reviewed,
             resolver_assessment,
             resolution,
@@ -7736,6 +7811,7 @@ pub fn cmd_plan_db(
             cost,
             routine_pins,
             type_pins,
+            declared_type_pins,
             reviewed,
             resolver_assessment,
             resolution,
@@ -7797,7 +7873,16 @@ pub fn cmd_plan_db(
             modules,
             roles: crate::report::touched_roles(&names),
             risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
-            connected_checks,
+            connected_checks: {
+                let mut checks = connected_checks;
+                if declared_type_pins.iter().any(|pin| matches!(&pin.definition, pbps_model::ManagedType::Domain { default, checks, .. } if default.is_some() || !checks.is_empty())) {
+                    checks.push(crate::engine::ConnectedCheck {
+                        name: "declared-domain-code", engine: "PostgreSQL", status: "deferred",
+                        message: "Declared domain checks and defaults are vetted inside apply, immediately after their type statements.".into(),
+                    });
+                }
+                checks
+            },
             type_routines: reviewed.0.clone(),
             type_routine_approval: (!reviewed.0.is_empty())
                 .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
@@ -7860,6 +7945,7 @@ pub fn cmd_plan_db(
         // declarations' scope, carried so that `apply` needs no checkout.
         plan.data = loaded.schema.data_scopes();
         plan.routine_pins = routine_pins;
+        plan.declared_type_pins = declared_type_pins;
         plan.type_pins = type_pins;
         plan.pin_type_routines = project.config.pin_type_routines;
         (plan.type_routines, plan.type_routine_pins) = reviewed;
@@ -8735,7 +8821,7 @@ fn rename_snapshot_roles(
 fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
     let mut scoped = recorded.clone();
     for (uid, name) in &declared.types {
-        if scoped.type_uid(name).is_none() {
+        if !scoped.types.contains_key(uid) && scoped.type_uid(name).is_none() {
             scoped.types.insert(uid.clone(), name.clone());
         }
     }
@@ -9138,7 +9224,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             }
             .await;
             finish_transaction(conn, dialect, result).await
-        } else if stmt.transactional && (!written_routines.is_empty() || !plan.type_pins.is_empty())
+        } else if stmt.transactional
+            && (stmt.declared_type.is_some()
+                || !written_routines.is_empty()
+                || !plan.type_pins.is_empty()
+                || !plan.declared_type_pins.is_empty())
         {
             // A step of a plan that writes routines runs in a transaction of
             // its own, so that a SECURITY DEFINER routine outside the safe
@@ -9148,6 +9238,14 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 .await?;
             let result = async {
                 conn.execute(&stmt.sql).await?;
+                if let Some(type_statement) = &stmt.declared_type {
+                    pbps_pg::type_refs::declared::vet(
+                        conn,
+                        type_statement,
+                        &project.config.trusted_roles,
+                    )
+                    .await?;
+                }
                 crate::engine::refuse_unsafe_definers(
                     conn,
                     &written_routines,
@@ -9218,6 +9316,15 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         }
         for (from, to) in &stmt.role_renames {
             live_ids.rename_role(from, to);
+        }
+        if let Some(type_statement) = &stmt.declared_type {
+            if type_statement.definition.is_some() {
+                live_ids
+                    .types
+                    .insert(type_statement.uid.clone(), type_statement.name.clone());
+            } else {
+                live_ids.types.remove(&type_statement.uid);
+            }
         }
         adopt_created(&mut live_ids, &plan.ids, &stmt.creates);
 
@@ -10146,6 +10253,7 @@ async fn execute_transaction_body(
             position,
             &crate::engine::DataWriteGuard::default(),
             None,
+            trusted,
         )
         .await?;
     }
@@ -10159,7 +10267,17 @@ async fn execute_statements(
     reviewed: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
     for position in 0..statements.len() {
-        execute_statement(conn, statements, position, data_guard, reviewed).await?;
+        execute_statement(
+            conn,
+            statements,
+            position,
+            data_guard,
+            reviewed,
+            reviewed
+                .map(|a| &a.project.config.trusted_roles)
+                .unwrap_or(&BTreeSet::new()),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -10172,6 +10290,7 @@ async fn execute_statement(
     position: usize,
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<()> {
     let stmt = &statements[position];
     if let Some(approved) = reviewed {
@@ -10195,6 +10314,9 @@ async fn execute_statement(
             "the database rejected this statement, and the whole plan was rolled back:\n{}",
             stmt.sql
         )));
+    }
+    if let Some(type_statement) = &stmt.declared_type {
+        pbps_pg::type_refs::declared::vet(conn, type_statement, trusted).await?;
     }
     Ok(())
 }

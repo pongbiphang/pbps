@@ -425,6 +425,59 @@ pub fn validate_saved_plan(
         struct Identity(#[source] Box<dyn std::error::Error + Send + Sync>);
         AdmissionError::from_error(Identity(Box::new(source)))
     })?;
+    let mut pinned_types = std::collections::BTreeSet::new();
+    for pin in &plan.declared_type_pins {
+        if pin.uid.kind() != pbps_model::UidKind::Type
+            || plan.ids.types.get(&pin.uid) != Some(&pin.name)
+            || !pinned_types.insert(pin.uid.clone())
+        {
+            refuse!(
+                "declared type evidence disagrees with the identity mapping for `{}`",
+                pin.name.shown()
+            );
+        }
+        if let Some(error) = dialect
+            .validate_type(&pin.name, &pin.definition)
+            .into_iter()
+            .next()
+        {
+            return Err(AdmissionError::from_error(error));
+        }
+    }
+    if pinned_types.len() != plan.ids.types.len() {
+        refuse!("the plan does not pin every declared type identity");
+    }
+    for step in &plan.changes.changes {
+        // These checks supplement the existing admission for type lifecycle payloads.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let valid = match &step.change {
+            pbps_model::Change::CreateType {
+                uid,
+                name,
+                definition,
+            } => {
+                uid.kind() == pbps_model::UidKind::Type
+                    && plan.ids.types.get(uid) == Some(name)
+                    && plan.declared_type_pins.iter().any(|p| {
+                        p.uid == *uid && p.before.is_none() && p.definition == **definition
+                    })
+            }
+            pbps_model::Change::RenameType { uid, from, to, .. } => {
+                uid.kind() == pbps_model::UidKind::Type
+                    && plan.ids.types.get(uid) == Some(to)
+                    && plan.declared_type_pins.iter().any(|p| {
+                        p.uid == *uid && p.before.as_ref().is_some_and(|b| b.name == *from)
+                    })
+            }
+            pbps_model::Change::DropType { uid, .. } => {
+                uid.kind() == pbps_model::UidKind::Type && !plan.ids.types.contains_key(uid)
+            }
+            _ => true,
+        };
+        if !valid {
+            refuse!("type lifecycle payload disagrees with its declared evidence");
+        }
+    }
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 

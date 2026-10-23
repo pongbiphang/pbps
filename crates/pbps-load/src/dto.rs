@@ -47,6 +47,8 @@ pub struct KindProbe {
 pub struct EnumTypeDto {
     #[serde(rename = "enum")]
     pub name: String,
+    #[serde(default)]
+    pub renamed_from: Option<String>,
     #[schemars(schema_with = "enum_values_schema")]
     pub values: Vec<String>,
 }
@@ -61,6 +63,8 @@ fn enum_values_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::S
 pub struct DomainTypeDto {
     #[serde(rename = "domain")]
     pub name: String,
+    #[serde(default)]
+    pub renamed_from: Option<String>,
     #[serde(rename = "type")]
     pub base: String,
     #[serde(default)]

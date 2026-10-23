@@ -296,6 +296,9 @@ pub(crate) fn planned_schema_grants(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -406,6 +409,9 @@ impl Authorization {
                         Change::Grant { .. }
                             | Change::Revoke { .. }
                             | Change::PublicExecution { .. }
+                            | Change::CreateType { .. }
+                            | Change::DropType { .. }
+                            | Change::RenameType { .. }
                             | Change::CreateRole { .. }
                             | Change::RenameRole { .. }
                             | Change::DropRole { .. }

@@ -38,7 +38,11 @@ fn tables_views_and_indexes_share_the_schemas_relation_namespace() {
     ] {
         assert_eq!(
             namespaces(kind),
-            std::slice::from_ref(&relations),
+            if kind == NameKind::Index {
+                vec![relations.clone()]
+            } else {
+                vec![relations.clone(), Namespace::Types("app".into())]
+            },
             "{kind:?}"
         );
     }

@@ -36,7 +36,7 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
-    #[error("type `{name}`: {reason}; type lifecycle arrives in later slices of #1635", name = .name.shown())]
+    #[error("type `{name}`: {reason}", name = .name.shown())]
     TypeLifecycleUnsupported {
         name: pbps_model::TypeRef,
         reason: String,
@@ -533,9 +533,48 @@ pub(crate) fn rebuilding_by(
     screen: Screen,
     read_back: Option<&Schema>,
 ) -> Result<crate::order::DiffPlan, Vec<DiffError>> {
-    let d = diff_partial_rebuilding(
+    let mut d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
+    if d.errors.is_empty() {
+        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+        let mode = if dialect.rebuilds_modules() {
+            ModuleEdits::Rebuilt
+        } else {
+            ModuleEdits::InPlace
+        };
+        let operations = Operations::of_plan(&d.changes.changes, mode);
+        if let Ok(names) = pbps_model::plan_names::PlanNames::of(&d.changes.changes, declared.ids) {
+            let owners = PlanOwners::new(names, base.ids, declared.ids);
+            let before = Snapshot {
+                schema: base.schema,
+                ids: base.ids,
+            };
+            let slots =
+                crate::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
+            for violation in crate::order::slots::verify(
+                operations.as_slice(),
+                &slots,
+                dialect,
+                None,
+                &owners,
+                before,
+            )
+            .0
+            {
+                if let crate::order::slots::SlotViolation::Contested { slot, .. }
+                | crate::order::slots::SlotViolation::IntermediateHeld { slot, .. } = violation
+                    && let pbps_dialect::slots::Namespace::Types(schema) = slot.namespace
+                    && let Ok(name) = pbps_model::TypeRef::new(&schema, &slot.name)
+                {
+                    d.errors.push(DiffError::TypeLifecycleUnsupported {
+                        name,
+                        reason: "pg_type name is already occupied by another declaration".into(),
+                    });
+                }
+            }
+        }
+    }
     if d.errors.is_empty() {
         // The resolver's intermediate plan is not an order anything runs: its
         // final one is observed where it is made.
@@ -596,13 +635,12 @@ pub fn type_differences(
     dialect: &(impl Dialect + ?Sized),
 ) -> Vec<DiffError> {
     let mut errs = Vec::new();
-    // Types are compared state, but have no Change or DDL in slice one.
-    // The caller has already cut the live catalog to the managed set.
+    // Whole-object changes are handled by uid; retained definitions still
+    // refuse the attributes reserved for later slices.
     let names: BTreeSet<_> = base.types.keys().chain(declared.types.keys()).collect();
     for name in names {
         let reason = match (base.types.get(name), declared.types.get(name)) {
-            (None, Some(_)) => Some("declared but absent from the target".to_owned()),
-            (Some(_), None) => Some("present in the managed target but not declared".to_owned()),
+            (None, Some(_)) | (Some(_), None) => None,
             (Some(old), Some(new)) => {
                 let normalize = |definition: &pbps_model::ManagedType| {
                     let mut definition = definition.clone();
@@ -614,7 +652,7 @@ pub fn type_differences(
                     definition
                 };
                 let fields = normalize(old).differences(&normalize(new));
-                (!fields.is_empty()).then(|| format!("{} changed", fields.join(", ")))
+                (!fields.is_empty()).then(|| format!("{} changed; enum label changes require #1635 slice 3, domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
             }
             (None, None) => None,
         };
@@ -715,7 +753,108 @@ pub(crate) fn diff_partial_rebuilding(
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
 
-    errs.extend(type_differences(base.schema, declared.schema, dialect));
+    // Definitions match by recorded identity. A rename is never inferred
+    // from equal definitions or a pair of disappearing/appearing names.
+    let unrecorded_base = Schema {
+        types: base
+            .schema
+            .types
+            .iter()
+            .filter(|(name, _)| {
+                base.ids.type_uid(name).is_none() && declared.ids.type_uid(name).is_none()
+            })
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    errs.extend(type_differences(&unrecorded_base, declared.schema, dialect));
+    let mut type_renames = BTreeMap::new();
+    for (uid, old_name) in &base.ids.types {
+        let Some(old) = base.schema.types.get(old_name) else {
+            continue;
+        };
+        match declared
+            .ids
+            .types
+            .get(uid)
+            .and_then(|name| declared.schema.types.get(name).map(|ty| (name, ty)))
+        {
+            None => {
+                let used = declared.schema.tables.values().any(|t| t.columns.values().any(|c| c.ty.type_ref() == Some(old_name)))
+                    || declared.schema.types.values().any(|t| matches!(t, pbps_model::ManagedType::Domain { base, .. } if base.type_ref() == Some(old_name)));
+                if used {
+                    errs.push(DiffError::TypeLifecycleUnsupported { name: old_name.clone(), reason: "a retained declaration still uses this type; drop or change its dependents first".into() });
+                }
+                changes.push(Change::DropType {
+                    uid: uid.clone(),
+                    name: old_name.clone(),
+                    definition: Box::new(old.clone()),
+                });
+            }
+            Some((name, new)) => {
+                let mut comparable = old.clone();
+                if let pbps_model::ManagedType::Domain { base: ty, .. } = &mut comparable
+                    && let Some(reference) = ty.type_ref()
+                    && let Some(type_uid) = base.ids.type_uid(reference)
+                    && let Some(renamed) = declared.ids.types.get(type_uid)
+                {
+                    *ty = if ty.is_array() {
+                        pbps_model::ColumnType::reference(renamed.clone()).into_array()
+                    } else {
+                        pbps_model::ColumnType::reference(renamed.clone())
+                    };
+                }
+                let old_schema = Schema {
+                    types: [(name.clone(), comparable)].into(),
+                    ..Default::default()
+                };
+                let new_schema = Schema {
+                    types: [(name.clone(), new.clone())].into(),
+                    ..Default::default()
+                };
+                errs.extend(type_differences(&old_schema, &new_schema, dialect));
+                if old_name != name {
+                    type_renames.insert(old_name.clone(), name.clone());
+                    changes.push(Change::RenameType {
+                        uid: uid.clone(),
+                        from: old_name.clone(),
+                        to: name.clone(),
+                        definition: Box::new(new.clone()),
+                    });
+                }
+            }
+        }
+    }
+    for (uid, name) in &declared.ids.types {
+        if base
+            .ids
+            .types
+            .get(uid)
+            .and_then(|old| base.schema.types.get(old))
+            .is_none()
+            && let Some(definition) = declared.schema.types.get(name)
+        {
+            changes.push(Change::CreateType {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Box::new(definition.clone()),
+            });
+        }
+    }
+    for start in type_renames.keys() {
+        let mut seen = BTreeSet::new();
+        let mut name = start;
+        while let Some(next) = type_renames.get(name) {
+            if !seen.insert(name) {
+                errs.push(DiffError::TypeLifecycleUnsupported {
+                    name: start.clone(),
+                    reason: "type rename cycle (swap) is refused; use separate plans".into(),
+                });
+                break;
+            }
+            name = next;
+        }
+    }
 
     // A retained uid is still a managed claim after a manual drop and a
     // baseline. It cannot become an unheld identity in an empty apply.
@@ -1278,6 +1417,9 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetEnsureKeys { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1334,6 +1476,9 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1530,6 +1675,9 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1590,6 +1738,9 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -1935,7 +2086,36 @@ pub(crate) fn diff_partial_rebuilding(
             .and_then(|t| t.partition_of.as_ref())
             .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
     };
+    let mut type_rank = BTreeMap::new();
+    let mut drop_type_rank = BTreeMap::new();
+    for (schema, ranks) in [
+        (declared.schema, &mut type_rank),
+        (base.schema, &mut drop_type_rank),
+    ] {
+        for name in schema.types.keys() {
+            let mut at = name;
+            let mut seen = BTreeSet::new();
+            while let Some(pbps_model::ManagedType::Domain { base, .. }) = schema.types.get(at) {
+                if !seen.insert(at.clone()) {
+                    errs.push(DiffError::TypeLifecycleUnsupported {
+                        name: name.clone(),
+                        reason: "domain base dependency cycle".into(),
+                    });
+                    break;
+                }
+                let Some(next) = base.type_ref() else {
+                    break;
+                };
+                at = next;
+            }
+            ranks.insert(name.clone(), seen.len() as isize);
+        }
+    }
     let sort_class = |c: &Change| -> (u8, usize) {
+        if matches!(c, Change::CreateType { .. }) {
+            return (7, 0);
+        }
+
         // After every module and its PUBLIC decision, then policies before
         // either flag. Keep the established class ordinals (DEC-1172.1).
         if matches!(c, Change::CreatePolicy { .. }) {
@@ -2168,7 +2348,15 @@ pub(crate) fn diff_partial_rebuilding(
             {
                 *rank
             } else {
-                dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank)
+                dependency_rank(
+                    &p.change,
+                    &create_rank,
+                    &drop_rank,
+                    &data_rank,
+                    &role_rank,
+                    &type_rank,
+                    &drop_type_rank,
+                )
             },
             p.change.subject(),
             // Columns added to one table in the order they are declared:
@@ -2274,7 +2462,14 @@ fn diff_columns(
         };
 
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
-        let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        let (mut from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
+        if let (Some(old), Some(new)) = (from_ty.type_ref(), to_ty.type_ref())
+            && index.base.type_uid(old).is_some()
+            && index.base.type_uid(old) == index.declared.type_uid(new)
+            && from_ty.is_array() == to_ty.is_array()
+        {
+            from_ty = to_ty.clone();
+        }
         let mut recomputed = false;
         // A numbering source changed in place (#1889, DEC-1889.1), where the
         // engine has an `ALTER` for it and the table takes it. A parent's
@@ -2658,6 +2853,9 @@ fn recreate_referenced_foreign_keys(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -3215,6 +3413,9 @@ fn recreate_retyped_dependents(
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
+        | Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }
@@ -5254,6 +5455,9 @@ fn refuse_computed_dependencies(
                     | Change::CreateModule { .. }
                     | Change::AlterModule { .. }
                     | Change::DropModule { .. }
+                    | Change::CreateType { .. }
+                    | Change::DropType { .. }
+                    | Change::RenameType { .. }
                     | Change::CreateRole { .. }
                     | Change::DropRole { .. }
                     | Change::RenameRole { .. }
@@ -6281,6 +6485,8 @@ fn dependency_rank(
     drop_rank: &BTreeMap<ModuleId, usize>,
     data_rank: &BTreeMap<TableName, usize>,
     role_rank: &BTreeMap<pbps_model::RoleName, usize>,
+    type_rank: &BTreeMap<pbps_model::TypeRef, isize>,
+    drop_type_rank: &BTreeMap<pbps_model::TypeRef, isize>,
 ) -> isize {
     match change {
         Change::RebuildPartitionedTable(_)
@@ -6295,6 +6501,10 @@ fn dependency_rank(
         // Module ranks can be arbitrarily deep. A fixed -1 would leave a
         // policy behind a dropped routine it calls (DEC-1173.2).
         Change::DropPolicy { .. } => -(drop_rank.len() as isize) - 1,
+        Change::CreateType { name, .. } | Change::RenameType { to: name, .. } => {
+            *type_rank.get(name).unwrap_or(&0)
+        }
+        Change::DropType { name, .. } => -drop_type_rank.get(name).copied().unwrap_or(0),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
@@ -7052,6 +7262,9 @@ fn order_key(c: &Change) -> u8 {
         | Change::AnalyzeTableTree(_) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")
         }
+        Change::CreateType { .. } => 7,
+        Change::DropType { .. } => 18,
+        Change::RenameType { .. } => 1,
         // A policy releases its bindings before module and column teardown.
         Change::DropPolicy { .. } => 0,
         // Modules go first and last, and both ends are load-bearing. A
@@ -24511,7 +24724,81 @@ mod managed_type_tests {
     }
 
     #[test]
-    fn every_type_lifecycle_difference_refuses_a_plan_by_name() {
+    fn type_identity_drives_creation_removal_and_rename_while_swaps_refuse() {
+        let definition = ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let a: pbps_model::TypeRef = "app.a".parse().unwrap();
+        let b: pbps_model::TypeRef = "app.b".parse().unwrap();
+        let uid: Uid = "y_000001".parse().unwrap();
+        let base = Schema {
+            types: [(a.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let target = Schema {
+            types: [(b.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let base_ids = IdsFile {
+            types: [(uid.clone(), a.clone())].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: [(uid.clone(), b.clone())].into(),
+            ..Default::default()
+        };
+        let run = |base: &Schema, base_ids: &IdsFile, desired: &Schema, ids: &IdsFile| {
+            diff(
+                Side {
+                    schema: base,
+                    ids: base_ids,
+                },
+                Side {
+                    schema: desired,
+                    ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let renamed = run(&base, &base_ids, &target, &ids).unwrap();
+        assert!(
+            matches!(&renamed.changes[0].change, Change::RenameType { uid: got, from, to, .. } if got == &uid && from == &a && to == &b)
+        );
+        let created = run(&Schema::default(), &IdsFile::default(), &base, &base_ids).unwrap();
+        assert!(matches!(
+            created.changes[0].change,
+            Change::CreateType { .. }
+        ));
+        let dropped = run(&base, &base_ids, &Schema::default(), &IdsFile::default()).unwrap();
+        assert!(matches!(dropped.changes[0].change, Change::DropType { .. }));
+        assert_eq!(
+            dropped.risks(),
+            [pbps_model::change::RiskClass::Destructive].into()
+        );
+        let both = Schema {
+            types: [(a.clone(), definition.clone()), (b.clone(), definition)].into(),
+            ..Default::default()
+        };
+        let other: Uid = "y_000002".parse().unwrap();
+        let old = IdsFile {
+            types: [(uid.clone(), a.clone()), (other.clone(), b.clone())].into(),
+            ..Default::default()
+        };
+        let swapped = IdsFile {
+            types: [(uid, b), (other, a)].into(),
+            ..Default::default()
+        };
+        assert!(
+            run(&both, &old, &both, &swapped)
+                .unwrap_err()
+                .iter()
+                .any(|e| e.to_string().contains("swap"))
+        );
+    }
+
+    #[test]
+    fn type_attribute_changes_remain_refused_by_name() {
         let enumeration = ManagedType::Enum {
             values: vec!["sad".into(), "ok".into()],
         };
@@ -24522,10 +24809,7 @@ mod managed_type_tests {
             checks: [("digits".into(), "VALUE <> ''".into())].into(),
             collation: None,
         };
-        let mut cases = vec![
-            (Schema::default(), schema(enumeration.clone())),
-            (schema(enumeration.clone()), Schema::default()),
-        ];
+        let mut cases = Vec::new();
         for values in [
             vec!["sad", "ok", "happy"],
             vec!["sad"],
@@ -24586,8 +24870,7 @@ mod managed_type_tests {
             assert!(
                 errors.iter().any(|error| {
                     let message = error.to_string();
-                    message.contains("app.t")
-                        && message.contains("type lifecycle arrives in later slices")
+                    message.contains("app.t") && message.contains("slice 3")
                 }),
                 "{errors:?}"
             );
@@ -24634,9 +24917,7 @@ mod managed_type_tests {
         assert!(
             errors.iter().any(|error| {
                 let message = error.to_string();
-                message.contains("app.gone")
-                    && message.contains("its identity remains recorded")
-                    && message.contains("type lifecycle arrives in later slices")
+                message.contains("app.gone") && message.contains("its identity remains recorded")
             }),
             "{errors:?}"
         );

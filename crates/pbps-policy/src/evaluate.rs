@@ -399,6 +399,9 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
+                | Change::CreateType { .. }
+                | Change::DropType { .. }
+                | Change::RenameType { .. }
                 | Change::CreateRole { .. }
                 | Change::DropRole { .. }
                 | Change::RenameRole { .. }

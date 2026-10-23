@@ -83,8 +83,8 @@ pub use name::{
 };
 pub use partitions::Partitions;
 pub use plan::{
-    PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, TypePin, TypeRoutine,
-    state_checksum, wire_fingerprint,
+    DeclaredTypeBefore, DeclaredTypePin, PlanBaseline, PlanMode, PlanOrigin, RoutinePins,
+    SavedPlan, SchemaPin, TypePin, TypeRoutine, state_checksum, wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{Rebuild, RebuildIdentities};

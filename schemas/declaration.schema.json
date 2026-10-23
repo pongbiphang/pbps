@@ -1629,6 +1629,13 @@
         "enum": {
           "type": "string"
         },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "values": {
           "type": "array",
           "items": {
@@ -1649,6 +1656,13 @@
       "properties": {
         "domain": {
           "type": "string"
+        },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "type": {
           "type": "string"
@@ -1686,6 +1700,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 55,
+  "x-pbps-schema-version": 56,
   "x-pbps-tool-version": "0.0.0"
 }
