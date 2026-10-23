@@ -1092,3 +1092,16 @@ Observed PKs supply teardown; desired typed definitions supply restoration.
 The module adapter preserves existing lists and byte oracles without claiming
 catalog completeness. Collection and expansion remain later slices; no execution
 authority is enabled.
+
+<a id="dec-2298-6"></a>
+
+**DEC-2298.6. PostgreSQL dependency collection preserves physical evidence.**
+The engine routes Module/Table roots to a transaction-scoped collector, separate
+from the unchanged module compatibility route. Catalog-local relation, attribute,
+row/array type, exact routine and key bindings retain ownership and every direct
+edge, including partition clones, inherited checks, TOAST and PG18 NOT NULL.
+Unknown kinds remain named, unrepresentable evidence. Missing source members and
+unreadable reads refuse; SQLSTATE 42501 is retained with its source error.
+Publication membership reads all three raw modes and ancestors: the convenience
+view omits empty partitioned parents. Evidence grants no execution authority;
+PR4 must lock and recertify before execution. No ordering or admission changes.

@@ -204,3 +204,32 @@ fn module_compatibility_keeps_the_original_lists_and_empty_reads() {
     edit(&mut g, 1).held = Held::Root(Root::Module(module.clone()));
     assert_eq!(g.closure(&Root::Module(module)).unwrap().edges.len(), 4);
 }
+
+#[test]
+fn catalog_publication_and_managed_facts_are_required_even_with_a_complete_graph() {
+    let mut catalog = Catalog {
+        graph: diamond(),
+        ..Catalog::default()
+    };
+    let declared = pbps_model::Schema::default();
+    for fact in [Fact::Absent, Fact::Unreadable("SQLSTATE 42501".into())] {
+        catalog.publications = fact;
+        assert!(
+            catalog
+                .checked(&root(), &declared)
+                .unwrap_err()
+                .contains("publication")
+        );
+    }
+    catalog.publications = Fact::Present(BTreeSet::new());
+    assert!(
+        catalog
+            .checked(&root(), &declared)
+            .unwrap_err()
+            .contains("node 2")
+    );
+    catalog.publications =
+        Fact::Present([("replication".into(), "app.parent".parse().unwrap())].into());
+    let why = catalog.checked(&root(), &declared).unwrap_err();
+    assert!(why.contains("replication") && why.contains("app.parent"));
+}

@@ -3544,6 +3544,23 @@ pub async fn check_module_rebuilds(
     }
 }
 
+/// Complete physical evidence for future table-root expansion; this grants no admission.
+#[allow(
+    dead_code,
+    reason = "PR2c consumes these facts; PR4 alone grants admission"
+)]
+pub async fn catalog_dependents(
+    conn: &mut Conn,
+    root: &pbps_diff::order::catalog::graph::Root,
+    source: pbps_diff::Side<'_>,
+) -> anyhow::Result<pbps_diff::order::catalog::graph::Catalog> {
+    anyhow::ensure!(
+        conn.driver() == Driver::Postgres,
+        "{root:?}: complete dependency evidence requires PostgreSQL; SQL Server rebuild is refused"
+    );
+    Ok(pbps_pg::modules::dependencies::collect(conn, root, source).await?)
+}
+
 /// Every dependent of every module this plan drops, read inside the caller's
 /// transaction (`modules::dependents` refuses outside one). Empty on SQL
 /// Server, whose `CREATE OR ALTER` rebuilds nothing.

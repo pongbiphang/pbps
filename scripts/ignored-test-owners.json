@@ -1400,6 +1400,8 @@
         "darwin"
       ],
       "cases": [
+        "dependencies_tests::table_catalog_keeps_physical_edges_bindings_and_clone_owners",
+        "dependencies_tests::publication_modes_missing_trees_and_unreadable_catalogs_are_named",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "a_backfilled_literal_is_compared_through_its_columns_type",
         "a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting",

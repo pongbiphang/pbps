@@ -3497,3 +3497,6 @@ pub async fn policies_affected_by_table_rename(
     }
     Ok(found)
 }
+
+/// Lossless root dependency evidence; the legacy module adapter stays unchanged.
+pub mod dependencies;
