@@ -953,7 +953,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 // summary stops counting it.
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
+Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
         Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
@@ -1316,6 +1316,7 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
 pub fn describe(c: &Change) -> String {
     match c {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             let (operation, _) = c.pending_rebuild().expect("rebuild variant");

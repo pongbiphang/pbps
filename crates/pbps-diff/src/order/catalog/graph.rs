@@ -98,6 +98,8 @@ pub struct Graph {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Closure {
+    /// Validated ultimate action owner, shared by restoration and name slots.
+    pub owners: BTreeMap<Object, Object>,
     pub nodes: BTreeMap<Object, Node>,
     pub edges: BTreeSet<(Object, Link)>,
     pub surfaces: BTreeMap<Object, Dependent>,
@@ -222,6 +224,10 @@ impl Graph {
                     .join(", ")
             ));
         }
+        out.owners = owners
+            .into_iter()
+            .map(|(id, owner)| (id.clone(), owner.clone()))
+            .collect();
         Ok(out)
     }
 }
@@ -259,8 +265,18 @@ pub struct Key {
     pub referenced_columns: Vec<Object>,
 }
 
+/// Physical spellings and parser-chosen index attribute names, never describe text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartSpelling {
+    pub table: pbps_model::TableName,
+    pub name: pbps_model::ObjectLocalName,
+    pub kind: pbps_model::operation::NameKind,
+    pub index_attributes: Option<Vec<pbps_model::ColumnName>>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
+    pub spellings: Fact<BTreeMap<Object, PartSpelling>>,
     pub graph: Graph,
     pub relations: BTreeMap<Object, Relation>,
     pub keys: BTreeMap<Object, Key>,

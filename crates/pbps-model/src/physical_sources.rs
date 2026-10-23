@@ -378,6 +378,7 @@ impl Build<'_, '_> {
         let boundary = step + 1;
         match change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => {}
             Change::CreateTable { uid, table, .. } => {

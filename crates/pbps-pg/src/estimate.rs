@@ -456,6 +456,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
     };
     match change {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => None,
         Change::AlterColumnType {

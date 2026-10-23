@@ -105,6 +105,7 @@ impl<'p> PlanFacts<'p> {
         for (at, p) in names.changes().iter().enumerate() {
             let event = match &p.change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => continue,
                 Change::CreateTable { name, table, .. } => Event::CreateTable { name, table },

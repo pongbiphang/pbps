@@ -3112,6 +3112,7 @@ name = pbps_model::escape::Escaped(&name),))
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
@@ -5869,7 +5870,14 @@ fn rebuild_parts_are_refused_by_name_before_sql_emission() {
         "../../pbps-model/tests/fixtures/rebuild_operations.json"
     ))
     .unwrap();
-    for change in changes {
+    #[path = "../../pbps-model/tests/support/rebuild.rs"]
+    mod recipe_fixture;
+    for change in changes
+        .into_iter()
+        .chain([Change::BuildPartitionedIndex(Box::new(
+            recipe_fixture::index_recipe(),
+        ))])
+    {
         let (operation, table) = change.pending_rebuild().unwrap();
         let error = emit(&Postgres::default(), &change, Strategy::default()).unwrap_err();
         assert_eq!(

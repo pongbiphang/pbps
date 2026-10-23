@@ -65,3 +65,88 @@ pub struct IntermediateAddress {
     pub address: TableName,
     pub uid: Uid,
 }
+
+/// Parent-only construction, explicit leaf builds and attachment (DEC-2298.8).
+/// A key clone includes a same-named leaf constraint before attachment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildPartitionedIndex {
+    pub parent: RebuildRelation,
+    pub name: crate::ObjectLocalName,
+    pub definition: PartitionIndexDefinition,
+    /// Every clone belongs to this parent part, never an independent leaf index.
+    pub clones: Vec<PartitionIndexClone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionIndexDefinition {
+    Index(crate::Index),
+    PrimaryKey(crate::PrimaryKey),
+    Unique(crate::UniqueConstraint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionIndexClone {
+    pub leaf: RebuildRelation,
+    pub name: crate::ObjectLocalName,
+}
+
+impl BuildPartitionedIndex {
+    pub fn part(&self) -> crate::IndexPart {
+        match self.definition {
+            PartitionIndexDefinition::Index(_) => crate::IndexPart::Index(self.name.clone()),
+            PartitionIndexDefinition::PrimaryKey(_) => crate::IndexPart::PrimaryKey,
+            PartitionIndexDefinition::Unique(_) => crate::IndexPart::Unique(self.name.clone()),
+        }
+    }
+
+    /// The ordinary parent definition, without recursive clone creation semantics.
+    pub fn parent_change(&self) -> crate::Change {
+        let table = self.parent.name.clone();
+        let name = self.name.clone();
+        match &self.definition {
+            PartitionIndexDefinition::Index(index) => crate::Change::AddIndex {
+                table,
+                name,
+                index: Box::new(index.clone()),
+                clustered: false,
+            },
+            PartitionIndexDefinition::PrimaryKey(key) => crate::Change::SetPrimaryKey {
+                table,
+                from: None,
+                to: Some(key.clone()),
+                nonclustered: false,
+            },
+            PartitionIndexDefinition::Unique(key) => crate::Change::AddUnique {
+                table,
+                name,
+                constraint: key.clone(),
+                clustered: false,
+            },
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let PartitionIndexDefinition::PrimaryKey(key) = &self.definition
+            && key.name.as_ref() != Some(&self.name)
+        {
+            return Err("parent primary key needs the recipe's explicit name");
+        }
+        let mut ids = std::collections::BTreeSet::from([&self.parent.uid]);
+        let mut tables = std::collections::BTreeSet::from([&self.parent.name]);
+        let mut names = std::collections::BTreeSet::from([(&self.parent.name.schema, &self.name)]);
+        if self.parent.uid.kind() != crate::UidKind::Table
+            || self.clones.iter().any(|c| {
+                c.leaf.uid.kind() != crate::UidKind::Table
+                    || !ids.insert(&c.leaf.uid)
+                    || !tables.insert(&c.leaf.name)
+                    || !names.insert((&c.leaf.name.schema, &c.name))
+            })
+        {
+            return Err("clone owners or explicit names are foreign or duplicated");
+        }
+        Ok(())
+    }
+}

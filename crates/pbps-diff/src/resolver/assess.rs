@@ -198,7 +198,7 @@ fn moves_bindings(
 ) -> bool {
     match change {
 Change::RebuildPartitionedTable(_) => true,
-Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => false,
+Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => false,
         // Relations, their row types and their columns.
         Change::CreateTable { .. }
         | Change::DropTable { .. }

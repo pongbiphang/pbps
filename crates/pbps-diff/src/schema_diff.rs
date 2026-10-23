@@ -1349,6 +1349,7 @@ pub(crate) fn diff_partial_rebuilding(
         .iter()
         .filter_map(|change| match change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. } => Some(id.clone()),
@@ -1408,6 +1409,7 @@ pub(crate) fn diff_partial_rebuilding(
         .iter()
         .filter_map(|change| match change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. }
@@ -1607,6 +1609,7 @@ pub(crate) fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| match &p.change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::RenameColumn { table, .. } => Some(table.clone()),
@@ -1668,6 +1671,7 @@ pub(crate) fn diff_partial_rebuilding(
     let frees_a_renamed_column = |c: &Change| -> bool {
         match c {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => false,
             Change::DropColumn { column, .. } => {
@@ -2772,6 +2776,7 @@ fn recreate_referenced_foreign_keys(
     for change in changes.iter() {
         let (table, columns) = match change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => continue,
             Change::SetPrimaryKey {
@@ -3322,6 +3327,7 @@ fn recreate_retyped_dependents(
     }
     for (column, dependents) in changes.iter().filter_map(|change| match change {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => None,
         Change::AlterColumnType {
@@ -5375,6 +5381,7 @@ fn refuse_computed_dependencies(
                 }
                 let module = match change {
                     Change::RebuildPartitionedTable(_)
+                    | Change::BuildPartitionedIndex(_)
                     | Change::CopyTableRows(_)
                     | Change::AnalyzeTableTree(_) => None,
                     // Standing, or re-added: either way it calls the module
@@ -6466,6 +6473,7 @@ fn dependency_rank(
 ) -> isize {
     match change {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")
@@ -7234,6 +7242,7 @@ const ROW_DELETIONS: u8 = 12;
 fn order_key(c: &Change) -> u8 {
     match c {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")

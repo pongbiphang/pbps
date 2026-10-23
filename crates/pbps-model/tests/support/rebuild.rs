@@ -41,3 +41,25 @@ pub fn approval() -> (
         .collect();
     (*root, base, desired, addresses)
 }
+
+#[allow(dead_code)]
+pub fn index_recipe() -> BuildPartitionedIndex {
+    let Change::CopyTableRows(copy) = changes().remove(1) else {
+        panic!()
+    };
+    BuildPartitionedIndex {
+        parent: copy.target,
+        name: "p_idx".into(),
+        definition: PartitionIndexDefinition::Index(
+            serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
+        ),
+        clones: copy
+            .target_partitions
+            .into_iter()
+            .map(|leaf| PartitionIndexClone {
+                leaf,
+                name: "p1_k_idx".into(),
+            })
+            .collect(),
+    }
+}

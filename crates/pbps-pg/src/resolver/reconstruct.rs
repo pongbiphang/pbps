@@ -233,6 +233,7 @@ impl Reconstruction {
             let first_step = steps.len();
             match change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {
                     return Err(ReconstructError::Unsupported(format!(

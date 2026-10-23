@@ -46,6 +46,22 @@ async fn table_catalog_keeps_physical_edges_bindings_and_clone_owners() {
         .await
         .unwrap();
     let closure = found.checked(&root(), &pulled.schema).unwrap();
+    let spellings = found.spellings.require("typed source spellings").unwrap();
+    let (clone, spelling) = spellings
+        .iter()
+        .find(|(_, s)| {
+            s.table == "app.child".parse().unwrap()
+                && s.name.raw() == "child_pkey"
+                && s.kind == pbps_model::operation::NameKind::Index
+        })
+        .unwrap();
+    assert_eq!(spelling.index_attributes, Some(vec!["id".into()]));
+    assert!(matches!(&closure.nodes[&closure.owners[clone]].held,
+        Held::Dependent(Holds::TablePart { table, part: Part::PrimaryKey(_) })
+        if table == &"app.parent".parse().unwrap()));
+    assert!(spellings.values().any(|s| s.table == spelling.table
+        && s.name == spelling.name
+        && s.kind == pbps_model::operation::NameKind::Constraint));
     assert!(found.graph.nodes.values().all(
         |n| !matches!(n, Fact::Present(Node { described, .. }) if described.contains("unrelated"))
     ));
@@ -466,4 +482,233 @@ async fn publication_modes_missing_trees_and_unreadable_catalogs_are_named() {
     );
     db.conn.execute("ROLLBACK").await.unwrap();
     db.drop().await;
+}
+
+#[test]
+fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
+    use pbps_diff::order::catalog::graph::Binding;
+    use pbps_diff::order::{
+        catalog::{Holds, Part, graph::*},
+        slots,
+    };
+    use pbps_model::operation::{
+        ModuleEdits, Operations, Origin, PlanOwners, Snapshot, Source as OriginSource,
+    };
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::*;
+    #[path = "../../../pbps-model/tests/support/rebuild.rs"]
+    mod fixture;
+    let dialect = pbps_pg::Postgres::new();
+    use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
+    use pbps_model::operation::NameKind;
+    let (root, base, desired, addresses) = fixture::approval();
+    let mut schema = Schema {
+        tables: root.before.clone(),
+        ..Default::default()
+    };
+    let leaf = root
+        .before
+        .keys()
+        .find(|n| **n != root.table)
+        .unwrap()
+        .clone();
+    let r = fixture::index_recipe();
+    let pbps_model::PartitionIndexDefinition::Index(index) = r.definition else {
+        panic!()
+    };
+    schema
+        .tables
+        .get_mut(&root.table)
+        .unwrap()
+        .indexes
+        .insert("p_idx".into(), index.clone());
+    let ids = base.index();
+    let old_leaf = ids.table_uid(&leaf).unwrap().clone();
+    let obj = |id| Object {
+        catalog: "pg_class".into(),
+        id,
+        attribute: 0,
+    };
+    let link = |dependent| Link {
+        binding: if dependent == obj(3) {
+            Binding::Ownership(Ownership::PartitionClone)
+        } else {
+            Binding::Object
+        },
+        dependent,
+        kind: "n".into(),
+    };
+    let node = |held, children: Vec<Object>| {
+        Fact::Present(Node {
+            described: "typed index fact".into(),
+            held,
+            dependents: Fact::Present(children.into_iter().map(link).collect()),
+        })
+    };
+    let key = Root::Table(ids.table_uid(&root.table).unwrap().clone());
+    let mut catalog = Catalog::default();
+    catalog
+        .graph
+        .roots
+        .insert(key.clone(), Fact::Present(obj(1)));
+    catalog.graph.nodes = [
+        (obj(1), node(Held::Root(key.clone()), vec![obj(2)])),
+        (
+            obj(2),
+            node(
+                Held::Dependent(Holds::TablePart {
+                    table: root.table.clone(),
+                    part: Part::Index("p_idx".into()),
+                }),
+                vec![obj(3)],
+            ),
+        ),
+        (
+            obj(3),
+            node(
+                Held::Owned {
+                    by: obj(2),
+                    kind: Ownership::PartitionClone,
+                },
+                vec![],
+            ),
+        ),
+    ]
+    .into();
+    catalog.spellings = Fact::Present(
+        [(
+            obj(3),
+            PartSpelling {
+                table: leaf.clone(),
+                name: "p1_k_idx".into(),
+                kind: NameKind::Index,
+                index_attributes: Some(vec!["k".into()]),
+            },
+        )]
+        .into(),
+    );
+    let slot = SlotKey {
+        namespace: Namespace::Relations("app".into()),
+        name: "p1_k_idx".into(),
+    };
+    let facts = CatalogFacts {
+        occupants: vec![Occupant {
+            slot: slot.clone(),
+            kind: "inherited index".into(),
+            owner: Some(leaf),
+            column: None,
+        }],
+        ..Default::default()
+    };
+    let logical = [PlannedChange::new(Change::RebuildPartitionedTable(
+        Box::new(root.clone()),
+    ))];
+    let owners = PlanOwners::new(PlanNames::of(&logical, &desired).unwrap(), &base, &desired)
+        .with_rebuild_addresses(&root, &base, &addresses)
+        .unwrap();
+    let before = Snapshot {
+        schema: &schema,
+        ids: &base,
+    };
+    let parts = [
+        Change::AddIndex {
+            table: "app.tmp_p1".parse().unwrap(),
+            name: "p1_k_idx".into(),
+            index: Box::new(index),
+            clustered: false,
+        },
+        Change::DropIndex {
+            table: root.table.clone(),
+            name: "p_idx".into(),
+        },
+        Change::DropTable {
+            uid: old_leaf,
+            name: "app.old_p1".parse().unwrap(),
+            detach_from: None,
+        },
+    ];
+    for order in [[0, 1, 2], [1, 0, 2]] {
+        let ops = Operations::expanded(
+            1,
+            order.map(|i| {
+                (
+                    match i {
+                        0 => Origin::Restoration(OriginSource::Change(0)),
+                        1 => Origin::Teardown(OriginSource::Change(0)),
+                        2 => Origin::SplitPart(0),
+                        _ => unreachable!(),
+                    },
+                    PlannedChange::new(parts[i].clone()),
+                )
+            }),
+            ModuleEdits::InPlace,
+        );
+        let plain = slots::analyse(ops.as_slice(), &owners, before, &dialect);
+        let enriched =
+            slots::with_catalog_parts(plain, &catalog, &key, &owners, before, &dialect).unwrap();
+        let holder = enriched.catalog_owned.values().next().unwrap().clone();
+        let release = order.iter().position(|i| *i == 1).unwrap();
+        let carried = vec![slots::Carried {
+            occupant: 0,
+            slot: slot.clone(),
+            step: 2,
+            lands: None,
+        }];
+        let edges = slots::edges(&enriched, Some(&facts), &carried);
+        let claim = order.iter().position(|i| *i == 0).unwrap();
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.before == release && e.after == claim)
+        );
+        assert!(!edges.iter().any(|e| e.before == 2 && e.after == claim));
+        let (violations, _) = slots::verify(
+            ops.as_slice(),
+            &enriched,
+            &dialect,
+            Some(&facts),
+            &owners,
+            before,
+        );
+        assert_eq!(violations.is_empty(), release < claim);
+        let released = [holder].into();
+        let mut vacant = enriched.clone();
+        for fx in &mut vacant.effects {
+            fx.claims.clear();
+        }
+        assert!(
+            !slots::unavailable_names(
+                &vacant,
+                &Fact::Present(facts.clone()),
+                std::slice::from_ref(&slot.namespace),
+                &released
+            )
+            .unwrap()
+            .contains("p1_k_idx")
+        );
+        assert!(
+            slots::unavailable_names(
+                &enriched,
+                &Fact::Present(facts.clone()),
+                std::slice::from_ref(&slot.namespace),
+                &released
+            )
+            .unwrap()
+            .contains("p1_k_idx"),
+            "the new independent claim reserves its name"
+        );
+    }
+    catalog.spellings = Fact::Unreadable("42501".into());
+    assert!(
+        slots::with_catalog_parts(
+            slots::Slots::default(),
+            &catalog,
+            &key,
+            &owners,
+            before,
+            &dialect
+        )
+        .unwrap_err()
+        .contains("42501")
+    );
 }

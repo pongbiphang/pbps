@@ -630,6 +630,10 @@ impl Operation {
             Change::RebuildPartitionedTable(r) => {
                 ObjectKey::Table(Recorded(owners.table(&r.table, Spelling::Base)?))
             }
+            Change::BuildPartitionedIndex(r) => ObjectKey::Part {
+                table: checked_relation(owners, &r.parent, Spelling::Final)?,
+                part: PartKey::from(&r.part()),
+            },
             Change::CopyTableRows(c) => {
                 ObjectKey::Table(checked_relation(owners, &c.target, Spelling::Final)?)
             }
@@ -764,6 +768,7 @@ impl Operation {
             Ok(out)
         };
         Ok(match &self.step.change {
+            Change::BuildPartitionedIndex(_) => vec![produces(key()?)],
 Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable {
                 uid, name, table, ..

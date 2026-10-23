@@ -26,5 +26,9 @@ pub fn cases() -> Vec<(String, Change)> {
             .map(str::to_owned)
             .zip(rebuild::changes()),
         )
+        .chain(std::iter::once((
+            "BuildPartitionedIndex".into(),
+            Change::BuildPartitionedIndex(Box::new(rebuild::index_recipe())),
+        )))
         .collect()
 }

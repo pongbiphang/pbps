@@ -227,6 +227,7 @@ pub enum Change {
     RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
     CopyTableRows(Box<crate::CopyTableRows>),
     AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
+    BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
     CreateType {
         uid: Uid,
         name: crate::TypeRef,
@@ -1401,6 +1402,9 @@ impl Change {
         if let Change::AnalyzeTableTree(a) = self {
             return Some(("AnalyzeTableTree", &a.parent.name));
         }
+        if let Change::BuildPartitionedIndex(r) = self {
+            return Some(("BuildPartitionedIndex", &r.parent.name));
+        }
         None
     }
 
@@ -1419,6 +1423,7 @@ impl Change {
             Change::RebuildPartitionedTable(r) => &r.table,
             Change::CopyTableRows(c) => &c.target.name,
             Change::AnalyzeTableTree(a) => &a.parent.name,
+            Change::BuildPartitionedIndex(r) => &r.parent.name,
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
             Change::RenameTable { from, .. } => from,
             Change::AddColumn { table, .. }
@@ -1517,6 +1522,7 @@ impl Change {
                 )
                 .collect(),
             Change::AnalyzeTableTree(a) => a.partitions.iter().map(|p| &p.name).collect(),
+            Change::BuildPartitionedIndex(r) => r.clones.iter().map(|c| &c.leaf.name).collect(),
             Change::RenameTable { to, .. } => vec![to],
             // The parent's rows change, not its shape, and a partitioned
             // table holds no declared rows (#1544).
@@ -1605,6 +1611,7 @@ impl Change {
         // case it is looking at (117, 165, 191).
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::InsertRow {
@@ -1740,7 +1747,7 @@ impl Change {
                 })
                 .cloned()
                 .collect(),
-            Change::AnalyzeTableTree(_) => Vec::new(),
+            Change::AnalyzeTableTree(_) | Change::BuildPartitionedIndex(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => vec![table.column(name)],
             Change::RenameColumn {
                 table, from, to, ..
@@ -1823,6 +1830,7 @@ impl Change {
     pub fn columns_redefined(&self) -> Vec<(ColumnRef, ColumnField)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => {
@@ -1940,6 +1948,7 @@ impl Change {
     pub fn drops(&self) -> Option<Dropped> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::DropTable { name, .. } => Some(Dropped::Table(name.clone())),
@@ -2016,6 +2025,7 @@ impl Change {
     pub fn grant(&self) -> Option<(&crate::RoleName, &GrantTarget, PermissionChange<'_>)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::Grant {
@@ -2096,6 +2106,7 @@ impl Change {
     pub fn roles(&self) -> impl Iterator<Item = &crate::RoleName> {
         let (one, two) = match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => (None, None),
             Change::CreateRole { name, .. }
@@ -2168,6 +2179,7 @@ impl Change {
     pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
@@ -2243,6 +2255,7 @@ impl Change {
     pub fn columns_promised(&self) -> Vec<(ColumnRef, ColumnPromise<'_>)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn {
@@ -2350,6 +2363,7 @@ impl Change {
     pub fn columns_after(&self) -> Vec<(ColumnRef, Presence)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => {
@@ -2433,6 +2447,18 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
+            Change::BuildPartitionedIndex(r) => it(
+                &r.parent.name,
+                (!matches!(r.definition, crate::PartitionIndexDefinition::PrimaryKey(_)))
+                    .then_some(r.name.raw()),
+                standing(match &r.definition {
+                    crate::PartitionIndexDefinition::Index(i) => PartDefinition::Index(i, false),
+                    crate::PartitionIndexDefinition::PrimaryKey(k) => {
+                        PartDefinition::PrimaryKey(k, false)
+                    }
+                    crate::PartitionIndexDefinition::Unique(k) => PartDefinition::Unique(k, false),
+                }),
+            ),
             Change::RebuildPartitionedTable(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
@@ -2568,6 +2594,7 @@ impl Change {
     pub fn roles_after(&self) -> Vec<(&crate::RoleName, Presence)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
@@ -2641,6 +2668,7 @@ impl Change {
     pub fn module(&self) -> Option<(&ModuleId, ModuleAfter<'_>)> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
@@ -2702,6 +2730,7 @@ impl Change {
     pub fn module_id(&self) -> Option<&ModuleId> {
         match self {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. }
@@ -2771,6 +2800,9 @@ impl Change {
     pub fn intrinsic_risks_with(&self, continues_ident: fn(char) -> bool) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
+            Change::BuildPartitionedIndex(r) => {
+                return r.parent_change().intrinsic_risks_with(continues_ident);
+            }
             Change::RebuildPartitionedTable(_) => { r.insert(RiskClass::Destructive); },
 Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             Change::DropTable { .. }

@@ -265,6 +265,15 @@ impl<S> PartialEq<PlanningPlan<S>> for ChangeSet {
 /// ```
 /// A model-owned root cannot impersonate a certified input:
 /// ```compile_fail
+/// fn recipe(recipe: pbps_model::BuildPartitionedIndex) {
+///     let raw = pbps_diff::order::propose(pbps_model::ChangeSet {
+///         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::BuildPartitionedIndex(Box::new(recipe)))],
+///     });
+///     let _: pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect> = raw;
+/// }
+/// ```
+///
+/// ```compile_fail
 /// fn root(root: pbps_model::RebuildPartitionedTable) {
 ///     let _: pbps_diff::order::OrderedPlan<pbps_dialect::MinimalDialect> = root.into();
 /// }
