@@ -261,7 +261,15 @@ fn historical_ids(
     missing_by_name(&mut ids.columns, &other.columns, &mut taken);
     missing_by_name(&mut ids.roles, &other.roles, &mut taken);
     missing_by_name(&mut ids.types, &other.types, &mut taken);
-    pbps_diff::observed_ids_reserving(schema, &ids, other)
+    let observed = pbps_diff::observed_ids_reserving(schema, &ids, other);
+    // Complete live names without replacing this snapshot's version or intent.
+    // Move permissions belong only to table UIDs retained by this schema.
+    ids.tables = observed.tables;
+    ids.columns = observed.columns;
+    ids.roles = observed.roles;
+    ids.types = observed.types;
+    ids.moves.retain(|uid, _| ids.tables.contains_key(uid));
+    ids
 }
 
 const PUBLIC_EXECUTE_NOT_RECORDED: &str = "Snapshots do not record historical public_execute.";
@@ -925,6 +933,99 @@ mod tests {
             after.column_uid(&table.column("other")),
             to.column_uid(&table.column("other"))
         );
+    }
+
+    #[test]
+    fn state_history_completion_keeps_selected_metadata_and_filters_unheld_live_ids() {
+        let (_stage, _project, entry) = fixture("history-id-metadata");
+        let mut schema = entry.snapshot.schema;
+        let table = schema.tables.keys().next().unwrap().clone();
+        schema.roles.insert("reader".into(), Default::default());
+        schema.types.insert(
+            "dbo.kind".parse().unwrap(),
+            pbps_model::ManagedType::Enum {
+                values: vec!["a".into()],
+            },
+        );
+        let move_permission = pbps_model::Move {
+            max_rows: 7,
+            allowed_at: "2026-10-23".into(),
+            reason: "selected snapshot permission".into(),
+            operator: "selected".into(),
+        };
+        let mut recorded = pbps_model::IdsFile {
+            version: pbps_model::ids::CURRENT_VERSION,
+            tables: [
+                ("t_aaaaaa".parse().unwrap(), table.clone()),
+                ("t_bbbbbb".parse().unwrap(), "dbo.missing".parse().unwrap()),
+            ]
+            .into(),
+            columns: [
+                ("c_aaaaaa".parse().unwrap(), table.column("code")),
+                ("c_bbbbbb".parse().unwrap(), table.column("missing")),
+            ]
+            .into(),
+            roles: [
+                ("r_aaaaaa".parse().unwrap(), "reader".into()),
+                ("r_bbbbbb".parse().unwrap(), "missing".into()),
+            ]
+            .into(),
+            types: [
+                ("y_aaaaaa".parse().unwrap(), "dbo.kind".parse().unwrap()),
+                ("y_bbbbbb".parse().unwrap(), "dbo.missing".parse().unwrap()),
+            ]
+            .into(),
+            tombstones: [(
+                "c_cccccc".parse().unwrap(),
+                pbps_model::Tombstone {
+                    was: "dbo.product.retired".into(),
+                    dropped_at: "2026-10-22".into(),
+                    reason: "selected snapshot retirement".into(),
+                    operator: "selected".into(),
+                },
+            )]
+            .into(),
+            moves: [
+                ("t_aaaaaa".parse().unwrap(), move_permission.clone()),
+                ("t_bbbbbb".parse().unwrap(), move_permission),
+            ]
+            .into(),
+        };
+        recorded.clone().validated().unwrap();
+        let mut other = recorded.clone();
+        other
+            .tombstones
+            .values_mut()
+            .for_each(|entry| entry.operator = "other".into());
+        other
+            .moves
+            .values_mut()
+            .for_each(|entry| entry.max_rows = 99);
+        let selected = recorded.clone();
+        recorded.tables.remove(&"t_bbbbbb".parse().unwrap());
+        recorded.columns.remove(&"c_bbbbbb".parse().unwrap());
+        recorded.roles.remove(&"r_bbbbbb".parse().unwrap());
+        recorded.types.remove(&"y_bbbbbb".parse().unwrap());
+        recorded.moves.remove(&"t_bbbbbb".parse().unwrap());
+        assert_eq!(historical_ids(&schema, &selected, &other), recorded);
+        assert_eq!(
+            historical_ids(&schema, &selected, &Default::default()),
+            recorded
+        );
+        let completed = historical_ids(&schema, &Default::default(), &other);
+        assert_eq!(completed.tables, recorded.tables);
+        assert_eq!(completed.columns, recorded.columns);
+        assert_eq!(completed.roles, recorded.roles);
+        assert_eq!(completed.types, recorded.types);
+        assert!(
+            completed.moves.is_empty(),
+            "borrowed names do not grant move permission"
+        );
+        assert!(
+            completed.tombstones.is_empty(),
+            "the other record cannot retire identities here"
+        );
+        completed.validated().unwrap();
     }
 
     #[test]
