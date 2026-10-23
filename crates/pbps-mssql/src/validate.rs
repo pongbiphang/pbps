@@ -83,8 +83,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
         };
         errs.push(invalid(format!(
             "role `{name}` cannot contain {reason}",
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         )));
     }
     if FIXED_ROLES
