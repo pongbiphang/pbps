@@ -146,8 +146,10 @@ unrelated cycle does not. Clause order inside an indivisible operation stays
 fixed, so an unsatisfied intra-operation boundary is an obligation.
 A restoration must qualify its changed ownership through the matching
 parent/child/property transfer; unrelated moves cannot supply that fact.
-`Schedule::of_graph` imports unmet requirements as obligations. Merely
-recording an unmet requirement in the debug shadow is insufficient.
+`Schedule::of_graph` imports only the symbolic contract's explicit unmet
+obligations. Ordinary `Graph::unmet` requirements remain observational
+`unprovided` facts under DEC-1954.6 and DEC-1956.3, even in a mixed graph.
+A symbolic contract obligation cannot be discharged by merely observing it.
 
 A concrete projection replays membership at each position and expands a
 recursive write only over the members then present. Transfers retain

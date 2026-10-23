@@ -228,8 +228,9 @@ impl Schedule {
         }
     }
 
-    /// Import the effect graph's edges and unmet requirements. A missing
-    /// producer is an obligation, not an independent operation (DEC-2296.1).
+    /// Import edges and the symbolic contract's own obligations (DEC-2296.1).
+    /// Ordinary graph unmet requirements remain observational `unprovided`
+    /// facts: no ordering can meet them (DEC-1954.6, DEC-1956.3).
     pub fn of_graph(graph: &Graph, operations: &[Operation]) -> Self {
         let mut schedule = Self::new(operations.len());
         for e in &graph.edges {
@@ -254,16 +255,6 @@ impl Schedule {
                 format!(
                     "{}: {issue}",
                     pbps_model::Text::from(operations[at].change().subject()).shown()
-                ),
-            );
-        }
-        for unmet in &graph.unmet {
-            schedule.obligation(
-                unmet.operation,
-                format!(
-                    "{} has an unmet ordering requirement {}; change the columns and the partitions in separate plans",
-                    pbps_model::Text::from(operations[unmet.operation].change().subject()).shown(),
-                    pbps_model::Text::from(format!("{:?}", unmet.requirement)).shown(),
                 ),
             );
         }

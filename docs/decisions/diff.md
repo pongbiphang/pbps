@@ -8371,8 +8371,11 @@ a guarded consumer. Operation-local engine effects supply recursion policy;
 order compiles admissible version cuts into the existing settlement's edges.
 A non-convex domain or disjunction remains a named unresolved obligation,
 with the remedy to change the columns and the partitions in separate plans.
-Sink, existing stages and proof boundaries stay unchanged. Graph unmet
-requirements are settlement obligations rather than silently independent work.
+Sink, existing stages and proof boundaries stay unchanged. Only explicit
+symbolic unmet obligations enter settlement; ordinary `Graph::unmet` facts
+stay observational `unprovided` findings under DEC-1954.6 and DEC-1956.3.
+This distinction applies to mixed graphs too; a symbolic clause does not
+promote unrelated ordinary requirements into new refusals.
 Projection and strict Final replay resolve actual membership in the given
 sequence; neither trusts a predicted child set or retries another ordering.
 Pending state is descriptive and cannot authorize emission. Saved fields,

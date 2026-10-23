@@ -75,8 +75,8 @@ pub struct Edge {
     pub because: Because,
 }
 
-/// An obligation no operation satisfies and the baseline does not: reported
-/// here, handled from S3 on.
+/// A requirement neither the plan nor the baseline can satisfy. This is an
+/// observational `unprovided` fact, not a settlement obligation (DEC-1954.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unmet {
     pub operation: usize,

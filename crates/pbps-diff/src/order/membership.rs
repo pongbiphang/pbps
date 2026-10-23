@@ -510,7 +510,8 @@ impl Projection<'_> {
         let index = match at {
             At::Start => 0,
             At::End => self.operations.len(),
-            At::Before(i) => i,
+            At::Before(i) if i < self.operations.len() => i,
+            At::Before(_) => return None,
             At::After(i) => i.checked_add(1)?,
         };
         self.states.get(index)

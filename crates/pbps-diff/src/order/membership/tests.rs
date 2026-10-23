@@ -308,7 +308,6 @@ fn permits(graph: &Graph, order: &[usize]) -> bool {
         position[i] = at;
     }
     graph.symbolic_unmet.is_empty()
-        && graph.unmet.is_empty()
         && graph
             .edges
             .iter()
@@ -1611,4 +1610,61 @@ fn a_restoration_requires_its_own_property_transfer_in_compiler_and_replay() {
             .contains("no matching ownership/property transfer")
     );
     graph_and_replay_agree(&f, &f.graph(), &[]);
+}
+
+#[test]
+fn projection_before_requires_an_existing_operation_even_on_an_empty_plan() {
+    for n in [0, 1, 3] {
+        let mut f = Fixture::new(n);
+        if n > 0 {
+            f.write(0, Version::Base, value("1"), value("7"));
+        }
+        let view = project(&f.ops, &f.fx, &f.base).unwrap();
+        assert_eq!(view.state(At::Start), Some(&f.base));
+        assert!(view.state(At::End).is_some());
+        for i in 0..n {
+            assert_eq!(
+                view.state(At::Before(i)),
+                view.state(if i == 0 { At::Start } else { At::After(i - 1) })
+            );
+        }
+        for i in [n, n + 1, usize::MAX] {
+            assert!(
+                view.state(At::Before(i)).is_none(),
+                "Before({i}) with n={n}"
+            );
+            assert!(view.state(At::After(i)).is_none(), "After({i}) with n={n}");
+        }
+        if n > 0 {
+            assert_eq!(view.state(At::After(n - 1)), view.state(At::End));
+        }
+    }
+}
+
+#[test]
+fn ordinary_unprovided_requirements_do_not_block_symbolic_boundaries() {
+    let mut f = Fixture::new(2);
+    f.base
+        .cells
+        .get_mut(&(f.a.clone(), f.local.clone()))
+        .unwrap()
+        .value = Fact::Known(value("7"));
+    f.write(0, Version::Base, value("1"), value("7"));
+    f.movement(
+        1,
+        MoveKind::Attach,
+        ShapeCheck::SameDefinition,
+        TransferPolicy::Inherit,
+        inherited("7"),
+    );
+    f.fx[0]
+        .requires
+        .push(pbps_model::operation::Requirement::Exists(
+            ObjectKey::Module("app.unmanaged_view".parse().unwrap()),
+        ));
+    let graph = f.graph();
+    assert_eq!(graph.unmet.len(), 1);
+    assert!(graph.symbolic_unmet.is_empty());
+    assert_eq!(f.edges(), BTreeSet::from([(f.ops[0].id(), f.ops[1].id())]));
+    graph_and_replay_agree(&f, &graph, &[]);
 }

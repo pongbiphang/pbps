@@ -334,31 +334,153 @@ fn a_long_cycle_is_named_without_overflowing_the_stack() {
 }
 
 #[test]
-fn a_graphs_unmet_requirement_cannot_be_lost_at_settlement() {
+fn ordinary_unprovided_requirements_stay_observational_beside_symbolic_obligations() {
     use pbps_model::operation::{ModuleEdits, ObjectKey, Operations, Requirement};
     let given = plan(&["a"]);
     let operations = Operations::of_plan(&given.changes, ModuleEdits::InPlace);
     let missing = Requirement::Exists(ObjectKey::Module(pbps_model::ModuleId::Named(
         "app.missing".parse().unwrap(),
     )));
-    let graph = super::Graph {
+    let mut graph = super::Graph {
         unmet: vec![super::Unmet {
             operation: 0,
             requirement: missing,
         }],
         ..Default::default()
     };
-    let refusal = Schedule::of_graph(&graph, operations.as_slice())
+    let settled = Schedule::of_graph(&graph, operations.as_slice())
         .settle_raw(given.clone())
+        .unwrap();
+    assert_eq!(settled.changes, given);
+    assert!(settled.proof.edges().is_empty());
+    // Even a mixed graph refuses only its explicit symbolic obligation.
+    graph.symbolic_unmet.push(super::membership::Problem {
+        operation: operations.as_slice()[0].id(),
+        detail: "unread membership fact".into(),
+    });
+    let refusal = Schedule::of_graph(&graph, operations.as_slice())
+        .sequence()
         .unwrap_err();
-    let text = refusal.describe(&given);
-    assert!(
-        text.contains("missing") && text.contains("separate plans"),
-        "{text}"
-    );
-    assert!(
-        Schedule::of_graph(&super::Graph::default(), operations.as_slice())
-            .settle_raw(given)
-            .is_ok()
-    );
+    let Refusal::Unmet(obligations) = &refusal else {
+        panic!("{refusal:?}")
+    };
+    assert_eq!(obligations.len(), 1);
+    assert!(obligations[0].refusal.contains("unread membership fact"));
+    assert!(!obligations[0].refusal.contains("app.missing"));
+}
+
+/// Frozen ordinary adapter from master 0582bcb4224d9adb737de0c4df11f8fac6b15d0e.
+/// Ordinary reason arms and the settling algorithm are unchanged; the oracle
+/// deliberately imports only edges, not observational graph diagnostics.
+fn master_of_graph(
+    graph: &super::Graph,
+    operations: &[pbps_model::operation::Operation],
+) -> Schedule {
+    let mut schedule = Schedule::new(operations.len());
+    for e in &graph.edges {
+        schedule.edge(
+            e.before,
+            e.after,
+            e.source,
+            super::schedule::reason(e, operations),
+        );
+    }
+    schedule
+}
+
+#[test]
+fn ordinary_graphs_keep_masters_orders_proofs_and_refusals_exhaustively() {
+    use super::{Because, Edge, Graph, Unmet};
+    use pbps_model::operation::{
+        BoundInput, Incarnation, ModuleEdits, ObjectKey, Operations, Requirement,
+    };
+    // Every absent/ordinary-source/declared edge, including self-edges, on
+    // up to three steps, repeated for every source. This includes DAGs,
+    // mixed and declared-only cycles, disconnected and empty graphs.
+    // Rotate reasons and all ordinary requirement forms beside them.
+    let sources = [
+        Source::Effect,
+        Source::Declared,
+        Source::Lexical,
+        Source::Catalog,
+        Source::Binding,
+        Source::Execution,
+        Source::Search,
+    ];
+    let key = ObjectKey::Module(pbps_model::ModuleId::Named(
+        "app.unmanaged_view".parse().unwrap(),
+    ));
+    let requirements = [
+        Requirement::Exists(key.clone()),
+        Requirement::Is(key.clone(), Incarnation::Final),
+        Requirement::Absent(key.clone()),
+        Requirement::Reads(key.clone()),
+        Requirement::BeforeRewrite(key.clone()),
+        Requirement::Bound(
+            key.clone(),
+            BoundInput {
+                input: key.clone(),
+                incarnation: Incarnation::Base,
+            },
+        ),
+    ];
+    for source in sources {
+        for n in 0..=3usize {
+            let owned: Vec<_> = (0..n).map(|i| format!("r{i}")).collect();
+            let given = plan(&owned.iter().map(String::as_str).collect::<Vec<_>>());
+            let operations = Operations::of_plan(&given.changes, ModuleEdits::InPlace);
+            for seed in 0..3usize.pow((n * n) as u32) {
+                let mut encoded = seed;
+                let mut graph = Graph::default();
+                for before in 0..n {
+                    for after in 0..n {
+                        let edge = encoded % 3;
+                        encoded /= 3;
+                        if edge != 0 {
+                            graph.edges.insert(Edge {
+                                before,
+                                after,
+                                source: if edge == 1 { source } else { Source::Declared },
+                                because: match seed % 3 {
+                                    0 => Because::Declared,
+                                    1 => Because::Creates(key.clone()),
+                                    _ => Because::BeforeRewrite(key.clone()),
+                                },
+                            });
+                        }
+                    }
+                }
+                graph.unmet.push(Unmet {
+                    operation: n.saturating_sub(1),
+                    requirement: requirements[seed % requirements.len()].clone(),
+                });
+                graph.ambiguous.push(super::edges::Ambiguous {
+                    operation: 0,
+                    key: key.clone(),
+                });
+                let actual = Schedule::of_graph(&graph, operations.as_slice());
+                let oracle = master_of_graph(&graph, operations.as_slice());
+                assert_eq!(
+                    actual.constraints(),
+                    oracle.constraints(),
+                    "n={n}, seed={seed}"
+                );
+                match (
+                    actual.settle_raw(given.clone()),
+                    oracle.settle_raw(given.clone()),
+                ) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.sequence, b.sequence);
+                        assert_eq!(a.changes, b.changes);
+                        assert_eq!(a.proof, b.proof);
+                    }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(a, b);
+                        assert_eq!(a.describe(&given), b.describe(&given));
+                    }
+                    (a, b) => panic!("ordinary graph changed at n={n}, seed={seed}: {a:?} / {b:?}"),
+                }
+            }
+        }
+    }
 }
