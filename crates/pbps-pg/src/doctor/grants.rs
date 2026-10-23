@@ -214,14 +214,13 @@ pub(super) async fn missing(
             let Some(permission) = permission(&text(&row, "privilege")?) else {
                 continue;
             };
-            let schema = text(&row, "schema_name")?;
-            let securable = match text(&row, "kind")?.as_str() {
-                "schema" => Securable::Schema(schema),
-                "routine" => Securable::Routine(
-                    ObjectName::new(schema, text(&row, "object_name")?),
-                    Some(text(&row, "signature")?),
-                ),
-                _ => Securable::Object(ObjectName::new(schema, text(&row, "object_name")?)),
+            let Some(securable) = catalog_securable(
+                &text(&row, "kind")?,
+                ObjectName::new(text(&row, "schema_name")?, text(&row, "object_name")?),
+                text(&row, "signature")?,
+                text(&row, "column_name")?,
+            ) else {
+                continue;
             };
             if !manages(&securable, &managed_tables, &managed_modules) {
                 continue;
@@ -279,6 +278,23 @@ fn add_gap(
         }
     }
     Ok(())
+}
+
+fn catalog_securable(
+    kind: &str,
+    object: ObjectName,
+    signature: String,
+    column: String,
+) -> Option<Securable> {
+    Some(match kind {
+        "schema" => Securable::Schema(object.schema),
+        "routine" => Securable::Routine(object, Some(signature)),
+        // Like the planner, address an owned sequence by its table column,
+        // never by a physical name that can be changed independently.
+        "sequence" if !column.is_empty() => Securable::Sequence(object.column(column)),
+        "sequence" => return None,
+        _ => Securable::Object(object),
+    })
 }
 
 // The same namespace boundary as pbps_diff::scope: a managed overload never
@@ -419,26 +435,40 @@ fn catalog_question(values: &str) -> String {
         ), targets AS (
             SELECT n.nspname AS schema_name, c.relname AS object_name,
                    'table' AS kind, '' AS signature, c.relowner AS owner, c.relacl AS acl,
-                   pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
+                   pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok, '' AS column_name
               FROM pg_catalog.pg_class c
               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind IN ('r', 'v', 'p')
             UNION ALL
+            SELECT n.nspname, t.relname, 'sequence', '', s.relowner, s.relacl,
+                   pg_catalog.has_schema_privilege(n.oid, 'USAGE'), a.attname
+              FROM pg_catalog.pg_class s
+              JOIN pg_catalog.pg_depend d
+                ON d.objid = s.oid AND d.objsubid = 0 AND d.deptype = 'a'
+               AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+               AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+              JOIN pg_catalog.pg_class t ON t.oid = d.refobjid AND t.relkind IN ('r', 'p')
+              JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+               AND a.attnum > 0 AND NOT a.attisdropped
+              JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+             WHERE s.relkind = 'S'
+            UNION ALL
             SELECT n.nspname, p.proname, 'routine',
                    COALESCE((SELECT pg_catalog.string_agg(pg_catalog.format_type(u.ty, NULL), ', ' ORDER BY u.pos)
                        FROM pg_catalog.unnest(p.proargtypes) WITH ORDINALITY u(ty, pos)), ''),
-                   p.proowner, p.proacl, pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+                   p.proowner, p.proacl, pg_catalog.has_schema_privilege(n.oid, 'USAGE'), ''
               FROM pg_catalog.pg_proc p
               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
              WHERE p.prokind IN ('f', 'p')
             UNION ALL
-            SELECT n.nspname, '', 'schema', '', n.nspowner, n.nspacl, true
+            SELECT n.nspname, '', 'schema', '', n.nspowner, n.nspacl, true, ''
               FROM pg_catalog.pg_namespace n
         )
         SELECT t.schema_name, t.object_name, t.kind, t.signature,
                a.privilege_type AS privilege, pg_catalog.pg_get_userbyid(a.grantor) AS grantor,
                {held} AS held,
-               t.usage_ok
+               t.usage_ok, t.column_name
           FROM targets t
           CROSS JOIN LATERAL pg_catalog.aclexplode(t.acl) a
           JOIN managed m ON m.oid = a.grantee
@@ -451,6 +481,24 @@ fn catalog_question(values: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adopted_sequence_authority_uses_its_owning_column_in_a_managed_table() {
+        let table = ObjectName::new("app", "t");
+        let decode = |kind: &str, column: &str| {
+            catalog_securable(kind, table.clone(), String::new(), column.to_owned())
+        };
+        let sequence = decode("sequence", "id").unwrap();
+        assert_eq!(sequence, Securable::Sequence(table.column("id")));
+        assert!(manages(
+            &sequence,
+            &[table.clone()].into(),
+            &BTreeSet::new()
+        ));
+        assert!(!manages(&sequence, &BTreeSet::new(), &BTreeSet::new()));
+        assert_eq!(decode("sequence", ""), None, "no owning column");
+        assert_eq!(decode("table", "id"), Some(Securable::Object(table)));
+    }
 
     #[test]
     fn explicit_sequence_authority_uses_the_column_and_each_requested_privilege() {
