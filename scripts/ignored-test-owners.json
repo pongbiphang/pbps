@@ -510,6 +510,7 @@
         "type_refs::a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows",
         "type_refs::a_nonnull_composite_with_null_attributes_satisfies_column_not_null",
         "type_refs::a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_are_erased",
+        "type_refs::declared_enum_null_defaults_refuse_planning_without_applying_while_domains_converge",
         "type_refs::partition_null_defaults_keep_domains_but_erase_enum_and_composite_constants",
         "type_refs::a_domains_default_populates_a_new_primary_key_without_a_null_projection",
         "type_refs::fast_domain_defaults_evaluate_on_empty_tables_and_require_trusted_owners",
