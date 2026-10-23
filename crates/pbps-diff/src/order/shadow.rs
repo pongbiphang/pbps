@@ -294,6 +294,11 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
             }
         )
     };
+    let pending_release = if stage == Stage::Final {
+        vec![false; ops.len()]
+    } else {
+        super::release_inputs::pending_consumers(&report.graph, ops)
+    };
     let violations: Vec<String> = report
         .violations
         .iter()
@@ -326,6 +331,18 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
                 after,
                 edge,
             } if stage != Stage::Final && super::edges::connected_module_release(edge, ops) => {
+                format!(
+                    "connected {} must precede {} because {:?}",
+                    name(*before),
+                    name(*after),
+                    edge.because
+                )
+            }
+            Violation::Edge {
+                before,
+                after,
+                edge,
+            } if pending_release[edge.before] || pending_release[edge.after] => {
                 format!(
                     "connected {} must precede {} because {:?}",
                     name(*before),

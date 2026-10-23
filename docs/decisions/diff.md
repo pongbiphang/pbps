@@ -5761,6 +5761,8 @@ The effects are not computed in a release build. Whether the verifier
 becomes a release-build gate, and with it whether `settle` orders every plan
 over the effect graph, is #1776's to decide after #1965's benchmark.
 
+*Amended for required inserts by [DEC-2174.1](#dec-2174-1): their declared row effects now carry their consumers through this settlement.*
+
 **What a moved change must not pass is kept, not sunk.** `passes` refused a
 held drop or retype that would move past a change that needs it first:
 
@@ -8324,3 +8326,37 @@ the partial differ, old resolver and current settle are named separately.
 Update-site counts are bounded audited scenarios, not a claim that every
 future kind needs only effects. Host-dependent measurements and issue states
 belong to the closure evidence rather than durable architectural rules.
+
+<a id="dec-2174-1"></a>
+
+**DEC-2174.1. A released required input's drop delays its insert and the
+insert's effect consumers in the existing release settlement.** #2086 states
+that an insert omitting a baseline NOT NULL input with nothing to fill it
+requires that input's NOT NULL to be absent. The former DEC-1956.3 Keep
+refused a valid plan when the drop waited for a later generated-expression
+release. The missing piece was the insert's consumers, not a new ordering
+policy: a child row referencing it, a later row of the same table, and keys
+that read its rows must stay after it.
+
+The CLI retains catalog/lexical release observations and trigger timing.
+Order builds operations and the effect graph from the real before/after
+schemas and identities. The affected inserts seed a transitive consumer
+closure; incoming prerequisites constrain that closure too. Its edges,
+through `Schedule::of_graph`, join this settlement's own release constraints.
+The required-insert Keep becomes a drop-to-insert edge. Unrelated graph
+edges and other Keeps remain at their existing stages. This neither unions
+prior proofs nor adds a pass, rank, tie-break or release verifier. Typed
+settlement keeps original sources, origins and the engine brand together.
+Nullable/defaulted inputs and the existing trigger-aware exceptions retain
+their order; retype/name-taker refusals are unchanged. The debug observer records
+potential crossing consumers as connected until the existing catalog release
+settlement, including trigger cases whose portable requirement is unknown;
+Final replay still checks every edge. This prevents the earlier
+observer from refusing the intermediate key order the release stage repairs.
+
+The PostgreSQL 18 flow proves the exact SET EXPRESSION release, applied rows,
+consumer order and an empty replan. PostgreSQL 16 cannot SET EXPRESSION:
+its supported sibling drops the generated reader and old input, applies the
+rows and replans empty. The existing pre-17 expression-change refusal stays;
+the sibling is not evidence that the newer SQL works on 16. Unit pins cover
+child rows, later same-table rows, keys and retained provenance.

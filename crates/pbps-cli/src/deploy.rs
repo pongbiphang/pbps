@@ -7217,7 +7217,14 @@ pub fn cmd_plan_db(
             // after the plan's change to that expression which stops reading
             // it (DEC-1316.1): after the module passes, which may move that
             // change, and before the checks that read the order.
-            crate::engine::release_generated_inputs(&mut conn, &mut cs, &resolved.ids).await?;
+            crate::engine::release_generated_inputs(
+                &mut conn,
+                &mut cs,
+                pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
+                pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+                dialect.as_ref(),
+                &hints.module_deps,
+            ).await?;
             // A computed column's function drops after it, by the catalog's
             // edges (DEC-1431.1): before the rename walk, which moves a
             // module drop only between the drops these edges order it
