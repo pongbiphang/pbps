@@ -1908,10 +1908,19 @@ pub fn attach_policy_findings<S: Clone>(
 
 /// A rule's finding as the envelope carries it: the rule id is the finding id.
 pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
+    // A saved plan can supply this prose without going through its producers.
+    // Keep already shown names and tool backslashes (DEC-2084.1), but make raw
+    // controls in hand-made findings inert without changing the sealed plan.
+    let message = f
+        .message
+        .split('\\')
+        .map(|part| pbps_model::escape::Escaped(part).to_string())
+        .collect::<Vec<_>>()
+        .join("\\");
     match f.severity {
-        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), f.message.clone()),
-        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), f.message.clone()),
-        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), message),
+        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), message),
+        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), message),
     }
 }
 

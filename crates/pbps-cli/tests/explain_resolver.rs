@@ -977,10 +977,10 @@ fn assert_only_the_reports_own_lines(text: &str, plain: &str, what: &str) {
 
 /// A reviewer approves from the text report, and a hand-made plan holds valid
 /// names and free text with control characters in them: the report shows each
-/// of them escaped, in the lines it already had, and `--format json`, which
-/// escapes them as JSON, is what it was.
+/// of them escaped, in the lines it already had. Structured JSON values stay
+/// raw while human-facing prose is shown once in every format.
 #[test]
-fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
+fn the_report_keeps_structured_plan_values_raw_and_shows_prose_once() {
     let shown = HOSTILE_SHOWN;
     let explained = |plan: SavedPlan| {
         let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
@@ -1017,8 +1017,7 @@ fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
     let checks = &text[text.find("Checks that run before").expect(&text)..];
     assert!(checks.contains(shown), "a probe: {checks}");
 
-    // JSON is what it was: each value as JSON spells it, and not escaped a
-    // second time.
+    // Structured values retain their bytes; generated prose is shown once.
     let raw = String::from_utf8(json.stdout.clone()).unwrap();
     let value = report(&json);
     for (what, got) in [
@@ -1032,12 +1031,19 @@ fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
         raw.contains(&serde_json::to_string(HOSTILE).unwrap()),
         "{raw}"
     );
-    assert!(!raw.contains(shown) && !raw.contains("\\u{1b}"), "{raw}");
     let approval = value["data"]["risks"][0]["changes"][0].as_str().unwrap();
     assert!(
-        approval.contains(HOSTILE) && !approval.contains(shown),
+        approval.contains(shown) && !approval.contains(HOSTILE),
         "{approval:?}"
     );
+
+    let finding = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == HOSTILE)
+        .unwrap();
+    assert_eq!(finding["message"], shown);
 
     // A resolved plan, with the resolver's entry, image and limitation.
     let (text, json) = explained(resolved_plan_holding(HOSTILE));
@@ -1347,5 +1353,53 @@ fn same_instance_is_explained_and_tampering_fails_the_approved_checksum() {
             String::from_utf8_lossy(&out.stderr).contains("checksum"),
             "{out:?}"
         );
+    }
+}
+
+#[test]
+fn saved_finding_prose_preserves_tool_backslashes_and_the_sealed_plan() {
+    let rendered = format!(r"tool bytea `\x` names {HOSTILE_SHOWN}");
+    for (message, expected) in [
+        (
+            format!(r"tool bytea `\x` names {HOSTILE}"),
+            rendered.clone(),
+        ),
+        (rendered.clone(), rendered),
+        (
+            r"tool bytea `\x` names literal\\n".into(),
+            r"tool bytea `\x` names literal\\n".into(),
+        ),
+        (
+            "tool bytea `\\x` names 名前_ünï❤️".into(),
+            "tool bytea `\\x` names 名前_ünï❤️".into(),
+        ),
+    ] {
+        let mut plan = plan_holding("ordinary");
+        plan.changes.changes[0].findings[0].message = message;
+        let checksum = plan.wire_fingerprint();
+        let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+        let text = artifact.explain("text");
+        assert!(text.status.success(), "{text:?}");
+        let text = String::from_utf8(text.stdout).unwrap();
+        assert!(
+            text.contains(&format!("      warning: ordinary — {expected}\n")),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let json = artifact.explain("json");
+        assert!(json.status.success(), "{json:?}");
+        let value = report(&json);
+        let finding = value["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["id"] == "ordinary")
+            .unwrap();
+        assert_eq!(finding["message"], expected);
+        assert_eq!(value["data"]["checksum"], checksum);
+        assert_eq!(plan.wire_fingerprint(), checksum);
     }
 }

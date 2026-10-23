@@ -1163,11 +1163,12 @@ pub fn changes(cs: &ChangeSet) -> String {
         // The analyzers' findings, under the change they are about, at the
         // severity the project chose (ADR-0008).
         for f in &p.findings {
+            let finding = crate::policy_finding(f);
             out.push_str(&format!(
                 "      {}: {} — {}\n",
-                f.severity,
-                Escaped(&f.id),
-                f.message
+                finding.severity_word(),
+                Escaped(&finding.id),
+                finding.message
             ));
         }
     }
