@@ -1080,3 +1080,15 @@ Until the complete route ships, a logical root has no physical effects and is
 refused by name. Certification, saved-plan admission and both real emitters
 also refuse roots and partial rebuild parts, even without a pending record.
 Existing operation, SQL, saved wire and checksum behavior is unchanged.
+
+<a id="dec-2298-5"></a>
+
+**DEC-2298.5. Table-root dependency evidence is lossless and non-executable.**
+Module/Table(UID) roots and catalog object/attribute identities preserve every
+direct edge, binding and action owner across diamonds and clones. Each reverse
+read distinguishes absent, unreadable and read-empty. Closure validates cycles
+without ordering operations; external referenced keys are evidence, not teardown.
+Observed PKs supply teardown; desired typed definitions supply restoration.
+The module adapter preserves existing lists and byte oracles without claiming
+catalog completeness. Collection and expansion remain later slices; no execution
+authority is enabled.

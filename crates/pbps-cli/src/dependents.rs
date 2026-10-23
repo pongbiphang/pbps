@@ -537,11 +537,21 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
             let part = match part {
                 Part::Default(_) => Part::Default(here.address.name),
                 Part::Generated(_) => Part::Generated(here.address.name),
-                Part::Check(_) | Part::Index(_) | Part::Policy(_) => unreachable!(),
+                Part::PrimaryKey(_)
+                | Part::Unique(_)
+                | Part::ForeignKey(_)
+                | Part::Check(_)
+                | Part::Index(_)
+                | Part::Policy(_) => unreachable!(),
             };
             (here.address.table, part)
         }
-        Part::Check(_) | Part::Index(_) | Part::Policy(_) => {
+        Part::PrimaryKey(_)
+        | Part::Unique(_)
+        | Part::ForeignKey(_)
+        | Part::Check(_)
+        | Part::Index(_)
+        | Part::Policy(_) => {
             let Located::Present(table) = sources.locate_table(table, at) else {
                 return None;
             };
@@ -768,6 +778,9 @@ fn removal_of(
             })
         }
         Holds::TablePart { table, part } => Ok(match part {
+            Part::PrimaryKey(_) | Part::Unique(_) | Part::ForeignKey(_) => {
+                unreachable!("outside the frozen module oracle")
+            }
             Part::Check(name) => Change::DropCheck {
                 table: table.clone(),
                 name: name.clone(),
@@ -848,7 +861,11 @@ fn restoration_of(
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
                 },
-                Part::Policy(_) | Part::Generated(_) => return Err(unsupported()),
+                Part::PrimaryKey(_)
+                | Part::Unique(_)
+                | Part::ForeignKey(_)
+                | Part::Policy(_)
+                | Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {
                     let (to, fallback, origin) = if let Some(of) = &t.partition_of {
                         (

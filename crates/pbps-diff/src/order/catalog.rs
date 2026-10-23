@@ -1,6 +1,8 @@
 //! Pure facts supplied by the connected engine; no catalog reads live here.
 use pbps_model::{ModuleId, Schema, TableName, ValueSource};
 
+pub mod graph;
+
 /// What a dependent is, in terms this project can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holds {
@@ -28,6 +30,10 @@ pub enum Holds {
 /// Which part of a table a dependent is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
+    /// The observed source key, including its actual constraint name.
+    PrimaryKey(pbps_model::PrimaryKey),
+    Unique(pbps_model::ObjectLocalName),
+    ForeignKey(pbps_model::ObjectLocalName),
     Check(pbps_model::ObjectLocalName),
     Default(pbps_model::ColumnName),
     Index(pbps_model::ObjectLocalName),
@@ -59,6 +65,9 @@ impl Dependent {
             Holds::Module(id) => declared.modules.contains_key(id),
             Holds::TablePart { table, part } => declared.tables.get(table).is_some_and(|t| {
                 match part {
+                    Part::PrimaryKey(_) => t.primary_key.is_some(),
+                    Part::Unique(name) => t.unique.contains_key(name),
+                    Part::ForeignKey(name) => t.foreign_keys.contains_key(name),
                     Part::Check(name) => t.checks.contains_key(name),
                     Part::Index(name) => t.indexes.contains_key(name),
                     // A default is the column's, and the column is what the
