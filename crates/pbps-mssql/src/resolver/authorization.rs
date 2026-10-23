@@ -139,7 +139,7 @@ pub struct AuthorizationContext {
     /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
-    /// Object and column permissions in the staged scope (DEC-2267.1).
+    /// Object, column and type permissions in the staged scope (DEC-2267.1).
     #[serde(
         skip_serializing_if = "BTreeMap::is_empty",
         serialize_with = "staged::serialize"
@@ -552,6 +552,7 @@ fn named_principals(
     named.extend(context.roles.keys().cloned());
     named.extend(context.impersonation.iter().cloned());
     named.extend(context.principal_owners.values().cloned());
+    named.extend(context.principals.keys().cloned());
     for object in context.staged.values() {
         named.insert(object.owner.clone());
         for grant in &object.grants {
@@ -618,6 +619,35 @@ pub struct PrincipalMap {
 }
 
 impl PrincipalMap {
+    /// File-created roots may introduce ACL-only grantors after database setup.
+    /// Extend without renumbering any principal already used by a schema/ACL.
+    pub async fn extend_staged(
+        &mut self,
+        conn: &mut impl QueryConnection,
+        context: &AuthorizationContext,
+        token: &str,
+    ) -> Result<(), DbError> {
+        for logical in named_principals(context, &[]) {
+            if self.to_run_local.contains_key(&logical) {
+                continue;
+            }
+            let run = if is_built_in(context, &logical) {
+                logical.clone()
+            } else {
+                let name: pbps_model::RoleName =
+                    format!("pbps_principal_{}_{token}", self.to_run_local.len()).into();
+                let quoted = bracket(name.raw());
+                let sql = match context.principals.get(&logical) {
+                    Some(PrincipalKind::Role) => format!("CREATE ROLE {quoted} AUTHORIZATION dbo;"),
+                    _ => format!("CREATE USER {quoted} WITHOUT LOGIN;"),
+                };
+                conn.query(&sql).await?;
+                name
+            };
+            self.to_run_local.insert(logical, run);
+        }
+        Ok(())
+    }
     /// `token` is the run's unique suffix; run-local principals are
     /// `pbps_principal_<n>_<token>`.
     pub fn generate(context: &AuthorizationContext, planned: &[PlannedGrant], token: &str) -> Self {
@@ -848,6 +878,75 @@ pub async fn reconstruct_database(
             (None, _) => logical,
         };
         replay(admin, map, owner, &grants, &on, &mut BTreeSet::new()).await?;
+    }
+    Ok(())
+}
+
+/// Fill schemas the file left absent. Existing schemas may be file-owned:
+/// neither ownership nor ACLs on them are repaired by this trusted setup.
+pub async fn reconstruct_missing_schemas(
+    conn: &mut impl QueryConnection,
+    map: &PrincipalMap,
+    context: &AuthorizationContext,
+) -> Result<(), DbError> {
+    for (name, schema) in &context.schemas {
+        if SYSTEM_SCHEMAS.contains(&name.as_str()) {
+            continue;
+        }
+        if !conn
+            .query(&format!(
+                "SELECT name FROM sys.schemas WHERE name={};",
+                literal(name)
+            ))
+            .await?
+            .is_empty()
+        {
+            continue;
+        }
+        let owner = map
+            .run_local(&schema.owner)
+            .ok_or_else(|| DbError::BadRow("unmapped schema owner".into()))?;
+        let quoted_owner = bracket(owner.raw());
+        let quoted_schema = bracket(name);
+        conn.query(&format!(
+            "CREATE SCHEMA {quoted_schema} AUTHORIZATION {quoted_owner};"
+        ))
+        .await?;
+        replay(
+            conn,
+            map,
+            &schema.owner,
+            &schema.grants,
+            &format!(" ON SCHEMA::{quoted_schema}"),
+            &mut BTreeSet::new(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Called only after the file's ownership partition has been accepted. This
+/// preserves its owner while reproducing the target schema's visible grants.
+pub async fn replay_file_schema_permissions(
+    conn: &mut impl QueryConnection,
+    map: &PrincipalMap,
+    context: &AuthorizationContext,
+    names: &[String],
+) -> Result<(), DbError> {
+    for name in names {
+        let schema = context
+            .schemas
+            .get(name)
+            .ok_or_else(|| DbError::BadRow("the file schema authorization is unreadable".into()))?;
+        replay(
+            conn,
+            map,
+            &schema.owner,
+            &schema.grants,
+            &format!(" ON SCHEMA::{}", bracket(name)),
+            &mut BTreeSet::new(),
+        )
+        .await?;
     }
     Ok(())
 }

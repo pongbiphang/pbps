@@ -55,7 +55,9 @@ fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
         .collect()
 }
 
-fn mssql_planned(planned: &[PlannedGrant]) -> Vec<mssql_auth::PlannedGrant> {
+pub(in crate::resolver) fn mssql_planned(
+    planned: &[PlannedGrant],
+) -> Vec<mssql_auth::PlannedGrant> {
     // SQL Server's reproduction retains its original per-permission shape.
     planned
         .iter()

@@ -49,6 +49,7 @@ pub enum ColumnPermissionState {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum PermissionScope {
+    /// The whole staged securable: an object or a user-defined type.
     Object(PermissionState),
     Column {
         name: String,
@@ -88,13 +89,34 @@ pub struct OwnerPartition {
 }
 
 impl OwnerPartition {
+    /// Trusted renderer ownership only. File-supplied subjects are verified,
+    /// never passed through an ownership repair.
+    pub fn restricted_to(&self, objects: &BTreeSet<ObjectIdentity>) -> Self {
+        Self {
+            owners: self
+                .owners
+                .iter()
+                .filter(|(subject, _)| match subject {
+                    Subject::Securable(id) => {
+                        matches!(id.class.as_str(), class::OBJECT | class::TYPE)
+                            && objects.contains(id)
+                    }
+                    Subject::Deployer | Subject::DatabaseOwner => true,
+                })
+                .map(|(s, o)| (s.clone(), o.clone()))
+                .collect(),
+        }
+    }
     pub fn from_capture(
         captured: &CapturedInputs,
         context: &AuthorizationContext,
     ) -> Result<Self, Uncovered> {
         let effective = captured.effective_owners()?;
         let mut held_schemas: BTreeSet<String> = context.schemas.keys().cloned().collect();
-        for id in effective.keys().filter(|id| id.class == class::OBJECT) {
+        for id in captured
+            .objects()
+            .filter(|id| id.class == class::OBJECT || id.class == class::TYPE)
+        {
             if let Some(schema) = id.name.first() {
                 held_schemas.insert(schema.clone());
             }
@@ -135,15 +157,27 @@ impl OwnerPartition {
     }
 }
 
-fn object_name(id: &ObjectIdentity) -> Result<String, DbError> {
+fn securable_name(id: &ObjectIdentity) -> Result<String, DbError> {
     match (
         id.class.as_str(),
         id.name.as_slice(),
         id.signature.as_slice(),
     ) {
-        (class::OBJECT, [schema, name], []) => Ok(format!("{}.{}", bracket(schema), bracket(name))),
+        (class::OBJECT | class::TYPE, [schema, name], []) => {
+            Ok(format!("{}.{}", bracket(schema), bracket(name)))
+        }
         _ => Err(DbError::BadRow(
-            "staged authorization requires a schema-qualified object identity".into(),
+            "staged authorization requires a schema-qualified object or type identity".into(),
+        )),
+    }
+}
+
+fn permission_class(id: &ObjectIdentity) -> Result<(&'static str, u8), DbError> {
+    match id.class.as_str() {
+        class::OBJECT => Ok(("OBJECT", 1)),
+        class::TYPE => Ok(("TYPE", 6)),
+        _ => Err(DbError::BadRow(
+            "staged authorization does not cover this permission class".into(),
         )),
     }
 }
@@ -155,9 +189,9 @@ pub async fn reconstruct_owners(
     map: &PrincipalMap,
     target: &OwnerPartition,
 ) -> Result<(), DbError> {
-    // Schemas first, then objects. Children that share their parent's owner
+    // Schemas first, then types and objects. Children that share their parent's owner
     // inherit it, just as Index::owner resolves them on the target.
-    for wanted_class in [class::SCHEMA, class::OBJECT] {
+    for wanted_class in [class::SCHEMA, class::TYPE, class::OBJECT] {
         for (subject, owner) in &target.owners {
             let Subject::Securable(id) = subject else {
                 continue;
@@ -188,8 +222,16 @@ pub async fn reconstruct_owners(
                     continue;
                 }
                 format!("SCHEMA::{}", bracket(name))
+            } else if wanted_class == class::TYPE {
+                let [schema, name] = id.name.as_slice() else {
+                    return Err(DbError::BadRow("invalid type owner identity".into()));
+                };
+                if !id.signature.is_empty() {
+                    return Err(DbError::BadRow("invalid type owner signature".into()));
+                }
+                format!("TYPE::{}.{}", bracket(schema), bracket(name))
             } else {
-                let name = object_name(id)?;
+                let name = securable_name(id)?;
                 let rows = conn.query(&format!(
                     "SELECT OBJECT_SCHEMA_NAME(parent_object_id) AS parent_schema, \
                      OBJECT_NAME(parent_object_id) AS parent_name FROM sys.objects WHERE object_id=OBJECT_ID({});", literal(&name)
@@ -224,7 +266,7 @@ pub async fn reconstruct_owners(
 }
 
 /// Captures visible ACL rows and effective answers as the target deployer.
-/// Role/public rows are included; object and column identities are names,
+/// Role/public rows are included; object, column and type identities are names,
 /// never database-local numeric IDs. This extends the principal map's input
 /// before it is generated, so an ACL-only grantor is also reproduced.
 pub async fn read_staged_permissions(
@@ -250,18 +292,28 @@ pub async fn read_staged_permissions(
         context.principals.extend(extra.principals);
         context.principal_owners.extend(extra.principal_owners);
     }
+    // An alias type's owner need not own a schema or appear in an object ACL.
+    // Keep it in the same run-local principal map used for object owners.
+    for (subject, owner) in &owners.owners {
+        if matches!(subject, Subject::Securable(id) if id.class == class::TYPE) {
+            context
+                .principals
+                .entry(owner.clone())
+                .or_insert(PrincipalKind::User);
+        }
+    }
     let mut staged = BTreeMap::new();
     for (subject, owner) in &owners.owners {
         let Subject::Securable(id) = subject else {
             continue;
         };
-        if id.class != class::OBJECT {
+        if !matches!(id.class.as_str(), class::OBJECT | class::TYPE) {
             continue;
         }
-        let name = object_name(id)?;
-        let rows = conn
-            .query(&format!("SELECT OBJECT_ID({}) AS id;", literal(&name)))
-            .await?;
+        let name = securable_name(id)?;
+        let (kind, permission_class) = permission_class(id)?;
+        let catalog_id = format!("{kind}_ID({})", literal(&name));
+        let rows = conn.query(&format!("SELECT {catalog_id} AS id;")).await?;
         if rows.len() != 1 || rows[0].try_get::<i32>("id")?.is_none() {
             return Err(DbError::Refused(format!(
                 "staged object {name} is absent or unreadable"
@@ -271,7 +323,7 @@ pub async fn read_staged_permissions(
         for row in conn
             .query(&format!(
                 "SELECT subentity_name AS column_name, permission_name AS permission \
-            FROM fn_my_permissions({},N'OBJECT');",
+            FROM fn_my_permissions({},N'{kind}');",
                 literal(&name)
             ))
             .await?
@@ -286,18 +338,20 @@ pub async fn read_staged_permissions(
             "SELECT USER_NAME(p.grantee_principal_id) AS grantee,USER_NAME(p.grantor_principal_id) AS grantor,\
              p.permission_name AS permission,p.state_desc AS state,p.minor_id,\
              COL_NAME(p.major_id,p.minor_id) AS column_name FROM sys.database_permissions p \
-             WHERE p.class=1 AND p.major_id=OBJECT_ID({});", literal(&name)
+             WHERE p.class={permission_class} AND p.major_id={catalog_id};"
         )).await? {
             let state = required(&row, "state", "a staged permission state")?;
             let minor = row.try_get::<i32>("minor_id")?.ok_or_else(|| DbError::BadRow("unreadable permission column ID".into()))?;
             let scope = if minor == 0 {
                 PermissionScope::Object(PermissionState::read(&state)?)
-            } else {
+            } else if id.class == class::OBJECT {
                 PermissionScope::Column {
                     name: required(&row, "column_name", "a staged permission column")?,
                     state: if state == "REVOKE" { ColumnPermissionState::Revoke }
                         else { ColumnPermissionState::Permission(PermissionState::read(&state)?) },
                 }
+            } else {
+                return Err(DbError::BadRow("a type permission cannot name a column".into()));
             };
             held.push(StagedGrant {
                 grantee: required(&row,"grantee","a staged grantee")?.into(),
@@ -332,7 +386,7 @@ pub async fn read_staged_permissions(
     Ok(())
 }
 
-/// Replays object rows first, then column rows and REVOKE exceptions, only
+/// Replays whole-securable rows first, then column rows and REVOKE exceptions, only
 /// after ownership has been accepted. It cannot repair contradictory owners.
 pub async fn replay_staged_permissions(
     conn: &mut impl QueryConnection,
@@ -343,10 +397,16 @@ pub async fn replay_staged_permissions(
 ) -> Result<(), DbError> {
     target_owners.verify(current_owners)?;
     for (id, object) in context.staged.iter() {
-        let name = object_name(id)?;
+        let name = securable_name(id)?;
+        let (kind, _) = permission_class(id)?;
         let mut groups: BTreeMap<Option<&str>, Vec<Grant>> = BTreeMap::new();
         let mut revoked = Vec::new();
         for held in &object.grants {
+            if id.class == class::TYPE && matches!(held.scope, PermissionScope::Column { .. }) {
+                return Err(DbError::BadRow(
+                    "a type permission cannot name a column".into(),
+                ));
+            }
             let (column, state) = match &held.scope {
                 PermissionScope::Object(state) => (None, *state),
                 PermissionScope::Column {
@@ -386,7 +446,7 @@ pub async fn replay_staged_permissions(
                 map,
                 &object.owner,
                 grants,
-                &format!(" ON OBJECT::{name}{column}"),
+                &format!(" ON {kind}::{name}{column}"),
                 able,
             )
             .await?;
@@ -411,7 +471,7 @@ pub async fn replay_staged_permissions(
     Ok(())
 }
 
-/// Re-reads the complete database and staged-object context as the entered
+/// Re-reads the complete database and staged-securable context as the entered
 /// deployer, including what a file might have added to its authority.
 pub async fn verify_staged_authorization(
     conn: &mut impl QueryConnection,
@@ -454,6 +514,27 @@ pub async fn verify_staged_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_rendered_ownership_never_repairs_file_schemas() {
+        let object = crate::resolver::capture::object("dbo", "rendered");
+        let schema = ObjectIdentity {
+            class: class::SCHEMA.into(),
+            name: vec!["dbo".into()],
+            signature: vec![],
+        };
+        let partition = OwnerPartition {
+            owners: BTreeMap::from([
+                (Subject::Securable(object.clone()), "dbo".into()),
+                (Subject::Securable(schema.clone()), "dbo".into()),
+                (Subject::Deployer, "dbo".into()),
+            ]),
+        };
+        let narrowed = partition.restricted_to(&BTreeSet::from([schema.clone(), object.clone()]));
+        assert!(narrowed.owners.contains_key(&Subject::Securable(object)));
+        assert!(!narrowed.owners.contains_key(&Subject::Securable(schema)));
+        assert!(narrowed.owners.contains_key(&Subject::Deployer));
+    }
 
     #[test]
     fn owner_groups_compare_relationships_and_keep_distinct_owners_apart() {

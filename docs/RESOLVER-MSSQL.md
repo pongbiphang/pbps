@@ -715,8 +715,56 @@ post-file inventory root and accepts the corresponding target shapes. Its
 `changed_since` check compares those accepted shapes against the final target
 capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
 the canonical `mssql-capture-v3` shape and its sealed prerequisites, so later
-rechecks do not lose facts the staged comparison used. The CLI still stops at
-the externals boundary; file execution and rendering are #2269.
+rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals before stopping at the named #2238
+reconstruction boundary. No planning or binding certificate is fabricated.
+
+**File execution and rendering (DEC-2269.1).** Preparation inventories the
+bounded scratch after generated database authorization setup, executes the
+file on a separate connection entered into the same sandbox WITH NO REVERT,
+inventories again, renders missing required externals, and inventories a third
+time. The inspection session retains its owner context independently of file
+DENYs and session settings. Every created root, including an unreferenced
+schema's object, enters the complete staged comparison. Children are carried
+only when their parent was created; every other inventory class is either
+compared or refused by name. Only exact generated setup identities are excluded.
+
+Standalone GO lines are split outside single/double quotes, bracketed
+identifiers, line comments and nested block comments. Trailing comments remain
+comments in the adjacent batch, including multiline comments. GO repetition
+and sqlcmd directives/variables refuse before execution. No shell client runs.
+Partial commits, batch failures, comparison refusals and cancellation all use
+the recorded owned cleanup; a wrapping transaction cannot contain dynamic EXEC
+that commits it. File sessions close before cleanup acquires a fresh bounded
+connection.
+
+The pure renderer uses catalog structure with quoted identifiers. Its bounded
+templates cover alias types, ordinary table columns (including identity),
+ordinary unique B-tree keys/indexes, nullable typed views, sequences, scalar
+routines whose semantic flags the constant template reproduces, and external
+CASCADE constraints. Complete comparison rejects every unreproduced setting
+or future scalar property. A non-nullable view, computed column, filtered
+unique index, unsupported routine property or other unqualified class refuses
+by name; the operator may supply a matching file. Original module bodies,
+assemblies and cross-database text are never replayed. File ownership is not
+repaired. Rendered objects receive their mapped ownership before ACL replay,
+and the entered compile session verifies the resulting authorization.
+
+Supplied cleanup carries class-6 ACLs with the exact type it will drop
+(DEC-2269.2). Independently revoking a grant-option chain can invalidate a
+later row's recorded grantor and report 15151; DROP TYPE removes the ACLs
+after dependent objects have been removed. An unreadable type identity or a
+permission without a recorded type drop still refuses. The final inventory
+read must be empty before the sandbox user is removed.
+
+An external or cascade-closure object which needs a managed object cannot
+exist before reconstruction. At a missing scratch prerequisite, the catalog
+check names both objects and says it waits for reconstruction (#2238). The
+renderer refuses the same dependency before emitting DDL. The legal chain
+`a -> managed -> x` measures error 1767 before managed exists; inventing that
+table during setup is a managed overlap. #2238 will lift this refusal through
+chained staging and subsequent complete comparison. The all-external chain
+is accepted. Same-instance configuration, provenance sealing and explain are
+still #2270; this preparation does not publish evidence.
 
 The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
 

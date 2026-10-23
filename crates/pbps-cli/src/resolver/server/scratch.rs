@@ -22,7 +22,7 @@
 //! is qualified under the compatibility rule that compares what each engine
 //! reports about itself.
 //! SQL Server records its run-owned resources before creation too, executes
-//! setup in a NO REVERT sandbox, and currently refuses at externals (#2237).
+//! setup and externals in NO REVERT sandboxes, and refuses at reconstruction (#2238).
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
@@ -312,6 +312,7 @@ impl Run<'_> {
                 pbps_db::resolver::Observation::Observed { value: build },
             );
         }
+        prepared.require_reconstruction()?;
         let mut report = scope::compare_reported(driver, &target_catalog, prepared.catalog())
             .map_err(Error::Scope)?;
         for key in prepared.differences() {

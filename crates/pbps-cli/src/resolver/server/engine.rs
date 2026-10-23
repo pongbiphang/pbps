@@ -55,6 +55,7 @@ pub(super) enum Scratch<'a> {
 }
 pub(super) enum Prepared {
     Postgres(postgres::Prepared),
+    Mssql(mssql::Prepared),
 }
 pub(super) enum Binding {
     Postgres(postgres::Binding),
@@ -64,6 +65,11 @@ pub(super) enum Chained {
 }
 pub(super) enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
+    #[expect(
+        dead_code,
+        reason = "accepted SQL Server capture consumers are implemented by #2238"
+    )]
+    Mssql(pbps_mssql::resolver::capture::Staged),
 }
 pub(super) enum CompiledCapture {
     Postgres(postgres::Closing),
@@ -123,8 +129,17 @@ pub(super) async fn scratch<'a>(
             Ok((provisioning, Scratch::Postgres(scratch)))
         }
         (Driver::Mssql, Standard::Mssql) => {
-            let (provisioning, scratch) =
-                mssql::scratch(target, admin, tokens, planned_identity, scratch).await?;
+            let (provisioning, scratch) = mssql::scratch(
+                target,
+                admin,
+                tokens,
+                planned_identity,
+                scratch,
+                externals,
+                request,
+                provenance,
+            )
+            .await?;
             Ok((provisioning, Scratch::Mssql(scratch)))
         }
         (Driver::Mssql, Standard::Postgres(_)) | (Driver::Postgres, Standard::Mssql) => {
@@ -156,7 +171,18 @@ impl Scratch<'_> {
                     .await
                     .map(Prepared::Postgres)
             }
-            Self::Mssql(scratch) => match scratch.prepare(provisioning, admin, target).await? {},
+            Self::Mssql(scratch) => scratch
+                .prepare(
+                    provisioning,
+                    admin,
+                    target,
+                    target_connection,
+                    authorization,
+                    schemas,
+                    binding,
+                )
+                .await
+                .map(Prepared::Mssql),
         }
     }
 
@@ -168,7 +194,9 @@ impl Scratch<'_> {
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
         match self {
-            Self::Mssql(_) => Err(unsupported()),
+            Self::Mssql(_) => Err(Error::Binding(
+                "SQL Server resolver reconstruction is not implemented yet (#2238)".into(),
+            )),
             Self::Postgres(scratch) => scratch
                 .reconstruction(target, binding, ids, dependencies)
                 .await
@@ -185,7 +213,11 @@ impl Scratch<'_> {
         binding: &Binding,
     ) -> Result<Staged, Error> {
         match (self, prepared, binding) {
-            (Self::Mssql(_), Prepared::Postgres(_), Binding::Postgres(_)) => Err(unsupported()),
+            (Self::Mssql(_), Prepared::Mssql(prepared), _) => {
+                Ok(Staged::Mssql(prepared.staged.clone()))
+            }
+            (Self::Mssql(_), Prepared::Postgres(_), _)
+            | (Self::Postgres(_), Prepared::Mssql(_), _) => Err(unsupported()),
             (Self::Postgres(scratch), Prepared::Postgres(prepared), Binding::Postgres(binding)) => {
                 scratch
                     .compare_externals(provisioning, prepared, admin, target, binding)
@@ -215,50 +247,70 @@ impl Scratch<'_> {
 }
 
 impl Prepared {
+    /// SQL Server preparation is usable on its own; the shared planning path
+    /// still needs reconstruction and a real binding certificate (#2238).
+    pub(super) fn require_reconstruction(&self) -> Result<(), Error> {
+        match self {
+            Self::Postgres(_) => Ok(()),
+            Self::Mssql(_) => Err(Error::Binding(
+                "SQL Server resolver reconstruction is not implemented yet (#2238)".into(),
+            )),
+        }
+    }
+
     pub(super) fn catalog(&self) -> &CatalogFacts {
         match self {
             Self::Postgres(prepared) => &prepared.scratch_catalog,
+            Self::Mssql(prepared) => &prepared.scratch_catalog,
         }
     }
     #[cfg(test)]
     pub(super) fn catalog_mut(&mut self) -> &mut CatalogFacts {
         match self {
             Self::Postgres(prepared) => &mut prepared.scratch_catalog,
+            Self::Mssql(prepared) => &mut prepared.scratch_catalog,
         }
     }
     pub(super) fn into_catalog(self) -> CatalogFacts {
         match self {
             Self::Postgres(prepared) => prepared.scratch_catalog,
+            Self::Mssql(prepared) => prepared.scratch_catalog,
         }
     }
     pub(super) fn differences(&self) -> &[String] {
         match self {
             Self::Postgres(prepared) => &prepared.differences,
+            Self::Mssql(prepared) => &prepared.differences,
         }
     }
     pub(super) fn supplied(&self) -> bool {
         match self {
             Self::Postgres(prepared) => prepared.compile.is_none() && prepared.capture.is_none(),
+            Self::Mssql(_) => false,
         }
     }
     pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
         match (self, binding) {
             (Self::Postgres(prepared), Binding::Postgres(binding)) => prepared.split(binding),
+            (Self::Mssql(_), _) => None,
         }
     }
     pub(super) fn has_filled(&self) -> bool {
         match self {
             Self::Postgres(prepared) => prepared.has_filled(),
+            Self::Mssql(prepared) => !prepared.staged.compared().is_empty(),
         }
     }
     pub(super) fn unfillable(&self) -> Vec<String> {
         match self {
             Self::Postgres(prepared) => prepared.unfillable(),
+            Self::Mssql(_) => Vec::new(),
         }
     }
     pub(super) fn waiting(&self) -> String {
         match self {
             Self::Postgres(prepared) => prepared.waiting(),
+            Self::Mssql(_) => String::new(),
         }
     }
 }
@@ -267,6 +319,9 @@ impl Binding {
     pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
         match (self, prepared) {
             (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding.chains(prepared),
+            (Self::Postgres(_), Prepared::Mssql(_)) => {
+                unreachable!("SQL Server reconstruction refuses before binding")
+            }
         }
     }
     pub(super) fn len(&self) -> usize {
@@ -291,6 +346,7 @@ impl Binding {
                 };
                 binding.compile(extras, driver, zone, compile, steps).await
             }
+            (_, Prepared::Mssql(_)) => Err(unsupported()),
         }
     }
     pub(super) async fn fill_chained(
@@ -305,6 +361,7 @@ impl Binding {
                 .fill_chained(prepared, admin, split, outside)
                 .await
                 .map(Chained::Postgres),
+            (_, Prepared::Mssql(_)) => Err(unsupported()),
         }
     }
     pub(super) async fn compare_chained(
@@ -321,6 +378,7 @@ impl Binding {
                     .await
                     .map(Staged::Postgres)
             }
+            (_, Prepared::Mssql(_), _) => Err(unsupported()),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -344,6 +402,7 @@ impl Binding {
                     .await
                     .map(CompiledCapture::Postgres)
             }
+            (_, Prepared::Mssql(_), _) | (_, _, Staged::Mssql(_)) => Err(unsupported()),
         }
     }
     pub(super) async fn capture_opening(
@@ -374,6 +433,9 @@ impl Binding {
                 CapturedInputs::Postgres(current),
                 Staged::Postgres(staged),
             ) => binding.assess(closing, current, staged),
+            (_, _, _, Staged::Mssql(_)) => {
+                unreachable!("SQL Server reconstruction refuses before assessment")
+            }
         }
     }
 }
@@ -382,6 +444,11 @@ impl Staged {
     pub(super) fn extend(&mut self, other: Self) {
         match (self, other) {
             (Self::Postgres(staged), Self::Postgres(other)) => staged.extend(other),
+            (Self::Mssql(_), Self::Mssql(_))
+            | (Self::Mssql(_), Self::Postgres(_))
+            | (Self::Postgres(_), Self::Mssql(_)) => {
+                unreachable!("SQL Server has no chained reconstruction yet (#2238)")
+            }
         }
     }
     pub(super) fn changed_since(&self, current: &CapturedInputs) -> Vec<String> {
@@ -389,11 +456,13 @@ impl Staged {
             (Self::Postgres(staged), CapturedInputs::Postgres(current)) => {
                 staged.changed_since(current)
             }
+            (Self::Mssql(_), _) => unreachable!("SQL Server reconstruction refuses before capture"),
         }
     }
     pub(super) fn through_shape_view(&self, error: Error) -> Error {
         match self {
             Self::Postgres(staged) => postgres::through_shape_view(error, staged),
+            Self::Mssql(_) => error,
         }
     }
 }

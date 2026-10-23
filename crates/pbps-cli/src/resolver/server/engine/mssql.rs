@@ -1,13 +1,14 @@
 //! SQL Server's scratch adapter: the shared runner owns the lifecycle, and
 //! the dialect owns every statement and inventory (DEC-2236.1).
 
-use super::super::scratch::{Provisioning, Tokens};
-use super::super::{Error, ProduceError};
+use super::super::scratch::{Provenance, Provisioning, Tokens};
+use super::super::{BindingRequest, Error, ProduceError, ScopeRequest};
 use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
-use pbps_mssql::resolver::{self, scratch as sql};
+use pbps_mssql::resolver::{self, authorization as auth, capture, externals, scratch as sql};
+use std::collections::BTreeSet;
 
 enum Created {
     Nothing,
@@ -27,18 +28,55 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     backend: sql::Backend,
     created: Created,
     entered: bool,
+    acquired: Option<sql::Database>,
+    externals: Option<&'a str>,
+    request: &'a ScopeRequest,
+    // Preserve the selected source for #2270's evidence handoff.
+    _provenance: &'a Provenance,
+    _placement: sql::Placement,
+}
+
+pub(in crate::resolver::server) struct Prepared {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the compile connection handoff is consumed by #2238"
+        )
+    )]
+    pub(in crate::resolver::server) compile: Conn,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the principal map handoff is consumed by #2238")
+    )]
+    pub(in crate::resolver::server) map: scope::Principals,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the accepted inventory handoff is consumed by #2238"
+        )
+    )]
+    pub(in crate::resolver::server) inventory: externals::Inventory,
+    pub(in crate::resolver::server) staged: capture::Staged,
+    pub(super) scratch_catalog: CatalogFacts,
+    pub(super) differences: Vec<String>,
 }
 
 fn read(error: pbps_db::DbError) -> Error {
     Error::Read(error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn scratch<'a>(
     target: &mut Conn,
     admin: &mut Conn,
     tokens: &Tokens,
     planned_identity: &str,
     connection: &'a str,
+    externals: Option<&'a str>,
+    request: &'a ScopeRequest,
+    provenance: &'a Provenance,
 ) -> Result<(Provisioning, Scratch<'a>), ProduceError> {
     let result = async {
         let identity = sql::cluster_identity(target).await.map_err(read)?;
@@ -65,6 +103,11 @@ pub(super) async fn scratch<'a>(
                     "the scratch database is the target database".into(),
                 ));
             }
+            sql::Placement::SameInstance if externals.is_some() => {
+                return Err(Error::Binding(
+                    "a same-instance externals file waits for the explicit policy (#2270)".into(),
+                ));
+            }
             sql::Placement::SameInstance => Provisioning::Supplied,
             sql::Placement::SeparateInstance => {
                 if sql::provisions(admin).await.map_err(read)? {
@@ -82,6 +125,11 @@ pub(super) async fn scratch<'a>(
                 backend,
                 created: Created::Nothing,
                 entered: false,
+                acquired: None,
+                externals,
+                request,
+                _provenance: provenance,
+                _placement: placement,
             },
         ))
     }
@@ -90,12 +138,17 @@ pub(super) async fn scratch<'a>(
 }
 
 impl Scratch<'_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare(
         &mut self,
         provisioning: Provisioning,
         admin: &mut Conn,
         target: &CatalogFacts,
-    ) -> Result<std::convert::Infallible, Error> {
+        target_connection: &mut Conn,
+        authorization: &scope::Authorization,
+        schemas: &[String],
+        binding: &BindingRequest<'_>,
+    ) -> Result<Prepared, Error> {
         if !sql::on_backend(admin, &self.backend).await.map_err(read)? {
             return Err(Error::Unusable(
                 "the scratch connection changed backend after separation".into(),
@@ -163,6 +216,7 @@ impl Scratch<'_> {
                 "the supplied scratch database changed after separation".into(),
             ));
         }
+        self.acquired = Some(sql::database(&mut owner).await.map_err(read)?);
         sql::require_owner(&mut owner).await.map_err(read)?;
         let inventory = sql::inventory::read(&mut owner, None).await.map_err(read)?;
         if !inventory.is_empty() {
@@ -210,9 +264,214 @@ impl Scratch<'_> {
                 inventory.names().join(", ")
             )));
         }
-        Err(Error::Binding(
-            "SQL Server resolver externals are not implemented yet (#2237)".into(),
-        ))
+        let managed = [binding.base, binding.desired];
+        let required = capture::required_externals(target_connection, &managed)
+            .await
+            .map_err(capture_error)?;
+        let waiting = required.waiting();
+        if !waiting.is_empty() {
+            return Err(Error::Externals(waiting));
+        }
+        let mut context = match authorization {
+            scope::Authorization::Mssql(context) => auth::read(
+                target_connection,
+                &context.schemas.keys().cloned().collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(read)?,
+            _ => {
+                return Err(Error::Scope(
+                    "the SQL Server authorization belongs to another engine".into(),
+                ));
+            }
+        };
+        let external_scope = capture::CaptureScope {
+            retained: required.roots().clone(),
+            candidates: BTreeSet::new(),
+        };
+        let initial = capture::capture(target_connection, &external_scope)
+            .await
+            .map_err(capture_error)?;
+        let initial_owners = auth::OwnerPartition::from_capture(&initial, &context)
+            .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
+        auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
+            .await
+            .map_err(read)?;
+        let token = format!("{:032x}", rand::random::<u128>());
+        let planned = scope::mssql_planned(&self.request.planned);
+        let mut map = auth::PrincipalMap::generate(&context, &planned, &token);
+        let mut setup_context = context.clone();
+        let initially_held = match authorization {
+            scope::Authorization::Mssql(context) => &context.schemas,
+            _ => unreachable!("authorization checked above"),
+        };
+        setup_context
+            .schemas
+            .retain(|name, _| initially_held.contains_key(name));
+        auth::reconstruct_database(&mut owner, &map, &setup_context)
+            .await
+            .map_err(read)?;
+        let before = externals::inventory(&mut owner, &sandbox)
+            .await
+            .map_err(read)?;
+        if let Some(script) = self.externals {
+            let mut file = self.bounded(&database, &sandbox, &databases).await?;
+            externals::run(&mut file, script)
+                .await
+                .map_err(|e| Error::Externals(vec![e.to_string()]))?;
+            drop(file);
+        }
+        let middle = externals::inventory(&mut owner, &sandbox)
+            .await
+            .map_err(read)?;
+        let from_file = externals::created(&before, &middle);
+        // Validate all file roots before filling; absence/overlap and hidden
+        // shape errors name the file's object rather than a renderer failure.
+        capture::compare_staged(&mut owner, target_connection, &from_file, &[])
+            .await
+            .map_err(stage_error)?;
+        let items = externals::render::missing(&required, &from_file).map_err(Error::Externals)?;
+        auth::reconstruct_missing_schemas(&mut owner, &map, &context)
+            .await
+            .map_err(read)?;
+        let mut render_session = self.bounded(&database, &sandbox, &databases).await?;
+        for item in &items {
+            for statement in &item.statements {
+                render_session.execute(statement).await.map_err(|e| {
+                    Error::Externals(vec![format!("rendered {:?}: {e}", item.object)])
+                })?;
+            }
+        }
+        drop(render_session);
+        let after = externals::inventory(&mut owner, &sandbox)
+            .await
+            .map_err(read)?;
+        let created = externals::created(&before, &after);
+        let target_scope = capture::CaptureScope {
+            retained: created.clone(),
+            candidates: BTreeSet::new(),
+        };
+        let target_inputs = capture::capture(target_connection, &target_scope)
+            .await
+            .map_err(capture_error)?;
+        let target_owners = auth::OwnerPartition::from_capture(&target_inputs, &context)
+            .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
+        auth::read_staged_permissions(target_connection, &mut context, &target_owners)
+            .await
+            .map_err(read)?;
+        map.extend_staged(&mut owner, &context, &token)
+            .await
+            .map_err(read)?;
+        let rendered_objects = externals::created(&middle, &after);
+        auth::reconstruct_owners(
+            &mut owner,
+            &map,
+            &target_owners.restricted_to(&rendered_objects),
+        )
+        .await
+        .map_err(read)?;
+        let mut local = context.clone();
+        if !context.principal.superuser {
+            local.principal.effective = map
+                .deployer(&context)
+                .ok_or_else(|| Error::Scope("no mapped deployer".into()))?;
+        }
+        let current_inputs = capture::capture(&mut owner, &target_scope)
+            .await
+            .map_err(capture_error)?;
+        let current_owners = auth::OwnerPartition::from_capture(&current_inputs, &local)
+            .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
+        target_owners.verify(&current_owners).map_err(read)?;
+        let file_schemas = from_file
+            .iter()
+            .filter(|id| id.class == capture::class::SCHEMA)
+            .map(|id| id.name[0].clone())
+            .collect::<Vec<_>>();
+        auth::replay_file_schema_permissions(&mut owner, &map, &context, &file_schemas)
+            .await
+            .map_err(read)?;
+
+        auth::replay_staged_permissions(
+            &mut owner,
+            &map,
+            &context,
+            &target_owners,
+            &current_owners,
+        )
+        .await
+        .map_err(read)?;
+        let staged = capture::compare_staged(&mut owner, target_connection, &created, &managed)
+            .await
+            .map_err(stage_error)?;
+        let mut compile = self.bounded(&database, &sandbox, &databases).await?;
+        auth::enter_sandbox_deployer(
+            &mut compile,
+            &map,
+            &context,
+            target,
+            &auth::SandboxScope {
+                sandbox: &sandbox,
+                scratch: &database,
+                databases: &databases,
+            },
+        )
+        .await
+        .map_err(read)?;
+        let all_schemas = context.schemas.keys().cloned().collect::<Vec<_>>();
+        let differences = auth::verify_staged_authorization(
+            &mut compile,
+            &map,
+            &context,
+            &all_schemas,
+            &target_owners,
+            &current_owners,
+        )
+        .await
+        .map_err(read)?;
+        if !differences.is_empty() {
+            return Err(Error::Externals(differences));
+        }
+        auth::apply_planned(&mut compile, &map, &planned)
+            .await
+            .map_err(read)?;
+        let scratch_catalog = scope::read_catalog(&mut compile, Driver::Mssql, schemas, &[])
+            .await
+            .map_err(read)?;
+        Ok(Prepared {
+            compile,
+            map: scope::Principals::Mssql(map),
+            inventory: after,
+            staged,
+            scratch_catalog,
+            differences,
+        })
+    }
+
+    async fn bounded(
+        &self,
+        database: &str,
+        sandbox: &str,
+        databases: &[String],
+    ) -> Result<Conn, Error> {
+        let mut conn = Conn::connect(Driver::Mssql, self.connection)
+            .await
+            .map_err(read)?;
+        if !sql::marked(&mut conn, &self.mark).await.map_err(read)? {
+            return Err(Error::Unusable(
+                "the staging session does not reach the marked instance".into(),
+            ));
+        }
+        sql::use_database(&mut conn, database).await.map_err(read)?;
+        if self.acquired.as_ref() != Some(&sql::database(&mut conn).await.map_err(read)?) {
+            return Err(Error::Unusable(
+                "the staging database changed after acquisition".into(),
+            ));
+        }
+        sql::enter_sandbox(&mut conn, sandbox).await.map_err(read)?;
+        sql::sandbox_checks(&mut conn, databases, database)
+            .await
+            .map_err(read)?;
+        Ok(conn)
     }
 
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
@@ -309,5 +568,15 @@ impl Scratch<'_> {
                 })
             }
         }
+    }
+}
+
+fn capture_error(error: capture::CaptureError) -> Error {
+    Error::Externals(vec![format!("{error:?}")])
+}
+fn stage_error(error: capture::StageError) -> Error {
+    match error {
+        capture::StageError::Refused(findings) => Error::Externals(findings),
+        capture::StageError::Capture(error) => capture_error(error),
     }
 }

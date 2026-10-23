@@ -61,6 +61,8 @@ SQL_BUILDERS = {
     for engine in ("pg", "mssql")
     for module in ("emit", "preflight", "rows", "catalog")
 } | {
+    "crates/pbps-mssql/src/resolver/externals.rs",
+    "crates/pbps-mssql/src/resolver/externals/render.rs",
     "crates/pbps-mssql/src/resolver/authorization/sandbox.rs",
     "crates/pbps-mssql/src/resolver/authorization/staged.rs",
     "crates/pbps-mssql/src/resolver/capture/object_properties.rs",
@@ -141,6 +143,8 @@ ALLOWED = {
     "crates/pbps-mssql/src/preflight.rs": (None, "builds SQL Server probe SQL from raw names"),
     "crates/pbps-mssql/src/rows.rs": (None, "builds SQL Server row reads and writes from raw names"),
     "crates/pbps-mssql/src/catalog.rs": (None, "the SQL Server catalog reader's SQL"),
+    "crates/pbps-mssql/src/resolver/externals.rs": (None, "executes bounded externals batches and reads their complete catalog inventory"),
+    "crates/pbps-mssql/src/resolver/externals/render.rs": (None, "quotes catalog structure into SQL Server externals templates"),
     "crates/pbps-mssql/src/resolver/authorization/sandbox.rs": (
         None, "quotes raw principal names into irreversible SQL Server deployer entry SQL",
     ),
