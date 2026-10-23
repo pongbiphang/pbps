@@ -2654,6 +2654,7 @@ the existing reference pin retains those facts. A domain's inherited base
 collation is absent, an override is qualified. Per-type definition decode
 failures are named type limitations, leaving unrelated objects readable while
 a declared counterpart is refused as unrepresentable rather than absent.
+Undeclared type limitations remain in the unreadable catalog inventory for connected commands' unmanaged policy, while declared ones belong only to managed limitations.
 A catalog base outside the column type catalog, such as `int4range` or
 `int4multirange`, is preserved as a
 qualified reference, including its array marker. This does not admit range

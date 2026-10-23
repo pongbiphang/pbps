@@ -72,6 +72,80 @@ fn unrepresentable_types_leave_unrelated_plans_usable_and_declared_dependents_re
             "--reason",
             "adopt representable objects",
         ]));
+        let policy_plan = d.dir.join("unmanaged-type.plan.json");
+        for policy in ["error", "warn", "ignore"] {
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                format!("dialect: postgres\nunmanaged: {policy}\n"),
+            )
+            .unwrap();
+            d.commit();
+            let out = d.run(&["plan", "--db", db, "--out", policy_plan.to_str().unwrap()]);
+            let message = stderr(&out);
+            if policy == "error" {
+                assert_ne!(code(&out), 0, "{message}");
+                assert!(message.contains("`unmanaged: error`"), "{message}");
+                assert!(message.contains("type app._mood ("), "{message}");
+                assert!(!policy_plan.exists());
+            } else {
+                assert_eq!(code(&out), 0, "{message}");
+                assert_eq!(
+                    message.contains("are not declared and are left alone"),
+                    policy == "warn",
+                    "{message}"
+                );
+                if policy == "warn" {
+                    assert!(
+                        message.lines().any(|line| {
+                            line.contains("are not declared and are left alone")
+                                && line.contains("type app._mood (")
+                        }),
+                        "{message}"
+                    );
+                }
+                assert!(policy_plan.exists());
+                std::fs::remove_file(&policy_plan).unwrap();
+            }
+            let out = d.run(&["verify", "--db", db, "--format", "json"]);
+            let message = stderr(&out);
+            let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+            assert_eq!(
+                code(&out),
+                if policy == "error" { 2 } else { 0 },
+                "{report}: {message}"
+            );
+            assert_eq!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["id"] == "state.unmanaged-refused"
+                            && finding["message"]
+                                .as_str()
+                                .is_some_and(|message| message.contains("type app._mood ("))
+                    }),
+                policy == "error",
+                "{report}: {message}"
+            );
+            assert_eq!(
+                message.contains("are not declared and are left alone"),
+                policy == "warn",
+                "{message}"
+            );
+            if policy == "warn" {
+                assert!(
+                    message.lines().any(|line| {
+                        line.contains("are not declared and are left alone")
+                            && line.contains("type app._mood (")
+                    }),
+                    "{message}"
+                );
+            }
+            eprintln!(
+                "PostgreSQL {major}: unmanaged {policy}: plan and verify name/refuse/warn/ignore app._mood as configured"
+            );
+        }
         d.table("table: app.t\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n");
         succeeds(d.run(&["plan", "--no-dev"]));
         d.commit();
