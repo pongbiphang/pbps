@@ -1400,6 +1400,9 @@ fn cmd_pull(
         "pull cannot preserve identities; restore the identity file from git, or deliberately \
          remove it only when starting a new adoption",
     )?;
+    let mut would_overwrite = false;
+    let overwrite_message = "this project already has declarations; pull would overwrite them.\n\
+         Re-run with --force if that is what you want, or pull into a fresh project and merge.";
     if !force {
         // A listing that *failed* is not an empty directory. This guard is the
         // only thing standing between an unforced `pull` and the user's
@@ -1431,12 +1434,16 @@ fn cmd_pull(
             !ids.tables.is_empty()
                 || !ids.columns.is_empty()
                 || !ids.roles.is_empty()
+                || !ids.types.is_empty()
                 || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
-            bail!(
-                "this project already has declarations; pull would overwrite them.\n                 Re-run with --force if that is what you want, or pull into a fresh project and merge."
-            );
+            // Recorded types need the catalog's named absence/omission refusal
+            // even on an unforced pull, before the generic overwrite advice.
+            if existing_ids.as_ref().is_none_or(|ids| ids.types.is_empty()) {
+                bail!("{overwrite_message}");
+            }
+            would_overwrite = true;
         }
     }
 
@@ -1587,7 +1594,29 @@ fn cmd_pull(
     }
 
     let ids = existing_ids.clone().unwrap_or_default();
-    let resolution = pbps_diff::resolve(&pulled.schema, &ids, &[], &context(project.root()));
+    let type_limitations = ids
+        .types
+        .values()
+        .filter_map(|name| {
+            let details: Vec<_> = pulled
+                .limitations
+                .iter()
+                .filter(|limitation| {
+                    matches!(&limitation.target,
+                        pbps_db::catalog::LimitationTarget::Type(target)
+                            if target.schema == name.schema() && target.name == name.name())
+                })
+                .map(|limitation| limitation.detail.as_str())
+                .collect();
+            (!details.is_empty()).then(|| (name.clone(), details.join("; ")))
+        })
+        .collect();
+    let resolution = pbps_diff::resolve_pulled(
+        &pulled.schema,
+        &ids,
+        &type_limitations,
+        &context(project.root()),
+    );
     if let Err(blockers) = &resolution {
         // Only missing human intent permits publishing declarations. An
         // unrepresentable name must still fail before writing anything (#108).
@@ -1607,6 +1636,10 @@ fn cmd_pull(
                 report::blockers(blockers)
             );
         }
+    }
+
+    if would_overwrite {
+        bail!("{overwrite_message}");
     }
 
     // Staged first, outside the project, and loaded back through the checks
@@ -1663,9 +1696,10 @@ fn cmd_pull(
     }
 
     println!(
-        "Pulled {} table(s) and {} module(s) into `{}`.",
+        "Pulled {} table(s), {} module(s) and {} type(s) into `{}`.",
         pulled.schema.tables.len(),
         pulled.schema.modules.len(),
+        pulled.schema.types.len(),
         dir.display()
     );
     let left_out = pulled.warnings.len() + pulled.unexpressible.len();
@@ -1691,8 +1725,11 @@ fn cmd_pull(
     if existing_ids.is_none() || res.ids != ids {
         write_ids(project, &res.ids)?;
     }
-    let minted = res.created_tables.len() + res.added_columns.len() + res.created_roles.len();
-    let kept = ids.tables.len() + ids.columns.len() + ids.roles.len();
+    let minted = res.created_tables.len()
+        + res.added_columns.len()
+        + res.created_roles.len()
+        + res.ids.types.len().saturating_sub(ids.types.len());
+    let kept = ids.tables.len() + ids.columns.len() + ids.roles.len() + ids.types.len();
     println!("Preserved {kept} existing identities; minted {minted} new identities.");
     println!(
         "Next: review and commit these files. Pull does not update database history or accept \
@@ -2015,6 +2052,14 @@ fn declaration_problems_with_sources(
 ) -> Vec<(&'static str, String)> {
     let schema = &loaded.schema;
     let mut out: Vec<(&'static str, String)> = Vec::new();
+    for (name, definition) in &schema.types {
+        for error in dialect.validate_type(name, definition) {
+            out.push((
+                "dialect.rejected",
+                format!("type `{}`: {error}", name.shown()),
+            ));
+        }
+    }
     // Three layers, all reported in the same pass: the loader checks shape, the
     // dialect checks what the engine will refuse (a nullable PK column, an
     // IDENTITY on nvarchar), and the whole-schema checks below see what no
@@ -2231,6 +2276,13 @@ fn types_as_the_dialect_spells_them(
     dialect: &dyn Dialect,
 ) -> pbps_model::Schema {
     let mut out = schema.clone();
+    for definition in out.types.values_mut() {
+        if let pbps_model::ManagedType::Domain { base, .. } = definition
+            && let Ok(ty) = dialect.normalize_type(base)
+        {
+            *base = ty;
+        }
+    }
     for table in out.tables.values_mut() {
         for column in table.columns.values_mut() {
             if let Ok(ty) = dialect.normalize_type(&column.ty) {
@@ -2607,6 +2659,9 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Role(r)) => {
                 declared.roles.insert(r.name, r.role);
             }
+            Ok(pbps_load::LoadedFile::Type(t)) => {
+                declared.types.insert(t.name, t.definition);
+            }
             Ok(pbps_load::LoadedFile::Module(_)) | Err(_) => {}
         }
     }
@@ -2791,6 +2846,9 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Role(r) => {
                 declared.roles.insert(r.name.clone(), r.role.clone());
             }
+            pbps_load::LoadedFile::Type(t) => {
+                declared.types.insert(t.name.clone(), t.definition.clone());
+            }
             pbps_load::LoadedFile::Module(_) => {}
         }
     }
@@ -2803,6 +2861,9 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
     } in staged
     {
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
+            pbps_load::LoadedFile::Type(t) => {
+                (pbps_load::render_type(&t.name, &t.definition), Vec::new())
+            }
             pbps_load::LoadedFile::Module(m) => (
                 // A module has no one-shot annotations to absorb: it carries no
                 // identity, so there is no rename intent to record (ADR-0002).

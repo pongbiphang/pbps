@@ -171,6 +171,9 @@ pub struct Limitation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LimitationTarget {
     Relation(TableName),
+    /// Keep the catalog spelling even when the type-reference grammar cannot
+    /// name it; types have a namespace distinct from relations and modules.
+    Type(ObjectName),
     /// A module in a shared object namespace, even when its declaration also
     /// carries a trigger parent. The unreadable body cannot supply that parent.
     SharedModule(ObjectName),
@@ -197,15 +200,16 @@ impl LimitationTarget {
             Self::Relation(name) => matches!(id, pbps_model::ModuleId::Named(n) if n == name),
             Self::SharedModule(name) => *name == id.object_name(),
             Self::Module(module) => module == id,
-            Self::UnnameableModule(_) => false,
+            Self::Type(_) | Self::UnnameableModule(_) => false,
         }
     }
 
     pub fn object_name(&self) -> ObjectName {
         match self {
-            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
-                name.clone()
-            }
+            Self::Relation(name)
+            | Self::Type(name)
+            | Self::SharedModule(name)
+            | Self::UnnameableModule(name) => name.clone(),
             Self::Module(id) => id.object_name(),
         }
     }
@@ -215,9 +219,10 @@ impl LimitationTarget {
 impl std::fmt::Display for LimitationTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
-                name.raw().fmt(f)
-            }
+            Self::Relation(name)
+            | Self::Type(name)
+            | Self::SharedModule(name)
+            | Self::UnnameableModule(name) => name.raw().fmt(f),
             // Raw inventory text is escaped by its human writer until #2084 step 5 (DEC-2084.1).
             Self::Module(id) => id.raw().fmt(f),
         }

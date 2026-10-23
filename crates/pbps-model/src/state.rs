@@ -135,7 +135,8 @@ use crate::schema::Schema;
 /// `pbps baseline --reason ...`.
 /// 28 records authored policy predicates independently (DEC-1172.2).
 /// Version 29 admits existing user-type references (DEC-1523.2).
-pub const CURRENT_VERSION: u32 = 29;
+/// Version 30 records declared enums and domains (DEC-1635.1).
+pub const CURRENT_VERSION: u32 = 30;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -617,7 +618,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 29);
+        assert_eq!(CURRENT_VERSION, 30);
     }
 
     fn schema_with(ty: &str) -> Schema {

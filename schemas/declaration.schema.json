@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pbps declaration",
-  "description": "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name.",
+  "description": "One pbps declaration file: a table, module, role, enum or domain.\nThe leading key is both the kind and the name.",
   "anyOf": [
     {
       "$ref": "#/$defs/TableDto"
@@ -11,6 +11,12 @@
     },
     {
       "$ref": "#/$defs/RoleDto"
+    },
+    {
+      "$ref": "#/$defs/EnumTypeDto"
+    },
+    {
+      "$ref": "#/$defs/DomainTypeDto"
     }
   ],
   "$defs": {
@@ -1615,8 +1621,71 @@
       "required": [
         "role"
       ]
+    },
+    "EnumTypeDto": {
+      "description": "A shared enum: label order is semantic state.",
+      "type": "object",
+      "properties": {
+        "enum": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enum",
+        "values"
+      ]
+    },
+    "DomainTypeDto": {
+      "description": "A shared domain, with its column-style base type and named checks.",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "not_null": {
+          "type": "boolean",
+          "default": false
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "checks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "collation": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "type"
+      ]
     }
   },
-  "x-pbps-schema-version": 53,
+  "x-pbps-schema-version": 54,
   "x-pbps-tool-version": "0.0.0"
 }

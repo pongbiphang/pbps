@@ -111,6 +111,7 @@ fn decision_count(blocker: &Blocker) -> Option<usize> {
         | Blocker::ConflictingRenameIntents { .. }
         | Blocker::RenameTargetExists { .. }
         | Blocker::UnrepresentableName { .. }
+        | Blocker::MissingType { .. }
         | Blocker::MoveNotBesideDefault { .. } => None,
     }
 }
@@ -289,6 +290,7 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         | Blocker::ConflictingRenameIntents { .. }
         | Blocker::RenameTargetExists { .. }
         | Blocker::UnrepresentableName { .. }
+        | Blocker::MissingType { .. }
         | Blocker::MoveNotBesideDefault { .. } => {}
     }
 }
@@ -581,6 +583,7 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::RenameTargetExists { .. } => "identity.rename-target-exists",
             Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
             Blocker::MoveNotBesideDefault { .. } => "identity.move-not-beside-default",
+            Blocker::MissingType { .. } => "identity.missing-type",
         }
     }
     let text = one_blocker(b);
@@ -600,6 +603,20 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
 fn one_blocker(b: &Blocker) -> String {
     let why = placeholder("why");
     match b {
+        Blocker::MissingType {
+            name,
+            unrepresentable,
+        } => {
+            let why = match unrepresentable {
+                Some(detail) => format!("is unrepresentable: {detail}"),
+                None => "is absent from the pulled schema".into(),
+            };
+            format!(
+                "  type `{name}` {why}; its identity remains recorded; type lifecycle \
+                 arrives in later slices of #1635, so pull cannot record a drop\n",
+                name = name.shown()
+            )
+        }
         Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
             "  if {from} -> {to} is what you meant (provisional table identity):\n{}",
             one_blocker(blocker),
@@ -2673,6 +2690,34 @@ mod tests {
         let finding = blocker_finding(&blocker);
         assert_eq!(finding.id, "identity.unrepresentable-name");
         assert!(finding.message.contains("a.b"), "{finding:?}");
+    }
+
+    #[test]
+    fn missing_type_diagnostics_distinguish_absence_from_unrepresentability() {
+        for detail in [None, Some("domain base app._mood is unsupported".into())] {
+            let blocker = Blocker::MissingType {
+                name: "app.mood".parse().unwrap(),
+                unrepresentable: detail.clone(),
+            };
+            let finding = blocker_finding(&blocker);
+            assert_eq!(finding.id, "identity.missing-type");
+            assert!(finding.message.contains("app.mood"), "{finding:?}");
+            assert!(
+                finding
+                    .message
+                    .contains("type lifecycle arrives in later slices of #1635")
+            );
+            assert_eq!(finding.message.contains("is absent"), detail.is_none());
+            assert_eq!(
+                finding.message.contains("is unrepresentable"),
+                detail.is_some()
+            );
+            if let Some(detail) = detail {
+                assert!(finding.message.contains(&detail));
+            }
+            assert!(finding.remedy.is_none());
+            assert!(!blockers(&[blocker]).contains("pbps drop"));
+        }
     }
 
     /// The table-level case must not claim to be about a column.

@@ -65,7 +65,7 @@ pub struct Managed {
     /// database as it stands. Only a plan that revokes one is impossible, and
     /// that is what [`crate::engine::unrevocable_grants`] refuses.
     pub unrevocable: Vec<pbps_db::catalog::Unrevocable>,
-    /// Every module in the database that introspection cannot express, by identity,
+    /// Every module or type in the database that introspection cannot express, by identity,
     /// with the reason already rendered.
     ///
     /// Returned in full rather than filtered to the managed set, because the
@@ -173,6 +173,7 @@ where
         if captured.schema != checked.schema
             || captured.missing != checked.missing
             || captured.missing_roles != checked.missing_roles
+            || captured.missing_types != checked.missing_types
             || captured.unexpressible != checked.unexpressible
         {
             bail!(
@@ -2591,7 +2592,7 @@ async fn staged_baseline(
     Vec<pbps_db::catalog::Unrevocable>,
 )> {
     let pulled = pull(conn, crate::engine::Read::Snapshot).await?;
-    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+    let unreadable = unreadable_objects(&pulled);
     // Over the *watched* set, which contains the checked one: a module this
     // plan is about to write that the catalog cannot read back is a
     // limitation, and it is only in the wider set. The two reads this
@@ -2658,7 +2659,7 @@ async fn managed_state_full(
     read: crate::engine::Read,
 ) -> anyhow::Result<Managed> {
     let pulled = pull(conn, read).await?;
-    let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+    let unreadable = unreadable_objects(&pulled);
     let limitations = managed_limitations(&pulled, ids, modules, external);
     let unmanaged_relations = pulled
         .limitations
@@ -2671,6 +2672,7 @@ async fn managed_state_full(
                 Some(name.clone())
             }
             pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::Type(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
@@ -3778,7 +3780,18 @@ pub(crate) fn managed_limitations(
     pulled
         .limitations
         .iter()
-        .filter(|limitation| omission_is_managed(&limitation.target, &managed_tables, modules))
+        .filter(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Type(name) => ids
+                .types
+                .values()
+                .any(|t| t.schema() == name.schema && t.name() == name.name),
+            pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => {
+                omission_is_managed(&limitation.target, &managed_tables, modules)
+            }
+        })
         .map(|limitation| limitation.detail.clone())
         .chain(
             pulled
@@ -4057,12 +4070,13 @@ fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbError>) {
 #[error("{0}")]
 pub struct UnmanagedPolicy(String);
 
-/// Converts the dialect's unreadable-module inventory into the common identity and
-/// description form used by connected commands.
-pub(crate) fn unreadable_modules(
-    modules: &[pbps_db::catalog::UnmanagedModule],
+/// Converts unreadable modules and type limitations into the common identity
+/// and description form used by connected commands.
+pub(crate) fn unreadable_objects(
+    pulled: &pbps_db::catalog::Pulled,
 ) -> Vec<(pbps_db::catalog::LimitationTarget, String)> {
-    modules
+    pulled
+        .unmanaged_modules
         .iter()
         .map(|module| {
             (
@@ -4075,11 +4089,34 @@ pub(crate) fn unreadable_modules(
                 ),
             )
         })
+        // An omitted type has no definition to scope, but remains a catalog
+        // object subject to the unmanaged policy (SPEC §4.8, DEC-1635.1).
+        .chain(
+            pulled
+                .limitations
+                .iter()
+                .filter(|limitation| {
+                    matches!(
+                        limitation.target,
+                        pbps_db::catalog::LimitationTarget::Type(_)
+                    )
+                })
+                .map(|limitation| {
+                    (
+                        limitation.target.clone(),
+                        format!(
+                            "type {} ({})",
+                            pbps_model::escape::Escaped(&limitation.target.to_string()),
+                            limitation.detail
+                        ),
+                    )
+                }),
+        )
         .collect()
 }
 
 /// Names every representable or unreadable catalog object outside the managed
-/// set — tables, modules and roles alike — for applying the `unmanaged:`
+/// set — tables, types, modules and roles alike — for applying the `unmanaged:`
 /// policy of SPEC §8.2.
 pub(crate) fn unmanaged_objects(
     scoped: &pbps_diff::Scoped,
@@ -4097,6 +4134,12 @@ pub(crate) fn unmanaged_objects(
         .map(|name| name.shown().to_string())
         .chain(
             scoped
+                .unmanaged_types
+                .iter()
+                .map(|name| format!("type {}", name.shown())),
+        )
+        .chain(
+            scoped
                 .unmanaged_modules
                 .iter()
                 .map(|id| id.shown().to_string()),
@@ -4111,7 +4154,7 @@ pub(crate) fn unmanaged_objects(
                 .iter()
                 .map(|r| format!("role {}", r.shown())),
         )
-        // Unreadable modules are absent from `scoped.schema`, but they are
+        // Unreadable modules and types are absent from `scoped.schema`, but they are
         // still catalog objects. If their target is outside the supplied managed
         // set, the unmanaged policy applies exactly as it does to a readable
         // module. Without this half, encryption was an accidental escape from
@@ -4119,8 +4162,17 @@ pub(crate) fn unmanaged_objects(
         .chain(
             unreadable
                 .iter()
-                .filter(|(target, _)| {
-                    !omission_is_managed(target, &managed_tables, managed_modules)
+                .filter(|(target, _)| match target {
+                    pbps_db::catalog::LimitationTarget::Type(name) => !ids
+                        .types
+                        .values()
+                        .any(|t| t.schema() == name.schema && t.name() == name.name),
+                    pbps_db::catalog::LimitationTarget::Relation(_)
+                    | pbps_db::catalog::LimitationTarget::SharedModule(_)
+                    | pbps_db::catalog::LimitationTarget::Module(_)
+                    | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => {
+                        !omission_is_managed(target, &managed_tables, managed_modules)
+                    }
                 })
                 .map(|(_, description)| description.clone()),
         )
@@ -4181,6 +4233,18 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
             "warning: the identity file names {} table(s) this database does not have: {}",
             names.len(),
             names.join(", ")
+        );
+    }
+    if !scoped.missing_types.is_empty() {
+        eprintln!(
+            "warning: the identity file names {} type(s) this database does not have: {}",
+            scoped.missing_types.len(),
+            scoped
+                .missing_types
+                .iter()
+                .map(|name| name.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if !scoped.missing_roles.is_empty() {
@@ -4460,6 +4524,15 @@ fn refuse_pinned_movement(
     after: &Schema,
     label: &str,
 ) -> anyhow::Result<()> {
+    let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
+    for name in types {
+        if before.types.get(name) != after.types.get(name) {
+            bail!(
+                "type `{}` changed during {label}; type lifecycle arrives in later slices of #1635",
+                name.shown()
+            );
+        }
+    }
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, plan.ids)?;
@@ -5654,7 +5727,10 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
             // never creates (#1600, #1606).
             crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
-            let held = ids.without(&scoped.missing).without_roles(&gone);
+            let held = ids
+                .without(&scoped.missing)
+                .without_roles(&gone)
+                .without_types(&scoped.missing_types);
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
@@ -5862,7 +5938,10 @@ pub fn cmd_baseline(
                 // What the database holds, as `snapshot` records it (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
-                let held = ids.without(&scoped.missing).without_roles(&gone);
+                let held = ids
+                    .without(&scoped.missing)
+                    .without_roles(&gone)
+                    .without_types(&scoped.missing_types);
                 let mut snapshot = with_provenance(
                     project.root(),
                     StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
@@ -6449,7 +6528,10 @@ pub fn cmd_bootstrap(
                 // those as held would make the next plan skip them (#1600, #1606).
                 crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
                 let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
-                let held = ids.without(&built.missing).without_roles(&gone);
+                let held = ids
+                    .without(&built.missing)
+                    .without_roles(&gone)
+                    .without_types(&built.missing_types);
                 crate::engine::recheck_type_prerequisites(
                     &mut conn,
                     &bootstrap_pins,
@@ -6657,6 +6739,26 @@ pub fn cmd_plan_db(
 
         let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        if !resolved.ids.types.is_empty() {
+            let live = crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
+            // An omitted definition is present but unrepresentable. Refuse it
+            // before the lifecycle comparison can misreport it as absent.
+            refuse_managed_limitations(&managed_limitations(
+                &live,
+                &resolved.ids,
+                &managed_modules(None, Some(&loaded.schema)),
+                &pbps_diff::external_parents(&loaded.schema),
+            ))?;
+            let managed = Schema {
+                types: live.schema.types.into_iter()
+                    .filter(|(name, _)| resolved.ids.type_uid(name).is_some()).collect(),
+                ..Default::default()
+            };
+            let errors = pbps_diff::schema_diff::type_differences(&managed, &loaded.schema, dialect.as_ref());
+            if !errors.is_empty() {
+                bail!("{}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
+            }
+        }
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
             &[&loaded.schema],
@@ -6858,6 +6960,13 @@ pub fn cmd_plan_db(
             &as_recorded,
             &mut expected,
         )?;
+        // First declarations adopt the live definition, as newly managed
+        // cluster roles do. Already recorded types still participate in drift.
+        for (name, definition) in &as_recorded.types {
+            if entry.snapshot.ids.type_uid(name).is_none() {
+                expected.types.insert(name.clone(), definition.clone());
+            }
+        }
         let recorded = pbps_model::state_checksum(&expected, &recorded_ids);
         if live != recorded {
             bail!(
@@ -8233,7 +8342,10 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         .await?
         .renames;
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
-    if plan.changes.is_empty() && original_ids.roles == plan.ids.roles {
+    if plan.changes.is_empty()
+        && original_ids.roles == plan.ids.roles
+        && original_ids.types == plan.ids.types
+    {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
         if !pinned_managed.references.is_empty() || !plan.type_pins.is_empty() {
@@ -8582,6 +8694,11 @@ fn rename_snapshot_roles(
 /// baseline UID; only their post-apply identity changes when a UID is replaced.
 fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
     let mut scoped = recorded.clone();
+    for (uid, name) in &declared.types {
+        if scoped.type_uid(name).is_none() {
+            scoped.types.insert(uid.clone(), name.clone());
+        }
+    }
     if !dialect.manages_roles() {
         for (uid, name) in &declared.roles {
             if !scoped.roles.values().any(|old| old == name) {
@@ -8900,6 +9017,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // on a resume — and each statement moves it, using what the emitter said
     // that statement does (`Statement::renames`).
     let mut live_ids = entry.snapshot.ids.clone();
+    // Types have no lifecycle statements in this slice: every planned type
+    // identity already exists and must remain in each checkpoint's scope.
+    live_ids.types = plan.ids.types.clone();
     if !dialect.manages_roles() {
         live_ids.roles = plan.ids.roles.clone();
     }
@@ -10283,7 +10403,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+            let unreadable = unreadable_objects(&pulled);
             let expected = format!("view app.{shown} ({why})");
             assert_eq!(unreadable[0].1, expected);
             let empty = IdsFile::default();
@@ -14475,8 +14595,10 @@ mod tests {
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
+            unmanaged_types: Vec::new(),
             unexpressible: Vec::new(),
             missing_roles: Vec::new(),
+            missing_types: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new().into(),
@@ -14531,8 +14653,10 @@ mod tests {
             missing: Vec::new(),
             unmanaged_modules: Vec::new(),
             unmanaged_roles: Vec::new(),
+            unmanaged_types: Vec::new(),
             unexpressible: Vec::new(),
             missing_roles: Vec::new(),
+            missing_types: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
             session_role: String::new().into(),
@@ -14572,6 +14696,11 @@ mod tests {
             "an aggregate".to_owned(),
         );
         check(&empty, &[aggregate], &[]).expect("a routine does not occupy a table's name");
+
+        let ty = LimitationTarget::Type(x);
+        assert!(!ty.matches_module(&"app.x".parse().unwrap()));
+        check(&empty, &[(ty, "an omitted type".into())], &[])
+            .expect("a type limitation is not an unreadable relation");
     }
 
     /// SPEC §7.6 promises the closing read holds the field the plan is itself
@@ -21233,7 +21362,7 @@ mod tests {
             &modules,
             &Default::default(),
         );
-        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+        let unreadable = unreadable_objects(&pulled);
 
         let limited = managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new());
         let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &modules);
@@ -21323,7 +21452,7 @@ mod tests {
         // The identity remains authoritative even though no table was pulled.
         let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &Default::default());
         assert!(scoped.schema.tables.is_empty());
-        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+        let unreadable = unreadable_objects(&pulled);
         let outside = unmanaged_objects(&scoped, &unreadable, &ids, &modules);
         assert_eq!(outside.len(), 4, "{outside:?}");
         for item in pulled.unmanaged_modules.iter().skip(1) {
@@ -21355,6 +21484,72 @@ mod tests {
             5
         );
         assert!(managed_limitations(&pulled, &empty, &modules, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn omitted_types_are_managed_only_by_their_own_declared_identities() {
+        use pbps_db::catalog::{Limitation, LimitationTarget, Pulled};
+        let name = TableName::new("app", "mood");
+        let pulled = Pulled {
+            limitations: vec![Limitation {
+                target: LimitationTarget::Type(name.clone()),
+                detail: "type app.mood cannot be represented".into(),
+            }],
+            ..Default::default()
+        };
+        let mut ids = IdsFile::default();
+        ids.tables.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.mood", 0),
+            name.clone(),
+        );
+        let modules = [ModuleId::Named(name.clone())].into_iter().collect();
+        assert!(managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()).is_empty());
+        let unreadable = unreadable_objects(&pulled);
+        let scoped = pbps_diff::scope(&pulled.schema, &ids, &modules, &BTreeSet::new());
+        assert_eq!(
+            unmanaged_objects(&scoped, &unreadable, &ids, &modules),
+            ["type app.mood (type app.mood cannot be represented)"]
+        );
+        let refusal = cut(
+            &pulled,
+            &ids,
+            &modules,
+            &BTreeSet::new(),
+            &unreadable,
+            pbps_config::Unmanaged::Error,
+        )
+        .unwrap_err();
+        assert!(refusal.is::<UnmanagedPolicy>(), "{refusal:#}");
+        assert!(refusal.to_string().contains("type app.mood"));
+        ids.types.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Type, "app.mood", 0),
+            "app.mood".parse().unwrap(),
+        );
+        assert_eq!(
+            managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()),
+            ["type app.mood cannot be represented"]
+        );
+        assert!(unmanaged_objects(&scoped, &unreadable, &ids, &modules).is_empty());
+        cut(
+            &pulled,
+            &ids,
+            &modules,
+            &BTreeSet::new(),
+            &unreadable,
+            pbps_config::Unmanaged::Error,
+        )
+        .expect("a declared type is refused by managed limitations, not unmanaged policy");
+        let relation = Pulled {
+            limitations: vec![Limitation {
+                target: LimitationTarget::Relation(name),
+                detail: "table app.mood cannot be represented".into(),
+            }],
+            ..Default::default()
+        };
+        ids.tables.clear();
+        assert!(
+            managed_limitations(&relation, &ids, &BTreeSet::new(), &BTreeSet::new()).is_empty()
+        );
     }
 
     #[test]
@@ -21397,7 +21592,7 @@ mod tests {
             &held,
             &Default::default(),
         );
-        let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+        let unreadable = unreadable_objects(&pulled);
         let unmanaged = unmanaged_objects(&scoped, &unreadable, &IdsFile::default(), &held);
         assert_eq!(unmanaged.len(), 3, "{unmanaged:?}");
         assert!(unmanaged.iter().any(|s| s.contains("app.f(bigint)")));

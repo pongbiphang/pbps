@@ -23,6 +23,10 @@ use pbps_model::{ColumnName, ReferentialAction};
 /// "unknown field `colunms`" from whichever variant happened to be tried first.
 #[derive(Debug, serde::Deserialize)]
 pub struct KindProbe {
+    #[serde(default, rename = "enum")]
+    pub enumeration: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
     #[serde(default)]
     pub table: Option<String>,
     #[serde(default)]
@@ -35,6 +39,38 @@ pub struct KindProbe {
     pub trigger: Option<String>,
     #[serde(default)]
     pub role: Option<pbps_model::RoleName>,
+}
+
+/// A shared enum: label order is semantic state.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnumTypeDto {
+    #[serde(rename = "enum")]
+    pub name: String,
+    #[schemars(schema_with = "enum_values_schema")]
+    pub values: Vec<String>,
+}
+
+fn enum_values_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "array", "items": {"type": "string"}, "uniqueItems": true})
+}
+
+/// A shared domain, with its column-style base type and named checks.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DomainTypeDto {
+    #[serde(rename = "domain")]
+    pub name: String,
+    #[serde(rename = "type")]
+    pub base: String,
+    #[serde(default)]
+    pub not_null: bool,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub checks: BTreeMap<String, String>,
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 /// One database role and its grants (ADR-0005).
@@ -1343,8 +1379,8 @@ pub enum IndexOrder {
 // happened to be tried first. This type exists so the *schema* says what the
 // loader accepts, in one place, generated from the very structures it reads.
 
-/// One pbps declaration file: a table, one view, procedure, function or
-/// trigger, or a database role. The leading key is both the kind and the name.
+/// One pbps declaration file: a table, module, role, enum or domain.
+/// The leading key is both the kind and the name.
 #[derive(schemars::JsonSchema)]
 #[serde(untagged)]
 #[schemars(title = "pbps declaration")]
@@ -1354,6 +1390,8 @@ pub enum DeclarationFile {
     Table(Box<TableDto>),
     Module(Box<ModuleDto>),
     Role(Box<RoleDto>),
+    Enum(Box<EnumTypeDto>),
+    Domain(Box<DomainTypeDto>),
 }
 
 #[cfg(test)]

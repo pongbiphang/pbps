@@ -470,7 +470,7 @@ fn record_catalog_findings(
         );
     }
 
-    let unreadable = crate::deploy::unreadable_modules(&pulled.unmanaged_modules);
+    let unreadable = crate::deploy::unreadable_objects(pulled);
     let unmanaged_objects =
         crate::deploy::unmanaged_objects(scoped, &unreadable, recorded_ids, &recorded_modules);
     if unmanaged != pbps_config::Unmanaged::Ignore && !unmanaged_objects.is_empty() {
@@ -1180,6 +1180,56 @@ mod tests {
             &Default::default(),
         );
         (entry, pulled, scoped)
+    }
+
+    #[test]
+    fn omitted_types_obey_the_status_unmanaged_policy() {
+        use pbps_db::catalog::{Limitation, LimitationTarget};
+        let (entry, mut pulled, _) = stray_table();
+        pulled.schema.tables.clear();
+        pulled.limitations.push(Limitation {
+            target: LimitationTarget::Type(pbps_model::TableName::new("app", "_mood")),
+            detail: "type name starts with `_`".into(),
+        });
+        let scoped = pbps_diff::scope(
+            &pulled.schema,
+            &entry.snapshot.ids,
+            &Default::default(),
+            &Default::default(),
+        );
+        for (policy, state, finding_id) in [
+            (
+                pbps_config::Unmanaged::Error,
+                "policy",
+                "state.unmanaged-refused",
+            ),
+            (pbps_config::Unmanaged::Warn, "warning", "state.unmanaged"),
+            (pbps_config::Unmanaged::Ignore, "ok", ""),
+        ] {
+            let mut r = row("prod", "ok");
+            record_catalog_findings(
+                &mut r,
+                &entry,
+                &pulled,
+                &scoped,
+                Ok(Default::default()),
+                policy,
+            );
+            assert_eq!(r.state, state, "{r:?}");
+            let found = findings(&[r]);
+            if policy == pbps_config::Unmanaged::Ignore {
+                assert!(found.is_empty(), "{found:?}");
+            } else {
+                assert_eq!(found.len(), 1, "{found:?}");
+                assert_eq!(found[0].id, finding_id);
+                assert!(
+                    found[0]
+                        .message
+                        .contains("type app._mood (type name starts with `_`)"),
+                    "{found:?}"
+                );
+            }
+        }
     }
 
     #[test]

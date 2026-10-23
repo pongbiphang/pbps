@@ -52,6 +52,9 @@ mod removal_names_tests;
 #[path = "support/rename_order.rs"]
 mod rename_order_tests;
 
+#[path = "support/managed_types.rs"]
+mod managed_types_tests;
+
 #[path = "support/user_types.rs"]
 mod user_types_tests;
 
@@ -19108,6 +19111,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
                 name,
             }) => format!("{}.{name}", on.name),
             target @ (pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::Type(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_)) => target.object_name().name,

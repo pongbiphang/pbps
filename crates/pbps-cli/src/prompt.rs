@@ -226,7 +226,9 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // declaration), and there is no intent this prompt could record that
         // would let resolution proceed with a name pbps's own identity format
         // cannot carry.
-        Blocker::UnrepresentableName { .. } | Blocker::MoveNotBesideDefault { .. } => {}
+        Blocker::UnrepresentableName { .. }
+        | Blocker::MissingType { .. }
+        | Blocker::MoveNotBesideDefault { .. } => {}
     }
     out
 }
@@ -421,6 +423,9 @@ fn question(b: &Blocker) -> String {
                 "{table} is not a range or list partition beside a DEFAULT",
                 table = table.shown()
             )
+        }
+        Blocker::MissingType { name, .. } => {
+            format!("type {} cannot be retired by pull", name.shown())
         }
     }
 }

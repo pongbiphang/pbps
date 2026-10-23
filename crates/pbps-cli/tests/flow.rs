@@ -23096,3 +23096,24 @@ mod certified_fixture {
         "/../pbps-diff/tests/support/emission.rs"
     ));
 }
+
+#[test]
+fn a_sql_server_project_refuses_a_declared_type_by_name() {
+    let d = Demo::new("managed-type-mssql1635");
+    std::fs::write(
+        d.dir.join("schema/app.mood.type.yml"),
+        "enum: app.mood\nvalues: [sad, happy]\n",
+    )
+    .unwrap();
+    let output = d.run(&["validate"]);
+    assert_ne!(code(&output), 0);
+    let message = stderr(&output);
+    assert!(
+        message.contains("app.mood")
+            && message.contains("does not support declared enum and domain types"),
+        "{message}"
+    );
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let output = d.run(&["validate"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+}

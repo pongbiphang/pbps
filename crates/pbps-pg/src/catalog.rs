@@ -1224,6 +1224,7 @@ fn batch_query() -> String {
         ("modules", modules_query(), "schema_name, name, oid"),
         ("module_args", module_args_query(), "oid, pos"),
         ("roles", ROLES.to_owned(), "name"),
+        ("types", crate::user_types::managed_query(), "schema, name"),
         ("grants", grants_query(), "schema_name, object_name, column_name, grantee, privilege_type"),
         ("empty_routine_acls", empty_routine_acls_query(), "schema_name, name, oid"),
         ("routine_args", grant_routine_args_query(), "oid, pos"),
@@ -1393,6 +1394,28 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
     }
 
     let mut raw = RawCatalog::default();
+    for row in batch.get("types").ok_or_else(|| missing("types"))? {
+        // Without these query columns there is no identity to attribute a
+        // limitation to. Their failure still means the query and reader differ.
+        let schema = text(row, "schema")?;
+        let name = text(row, "name")?;
+        match decode_managed_type(row, &schema, &name) {
+            Ok((name, definition)) => {
+                raw.types.insert(name, definition);
+            }
+            Err(error) => {
+                let name = TableName::new(schema, name);
+                warnings.push(Limitation {
+                    detail: format!(
+                        "type `{}` cannot be represented: {error}. It is left out of the pull; \
+                         this is not an absent type.",
+                        name.shown()
+                    ),
+                    target: LimitationTarget::Type(name),
+                });
+            }
+        }
+    }
     for row in batch.get("tables").ok_or_else(|| missing("tables"))? {
         raw.tables.push(RawTable {
             oid: number(row, "oid")?,
@@ -2587,6 +2610,88 @@ fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
          snapshot so that it cannot report half of a change as a whole schema, and this is \
          that guard firing. Run it again when the other change has finished."
     ))
+}
+
+// Only the row identity is decoded outside this boundary: every failure in a
+// type's definition is a named omission, never failure of unrelated types or
+// tables in the same statement snapshot (DEC-1635.1).
+fn decode_managed_type(
+    row: &serde_json::Value,
+    schema: &str,
+    name: &str,
+) -> Result<(pbps_model::TypeRef, pbps_model::ManagedType), DbError> {
+    let name =
+        pbps_model::TypeRef::new(schema, name).map_err(|e| DbError::BadRow(e.to_string()))?;
+    let definition = match text(row, "kind")?.as_str() {
+        "e" => pbps_model::ManagedType::Enum {
+            values: strings(row, "labels")?,
+        },
+        "d" => {
+            let mut checks = BTreeMap::new();
+            for check in row
+                .get("checks")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| missing("domain checks"))?
+            {
+                let contype = text(check, "contype")?;
+                if contype != "c" {
+                    return Err(DbError::BadRow(format!(
+                        "domain `{}` has an unsupported constraint kind `{contype}`",
+                        name.shown()
+                    )));
+                }
+                checks.insert(text(check, "name")?.into(), text(check, "expression")?);
+            }
+            pbps_model::ManagedType::Domain {
+                base: domain_base(row)?,
+                not_null: flag(row, "not_null")?,
+                default: optional_text(row, "default_expr")?,
+                checks,
+                collation: optional_text(row, "collation")?
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|e: pbps_model::TypeParseError| {
+                        DbError::BadRow(format!("invalid domain collation: {e}"))
+                    })?,
+            }
+        }
+        _ => {
+            return Err(DbError::BadRow(format!(
+                "type `{}` has an unsupported kind",
+                name.shown()
+            )));
+        }
+    };
+    if !flag(row, "defined")? {
+        return Err(DbError::BadRow(format!(
+            "type `{}` is not defined",
+            name.shown()
+        )));
+    }
+    Ok((name, definition))
+}
+
+fn domain_base(row: &impl CatalogFields) -> Result<pbps_model::ColumnType, DbError> {
+    let parse = |value: String| {
+        value
+            .parse::<pbps_model::ColumnType>()
+            .map_err(|e| DbError::BadRow(e.to_string()))
+    };
+    let base = parse(text(row, "base")?)?;
+    if base.type_ref().is_some() || !base.args.is_empty() || crate::types::normalize(&base).is_ok()
+    {
+        return Ok(base);
+    }
+    // A domain may wrap a built-in outside the column catalog, such as
+    // int4range. Preserve its catalog identity through the existing reference
+    // grammar, without admitting that kind as a standalone column (#1635).
+    let reference = parse(text(row, "base_reference")?)?;
+    if reference.type_ref().is_none() {
+        return Err(DbError::BadRow(
+            "a domain base reference is not qualified".into(),
+        ));
+    }
+    Ok(reference)
 }
 
 fn missing(column: &str) -> DbError {
@@ -4695,6 +4800,147 @@ mod tests {
         // are transactional. Roll back before the owned database is dropped.
     }
 
+    #[test]
+    fn missing_type_inventory_is_not_an_empty_catalog() {
+        let mut batch = empty_catalog_batch();
+        assert!(decode_batch(&batch).unwrap().0.types.is_empty());
+        batch.remove("types");
+        assert!(
+            decode_batch(&batch)
+                .unwrap_err()
+                .to_string()
+                .contains("types")
+        );
+    }
+
+    #[test]
+    fn unrepresentable_types_are_named_omissions_without_losing_the_rest_of_the_batch() {
+        let good_enum = serde_json::json!({
+            "schema": "app", "name": "mood", "kind": "e", "defined": true,
+            "labels": []
+        });
+        let good_domain = serde_json::json!({
+            "schema": "app", "name": "positive", "kind": "d", "defined": true,
+            "base": "integer", "not_null": true, "default_expr": null,
+            "collation": null,
+            "checks": [{"name": "positive_check", "contype": "c", "expression": "VALUE > 0"}]
+        });
+        let mut cases = Vec::new();
+        for (field, value, reason) in [
+            ("name", serde_json::json!("_mood"), "starts with `_`"),
+            ("kind", serde_json::json!("x"), "unsupported kind"),
+            ("defined", serde_json::json!(false), "not defined"),
+            ("labels", serde_json::json!(null), "labels"),
+            ("labels", serde_json::json!([1]), "labels"),
+        ] {
+            let mut row = good_enum.clone();
+            row[field] = value;
+            cases.push((row, reason));
+        }
+        for (field, value, reason) in [
+            ("base", serde_json::json!("app._mood"), "starts with `_`"),
+            ("base", serde_json::json!("int4range"), "base_reference"),
+            ("not_null", serde_json::json!(null), "not_null"),
+            ("default_expr", serde_json::json!(1), "default_expr"),
+            ("collation", serde_json::json!("unqualified"), "collation"),
+            ("checks", serde_json::json!(null), "domain checks"),
+            (
+                "checks",
+                serde_json::json!([{"contype": "x"}]),
+                "unsupported constraint",
+            ),
+            (
+                "checks",
+                serde_json::json!([{"contype": "c", "name": "bad", "expression": null}]),
+                "expression",
+            ),
+            (
+                "checks",
+                serde_json::json!([{"contype": "c", "expression": "true"}]),
+                "name",
+            ),
+        ] {
+            let mut row = good_domain.clone();
+            row[field] = value;
+            cases.push((row, reason));
+        }
+        for (mut bad, reason) in cases {
+            if bad["name"] != "_mood" {
+                bad["name"] = serde_json::json!("bad");
+            }
+            let target = TableName::new("app", bad["name"].as_str().unwrap());
+            let mut batch = empty_catalog_batch();
+            batch.insert(
+                "types".into(),
+                vec![good_enum.clone(), bad, good_domain.clone()],
+            );
+            let (raw, limitations, _) = decode_batch(&batch).unwrap();
+            assert_eq!(raw.types.len(), 2, "{reason}");
+            assert!(raw.types.contains_key(&"app.mood".parse().unwrap()));
+            assert!(matches!(
+                &raw.types[&"app.mood".parse().unwrap()],
+                pbps_model::ManagedType::Enum { values } if values.is_empty()
+            ));
+            assert!(matches!(
+                raw.types[&"app.positive".parse().unwrap()],
+                pbps_model::ManagedType::Domain { not_null: true, .. }
+            ));
+            assert_eq!(limitations.len(), 1, "{reason}");
+            assert_eq!(
+                limitations[0].target,
+                LimitationTarget::Type(target.clone())
+            );
+            assert!(limitations[0].detail.contains(&target.shown().to_string()));
+            assert!(
+                limitations[0].detail.contains(reason),
+                "{}",
+                limitations[0].detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_row_without_a_catalog_identity_is_still_a_broken_read() {
+        for row in [
+            serde_json::json!({"name": "mood"}),
+            serde_json::json!({"schema": "app"}),
+            serde_json::json!({"schema": "app", "name": null}),
+        ] {
+            let mut batch = empty_catalog_batch();
+            batch.insert("types".into(), vec![row]);
+            assert!(decode_batch(&batch).is_err());
+        }
+    }
+
+    #[test]
+    fn domain_bases_outside_the_column_catalog_remain_qualified_references() {
+        for (base, qualified) in [
+            ("int4range", "pg_catalog.int4range"),
+            ("int4multirange", "pg_catalog.int4multirange"),
+            ("int4range[]", "pg_catalog.int4range[]"),
+        ] {
+            let held = domain_base(&serde_json::json!({"base": base, "base_reference": qualified}))
+                .unwrap();
+            assert_eq!(held, qualified.parse().unwrap());
+            assert!(crate::types::normalize(&held).is_ok());
+            assert!(crate::types::normalize(&base.parse().unwrap()).is_err());
+        }
+        let varchar = domain_base(&serde_json::json!({"base": "character varying(20)"})).unwrap();
+        assert_eq!(varchar, "character varying(20)".parse().unwrap());
+        assert!(domain_base(&serde_json::json!({"base": "int4range"})).is_err());
+        assert!(
+            domain_base(&serde_json::json!({"base": "int4range", "base_reference": "integer"}))
+                .is_err()
+        );
+        // A bad modifier is still a validation error, never erased by the
+        // qualified spelling of its otherwise ordinary built-in base.
+        let bad = domain_base(
+            &serde_json::json!({"base": "integer(1)", "base_reference": "pg_catalog.int4"}),
+        )
+        .unwrap();
+        assert!(crate::types::normalize(&bad).is_err());
+    }
+
     /// Every batch key [`decode_batch`] requires, each holding no rows —
     /// a starting point for a test that cares about exactly one part.
     fn empty_catalog_batch() -> CatalogBatch {
@@ -4708,6 +4954,7 @@ mod tests {
             "indexes",
             "modules",
             "module_args",
+            "types",
             "roles",
             "grants",
             "routine_args",

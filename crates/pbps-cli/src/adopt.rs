@@ -248,7 +248,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
                         .or_insert_with(|| (name.clone(), limitation.detail.clone()));
                 }
             }
-            LimitationTarget::SharedModule(_)
+            LimitationTarget::Type(_)
+            | LimitationTarget::SharedModule(_)
             | LimitationTarget::Module(_)
             | LimitationTarget::UnnameableModule(_) => {}
         }
@@ -511,6 +512,12 @@ pub(crate) fn write_declarations(
     // the first, with the identity file naming both (DECISIONS 135).
     declaration_file::refuse_folded_paths(&declaration_file::paths_of(dir, schema)?)?;
     let mut written = BTreeSet::new();
+    for (name, definition) in &schema.types {
+        let path = declaration_file::type_path(dir, name)?;
+        std::fs::write(&path, pbps_load::render_type(name, definition))
+            .with_context(|| format!("cannot write `{}`", path.display()))?;
+        written.insert(path);
+    }
     for (name, table) in &schema.tables {
         // A partition is written in its parent's file (#1170).
         if table.partition_of.is_some() {

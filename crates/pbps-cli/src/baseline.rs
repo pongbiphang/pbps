@@ -325,6 +325,10 @@ fn load_from_git(
                 schema.roles.insert(r.name, r.role);
                 count += 1;
             }
+            Ok(pbps_load::LoadedFile::Type(t)) => {
+                schema.types.insert(t.name, t.definition);
+                count += 1;
+            }
             Err(errs) => {
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.
@@ -430,6 +434,14 @@ pub fn changed_subjects(
             ));
         }
     }
+    for (uid, name) in before.types.iter().chain(&now.types) {
+        if before.types.get(uid) != now.types.get(uid) {
+            // Raw grouping key, never diagnostic prose.
+            let mut key = String::from("type ");
+            key.push_str(&name.raw().to_string());
+            out.insert(key);
+        }
+    }
     // The declarations themselves, matched through the uid so a rename does
     // not hide a change behind it: a table that kept its name and gained an
     // index, changed a type or grew its `data:` block is the object the
@@ -443,6 +455,18 @@ pub fn changed_subjects(
             .and_then(|old_name| before_schema.tables.get(old_name));
         if was != Some(table) {
             out.insert(name.raw().to_string());
+        }
+    }
+    for (name, definition) in &now_schema.types {
+        let was = now_names
+            .type_uid(name)
+            .and_then(|uid| before.types.get(uid))
+            .and_then(|old_name| before_schema.types.get(old_name));
+        if was != Some(definition) {
+            // Raw grouping key, never diagnostic prose.
+            let mut key = String::from("type ");
+            key.push_str(&name.raw().to_string());
+            out.insert(key);
         }
     }
     for (name, role) in &now_schema.roles {
