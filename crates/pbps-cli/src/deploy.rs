@@ -6867,8 +6867,10 @@ pub fn cmd_plan_db(
             bail!("{message}");
         }
 
+        let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
         let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        dependencies = crate::engine::compare_dependencies(&mut conn, &loaded.dependencies).await?;
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
             &[&loaded.schema],
@@ -7870,6 +7872,7 @@ pub fn cmd_plan_db(
         let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &resolved.ids)?;
         let (tables, modules) = crate::report::touched(&names);
         let data = crate::PlanData {
+            dependencies: dependencies.clone(),
             baseline: baseline_description.clone(),
             time_zone: baseline_zone.as_ref().map(ToString::to_string),
             changes: cs.changes.len(),
@@ -7896,6 +7899,7 @@ pub fn cmd_plan_db(
             resolver_assessment,
         };
         if !json {
+            print!("{}", crate::dependencies::render(&dependencies));
             println!("Baseline: {baseline_description}");
             if let Some(zone) = &baseline_zone {
                 // Named because nothing in a statement shows it: the same
@@ -7944,6 +7948,7 @@ pub fn cmd_plan_db(
             resolved.ids,
         );
         plan.module_deps = loaded.hints.module_deps.clone();
+        plan.dependencies = dependencies;
         plan.git_sha = db::git_sha(project.root());
         // The rows the state recorded after the apply has to cover: the
         // declarations' scope, carried so that `apply` needs no checkout.

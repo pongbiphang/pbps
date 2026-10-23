@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 57;
+pub const SCHEMA_VERSION: u32 = 58;
+// 58: declared SQL Server cross-database dependencies and comparison reports (#2322).
 // 57: historical state show, diff and export envelopes (issue #2289).
 // 56: declared type rename annotations and deferred domain vetting (#1635 slice two).
 // 55: SQL Server same_instance configuration and explain provenance (#2270).
@@ -557,6 +558,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dependency_schema_and_loader_agree_on_shapes_and_named_refusals() {
+        let validator = jsonschema::validator_for(&schema(SchemaKind::Declaration)).unwrap();
+        let valid = serde_json::json!({
+            "dependency": "otherdb.dbo.customers", "kind": "table",
+            "columns": {"id": {"type": "int", "nullable": false}, "name": {"type": "nvarchar(100)"}}
+        });
+        for kind in ["table", "view"] {
+            let mut value = valid.clone();
+            value["kind"] = kind.into();
+            assert!(validator.is_valid(&value));
+            assert!(
+                pbps_load::load_file_str(
+                    std::path::Path::new("dependency.yml"),
+                    &value.to_string()
+                )
+                .is_ok()
+            );
+        }
+        for (pointer, bad) in [
+            ("/dependency", serde_json::json!("dbo.customers")),
+            ("/kind", serde_json::json!("procedure")),
+            ("/columns", serde_json::json!({})),
+            ("/columns/id/nullable", serde_json::Value::Null),
+        ] {
+            let mut value = valid.clone();
+            *value.pointer_mut(pointer).unwrap() = bad;
+            assert!(!validator.is_valid(&value), "{value}");
+            assert!(
+                pbps_load::load_file_str(
+                    std::path::Path::new("dependency.yml"),
+                    &value.to_string()
+                )
+                .is_err()
+            );
+        }
+    }
+
     /// Current output and the mutable copies may drift together. An archived
     /// document selected by the version does not drift with either of them.
     #[test]
@@ -652,7 +691,8 @@ mod tests {
     /// misspelt key; so do the server entry's `standard:` types within it
     /// (#1708). `Discovery`'s two maps accept new keys whose values are
     /// `Observation`s, and nothing else. `TypeRoutine` retains the saved
-    /// plan's closed source-record shape (DEC-2181.2).
+    /// plan's closed source-record shape (DEC-2181.2). Dependency records
+    /// retain their closed saved shape and three-part map-key grammar.
     #[test]
     fn only_the_named_envelope_objects_constrain_unnamed_properties() {
         let constrained = constrained_objects(&schema(SchemaKind::Envelope));
@@ -660,8 +700,13 @@ mod tests {
         assert_eq!(
             names,
             [
+                "Dependency",
+                "DependencyColumn",
                 "Discovery/properties/observations",
                 "Discovery/properties/qualification",
+                "Explanation/properties/dependencies",
+                "PlanData/properties/dependencies",
+                "PlannedDependency",
                 "PublicGrant",
                 "PublicStandard",
                 "ResolverProfile/oneOf/0",

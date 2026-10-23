@@ -867,6 +867,43 @@ applicable saved plan; connected planning is still required for apply. An equal
 live type needs no operation. An unrecorded, undeclared live type remains under
 §8.2's unmanaged policy. External-reference offline restrictions remain.
 
+### 4.9 Declared cross-database dependencies (SQL Server)
+
+A single-database project may declare the shape of a table or view in another
+database, one YAML file per object beneath `schema_dir`:
+
+```yaml
+dependency: otherdb.dbo.customers
+kind: table
+columns:
+  id: {type: int, nullable: false}
+  name: {type: nvarchar(100)}
+```
+
+The name has exactly three nonempty parts (`database.schema.object`), the kind
+is `table` or `view`, and columns are nonempty. Types use the SQL Server native
+grammar; nullable defaults to true. Duplicate declarations and PostgreSQL
+dependencies are refused by name. Dependencies are assumptions beside Schema:
+they have no UID, create/alter/drop change, ordering effect or emitted SQL.
+
+Connected planning refuses the target database's own name, resolved by database
+ID. When the other catalog is readable, the object's kind, exact column set,
+normalized types (length, precision and scale included) and nullability must
+match. A missing database, a missing object in a readable catalog or a mismatch
+refuses by name. Without database access or sufficient metadata visibility,
+the dependency remains valid and is labelled `declared, not compared`.
+An empty catalog result never proves unreadability; metadata grants and
+effective denials supply that evidence (DEC-2322.1).
+
+The saved plan pins both declarations and comparison outcomes in its checksum.
+Plan and explain show them in human and JSON output; offline previews label
+them `declared, not compared`. Apply re-reads no dependency. The engine binds
+three-part references when it creates managed objects inside the transaction;
+a missing object or column fails there and rolls the transaction back.
+Changes to the other database are outside this project's drift boundary.
+Resolver rehearsal over declared companions remains #2323; the resolver's
+existing refusal of undeclared three-part references is unchanged.
+
 ## 5. The identity file (`schema.ids.json`)
 
 ### 5.1 Format

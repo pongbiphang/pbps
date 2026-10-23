@@ -4,6 +4,9 @@
   "description": "One pbps declaration file: a table, module, role, enum or domain.\nThe leading key is both the kind and the name.",
   "anyOf": [
     {
+      "$ref": "#/$defs/DependencyDto"
+    },
+    {
       "$ref": "#/$defs/TableDto"
     },
     {
@@ -20,6 +23,57 @@
     }
   ],
   "$defs": {
+    "DependencyDto": {
+      "type": "object",
+      "properties": {
+        "dependency": {
+          "$ref": "#/$defs/DependencyName"
+        },
+        "kind": {
+          "$ref": "#/$defs/DependencyKind"
+        },
+        "columns": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DependencyColumnDto"
+          },
+          "minProperties": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dependency",
+        "kind",
+        "columns"
+      ]
+    },
+    "DependencyName": {
+      "type": "string",
+      "pattern": "^[^.]+\\.[^.]+\\.[^.]+$"
+    },
+    "DependencyKind": {
+      "type": "string",
+      "enum": [
+        "table",
+        "view"
+      ]
+    },
+    "DependencyColumnDto": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
     "TableDto": {
       "type": "object",
       "properties": {
@@ -1700,6 +1754,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 57,
+  "x-pbps-schema-version": 58,
   "x-pbps-tool-version": "0.0.0"
 }

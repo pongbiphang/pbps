@@ -34,6 +34,7 @@ use pbps_model::{
 };
 
 pub mod catalog;
+pub mod dependencies;
 pub mod doctor;
 pub mod edition;
 pub mod emit;

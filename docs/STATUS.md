@@ -6,6 +6,13 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
+SQL Server projects may declare cross-database table/view shapes with
+`dependency:` files (#2322, SPEC §4.9). Connected planning compares readable
+catalogs and labels unreadable dependencies `declared, not compared`; plan
+and explain retain that outcome and the columns. The declarations and outcomes
+are checksum-pinned assumptions, with no UID or managed changes. Apply binds
+managed SQL normally in its transaction. Resolver companion rehearsal is #2323.
+
 #1172/#1173 support PostgreSQL ordinary-table row-security declarations,
 coherent catalog adoption and transactional policy/flag changes on created
 and standing tables. Replacements are explicit drops and creates, widening

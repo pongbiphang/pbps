@@ -167,6 +167,10 @@ ALLOWED = {
         None,
         "writes the type declaration YAML, quoting each value with fmt's `scalar`",
     ),
+    "crates/pbps-load/src/dependencies.rs": (
+        None,
+        "writes dependency declaration YAML, quoting each raw value with fmt's scalar",
+    ),
     "crates/pbps-docs/src/html.rs": (
         None,
         "writes the HTML document, escaping each value with its own `esc`",

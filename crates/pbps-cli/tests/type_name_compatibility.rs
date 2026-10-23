@@ -219,11 +219,19 @@ where
     plan.version = 46;
     state.version = 29;
     state.plan_checksum = Some(plan.wire_fingerprint());
-    // #1635 adds new declaration branches under schema set 54. The captured
-    // legacy branches must still keep their exact contract and bytes.
+    // Strip the type branches from set 54 (extended in set 56) and the
+    // dependency branch from set 58. Captured legacy branches must still
+    // keep their exact contract and bytes.
     let mut declaration_schema =
         serde_json::to_value(schemars::schema_for!(pbps_load::dto::DeclarationFile)).unwrap();
-    for name in ["EnumTypeDto", "DomainTypeDto"] {
+    for name in [
+        "EnumTypeDto",
+        "DomainTypeDto",
+        "DependencyDto",
+        "DependencyName",
+        "DependencyKind",
+        "DependencyColumnDto",
+    ] {
         let reference = format!("#/$defs/{name}");
         declaration_schema["anyOf"]
             .as_array_mut()
@@ -232,7 +240,9 @@ where
         declaration_schema["$defs"]
             .as_object_mut()
             .unwrap()
-            .remove(name);
+            // Keep the captured order: with preserve_order, remove() swaps
+            // the last definition into the removed slot.
+            .shift_remove(name);
     }
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."

@@ -672,3 +672,35 @@ pre-plan RLS context and lazy unchecked wrapping (DEC-1172.3).
 No version changes: this closes an undeliverable execution path without changing
 plan 47, state 29 or schema set 53. Unit and PostgreSQL 16/18 tests pin staged
 admission, ownership, releases, transitions, rollback, stale baselines and guards.
+
+<a id="dec-2322-1"></a>
+
+**DEC-2322.1. Cross-database dependencies are checksum-pinned assumptions beside
+Schema, never managed changes.** A SQL Server `dependency:` file names exactly
+three parts and a table or view with a nonempty column shape. It has no UID,
+change kind or lowering route. Saved plans retain the declarations and their
+`compared` or `declared, not compared` outcome; offline previews retain the
+latter. Plan format 50 identifies this additional closed wire shape. Neither
+apply nor its read-back queries dependencies: the engine binds managed SQL
+inside the ordinary apply transaction, and a binding failure rolls it back.
+The declaration and comparison are shown in plan and explain, human and JSON.
+
+On SQL Server 17.0.4075.5, a non-sa login without database access receives
+HAS_DBACCESS=0 and error 916; with access but without VIEW DEFINITION it sees
+no object row and OBJECT_ID is NULL. With database VIEW DEFINITION, a missing
+object has no row while an existing object is visible. A nonexistent database
+has DB_ID/HAS_DBACCESS NULL and USE raises 911. An effective object DENY hides
+an existing object despite database VIEW DEFINITION: its permission row stays
+visible, while HAS_PERMS_BY_NAME returns 0 for both hidden and absent objects.
+Comparison therefore requires positive visibility evidence, including the
+DEC-1192.1 effective-denial check for an absence claim. A visible object with
+object VIEW DEFINITION is readable independently. Failure of a query is never
+an empty catalog or an accepted assumption. Denying VIEW ANY DATABASE makes
+DB_ID NULL even for an existing database, while HAS_DBACCESS still reports 0;
+an absent database reports NULL for both. When needed, a read-only USE probe
+distinguishes engine errors 911 (missing) and 916 (inaccessible), without a
+server visibility grant. Other errors retain their source and refuse.
+A readable dependency must match kind, the exact column set, normalized native
+types (including length, precision and scale), and nullability. The connection's
+actual target database is refused by database ID. Resolver companion databases
+and the existing undeclared-three-part refusal remain #2323's separate slice.

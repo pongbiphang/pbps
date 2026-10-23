@@ -271,6 +271,9 @@
         "darwin"
       ],
       "cases": [
+        "dependencies2322::readable_dependencies_compare_exact_shapes_and_name_each_refusal",
+        "dependencies2322::unreadable_dependencies_are_reported_without_claiming_comparison",
+        "dependencies2322::apply_binds_dependencies_transactionally_without_repeating_the_comparison",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",
         "abrupt_staged_ddl_refuses_unrecorded_progress",
         "abrupt_staged_row_write_refuses_unproved_replay",

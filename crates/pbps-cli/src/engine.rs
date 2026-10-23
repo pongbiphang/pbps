@@ -41,6 +41,19 @@ use pbps_db::impact::{ImpactError, ImpactReport, RenameTarget};
 use pbps_db::{Conn, DbError, Driver, LedgerEntry, LedgerError, LockInfo, TimelineEntry};
 use pbps_model::{ChangeSet, IdsFile, ObservedRows, RowScope, Schema, StateSnapshot, TableName};
 
+pub async fn compare_dependencies(
+    conn: &mut Conn,
+    declarations: &pbps_model::dependency::Dependencies,
+) -> anyhow::Result<pbps_model::dependency::PlannedDependencies> {
+    match conn.driver() {
+        Driver::Mssql => Ok(pbps_mssql::dependencies::compare(conn, declarations).await?),
+        Driver::Postgres if declarations.is_empty() => Ok(Default::default()),
+        Driver::Postgres => {
+            anyhow::bail!("PostgreSQL does not support cross-database dependencies")
+        }
+    }
+}
+
 /// Execute one staged DDL statement, including recovery owned by its engine.
 pub async fn execute_staged_statement(
     conn: &mut Conn,
