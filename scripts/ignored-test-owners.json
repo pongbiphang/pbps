@@ -482,6 +482,7 @@
       "cases": [
         "a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
+        "managed_types::missing_managed_types_refuse_pull_before_any_project_write",
         "managed_types::pulled_type_files_converge_and_each_type_change_is_refused_without_sql",
         "managed_types::unrepresentable_types_leave_unrelated_plans_usable_and_declared_dependents_refused",
         "type_refs::existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays",
