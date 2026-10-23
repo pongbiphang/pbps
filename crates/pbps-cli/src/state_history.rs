@@ -255,6 +255,13 @@ fn historical_ids(
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
         .chain(ids.tombstones.keys())
+        .chain(ids.rebuilds.values().flat_map(|rebuild| {
+            rebuild
+                .replacement
+                .tables
+                .keys()
+                .chain(rebuild.replacement.columns.keys())
+        }))
         .cloned()
         .collect();
     missing_by_name(&mut ids.tables, &other.tables, &mut taken);
@@ -263,13 +270,18 @@ fn historical_ids(
     missing_by_name(&mut ids.types, &other.types, &mut taken);
     let observed = pbps_diff::observed_ids_reserving(schema, &ids, other);
     // Complete live names without replacing this snapshot's version or intent.
-    // Move permissions belong only to table UIDs retained by this schema.
-    ids.tables = observed.tables;
-    ids.columns = observed.columns;
-    ids.roles = observed.roles;
-    ids.types = observed.types;
-    ids.moves.retain(|uid, _| ids.tables.contains_key(uid));
-    ids
+    // Spell every field so new identity metadata requires a preservation choice.
+    ids.moves.retain(|uid, _| observed.tables.contains_key(uid));
+    pbps_model::IdsFile {
+        version: ids.version,
+        tables: observed.tables,
+        columns: observed.columns,
+        roles: observed.roles,
+        types: observed.types,
+        tombstones: ids.tombstones,
+        moves: ids.moves,
+        rebuilds: ids.rebuilds,
+    }
 }
 
 const PUBLIC_EXECUTE_NOT_RECORDED: &str = "Snapshots do not record historical public_execute.";
@@ -990,6 +1002,25 @@ mod tests {
                 ("t_bbbbbb".parse().unwrap(), move_permission),
             ]
             .into(),
+            rebuilds: [(
+                "t_aaaaaa".parse().unwrap(),
+                pbps_model::Rebuild {
+                    source: pbps_model::RebuildIdentities {
+                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+                        columns: [("c_aaaaaa".parse().unwrap(), table.column("code"))].into(),
+                    },
+                    replacement: pbps_model::RebuildIdentities {
+                        tables: [("t_dddddd".parse().unwrap(), table.clone())].into(),
+                        columns: [("c_dddddd".parse().unwrap(), table.column("code"))].into(),
+                    },
+                    target_checksum: "1".repeat(64),
+                    max_rows: 17,
+                    allowed_at: "2026-10-24".into(),
+                    reason: "selected snapshot rebuild".parse().unwrap(),
+                    operator: "selected".into(),
+                },
+            )]
+            .into(),
         };
         recorded.clone().validated().unwrap();
         let mut other = recorded.clone();
@@ -1001,6 +1032,10 @@ mod tests {
             .moves
             .values_mut()
             .for_each(|entry| entry.max_rows = 99);
+        other
+            .rebuilds
+            .values_mut()
+            .for_each(|entry| entry.operator = "other".into());
         let selected = recorded.clone();
         recorded.tables.remove(&"t_bbbbbb".parse().unwrap());
         recorded.columns.remove(&"c_bbbbbb".parse().unwrap());
@@ -1025,7 +1060,92 @@ mod tests {
             completed.tombstones.is_empty(),
             "the other record cannot retire identities here"
         );
+        assert!(
+            completed.rebuilds.is_empty(),
+            "borrowed names do not grant rebuild permission"
+        );
         completed.validated().unwrap();
+        selected.validated().unwrap();
+        other.validated().unwrap();
+    }
+
+    #[test]
+    fn state_history_completion_reserves_both_records_rebuild_replacement_uids() {
+        let (_stage, _project, entry) = fixture("history-rebuild-reservations");
+        let mut schema = entry.snapshot.schema;
+        let table = schema.tables.keys().next().unwrap().clone();
+        schema.tables.get_mut(&table).unwrap().columns.insert(
+            "source".into(),
+            pbps_model::Column::new("int".parse().unwrap()),
+        );
+        let added: pbps_model::TableName = "dbo.added".parse().unwrap();
+        schema
+            .tables
+            .insert(added.clone(), schema.tables[&table].clone());
+        let table_collision =
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, &added.raw().to_string(), 0);
+        let column_collision = pbps_model::Uid::derived(
+            pbps_model::UidKind::Column,
+            &table.column("code").raw().to_string(),
+            0,
+        );
+        let selected = pbps_model::IdsFile {
+            version: pbps_model::ids::CURRENT_VERSION,
+            tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+            columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
+            roles: BTreeMap::new(),
+            types: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            moves: BTreeMap::new(),
+            rebuilds: [(
+                "t_aaaaaa".parse().unwrap(),
+                pbps_model::Rebuild {
+                    source: pbps_model::RebuildIdentities {
+                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+                        columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
+                    },
+                    replacement: pbps_model::RebuildIdentities {
+                        tables: [(table_collision.clone(), table.clone())].into(),
+                        columns: [(column_collision.clone(), table.column("source"))].into(),
+                    },
+                    target_checksum: "1".repeat(64),
+                    max_rows: 7,
+                    allowed_at: "2026-10-24".into(),
+                    reason: "reserve future identities".parse().unwrap(),
+                    operator: "selected".into(),
+                },
+            )]
+            .into(),
+        };
+        selected.clone().validated().unwrap();
+        let original = selected.clone();
+        // Explicit counterpart UIDs cannot become live while reserved here.
+        let mut other = selected.clone();
+        other.rebuilds.clear();
+        other.tables.insert(table_collision.clone(), added.clone());
+        other
+            .columns
+            .insert(column_collision.clone(), table.column("code"));
+        other.clone().validated().unwrap();
+        let completed = historical_ids(&schema, &selected, &other);
+        assert_eq!(completed.rebuilds, selected.rebuilds);
+        assert_ne!(completed.table_uid(&added), Some(&table_collision));
+        assert_ne!(
+            completed.column_uid(&table.column("code")),
+            Some(&column_collision)
+        );
+        completed.validated().unwrap();
+        // Derivation also reserves replacements present only on the other side.
+        let empty = pbps_model::IdsFile::default();
+        let completed = historical_ids(&schema, &empty, &selected);
+        assert_ne!(completed.table_uid(&added), Some(&table_collision));
+        assert_ne!(
+            completed.column_uid(&table.column("code")),
+            Some(&column_collision)
+        );
+        assert!(completed.rebuilds.is_empty());
+        completed.validated().unwrap();
+        assert_eq!(selected, original);
     }
 
     #[test]

@@ -408,6 +408,15 @@ pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsF
         .chain(reserved.roles.keys())
         .chain(reserved.types.keys())
         .chain(reserved.tombstones.keys())
+        .chain([recorded, reserved].into_iter().flat_map(|ids| {
+            ids.rebuilds.values().flat_map(|rebuild| {
+                rebuild
+                    .replacement
+                    .tables
+                    .keys()
+                    .chain(rebuild.replacement.columns.keys())
+            })
+        }))
         .cloned()
         .collect();
 
