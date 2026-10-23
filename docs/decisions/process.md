@@ -1413,10 +1413,17 @@ crosses audited and unrelated paths with quoting, whitespace and hexadecimal
 or Unicode escapes in block and flow forms, including a flow job header.
 
 Skipping an opaque flow value needs only where it ends, so the scanner must
-tell a comment from text by one rule rather than a list of separators: a `#`
-is text only where it continues a plain scalar (`https://x/#frag`, `b:#c`).
-After whitespace, any flow indicator, a closing quote or a quoted key's `:`
-it starts a comment, as PyYAML reads each of these (measured). Reading a text
-`#` as a comment would skip the rest of the line and could hide a key after
-it, so the rule errs toward text and a stray case is refused as an
-unterminated mapping, never accepted.
+tell a comment from text by token state, never character lookbehind. A quote
+opens a quoted scalar only at its start; quotes inside a plain scalar remain
+text, even after whitespace. A `#` continues that plain scalar unless
+separated by whitespace; between tokens it starts a comment. A completed
+quoted key makes its following colon an indicator, while `a:#b` remains plain
+text. Separation and comment line endings use YAML's characters, not Python's
+broader Unicode whitespace; a non-breaking space is plain text. Opaque
+collections and audited scalar values share this reading, pinned
+against PyYAML. This is smaller than adding a separate refusal policy for
+comments and embedded quotes, which would still need to distinguish those
+tokens. Unreadable quoted tokens and node properties or aliases outside this
+bounded grammar are refused as unsupported flow mappings. Reading a text `#`
+as a comment could hide a later scheduling key, so uncertainty must refuse,
+never accept while hiding that key.

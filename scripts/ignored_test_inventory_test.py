@@ -425,32 +425,157 @@ class WorkflowKeySpellings(unittest.TestCase):
                 list(audit.workflow_runs(source, "live"))
 
     def test_a_hash_inside_a_scalar_is_text_and_only_a_separated_hash_comments(self):
-        # YAML starts a comment only at a `#` after whitespace or a line start.
-        for source in ("    env: { URL: https://example.test/#fragment }\n",
-                       "    steps:\n      - { name: build#1, run: echo }\n",
-                       "    steps: [{ name: a#b, run: echo }]\n",
-                       "    strategy: { matrix: { cell: [a#1, b#2] } }\n",
-                       "    env: { A: x # a comment\n      }\n",
-                       # A comment may follow a flow indicator directly.
-                       "    env: {# [ text\n      A: value}\n",
-                       "    env: { A: x,# [ text\n      B: y }\n",
-                       "    env: { A: [# { text\n      a] }\n",
-                       # ... or a closing indicator, a closing quote, or a
-                       # value indicator between tokens.
-                       "    env: { A: []# [ text\n      , B: v }\n",
-                       "    env: { A: {}# { text\n      , B: v }\n",
-                       "    env: { A: \"x\"# [ text\n      , B: v }\n",
-                       "    env: { A: 'x'# [ text\n      , B: v }\n",
-                       "    env: { \"A\":# [ text\n      v }\n"):
-            with self.subTest(source=source):
-                audit.check_workflow_key_spellings(source, "live")
-        # A separated comment still hides nothing, and a `#` inside a plain
-        # scalar is not one: the key after it is read in both cases.
-        for source in ("    steps:\n      - { name: a # note\n          , 'if': false }\n",
-                       "    steps:\n      - { name: a:#b, 'if': false }\n",
-                       "    steps:\n      - { name: a#b, 'if': false }\n"):
-            with self.subTest(source=source), self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
-                audit.check_workflow_key_spellings(source, "live")
+        # Quoted/plain token state, not the previous character, decides
+        # whether a hash can comment out delimiter-shaped text.
+        for source, reading in (
+            ('    env: { URL: https://example.test/#fragment }\n', {'env': {'URL': 'https://example.test/#fragment'}}),
+            ('    steps:\n      - { name: build#1, run: echo }\n', {'steps': [{'name': 'build#1', 'run': 'echo'}]}),
+            ('    steps: [{ name: a#b, run: echo }]\n', {'steps': [{'name': 'a#b', 'run': 'echo'}]}),
+            ('    strategy: { matrix: { cell: [a#1, b#2] } }\n', {'strategy': {'matrix': {'cell': ['a#1', 'b#2']}}}),
+            ('    env: { A: x # a comment\n      }\n', {'env': {'A': 'x'}}),
+            ('    env: {# [ text\n      A: value}\n', {'env': {'A': 'value'}}),
+            ('    env: { A: x,# [ text\n      B: y }\n', {'env': {'A': 'x', 'B': 'y'}}),
+            ('    env: { A: [# { text\n      a] }\n', {'env': {'A': ['a']}}),
+            ('    env: { A: []# [ text\n      , B: v }\n', {'env': {'A': [], 'B': 'v'}}),
+            ('    env: { A: {}# { text\n      , B: v }\n', {'env': {'A': {}, 'B': 'v'}}),
+            ('    env: { A: "x"# [ text\n      , B: v }\n', {'env': {'A': 'x', 'B': 'v'}}),
+            ("    env: { A: 'x'# [ text\n      , B: v }\n", {'env': {'A': 'x', 'B': 'v'}}),
+            ('    env: { "A":# [ text\n      v }\n', {'env': {'A': 'v'}}),
+            ("    steps:\n      - { name: a # note\n          , 'if': false }\n", {'steps': [{'name': 'a', 'if': False}]}),
+            ("    steps:\n      - { name: a:#b, 'if': false }\n", {'steps': [{'name': 'a:#b', 'if': False}]}),
+            ("    steps:\n      - { name: a#b, 'if': false }\n", {'steps': [{'name': 'a#b', 'if': False}]}),
+        ):
+            self.assert_flow_reading(source, reading)
+
+    def assert_flow_reading(self, source, reading):
+        # The readings were measured with PyYAML 6.0.3, not inferred from
+        # this scanner. JSON supplies an equivalent spelling without a
+        # YAML dependency in CI; keep the scheduling container keys plain.
+        equivalent = re.sub(r'"(strategy|matrix|steps|run)":', r"\1:", json.dumps(reading))
+        steps = reading.get("steps", [])
+        alternate = "if" in reading or any("if" in step for step in steps)
+        for body in (source, equivalent):
+            with self.subTest(source=body, expected_yaml=reading):
+                if alternate:
+                    with self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
+                        audit.check_workflow_key_spellings(body, "live")
+                else:
+                    audit.check_workflow_key_spellings(body, "live")
+
+    def test_plain_and_quoted_flow_scalars_preserve_the_measured_yaml_reading(self):
+        # Each row gives the source, its decoded value, and its decoded
+        # key. None marks a key form PyYAML rejects, not an absent key.
+        readings = (
+            ('a#b', 'a#b', 'a#b'),
+            ('a#', 'a#', 'a#'),
+            ('# note\n      text', 'text', 'text'),
+            ("a'#b", "a'#b", "a'#b"),
+            ('a"#b', 'a"#b', 'a"#b'),
+            ("a'#", "a'#", "a'#"),
+            ('a"#', 'a"#', 'a"#'),
+            ("a'", "a'", "a'"),
+            ('a"', 'a"', 'a"'),
+            ("a'b", "a'b", "a'b"),
+            ('a"b', 'a"b', 'a"b'),
+            ("a 'b#c", "a 'b#c", "a 'b#c"),
+            ('a "b#c', 'a "b#c', 'a "b#c'),
+            ("a 'b'#c", "a 'b'#c", "a 'b'#c"),
+            ('a "b"#c', 'a "b"#c', 'a "b"#c'),
+            ("'a#b'", 'a#b', 'a#b'),
+            ('"a#b"', 'a#b', 'a#b'),
+            ("'a'# note\n      ", 'a', None),
+            ('"a"# note\n      ', 'a', None),
+            ('a:#b', 'a:#b', 'a:#b'),
+            ('a:#', 'a:#', 'a:#'),
+            ('-a#b', '-a#b', '-a#b'),
+            ("a#'b", "a#'b", "a#'b"),
+            ('a#"b', 'a#"b', 'a#"b'),
+            ("a''#b", "a''#b", "a''#b"),
+            ('a""#b', 'a""#b', 'a""#b'),
+            ("a' # note\n      ", "a'", None),
+            ('a" # note\n      ', 'a"', None),
+        )
+        for scalar, value, key in readings:
+            self.assert_flow_reading("    env: { A: " + scalar + " }\n", {"env": {"A": value}})
+            self.assert_flow_reading("    env: { A: [{ B: " + scalar + " }] }\n",
+                                     {"env": {"A": [{"B": value}]}})
+            self.assert_flow_reading("    steps: [{ name: " + scalar + ", 'if': false }]\n",
+                                     {"steps": [{"name": value, "if": False}]})
+            if key is not None:
+                self.assert_flow_reading("    env: { " + scalar + ": v }\n", {"env": {key: "v"}})
+                # Unsupported key tokens must refuse before a later condition
+                # can disappear. Supported ones reach that alternate spelling.
+                source = "    steps: [{ " + scalar + ": v, 'if': false }]\n"
+                with self.subTest(source=source, expected_yaml={"steps": [{key: "v", "if": False}]}):
+                    with self.assertRaisesRegex(audit.InventoryError,
+                            "alternate spelling|unsupported flow mapping needs an explicit audit"):
+                        audit.check_workflow_key_spellings(source, "live")
+
+    def test_flow_indicators_leave_comments_and_scalar_text_in_the_measured_tokens(self):
+        readings = (
+            ('{# } [ "\n       A: v}', {'A': 'v'}),
+            ('{A: v,# } [ "\n       B: w}', {'A': 'v', 'B': 'w'}),
+            ('{A: [# } [ "\n       a]}', {'A': ['a']}),
+            ('{A: []# } [ "\n       , B: v}', {'A': [], 'B': 'v'}),
+            ('{A: {}# } [ "\n       , B: v}', {'A': {}, 'B': 'v'}),
+            ('{"A":# } [ "\n       v}', {'A': 'v'}),
+            ('{\'A\':# } [ "\n       v}', {'A': 'v'}),
+            ('{A:#b}', {'A:#b': None}),
+            ('{A: # } [ "\n       v}', {'A': 'v'}),
+            ('[# } [ "\n       a]', ['a']),
+            ('[a,# } [ "\n       b]', ['a', 'b']),
+            ('[[]# } [ "\n       , b]', [[], 'b']),
+            ('[{}# } [ "\n       , b]', [{}, 'b']),
+            ('["a"# } [ "\n       , b]', ['a', 'b']),
+            ('[\'a\'# } [ "\n       , b]', ['a', 'b']),
+            ('{A: "}#x", B: "[\\"#x"}', {'A': '}#x', 'B': '["#x'}),
+            ("{A: '}#x', B: '[a''#x'}", {'A': '}#x', 'B': "[a'#x"}),
+            ('{"A":"#x"}', {'A': '#x'}),
+            ('{A: a\n       "b#c}', {'A': 'a "b#c'}),
+        )
+        for flow, value in readings:
+            self.assert_flow_reading("    env: " + flow + "\n", {"env": value})
+            self.assert_flow_reading("    steps: [{ env: " + flow + ", 'if': false }]\n",
+                                     {"steps": [{"env": value, "if": False}]})
+
+    def test_an_embedded_quote_cannot_hide_a_later_scheduling_key(self):
+        for source, reading in (
+            ("    env: { URL: abc'#fragment }\n", {'env': {'URL': "abc'#fragment"}}),
+            ('    env: { URL: ab"#c }\n', {'env': {'URL': 'ab"#c'}}),
+            ("    steps:\n      - { name: a'#b, 'if': false }\n", {'steps': [{'name': "a'#b", 'if': False}]}),
+        ):
+            self.assert_flow_reading(source, reading)
+
+    def test_only_yaml_separation_can_start_a_comment_in_a_plain_scalar(self):
+        readings = (
+            ("{ A: a'\u00a0#fragment }", "a'\u00a0#fragment"),
+            ("{ A: a'\u2003#fragment }", "a'\u2003#fragment"),
+            ("{ A: a'\u202f#fragment }", "a'\u202f#fragment"),
+            ("{ A: a' # } [ text\n      }", "a'"),
+            ("{ A: a'\n# } [ text\n      }", "a'"),
+            ("{ A: a'\r# } [ text\r      }", "a'"),
+            ("{ A: a'\x85# } [ text\x85      }", "a'"),
+            ("{ A: a'\u2028# } [ text\u2028      }", "a'"),
+            ("{ A: a'\u2029# } [ text\u2029      }", "a'"),
+        )
+        for flow, value in readings:
+            self.assert_flow_reading("    env: " + flow + "\n", {"env": {"A": value}})
+            # If text is mistaken for a comment, a loose `}` in a later block
+            # scalar can balance the skipped collection and hide the condition.
+            self.assert_flow_reading("    env: " + flow + "\n    'if': false\n    run: |\n      echo }\n",
+                                     {"env": {"A": value}, "if": False, "run": "echo }\n"})
+
+    def test_flow_tokens_requiring_another_scalar_grammar_are_refused_by_name(self):
+        # PyYAML reads these as {"A": "}#text"}, {"A": "]#text"},
+        # and {"A": "x", "B": "x"}; properties/aliases are outside the
+        # bounded scanner. An incomplete quoted token also fails closed.
+        for flow in ('{ A: !!str "}#text" }', '{ A: &value "]#text" }',
+                     '{ A: &value x, B: *value }', '{ A: "unterminated }'):
+            for source in ("    env: " + flow + "\n",
+                           "    steps: [{ env: " + flow + ", 'if': false }]\n"):
+                with self.subTest(source=source), self.assertRaisesRegex(
+                        audit.InventoryError, "unsupported flow mapping needs an explicit audit"):
+                    audit.check_workflow_key_spellings(source, "live")
 
     def test_canonical_and_distinct_quoted_keys_pass_the_spelling_guard(self):
         for position, template in self.positions.items():

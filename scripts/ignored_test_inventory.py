@@ -587,14 +587,10 @@ AUDITED_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include
 YAML_QUOTED = r""""(?:\\[\s\S]|[^"\\])*"|'(?:''|[^'])*'"""
 YAML_QUOTED_SCALAR = re.compile(YAML_QUOTED)
 YAML_KEY = re.compile(r"(" + YAML_QUOTED + r"|[^\s{}\[\],:'\"#]+)([ \t]*):")
-# A `#` is text only where it continues a plain scalar (`https://x/#frag`,
-# `build#1`, `b:#c`); after whitespace, a flow indicator or a closing quote
-# it starts a comment, as the YAML reader takes it, and so it does after the
-# `:` of a quoted key (`"A":#`). Between tokens any `#` is a comment, which
-# `whitespace` below reads by position instead.
-YAML_COMMENT = r"(?:(?<![^\s{}\[\],\"'])|(?<=[\"']:))#[^\n]*"
-YAML_FLOW_SCALAR = re.compile(r"(?:" + YAML_QUOTED + r"|" + YAML_COMMENT + r"|[^,}\]\"'#\s]|\s(?!#)|(?<=[^\s{}\[\],\"'])#)*")
-YAML_FLOW_DELIMITER = re.compile(YAML_QUOTED + r"|" + YAML_COMMENT + r"|[{}\[\]]")
+# Python's Unicode whitespace includes plain YAML text such as NBSP. Treating
+# it as separation could comment out a closing delimiter and a later key.
+YAML_SEPARATION = " \t\r\n\x85\u2028\u2029"
+YAML_SPACE_OR_COMMENT = re.compile(r"(?:[ \t\r\n\x85\u2028\u2029]+|#[^\r\n\x85\u2028\u2029]*)*")
 
 
 def check_workflow_key_spellings(body, job):
@@ -613,18 +609,53 @@ def check_workflow_key_spellings(body, job):
         return (*path, name)
 
     def whitespace(index):
-        return re.compile(r"(?:\s+|#[^\n]*)*").match(body, index).end()
+        return YAML_SPACE_OR_COMMENT.match(body, index).end()
+
+    def flow_separation(index):
+        return index == len(body) or body[index] in YAML_SEPARATION or body[index] in "{}[],"
+
+    def flow_scalar(index):
+        # A quote opens a quoted token only at the scalar's start. In a plain
+        # scalar even a quote after whitespace is text (DEC-2183.1).
+        if index < len(body) and body[index] in "\"'":
+            scalar = YAML_QUOTED_SCALAR.match(body, index)
+            require(scalar is not None, f"unsupported flow mapping needs an explicit audit: {job}")
+            return scalar.end()
+        # Node properties can introduce a quoted scalar after another token.
+        # Refuse these rather than mistake its quoted delimiters for structure.
+        require(index >= len(body) or body[index] not in "!&*",
+                f"unsupported flow mapping needs an explicit audit: {job}")
+        separated = False
+        while index < len(body):
+            char = body[index]
+            if char in "{}[]," or (char == "#" and separated): break
+            if char == ":" and flow_separation(index + 1): break
+            separated = char in YAML_SEPARATION
+            index += 1
+        return index
 
     def flow(index, path):
         # Opaque values need only a balanced end, not our mapping grammar.
         # In particular, action inputs may use YAML's explicit/complex keys.
         if path not in ((), ("strategy",), ("strategy", "matrix"), ("steps",), ("steps", None)):
             depth = 0
-            for token in YAML_FLOW_DELIMITER.finditer(body, index):
-                if token[0] in ("{", "["): depth += 1
-                elif token[0] in ("}", "]"):
+            while index < len(body):
+                index = whitespace(index)
+                if index == len(body): break
+                char = body[index]
+                if char in "{[": depth += 1
+                elif char in "}]":
                     depth -= 1
-                    if depth == 0: return token.end()
+                    if depth == 0: return index + 1
+                elif char != "," and not (char in ":?" and flow_separation(index + 1)):
+                    end = flow_scalar(index)
+                    require(end > index, f"unsupported flow mapping needs an explicit audit: {job}")
+                    # A completed quoted key makes its colon an indicator even
+                    # without separation; a colon inside plain text does not.
+                    if char in "\"'" and body[end:end + 1] == ":": end += 1
+                    index = end
+                    continue
+                index += 1
             raise InventoryError(f"unterminated flow mapping: {job}")
         mapping = body[index] == "{"
         closing = "}" if mapping else "]"
@@ -633,12 +664,15 @@ def check_workflow_key_spellings(body, job):
             child = (*path, None)
             if mapping:
                 key = YAML_KEY.match(body, index)
-                require(key is not None, f"unsupported flow mapping needs an explicit audit: {job}")
+                # A plain key's colon needs separation; a:#b is still plain
+                # text. Never hand its hash to the between-token comment scan.
+                require(key is not None and (key[1][0] in "\"'" or flow_separation(key.end())),
+                        f"unsupported flow mapping needs an explicit audit: {job}")
                 child, index = entry(key, path), whitespace(key.end())
             if index < len(body) and body[index] in "{[":
                 index = flow(index, child)
             else:
-                index = YAML_FLOW_SCALAR.match(body, index).end()
+                index = flow_scalar(index)
             index = whitespace(index)
             require(index < len(body), f"unterminated flow mapping: {job}")
             if body[index] == closing: break
