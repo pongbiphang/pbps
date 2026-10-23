@@ -958,9 +958,19 @@ fn resolve_tables(
         .map(|(u, n)| (n.clone(), u.clone()))
         .collect();
 
+    // Replacement names belong to the recorded expansion, including members
+    // absent from the source. Resolving them here would give the same desired
+    // object a second identity before the rebuild can qualify (DEC-2298.2).
+    let reserved: BTreeSet<TableName> = r
+        .ids
+        .rebuilds
+        .values()
+        .flat_map(|rebuild| rebuild.replacement.tables.values().cloned())
+        .collect();
+
     let mut appeared: BTreeSet<TableName> = declared_names
         .iter()
-        .filter(|n| !known.contains_key(**n))
+        .filter(|n| !known.contains_key(**n) && !reserved.contains(**n))
         .map(|n| (*n).clone())
         .collect();
     let mut disappeared: BTreeSet<TableName> = known
@@ -1122,9 +1132,21 @@ fn resolve_columns(
             .or_default()
             .insert(c.name.clone(), u.clone());
     }
+    // Group reservations once as well: only exact replacement names are
+    // reserved, so unrelated additions on the same parent still get UIDs.
+    let mut reserved_by_table: BTreeMap<TableName, BTreeSet<ColumnName>> = BTreeMap::new();
+    for rebuild in r.ids.rebuilds.values() {
+        for column in rebuild.replacement.columns.values() {
+            reserved_by_table
+                .entry(column.table.clone())
+                .or_default()
+                .insert(column.name.clone());
+        }
+    }
     for (table_name, table) in &declared.tables {
         let declared_cols: BTreeSet<&ColumnName> = table.columns.keys().collect();
         let known = known_by_table.remove(table_name).unwrap_or_default();
+        let reserved = reserved_by_table.remove(table_name).unwrap_or_default();
         // A partition's columns are its parent's, and it declares none, so a
         // table that holds column uids and is declared as a partition is one
         // being attached (#1545, DEC-1545.1): its columns become the
@@ -1140,7 +1162,7 @@ fn resolve_columns(
 
         let mut appeared: BTreeSet<ColumnName> = declared_cols
             .iter()
-            .filter(|n| !known.contains_key(**n))
+            .filter(|n| !known.contains_key(**n) && !reserved.contains(**n))
             .map(|n| (*n).clone())
             .collect();
         let mut disappeared: BTreeSet<ColumnName> = known

@@ -101,6 +101,110 @@ fn recorded(base: &Schema, ids: &IdsFile, desired: &Schema) -> IdsFile {
     .unwrap()
 }
 
+fn with_additions(mut desired: Schema, column: bool, partition: bool) -> Schema {
+    if column {
+        desired
+            .tables
+            .get_mut(&table())
+            .unwrap()
+            .columns
+            .insert("extra".into(), Column::new("integer".parse().unwrap()));
+    }
+    if partition {
+        let mut leaf = desired.tables[&TableName::new("app", "p1")].clone();
+        leaf.partition_of.as_mut().unwrap().bound = PartitionBound::Range {
+            from: vec![BoundDatum::Value("10".into())],
+            to: vec![BoundDatum::Value("20".into())],
+        };
+        desired.tables.insert(TableName::new("app", "p2"), leaf);
+    }
+    desired
+}
+
+fn check_replacement_reservations(column: bool, partition: bool) {
+    let (base, ids, desired) = fixture();
+    let desired = with_additions(desired, column, partition);
+    let approval = recorded(&base, &ids, &desired);
+    for resolution in [
+        crate::resolve(&desired, &approval, &[], &ctx()),
+        crate::resolve_with_annotations(&desired, &approval, &[], 0, &ctx()),
+        crate::resolve_pulled(&desired, &approval, &BTreeMap::new(), &ctx()),
+    ] {
+        let resolved = resolution.unwrap();
+        assert_eq!(resolved.ids, approval);
+        assert!(resolved.created_tables.is_empty());
+        assert!(resolved.added_columns.is_empty());
+        resolved.ids.validate().unwrap();
+        let payload = qualify(side(&base, &ids), side(&desired, &resolved.ids), &table()).unwrap();
+        assert_eq!(
+            payload.intent.replacement,
+            approval.rebuilds.values().next().unwrap().replacement
+        );
+        assert_eq!(
+            crate::resolve(&desired, &resolved.ids, &[], &ctx())
+                .unwrap()
+                .ids,
+            approval
+        );
+    }
+}
+
+#[test]
+fn added_parent_columns_keep_their_rebuild_reservations() {
+    check_replacement_reservations(true, false);
+}
+
+#[test]
+fn added_partitions_keep_their_rebuild_reservations() {
+    check_replacement_reservations(false, true);
+}
+
+#[test]
+fn added_partitions_and_columns_keep_their_rebuild_reservations() {
+    check_replacement_reservations(true, true);
+}
+
+#[test]
+fn unreserved_names_still_receive_live_identities() {
+    let (base, ids, desired) = fixture();
+    let mut desired = with_additions(desired, true, true);
+    let approval = recorded(&base, &ids, &desired);
+    let other = TableName::new("app", "other");
+    desired
+        .tables
+        .insert(other.clone(), base.tables[&table()].clone());
+    desired
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .insert("unreserved".into(), Column::new("integer".parse().unwrap()));
+    // The rebuild never reserves type identities; new managed types must
+    // remain resolvable while a table replacement is pending as well.
+    let ty: pbps_model::TypeRef = "app.count".parse().unwrap();
+    desired.types.insert(
+        ty.clone(),
+        pbps_model::ManagedType::Enum {
+            values: vec!["one".into()],
+        },
+    );
+    for resolution in [
+        crate::resolve(&desired, &approval, &[], &ctx()),
+        crate::resolve_with_annotations(&desired, &approval, &[], 0, &ctx()),
+        crate::resolve_pulled(&desired, &approval, &BTreeMap::new(), &ctx()),
+    ] {
+        let resolved = resolution.unwrap().ids;
+        assert!(resolved.table_uid(&other).is_some());
+        assert!(resolved.column_uid(&other.column("k")).is_some());
+        assert!(resolved.column_uid(&table().column("unreserved")).is_some());
+        assert!(resolved.type_uid(&ty).is_some());
+        assert!(resolved.table_uid(&TableName::new("app", "p2")).is_none());
+        assert!(resolved.column_uid(&table().column("extra")).is_none());
+        assert_eq!(resolved.rebuilds, approval.rebuilds);
+        resolved.validate().unwrap();
+    }
+}
+
 fn check_partition_override_is_refused(own: PartitionColumn) {
     let (base, ids, desired) = fixture();
     let approval = recorded(&base, &ids, &desired);
