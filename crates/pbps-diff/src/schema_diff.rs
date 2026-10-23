@@ -223,7 +223,7 @@ pub enum DiffError {
     PartitionedTableChange { table: TableName, what: Vec<String> },
 
     #[error("cannot plan the blocking rewrite of {table}: {why}", table = .table.shown())]
-    RebuildTable { table: TableName, why: &'static str },
+    RebuildTable { table: TableName, why: String },
 
     #[error("the rebuild intent for {uid} has no source parent identity")]
     RebuildIdentity { uid: Uid },
@@ -691,11 +691,12 @@ pub(crate) fn diff_partial_rebuilding(
                     return DiffError::RebuildIdentity { uid: uid.clone() };
                 };
                 let why = if dialect.name() != "postgres" {
-                    "this engine does not support table rebuilds"
+                    "this engine does not support table rebuilds".to_owned()
                 } else {
                     match crate::rebuild::qualify(base, declared, &table, dialect) {
                         Ok(_) => {
                             "recorded intent is valid; table rebuild execution is not available yet"
+                                .to_owned()
                         }
                         Err(error) => error.why,
                     }

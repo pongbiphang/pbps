@@ -104,6 +104,46 @@ fn rebuild_aliases_record_and_plan_from_one_canonical_schema() {
 }
 
 #[test]
+fn partition_overrides_refuse_rebuild_recording_without_writing_ids() {
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    for own in ["default: '7'", "nullable: false"] {
+        let overridden = parent.replace(
+            "  p1: {from: [0], to: [10]}",
+            &format!("  p1:\n    from: [0]\n    to: [10]\n    columns:\n      k: {{{own}}}"),
+        );
+        for source_has_override in [false, true] {
+            let d = Demo::new("rebuild2298-overrides");
+            d.table(if source_has_override {
+                &overridden
+            } else {
+                parent
+            });
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            d.table(&overridden.replace("partition_by: [k]", "partition_by: [bucket]"));
+            let ids_path = d.dir.join("schema.ids.json");
+            let before = std::fs::read(&ids_path).unwrap();
+            let out = d.run(&[
+                "rebuild-table",
+                "app.p",
+                "--max-rows",
+                "20",
+                "--reason",
+                "maintenance",
+            ]);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            assert!(stderr(&out).contains("app.p1.k"), "{}", stderr(&out));
+            assert!(
+                stderr(&out).contains("partition column override"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
 fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
     let d = Demo::new("rebuild2298");
     let before = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";

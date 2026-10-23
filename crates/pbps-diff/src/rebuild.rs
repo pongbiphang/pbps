@@ -24,13 +24,13 @@ pub struct RebuildPartitionedTable {
 #[error("cannot rebuild {table}: {why}", table = .table.shown())]
 pub struct RebuildError {
     pub table: TableName,
-    pub why: &'static str,
+    pub why: String,
 }
 
-fn refused(table: &TableName, why: &'static str) -> RebuildError {
+fn refused(table: &TableName, why: impl Into<String>) -> RebuildError {
     RebuildError {
         table: table.clone(),
-        why,
+        why: why.into(),
     }
 }
 
@@ -110,6 +110,30 @@ fn source_identities(base: Side<'_>, table: &TableName) -> Result<RebuildIdentit
     Ok(source)
 }
 
+fn refuse_partition_column_overrides(
+    members: &BTreeMap<TableName, Table>,
+    table: &TableName,
+) -> Result<(), RebuildError> {
+    // A partition's own defaults and NOT NULLs are not Table::columns:
+    // those are empty because its columns belong to the parent.
+    for (name, member) in members {
+        if let Some(column) = member
+            .partition_of
+            .as_ref()
+            .and_then(|of| of.columns.keys().next())
+        {
+            return Err(refused(
+                table,
+                format!(
+                    "{} has a partition column override; only plain copied columns are qualified",
+                    name.column(column).shown()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), RebuildError> {
     for schema in [base, desired] {
         let Some(root) = schema.tables.get(table) else {
@@ -129,6 +153,7 @@ fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), Rebui
             return Err(refused(table, "only a managed RANGE parent can be rebuilt"));
         }
         let members = tree(schema, table);
+        refuse_partition_column_overrides(&members, table)?;
         if members.values().any(|t| {
             (t.partition_of.is_some() && t.partition_by.is_some())
                 || !t.computed.is_empty()
@@ -216,6 +241,10 @@ pub fn record(
         ids: base.ids,
     };
     let desired = &after.0;
+    // Re-recording after committing the desired key is convergent, but an
+    // old approval must still pass the column-override guard on both ends.
+    refuse_partition_column_overrides(&tree(base.schema, table), table)?;
+    refuse_partition_column_overrides(&tree(desired, table), table)?;
     let checksum = after.fingerprint();
     let mut out = ids.clone();
     if let Some(old) = ids.rebuilds.get(uid) {

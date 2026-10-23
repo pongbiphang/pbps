@@ -1,5 +1,5 @@
 use super::*;
-use pbps_model::{BoundDatum, Column, PartitionBound, PartitionBy, PartitionOf};
+use pbps_model::{BoundDatum, Column, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
 
 fn record(
     base: Side<'_>,
@@ -99,6 +99,82 @@ fn recorded(base: &Schema, ids: &IdsFile, desired: &Schema) -> IdsFile {
         &ctx(),
     )
     .unwrap()
+}
+
+fn check_partition_override_is_refused(own: PartitionColumn) {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let child = TableName::new("app", "p1");
+    for location in ["source", "desired", "both"] {
+        let mut before = base.clone();
+        let mut after = desired.clone();
+        for (schema, side) in [(&mut before, "source"), (&mut after, "desired")] {
+            if location == side || location == "both" {
+                let member = schema.tables.get_mut(&child).unwrap();
+                assert!(member.columns.is_empty());
+                member
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .insert("k".into(), own.clone());
+            }
+        }
+        // An approval written by the old predicate must not pass just because
+        // its desired fingerprint still matches, or take the re-record shortcut.
+        let mut legacy = approval.clone();
+        legacy.rebuilds.values_mut().next().unwrap().target_checksum =
+            canonical_schema(&after, &pbps_dialect::MinimalDialect).fingerprint();
+        legacy.validate().unwrap();
+        for current in [&ids, &legacy] {
+            let error = record(
+                side(&before, &ids),
+                &after,
+                current,
+                &table(),
+                20,
+                &"maintenance".parse().unwrap(),
+                &ctx(),
+            )
+            .unwrap_err();
+            assert_eq!(error.table, table());
+            assert!(error.why.contains("app.p1.k"), "{location}: {error}");
+            assert!(error.why.contains("partition column override"), "{error}");
+        }
+        let error = qualify(side(&before, &ids), side(&after, &legacy), &table()).unwrap_err();
+        assert!(error.why.contains("app.p1.k"), "{location}: {error}");
+        assert!(error.why.contains("partition column override"), "{error}");
+    }
+}
+
+#[test]
+fn partition_default_overrides_refuse_recording_and_qualification() {
+    check_partition_override_is_refused(PartitionColumn {
+        default: Some("7".into()),
+        ..PartitionColumn::default()
+    });
+}
+
+#[test]
+fn partition_not_null_overrides_refuse_recording_and_qualification() {
+    check_partition_override_is_refused(PartitionColumn {
+        not_null: true,
+        ..PartitionColumn::default()
+    });
+}
+
+#[test]
+fn trees_without_partition_overrides_still_record_and_qualify() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let payload = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+    assert!(
+        payload
+            .after
+            .values()
+            .filter_map(|t| t.partition_of.as_ref())
+            .all(|of| of.columns.is_empty())
+    );
 }
 
 #[test]
