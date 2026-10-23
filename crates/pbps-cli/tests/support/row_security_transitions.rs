@@ -123,8 +123,8 @@ fn row_security_c_standing_transitions_apply_verify_and_replan_empty() {
 fn row_security_c_nonowners_are_refused_at_plan_and_saved_apply_before_writes() {
     versions(|base, _| {
         let mut roles = Roles::new(base);
-        let nonowner = roles.create("c_nonowner", "LOGIN PASSWORD 'Pbps!Test12345'");
-        let inheriting = roles.create("c_inherit", "LOGIN PASSWORD 'Pbps!Test12345'");
+        let nonowner = roles.create("c_nonowner", "LOGIN PASSWORD 'trigger-test'");
+        let inheriting = roles.create("c_inherit", "LOGIN PASSWORD 'trigger-test'");
         let owner = roles.create("c_owner", "");
         on_server(base, &format!("GRANT {owner} TO {inheriting}"));
         let own = OwnDatabase::new(base, "rls_c_owners");
@@ -148,8 +148,7 @@ fn row_security_c_nonowners_are_refused_at_plan_and_saved_apply_before_writes() 
         );
         let plan = connected_artifact(&d, connection, false);
         let snapshot = latest_snapshot(connection);
-        let as_role = |role: &str| connection.replace("user=postgres", &format!("user={role}"));
-        let no = as_role(&nonowner);
+        let no = as_role(connection, &nonowner);
         let out = d.run(&["plan", "--db", &no]);
         assert_ne!(code(&out), 0);
         assert!(
@@ -174,7 +173,7 @@ fn row_security_c_nonowners_are_refused_at_plan_and_saved_apply_before_writes() 
             1
         );
         // Inherited owner privileges satisfy the same predicate as ALTER TABLE.
-        succeeds(d.run(&["plan", "--db", &as_role(&inheriting)]));
+        succeeds(d.run(&["plan", "--db", &as_role(connection, &inheriting)]));
     });
 }
 
@@ -378,7 +377,7 @@ fn row_security_c_stale_policies_and_missing_roles_preserve_original_policy() {
 fn row_security_c_staged_planning_refuses_and_probes_use_forced_owner_preplan_state() {
     versions(|base, _| {
         let mut roles = Roles::new(base);
-        let owner = roles.create("c_probe", "LOGIN PASSWORD 'Pbps!Test12345'");
+        let owner = roles.create("c_probe", "LOGIN PASSWORD 'trigger-test'");
         let own = OwnDatabase::new(base, "rls_c_probe");
         let connection = own.connection();
         on_server(
@@ -412,7 +411,7 @@ fn row_security_c_staged_planning_refuses_and_probes_use_forced_owner_preplan_st
             "\"n\":\n    type: integer\n    nullable: false",
         );
         write(&d, &target);
-        let as_owner = connection.replace("user=postgres", &format!("user={owner}"));
+        let as_owner = as_role(connection, &owner);
         let path = connected_artifact(&d, &as_owner, false);
         let out = approved_apply(&d, &as_owner, &path, ALLOW);
         assert_ne!(code(&out), 0);
