@@ -222,24 +222,41 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                 .push(problem(candidates[0].position.id, why)),
         }
     }
-    for ((key, _), list) in &mut restores {
-        // Existing write/write policy uses immutable operation identities.
+    let declared_moves = moves_by_child(fx);
+    for ((key, child), list) in &mut restores {
+        // The existing write/write policy applies to the same physical cell.
+        // Different child properties do not share a restoration dependency.
         list.sort_by_key(|r| (r.position.id, r.position.clause));
-        for pair in list.windows(2) {
-            restore_edge(graph, pair[0].position, pair[1].position, key);
+        let mut last = BTreeMap::new();
+        for r in list.iter() {
+            if let Some(previous) = last.insert(&r.value.property, *r) {
+                restore_edge(graph, previous.position, r.position, key);
+            }
         }
         for r in list.iter() {
             if let Err(why) = r.value.value.known() {
                 graph.symbolic_unmet.push(problem(r.position.id, why));
             }
-            if let Some(chain) = chains.get(key) {
-                for w in chain {
-                    restore_edge(graph, w.position, r.position, key);
+        }
+        // A move's cut below determines whether a recursive write can still
+        // reach its transferred cell. Stationary members use recorded aliases.
+        if !declared_moves.contains_key(child)
+            && let Some(member) = base.members.get(child)
+            && member.parent == key.parent
+            && let Some(property) = member.aliases.get(&key.property)
+            && let Some(chain) = chains.get(key)
+        {
+            for r in list.iter().filter(|r| &r.value.property == property) {
+                let final_value = last[property].position.clause == r.position.clause
+                    && last[property].position.at == r.position.at;
+                match restoration_predecessor(chain, r, 0, final_value) {
+                    Ok(Some(w)) => restore_edge(graph, w.position, r.position, key),
+                    Ok(None) => {}
+                    Err(why) => graph.symbolic_unmet.push(problem(r.position.id, why)),
                 }
             }
         }
     }
-    let declared_moves = moves_by_child(fx);
     for rs in restores.values() {
         for r in rs {
             if let Err(why) = restoration_target(r.value, &declared_moves, base) {
@@ -357,6 +374,18 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                         "non-convex boundary for {key:?} and child {}",
                         m.child.uid()
                     ));
+                }
+                // Only the final restoration supplies this cell's declared
+                // goal. Earlier restorations may precede a later parent write.
+                // Cuts describe possible membership, not Sink's chosen order.
+                if m.kind == MoveKind::Attach {
+                    for (i, r) in rs.iter().enumerate() {
+                        match restoration_predecessor(list, r, lo, i + 1 == rs.len()) {
+                            Ok(Some(w)) => restore_edge(graph, w.position, r.position, &key),
+                            Ok(None) => {}
+                            Err(why) => return Err(why),
+                        }
+                    }
                 }
                 if lo > 0 {
                     edge(graph, list[lo - 1].position, position, &key);
@@ -532,6 +561,65 @@ fn qualify_interactions(
             }
         }
     }
+}
+/// Evaluate suffix compositions of the declared parent version chain on the
+/// restored value. A later write can erase an earlier write's effect, so a
+/// pairwise value comparison would still add unnecessary restoration edges.
+/// Restoring changes no physical origin; only creation/retirement's value
+/// preconditions need checking in addition to the resulting value.
+fn restoration_predecessor<'a>(
+    chain: &[Write<'a>],
+    r: &Restore<'_>,
+    first_cut: usize,
+    final_value: bool,
+) -> Result<Option<Write<'a>>, String> {
+    if !final_value {
+        // Intermediate restorations keep the existing physical-incarnation
+        // boundary; only their value-recovery dependencies can be relaxed.
+        return Ok(chain[first_cut..]
+            .iter()
+            .rev()
+            .find(|w| {
+                w.value.scope == Scope::MembersAtOperation && w.value.lifetime != Lifetime::Retain
+            })
+            .copied());
+    }
+    let Ok(restored) = r.value.value.known() else {
+        return Ok(None);
+    };
+    let admitted: Vec<_> = (first_cut..=chain.len())
+        .map(|cut| {
+            let mut value = restored.clone();
+            for w in &chain[cut..] {
+                if w.value.scope == Scope::ParentOnly {
+                    continue;
+                }
+                let Ok(to) = w.value.to.known() else {
+                    return false;
+                };
+                let next = w.value.policy.apply(&value, to);
+                if (w.value.lifetime == Lifetime::Create
+                    && (value.datum != Datum::Absent || next.datum == Datum::Absent))
+                    || (w.value.lifetime == Lifetime::Retire && next.datum != Datum::Absent)
+                {
+                    return false;
+                }
+                value = next;
+            }
+            value == *restored
+        })
+        .collect();
+    // The cut after all writes always admits the restoration itself. A
+    // disconnected safe domain cannot be represented by a preferred side.
+    let lo = admitted.iter().position(|yes| *yes).unwrap();
+    if admitted[lo..].iter().any(|yes| !yes) {
+        return Err(format!(
+            "non-convex restoration boundary for {:?} and child {}",
+            r.value.key,
+            r.value.child.uid()
+        ));
+    }
+    Ok((lo > 0).then(|| chain[first_cut + lo - 1]))
 }
 fn restore_edge(graph: &mut Graph, before: Position, after: Position, key: &Key) {
     dependency(graph, before, after, Because::Restores(key.clone()));

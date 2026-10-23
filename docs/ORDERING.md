@@ -156,6 +156,21 @@ restorations that overwrite a versioned input without a shared version chain
 remain named obligations; matching endpoint text cannot supply that chain.
 Test-only generated contracts enumerate every permitted topological order
 against independent replay, including supported and unqualified declarations.
+Only the final restoration of each physical cell needs value recovery.
+Intermediate restorations retain the existing physical-incarnation boundary
+across creation/retirement; value equality cannot move them to an old origin.
+Compose the reaching recursive suffix, including physical lifetime preconditions:
+parent-only writes, later writes after detach, and suffixes that preserve the
+restored value impose no such edge. Earlier value restorations may precede the
+suffix. Non-convex restoration cuts retain the contract's named disjunction
+obligation; they never select a preferred incarnation.
+The existing logical write/write order links only restorations of the same cell.
+Necessity tests require replay counterexamples for symbolic edges or a checked
+named certificate: another dependency path, that same-cell write/write policy,
+an intermediate restoration's physical incarnation, or a stationary member's
+declared final restoration value. A stationary
+restoration has no transfer goal in replay; that last certificate independently
+checks that reversing the edge loses its declared final value.
 `Schedule::of_graph` imports only the symbolic contract's explicit unmet
 obligations. Ordinary `Graph::unmet` requirements remain observational
 `unprovided` facts under DEC-1954.6 and DEC-1956.3, even in a mixed graph.

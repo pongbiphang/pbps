@@ -159,9 +159,7 @@ impl Audit {
     }
 }
 
-#[test]
-fn every_generated_membership_contract_agrees_with_all_its_topological_replays() {
-    let mut audit = Audit::default();
+fn generated_contracts(mut visit: impl FnMut(String, &Fixture)) {
     // Exhaust all directed membership graphs of up to three moves. This
     // includes fresh chains/cycles, competing parents and repeated children.
     let endpoints = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)];
@@ -175,7 +173,7 @@ fn every_generated_membership_contract_agrees_with_all_its_topological_replays()
                 fx.symbolic
                     .push(movement(p, c, MoveKind::Attach, vec![transfer(0, 0, 0)]));
             }
-            audit.check(label, &f);
+            visit(label, &f);
         }
     }
     // Exhaust occupancy and all two-transfer maps over two slots. Targets
@@ -209,7 +207,7 @@ fn every_generated_membership_contract_agrees_with_all_its_topological_replays()
                     ts.push(transfer(v / 4, (v / 2) % 2, v % 2));
                 }
                 f.fx[0].symbolic.push(movement(0, 1, kind, ts));
-                audit.check(format!("slots/{kind:?}/{occupied}/{code}"), &f);
+                visit(format!("slots/{kind:?}/{occupied}/{code}"), &f);
             }
         }
     }
@@ -278,7 +276,12 @@ fn every_generated_membership_contract_agrees_with_all_its_topological_replays()
                                             .then(|| tables()[0].clone()),
                                     }));
                                 }
-                                audit.check(format!("boundaries/{kind:?}/{scope:?}/{policy:?}/{transfer_policy:?}/{check:?}/{restore_count}/{goal:?}"), &f);
+                                visit(
+                                    format!(
+                                        "boundaries/{kind:?}/{scope:?}/{policy:?}/{transfer_policy:?}/{check:?}/{restore_count}/{goal:?}"
+                                    ),
+                                    &f,
+                                );
                             }
                         }
                     }
@@ -310,13 +313,13 @@ fn every_generated_membership_contract_agrees_with_all_its_topological_replays()
         .symbolic
         .push(movement(0, 1, MoveKind::Attach, ts));
     for input in permutations(2) {
-        audit.check(format!("cycle/{input:?}"), &cycle.reordered(&input));
+        visit(format!("cycle/{input:?}"), &cycle.reordered(&input));
     }
     // Valid physical births/rebuilds need more than arbitrary random inputs:
     // a restoration through the wrong parent can corrupt the absent input.
     for rebuild in [false, true] {
         for matched in [false, true] {
-            audit.check(
+            visit(
                 format!("lifetime/{rebuild}/{matched}"),
                 &lifetime_contract(rebuild, matched),
             );
@@ -461,8 +464,14 @@ fn every_generated_membership_contract_agrees_with_all_its_topological_replays()
                 f.fx[at].symbolic.push(clause);
             }
         }
-        audit.check(format!("seed/{case}"), &f);
+        visit(format!("seed/{case}"), &f);
     }
+}
+
+#[test]
+fn every_generated_membership_contract_agrees_with_all_its_topological_replays() {
+    let mut audit = Audit::default();
+    generated_contracts(|label, f| audit.check(label, f));
     let summary = format!(
         "cases={} accepted={} named={} cycles={} topological_orders={} accepted_orders={} replayable_orders={} disagreements={}",
         audit.cases,
@@ -763,3 +772,5 @@ fn a_foreign_restoration_cannot_corrupt_a_recursive_members_physical_birth() {
         sound(&lifetime_contract(rebuild, true));
     }
 }
+
+mod necessity;
