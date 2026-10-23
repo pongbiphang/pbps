@@ -1956,6 +1956,8 @@
         "deployer2267::deployer_cannot_return_to_sandbox_or_login",
         "deployer2267::object_references_grant_is_replayed",
         "deployer2267::object_references_deny_is_replayed",
+        "deployer2267::type_references_grants_reach_the_entered_compile_session",
+        "deployer2267::type_references_deny_overrides_schema_grants_in_the_compile_session",
         "deployer2267::nested_role_denies_and_column_exceptions_are_replayed",
         "deployer2267::object_grant_option_covers_column_grant_chains_without_extra_acl_rows",
         "deployer2267::column_grantors_without_captured_capabilities_get_only_the_needed_column_options",

@@ -101,7 +101,15 @@ async fn owners(
             .collect(),
         candidates: BTreeSet::new(),
     };
-    let captured = capture::capture(conn, &scope).await.unwrap();
+    owners_in_scope(conn, context, &scope).await
+}
+
+async fn owners_in_scope(
+    conn: &mut Conn,
+    context: &auth::AuthorizationContext,
+    scope: &capture::CaptureScope,
+) -> auth::OwnerPartition {
+    let captured = capture::capture(conn, scope).await.unwrap();
     auth::OwnerPartition::from_capture(&captured, context).unwrap()
 }
 
@@ -190,6 +198,22 @@ impl Fixture {
         rendered: &[&str],
         objects: &[(&str, &str)],
     ) -> Prepared {
+        let scope = capture::CaptureScope {
+            retained: objects
+                .iter()
+                .map(|(schema, name)| capture::object(schema, name))
+                .collect(),
+            candidates: BTreeSet::new(),
+        };
+        self.prepare_scope(dbo, rendered, &scope).await
+    }
+
+    async fn prepare_scope(
+        &mut self,
+        dbo: bool,
+        rendered: &[&str],
+        scope: &capture::CaptureScope,
+    ) -> Prepared {
         if !dbo {
             self.target
                 .execute("EXECUTE AS USER=N'dep' WITH NO REVERT;")
@@ -201,12 +225,14 @@ impl Fixture {
         let facts = environment::read(&mut self.target, &environment::Scope { schemas: &schemas })
             .await
             .unwrap();
-        let target_owners = owners(&mut self.target, &context, objects).await;
+        let target_owners = owners_in_scope(&mut self.target, &context, scope).await;
         auth::read_staged_permissions(&mut self.target, &mut context, &target_owners)
             .await
             .unwrap();
         let canonical: serde_json::Value = serde_json::from_slice(&context.canonical()).unwrap();
-        assert!(canonical["staged"].is_array());
+        if !context.staged.is_empty() {
+            assert!(canonical["staged"].is_array());
+        }
         let map = auth::PrincipalMap::generate(&context, &[], "deployer2267");
         scratch::create_sandbox(&mut self.scratch, "sandbox2267")
             .await
@@ -228,7 +254,7 @@ impl Fixture {
         if !dbo {
             local.principal.effective = map.deployer(&context).unwrap();
         }
-        let current_owners = owners(&mut self.scratch, &local, objects).await;
+        let current_owners = owners_in_scope(&mut self.scratch, &local, scope).await;
         auth::replay_staged_permissions(
             &mut self.scratch,
             &map,
@@ -373,6 +399,89 @@ async fn object_references_deny_is_replayed() {
         f.enter(&p).await.unwrap();
         assert!(f.verify(&p).await.is_empty());
         assert_eq!(error_code(&mut f.scratch,"CREATE TABLE app.child(i int REFERENCES app.ref(i));").await,"229");
+    }).await;
+}
+
+fn alias_scope() -> capture::CaptureScope {
+    capture::CaptureScope {
+        retained: BTreeSet::from([capture::ObjectIdentity {
+            class: capture::class::TYPE.into(),
+            name: vec!["dbo".into(), "amount".into()],
+            signature: vec![],
+        }]),
+        candidates: BTreeSet::new(),
+    }
+}
+
+async fn render_alias(f: &mut Fixture) -> Vec<String> {
+    let scope = alias_scope();
+    let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+    pbps_mssql::resolver::externals::render::render(&inputs, scope.retained.first().unwrap())
+        .unwrap()
+        .statements
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn type_references_grants_reach_the_entered_compile_session() {
+    for grantee in ["outer_role", "public"] {
+        case(
+            if grantee == "public" { "type_public" } else { "type_role" },
+            move |mut f| async move {
+                f.target.execute(&format!(
+                    "CREATE USER type_owner WITHOUT LOGIN; CREATE USER type_grantor WITHOUT LOGIN; \
+                     CREATE TYPE dbo.amount FROM decimal(9,2) NOT NULL; \
+                     ALTER AUTHORIZATION ON TYPE::dbo.amount TO type_owner; \
+                     GRANT REFERENCES ON TYPE::dbo.amount TO type_grantor WITH GRANT OPTION AS type_owner; \
+                     GRANT REFERENCES ON TYPE::dbo.amount TO {grantee} AS type_grantor;"
+                )).await.unwrap();
+                let rendered = render_alias(&mut f).await;
+                let ddl: Vec<_> = rendered.iter().map(String::as_str).collect();
+                let p = f.prepare_scope(false, &ddl, &alias_scope()).await;
+                let entered = f.enter(&p).await.unwrap();
+                assert!(f.verify(&p).await.is_empty());
+                for conn in [&mut f.target, &mut f.scratch] {
+                    // Compile and execute the same managed-table DDL under each
+                    // deployer; its only REFERENCES capability is type-level.
+                    conn.execute("CREATE TABLE app.using_alias(value dbo.amount);").await.unwrap();
+                    let rows = conn.query("SELECT user_type_id FROM sys.columns WHERE object_id=OBJECT_ID(N'app.using_alias') AND user_type_id=TYPE_ID(N'dbo.amount');").await.unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let rows = conn.query("SELECT HAS_PERMS_BY_NAME(N'dbo.amount',N'TYPE',N'REFERENCES') AS type_refs,HAS_PERMS_BY_NAME(N'dbo',N'SCHEMA',N'REFERENCES') AS schema_refs;").await.unwrap();
+                    assert_eq!(rows[0].try_get::<i32>("type_refs").unwrap(), Some(1));
+                    assert_eq!(rows[0].try_get::<i32>("schema_refs").unwrap(), Some(0));
+                }
+                // A file-added type permission must be detected at settlement.
+                let dep = entered.name().raw().to_owned();
+                f.scratch_admin.execute(&format!("GRANT EXECUTE ON TYPE::dbo.amount TO [{dep}];")).await.unwrap();
+                assert!(f.verify(&p).await.contains(&"staged:permissions".into()));
+            },
+        ).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn type_references_deny_overrides_schema_grants_in_the_compile_session() {
+    case("type_deny", |mut f| async move {
+        f.target.execute(
+            "CREATE USER type_owner WITHOUT LOGIN; CREATE TYPE dbo.amount FROM decimal(9,2) NOT NULL; \
+             ALTER AUTHORIZATION ON TYPE::dbo.amount TO type_owner; \
+             GRANT REFERENCES ON SCHEMA::dbo TO outer_role; \
+             DENY REFERENCES ON TYPE::dbo.amount TO outer_role;"
+        ).await.unwrap();
+        let rendered = render_alias(&mut f).await;
+        let ddl: Vec<_> = rendered.iter().map(String::as_str).collect();
+        let p = f.prepare_scope(false, &ddl, &alias_scope()).await;
+        f.enter(&p).await.unwrap();
+        assert!(f.verify(&p).await.is_empty());
+        for conn in [&mut f.target, &mut f.scratch] {
+            assert_eq!(error_code(conn,"CREATE TABLE app.denied_alias(value dbo.amount);").await,"15247");
+            let rows = conn.query("SELECT HAS_PERMS_BY_NAME(N'dbo.amount',N'TYPE',N'REFERENCES') AS type_refs,HAS_PERMS_BY_NAME(N'dbo',N'SCHEMA',N'REFERENCES') AS schema_refs;").await.unwrap();
+            assert_eq!(rows[0].try_get::<i32>("type_refs").unwrap(), Some(0));
+            assert_eq!(rows[0].try_get::<i32>("schema_refs").unwrap(), Some(1));
+            let rows = conn.query("SELECT OBJECT_ID(N'app.denied_alias') AS id;").await.unwrap();
+            assert!(rows[0].try_get::<i32>("id").unwrap().is_none());
+        }
     }).await;
 }
 

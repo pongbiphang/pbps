@@ -139,7 +139,7 @@ pub struct AuthorizationContext {
     /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
-    /// Object and column permissions in the staged scope (DEC-2267.1).
+    /// Object, column and type permissions in the staged scope (DEC-2267.1).
     #[serde(
         skip_serializing_if = "BTreeMap::is_empty",
         serialize_with = "staged::serialize"
