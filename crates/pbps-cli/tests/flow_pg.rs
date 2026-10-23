@@ -34400,3 +34400,19 @@ fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
         state_history::identities(&server, true);
     }
 }
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids() {
+    for server in [server(), old_server()] {
+        state_history::retained_column_ids(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids() {
+    for server in [server(), old_server()] {
+        state_history::unrecorded_column_ids(&server, true);
+    }
+}

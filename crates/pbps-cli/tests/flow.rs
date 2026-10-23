@@ -23164,3 +23164,15 @@ fn state_history_setup_failures_keep_the_single_json_envelope() {
 fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
     state_history::identities(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids() {
+    state_history::retained_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids() {
+    state_history::unrecorded_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

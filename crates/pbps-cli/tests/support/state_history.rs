@@ -496,6 +496,16 @@ pub fn refusals(server: &str, pg: bool) {
             "state.entry-unsupported-version",
             "snapshot is unreadable",
         );
+        let mut invalid_ids: serde_json::Value = serde_json::from_str(text).unwrap();
+        invalid_ids["ids"]["version"] = 999999.into();
+        set_record(connection, pg, *id, &invalid_ids.to_string());
+        refused(
+            &d,
+            connection,
+            &["state", command, &id_text],
+            "state.unreadable",
+            "inconsistent identity mapping",
+        );
         set_record(connection, pg, *id, text);
     }
     let mut old: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -814,4 +824,172 @@ pub fn identities(server: &str, pg: bool) {
     )));
     apply(&d, connection, "rename-back.json", &backward);
     assert!(plan(&d, connection, "rename-clean.json").changes.is_empty());
+}
+
+fn column_fixture(server: &str, pg: bool, name: &str) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(server, name);
+    if pg {
+        on_server(own.connection(), "CREATE SCHEMA app");
+    }
+    let schema = if pg { "app" } else { "dbo" };
+    let d = Demo::new(name);
+    std::fs::write(
+        d.dir.join("schema/product.yml"),
+        format!(
+            "table: {schema}.product\ncolumns:\n  id: {{type: int, nullable: false}}\n  recorded: {{type: int}}\n"
+        ),
+    )
+    .unwrap();
+    ok(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    ok(d.run(&["bootstrap", "--db", own.connection()]));
+    (own, d)
+}
+
+pub fn retained_column_ids(server: &str, pg: bool) {
+    let (own, d) = column_fixture(server, pg, "history-retained2289");
+    let connection = own.connection();
+    let schema = if pg { "app" } else { "dbo" };
+    on_server(
+        connection,
+        &format!("ALTER TABLE {schema}.product DROP COLUMN recorded"),
+    );
+    for recording in ["baseline", "snapshot"] {
+        let args = if recording == "baseline" {
+            vec![
+                "baseline",
+                "--reason",
+                "accept the missing column",
+                "--db",
+                connection,
+            ]
+        } else {
+            vec!["snapshot", "--force", "--db", connection]
+        };
+        ok(d.run(&args));
+        let entries = records(connection, pg);
+        let (id, text) = entries.last().unwrap();
+        let snapshot = pbps_model::StateSnapshot::from_json(text).unwrap();
+        let table: pbps_model::TableName = format!("{schema}.product").parse().unwrap();
+        assert!(
+            !snapshot.schema.tables[&table]
+                .columns
+                .contains_key("recorded")
+        );
+        assert!(
+            snapshot
+                .ids
+                .columns
+                .values()
+                .any(|c| c == &table.column("recorded"))
+        );
+        let id = id.to_string();
+        let before = project_bytes(&d.dir);
+        let shown =
+            json(ok(d.run(&[
+                "state", "show", &id, "--db", connection, "--format", "json",
+            ])));
+        assert_eq!(
+            shown["data"]["entry"]["snapshot"],
+            serde_json::to_value(&snapshot).unwrap()
+        );
+        let compared = json(ok(d.run(&[
+            "state", "diff", &id, &id, "--db", connection, "--format", "json",
+        ])));
+        assert!(
+            compared["data"]["changes"]["changes"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(project_bytes(&d.dir), before);
+        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        ok(d.run(&["state", "export", &id, "--db", connection, "--force"]));
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        assert!(
+            !loaded.schema.tables[&table]
+                .columns
+                .contains_key("recorded")
+        );
+        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    }
+}
+
+pub fn unrecorded_column_ids(server: &str, pg: bool) {
+    let (own, d) = column_fixture(server, pg, "history-unrecorded2289");
+    let connection = own.connection();
+    let schema = if pg { "app" } else { "dbo" };
+    let first = records(connection, pg)[0].0.to_string();
+    on_server(
+        connection,
+        &format!("ALTER TABLE {schema}.product ADD observed int NULL"),
+    );
+    ok(d.run(&[
+        "baseline",
+        "--reason",
+        "accept the added column",
+        "--db",
+        connection,
+    ]));
+    let second = records(connection, pg).last().unwrap().0.to_string();
+    let default_sql = if pg {
+        format!("ALTER TABLE {schema}.product ALTER COLUMN observed SET DEFAULT 7")
+    } else {
+        format!("ALTER TABLE {schema}.product ADD CONSTRAINT df_observed DEFAULT (7) FOR observed")
+    };
+    on_server(connection, &default_sql);
+    ok(d.run(&["snapshot", "--force", "--db", connection]));
+    let entries = records(connection, pg);
+    let third = entries.last().unwrap().0.to_string();
+    let table: pbps_model::TableName = format!("{schema}.product").parse().unwrap();
+    for (_, text) in entries.iter().skip(1) {
+        let snapshot = pbps_model::StateSnapshot::from_json(text).unwrap();
+        assert!(
+            snapshot.schema.tables[&table]
+                .columns
+                .contains_key("observed")
+        );
+        assert!(
+            !snapshot
+                .ids
+                .columns
+                .values()
+                .any(|c| c == &table.column("observed"))
+        );
+    }
+    let before = project_bytes(&d.dir);
+    for added in [&second, &third] {
+        for (from, to, add) in [(&first, added, true), (added, &first, false)] {
+            let compared = json(ok(d.run(&[
+                "state", "diff", from, to, "--db", connection, "--format", "json",
+            ])));
+            let changes: pbps_model::ChangeSet =
+                serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
+            assert_eq!(changes.changes.len(), 1, "{changes:?}");
+            let change = &changes.changes[0].change;
+            let expected = if add {
+                matches!(change, pbps_model::Change::AddColumn { table: actual, name, .. }
+                    if actual == &table && name.raw() == "observed")
+            } else {
+                matches!(change, pbps_model::Change::DropColumn { column, .. }
+                    if column == &table.column("observed"))
+            };
+            assert!(expected, "{changes:?}");
+        }
+    }
+    let changed = json(ok(d.run(&[
+        "state", "diff", &second, &third, "--db", connection, "--format", "json",
+    ])));
+    let changes: pbps_model::ChangeSet =
+        serde_json::from_value(changed["data"]["changes"].clone()).unwrap();
+    assert_eq!(changes.changes.len(), 1, "{changes:?}");
+    assert!(
+        changes.changes.iter().any(|p| matches!(&p.change,
+            pbps_model::Change::AlterColumnDefault { column, .. }
+                if column == &table.column("observed")
+        )),
+        "{changes:?}"
+    );
+    assert_eq!(project_bytes(&d.dir), before);
+    assert_eq!(records(connection, pg), entries);
 }

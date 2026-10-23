@@ -144,18 +144,12 @@ async fn read_entry(
             ),
         )
     })?;
-    entry
-        .snapshot
-        .ids
-        .clone()
-        .validated()
-        .and_then(|ids| ids.check_held_by(&entry.snapshot.schema))
-        .map_err(|error| {
-            let message = format!(
-                "{shown_label}: entry #{id}'s snapshot has an inconsistent identity mapping: {error}"
-            );
-            Refusal::new("state.unreadable", message)
-        })?;
+    entry.snapshot.ids.clone().validated().map_err(|error| {
+        let message = format!(
+            "{shown_label}: entry #{id}'s snapshot has an inconsistent identity mapping: {error}"
+        );
+        Refusal::new("state.unreadable", message)
+    })?;
     Ok(entry)
 }
 
@@ -254,14 +248,19 @@ pub fn cmd_diff(
             hints.module_deps.insert(id.clone(), deps.clone());
         }
     }
+    // Baseline and forced snapshots record what was observed, which can hold
+    // columns without identities and retain identities for missing columns.
+    // Complete each side from its own schema while keeping recorded matches.
+    let before_ids = pbps_diff::observed_ids(&before, &from.snapshot.ids);
+    let after_ids = pbps_diff::observed_ids(&after, &to.snapshot.ids);
     let diffed = pbps_diff::diff_partial(
         pbps_diff::Side {
             schema: &before,
-            ids: &from.snapshot.ids,
+            ids: &before_ids,
         },
         pbps_diff::Side {
             schema: &after,
-            ids: &to.snapshot.ids,
+            ids: &after_ids,
         },
         dialect.as_ref(),
         &hints,
@@ -424,8 +423,9 @@ fn export(
             .map(|path| path.strip_prefix(stage.path()).map(|p| dir.join(p)))
             .collect::<Result<_, _>>()?;
         let removed: Vec<_> = present
-            .into_iter()
-            .filter(|path| !files.contains(path))
+            .iter()
+            .filter(|path| !files.contains(*path))
+            .cloned()
             .collect();
         let root = crate::paths::absolute(&dir)?;
         // Force authorizes declaration replacement, never identity/config writes
@@ -452,6 +452,13 @@ fn export(
     // those exact validated bytes; never rerender a different representation.
     (|| -> anyhow::Result<()> {
         std::fs::create_dir_all(&dir)?;
+        // Remove old directory entries before publishing: a stale spelling can
+        // alias an output on a case-insensitive filesystem. Replacing every
+        // declaration entry also breaks old symlinks instead of following them.
+        for path in &present {
+            std::fs::remove_file(path)
+                .with_context(|| format!("cannot remove old declaration `{}`", path.display()))?;
+        }
         for path in &files {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -459,10 +466,6 @@ fn export(
             let source = stage.path().join(path.strip_prefix(&dir)?);
             std::fs::copy(&source, path)
                 .with_context(|| format!("cannot publish `{}`", path.display()))?;
-        }
-        for path in &removed {
-            std::fs::remove_file(path)
-                .with_context(|| format!("cannot remove stale declaration `{}`", path.display()))?;
         }
         Ok(())
     })()
@@ -653,6 +656,57 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
             "identity bytes\n"
+        );
+    }
+
+    #[test]
+    fn state_history_force_replaces_differently_cased_filenames_without_deleting_output() {
+        let (_stage, project, entry) = fixture("history-cased-path");
+        std::fs::create_dir(project.schema_dir()).unwrap();
+        let old = project.schema_dir().join("dbo.Product.yml");
+        std::fs::write(&old, "old declaration bytes\n").unwrap();
+        let (data, _) = export(
+            &project,
+            &entry,
+            true,
+            crate::dialect(&project).unwrap().as_ref(),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(data.removed, vec![old]);
+        assert_eq!(
+            pbps_load::schema_files(&project.schema_dir()).unwrap(),
+            data.files
+        );
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+        assert_eq!(loaded.schema, entry.snapshot.schema);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_history_force_replaces_output_symlinks_before_removing_their_stale_targets() {
+        let (_stage, project, entry) = fixture("history-output-symlink");
+        std::fs::create_dir(project.schema_dir()).unwrap();
+        let old = project.schema_dir().join("custom.yml");
+        let output = project.schema_dir().join("dbo.product.yml");
+        std::fs::write(&old, "old declaration bytes\n").unwrap();
+        std::os::unix::fs::symlink("custom.yml", &output).unwrap();
+        let (data, _) = export(
+            &project,
+            &entry,
+            true,
+            crate::dialect(&project).unwrap().as_ref(),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(data.removed, vec![old.clone()]);
+        assert!(!old.exists());
+        assert!(!std::fs::symlink_metadata(&output).unwrap().is_symlink());
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+        assert_eq!(loaded.schema, entry.snapshot.schema);
+        assert_eq!(
+            pbps_load::schema_files(&project.schema_dir()).unwrap(),
+            data.files
         );
     }
 
