@@ -31030,7 +31030,7 @@ fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() 
 /// human writers. A default the engine can ask about emits no warning.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans() {
+fn partition_default_warnings_show_names_once_in_json_and_human_output() {
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (version, server) in [("18", server()), ("16", old)] {
         let partition = "ev\nline\\tail";
@@ -31104,7 +31104,8 @@ partitions:
         let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
         let warnings = unasked(&report);
         assert_eq!(warnings.len(), 1, "{version}: {report}");
-        assert_eq!(warnings[0]["message"], raw, "{version}: {report}");
+        assert_eq!(warnings[0]["message"], shown, "{version}: {report}");
+        assert_ne!(warnings[0]["message"], raw, "{version}: {report}");
         let check_human = |output: Output| {
             let error = stderr(&succeeds(output));
             let lines: Vec<_> = error
