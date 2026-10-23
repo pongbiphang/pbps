@@ -216,7 +216,7 @@ pub struct Schedule {
     constraints: BTreeSet<Constraint>,
     keeps: Vec<Keep>,
     obligations: Vec<Obligation>,
-    remedy: Option<String>,
+    symbolic_constraints: BTreeSet<Constraint>,
 }
 
 impl Schedule {
@@ -232,15 +232,17 @@ impl Schedule {
     /// producer is an obligation, not an independent operation (DEC-2296.1).
     pub fn of_graph(graph: &Graph, operations: &[Operation]) -> Self {
         let mut schedule = Self::new(operations.len());
-        if graph
-            .edges
-            .iter()
-            .any(|edge| matches!(edge.because, Because::Boundary(_) | Because::Restores(_)))
-        {
-            schedule.remedy = Some(super::membership::REMEDY.into());
-        }
         for e in &graph.edges {
-            schedule.edge(e.before, e.after, e.source, reason(e, operations));
+            let reason = reason(e, operations);
+            schedule.edge(e.before, e.after, e.source, reason);
+            if matches!(e.because, Because::Boundary(_) | Because::Restores(_)) {
+                schedule.symbolic_constraints.insert(Constraint {
+                    before: e.before,
+                    after: e.after,
+                    source: e.source,
+                    reason,
+                });
+            }
         }
         for issue in &graph.symbolic_unmet {
             let at = operations
@@ -494,16 +496,22 @@ impl Schedule {
                 .min()
                 .unwrap_or_default();
             let inside: BTreeSet<usize> = members.iter().copied().collect();
-            let edges = left
+            let edges: Vec<_> = left
                 .iter()
                 .filter(|c| inside.contains(&c.before) && inside.contains(&c.after))
                 .map(|c| (*c).clone())
                 .collect();
+            // Only the reported component can justify this remedy. A
+            // symbolic edge elsewhere cannot explain an ordinary cycle.
+            let remedy = edges
+                .iter()
+                .any(|edge| self.symbolic_constraints.contains(edge))
+                .then(|| super::membership::REMEDY.into());
             return Err(Refusal::Cycle {
                 members,
                 edges,
                 waiting,
-                remedy: self.remedy.clone(),
+                remedy,
             });
         }
         Ok((emitted, kept))

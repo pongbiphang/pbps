@@ -1356,3 +1356,259 @@ fn recursion_never_touches_a_member_of_another_parent() {
         Fact::Known(value("9"))
     );
 }
+
+/// Compare every represented order, not only Sink's choice. Concrete replay
+/// does not interpret ordinary graph edges, so those remain explicit premises.
+fn graph_and_replay_agree(f: &Fixture, g: &Graph, ordinary: &[(usize, usize)]) {
+    let mut any = false;
+    for order in permutations(f.ops.len()) {
+        let ordered = f.reordered(&order);
+        let mut positions = vec![0; order.len()];
+        for (at, &i) in order.iter().enumerate() {
+            positions[i] = at;
+        }
+        let expected = ordinary.iter().all(|&(a, b)| positions[a] < positions[b])
+            && project(&ordered.ops, &ordered.fx, &ordered.base).is_ok();
+        assert_eq!(permits(g, &order), expected, "order {order:?}");
+        any |= expected;
+    }
+    let settled = Schedule::of_graph(g, &f.ops).sequence();
+    assert_eq!(settled.is_ok(), any, "{settled:?}");
+    if let Ok(order) = settled {
+        let ordered = f.reordered(&order);
+        project(&ordered.ops, &ordered.fx, &ordered.base).unwrap();
+    }
+}
+
+#[test]
+fn intra_operation_boundaries_follow_clause_order_in_compiler_and_replay() {
+    for kind in [MoveKind::Attach, MoveKind::Detach, MoveKind::Drop] {
+        for write_first_required in [false, true] {
+            for write_first in [false, true] {
+                let mut f = Fixture::new(1);
+                if kind == MoveKind::Attach {
+                    f.base
+                        .cells
+                        .get_mut(&(f.a.clone(), f.local.clone()))
+                        .unwrap()
+                        .value = Fact::Known(value(if write_first_required { "7" } else { "1" }));
+                } else {
+                    f.attached_baseline(value("1"));
+                }
+                f.write(0, Version::Base, value("1"), value("7"));
+                f.movement(
+                    0,
+                    kind,
+                    ShapeCheck::SameDefinition,
+                    TransferPolicy::Inherit,
+                    if kind == MoveKind::Attach {
+                        inherited("7")
+                    } else {
+                        value(if write_first_required { "7" } else { "1" })
+                    },
+                );
+                if !write_first {
+                    f.fx[0].symbolic.reverse();
+                }
+                let expected = kind == MoveKind::Drop || write_first == write_first_required;
+                assert_eq!(
+                    f.admits(),
+                    expected,
+                    "{kind:?}, {write_first_required}, {write_first}"
+                );
+                assert_eq!(project(&f.ops, &f.fx, &f.base).is_ok(), expected);
+                if !expected {
+                    assert!(f.refusal().contains("symbolic clause"));
+                }
+                graph_and_replay_agree(&f, &f.graph(), &[]);
+            }
+        }
+    }
+    // Restoration and membership dependencies use the same intra-operation
+    // check: their edges cannot silently disappear either.
+    let mut f = Fixture::new(1);
+    f.write(0, Version::Base, value("1"), value("7"));
+    f.movement(
+        0,
+        MoveKind::Attach,
+        ShapeCheck::None,
+        TransferPolicy::Preserve,
+        value("9"),
+    );
+    f.restore(0, value("9"), true);
+    let clauses = f.fx[0].symbolic.clone();
+    for order in permutations(3) {
+        f.fx[0].symbolic = order.iter().map(|&i| clauses[i].clone()).collect();
+        let expected = order[2] == 2;
+        assert_eq!(f.admits(), expected, "clauses {order:?}");
+        graph_and_replay_agree(&f, &f.graph(), &[]);
+    }
+}
+
+#[test]
+fn a_cycle_uses_only_its_own_symbolic_edges_for_the_remedy() {
+    let mut f = Fixture::new(4);
+    f.base
+        .cells
+        .get_mut(&(f.a.clone(), f.local.clone()))
+        .unwrap()
+        .value = Fact::Known(value("7"));
+    f.write(0, Version::Base, value("1"), value("7"));
+    f.movement(
+        1,
+        MoveKind::Attach,
+        ShapeCheck::SameDefinition,
+        TransferPolicy::Inherit,
+        inherited("7"),
+    );
+    for because in [Because::Boundary(f.key()), Because::Restores(f.key())] {
+        let mut g = f.graph();
+        g.edges.clear();
+        g.edges.insert(Edge {
+            before: 0,
+            after: 1,
+            source: Source::Effect,
+            because,
+        });
+        let ordinary = [
+            Edge {
+                before: 2,
+                after: 3,
+                source: Source::Effect,
+                because: Because::Declared,
+            },
+            Edge {
+                before: 3,
+                after: 2,
+                source: Source::Declared,
+                because: Because::Declared,
+            },
+        ];
+        g.edges.extend(ordinary.clone());
+        let why = Schedule::of_graph(&g, &f.ops).sequence().unwrap_err();
+        let crate::order::Refusal::Cycle {
+            members, remedy, ..
+        } = &why
+        else {
+            panic!("{why:?}")
+        };
+        assert_eq!(members, &[2, 3]);
+        assert_eq!(remedy, &None);
+        assert!(!why.describe(&f.plan()).contains(REMEDY));
+        // Replay accepts the symbolic component; only the independent
+        // ordinary cycle rules out every complete order.
+        project(&f.ops, &f.fx, &f.base).unwrap();
+        graph_and_replay_agree(&f, &g, &[(2, 3), (3, 2)]);
+        g.edges.remove(&ordinary[1]);
+        graph_and_replay_agree(&f, &g, &[(2, 3)]);
+        // A reported cycle that actually contains the symbolic edge does
+        // retain its remedy; the ordinary component is now acyclic.
+        let mut reversed = ordinary[0].clone();
+        reversed.before = 1;
+        reversed.after = 0;
+        g.edges.insert(reversed.clone());
+        let why = Schedule::of_graph(&g, &f.ops).sequence().unwrap_err();
+        let crate::order::Refusal::Cycle {
+            members, remedy, ..
+        } = &why
+        else {
+            panic!("{why:?}")
+        };
+        assert_eq!(members, &[0, 1]);
+        assert_eq!(remedy.as_deref(), Some(REMEDY));
+        graph_and_replay_agree(&f, &g, &[(2, 3), (1, 0)]);
+    }
+}
+
+#[test]
+fn a_restoration_requires_its_own_property_transfer_in_compiler_and_replay() {
+    let mut f = Fixture::new(2);
+    f.attached_baseline(value("9"));
+    f.movement(
+        1,
+        MoveKind::Detach,
+        ShapeCheck::None,
+        TransferPolicy::Preserve,
+        value("9"),
+    );
+    let other_parent = Property::Column(column("c_aaaaaa"), Attribute::Type);
+    let other_child = property(&f.a, Attribute::Type);
+    f.base.cells.insert(
+        (f.p.clone(), other_parent.clone()),
+        cell_value(&f.p, &other_parent, value("int")),
+    );
+    f.base.cells.insert(
+        (f.a.clone(), other_child.clone()),
+        cell_value(&f.a, &other_child, value("int")),
+    );
+    f.base
+        .members
+        .get_mut(&f.a)
+        .unwrap()
+        .aliases
+        .insert(other_parent.clone(), other_child.clone());
+    f.fx[0].symbolic.push(Clause::Restore(Restoration {
+        key: Key {
+            parent: f.p.clone(),
+            property: other_parent.clone(),
+        },
+        child: f.a.clone(),
+        property: other_child.clone(),
+        value: Fact::Known(value("bigint")),
+        member_of: None,
+    }));
+    // The detach carries only the default, not the restoration's type.
+    // Neither input permutation may treat that unrelated transfer as proof
+    // that the standalone type restoration is available.
+    for order in permutations(2) {
+        let shuffled = f.reordered(&order);
+        assert!(
+            shuffled
+                .refusal()
+                .contains("no matching ownership/property transfer")
+        );
+        assert!(project(&shuffled.ops, &shuffled.fx, &shuffled.base).is_err());
+        graph_and_replay_agree(&shuffled, &shuffled.graph(), &[]);
+    }
+    // Supplying the actual transfer admits detach -> restoration, and only
+    // that order; the property keeps its physical origin through the detach.
+    if let Clause::Move(m) = &mut f.fx[1].symbolic[0] {
+        let Boundary::All(ts) = &mut m.boundary else {
+            unreachable!()
+        };
+        ts.push(Transfer {
+            parent: other_parent,
+            from: other_child.clone(),
+            to: other_child.clone(),
+            check: ShapeCheck::None,
+            policy: TransferPolicy::Preserve,
+            goal: Fact::Known(value("bigint")),
+        });
+    }
+    for order in permutations(2) {
+        let shuffled = f.reordered(&order);
+        graph_and_replay_agree(&shuffled, &shuffled.graph(), &[]);
+        assert!(shuffled.edges().contains(&(f.ops[1].id(), f.ops[0].id())));
+        let done = shuffled.reordered(
+            &Schedule::of_graph(&shuffled.graph(), &shuffled.ops)
+                .sequence()
+                .unwrap(),
+        );
+        let view = project(&done.ops, &done.fx, &done.base).unwrap();
+        assert_eq!(
+            view.state(At::End).unwrap().cells[&(f.a.clone(), other_child.clone())].origin,
+            f.base.cells[&(f.a.clone(), other_child.clone())].origin
+        );
+    }
+    // A matching property on a different parent does not qualify it either.
+    let other = recorded("t_cccccc");
+    f.base.tables.insert(other.clone());
+    if let Clause::Restore(r) = &mut f.fx[0].symbolic[0] {
+        r.key.parent = other;
+    }
+    assert!(
+        f.refusal()
+            .contains("no matching ownership/property transfer")
+    );
+    graph_and_replay_agree(&f, &f.graph(), &[]);
+}

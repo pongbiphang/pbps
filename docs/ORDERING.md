@@ -141,7 +141,11 @@ move and its upper successor after it. A move compatible with both sides
 gets no preference edge. A fork, missing fact, non-convex interval or
 unrepresented disjunction is a named obligation with the separate-plans
 remedy. Other property/dependency constraints may form an ordinary cycle;
-cycles containing these boundary constraints retain that remedy too.
+cycles containing these boundary constraints retain that remedy too; an
+unrelated cycle does not. Clause order inside an indivisible operation stays
+fixed, so an unsatisfied intra-operation boundary is an obligation.
+A restoration must qualify its changed ownership through the matching
+parent/child/property transfer; unrelated moves cannot supply that fact.
 `Schedule::of_graph` imports unmet requirements as obligations. Merely
 recording an unmet requirement in the debug shadow is insufficient.
 

@@ -8378,6 +8378,14 @@ sequence; neither trusts a predicted child set or retries another ordering.
 Pending state is descriptive and cannot authorize emission. Saved fields,
 SQL/checksum bytes and the release-verifier policy do not change.
 
+Clause order within an indivisible operation is part of the declaration.
+A required boundary inside that operation must agree with its clause sequence;
+an unsatisfied self-boundary is an obligation, not a discarded edge.
+Restorations qualify changed ownership only through their matching parent,
+child and property transfer. An uncovered target remains unavailable in both
+compilation and replay. A cycle gets the separate-plans remedy only from
+symbolic edges inside the reported component, not another graph component.
+
 Before this contract was written, native SQL measurements on PostgreSQL
 16.15 and 18.6 exercised 44 fixtures: 300 two-order pairs, 600 executions,
 each in a rolled-back transaction, with no setup/recording errors. Of these,

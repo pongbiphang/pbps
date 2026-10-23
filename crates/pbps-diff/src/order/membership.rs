@@ -106,16 +106,62 @@ fn transfers(m: &s::Move) -> Result<&[Transfer], String> {
 }
 
 #[derive(Clone, Copy)]
-struct Write<'a> {
+struct Position {
     at: usize,
+    clause: usize,
     id: OperationId,
+}
+#[derive(Clone, Copy)]
+struct Write<'a> {
+    position: Position,
     value: &'a RecursiveWrite,
 }
 #[derive(Clone, Copy)]
 struct Restore<'a> {
-    at: usize,
-    id: OperationId,
+    position: Position,
     value: &'a Restoration,
+}
+
+fn moves_by_child(fx: &[Effects]) -> BTreeMap<Recorded, Vec<&s::Move>> {
+    let mut moves: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for clause in fx.iter().flat_map(|effect| &effect.symbolic) {
+        if let Clause::Move(m) = clause {
+            moves.entry(m.child.clone()).or_default().push(m);
+        }
+    }
+    moves
+}
+
+/// Declared transfer coverage is a prerequisite, independently of the order
+/// chosen. An unrelated move cannot qualify a restoration's new ownership.
+fn restoration_target(
+    r: &Restoration,
+    moves: &BTreeMap<Recorded, Vec<&s::Move>>,
+    base: &State,
+) -> Result<(), String> {
+    if !base.tables.contains(&r.key.parent) || !base.tables.contains(&r.child) {
+        return Err("restoration endpoint has an unknown UID".into());
+    }
+    if let Some(moves) = moves.get(&r.child) {
+        if moves.iter().any(|m| {
+            m.parent == r.key.parent
+                && m.kind != MoveKind::Drop
+                && r.member_of.as_ref() == (m.kind == MoveKind::Attach).then_some(&m.parent)
+                && transfers(m).is_ok_and(|ts| {
+                    ts.iter()
+                        .any(|t| t.parent == r.key.property && t.to == r.property)
+                })
+        }) {
+            return Ok(());
+        }
+        return Err("restoration target has no matching ownership/property transfer".into());
+    }
+    if base.members.get(&r.child).map(|m| &m.parent) != r.member_of.as_ref()
+        || cell(base, &r.child, &r.property).is_err()
+    {
+        return Err("restoration target ownership/property is unavailable".into());
+    }
+    Ok(())
 }
 
 /// Called only with symbolic clauses: ordinary graphs retain their exact
@@ -133,22 +179,22 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
     let mut moves = Vec::new();
     let mut restores: BTreeMap<(Key, Recorded), Vec<Restore<'_>>> = BTreeMap::new();
     for (at, (op, effect)) in ops.iter().zip(fx).enumerate() {
-        for clause in &effect.symbolic {
-            match clause {
-                Clause::Recurse(w) => writes.entry(w.key.clone()).or_default().push(Write {
-                    at,
-                    id: op.id(),
-                    value: w,
-                }),
-                Clause::Move(m) => moves.push((at, op.id(), m)),
+        for (clause, value) in effect.symbolic.iter().enumerate() {
+            let position = Position {
+                at,
+                clause,
+                id: op.id(),
+            };
+            match value {
+                Clause::Recurse(w) => writes
+                    .entry(w.key.clone())
+                    .or_default()
+                    .push(Write { position, value: w }),
+                Clause::Move(m) => moves.push((position, m)),
                 Clause::Restore(r) => restores
                     .entry((r.key.clone(), r.child.clone()))
                     .or_default()
-                    .push(Restore {
-                        at,
-                        id: op.id(),
-                        value: r,
-                    }),
+                    .push(Restore { position, value: r }),
                 Clause::Require(fact) => {
                     if let Err(why) = fact.known() {
                         graph.symbolic_unmet.push(problem(op.id(), why));
@@ -167,53 +213,43 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
         match chain(&key, &candidates, base) {
             Ok(ordered) => {
                 for pair in ordered.windows(2) {
-                    edge(graph, pair[0].at, pair[1].at, &key);
+                    edge(graph, pair[0].position, pair[1].position, &key);
                 }
                 chains.insert(key, ordered);
             }
-            Err(why) => graph.symbolic_unmet.push(problem(candidates[0].id, why)),
+            Err(why) => graph
+                .symbolic_unmet
+                .push(problem(candidates[0].position.id, why)),
         }
     }
     for ((key, _), list) in &mut restores {
         // Existing write/write policy uses immutable operation identities.
-        list.sort_by_key(|r| r.id);
+        list.sort_by_key(|r| (r.position.id, r.position.clause));
         for pair in list.windows(2) {
-            restore_edge(graph, pair[0].at, pair[1].at, key);
+            restore_edge(graph, pair[0].position, pair[1].position, key);
         }
         for r in list.iter() {
             if let Err(why) = r.value.value.known() {
-                graph.symbolic_unmet.push(problem(r.id, why));
+                graph.symbolic_unmet.push(problem(r.position.id, why));
             }
             if let Some(chain) = chains.get(key) {
                 for w in chain {
-                    restore_edge(graph, w.at, r.at, key);
+                    restore_edge(graph, w.position, r.position, key);
                 }
             }
         }
     }
-    for ((key, child), rs) in &restores {
-        if !base.tables.contains(&key.parent) || !base.tables.contains(child) {
-            for r in rs {
-                graph
-                    .symbolic_unmet
-                    .push(problem(r.id, "restoration endpoint has an unknown UID"));
-            }
-        }
-        if !moves.iter().any(|(_, _, m)| &m.child == child) {
-            for r in rs {
-                if base.members.get(child).map(|m| &m.parent) != r.value.member_of.as_ref()
-                    || cell(base, child, &r.value.property).is_err()
-                {
-                    graph.symbolic_unmet.push(problem(
-                        r.id,
-                        "restoration target ownership/property is unavailable",
-                    ));
-                }
+    let declared_moves = moves_by_child(fx);
+    for rs in restores.values() {
+        for r in rs {
+            if let Err(why) = restoration_target(r.value, &declared_moves, base) {
+                graph.symbolic_unmet.push(problem(r.position.id, why));
             }
         }
     }
     let mut seen = BTreeSet::new();
-    for (at, id, m) in moves {
+    for (position, m) in moves {
+        let id = position.id;
         let checked = (|| -> Result<(), String> {
             if !seen.insert(m.child.clone()) {
                 return Err(
@@ -276,7 +312,7 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     if r.value.property != t.to {
                         return Err("restoration addresses a different transferred property".into());
                     }
-                    restore_edge(graph, at, r.at, &key);
+                    restore_edge(graph, position, r.position, &key);
                 }
                 let mut admitted = Vec::new();
                 for cut in 0..=list.len() {
@@ -293,10 +329,10 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
                     ));
                 }
                 if lo > 0 {
-                    edge(graph, list[lo - 1].at, at, &key);
+                    edge(graph, list[lo - 1].position, position, &key);
                 }
                 if hi < list.len() {
-                    edge(graph, at, list[hi].at, &key);
+                    edge(graph, position, list[hi].position, &key);
                 }
             }
             Ok(())
@@ -310,23 +346,31 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
         assert!(positions.contains_key(&issue.operation));
     }
 }
-fn restore_edge(graph: &mut Graph, before: usize, after: usize, key: &Key) {
-    if before != after {
-        graph.edges.insert(Edge {
-            before,
-            after,
-            source: Source::Effect,
-            because: Because::Restores(key.clone()),
-        });
-    }
+fn restore_edge(graph: &mut Graph, before: Position, after: Position, key: &Key) {
+    dependency(graph, before, after, Because::Restores(key.clone()));
 }
-fn edge(graph: &mut Graph, before: usize, after: usize, key: &Key) {
-    if before != after {
+fn edge(graph: &mut Graph, before: Position, after: Position, key: &Key) {
+    dependency(graph, before, after, Because::Boundary(key.clone()));
+}
+fn dependency(graph: &mut Graph, before: Position, after: Position, because: Because) {
+    if before.at == after.at {
+        // Operations are indivisible. A self-edge cannot repair clauses in
+        // the opposite order; replay executes the original clause sequence.
+        if before.clause >= after.clause {
+            graph.symbolic_unmet.push(problem(
+                before.id,
+                format!(
+                    "symbolic clause {} must precede clause {} for {because:?}",
+                    before.clause, after.clause
+                ),
+            ));
+        }
+    } else {
         graph.edges.insert(Edge {
-            before,
-            after,
+            before: before.at,
+            after: after.at,
             source: Source::Effect,
-            because: Because::Boundary(key.clone()),
+            because,
         });
     }
 }
@@ -361,12 +405,12 @@ fn chain<'a>(key: &Key, list: &[Write<'a>], base: &State) -> Result<Vec<Write<'a
             &physical,
             value,
             w.value.lifetime,
-            w.id,
+            w.position.id,
             &key.parent,
             &key.property,
         )?;
         physical.value = Fact::Known(value.clone());
-        version = Version::After(w.id);
+        version = Version::After(w.position.id);
         out.push(w);
     }
     Ok(out)
@@ -386,9 +430,14 @@ fn admits(
         parent = w.value.to.known()?.clone();
         if m.kind != MoveKind::Attach && w.value.scope == Scope::MembersAtOperation {
             let next = w.value.policy.apply(&child, &parent);
-            let Ok(origin) =
-                next_origin(&physical, &next, w.value.lifetime, w.id, &m.child, &t.from)
-            else {
+            let Ok(origin) = next_origin(
+                &physical,
+                &next,
+                w.value.lifetime,
+                w.position.id,
+                &m.child,
+                &t.from,
+            ) else {
                 return Ok(false);
             };
             physical.origin = origin;
@@ -407,9 +456,14 @@ fn admits(
         for w in &chain[cut..] {
             if w.value.scope == Scope::MembersAtOperation {
                 let next = w.value.policy.apply(&child, w.value.to.known()?);
-                let Ok(origin) =
-                    next_origin(&physical, &next, w.value.lifetime, w.id, &m.child, &t.to)
-                else {
+                let Ok(origin) = next_origin(
+                    &physical,
+                    &next,
+                    w.value.lifetime,
+                    w.position.id,
+                    &m.child,
+                    &t.to,
+                ) else {
                     return Ok(false);
                 };
                 physical.origin = origin;
@@ -479,6 +533,15 @@ pub fn project<'a>(
     assert_eq!(ops.len(), fx.len());
     if let Some(op) = ops.first() {
         baseline_valid(base).map_err(|why| problem(op.id(), why))?;
+    }
+    let declared_moves = moves_by_child(fx);
+    for (op, effect) in ops.iter().zip(fx) {
+        for clause in &effect.symbolic {
+            if let Clause::Restore(r) = clause {
+                restoration_target(r, &declared_moves, base)
+                    .map_err(|why| problem(op.id(), why))?;
+            }
+        }
     }
     let mut states = vec![base.clone()];
     let mut writes = Vec::new();
