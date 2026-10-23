@@ -30,15 +30,21 @@ impl CapturedInputs {
     ) -> Option<&std::collections::BTreeMap<String, serde_json::Value>> {
         self.inputs.get(id).map(|input| &input.properties)
     }
-    /// Effective owners already resolved by `select::Index::owner`: explicit,
-    /// then parent, then schema. Only authorization metadata leaves here.
+    /// Effective ownership: explicit, then parent for objects, then schema.
+    /// Type ownership is held in its whole catalog row. Only authorization
+    /// metadata leaves here; the captured inputs remain unchanged.
     pub(crate) fn effective_owners(
         &self,
     ) -> Result<BTreeMap<ObjectIdentity, pbps_model::RoleName>, super::Uncovered> {
         self.inputs
             .iter()
             .filter(|(id, input)| {
-                [super::class::SCHEMA, super::class::OBJECT].contains(&id.class.as_str())
+                (matches!(
+                    id.class.as_str(),
+                    super::class::SCHEMA | super::class::OBJECT
+                ) || (id.class == super::class::TYPE
+                    && input.properties.get("user_defined")
+                        == Some(&serde_json::Value::Bool(true))))
                     && input.properties.get("engine") != Some(&serde_json::Value::Bool(true))
             })
             .map(|(id, input)| {
@@ -47,6 +53,27 @@ impl CapturedInputs {
                     .get("owner")
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok())
+                    .or_else(|| {
+                        if id.class != super::class::TYPE {
+                            return None;
+                        }
+                        input
+                            .properties
+                            .get("sys.types")
+                            .and_then(|row| row.get("principal_id"))
+                            .and_then(|value| serde_json::from_value(value.clone()).ok())
+                            .or_else(|| {
+                                self.inputs
+                                    .get(&ObjectIdentity {
+                                        class: super::class::SCHEMA.into(),
+                                        name: vec![id.name.first()?.clone()],
+                                        signature: vec![],
+                                    })?
+                                    .properties
+                                    .get("owner")
+                                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+                            })
+                    })
                     .ok_or_else(|| {
                         super::Uncovered::object(id, "the effective owner was not captured")
                     })?;

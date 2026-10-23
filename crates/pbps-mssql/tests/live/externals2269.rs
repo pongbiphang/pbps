@@ -3,6 +3,7 @@
 use super::connect_live;
 use pbps_db::Conn;
 use pbps_mssql::resolver::{
+    authorization as auth,
     capture::{self, StageError},
     externals, scratch,
 };
@@ -54,6 +55,27 @@ where
 }
 
 impl Fixture {
+    async fn type_owners(
+        &mut self,
+        scope: &capture::CaptureScope,
+    ) -> (
+        auth::AuthorizationContext,
+        auth::PrincipalMap,
+        auth::OwnerPartition,
+    ) {
+        let captured = capture::capture(&mut self.target, scope).await.unwrap();
+        let mut context = auth::read(&mut self.target, &["dbo".into()]).await.unwrap();
+        let owners = auth::OwnerPartition::from_capture(&captured, &context).unwrap();
+        auth::read_staged_permissions(&mut self.target, &mut context, &owners)
+            .await
+            .unwrap();
+        let map = auth::PrincipalMap::generate(&context, &[], "externals2269");
+        auth::reconstruct_database(&mut self.scratch, &map, &context)
+            .await
+            .unwrap();
+        (context, map, owners)
+    }
+
     async fn file(&mut self, sql: &str) -> Result<BTreeSet<capture::ObjectIdentity>, String> {
         let before = externals::inventory(&mut self.scratch, SANDBOX)
             .await
@@ -210,6 +232,90 @@ async fn rendered_external_matches_complete_compared_shape() {
         f.scratch.execute("ALTER SEQUENCE dbo.seq INCREMENT BY 3;").await.unwrap();
         refused(f.compare(&roots(&["seq"]),&[]).await,"seq");
     }).await;
+}
+
+fn alias(name: &str) -> capture::ObjectIdentity {
+    capture::ObjectIdentity {
+        class: capture::class::TYPE.into(),
+        name: vec!["dbo".into(), name.into()],
+        signature: vec![],
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn rendered_alias_type_explicit_and_inherited_owners_are_accepted() {
+    case("type_owners", |mut f| async move {
+        f.target
+            .execute(
+                "CREATE USER alias_owner WITHOUT LOGIN; \
+                 CREATE TYPE dbo.explicit_alias FROM decimal(9,2) NOT NULL; \
+                 CREATE TYPE dbo.inherited_alias FROM int NULL; \
+                 ALTER AUTHORIZATION ON TYPE::dbo.explicit_alias TO alias_owner;",
+            )
+            .await
+            .unwrap();
+        let scope = capture::CaptureScope {
+            retained: BTreeSet::from([alias("explicit_alias"), alias("inherited_alias")]),
+            candidates: BTreeSet::new(),
+        };
+        let (context, map, owners) = f.type_owners(&scope).await;
+        let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+        let before = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
+        for id in &scope.retained {
+            for sql in externals::render::render(&inputs, id).unwrap().statements {
+                f.scratch.execute(&sql).await.unwrap();
+            }
+        }
+        let after = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
+        let rendered = externals::created(&before, &after);
+        assert_eq!(rendered, scope.retained);
+        auth::reconstruct_owners(&mut f.scratch, &map, &owners.restricted_to(&rendered))
+            .await
+            .unwrap();
+        let current = capture::capture(&mut f.scratch, &scope).await.unwrap();
+        owners
+            .verify(&auth::OwnerPartition::from_capture(&current, &context).unwrap())
+            .unwrap();
+        let rows = f.scratch.query("SELECT t.principal_id FROM sys.types t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name=N'dbo' AND t.name=N'explicit_alias' AND t.principal_id<>s.principal_id;").await.unwrap();
+        assert_eq!(rows.len(), 1, "the rendered alias needs its explicit owner");
+        f.compare(&rendered, &[]).await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn file_alias_type_wrong_owner_is_never_repaired() {
+    case("file_type_owner", |mut f| async move {
+        f.target.execute("CREATE USER alias_owner WITHOUT LOGIN; CREATE TYPE dbo.file_alias FROM int NULL; CREATE TYPE dbo.rendered_alias FROM int NULL; ALTER AUTHORIZATION ON TYPE::dbo.file_alias TO alias_owner; ALTER AUTHORIZATION ON TYPE::dbo.rendered_alias TO alias_owner;").await.unwrap();
+        let scope = capture::CaptureScope {
+            retained: BTreeSet::from([alias("file_alias"), alias("rendered_alias")]),
+            candidates: BTreeSet::new(),
+        };
+        let (context, map, owners) = f.type_owners(&scope).await;
+        let from_file = f.file("CREATE TYPE dbo.file_alias FROM int NULL;").await.unwrap();
+        assert_eq!(from_file, BTreeSet::from([alias("file_alias")]));
+        let middle = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
+        let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+        for sql in externals::render::render(&inputs, &alias("rendered_alias")).unwrap().statements {
+            f.scratch.execute(&sql).await.unwrap();
+        }
+        let after = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
+        let rendered = externals::created(&middle, &after);
+        assert_eq!(rendered, BTreeSet::from([alias("rendered_alias")]));
+        auth::reconstruct_owners(&mut f.scratch, &map, &owners.restricted_to(&rendered))
+            .await
+            .unwrap();
+        let rows = f.scratch.query("SELECT principal_id FROM sys.types WHERE user_type_id=TYPE_ID(N'dbo.file_alias');").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].try_get::<i32>("principal_id").unwrap().is_none());
+        let current = capture::capture(&mut f.scratch, &scope).await.unwrap();
+        let error = owners.verify(&auth::OwnerPartition::from_capture(&current, &context).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("file-supplied ownership is not repaired"));
+        refused(f.compare(&scope.retained, &[]).await, "owner_group");
+    })
+    .await;
 }
 #[tokio::test]
 #[ignore]

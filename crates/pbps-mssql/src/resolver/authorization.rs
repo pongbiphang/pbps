@@ -552,6 +552,7 @@ fn named_principals(
     named.extend(context.roles.keys().cloned());
     named.extend(context.impersonation.iter().cloned());
     named.extend(context.principal_owners.values().cloned());
+    named.extend(context.principals.keys().cloned());
     for object in context.staged.values() {
         named.insert(object.owner.clone());
         for grant in &object.grants {

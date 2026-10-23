@@ -96,7 +96,10 @@ impl OwnerPartition {
                 .owners
                 .iter()
                 .filter(|(subject, _)| match subject {
-                    Subject::Securable(id) => id.class == class::OBJECT && objects.contains(id),
+                    Subject::Securable(id) => {
+                        matches!(id.class.as_str(), class::OBJECT | class::TYPE)
+                            && objects.contains(id)
+                    }
                     Subject::Deployer | Subject::DatabaseOwner => true,
                 })
                 .map(|(s, o)| (s.clone(), o.clone()))
@@ -173,9 +176,9 @@ pub async fn reconstruct_owners(
     map: &PrincipalMap,
     target: &OwnerPartition,
 ) -> Result<(), DbError> {
-    // Schemas first, then objects. Children that share their parent's owner
+    // Schemas first, then types and objects. Children that share their parent's owner
     // inherit it, just as Index::owner resolves them on the target.
-    for wanted_class in [class::SCHEMA, class::OBJECT] {
+    for wanted_class in [class::SCHEMA, class::TYPE, class::OBJECT] {
         for (subject, owner) in &target.owners {
             let Subject::Securable(id) = subject else {
                 continue;
@@ -206,6 +209,14 @@ pub async fn reconstruct_owners(
                     continue;
                 }
                 format!("SCHEMA::{}", bracket(name))
+            } else if wanted_class == class::TYPE {
+                let [schema, name] = id.name.as_slice() else {
+                    return Err(DbError::BadRow("invalid type owner identity".into()));
+                };
+                if !id.signature.is_empty() {
+                    return Err(DbError::BadRow("invalid type owner signature".into()));
+                }
+                format!("TYPE::{}.{}", bracket(schema), bracket(name))
             } else {
                 let name = object_name(id)?;
                 let rows = conn.query(&format!(
@@ -267,6 +278,16 @@ pub async fn read_staged_permissions(
         context.schemas.extend(extra.schemas);
         context.principals.extend(extra.principals);
         context.principal_owners.extend(extra.principal_owners);
+    }
+    // An alias type's owner need not own a schema or appear in an object ACL.
+    // Keep it in the same run-local principal map used for object owners.
+    for (subject, owner) in &owners.owners {
+        if matches!(subject, Subject::Securable(id) if id.class == class::TYPE) {
+            context
+                .principals
+                .entry(owner.clone())
+                .or_insert(PrincipalKind::User);
+        }
     }
     let mut staged = BTreeMap::new();
     for (subject, owner) in &owners.owners {

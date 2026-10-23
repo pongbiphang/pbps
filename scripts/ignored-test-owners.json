@@ -1976,6 +1976,8 @@
         "externals2269::hidden_inventory_is_not_empty_inventory",
         "externals2269::unreadable_external_shape_refuses",
         "externals2269::rendered_external_matches_complete_compared_shape",
+        "externals2269::rendered_alias_type_explicit_and_inherited_owners_are_accepted",
+        "externals2269::file_alias_type_wrong_owner_is_never_repaired",
         "externals2269::unsupported_renderer_shape_refuses_by_name",
         "externals2269::failed_file_and_comparison_cleanup_owned_objects",
         "externals2269::partial_commit_does_not_escape_owned_cleanup",
