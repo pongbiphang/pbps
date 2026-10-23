@@ -88,6 +88,18 @@ modes, so a caller-defined emitter cannot substitute an executable collection.
 The normal `pbps-mssql -> pbps-diff` edge remains the only added workspace
 crate dependency; no transport/engine dependency enters diff or dialect.
 
+The symbolic partition contract (DEC-2296.1) keeps neutral property/version,
+membership and ownership-transfer data in `pbps-model::operation::symbolic`.
+An operation-local engine hook may describe recursion over membership at
+execution time without enumerating endpoint children. `pbps-diff::order`
+owns its cut compiler, non-executable projection and independent replay.
+The contract PR enables no guarded consumer; engine production, pending
+normalization and probe integration remain separate changes. A borrowed
+projection cannot mint PlanView authority or serialize new saved-plan data.
+No additional settlement or proof union is introduced. See
+[the contract](ORDERING.md#membership-scoped-effect-contract) for unresolved
+domains, remaining guards, lock-window reporting and readback obligations.
+
 ## New-engine ordering contract
 
 An engine supplies ordering facts and lowering semantics to the shared

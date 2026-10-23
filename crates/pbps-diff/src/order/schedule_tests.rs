@@ -102,6 +102,7 @@ fn a_cycle_is_refused_by_name_not_ordered_arbitrarily() {
         members,
         edges,
         waiting,
+        ..
     } = &refusal
     else {
         panic!("{refusal:?}")
@@ -330,4 +331,34 @@ fn a_long_cycle_is_named_without_overflowing_the_stack() {
         Err(Refusal::Cycle { members, .. }) => assert_eq!(members.len(), n),
         other => panic!("{:?}", other.map(|s| s.sequence.len())),
     }
+}
+
+#[test]
+fn a_graphs_unmet_requirement_cannot_be_lost_at_settlement() {
+    use pbps_model::operation::{ModuleEdits, ObjectKey, Operations, Requirement};
+    let given = plan(&["a"]);
+    let operations = Operations::of_plan(&given.changes, ModuleEdits::InPlace);
+    let missing = Requirement::Exists(ObjectKey::Module(pbps_model::ModuleId::Named(
+        "app.missing".parse().unwrap(),
+    )));
+    let graph = super::Graph {
+        unmet: vec![super::Unmet {
+            operation: 0,
+            requirement: missing,
+        }],
+        ..Default::default()
+    };
+    let refusal = Schedule::of_graph(&graph, operations.as_slice())
+        .settle_raw(given.clone())
+        .unwrap_err();
+    let text = refusal.describe(&given);
+    assert!(
+        text.contains("missing") && text.contains("separate plans"),
+        "{text}"
+    );
+    assert!(
+        Schedule::of_graph(&super::Graph::default(), operations.as_slice())
+            .settle_raw(given)
+            .is_ok()
+    );
 }

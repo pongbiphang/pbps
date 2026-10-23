@@ -36,6 +36,10 @@ pub enum Source {
 /// it against `docs/ORDERING.md`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Because {
+    /// A symbolic membership/property version boundary (DEC-2296.1).
+    Boundary(pbps_model::operation::symbolic::Key),
+    /// An explicit own-value restoration after its scoped writers.
+    Restores(pbps_model::operation::symbolic::Key),
     /// The earlier creates what the later requires.
     Creates(ObjectKey),
     /// The earlier rewrites what the later requires, or reads the new name of.
@@ -92,6 +96,7 @@ pub struct Graph {
     pub edges: BTreeSet<Edge>,
     pub unmet: Vec<Unmet>,
     pub ambiguous: Vec<Ambiguous>,
+    pub symbolic_unmet: Vec<super::membership::Problem>,
 }
 
 impl Graph {
@@ -150,12 +155,19 @@ pub(crate) fn connected_module_release(edge: &Edge, operations: &[Operation]) ->
 #[derive(Debug, Clone, Default)]
 pub struct Baseline {
     held: BTreeSet<ObjectKey>,
+    pub(crate) symbolic: pbps_model::operation::symbolic::State,
 }
 
 impl Baseline {
+    /// Descriptive facts only; supplying them cannot certify a draft.
+    pub fn with_symbolic(mut self, state: pbps_model::operation::symbolic::State) -> Self {
+        self.symbolic = state;
+        self
+    }
     pub fn of(before: Snapshot<'_>, owners: &dyn pbps_model::operation::Owners) -> Self {
         Self {
             held: baseline_keys(before, owners),
+            symbolic: Default::default(),
         }
     }
 
@@ -168,6 +180,7 @@ impl Baseline {
     pub fn from_keys(keys: impl IntoIterator<Item = ObjectKey>) -> Self {
         Self {
             held: keys.into_iter().collect(),
+            symbolic: Default::default(),
         }
     }
 
@@ -243,6 +256,7 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
         Resource::Column(key) => Resource::Column(key.clone()),
     };
     Effects {
+        symbolic: effects.symbolic.clone(),
         creates: effects.creates.iter().map(merge).collect(),
         removes: effects
             .removes
@@ -563,11 +577,14 @@ pub fn graph(
     declared_edges(operations, declared, &mut |a, b| {
         edge(a, b, Source::Declared, Because::Declared)
     });
-    Graph {
+    let mut result = Graph {
         edges,
         unmet,
         ambiguous,
-    }
+        symbolic_unmet: Vec::new(),
+    };
+    super::membership::extend(&mut result, operations, &effects, &baseline.symbolic);
+    result
 }
 
 fn out_edge(

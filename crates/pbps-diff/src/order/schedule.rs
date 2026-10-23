@@ -87,6 +87,8 @@ pub enum Refusal {
         /// Every step left unordered, ascending: the cycle's members and
         /// what waits on them.
         waiting: Vec<usize>,
+        /// Only symbolic membership participants add this scoped remedy.
+        remedy: Option<String>,
     },
 }
 
@@ -117,7 +119,12 @@ impl Refusal {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Refusal::Kept(keep) => keep.refusal.clone(),
-            Refusal::Cycle { members, edges, .. } => {
+            Refusal::Cycle {
+                members,
+                edges,
+                remedy,
+                ..
+            } => {
                 let members: Vec<String> = members.iter().map(|&i| name(i)).collect();
                 let edges: Vec<String> = edges
                     .iter()
@@ -132,9 +139,12 @@ impl Refusal {
                     })
                     .collect();
                 format!(
-                    "these steps wait on one another: {}; because {}",
+                    "these steps wait on one another: {}; because {}{}",
                     members.join(", "),
-                    edges.join(", ")
+                    edges.join(", "),
+                    remedy
+                        .as_ref()
+                        .map_or_else(String::new, |text| format!("; {text}"))
                 )
             }
         }
@@ -206,6 +216,7 @@ pub struct Schedule {
     constraints: BTreeSet<Constraint>,
     keeps: Vec<Keep>,
     obligations: Vec<Obligation>,
+    remedy: Option<String>,
 }
 
 impl Schedule {
@@ -217,14 +228,42 @@ impl Schedule {
         }
     }
 
-    /// The effect graph's edges over `operations`, each with its reason
-    /// (DEC-1956.1). Its unmet requirements are not obligations here: the
-    /// verifier records them as `unprovided` and the plan stands
-    /// (DEC-1954.6, DEC-1956.3).
+    /// Import the effect graph's edges and unmet requirements. A missing
+    /// producer is an obligation, not an independent operation (DEC-2296.1).
     pub fn of_graph(graph: &Graph, operations: &[Operation]) -> Self {
         let mut schedule = Self::new(operations.len());
+        if graph
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.because, Because::Boundary(_) | Because::Restores(_)))
+        {
+            schedule.remedy = Some(super::membership::REMEDY.into());
+        }
         for e in &graph.edges {
             schedule.edge(e.before, e.after, e.source, reason(e, operations));
+        }
+        for issue in &graph.symbolic_unmet {
+            let at = operations
+                .iter()
+                .position(|op| op.id() == issue.operation)
+                .expect("a symbolic issue belongs to this operation collection");
+            schedule.obligation(
+                at,
+                format!(
+                    "{}: {issue}",
+                    pbps_model::Text::from(operations[at].change().subject()).shown()
+                ),
+            );
+        }
+        for unmet in &graph.unmet {
+            schedule.obligation(
+                unmet.operation,
+                format!(
+                    "{} has an unmet ordering requirement {}; change the columns and the partitions in separate plans",
+                    pbps_model::Text::from(operations[unmet.operation].change().subject()).shown(),
+                    pbps_model::Text::from(format!("{:?}", unmet.requirement)).shown(),
+                ),
+            );
         }
         schedule
     }
@@ -464,6 +503,7 @@ impl Schedule {
                 members,
                 edges,
                 waiting,
+                remedy: self.remedy.clone(),
             });
         }
         Ok((emitted, kept))
@@ -586,6 +626,8 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,
         Source::Effect | Source::Lexical | Source::Catalog => match &edge.because {
+            Because::Boundary(_) => OrderReason::Structural,
+            Because::Restores(_) => OrderReason::Restoration,
             Because::Creates(key)
             | Because::Removes(key)
             | Because::Frees(key)

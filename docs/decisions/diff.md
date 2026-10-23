@@ -8360,3 +8360,54 @@ its supported sibling drops the generated reader and old input, applies the
 rows and replans empty. The existing pre-17 expression-change refusal stays;
 the sibling is not evidence that the newer SQL works on 16. Unit pins cover
 child rows, later same-table rows, keys and retained provenance.
+
+
+<a id="dec-2296-1"></a>
+
+**DEC-2296.1. Recursive effects name membership at the operation, not the
+union of the endpoint children.** The contract adds symbolic property/version
+transitions, membership incarnations and ownership transfers without enabling
+a guarded consumer. Operation-local engine effects supply recursion policy;
+order compiles admissible version cuts into the existing settlement's edges.
+A non-convex domain or disjunction remains a named unresolved obligation,
+with the remedy to change the columns and the partitions in separate plans.
+Sink, existing stages and proof boundaries stay unchanged. Graph unmet
+requirements are settlement obligations rather than silently independent work.
+Projection and strict Final replay resolve actual membership in the given
+sequence; neither trusts a predicted child set or retries another ordering.
+Pending state is descriptive and cannot authorize emission. Saved fields,
+SQL/checksum bytes and the release-verifier policy do not change.
+
+Before this contract was written, native SQL measurements on PostgreSQL
+16.15 and 18.6 exercised 44 fixtures: 300 two-order pairs, 600 executions,
+each in a rolled-back transaction, with no setup/recording errors. Of these,
+306 executions accepted, 150 refused with SQLSTATE, and 144 accepted but
+produced different catalog/row/default outcomes from the reverse order.
+These are native observations, not successful pbps apply evidence.
+
+Add/drop/rename/type changes require the attach candidate's matching shape;
+wrong columns/type refuse 42804, wrong collation 42P21. A detach freezes the
+columns, defaults and parts present at its position. Parent SET/DROP DEFAULT
+overwrites attached own values: with parent 1 -> 7 and candidate own 9,
+SET then ATTACH leaves 9, ATTACH then SET leaves 7. Explicit own restorations
+may therefore be required in either order; redundant metadata-only ALTERs
+are accepted. Validator failures 22003, 23502, 23505, 23514 and 23503 depend
+on which rows are still in the tree; endpoint schemas do not establish row
+validity. A detached default can retain a sequence dependency (2BP01).
+Partition-key 42P16 and version-dependent identity/readback restrictions
+(42P16, 55000, 42601) remain capability refusals. Local NOT NULL retention
+also differs by engine version. Equal definition text does not erase bindings,
+local ownership, clone lineage or release/restoration event identities.
+
+The [complete pair matrix](../measurements/partition-moves-2296.md) records
+all profiles and pins the retained raw artifact hashes. Synthetic contract
+tests encode their semantic facts
+and do not claim to reproduce engine SQLSTATEs. Contract tests enumerate
+small orders only in tests and compare graph permission with concrete replay.
+The contract PR removes no schema-diff guard. The column and later part PRs
+must add live readback for every measured silent-difference case in scope,
+not a sample. They must explain that the first parent ALTER holds the tree's
+ACCESS EXCLUSIVE lock until commit and the attach scan runs inside that
+window; splitting manually remains the user's choice. Remaining refusals,
+including conflicting cuts and capabilities, must name the separate-plans
+remedy. A generic cycle message alone does not discharge that requirement.

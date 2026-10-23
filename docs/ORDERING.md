@@ -125,6 +125,50 @@ Bounded namespace search still proposes `Search` edges, and the PostgreSQL
 engine-generated-name trial remains scratch reconstruction rather than a
 generic slot allocator. These are retained limits, not extra scheduling passes.
 
+### Membership-scoped effect contract
+
+`operation::symbolic` declares recursive property writes, membership
+incarnations, transfers and explicit own-value restorations (DEC-2296.1).
+The parent UID and property identify a version chain; operation identities,
+not matching definition text or the current list positions, identify its
+transitions. Binding incarnations, own/inherited/local ownership and physical
+birth are distinct facts. Engines supply normalized definitions and the
+observed overwrite/preserve/adopt policy; the model parses no SQL.
+
+`order::membership` indexes the declarations and compiles each move's allowed
+cuts in those chains. An interval requires its lower predecessor before the
+move and its upper successor after it. A move compatible with both sides
+gets no preference edge. A fork, missing fact, non-convex interval or
+unrepresented disjunction is a named obligation with the separate-plans
+remedy. Other property/dependency constraints may form an ordinary cycle;
+cycles containing these boundary constraints retain that remedy too.
+`Schedule::of_graph` imports unmet requirements as obligations. Merely
+recording an unmet requirement in the debug shadow is insufficient.
+
+A concrete projection replays membership at each position and expands a
+recursive write only over the members then present. Transfers retain
+physical origin while changing managed scope; a drop retires the child.
+Independent Final replay checks the actual writes, transfers and goals,
+without importing a concrete child union from graph compilation. The
+non-executable `Pending` lookup distinguishes pending facts from missing
+sources; it grants no executable authority, as compiler-negative tests pin.
+Its borrowed operations/effects cannot be mutated underneath a live view.
+
+The contract is not activated for guarded plans yet. `attached()` and
+`detached_names()`, early weave/source projections, shipping engine clauses
+and boundary probe grounding remain the column/part PRs' integration work.
+Those PRs carry typed obligations to the existing effect settlement; they
+must not choose a preliminary order to construct their effects. Existing
+stages, Sink, brands, wire fields and the release-verifier policy stay intact.
+Test-only small-order enumeration checks soundness and admitted-interval
+completeness; it is not a shipping search/ordering stage.
+
+Every measured silent-difference case in an implementation PR's scope needs
+live readback on PG16/18, not a sample. In a combined transactional plan the
+first parent ALTER holds the tree's ACCESS EXCLUSIVE lock until commit;
+attach validation runs within that longer lock window. The eventual plan
+text must say so, and the operator can still choose separate plans.
+
 ### Base ordering policy
 
 The differ sorts every planned change by, in order:

@@ -2975,6 +2975,11 @@ pub trait Dialect {
     /// column calls it), or a write its statement makes beyond its change (a
     /// parent's `SET DEFAULT` reaching its partitions).
     ///
+    /// Symbolic clauses may name membership at this operation rather than
+    /// enumerating a union of endpoint children (DEC-2296.1). Order resolves
+    /// their property versions and transfers; this hook stays operation-local.
+    /// Shipping partition producers remain guarded until their integration.
+    ///
     /// Pure, like the rest of the dialect: it reads the step's payload and
     /// the two snapshots, and runs no query. A dependency only a connected
     /// plan's catalog reads is the `Catalog` edge source's, not this one's.
