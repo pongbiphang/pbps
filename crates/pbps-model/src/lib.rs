@@ -45,6 +45,7 @@ pub mod plan;
 pub mod plan_names;
 pub mod reason;
 pub mod rebuild;
+pub mod rebuild_ops;
 pub mod rename;
 pub mod resolver;
 pub mod role;
@@ -87,6 +88,10 @@ pub use plan::{
 };
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{Rebuild, RebuildIdentities};
+pub use rebuild_ops::{
+    AnalyzeTableTree, CopyColumn, CopySource, CopyTableRows, IntermediateAddress,
+    RebuildPartitionedTable, RebuildRelation,
+};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{

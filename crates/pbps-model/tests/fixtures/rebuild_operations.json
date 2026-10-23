@@ -1,0 +1,96 @@
+[
+  {
+    "op": "rebuild_partitioned_table",
+    "table": "app.p",
+    "intent": {
+      "source": {
+        "tables": {
+          "t_aaaaaa": "app.p",
+          "t_aaaaba": "app.p1"
+        },
+        "columns": {
+          "c_aaaaaa": "app.p.k"
+        }
+      },
+      "replacement": {
+        "tables": {
+          "t_bbbbbb": "app.p",
+          "t_bbbbab": "app.p1"
+        },
+        "columns": {
+          "c_bbbbbb": "app.p.k"
+        }
+      },
+      "target_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "max_rows": 10,
+      "allowed_at": "2026-10-24",
+      "reason": "Change the partition key",
+      "operator": "maintainer"
+    },
+    "before": {
+      "app.p": {
+        "columns": {}
+      },
+      "app.p1": {
+        "columns": {}
+      }
+    },
+    "after": {
+      "app.p": {
+        "columns": {}
+      },
+      "app.p1": {
+        "columns": {}
+      }
+    }
+  },
+  {
+    "op": "copy_table_rows",
+    "source": {
+      "uid": "t_aaaaaa",
+      "name": "app.p"
+    },
+    "target": {
+      "uid": "t_bbbbbb",
+      "name": "app.tmp_p"
+    },
+    "columns": [
+      {
+        "source": {
+          "column": "app.p.k",
+          "ty": "integer",
+          "collation": null
+        },
+        "target": "app.tmp_p.k",
+        "cast": "bigint",
+        "collation": null
+      }
+    ],
+    "source_partitions": [
+      {
+        "uid": "t_aaaaba",
+        "name": "app.p1"
+      }
+    ],
+    "target_partitions": [
+      {
+        "uid": "t_bbbbab",
+        "name": "app.tmp_p1"
+      }
+    ],
+    "max_rows": 10
+  },
+  {
+    "op": "analyze_table_tree",
+    "parent": {
+      "uid": "t_bbbbbb",
+      "name": "app.tmp_p"
+    },
+    "partitions": [
+      {
+        "uid": "t_bbbbab",
+        "name": "app.tmp_p1"
+      }
+    ]
+  }
+]

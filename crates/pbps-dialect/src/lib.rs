@@ -64,6 +64,11 @@ use pbps_model::{
 /// variant of its own so that its line breaks stay the tool's.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
+    #[error("{operation} for `{}` cannot be emitted before blocking rewrites are enabled", table.shown())]
+    RebuildUnavailable {
+        operation: &'static str,
+        table: pbps_model::TableName,
+    },
     #[error("{dialect} has no type `{}`", pbps_model::escape::Escaped(.ty))]
     UnknownType { dialect: &'static str, ty: String },
 
@@ -502,6 +507,9 @@ impl Unchecked {
     // the explain renderer escapes each complete check/reason once.
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => change.subject(),
             Change::AddCheck { table, name, .. } => {
                 format!(
                     "new check {name} on {table}",
@@ -2391,6 +2399,21 @@ pub trait Dialect {
     /// checked against this same answer so artifact validation cannot disagree.
     fn change_risks(&self, change: &Change) -> std::collections::BTreeSet<RiskClass> {
         let mut risks = change.intrinsic_risks_with(self.lexicon().identifier_continues);
+        if let Change::CopyTableRows(copy) = change {
+            for column in &copy.columns {
+                if let Some(source) = &column.source {
+                    if let Some(risk) = self.type_change_risk(&source.ty, &column.cast).risk_class()
+                    {
+                        risks.insert(risk);
+                    }
+                    if source.collation != column.collation
+                        && let Some(risk) = self.collation_change_risk(&column.cast)
+                    {
+                        risks.insert(risk);
+                    }
+                }
+            }
+        }
         if let Change::AlterColumnType { from, to, .. } = change
             && let Some(risk) = self.type_change_risk(from, to).risk_class()
         {

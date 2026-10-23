@@ -192,6 +192,9 @@ pub async fn drop_blockers(
         .iter()
         .enumerate()
         .filter_map(|(index, p)| match &p.change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::DropTable { name, .. } => {
                 Some((index, format!("table {name}", name = name.shown())))
             }

@@ -22,6 +22,9 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
             .clone()
     });
     let source = match &fixture_changes.changes[0].change {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => panic!("rename fixture contains a rebuild"),
         Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
         Change::RenameTable { from, .. } => Surface::Table(from.clone()),
         Change::CreateTable { .. }

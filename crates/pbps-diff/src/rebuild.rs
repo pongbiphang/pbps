@@ -10,15 +10,7 @@ use pbps_model::{
 
 use crate::{Context, Side};
 
-/// The logical root's typed source and destination, ready for a future order
-/// expansion. It deliberately cannot be inserted into an executable ChangeSet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RebuildPartitionedTable {
-    pub table: TableName,
-    pub intent: Rebuild,
-    pub before: BTreeMap<TableName, Table>,
-    pub after: BTreeMap<TableName, Table>,
-}
+pub use pbps_model::RebuildPartitionedTable;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("cannot rebuild {table}: {why}", table = .table.shown())]

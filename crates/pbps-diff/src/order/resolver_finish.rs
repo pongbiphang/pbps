@@ -45,7 +45,7 @@ pub(crate) fn finish<D: Dialect + ?Sized>(
     ordered.changes.identities = Some(operations.clone());
     Ok((
         Ordered {
-            changes: super::plan::canonical(ordered.changes, dialect),
+            changes: super::plan::canonical(ordered.changes, dialect).map_err(Error::Names)?,
             proof: ordered.proof,
         },
         operations,

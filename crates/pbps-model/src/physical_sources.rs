@@ -377,6 +377,9 @@ impl Build<'_, '_> {
         let before = At::Before(step);
         let boundary = step + 1;
         match change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => {}
             Change::CreateTable { uid, table, .. } => {
                 self.view
                     .table_births

@@ -23,6 +23,18 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .collect();
     for planned in &changes.changes {
         match &planned.change {
+            Change::RebuildPartitionedTable(r) => types.extend(
+                r.before
+                    .values()
+                    .chain(r.after.values())
+                    .flat_map(|t| t.columns.values().map(|c| &c.ty)),
+            ),
+            Change::CopyTableRows(c) => types.extend(
+                c.columns
+                    .iter()
+                    .flat_map(|c| std::iter::once(&c.cast).chain(c.source.iter().map(|s| &s.ty))),
+            ),
+            Change::AnalyzeTableTree(_) => {}
             Change::CreateTable { table, .. }
             | Change::AttachPartition { shape: table, .. }
             | Change::DetachPartition { shape: table, .. } => {

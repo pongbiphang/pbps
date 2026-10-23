@@ -109,3 +109,6 @@ pub use normalization::{drop_parameter_changes_of_rebuilt_indexes, normalize};
 pub use resolver_finish::reordered_operations;
 
 pub(crate) use plan::differ;
+
+#[cfg(test)]
+mod rebuild_tests;

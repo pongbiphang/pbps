@@ -1345,6 +1345,9 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
     for column in [false, true] {
         let (changes, mut evidence, mut compiled) = rename_endpoints(column);
         let source = match &changes.changes[0].change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => panic!("rename fixture contains a rebuild"),
             Change::RenameColumn { table, from, .. } => Surface::Column(table.column(from)),
             Change::RenameTable { from, .. } => Surface::Table(from.clone()),
             Change::CreateTable { .. }

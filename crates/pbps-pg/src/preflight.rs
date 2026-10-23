@@ -3058,6 +3058,7 @@ fn build<'v, 'p: 'v>(
         ));
     }
     match change {
+Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
         // A new column the declarations require a value in, with nothing to
         // put there. Every existing row breaks it, so the count is the table's
         // own — and it is a count rather than a yes, because "4,213 rows"
@@ -3972,6 +3973,9 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
         // Metadata compatibility remains checkable when the row projection
         // is unchecked. Include keys carried by a created table as well.
         let keys: Vec<_> = match &p.change {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddForeignKey {
                 table,
                 name,

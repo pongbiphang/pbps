@@ -159,7 +159,7 @@ mod tests {
             [(origin.clone(), default("1"))],
             ModuleEdits::Rebuilt,
         ));
-        let before = crate::order::plan::canonical(before, &pbps_dialect::MinimalDialect);
+        let before = crate::order::plan::canonical(before, &pbps_dialect::MinimalDialect).unwrap();
         let scope = PlannedChange::new(Change::SetDataMode {
             table: column.table.clone(),
             from: None,

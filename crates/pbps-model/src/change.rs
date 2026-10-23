@@ -223,6 +223,10 @@ pub enum DetachedKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
+    /// Planning-only until the complete rebuild route is admitted.
+    RebuildPartitionedTable(Box<crate::RebuildPartitionedTable>),
+    CopyTableRows(Box<crate::CopyTableRows>),
+    AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
     CreateTable {
         uid: Uid,
         name: TableName,
@@ -1368,6 +1372,20 @@ impl Change {
         }
     }
 
+    /// A planning-only rewrite payload; every executable seam refuses it until PR4.
+    pub fn pending_rebuild(&self) -> Option<(&'static str, &TableName)> {
+        if let Change::RebuildPartitionedTable(r) = self {
+            return Some(("RebuildPartitionedTable", &r.table));
+        }
+        if let Change::CopyTableRows(c) = self {
+            return Some(("CopyTableRows", &c.target.name));
+        }
+        if let Change::AnalyzeTableTree(a) = self {
+            return Some(("AnalyzeTableTree", &a.parent.name));
+        }
+        None
+    }
+
     /// The **table** this change acts on, or `None` for a change that is not
     /// to one.
     ///
@@ -1380,6 +1398,9 @@ impl Change {
     /// label asks [`Change::subject`].
     pub fn table(&self) -> Option<&TableName> {
         Some(match self {
+            Change::RebuildPartitionedTable(r) => &r.table,
+            Change::CopyTableRows(c) => &c.target.name,
+            Change::AnalyzeTableTree(a) => &a.parent.name,
             Change::CreateTable { name, .. } | Change::DropTable { name, .. } => name,
             Change::RenameTable { from, .. } => from,
             Change::AddColumn { table, .. }
@@ -1458,7 +1479,24 @@ impl Change {
     // and left to bless whatever happened at the other.
     pub fn objects(&self) -> impl Iterator<Item = &TableName> {
         let far_end = match self {
-            Change::RenameTable { to, .. } => Some(to),
+            Change::RebuildPartitionedTable(r) => r
+                .before
+                .keys()
+                .chain(r.after.keys())
+                .filter(|n| *n != &r.table)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            Change::CopyTableRows(c) => std::iter::once(&c.source.name)
+                .chain(
+                    c.source_partitions
+                        .iter()
+                        .chain(&c.target_partitions)
+                        .map(|p| &p.name),
+                )
+                .collect(),
+            Change::AnalyzeTableTree(a) => a.partitions.iter().map(|p| &p.name).collect(),
+            Change::RenameTable { to, .. } => vec![to],
             // The parent's rows change, not its shape, and a partitioned
             // table holds no declared rows (#1544).
             Change::CreateTable { .. }
@@ -1507,7 +1545,7 @@ impl Change {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => None,
+            | Change::PublicExecution { .. } => Vec::new(),
         };
         self.table().into_iter().chain(far_end)
     }
@@ -1542,6 +1580,9 @@ impl Change {
         // [`CellAfter::AtDefault`], and the caller asks the dialect which
         // case it is looking at (117, 165, 191).
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::InsertRow {
                 table,
                 key,
@@ -1651,6 +1692,28 @@ impl Change {
     // against a shape the plan itself moved.
     pub fn columns(&self) -> Vec<ColumnRef> {
         match self {
+            Change::RebuildPartitionedTable(r) => r
+                .intent
+                .source
+                .columns
+                .values()
+                .chain(r.intent.replacement.columns.values())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            Change::CopyTableRows(c) => c
+                .columns
+                .iter()
+                .flat_map(|p| {
+                    p.source
+                        .iter()
+                        .map(|s| &s.column)
+                        .chain(std::iter::once(&p.target))
+                })
+                .cloned()
+                .collect(),
+            Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => vec![table.column(name)],
             Change::RenameColumn {
                 table, from, to, ..
@@ -1729,6 +1792,9 @@ impl Change {
     // or the plan's own edit is reported as movement.
     pub fn columns_redefined(&self) -> Vec<(ColumnRef, ColumnField)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => {
                 vec![(table.column(name), ColumnField::Whole)]
             }
@@ -1840,6 +1906,9 @@ impl Change {
     // later that removes an object takes grants with it too.
     pub fn drops(&self) -> Option<Dropped> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::DropTable { name, .. } => Some(Dropped::Table(name.clone())),
             Change::DropModule { id, .. } => Some(Dropped::Module(id.clone())),
             Change::CreateTable { .. }
@@ -1910,6 +1979,9 @@ impl Change {
     // compared against a state it was never part of.
     pub fn grant(&self) -> Option<(&crate::RoleName, &GrantTarget, PermissionChange<'_>)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::Grant {
                 role,
                 target,
@@ -1984,6 +2056,9 @@ impl Change {
     // touched would be told "nothing" about it.
     pub fn roles(&self) -> impl Iterator<Item = &crate::RoleName> {
         let (one, two) = match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => (None, None),
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
@@ -2050,6 +2125,9 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn tables_after(&self) -> Vec<(&TableName, Presence)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable { name, .. } => vec![(name, Presence::Present)],
             // The table stays, as an ordinary one (#1544).
             Change::DetachPartition { table, .. } => vec![(table, Presence::Present)],
@@ -2119,6 +2197,9 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn columns_promised(&self) -> Vec<(ColumnRef, ColumnPromise<'_>)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn {
                 table,
                 name,
@@ -2220,6 +2301,9 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn columns_after(&self) -> Vec<(ColumnRef, Presence)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::AddColumn { table, name, .. } => {
                 vec![(table.column(name), Presence::Present)]
             }
@@ -2298,6 +2382,9 @@ impl Change {
         let it = |table, name, after| Some(PartChange { table, name, after });
         let standing = |d| PartAfter::Standing(d);
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::DropPolicy { table, name, .. } => {
                 it(table, Some(name), PartAfter::Gone(Part::Policy))
             }
@@ -2426,6 +2513,9 @@ impl Change {
     // Exhaustive rather than a wildcard, as every accessor here is.
     pub fn roles_after(&self) -> Vec<(&crate::RoleName, Presence)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
             Change::DropRole { name, .. } => vec![(name, Presence::Absent)],
             Change::RenameRole { from, to, .. } => {
@@ -2493,6 +2583,9 @@ impl Change {
     // read-back would record whatever is there as this plan's own result.
     pub fn module(&self) -> Option<(&ModuleId, ModuleAfter<'_>)> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
                 Some((id, ModuleAfter::Standing(module)))
             }
@@ -2548,6 +2641,9 @@ impl Change {
     /// The module this change acts on, if it is a module change at all.
     pub fn module_id(&self) -> Option<&ModuleId> {
         match self {
+            Change::RebuildPartitionedTable(_)
+            | Change::CopyTableRows(_)
+            | Change::AnalyzeTableTree(_) => None,
             Change::CreateModule { id, .. }
             | Change::AlterModule { id, .. }
             | Change::DropModule { id, .. } => Some(id),
@@ -2612,6 +2708,8 @@ impl Change {
     pub fn intrinsic_risks_with(&self, continues_ident: fn(char) -> bool) -> BTreeSet<RiskClass> {
         let mut r = BTreeSet::new();
         match self {
+            Change::RebuildPartitionedTable(_) => { r.insert(RiskClass::Destructive); },
+Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropIndex { .. }

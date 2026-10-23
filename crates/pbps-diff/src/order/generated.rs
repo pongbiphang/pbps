@@ -30,6 +30,10 @@ fn table_use(change: &Change) -> TableUse<'_> {
         ..Default::default()
     };
     match change {
+Change::RebuildPartitionedTable(_) => TableUse::default(),
+Change::CopyTableRows(c) => TableUse { complete: std::iter::once(&c.target.name).chain(c.target_partitions.iter().map(|p| &p.name)).collect(), writes: std::iter::once(&c.target.name).chain(c.target_partitions.iter().map(|p| &p.name)).collect(), seed: None },
+Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.name).chain(a.partitions.iter().map(|p| &p.name)).collect(), ..Default::default() },
+
         Change::CreateTable {
             name,
             table,
@@ -491,6 +495,9 @@ fn texts(change: &Change) -> Vec<&str> {
             .collect()
     }
     match change {
+        Change::RebuildPartitionedTable(_) | Change::AnalyzeTableTree(_) => Vec::new(),
+        Change::CopyTableRows(c) => c.columns.iter().map(|p| p.cast.base.as_str()).collect(),
+
         Change::CreateTable { table, .. } => table
             .columns
             .values()

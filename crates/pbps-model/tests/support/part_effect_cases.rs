@@ -2,6 +2,8 @@
 //! product APIs: test fixtures must not become another source of model facts.
 
 use pbps_model::Change;
+#[path = "rebuild.rs"]
+mod rebuild;
 
 pub fn cases() -> Vec<(String, Change)> {
     let values: Vec<serde_json::Value> =
@@ -14,5 +16,15 @@ pub fn cases() -> Vec<(String, Change)> {
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             (name, change)
         })
+        .chain(
+            [
+                "RebuildPartitionedTable",
+                "CopyTableRows",
+                "AnalyzeTableTree",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .zip(rebuild::changes()),
+        )
         .collect()
 }

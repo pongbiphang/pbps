@@ -294,7 +294,7 @@ mod effects_of_each_kind {
         let cell = |v: i64| Cell::Value(Value::Int(v));
         let mut new_table = table(&[("id", Column::new(int()).not_null())]);
         new_table.foreign_keys.insert("f".into(), fk());
-        vec![
+        let mut out = vec![
             (
                 "CreateTable",
                 Change::CreateTable {
@@ -836,7 +836,39 @@ mod effects_of_each_kind {
                     origin: RoutineOrigin::Created,
                 },
             ),
-        ]
+        ];
+        let mut rebuild: Vec<Change> =
+            serde_json::from_str(include_str!("fixtures/rebuild_operations.json")).unwrap();
+        if let Change::CopyTableRows(c) = &mut rebuild[1] {
+            c.source = pbps_model::RebuildRelation {
+                uid: uid(UidKind::Table, "r"),
+                name: tn("r"),
+            };
+            c.target = pbps_model::RebuildRelation {
+                uid: uid(UidKind::Table, "t"),
+                name: tn("t"),
+            };
+            c.source_partitions.clear();
+            c.target_partitions.clear();
+            c.columns.clear();
+        }
+        if let Change::AnalyzeTableTree(c) = &mut rebuild[2] {
+            c.parent = pbps_model::RebuildRelation {
+                uid: uid(UidKind::Table, "t"),
+                name: tn("t"),
+            };
+            c.partitions.clear();
+        }
+        out.extend(
+            [
+                "RebuildPartitionedTable",
+                "CopyTableRows",
+                "AnalyzeTableTree",
+            ]
+            .into_iter()
+            .zip(rebuild),
+        );
+        out
     }
 
     /// What an `Effects` says, as the words its row in the table uses.
@@ -914,8 +946,13 @@ mod effects_of_each_kind {
                 )],
                 ModuleEdits::InPlace,
             );
-            let fx = effects(&ops.as_slice()[0], &owners, snapshot, desired)
-                .unwrap_or_else(|e| panic!("{kind}: {e}"));
+            let result = effects(&ops.as_slice()[0], &owners, snapshot, desired);
+            if kind == "RebuildPartitionedTable" {
+                assert!(result.unwrap_err().to_string().contains("must be expanded"));
+                seen.insert(kind, BTreeSet::from(["refuses"]));
+                continue;
+            }
+            let fx = result.unwrap_or_else(|e| panic!("{kind}: {e}"));
             if kind == "DropPolicy" {
                 assert!(fx.creates.is_empty());
                 assert_eq!(fx.removes.len(), 1);

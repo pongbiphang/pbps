@@ -347,6 +347,9 @@ impl Declared {
         };
         for planned in &changes.changes {
             match &planned.change {
+                Change::RebuildPartitionedTable(_)
+                | Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_) => {}
                 Change::CreateTable { name, table, .. } => {
                     let fresh = Self::from_schema(&Schema {
                         tables: [(name.clone(), (**table).clone())].into_iter().collect(),
