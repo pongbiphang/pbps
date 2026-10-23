@@ -228,7 +228,8 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
         // cannot carry.
         Blocker::UnrepresentableName { .. }
         | Blocker::MissingType { .. }
-        | Blocker::MoveNotBesideDefault { .. } => {}
+        | Blocker::MoveNotBesideDefault { .. }
+        | Blocker::PendingRebuild { .. } => {}
     }
     out
 }
@@ -417,6 +418,12 @@ fn question(b: &Blocker) -> String {
                 .map(|t| format!("{t}: ", t = t.shown()))
                 .unwrap_or_default();
             format!("{prefix}{what} `{part}` contains a `.`")
+        }
+        Blocker::PendingRebuild { table, .. } => {
+            format!(
+                "{} has a pending rebuild; withdraw its recorded intent first",
+                table.shown()
+            )
         }
         Blocker::MoveNotBesideDefault { table } => {
             format!(

@@ -2261,6 +2261,12 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
 
 fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
     let path = project.ids_file();
+    ids.validate().with_context(|| {
+        format!(
+            "refusing to write inconsistent identity file `{}`",
+            path.display()
+        )
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -4324,6 +4330,39 @@ pub(crate) fn test_planning<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_writes_refuse_invalid_mappings_before_touching_the_file() {
+        let stage = adopt::Stage::new("invalid-identity-write").unwrap();
+        let config = stage.path().join("pbps.yml");
+        std::fs::write(
+            &config,
+            "dialect: postgres\nids_file: nested/schema.ids.json\n",
+        )
+        .unwrap();
+        let project = Project::load(&config).unwrap();
+        let path = project.ids_file();
+        let mut invalid = IdsFile::default();
+        invalid
+            .tables
+            .insert("t_aaaaaa".parse().unwrap(), "app.t".parse().unwrap());
+        invalid
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "app.t".parse().unwrap());
+        assert!(
+            write_ids(&project, &invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent")
+        );
+        assert!(!path.parent().unwrap().exists());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"original identity bytes").unwrap();
+        assert!(write_ids(&project, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original identity bytes");
+        write_ids(&project, &IdsFile::default()).unwrap();
+        assert_eq!(read_ids(&project).unwrap(), IdsFile::default());
+    }
 
     #[test]
     fn declared_loaders_imply_serial_access_only_for_postgres() {

@@ -143,6 +143,13 @@ pub enum Blocker {
         /// A catalog omission is not evidence that the type is gone.
         unrepresentable: Option<String>,
     },
+
+    /// The recorded source must stay intact until its rebuild is withdrawn.
+    PendingRebuild {
+        uid: Uid,
+        table: TableName,
+        object: String,
+    },
 }
 
 /// The half of a rename that two intents fought over.
@@ -248,6 +255,45 @@ pub fn resolve_with_annotations(
     resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
 }
 
+/// Intent cannot silently alter the source of a separately recorded approval.
+fn pending_rebuild_intents(ids: &IdsFile, intents: &[Intent]) -> Vec<Blocker> {
+    let mut covered = BTreeSet::new();
+    for (uid, rebuild) in &ids.rebuilds {
+        for intent in intents {
+            if !rebuild
+                .source
+                .tables
+                .values()
+                .any(|name| intent.concerns_table(name))
+            {
+                continue;
+            }
+            let object = match intent {
+                Intent::RenameTable { from, to } => {
+                    if rebuild.source.tables.values().any(|name| name == from) {
+                        from
+                    } else {
+                        to
+                    }
+                    .raw()
+                    .to_string()
+                }
+                Intent::RenameColumn { table, from, .. } => table.column(from).raw().to_string(),
+                Intent::DropColumn { column, .. } => column.raw().to_string(),
+                Intent::DropTable { table, .. } | Intent::MoveRows { table, .. } => {
+                    table.raw().to_string()
+                }
+                Intent::RenameRole { .. } | Intent::DropRole { .. } => continue,
+            };
+            covered.insert((uid.clone(), ids.tables[uid].clone(), object));
+        }
+    }
+    covered
+        .into_iter()
+        .map(|(uid, table, object)| Blocker::PendingRebuild { uid, table, object })
+        .collect()
+}
+
 /// `annotation_count` is how many leading `intents` came from declaration
 /// annotations; every later one is a current decision. A plain count, not an
 /// `Option`: an unknown provenance is the state #403 found each gate reading
@@ -259,6 +305,10 @@ fn resolve_with_provenance(
     annotation_count: usize,
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
+    let protected = pending_rebuild_intents(ids, intents);
+    if !protected.is_empty() {
+        return Err(protected);
+    }
     let mut r = Resolution {
         ids: ids.clone(),
         ..Default::default()
@@ -441,6 +491,29 @@ fn resolve_with_provenance(
         }
     }
 
+    // Resolution can also change identity without an explicit command, such
+    // as surrendering a table's own column UIDs when attaching a partition.
+    for (uid, rebuild) in &ids.rebuilds {
+        let changed = rebuild
+            .source
+            .tables
+            .iter()
+            .find_map(|(u, name)| {
+                (r.ids.tables.get(u) != Some(name)).then(|| name.raw().to_string())
+            })
+            .or_else(|| {
+                rebuild.source.columns.iter().find_map(|(u, column)| {
+                    (r.ids.columns.get(u) != Some(column)).then(|| column.raw().to_string())
+                })
+            });
+        if let Some(object) = changed {
+            blockers.push(Blocker::PendingRebuild {
+                uid: uid.clone(),
+                table: ids.tables[uid].clone(),
+                object,
+            });
+        }
+    }
     if blockers.is_empty() {
         sort_resolution(&mut r);
         Ok(r)
@@ -484,6 +557,7 @@ fn resolve_with_provenance(
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
                 | Blocker::MissingType { .. }
+                | Blocker::PendingRebuild { .. }
                 | Blocker::MoveNotBesideDefault { .. } => None,
             };
             if let Some(table) = table

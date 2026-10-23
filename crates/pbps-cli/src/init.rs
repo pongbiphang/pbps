@@ -453,6 +453,10 @@ fn mint_ids(schema: &Schema, root: &Path) -> anyhow::Result<IdsFile> {
 }
 
 fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
+    prepared
+        .ids
+        .validate()
+        .context("cannot stage inconsistent identities")?;
     std::fs::create_dir_all(root)
         .with_context(|| format!("cannot create project directory `{}`", root.display()))?;
     let nonce = std::time::SystemTime::now()

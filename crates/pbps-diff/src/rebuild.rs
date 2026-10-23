@@ -108,26 +108,23 @@ fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), Rebui
             return Err(refused(table, "only a managed RANGE parent can be rebuilt"));
         }
         let members = tree(schema, table);
-        if members.len() < 2
-            || members.values().any(|t| {
-                (t.partition_of.is_some() && t.partition_by.is_some())
-                    || !t.computed.is_empty()
-                    || t.columns
-                        .values()
-                        .any(|c| c.value_source != pbps_model::ValueSource::None)
-                    || t.system_time.is_some()
-                    || t.data.is_some()
-                    || t.replica_identity.is_some()
-                    || t.row_security.enabled
-                    || t.row_security.forced
-                    || !t.row_policies.is_empty()
-            })
-            || schema.tables.values().any(|t| {
-                t.partition_of
-                    .as_ref()
-                    .is_some_and(|of| &of.parent != table && members.contains_key(&of.parent))
-            })
-        {
+        if members.values().any(|t| {
+            (t.partition_of.is_some() && t.partition_by.is_some())
+                || !t.computed.is_empty()
+                || t.columns
+                    .values()
+                    .any(|c| c.value_source != pbps_model::ValueSource::None)
+                || t.system_time.is_some()
+                || t.data.is_some()
+                || t.replica_identity.is_some()
+                || t.row_security.enabled
+                || t.row_security.forced
+                || !t.row_policies.is_empty()
+        }) || schema.tables.values().any(|t| {
+            t.partition_of
+                .as_ref()
+                .is_some_and(|of| &of.parent != table && members.contains_key(&of.parent))
+        }) {
             return Err(refused(
                 table,
                 "only a flat tree with plain copied columns is qualified",

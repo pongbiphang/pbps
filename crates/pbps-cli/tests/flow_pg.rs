@@ -149,6 +149,154 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
         ),
         1
     );
+    // Omitting any source member must also omit its pending permission from
+    // each kind of ledger snapshot, while preserving the on-disk intent.
+    let pending = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    on_server(connection, "DROP TABLE app.p1");
+    for args in [
+        vec!["snapshot", "--db", connection, "--force"],
+        vec![
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "accept missing leaf",
+        ],
+    ] {
+        succeeds(d.run(&args));
+        let snapshot = latest_snapshot(connection);
+        snapshot.ids.validate().unwrap();
+        assert!(snapshot.ids.rebuilds.is_empty());
+        assert!(snapshot.ids.table_uid(&"app.p1".parse().unwrap()).is_none());
+        assert!(snapshot.ids.table_uid(&"app.p".parse().unwrap()).is_some());
+    }
+    assert_eq!(
+        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
+        pending
+    );
+}
+
+#[test]
+fn pending_rebuild_intents_refuse_without_poisoning_the_identity_file() {
+    let d = Demo::new("rebuild2298-intents");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    let declaration = d.dir.join("schema/app.t.yml");
+    d.table(parent);
+    let other = d.dir.join("schema/other.yml");
+    std::fs::write(
+        &other,
+        "table: app.other\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let desired = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&desired);
+    succeeds(d.run(&[
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ]));
+    let path = d.dir.join("schema.ids.json");
+    let before = std::fs::read(&path).unwrap();
+    let ids: pbps_model::IdsFile = serde_json::from_slice(&before).unwrap();
+    let root = ids.table_uid(&"app.p".parse().unwrap()).unwrap();
+    let cases = [
+        (
+            vec!["rename-table", "app.p", "app.q"],
+            Some(desired.replace("table: app.p", "table: app.q")),
+            "app.p",
+        ),
+        (
+            vec!["rename-table", "app.p1", "app.p2"],
+            Some(desired.replace("p1:", "p2:")),
+            "app.p1",
+        ),
+        (
+            vec!["drop-table", "app.p", "--reason", "retired"],
+            None,
+            "app.p",
+        ),
+        (
+            vec!["drop-table", "app.p1", "--reason", "retired"],
+            Some(desired.split("partitions:").next().unwrap().to_owned()),
+            "app.p1",
+        ),
+        (
+            vec!["rename", "app.p.k", "old_k"],
+            Some(desired.replace("  k:", "  old_k:")),
+            "app.p.k",
+        ),
+        (
+            vec!["drop", "app.p.k", "--reason", "retired"],
+            Some(desired.replace("  k: {type: integer}\n", "")),
+            "app.p.k",
+        ),
+        (
+            vec!["move-rows", "app.p1", "--max-rows", "1", "--reason", "move"],
+            Some(desired.clone()),
+            "app.p1",
+        ),
+        (
+            vec![
+                "intent",
+                "--rename-table",
+                "app.p1",
+                "app.p2",
+                "--rename",
+                "app.p.k",
+                "old_k",
+            ],
+            Some(desired.replace("p1:", "p2:").replace("  k:", "  old_k:")),
+            "app.p.k",
+        ),
+    ];
+    for (args, content, object) in cases {
+        if let Some(content) = content {
+            std::fs::write(&declaration, content).unwrap();
+        } else {
+            std::fs::remove_file(&declaration).unwrap();
+        }
+        let out = d.run(&args);
+        assert_ne!(code(&out), 0, "{args:?}: {}{}", stdout(&out), stderr(&out));
+        for fragment in [
+            object,
+            "pending rebuild of app.p",
+            "rebuilds",
+            "withdraw",
+            "commit",
+            &root.to_string(),
+        ] {
+            assert!(
+                stderr(&out).contains(fragment),
+                "{args:?}: {}",
+                stderr(&out)
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        d.table(&desired);
+    }
+    // A mutation outside the source is still allowed and leaves readable IDs.
+    std::fs::write(
+        &other,
+        "table: app.other2\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.other", "app.other2"]));
+    let mut ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    ids.validate().unwrap();
+    // Like moves, permission is withdrawn by a reviewed git edit, not a new
+    // flag supplying a different identity decision.
+    ids.rebuilds.remove(root);
+    std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+    d.commit();
+    d.table(&desired.replace("table: app.p", "table: app.q"));
+    succeeds(d.run(&["rename-table", "app.p", "app.q"]));
+    succeeds(d.run(&["validate"]));
 }
 
 #[path = "support/row_security_roundtrip.rs"]

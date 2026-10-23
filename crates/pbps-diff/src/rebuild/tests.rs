@@ -73,6 +73,123 @@ fn recorded(base: &Schema, ids: &IdsFile, desired: &Schema) -> IdsFile {
 }
 
 #[test]
+fn pending_rebuilds_refuse_covered_intents_and_implicit_uid_retirement() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let child = TableName::new("app", "p1");
+    let reason: Reason = "retired".parse().unwrap();
+    for intent in [
+        pbps_model::Intent::RenameTable {
+            from: table(),
+            to: TableName::new("app", "q"),
+        },
+        pbps_model::Intent::DropTable {
+            table: child.clone(),
+            reason: reason.clone(),
+        },
+        pbps_model::Intent::RenameColumn {
+            table: table(),
+            from: "k".into(),
+            to: "old_k".into(),
+        },
+        pbps_model::Intent::DropColumn {
+            column: table().column("k"),
+            reason,
+        },
+        pbps_model::Intent::MoveRows {
+            table: child.clone(),
+            max_rows: 10,
+            reason: "move".into(),
+        },
+    ] {
+        for annotations in [0, 1] {
+            let errors = crate::resolve_with_annotations(
+                &desired,
+                &approval,
+                std::slice::from_ref(&intent),
+                annotations,
+                &ctx(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&errors[..], [crate::Blocker::PendingRebuild { table: root, .. }] if root == &table())
+            );
+        }
+    }
+    // Surrendering own column identities on attach needs no explicit intent.
+    let mut attached = desired.clone();
+    let outer = TableName::new("app", "outer");
+    attached
+        .tables
+        .insert(outer.clone(), desired.tables[&table()].clone());
+    let mut of = base.tables[&child].partition_of.clone().unwrap();
+    of.parent = outer;
+    attached.tables.get_mut(&table()).unwrap().partition_of = Some(of);
+    let errors = crate::resolve(&attached, &approval, &[], &ctx()).unwrap_err();
+    assert!(errors.iter().any(|b| matches!(b, crate::Blocker::PendingRebuild { object, .. } if object == "app.p.k" || object == "app.p.bucket")));
+    // Unrelated identities remain resolvable.
+    let mut unrelated = desired.clone();
+    unrelated
+        .tables
+        .insert(TableName::new("app", "other"), Table::default());
+    crate::resolve(&unrelated, &approval, &[], &ctx())
+        .unwrap()
+        .ids
+        .validate()
+        .unwrap();
+}
+
+#[test]
+fn empty_range_parents_qualify_but_unchanged_keys_do_not() {
+    let (mut base, _, mut desired) = fixture();
+    let child = TableName::new("app", "p1");
+    base.tables.remove(&child);
+    desired.tables.remove(&child);
+    let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let approval = recorded(&base, &ids, &desired);
+    let payload = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+    assert_eq!(payload.before.len(), 1);
+    assert_eq!(payload.after.len(), 1);
+    assert!(
+        record(
+            side(&base, &ids),
+            &base,
+            &ids,
+            &table(),
+            20,
+            &"maintenance".parse().unwrap(),
+            &ctx()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn snapshot_omissions_discard_the_whole_pending_rebuild() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    assert_eq!(approval.without(&[]), approval);
+    assert_eq!(
+        approval.without(&[TableName::new("app", "unrelated")]),
+        approval
+    );
+    for missing in [table(), TableName::new("app", "p1")] {
+        let projected = approval.without(&[missing]);
+        assert!(projected.rebuilds.is_empty());
+        projected.validate().unwrap();
+    }
+    let mut missing_column = approval.clone();
+    missing_column
+        .columns
+        .remove(ids.column_uid(&table().column("k")).unwrap());
+    let projected = missing_column.without(&[]);
+    assert!(projected.rebuilds.is_empty());
+    projected.validate().unwrap();
+}
+
+#[test]
 fn rebuild_intent_reserves_lineage_and_converges_without_replacing_live_ids() {
     let (base, ids, desired) = fixture();
     let approval = recorded(&base, &ids, &desired);

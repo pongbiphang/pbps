@@ -1030,3 +1030,20 @@ That route must show observed rows and `pg_total_relation_size`, call the plan
 a blocking rewrite, run ANALYZE after copying, and refuse publication trees
 and unmanaged dependents by name. Unreadable catalog facts are refusals, not
 empty sets. These connected requirements have no permissive offline default.
+
+<a id="dec-2298-2"></a>
+
+**DEC-2298.2. Pending rebuild source identities remain fixed until permission is withdrawn.**
+Every identity intent targeting a covered table or column is refused by name,
+including declaration annotations and batched decisions. Automatic identity
+resolution may not discard or rename a covered UID either. The remedy names
+the rebuild's source UID: remove its entry from `rebuilds` in the identity
+file and commit the withdrawal before retrying. This follows `move-rows`,
+whose recorded permission is withdrawn by removing its `moves` entry; no new
+cancel command or allow word is introduced. Reapprove against the changed
+source if a rebuild is still wanted. Identity files are validated before any
+write, and the shared CLI ledger boundary validates every snapshot's IDs.
+If a snapshot omits any source table or column, its pending rebuild is omitted
+as a whole; retaining only the parent cannot describe a valid lineage. An
+empty managed RANGE parent is still a rebuildable tree: PostgreSQL permits
+it without children, and changing its key still requires replacement.

@@ -230,7 +230,19 @@ impl IdsFile {
             .retain(|_, column| !tables.contains(&column.table));
         let live = kept.tables.clone();
         kept.moves.retain(|uid, _| live.contains_key(uid));
-        kept.rebuilds.retain(|uid, _| live.contains_key(uid));
+        let columns = &kept.columns;
+        kept.rebuilds.retain(|_, rebuild| {
+            rebuild
+                .source
+                .tables
+                .iter()
+                .all(|(uid, name)| live.get(uid) == Some(name))
+                && rebuild
+                    .source
+                    .columns
+                    .iter()
+                    .all(|(uid, column)| columns.get(uid) == Some(column))
+        });
         kept
     }
 
