@@ -215,6 +215,12 @@ async fn read(
                     on: ObjectName::new(&m.schema, &m.name),
                     name: m.part.clone(),
                 }),
+                // Binding-only keys retain their physical metadata in `out.keys`,
+                // but supply no teardown definition (DEC-2298.5). A later walk
+                // of this node must still require its source declaration.
+                "primary" if !walk => {
+                    Holds::Unrepresentable("referenced primary key is binding evidence only".into())
+                }
                 "primary" => {
                     let key = source
                         .schema
@@ -257,7 +263,7 @@ async fn read(
             Held::Dependent(holds)
         };
         if id.catalog == "pg_class" && id.attribute == 0 && m.row_type != 0 {
-            if m.kind == "clone" && !source.schema.tables.contains_key(&table) {
+            if walk && m.kind == "clone" && !source.schema.tables.contains_key(&table) {
                 return Err(DbError::Refused(format!(
                     "{}: unmanaged partition",
                     Escaped(&m.described)
