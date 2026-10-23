@@ -10728,6 +10728,452 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
     }
 }
 
+/// A held relation can change both its name and bound without becoming
+/// another tool's partition. Only its current name is refused (DEC-2179.1).
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn baseline_catalog_evidence_names_only_the_rebound_held_partition() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").unwrap();
+    for (k, server) in [old, server()].iter().enumerate() {
+        let db = OwnDatabase::new(server, "catalog2179_rebound");
+        let d = catalog_handover_fixture(&db, k);
+        let before = scalar(db.connection(), "SELECT 'app.ev_2025'::regclass::oid::int8");
+        on_server(
+            db.connection(),
+            "ALTER TABLE app.ev DETACH PARTITION app.ev_2025;
+             ALTER TABLE app.ev_2025 RENAME TO held_now;
+             ALTER TABLE app.ev ATTACH PARTITION app.held_now
+                 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')",
+        );
+        assert_eq!(
+            before,
+            scalar(
+                db.connection(),
+                "SELECT 'app.held_now'::regclass::oid::int8"
+            )
+        );
+        let o = d.run(&["baseline", "--db", db.connection(), "--reason", "hand over"]);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        let error = stderr(&o);
+        assert!(error.contains("holds 1 partition(s)"), "{error}");
+        assert!(
+            error.contains("app.held_now is named by a drop intent"),
+            "{error}"
+        );
+        assert!(error.contains("recorded as app.ev_2025"), "{error}");
+        assert!(!error.contains("app.ev_other"), "{error}");
+        assert_eq!(
+            scalar(db.connection(), "SELECT count(*) FROM public.__pbps_state"),
+            1
+        );
+        // Once the held one is gone, the unrelated partition is handed over.
+        on_server(db.connection(), "DROP TABLE app.held_now");
+        succeeds(d.run(&["baseline", "--db", db.connection(), "--reason", "hand over"]));
+        assert!(
+            !latest_snapshot(db.connection())
+                .schema
+                .tables
+                .contains_key(&"app.ev_other".parse().unwrap())
+        );
+        assert_eq!(
+            scalar(
+                db.connection(),
+                "SELECT count(*) FROM pg_class WHERE oid = 'app.ev_other'::regclass"
+            ),
+            1
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").unwrap();
+    for (k, server) in [old, server()].iter().enumerate() {
+        let db = OwnDatabase::new(server, "catalog2179_dropped");
+        let d = catalog_handover_fixture(&db, k);
+        let before = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let oid = scalar(db.connection(), "SELECT 'app.ev_2025'::regclass::oid::int8");
+        on_server(db.connection(), "DROP TABLE app.ev_2025");
+        assert_eq!(
+            scalar(
+                db.connection(),
+                &format!("SELECT count(*) FROM pg_class WHERE oid = {oid}")
+            ),
+            0
+        );
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db.connection(),
+            "--reason",
+            "hand dropped",
+        ]));
+        assert_eq!(
+            scalar(db.connection(), "SELECT count(*) FROM public.__pbps_state"),
+            2
+        );
+        assert_eq!(
+            before,
+            std::fs::read(d.dir.join("schema.ids.json")).unwrap()
+        );
+        // Reusing the name and bound creates a different oid: the old intent
+        // still holds back no live relation, and baseline does not delete it.
+        on_server(
+            db.connection(),
+            "CREATE TABLE app.ev_2025 PARTITION OF app.ev FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        );
+        assert_ne!(
+            oid,
+            scalar(db.connection(), "SELECT 'app.ev_2025'::regclass::oid::int8")
+        );
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db.connection(),
+            "--reason",
+            "replacement is external",
+        ]));
+    }
+}
+
+/// Revoking PUBLIC's EXECUTE removes optional evidence, not the ability to
+/// deploy. Without evidence the held partition still keeps its parent refused.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        let role = format!("pbps_catalog2179_{k}_{}", std::process::id());
+        let _roles = ClusterRoles {
+            server: server.clone(),
+            names: vec![role.clone()],
+        };
+        let db = OwnDatabase::new(server, "catalog2179_unreadable");
+        on_server(
+            db.connection(),
+            &format!(
+                "CREATE ROLE {role} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+                 ALTER DATABASE \"{}\" OWNER TO {role}",
+                db.name
+            ),
+        );
+        let connection = as_role(db.connection(), &role);
+        on_server(
+            &connection,
+            "CREATE SCHEMA app;
+             CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts);
+             CREATE TABLE app.ev_2025 PARTITION OF app.ev
+                 FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+        );
+        let _execute = ControlSystemExecuteRevoked::new(db.connection());
+        let denied = try_on_server(&connection, "SELECT * FROM pg_catalog.pg_control_system()")
+            .expect_err("the non-superuser cannot read the cluster identity");
+        assert!(
+            denied.contains("permission denied for function pg_control_system"),
+            "{denied}"
+        );
+        assert_eq!(
+            text_of(
+                &connection,
+                "SELECT pg_catalog.has_function_privilege('pg_catalog.pg_control_system()', 'EXECUTE')::text"
+            ),
+            "false"
+        );
+        eprintln!(
+            "PostgreSQL {}: direct control read denied; deployment role has no EXECUTE",
+            text_of(&connection, "SHOW server_version")
+        );
+        let d = Demo::new(&format!("catalog2179-unreadable-{k}"));
+        succeeds(d.run(&["pull", "--db", &connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+        let assert_no_evidence = || {
+            assert!(latest_snapshot(&connection).baseline_evidence.is_none());
+            let recorded: serde_json::Value = serde_json::from_str(&text_of(
+                &connection,
+                "SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
+            ))
+            .unwrap();
+            assert!(recorded.get("baseline_evidence").is_none(), "{recorded}");
+        };
+        assert_no_evidence();
+        let path = d.dir.join("schema/app.ev.yml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let changed = text.replace("\ncolumns:\n", "\ncolumns:\n  note: {type: text}\n");
+        assert_ne!(text, changed);
+        std::fs::write(&path, &changed).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, &connection, &plan, &[]));
+        assert_no_evidence();
+        assert_eq!(
+            scalar(
+                &connection,
+                "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.ev'::regclass AND attname = 'note' AND NOT attisdropped"
+            ),
+            1
+        );
+        let held = changed.find("\npartitions:\n").unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\npartitions: external\n", &changed[..held]),
+        )
+        .unwrap();
+        succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+        d.commit();
+        on_server(
+            &connection,
+            "CREATE TABLE app.ev_other PARTITION OF app.ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+             ALTER TABLE app.ev DETACH PARTITION app.ev_2025;
+             ALTER TABLE app.ev ATTACH PARTITION app.ev_2025 FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')",
+        );
+        let refused = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        let error = stderr(&refused);
+        for expected in [
+            "as a partition of app.ev, whose partitions this baseline would leave external",
+            "which of them it is now cannot be told",
+            "pbps plan",
+            "pbps apply --plan",
+            "git revert <drop-intent-commit>",
+            "DEC-1852.1",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert_eq!(
+            scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+            2
+        );
+        eprintln!(
+            "PostgreSQL {}: pull, baseline, plan and apply succeed without evidence; handover keeps the parent refusal",
+            text_of(&connection, "SHOW server_version")
+        );
+    }
+}
+
+/// Dump/restore and template copy preserve ledger bytes but change database
+/// identity. Even a missing recorded oid cannot prove a drop there.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18 and pg_dump/psql or container variables"]
+fn baseline_catalog_evidence_keeps_the_parent_refusal_after_database_restore() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").unwrap();
+    for (k, server) in [old, server()].iter().enumerate() {
+        let source = OwnDatabase::new(server, "catalog2179_source");
+        let mut restored = OwnDatabase::new(server, "catalog2179_restore");
+        let copied = OwnDatabase::new(server, "catalog2179_template");
+        let d = catalog_handover_fixture(&source, k);
+        let original_oid = scalar(
+            source.connection(),
+            "SELECT 'app.ev_2025'::regclass::oid::int8",
+        );
+        // No partition has the recorded bound: the fallback must name the
+        // parent, rather than accidentally passing on a bound-based refusal.
+        on_server(source.connection(), "DROP TABLE app.ev_2025");
+        let container_var = if k == 0 {
+            "PBPS_TEST_PG_OLD_CONTAINER"
+        } else {
+            "PBPS_TEST_PG_CONTAINER"
+        };
+        dump_catalog_database(&source, &restored, container_var);
+        // A subsequent out-of-band database rename cannot restore matching
+        // evidence; the database oid remains that of the restored database.
+        let restored_oid = scalar(
+            restored.connection(),
+            "SELECT oid::int8 FROM pg_database WHERE datname=current_database()",
+        );
+        let renamed = format!("{}_renamed", restored.name);
+        on_server(
+            server,
+            &format!(
+                "ALTER DATABASE \"{}\" RENAME TO \"{renamed}\"",
+                restored.name
+            ),
+        );
+        restored.name = renamed;
+        restored.connection = with_dbname(server, &restored.name);
+        assert_eq!(
+            restored_oid,
+            scalar(
+                restored.connection(),
+                "SELECT oid::int8 FROM pg_database WHERE datname=current_database()"
+            )
+        );
+        on_server(
+            server,
+            &format!("DROP DATABASE \"{}\" WITH (FORCE)", copied.name),
+        );
+        on_server(
+            server,
+            &format!(
+                "CREATE DATABASE \"{}\" TEMPLATE \"{}\"",
+                copied.name, source.name
+            ),
+        );
+        let identity = "SELECT oid::int8 FROM pg_database WHERE datname = current_database()";
+        let source_db = scalar(source.connection(), identity);
+        let cluster = "SELECT system_identifier::text FROM pg_control_system()";
+        eprintln!(
+            "PG catalog copy measurement: source database oid={source_db}, held oid={original_oid}, cluster={}",
+            text_of(source.connection(), cluster)
+        );
+        for target in [&restored, &copied] {
+            eprintln!(
+                "target {} database oid={}",
+                target.name,
+                scalar(target.connection(), identity)
+            );
+            assert_ne!(source_db, scalar(target.connection(), identity));
+            assert_eq!(
+                text_of(source.connection(), cluster),
+                text_of(target.connection(), cluster)
+            );
+            assert_eq!(
+                scalar(
+                    target.connection(),
+                    &format!("SELECT count(*) FROM pg_class WHERE oid = {original_oid}")
+                ),
+                0
+            );
+            let o = d.run(&[
+                "baseline",
+                "--db",
+                target.connection(),
+                "--reason",
+                "hand over",
+            ]);
+            assert_ne!(code(&o), 0, "{}", stdout(&o));
+            let error = stderr(&o);
+            assert!(error.contains("as a partition of app.ev, whose partitions this baseline would leave external (app.ev_other)"), "{error}");
+            assert!(
+                error.contains("which of them it is now cannot be told"),
+                "{error}"
+            );
+            for remedy in [
+                "pbps plan",
+                "pbps apply --plan",
+                "git revert <drop-intent-commit>",
+                "DEC-1852.1",
+            ] {
+                assert!(error.contains(remedy), "{error}");
+            }
+            assert_eq!(
+                scalar(
+                    target.connection(),
+                    "SELECT count(*) FROM public.__pbps_state"
+                ),
+                1
+            );
+        }
+    }
+}
+
+fn catalog_handover_fixture(db: &OwnDatabase, k: usize) -> Demo {
+    let connection = db.connection();
+    on_server(connection,
+        "CREATE SCHEMA app;
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts);
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')");
+    let d = Demo::new(&format!("catalog2179-{}-{k}", db.name));
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    // Pin the recording side too: all managed tables, including the parent.
+    let recorded: serde_json::Value = serde_json::from_str(&text_of(
+        connection,
+        "SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
+    ))
+    .unwrap();
+    assert_eq!(recorded["version"], 31);
+    assert_eq!(
+        recorded["baseline_evidence"]["tables"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+    let evidence = &recorded["baseline_evidence"];
+    assert_eq!(
+        evidence["system_identifier"],
+        text_of(
+            connection,
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+    );
+    assert_eq!(
+        evidence["database_oid"],
+        scalar(
+            connection,
+            "SELECT oid::int8 FROM pg_database WHERE datname=current_database()"
+        )
+    );
+    for table in ["app.ev", "app.ev_2025"] {
+        assert_eq!(
+            evidence["tables"][table],
+            scalar(
+                connection,
+                &format!("SELECT '{table}'::regclass::oid::int8")
+            )
+        );
+    }
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+    std::fs::write(path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+    d.commit();
+    on_server(
+        connection,
+        "CREATE TABLE app.ev_other PARTITION OF app.ev FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+    );
+    d
+}
+
+fn dump_catalog_database(source: &OwnDatabase, target: &OwnDatabase, container_var: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let command = |program: &str, db: &OwnDatabase, input: bool| {
+        if let Some(container) = std::env::var_os(container_var) {
+            let mut command = Command::new("docker");
+            command.arg("exec");
+            if input {
+                command.arg("-i");
+            }
+            command
+                .arg(container)
+                .args([program, "-U", "postgres", "-d", &db.name]);
+            command
+        } else {
+            let mut command = Command::new(program);
+            command.arg("--dbname").arg(db.connection());
+            command
+        }
+    };
+    let dumped = command("pg_dump", source, false).output().expect("pg_dump");
+    assert!(
+        dumped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dumped.stderr)
+    );
+    let mut restore = command("psql", target, true)
+        .args(["-X", "-q", "--set=ON_ERROR_STOP=1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = restore.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || input.write_all(&dumped.stdout));
+    let output = restore.wait_with_output().unwrap();
+    fed(feeder.join().unwrap());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A pending drop intent takes a held partition's uid out of the identity
 /// file before anything runs. Under a parent now declared `partitions:
 /// external`, `baseline` would then read the partition as one of the
@@ -10765,6 +11211,11 @@ fn a_baseline_does_not_hand_over_a_rebound_partition_on(server: &str, k: usize) 
     succeeds(d.run(&["pull", "--db", &connection]));
     d.commit();
     succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    // Keep this historical parent-refusal fixture on a pre-evidence snapshot.
+    on_server(
+        &connection,
+        "UPDATE public.__pbps_state SET state_json = jsonb_set(state_json::jsonb - 'baseline_evidence', '{version}', '30')::text, state_version = 30",
+    );
     let path = d.dir.join("schema/app.ev.yml");
     let text = std::fs::read_to_string(&path).unwrap();
     let held = text.find("\npartitions:\n").unwrap();
@@ -10934,6 +11385,12 @@ fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
         &plan,
         &["--allow", "destructive"],
     ));
+    let applied = latest_snapshot(&connection);
+    assert_eq!(applied.version, 31);
+    assert!(
+        applied.baseline_evidence.is_some(),
+        "apply recorded no catalog evidence"
+    );
     assert_eq!(
         scalar(
             &connection,
@@ -21303,6 +21760,40 @@ fn pull_adopts_a_cluster_role_only_once_this_database_grants_it_something() {
 struct ClusterRoles {
     server: String,
     names: Vec<String>,
+}
+
+/// Shared with the resolver refusal test: restore PUBLIC's privilege even
+/// when a command or assertion panics, before its database is dropped.
+struct ControlSystemExecuteRevoked {
+    connection: String,
+}
+
+impl ControlSystemExecuteRevoked {
+    fn new(connection: &str) -> Self {
+        let guard = Self {
+            connection: connection.to_owned(),
+        };
+        on_server(
+            connection,
+            "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC",
+        );
+        guard
+    }
+}
+
+impl Drop for ControlSystemExecuteRevoked {
+    fn drop(&mut self) {
+        if let Err(error) = try_on_server(
+            &self.connection,
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC",
+        ) {
+            if std::thread::panicking() {
+                eprintln!("cannot restore pg_control_system EXECUTE: {error}");
+            } else {
+                panic!("cannot restore pg_control_system EXECUTE: {error}");
+            }
+        }
+    }
 }
 
 impl Drop for ClusterRoles {

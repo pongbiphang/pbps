@@ -1161,6 +1161,7 @@ mod tests {
             pbps_model::Table::default(),
         );
         let pulled = pbps_db::catalog::Pulled {
+            baseline_evidence: None,
             schema: live,
             onboarding_notices: Vec::new(),
             warnings: Vec::new(),

@@ -23,6 +23,9 @@ use crate::DbError;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pulled {
     pub schema: Schema,
+    /// Opaque recording sidecar from this catalog snapshot (DEC-2179.1).
+    /// PostgreSQL only; never an input to schema/identity comparison.
+    pub baseline_evidence: Option<pbps_model::baseline_evidence::BaselineEvidence>,
     /// The connected database's default collation, where the engine's model
     /// has column collations (#1175). A column under it is read back with no
     /// collation, so a declaration naming it has to be compared as naming

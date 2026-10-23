@@ -44,6 +44,56 @@ use crate::introspect::{
     assemble,
 };
 
+/// Complete catalog evidence for one baseline refusal, never schema identity.
+/// One statement keeps the database identity and every relation's existence
+/// together. Include unsupported and non-table relations: present is not absent.
+pub async fn baseline_catalog(
+    conn: &mut Conn,
+) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
+    fn required<'a, T: pbps_db::FromColumn<'a>>(row: &'a Row, name: &str) -> Result<T, DbError> {
+        row.try_get(name)?
+            .ok_or_else(|| DbError::BadRow(format!("baseline catalog returned NULL {name}")))
+    }
+    let identity = baseline_identity_query(conn).await?;
+    let rows = conn
+        .query(&format!(
+            "WITH identity AS MATERIALIZED ({identity})
+         SELECT i.system_identifier, i.database_oid, c.oid::int8 AS oid,
+         n.nspname::text AS schema_name, c.relname::text AS name,
+         CASE WHEN c.relispartition THEN
+           (SELECT h.inhparent::int8 FROM pg_catalog.pg_inherits h WHERE h.inhrelid = c.oid)
+         END AS parent_oid
+         FROM identity i CROSS JOIN pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+        ))
+        .await?;
+    let first = rows
+        .first()
+        .ok_or_else(|| DbError::BadRow("baseline catalog identity is unreadable".into()))?;
+    let database_oid = required::<i64>(first, "database_oid")?;
+    let Some(system_identifier) = first.try_get::<&str>("system_identifier")? else {
+        return Ok(None);
+    };
+    let mut relations = Vec::new();
+    for row in &rows {
+        relations.push((
+            required::<i64>(row, "oid")?,
+            TableName::new(
+                required::<&str>(row, "schema_name")?,
+                required::<&str>(row, "name")?,
+            ),
+            row.try_get::<i64>("parent_oid")?,
+        ));
+    }
+    Ok(Some(
+        pbps_model::baseline_evidence::BaselineCatalog::from_postgres(
+            system_identifier.to_owned(),
+            database_oid,
+            relations,
+        ),
+    ))
+}
+
 /// The emitter quotes both parts of every table name. PostgreSQL compares
 /// those identifiers exactly, independently of text-column collations.
 pub fn matching_table_names(wanted: &[TableName], observed: &[TableName]) -> Vec<TableName> {
@@ -1175,6 +1225,7 @@ async fn introspect_in(conn: &mut Conn, scope: Scope) -> Result<Pulled, DbError>
         .map_err(schema_changed_underneath)?;
 
     let mut pulled = assemble(&raw.0);
+    pulled.baseline_evidence = raw.3.map(|evidence| evidence.for_managed(&pulled.schema));
     // Prepended: a table the model cannot hold at all is the thing a reader
     // most needs to see, and it is not about any table in the schema.
     //
@@ -1198,6 +1249,7 @@ type CatalogRead = (
     RawCatalog,
     Vec<Limitation>,
     Vec<pbps_db::catalog::UnmanagedModule>,
+    Option<pbps_model::baseline_evidence::BaselineEvidence>,
 );
 
 type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
@@ -1211,7 +1263,32 @@ type CatalogBatch = BTreeMap<String, Vec<serde_json::Value>>;
 /// grantor a `GRANT` records and the one a `REVOKE` can match.
 const SESSION: &str = "SELECT current_user::text AS role";
 
-fn batch_query() -> String {
+// PostgreSQL checks EXECUTE at plan initialization, even inside an untaken
+// CASE branch (measured on 16.15 and 18.6, ADR-0018). Optional evidence must
+// omit the call entirely when PUBLIC's privilege has been revoked. A revoke
+// after this check remains an engine error, never absent evidence.
+async fn baseline_identity_query(conn: &mut Conn) -> Result<String, DbError> {
+    let rows = conn
+        .query(
+            "SELECT pg_catalog.has_function_privilege(\
+             'pg_catalog.pg_control_system()', 'EXECUTE') AS can_read",
+        )
+        .await?;
+    let [row] = rows.as_slice() else {
+        return Err(missing("one baseline identity privilege row"));
+    };
+    let system_identifier = if flag(row, "can_read")? {
+        "(SELECT s.system_identifier::text FROM pg_catalog.pg_control_system() s)"
+    } else {
+        "NULL::text"
+    };
+    Ok(format!(
+        "SELECT {system_identifier} AS system_identifier, d.oid::int8 AS database_oid
+         FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()"
+    ))
+}
+
+fn batch_query(identity: &str) -> String {
     // Aggregation must preserve semantic position order: sorting the JSON
     // itself would reorder columns and routine arguments (pinned live).
     let parts = [
@@ -1233,6 +1310,7 @@ fn batch_query() -> String {
         ("default_acls", DEFAULT_ACLS.to_owned(), "grantor, in_schema, objtype"),
         ("unheld_modules", unheld_modules_query(), "schema_name, name"),
         ("session", SESSION.to_owned(), "role"),
+        ("baseline_identity", identity.to_owned(), "database_oid"),
         ("owners", owners_query(), "schema_name, object_name, routine_oid, kind"),
     ]
     .into_iter()
@@ -1302,8 +1380,9 @@ fn policy_roles(row: &serde_json::Value) -> Result<pbps_model::PolicyRoles, DbEr
 }
 
 async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
+    let identity = baseline_identity_query(conn).await?;
     let mut batch = CatalogBatch::new();
-    for row in conn.query(&batch_query()).await? {
+    for row in conn.query(&batch_query(&identity)).await? {
         let part = text(&row, "part")?;
         let payload = text(&row, "payload")?;
         let rows = serde_json::from_str(&payload)
@@ -1823,7 +1902,23 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         });
         warnings.push(Limitation { target, detail });
     }
-    Ok((raw, warnings, unmanaged_modules))
+    let identity = batch
+        .get("baseline_identity")
+        .ok_or_else(|| missing("baseline_identity"))?;
+    if identity.len() != 1 {
+        return Err(missing("one baseline database identity"));
+    }
+    let database_oid = number(&identity[0], "database_oid")?;
+    let evidence = optional_text(&identity[0], "system_identifier")?.map(|system_identifier| {
+        pbps_model::baseline_evidence::BaselineEvidence::from_postgres(
+            system_identifier,
+            database_oid,
+            raw.tables
+                .iter()
+                .map(|table| (TableName::new(&table.schema, &table.name), table.oid)),
+        )
+    });
+    Ok((raw, warnings, unmanaged_modules, evidence))
 }
 
 /// The principals that could hold a grant in this database (ADR-0005).
@@ -4411,10 +4506,11 @@ mod tests {
         // Pin the engine's sharing, rather than a timing threshold affected by
         // the host's load. Six in-scope partition tables, with ordinary,
         // unsupported, extension, ledger and temporary tables all excluded.
+        let identity = baseline_identity_query(&mut conn).await.unwrap();
         let plan = conn
             .query(&format!(
                 "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
-                batch_query()
+                batch_query(&identity)
             ))
             .await
             .unwrap();
@@ -4660,7 +4756,7 @@ mod tests {
             CREATE TRIGGER audit BEFORE INSERT ON app.forced FOR EACH ROW EXECUTE FUNCTION app.tg();
             CREATE TRIGGER audit BEFORE INSERT ON app.disabled FOR EACH ROW EXECUTE FUNCTION app.tg();
             SET LOCAL search_path=app;")).await.unwrap();
-        let (raw, _, _) = read_all(&mut conn).await.unwrap();
+        let (raw, _, _, _) = read_all(&mut conn).await.unwrap();
         assert_eq!(raw.row_policies.len(), 6, "{raw:#?}");
         let policy = |name| {
             &raw.row_policies
@@ -4874,7 +4970,7 @@ mod tests {
                 "types".into(),
                 vec![good_enum.clone(), bad, good_domain.clone()],
             );
-            let (raw, limitations, _) = decode_batch(&batch).unwrap();
+            let (raw, limitations, _, _) = decode_batch(&batch).unwrap();
             assert_eq!(raw.types.len(), 2, "{reason}");
             assert!(raw.types.contains_key(&"app.mood".parse().unwrap()));
             assert!(matches!(
@@ -4967,12 +5063,49 @@ mod tests {
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }
-        // The one part that is never empty: `current_user` always answers.
+        batch.insert(
+            "baseline_identity".to_owned(),
+            vec![serde_json::json!({"system_identifier": "cluster", "database_oid": 42})],
+        );
+        // The session part is never empty: `current_user` always answers.
         batch.insert(
             "session".to_owned(),
             vec![serde_json::json!({"role": "deploy"})],
         );
         batch
+    }
+
+    #[test]
+    fn a_null_cluster_identifier_supplies_no_baseline_evidence() {
+        let mut batch = empty_catalog_batch();
+        assert!(decode_batch(&batch).unwrap().3.is_some());
+        batch.insert(
+            "baseline_identity".into(),
+            vec![serde_json::json!({"system_identifier": null, "database_oid": 42})],
+        );
+        assert!(decode_batch(&batch).unwrap().3.is_none());
+    }
+
+    #[test]
+    fn missing_or_malformed_baseline_identity_is_never_absent_evidence() {
+        let mut batch = empty_catalog_batch();
+        assert!(decode_batch(&batch).is_ok());
+        for bad in [
+            vec![],
+            vec![serde_json::json!({})],
+            vec![serde_json::json!({"database_oid": 42})],
+            vec![serde_json::json!({"system_identifier": 42, "database_oid": 42})],
+            vec![serde_json::json!({"system_identifier": "cluster", "database_oid": "unknown"})],
+            vec![serde_json::json!({"system_identifier": null})],
+            vec![serde_json::json!({"system_identifier": null, "database_oid": "unknown"})],
+            vec![serde_json::json!({"system_identifier": null, "database_oid": null})],
+            vec![serde_json::json!({"system_identifier": "cluster", "database_oid": 42}); 2],
+        ] {
+            batch.insert("baseline_identity".into(), bad);
+            assert!(decode_batch(&batch).is_err());
+        }
+        batch.remove("baseline_identity");
+        assert!(decode_batch(&batch).is_err());
     }
 
     fn row_security_table_row() -> serde_json::Value {
@@ -5004,7 +5137,7 @@ mod tests {
             let mut row = row_security_policy_row();
             row["command"] = command.into();
             batch.insert("policies".into(), vec![row]);
-            let (raw, _, _) = decode_batch(&batch).unwrap();
+            let (raw, _, _, _) = decode_batch(&batch).unwrap();
             assert_eq!(raw.row_policies[0].policy.command, expected);
             assert_eq!(
                 raw.row_policies[0].policy.to,
@@ -5024,7 +5157,7 @@ mod tests {
         row["has_check"] = true.into();
         row["check_expression"] = row["using_expression"].clone();
         batch.insert("policies".into(), vec![row]);
-        let (raw, _, _) = decode_batch(&batch).unwrap();
+        let (raw, _, _, _) = decode_batch(&batch).unwrap();
         let policy = &raw.row_policies[0].policy;
         assert!(policy.restrictive);
         assert_eq!(

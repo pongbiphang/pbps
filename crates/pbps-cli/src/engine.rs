@@ -268,6 +268,16 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
     }
 }
 
+/// The opaque evidence reader is reachable only through this connected seam.
+pub async fn baseline_catalog(
+    conn: &mut Conn,
+) -> Result<Option<pbps_model::baseline_evidence::BaselineCatalog>, DbError> {
+    match conn.driver() {
+        Driver::Mssql => Ok(None),
+        Driver::Postgres => pbps_pg::catalog::baseline_catalog(conn).await,
+    }
+}
+
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::state::record(conn, snapshot).await,

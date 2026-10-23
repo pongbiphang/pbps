@@ -2394,6 +2394,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     }
 
     Pulled {
+        baseline_evidence: None,
         database_collation: Some(raw.database_collation.clone()),
         schema,
         onboarding_notices,

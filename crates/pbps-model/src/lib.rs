@@ -23,6 +23,7 @@
 //! layout of `CREATE TABLE` — an order equality ignores, and which
 //! [`state_checksum`] therefore sorts away before hashing (DECISIONS 238).
 
+pub mod baseline_evidence;
 pub mod change;
 mod column_wire;
 pub mod data;

@@ -112,10 +112,10 @@ pub fn published(server: &str) {
         connection,
         &format!(
             "CREATE ROLE {reader} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
-             GRANT pg_read_all_data TO {reader}; \
-             REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC"
+             GRANT pg_read_all_data TO {reader}"
         ),
     );
+    let execute = ControlSystemExecuteRevoked::new(connection);
     let limited = as_role(connection, &reader);
     let as_reader = Targets {
         target: &limited,
@@ -127,10 +127,7 @@ pub fn published(server: &str) {
     // Negative: without `--staged` the same role stops at the identity read,
     // so the gate above was reached before it.
     let unread = run(&d, &plan_args(&artifact, &sql), Some(&as_reader));
-    on_server(
-        connection,
-        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC",
-    );
+    drop(execute);
     for (output, id) in [
         (&gated, "resolver.unresolved"),
         (&unread, "resolver.identity"),

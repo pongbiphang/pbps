@@ -70,6 +70,8 @@ machinery and never appear in the ids file (see 4.5).
 
 ### 1.3 Explicit non-goals
 
+Identity remains the uid recorded in git; [ADR-0018](ADR-0018-catalog-identity-evidence.md) permits opaque PostgreSQL catalog evidence only to narrow the pending-partition-drop baseline refusal.
+
 - **Data transformation (backfill) is not automated.** How data should be moved is
   a business decision and cannot be derived from a structural diff. When it is
   needed, a human runs the SQL and then re-baselines with `pbps baseline`.
