@@ -15,7 +15,7 @@ pub mod schema_diff;
 
 pub use identity::{
     Blocker, Context, RenameSide, RenameSource, Resolution, intent_is_absorbed, resolve,
-    resolve_with_annotations,
+    resolve_pulled, resolve_with_annotations,
 };
 pub use managed::{Scoped, external_parents, observed_ids, own_parts, scope};
 pub use schema_diff::{

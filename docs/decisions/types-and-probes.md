@@ -2700,8 +2700,11 @@ planning checks type definitions before reference prerequisites, so a missing
 declared enum does not become merely a missing column-type error. An equal
 definition plans no operation. A retained type uid without a declaration also
 refuses: a manual drop followed by a baseline must not let an empty plan
-record an identity the database does not hold. Newly managed live types enter the pinned
-baseline by their actual definition; already recorded ones still participate
+record an identity the database does not hold. A recorded type missing from a
+pull's read is a named blocker before any project write, with a catalog
+limitation reported as unrepresentable and its reason rather than as absence.
+Newly managed live types enter the pinned baseline by their actual definition;
+already recorded ones still participate
 in drift and read-back movement checks. An undeclared, unrecorded live type
 stays unmanaged under the existing ignore/warn/error policy. Offline planning
 can compare a git/file baseline, but cannot obtain live proof; a declared type

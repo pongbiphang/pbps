@@ -137,6 +137,12 @@ pub enum Blocker {
     /// whose parent declares a DEFAULT partition, so no rows can ever move
     /// into it (#1788, #1632).
     MoveNotBesideDefault { table: TableName },
+    /// Pull cannot retire a recorded type until its drop lifecycle exists.
+    MissingType {
+        name: pbps_model::TypeRef,
+        /// A catalog omission is not evidence that the type is gone.
+        unrepresentable: Option<String>,
+    },
 }
 
 /// The half of a rename that two intents fought over.
@@ -195,6 +201,31 @@ pub fn resolve(
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
     resolve_with_provenance(declared, ids, intents, 0, ctx)
+}
+
+/// Resolves a pulled schema without publishing an orphaned type identity.
+/// File-based planning keeps its retained-identity lifecycle check in the
+/// differ; pull must refuse before replacing any declarations (DEC-1635.2).
+/// Catalog readers supply neutral omission facts, keeping this layer pure.
+pub fn resolve_pulled(
+    declared: &Schema,
+    ids: &IdsFile,
+    unrepresentable: &BTreeMap<pbps_model::TypeRef, String>,
+    ctx: &Context,
+) -> Result<Resolution, Vec<Blocker>> {
+    let blockers: Vec<_> = ids
+        .types
+        .values()
+        .filter(|name| !declared.types.contains_key(*name))
+        .map(|name| Blocker::MissingType {
+            name: name.clone(),
+            unrepresentable: unrepresentable.get(name).cloned(),
+        })
+        .collect();
+    if !blockers.is_empty() {
+        return Err(blockers);
+    }
+    resolve(declared, ids, &[], ctx)
 }
 
 /// Resolve intents while preserving which leading entries came from declaration
@@ -452,6 +483,7 @@ fn resolve_with_provenance(
                 | Blocker::DropRoleNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
+                | Blocker::MissingType { .. }
                 | Blocker::MoveNotBesideDefault { .. } => None,
             };
             if let Some(table) = table
@@ -1626,6 +1658,75 @@ mod tests {
             operator: "test".into(),
             today: "2026-09-11".into(),
         }
+    }
+
+    #[test]
+    fn a_pulled_type_identity_requires_a_readable_definition() {
+        use pbps_model::ManagedType;
+        let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+        let uid: Uid = "y_000001".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.types.insert(uid.clone(), name.clone());
+        let mut declared = Schema::default();
+        assert_eq!(
+            resolve_pulled(&declared, &ids, &BTreeMap::new(), &ctx()).unwrap_err(),
+            vec![Blocker::MissingType {
+                name: name.clone(),
+                unrepresentable: None,
+            }]
+        );
+        let why = "domain base app._mood cannot be represented";
+        let limitations = [(name.clone(), why.to_owned())].into();
+        assert!(resolve_pulled(&declared, &IdsFile::default(), &limitations, &ctx()).is_ok());
+        assert_eq!(
+            resolve_pulled(&declared, &ids, &limitations, &ctx()).unwrap_err(),
+            vec![Blocker::MissingType {
+                name: name.clone(),
+                unrepresentable: Some(why.into()),
+            }]
+        );
+        // File-based planning still reaches the differ's single retained-uid
+        // lifecycle refusal instead of adding a second diagnosis here.
+        assert_eq!(resolve(&declared, &ids, &[], &ctx()).unwrap().ids, ids);
+        declared.types.insert(
+            name.clone(),
+            ManagedType::Enum {
+                values: vec!["ok".into()],
+            },
+        );
+        let resolved = resolve_pulled(&declared, &ids, &BTreeMap::new(), &ctx()).unwrap();
+        assert_eq!(resolved.ids, ids);
+        assert_eq!(resolved.ids.type_uid(&name), Some(&uid));
+        let fresh =
+            resolve_pulled(&declared, &IdsFile::default(), &BTreeMap::new(), &ctx()).unwrap();
+        assert!(fresh.ids.type_uid(&name).is_some());
+    }
+
+    #[test]
+    fn missing_pulled_tables_and_roles_still_require_drop_intent() {
+        let table = "app.gone".parse().unwrap();
+        let role = pbps_model::RoleName::new("reader");
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_000001".parse().unwrap(), table);
+        ids.roles.insert("r_000001".parse().unwrap(), role);
+        let schema = Schema::default();
+        let blockers = resolve_pulled(&schema, &ids, &BTreeMap::new(), &ctx()).unwrap_err();
+        assert_eq!(blockers, resolve(&schema, &ids, &[], &ctx()).unwrap_err());
+        assert!(
+            blockers
+                .iter()
+                .any(|b| matches!(b, Blocker::DropTableNeedsReason { .. }))
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|b| matches!(b, Blocker::DropRoleNeedsReason { .. }))
+        );
+        assert!(
+            !blockers
+                .iter()
+                .any(|b| matches!(b, Blocker::MissingType { .. }))
+        );
     }
 
     /// Each table's columns are resolved against its own recorded columns,

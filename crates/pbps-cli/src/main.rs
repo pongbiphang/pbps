@@ -1400,6 +1400,9 @@ fn cmd_pull(
         "pull cannot preserve identities; restore the identity file from git, or deliberately \
          remove it only when starting a new adoption",
     )?;
+    let mut would_overwrite = false;
+    let overwrite_message = "this project already has declarations; pull would overwrite them.\n\
+         Re-run with --force if that is what you want, or pull into a fresh project and merge.";
     if !force {
         // A listing that *failed* is not an empty directory. This guard is the
         // only thing standing between an unforced `pull` and the user's
@@ -1435,9 +1438,12 @@ fn cmd_pull(
                 || !ids.tombstones.is_empty()
         });
         if !existing.is_empty() || identities_exist {
-            bail!(
-                "this project already has declarations; pull would overwrite them.\n                 Re-run with --force if that is what you want, or pull into a fresh project and merge."
-            );
+            // Recorded types need the catalog's named absence/omission refusal
+            // even on an unforced pull, before the generic overwrite advice.
+            if existing_ids.as_ref().is_none_or(|ids| ids.types.is_empty()) {
+                bail!("{overwrite_message}");
+            }
+            would_overwrite = true;
         }
     }
 
@@ -1588,7 +1594,29 @@ fn cmd_pull(
     }
 
     let ids = existing_ids.clone().unwrap_or_default();
-    let resolution = pbps_diff::resolve(&pulled.schema, &ids, &[], &context(project.root()));
+    let type_limitations = ids
+        .types
+        .values()
+        .filter_map(|name| {
+            let details: Vec<_> = pulled
+                .limitations
+                .iter()
+                .filter(|limitation| {
+                    matches!(&limitation.target,
+                        pbps_db::catalog::LimitationTarget::Type(target)
+                            if target.schema == name.schema() && target.name == name.name())
+                })
+                .map(|limitation| limitation.detail.as_str())
+                .collect();
+            (!details.is_empty()).then(|| (name.clone(), details.join("; ")))
+        })
+        .collect();
+    let resolution = pbps_diff::resolve_pulled(
+        &pulled.schema,
+        &ids,
+        &type_limitations,
+        &context(project.root()),
+    );
     if let Err(blockers) = &resolution {
         // Only missing human intent permits publishing declarations. An
         // unrepresentable name must still fail before writing anything (#108).
@@ -1608,6 +1636,10 @@ fn cmd_pull(
                 report::blockers(blockers)
             );
         }
+    }
+
+    if would_overwrite {
+        bail!("{overwrite_message}");
     }
 
     // Staged first, outside the project, and loaded back through the checks

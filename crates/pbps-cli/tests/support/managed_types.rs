@@ -4,6 +4,120 @@ use pbps_model::{ManagedType, TableName};
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn missing_managed_types_refuse_pull_before_any_project_write() {
+    fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.insert(path.clone(), None);
+                files.extend(tree(&path));
+            } else {
+                files.insert(path.clone(), Some(std::fs::read(&path).unwrap()));
+            }
+        }
+        files
+    }
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "type_missing1635");
+        let db = own.connection();
+        let major = scalar(
+            db,
+            "SELECT current_setting('server_version_num')::bigint / 10000",
+        );
+        for (case, change, unrepresentable) in [
+            ("dropped", "DROP TYPE app.mood", None),
+            (
+                "renamed",
+                "ALTER TYPE app.mood RENAME TO _mood",
+                Some("app._mood"),
+            ),
+            (
+                "unrepresentable",
+                "DROP TYPE app.mood; CREATE TYPE app._base AS ENUM ('ok');
+                 CREATE DOMAIN app.mood AS app._base",
+                Some("app._base"),
+            ),
+        ] {
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('ok');
+                 CREATE TABLE app.t (id integer)",
+            );
+            let d = Demo::new(&format!("type-missing1635-{case}"));
+            succeeds(d.run(&["pull", "--db", db]));
+            let before = tree(&d.dir);
+            on_server(db, change);
+            // An unrelated new table would write a new file, while the changed
+            // table and lost type would overwrite and remove existing files.
+            on_server(
+                db,
+                "CREATE TABLE app.new (id integer); ALTER TABLE app.t ADD added integer",
+            );
+            for force in [true, false] {
+                let mut args = vec!["pull", "--db", db];
+                if force {
+                    args.push("--force");
+                }
+                let out = d.run(&args);
+                let message = stderr(&out);
+                assert_ne!(code(&out), 0, "{case}: {}", stdout(&out));
+                assert!(
+                    message.contains("app.mood")
+                        && message.contains("type lifecycle arrives in later slices of #1635"),
+                    "{case}, force={force}: {message}"
+                );
+                if let Some(name) = unrepresentable {
+                    assert!(message.contains(name), "{message}");
+                    assert!(message.contains("cannot be represented"), "{message}");
+                }
+                if case == "unrepresentable" {
+                    assert!(
+                        message.lines().any(|line| {
+                            line.contains("type `app.mood`")
+                                && line.contains("is unrepresentable")
+                                && line.contains("_base")
+                        }),
+                        "{message}"
+                    );
+                    assert!(
+                        !message.contains("is absent from the pulled schema"),
+                        "{message}"
+                    );
+                }
+                assert_eq!(
+                    tree(&d.dir),
+                    before,
+                    "{case}, force={force}: changed project tree"
+                );
+                eprintln!("PostgreSQL {major}: {case}, force={force}: {message}");
+            }
+            on_server(db, "DROP SCHEMA app CASCADE");
+            // A readable definition at the same name still preserves its uid.
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('ok'); CREATE TABLE app.t (id integer)",
+            );
+            let out = d.run(&["pull", "--db", db]);
+            assert_ne!(code(&out), 0);
+            assert!(
+                stderr(&out).contains("pull would overwrite"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(tree(&d.dir), before);
+            succeeds(d.run(&["pull", "--db", db, "--force"]));
+            assert_eq!(tree(&d.dir), before);
+            on_server(db, "DROP SCHEMA app CASCADE");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn unrepresentable_types_leave_unrelated_plans_usable_and_declared_dependents_refused() {
     use pbps_db::catalog::LimitationTarget;
     for server in [
@@ -410,6 +524,14 @@ fn pulled_type_files_converge_and_each_type_change_is_refused_without_sql() {
         assert!(
             stderr(&out).contains("app.mood")
                 && stderr(&out).contains("type lifecycle arrives in later slices"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(
+            stderr(&out)
+                .matches("type lifecycle arrives in later slices")
+                .count(),
+            1,
             "{}",
             stderr(&out)
         );
