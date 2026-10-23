@@ -625,7 +625,12 @@ compared, not passed.
 
 - **What is read:**
   - the object: `sys.objects`, `sys.sql_modules`' flags and the
-    `OBJECTPROPERTYEX` properties the engine reports for its type;
+    `OBJECTPROPERTYEX` properties in the named SQL Server 17 manifest
+    `capture::OBJECT_PROPERTIES`. Every manifest name has an explicit
+    disposition. The API cannot enumerate future property names; qualifying
+    another engine version requires checking this manifest against its
+    documented properties. NULL is retained as a value for non-applicability;
+    missing rows, unreadable metadata and failed queries refuse;
   - its columns: a table's, a view's and a table-valued function's result
     columns, from `sys.columns`;
   - its parameters (`sys.parameters`);
@@ -638,8 +643,19 @@ compared, not passed.
   - a module's definition, since a view may be staged as a shape view of
     typed NULLs;
   - column defaults and CHECK bodies;
-  - foreign keys, non-unique indexes and triggers: no creation in another
-    object reads them;
+  - noncascading foreign keys, non-unique indexes and ordinary triggers;
+    their redundant Has/Count/ID properties are named individually in the
+    manifest, including summaries that mix retained and skipped children.
+    Unique keys and relevant cascade/trigger prerequisites are compared
+    separately; a prefix never selects properties to skip;
+  - module text in both normalized properties and `sys.sql_modules`, and
+    default references in column/type rows as well as the skipped children;
+  - `Cardinality`, `TableIsLockedOnBulkLoad` and `sys.tables.lock_on_bulk_load`;
+    and the progress counters `TableFullTextMergeStatus`,
+    `TableFulltextDocsProcessed`, `TableFulltextFailCount`,
+    `TableFulltextItemCount`, `TableFulltextPendingChanges` and
+    `TableFulltextPopulateStatus`. Fulltext configuration remains compared;
+    no build-specific expected-value table supplies a baseline;
   - ids, dates and owner names, which differ on scratch by construction,
     as PostgreSQL drops role names.
 - **Owner equality is compared.** Unlike PostgreSQL, SQL Server reads
@@ -669,8 +685,37 @@ missed each in turn.
 | A column's type, a user type by `schema.name` | A schema-bound view and a computed column read it at creation |
 | Whether two objects share an effective owner | A `PERSISTED` computed column refuses a function owned by another principal than the table (4988) [`a_persisted_column_needs_its_functions_owner_to_be_the_tables`] |
 
+**Cascade legality remains the engine's decision.** For each managed DELETE
+or UPDATE CASCADE edge, traverse external CASCADE edges in both directions to
+include the connected closure, including external-to-external paths. Preserve
+column mappings, keys, exact actions and effective-owner equality. Include the
+INSTEAD OF event metadata on a referencing table that blocks the matching
+cascade (1787); a trigger on the parent or for another action is not a barrier.
+Noncascading edges and disconnected action paths add no barrier. The staged
+comparison refuses a missing or different prerequisite before accepting shapes;
+SQL Server itself decides multiple-path legality (1785).
+
 A three-part or four-part reference refuses by name: the externals file stages
-objects in one database and cannot stand in for another.
+objects in one database and cannot stand in for another. The single named
+multipart check reads `sys.sql_expression_dependencies` before interpreting
+referenced IDs, including qualifiers naming the current database and deferred
+missing user objects. For synonyms it resolves `sys.synonyms.base_object_name`
+with `PARSENAME`; a database or server component refuses even without a
+dependency row. No source parser is used (DEC-2268.1).
+
+**Accepted residual:** SQL Server does not record references to system objects
+in another database's `sys` schema, such as `master.sys.objects`. Build equality
+makes those system objects identical on the qualified instances. User objects,
+including `msdb.dbo.sysjobs`, are recorded and refused. Dynamic SQL is not bound
+at creation and remains outside this static dependency check.
+
+`capture::Staged` has private construction: success accounts for every supplied
+post-file inventory root and accepts the corresponding target shapes. Its
+`changed_since` check compares those accepted shapes against the final target
+capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
+the canonical `mssql-capture-v3` shape and its sealed prerequisites, so later
+rechecks do not lose facts the staged comparison used. The CLI still stops at
+the externals boundary; file execution and rendering are #2269.
 
 The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
 

@@ -317,6 +317,7 @@ impl Builder<'_> {
                 "a numbered procedure group is not read by the capture",
             ));
         }
+        super::references::require_local(catalog, id, &me)?;
         let mut properties = BTreeMap::new();
         properties.insert("type".into(), json!(object.kind));
         properties.insert("owner".into(), json!(self.index.owner(object)?));
@@ -331,6 +332,51 @@ impl Builder<'_> {
             None => None,
         };
         properties.insert("parent".into(), json!(parent));
+        if let Some(reported) = catalog.object_properties.get(&id) {
+            use super::object_properties::{PropertyDisposition as P, property_disposition};
+            let mut reported = reported.clone();
+            for (name, value) in &mut reported {
+                if value.is_null() {
+                    continue;
+                }
+                *value = match property_disposition(name) {
+                    // Preserve this component's observation. Substituting the
+                    // earlier object row would hide a change between reads.
+                    Some(P::Owner) => {
+                        json!(self.index.principal(value.as_i64().ok_or_else(|| {
+                            Uncovered::object(&me, "an owner property is not an id")
+                        })?)?)
+                    }
+                    Some(P::Schema) => {
+                        json!(self.index.schema_identity(value.as_i64().ok_or_else(|| {
+                            Uncovered::object(&me, "a schema property is not an id")
+                        })?)?)
+                    }
+                    Some(P::FulltextCatalog) if value.as_i64() != Some(0) => catalog
+                        .fulltext
+                        .get(&(
+                            "catalog",
+                            value.as_i64().ok_or_else(|| {
+                                Uncovered::object(&me, "a fulltext catalog property is not an id")
+                            })?,
+                        ))
+                        .cloned()
+                        .ok_or_else(|| {
+                            Uncovered::object(&me, "a fulltext catalog property is unreadable")
+                        })?,
+                    Some(P::Column) if value.as_i64() != Some(0) => json!(self.index.column(
+                        object,
+                        value.as_i64().ok_or_else(|| Uncovered::object(
+                            &me,
+                            "a fulltext key column property is not an id"
+                        ))?
+                    )?),
+                    _ => value.clone(),
+                };
+            }
+            properties.insert("OBJECTPROPERTYEX".into(), json!(reported));
+        }
+
         if let Some(module) = catalog.modules.get(&id) {
             // `WITH ENCRYPTION` hides the text from every reader, `sa`
             // included: an unreadable definition is not an empty one.
@@ -537,12 +583,6 @@ impl Builder<'_> {
                 });
         }
         for dependency in catalog.dependencies.iter().filter(|d| d.referencing == id) {
-            if dependency.server.is_some() || dependency.database.is_some() {
-                return Err(Uncovered::object(
-                    &me,
-                    "a reference names an object in another database or server",
-                ));
-            }
             if dependency.caller_dependent {
                 self.result
                     .runtime
@@ -750,6 +790,13 @@ impl Builder<'_> {
             .collect();
         for child in children {
             self.enqueue(child);
+        }
+        // Cascade legality reads paths in both directions, including a chain
+        // through external tables no managed table references directly.
+        for (&key, fk) in &catalog.foreign_keys {
+            if fk.referenced == id && (fk.on_delete == "CASCADE" || fk.on_update == "CASCADE") {
+                self.enqueue(key);
+            }
         }
         properties.extend(self.whole.object(id, &self.index)?);
         self.follow_referenced();

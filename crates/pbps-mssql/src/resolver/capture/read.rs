@@ -207,10 +207,12 @@ pub(super) struct Catalog {
     pub principals: Vec<Principal>,
     pub objects: Vec<Object>,
     pub modules: BTreeMap<i64, Module>,
+    pub object_properties: BTreeMap<i64, BTreeMap<String, serde_json::Value>>,
     pub columns: Vec<Column>,
     pub parameters: Vec<Parameter>,
     pub types: Vec<Type>,
     pub synonyms: BTreeMap<i64, String>,
+    pub qualified_synonyms: BTreeSet<i64>,
     /// Each DML trigger's state, by its object id: whether it is disabled,
     /// which leaves its text and stops it firing, and whether it runs
     /// instead of its statement.
@@ -427,7 +429,8 @@ const TABLE_TYPE_KEYS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS 
     WHERE i.is_primary_key = 1 OR i.is_unique_constraint = 1;";
 
 const SYNONYMS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
-    CONVERT(nvarchar(1035), base_object_name) AS base FROM sys.synonyms;";
+    CONVERT(nvarchar(1035), base_object_name) AS base, \
+    PARSENAME(base_object_name,3) AS [database], PARSENAME(base_object_name,4) AS server FROM sys.synonyms;";
 
 // A DEFAULT is never disabled or untrusted; a CHECK can be both, with its
 // text unchanged (`ALTER TABLE ... NOCHECK CONSTRAINT`).
@@ -1215,9 +1218,13 @@ pub(super) async fn read(
             });
     }
     let mut synonyms = BTreeMap::new();
+    let mut qualified_synonyms = BTreeSet::new();
     for row in rows(conn, SYNONYMS).await? {
         let row = Text(&row);
         synonyms.insert(row.number("id")?, row.required("base")?);
+        if row.optional("database")?.is_some() || row.optional("server")?.is_some() {
+            qualified_synonyms.insert(row.number("id")?);
+        }
     }
     let mut constraints = BTreeMap::new();
     for row in rows(conn, CONSTRAINTS).await? {
@@ -1317,10 +1324,12 @@ pub(super) async fn read(
         principals,
         objects,
         modules,
+        object_properties: BTreeMap::new(),
         columns,
         parameters,
         types,
         synonyms,
+        qualified_synonyms,
         triggers,
         keys,
         unique_indexes,

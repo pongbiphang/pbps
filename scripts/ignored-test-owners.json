@@ -1966,7 +1966,27 @@
         "deployer2267::equivalent_owner_role_keeps_acl_principals_and_still_detects_extra_grants",
         "deployer2267::non_equivalent_owner_role_refuses_with_matching_acl_rows",
         "deployer2267::different_effective_owner_refuses",
-        "deployer2267::ownership_is_replayed_before_object_acl"
+        "deployer2267::ownership_is_replayed_before_object_acl",
+        "staged2268::external_nullability_and_type_differences_refuse",
+        "staged2268::five_hundred_rows_do_not_change_external_shape",
+        "staged2268::skipped_child_aggregate_flags_do_not_change_shape",
+        "staged2268::bulk_lock_option_is_skipped_in_every_representation",
+        "staged2268::unknown_scalar_catalog_property_is_compared",
+        "staged2268::module_body_can_differ_but_compile_flags_cannot",
+        "staged2268::determinism_precision_and_data_access_are_compared",
+        "staged2268::null_property_is_not_an_absent_object",
+        "staged2268::staged_external_change_after_acceptance_is_detected",
+        "staged2268::qualified_user_object_references_refuse",
+        "staged2268::qualified_synonym_refuses",
+        "staged2268::two_part_reference_is_accepted",
+        "staged2268::every_created_root_and_managed_overlap_is_accounted_for",
+        "staged2268::external_cascade_closure_preserves_multiple_path_refusal",
+        "staged2268::noncascading_or_disjoint_actions_do_not_add_a_barrier",
+        "staged2268::referencing_instead_of_trigger_blocks_matching_cascade",
+        "staged2268::parent_or_other_action_trigger_does_not_block",
+        "staged2268::view_and_table_function_result_columns_are_compared",
+        "staged2268::owner_names_can_differ_but_equality_with_managed_schemas_cannot",
+        "staged2268::type_defaults_are_skipped_and_type_owner_equality_is_preserved"
       ]
     },
     {

@@ -86,9 +86,10 @@ export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
 
 # The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
 # which needs the same server and is `#[ignore]`d for the same reason.
-cargo test -p pbps-mssql --test live -- --ignored --skip scratch2236 --skip deployer2267 "$@"
+cargo test -p pbps-mssql --test live -- --ignored --skip scratch2236 --skip deployer2267 --skip staged2268 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267 "$@"
+cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268 "$@"
 cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests "$@"
 # The seam's own error conversion on this driver (issue #167): measured
 # against a real server, `tiberius`'s `Display` already carries the server's

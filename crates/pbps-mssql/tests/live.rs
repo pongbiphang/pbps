@@ -41,6 +41,9 @@ mod binding_releases;
 #[path = "live/scratch2236.rs"]
 mod scratch2236;
 
+#[path = "live/staged2268.rs"]
+mod staged2268;
+
 #[path = "live/deployer2267.rs"]
 mod deployer2267;
 
