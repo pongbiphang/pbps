@@ -17,9 +17,11 @@
 //!
 //! In a release build the effects order the resolver's plan and the connected
 //! PostgreSQL handovers of an identity sequence's or detached clone's name
-//! (DEC-1986.1, DEC-1558.1), and baseline binding releases (DEC-2228.1). Other
-//! callers settle only the edges they state, such as the generated- and
-//! computed-column releases (DEC-1956.3). The resolver combines the effects,
+//! (DEC-1986.1, DEC-1558.1), and baseline binding releases (DEC-2228.1).
+//! Generated-input releases also carry delayed inserts and their effect
+//! consumers within the existing settlement (DEC-2174.1). Other callers,
+//! including computed-column releases, settle only their stated constraints
+//! (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).
 
 #![cfg_attr(
@@ -51,6 +53,7 @@ pub mod new_tables;
 pub(crate) mod normalization;
 pub mod parent_defaults;
 mod plan;
+pub mod release_inputs;
 pub(crate) mod rename_order;
 pub(crate) mod resolver_finish;
 pub(crate) mod resolver_prepare;

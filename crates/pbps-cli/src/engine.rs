@@ -1959,12 +1959,12 @@ fn release_of(
 ///
 /// A change runs where the differ put it unless an edge holds it back; then
 /// it runs right after the last change it waits for. Nothing moves earlier.
+/// Required inserts and their effect consumers follow a released drop
+/// (#2174); they no longer cause the old #1397 kept-order refusal.
 /// Returns how many changes moved, or a refusal:
 /// - a change the moved one passes needs what it holds back: a column's name
 ///   taken before its drop runs, or a row, key or module that may need its
 ///   new type before its retype runs;
-/// - a drop of a `NOT NULL` input with no default, moved past a row the plan
-///   inserts into its table, which the column refuses while it stands (#1397);
 /// - a drop of a column another generated column's new text may read, which
 ///   no order performs (#1391);
 /// - changes that wait on one another, as two generated columns trading
@@ -1973,13 +1973,16 @@ fn release_of(
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn order_after_releases<S: Clone>(
     changes: &mut PlanningPlan<S>,
-    ids: &pbps_model::IdsFile,
+    before: pbps_diff::Side<'_>,
+    after: pbps_diff::Side<'_>,
     dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
+    dialect: &dyn pbps_dialect::Dialect,
+    declared: &pbps_model::ModuleDeps,
 ) -> Result<usize, String> {
     use pbps_model::Change;
     use pbps_pg::generated::may_read;
-    let names =
-        pbps_model::plan_names::PlanNames::of(&changes.changes, ids).map_err(|e| e.to_string())?;
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
+        .map_err(|e| e.to_string())?;
     // Inputs a row cannot be inserted without while they stand, by their
     // live table and name (#1397), each with the position from which on it
     // is: `None` from the start, or `Some(j)` past the plan's first change
@@ -2116,14 +2119,15 @@ pub(crate) fn order_after_releases<S: Clone>(
     // Settled over those edges: a change runs where the differ put it unless
     // an edge holds it back, then right after the last change it waits for
     // (DEC-1391.1, DEC-1956.2). What a held change must not pass is kept, not
-    // moved along with it: the edges that would move it safely, its name
-    // slots and what its text names, are not stated yet (DEC-1956.3).
+    // moved along with it (DEC-1956.3). Required inserts are the exception:
+    // order carries their effect consumers in this same settlement (#2174).
     let mut schedule = Schedule::new(n);
     for (i, ws) in waits.iter().enumerate() {
         for (&w, &source) in ws {
             schedule.edge(w, i, source, OrderReason::Structural);
         }
     }
+    let mut carried = std::collections::BTreeSet::new();
     for (h, ws) in waits.iter().enumerate() {
         if ws.is_empty() {
             continue;
@@ -2141,8 +2145,19 @@ pub(crate) fn order_after_releases<S: Clone>(
                 stack.extend(waits[w].keys().copied());
             }
         }
-        keep_ahead(&mut schedule, changes, &names, &required, h, reach);
+        keep_ahead(
+            &mut schedule,
+            changes,
+            &names,
+            &required,
+            &mut carried,
+            h,
+            reach,
+        );
     }
+    let schedule = pbps_diff::order::release_inputs::carry_inserts(
+        changes, schedule, &carried, before, after, dialect, declared,
+    )?;
     let settled = match schedule.settle(changes.clone()) {
         Ok(settled) => settled,
         Err(refusal) => {
@@ -2191,26 +2206,16 @@ fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
     })
 }
 
-/// What the change at `held`, which waits for its release, must stay ahead
-/// of: a later change that needs what it holds back. A held change that
-/// would pass one is refused by name with the two-plan remedy (DEC-1316.1,
-/// DEC-1391.1). These are kept, not edges: moving the later change along
-/// would need the edges its own readers hang on, its name slots (#1957) and
-/// what texts name (#1967), which are not stated yet (DEC-1956.3).
-///
-/// `reach` is the furthest position among what `held` waits for, directly or
-/// not. Settled, `held` lands after it and passes every change the differ put
-/// before it, none of which is ever held itself: an insert, a name's taker, a
-/// row, key, module or grant waits for nothing here. So only the changes
-/// before `reach` are kept, and of each kind only the first, which is the one
-/// the refusal names: a plan of many retypes and rows states a few kept
-/// orders per held change, not one per pair (#1956 review). Stated in the
-/// order the refusals are checked.
+/// Keep the existing name-taker and retype refusal boundaries (DEC-1956.3).
+/// `reach` bounds crossings of the release's waits, preserving their original
+/// refusal priority. Required inserts instead receive drop-to-insert edges
+/// and seed the effect closure that carries their consumers (DEC-2174.1).
 fn keep_ahead(
     schedule: &mut pbps_diff::order::Schedule,
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
     required: &BTreeMap<(TableName, pbps_model::ColumnName), Option<usize>>,
+    carried: &mut std::collections::BTreeSet<usize>,
     held: usize,
     reach: usize,
 ) {
@@ -2227,30 +2232,24 @@ fn keep_ahead(
             .skip(held + 1)
             .map(|(i, p)| (i, &p.change))
     };
-    // A drop holds its column until it runs, and an input that is `NOT NULL`
-    // with no default refuses a row inserted without it, as every row of its
-    // table the plan inserts is once the declaration drops it. The drop
-    // cannot both follow the release and precede the insert (#1397). A
-    // nullable or defaulted input lets the row in, and that plan applies.
+    // #2086 states why an omitted required input must be gone. Move every
+    // affected insert with its effect consumers, rather than refusing the
+    // crossing or moving the row away from its child rows and keys (#2174).
     if matches!(change, pbps_model::Change::DropColumn { .. })
         && let Some(&from) = required.get(&(table, live))
-        && let Some((i, insert)) = later().find(|(i, c)| {
+    {
+        for (i, _) in later().filter(|(i, c)| {
             matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table)
                 && from.is_none_or(|j| j < *i)
-        })
-    {
-        schedule.keep(
-            held,
-            i,
-            format!(
-                "{column} is dropped after the expression change that releases it, which \
-                 follows `{}`: the column is NOT NULL with no default, so that row, which \
-                 does not write it, is refused while the column stands. Apply the \
-                 expression change in a plan of its own first, then this one.",
-                insert.subject(),
-                column = column.shown(),
-            ),
-        );
+        }) {
+            schedule.edge(
+                held,
+                i,
+                pbps_diff::order::Source::Catalog,
+                pbps_model::resolver::OrderReason::Structural,
+            );
+            carried.insert(i);
+        }
     }
     // A drop holds its name until it runs: a change taking the name needs it
     // free, and the release needs the column still there.
@@ -2327,12 +2326,15 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
 pub async fn release_generated_inputs<S: Clone>(
     conn: &mut Conn,
     changes: &mut PlanningPlan<S>,
-    ids: &pbps_model::IdsFile,
+    before: pbps_diff::Side<'_>,
+    after: pbps_diff::Side<'_>,
+    dialect: &dyn pbps_dialect::Dialect,
+    declared: &pbps_model::ModuleDeps,
 ) -> anyhow::Result<usize> {
     if conn.driver() != Driver::Postgres {
         return Ok(0);
     }
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)?;
     let mut dependences = BTreeMap::new();
     for p in &changes.changes {
         if let Some((table, ..)) = changed_column(&names, &p.change)
@@ -2342,7 +2344,7 @@ pub async fn release_generated_inputs<S: Clone>(
             e.insert(found);
         }
     }
-    order_after_releases(changes, ids, &dependences)
+    order_after_releases(changes, before, after, &dependences, dialect, declared)
         .map_err(|why| anyhow::anyhow!("generation_support (PostgreSQL): {why}"))
 }
 
@@ -3938,9 +3940,104 @@ mod tests {
         changes: &mut ChangeSet,
         dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
     ) -> Result<usize, String> {
-        let ids = crate::plan_fixture::ids(changes);
+        let mut ids = crate::plan_fixture::ids(changes);
+        if !changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
+        {
+            // Older name-only fixtures do not enter the carried-row graph.
+            let schema = pbps_model::Schema::default();
+            return crate::test_planning(changes, |plan| {
+                super::order_after_releases(
+                    plan,
+                    pbps_diff::Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    dependences,
+                    &pbps_pg::Postgres::new(),
+                    &pbps_model::ModuleDeps::new(),
+                )
+            });
+        }
+        let mut base_ids = ids.clone();
+        let mut before = pbps_model::Schema::default();
+        for (table, dependences) in dependences {
+            let shape = before.tables.entry(table.clone()).or_default();
+            for name in ["id", "b"]
+                .into_iter()
+                .map(pbps_model::ColumnName::from)
+                .chain(
+                    dependences
+                        .iter()
+                        .flat_map(|d| [d.base.clone(), d.generated.clone()]),
+                )
+            {
+                shape
+                    .columns
+                    .entry(name.clone())
+                    .or_insert_with(|| pbps_model::Column::new("integer".parse().unwrap()));
+                if !ids
+                    .columns
+                    .values()
+                    .any(|c| c.table == *table && c.name == name)
+                {
+                    let address = table.column(&name).raw().to_string();
+                    let uid = pbps_model::Uid::derived(pbps_model::UidKind::Column, &address, 0);
+                    ids.columns.insert(uid.clone(), table.column(&name));
+                    base_ids.columns.insert(uid, table.column(&name));
+                }
+            }
+            for d in dependences {
+                shape.columns.get_mut(&d.base).unwrap().nullable =
+                    !d.base_required && !d.filled_by_trigger;
+                let base = d.base.raw();
+                shape.columns.get_mut(&d.generated).unwrap().value_source =
+                    pbps_model::ValueSource::Generated(pbps_model::Generated {
+                        expression: format!("{base} * 2"),
+                        stored: true,
+                    });
+            }
+        }
+        let mut after = before.clone();
+        for p in &changes.changes {
+            if let pbps_model::Change::AlterModule { id, module } = &p.change
+                && module.kind == pbps_model::ModuleKind::Trigger
+            {
+                // A declared trigger stands at both ends even when the catalog
+                // says an earlier rebuild stops filling the omitted input.
+                before.modules.insert(id.clone(), (**module).clone());
+                after.modules.insert(id.clone(), (**module).clone());
+            }
+            if let pbps_model::Change::DropColumn { uid, column } = &p.change {
+                base_ids.columns.retain(|_, c| c != column);
+                base_ids.columns.insert(uid.clone(), column.clone());
+                ids.columns.retain(|_, c| c != column);
+                if let Some(table) = after.tables.get_mut(&column.table) {
+                    table.columns.shift_remove(&column.name);
+                }
+            }
+        }
         crate::test_planning(changes, |plan| {
-            super::order_after_releases(plan, &ids, dependences)
+            super::order_after_releases(
+                plan,
+                pbps_diff::Side {
+                    schema: &before,
+                    ids: &base_ids,
+                },
+                pbps_diff::Side {
+                    schema: &after,
+                    ids: &ids,
+                },
+                dependences,
+                &pbps_pg::Postgres::new(),
+                &pbps_model::ModuleDeps::new(),
+            )
         })
     }
     fn unreleased(
@@ -4057,6 +4154,110 @@ mod tests {
     /// the plan's change to that expression which stops reading it, and only
     /// then (DEC-1316.1). Negatives: an expression that may still read it, a
     /// column no generated column reads, and a name taken in between.
+    #[test]
+    fn nullable_and_defaulted_released_inputs_keep_their_insert_before_the_release() {
+        use pbps_model::{
+            Change, Column, Generated, IdsFile, PlannedChange, Schema, Table, UidKind, ValueSource,
+        };
+        let table: TableName = "app.t".parse().unwrap();
+        for defaulted in [false, true] {
+            let mut shape = Table::default();
+            for name in ["id", "a", "b", "g"] {
+                shape
+                    .columns
+                    .insert(name.into(), Column::new("integer".parse().unwrap()));
+            }
+            let input = shape.columns.get_mut("a").unwrap();
+            input.nullable = !defaulted;
+            if defaulted {
+                input.value_source = ValueSource::Default("7".into());
+            }
+            shape.columns.get_mut("g").unwrap().value_source = ValueSource::Generated(Generated {
+                expression: "a * 2".into(),
+                stored: true,
+            });
+            let mut before = Schema::default();
+            before.tables.insert(table.clone(), shape);
+            let mut base_ids = IdsFile::default();
+            base_ids
+                .tables
+                .insert("t_aaaaaa".parse().unwrap(), table.clone());
+            for name in ["id", "a", "b", "g"] {
+                base_ids.columns.insert(
+                    pbps_model::Uid::derived(UidKind::Column, name, 0),
+                    table.column(name),
+                );
+            }
+            let a = pbps_model::Uid::derived(UidKind::Column, "a", 0);
+            let g = pbps_model::Uid::derived(UidKind::Column, "g", 0);
+            let mut ids = base_ids.clone();
+            ids.columns.remove(&a);
+            let mut after = before.clone();
+            let shape = after.tables.get_mut(&table).unwrap();
+            shape.columns.shift_remove("a");
+            shape.columns.get_mut("g").unwrap().value_source = ValueSource::Generated(Generated {
+                expression: "b * 2".into(),
+                stored: true,
+            });
+            let changes = vec![
+                Change::DropColumn {
+                    uid: a,
+                    column: table.column("a"),
+                },
+                Change::InsertRow {
+                    table: table.clone(),
+                    key_column: "id".into(),
+                    identity_key: false,
+                    key: pbps_model::RowKey::from("1"),
+                    row: pbps_model::Row::default(),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                },
+                Change::AlterColumnExpression {
+                    uid: g,
+                    column: table.column("g"),
+                    from: "a * 2".into(),
+                    to: "b * 2".into(),
+                },
+            ];
+            let expected = vec![changes[1].clone(), changes[2].clone(), changes[0].clone()];
+            let mut cs = ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            };
+            let found = BTreeMap::from([(
+                table.clone(),
+                vec![pbps_pg::generated::Dependence {
+                    base: "a".into(),
+                    generated: "g".into(),
+                    base_required: false,
+                    filled_by_trigger: false,
+                }],
+            )]);
+            let moved = crate::test_planning(&mut cs, |plan| {
+                super::order_after_releases(
+                    plan,
+                    pbps_diff::Side {
+                        schema: &before,
+                        ids: &base_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                    &found,
+                    &pbps_pg::Postgres::new(),
+                    &pbps_model::ModuleDeps::new(),
+                )
+            })
+            .unwrap();
+            assert_eq!(moved, 1);
+            assert_eq!(
+                cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
     // A test rendering: any other kind of change is a failure.
     #[allow(clippy::wildcard_enum_match_arm)]
     #[test]
@@ -4262,8 +4463,8 @@ mod tests {
         assert!(refusal.contains("may need the new type"), "{refusal}");
         // A drop moved past a row inserted into its table, as it is when the
         // release follows a function create: a `NOT NULL` input with no
-        // default refuses the row, which cannot write it, so the plan is
-        // refused by name (#1397).
+        // default refuses the row while it stands. The row follows the
+        // release and drop through an edge now (#2174).
         let insert = |table: &TableName| Change::InsertRow {
             table: table.clone(),
             key_column: "id".into(),
@@ -4283,13 +4484,13 @@ mod tests {
             }],
         )]);
         let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
-        let refusal = order_after_releases(&mut cs, &requires_a).unwrap_err();
-        assert!(
-            refusal.contains("app.t.a is dropped after the expression change")
-                && refusal.contains("NOT NULL with no default")
-                && refusal.contains("in a plan of its own first"),
-            "{refusal}"
-        );
+        assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(2));
+        assert!(matches!(
+            cs.changes[0].change,
+            Change::AlterColumnExpression { .. }
+        ));
+        assert!(matches!(cs.changes[1].change, Change::DropColumn { .. }));
+        assert!(matches!(cs.changes[2].change, Change::InsertRow { .. }));
         // Negatives: a nullable or defaulted input lets the row in, a row of
         // another table is no concern of the column, and an insert after the
         // release is never passed.
@@ -4333,11 +4534,9 @@ mod tests {
         };
         for change in [drop_trigger("app.t"), alter_trigger()] {
             let mut cs = plan(vec![change, drop("a"), insert(&t), recompute("b * 2")]);
-            let refusal = order_after_releases(&mut cs, &filled_a).unwrap_err();
-            assert!(
-                refusal.contains("app.t.a is dropped after the expression change"),
-                "{refusal}"
-            );
+            assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(2));
+            assert!(matches!(cs.changes[2].change, Change::DropColumn { .. }));
+            assert!(matches!(cs.changes[3].change, Change::InsertRow { .. }));
         }
         // A trigger rewritten after the row still stands when the row is
         // written, as the differ puts a module change after the rows.
@@ -4581,7 +4780,15 @@ mod tests {
             let ids = crate::plan_fixture::ids(&cs);
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
             let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
-            keep_ahead(&mut schedule, &cs, &names, &BTreeMap::new(), held, reach);
+            keep_ahead(
+                &mut schedule,
+                &cs,
+                &names,
+                &BTreeMap::new(),
+                &mut std::collections::BTreeSet::new(),
+                held,
+                reach,
+            );
             schedule.kept_orders().to_vec()
         };
         // Released first: the retype waits for nothing after it.
@@ -5321,7 +5528,22 @@ mod plan_name_tests {
         dependences: &BTreeMap<TableName, Vec<pbps_pg::generated::Dependence>>,
     ) -> Result<usize, String> {
         crate::test_planning(changes, |plan| {
-            super::order_after_releases(plan, ids, dependences)
+            // These name-only fixtures never enter the carried-row graph.
+            let schema = pbps_model::Schema::default();
+            super::order_after_releases(
+                plan,
+                pbps_diff::Side {
+                    schema: &schema,
+                    ids,
+                },
+                pbps_diff::Side {
+                    schema: &schema,
+                    ids,
+                },
+                dependences,
+                &pbps_pg::Postgres::new(),
+                &pbps_model::ModuleDeps::new(),
+            )
         })
     }
 

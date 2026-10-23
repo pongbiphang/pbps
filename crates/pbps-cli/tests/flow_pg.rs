@@ -14250,11 +14250,11 @@ fn an_expression_change_releases_a_generated_column_from_a_dropped_function() {
 /// creates, so its release of `a` runs after the plan's rows, and `a`'s drop
 /// waits behind it, past a row inserted into the table (#1397). A nullable
 /// input lets that row in, and the plan applies end to end. A `NOT NULL`
-/// input with no default would refuse the row inside the apply, so the plan
-/// is refused by name at `plan --db`, before anything runs.
+/// input with no default instead delays its insert and the insert's consumers
+/// until the release and drop have run (#2174). This exact flow needs PG17+.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
-fn a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required() {
+fn a_released_input_dropped_past_an_inserted_row_carries_its_consumers() {
     let server = server();
     let own = OwnDatabase::new(&server, "released-drop-insert");
     let connection = own.connection().to_owned();
@@ -14264,7 +14264,8 @@ fn a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required()
          CREATE TABLE app.opt (id integer PRIMARY KEY, a integer, b integer, \
                                g integer GENERATED ALWAYS AS (a * 2) STORED); \
          CREATE TABLE app.req (id integer PRIMARY KEY, a integer NOT NULL, b integer, \
-                               g integer GENERATED ALWAYS AS (a * 2) STORED)",
+                               g integer GENERATED ALWAYS AS (a * 2) STORED); \
+         CREATE TABLE app.child (id integer PRIMARY KEY, pid integer NOT NULL REFERENCES app.req(id))",
     );
     let d = Demo::new("released-drop-insert");
     succeeds(d.run(&["pull", "--db", &connection]));
@@ -14353,37 +14354,88 @@ fn a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required()
     );
     succeeds(d.run(&["verify", "--db", &connection]));
 
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", &connection]))).contains("No changes"));
     revise("req", "h");
-    let refused = d.run(&["plan", "--db", &connection]);
-    assert_eq!(
-        code(&refused),
-        1,
-        "{}{}",
-        stdout(&refused),
-        stderr(&refused)
+    let path = d.dir.join("schema/app.req.yml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("    1: {b: 3}", "    1: {b: 3}\n    2: {b: 4}")
+        + "\nunique:\n  req_b_unique: [b]\n";
+    std::fs::write(path, text).unwrap();
+    let path = d.dir.join("schema/app.child.yml");
+    let text = std::fs::read_to_string(&path).unwrap()
+        + "\ndata:\n  mode: exact\n  rows:\n    1: {pid: 1}\n";
+    std::fs::write(path, text).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let at = |predicate: &dyn Fn(&pbps_model::Change) -> bool| {
+        saved
+            .changes
+            .changes
+            .iter()
+            .position(|p| predicate(&p.change))
+            .unwrap()
+    };
+    use pbps_model::Change;
+    let release = at(
+        &|c| matches!(c,Change::AlterColumnExpression { column,.. } if column.table.raw().to_string()=="app.req"),
     );
+    let dropped = at(
+        &|c| matches!(c,Change::DropColumn { column,.. } if column.table.raw().to_string()=="app.req" && column.name.raw()=="a"),
+    );
+    let parent = at(
+        &|c| matches!(c,Change::InsertRow { table,key,.. } if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("1")),
+    );
+    let later = at(
+        &|c| matches!(c,Change::InsertRow { table,key,.. } if table.raw().to_string()=="app.req" && *key==pbps_model::RowKey::from("2")),
+    );
+    let child =
+        at(&|c| matches!(c,Change::InsertRow { table,.. } if table.raw().to_string()=="app.child"));
+    let key =
+        at(&|c| matches!(c,Change::AddUnique { table,.. } if table.raw().to_string()=="app.req"));
     assert!(
-        stderr(&refused).contains("app.req.a is dropped after the expression change")
-            && stderr(&refused).contains("NOT NULL with no default"),
-        "{}",
-        stderr(&refused)
+        release < dropped && dropped < parent && parent < later && parent < child && later < key,
+        "{:?}",
+        saved.changes
     );
-    // Nothing ran: `a` and its generated column stand as they were.
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &[
+            "--allow",
+            "narrowing",
+            "--allow",
+            "destructive",
+            "--allow",
+            "constraint",
+        ],
+    ));
+    assert_eq!(scalar(&connection, "SELECT sum(g)::int8 FROM app.req"), 21);
     assert_eq!(
-        scalar(
-            &connection,
-            "SELECT count(*) FROM pg_attribute \
-             WHERE attrelid = 'app.req'::regclass AND attname = 'a' AND NOT attisdropped"
-        ),
+        scalar(&connection, "SELECT count(*) FROM app.child WHERE pid=1"),
         1
     );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", &connection]))).contains("No changes"));
 }
 
 /// The same plan as above, on a `NOT NULL` input a `BEFORE INSERT` trigger
 /// fills (#2178). The trigger kept, the row is let in and the plan applies.
 /// The trigger dropped by the same plan, the one that would fill `a` may be
-/// gone when the row is written, so the plan is refused by name as for an
-/// input nothing fills, before anything runs.
+/// gone when the row is written, so its row must follow the released input's
+/// drop, just as for an input nothing fills (#2174).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger() {
@@ -14482,29 +14534,111 @@ fn a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger(
     assert_eq!(removed.len(), 2, "{removed:?}");
     succeeds(d.run(&["plan"]));
     d.commit();
-    let refused = d.run(&["plan", "--db", &connection]);
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "destructive"],
+    ));
     assert_eq!(
-        code(&refused),
-        1,
-        "{}{}",
-        stdout(&refused),
-        stderr(&refused)
+        scalar(&connection, "SELECT g::int8 FROM app.gone WHERE id=1"),
+        9
     );
-    assert!(
-        stderr(&refused).contains("app.gone.a is dropped after the expression change")
-            && stderr(&refused).contains("NOT NULL with no default"),
-        "{}",
-        stderr(&refused)
-    );
-    // Nothing ran: the trigger and `a` stand as they were.
     assert_eq!(
         scalar(
             &connection,
-            "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.gone'::regclass \
-             AND NOT tgisinternal"
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid='app.gone'::regclass AND NOT tgisinternal"
         ),
-        1
+        0
     );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", &connection]))).contains("No changes"));
+}
+
+/// PG16 cannot SET EXPRESSION. Removing the generated reader is its supported
+/// sibling; this tests real plan/apply/empty-replan, not the PG17+ expression flip.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_dropped_generated_reader_releases_its_required_input_before_inserted_rows() {
+    for (version, server) in [(16, old_server()), (18, server())] {
+        let own = OwnDatabase::new(&server, &format!("released-reader-{version}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; CREATE TABLE app.p (id integer PRIMARY KEY,a integer NOT NULL,b integer,g integer GENERATED ALWAYS AS (a*2) STORED); CREATE TABLE app.c (id integer PRIMARY KEY,pid integer NOT NULL REFERENCES app.p(id))",
+        );
+        let d = Demo::new(&format!("released-reader-{version}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.p.yml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut removed = false;
+        let edited = text
+            .lines()
+            .filter(|line| {
+                if !line.starts_with("   ") {
+                    removed = *line == "  a:" || *line == "  g:";
+                }
+                !removed
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\nunique:\n  p_b_unique: [b]\ndata:\n  mode: exact\n  rows:\n    1: {b: 3}\n    2: {b: 4}\n";
+        std::fs::write(path, edited).unwrap();
+        let path = d.dir.join("schema/app.c.yml");
+        let text = std::fs::read_to_string(&path).unwrap()
+            + "\ndata:\n  mode: exact\n  rows:\n    1: {pid: 1}\n";
+        std::fs::write(path, text).unwrap();
+        succeeds(d.run(&[
+            "intent",
+            "--drop",
+            "app.p.a",
+            "reader and old input removed",
+            "--drop",
+            "app.p.g",
+            "reader and old input removed",
+        ]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let drop_at = |name: &str| {
+            saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::DropColumn { column,.. } if column.table.raw().to_string()=="app.p" && column.name.raw()==name)).unwrap()
+        };
+        let insert=saved.changes.changes.iter().position(|p| matches!(&p.change,pbps_model::Change::InsertRow { table,.. } if table.raw().to_string()=="app.p")).unwrap();
+        assert!(
+            drop_at("g") < drop_at("a") && drop_at("a") < insert,
+            "PG{version}: {:?}",
+            saved.changes
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &path,
+            &[
+                "--allow",
+                "destructive",
+                "--allow",
+                "narrowing",
+                "--allow",
+                "constraint",
+            ],
+        ));
+        assert_eq!(scalar(connection, "SELECT sum(b)::int8 FROM app.p"), 7);
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.c WHERE pid=1"),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+        assert!(
+            stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"),
+            "PG{version}"
+        );
+    }
 }
 
 /// One revision changes a generated column's expression to stop reading `a`
