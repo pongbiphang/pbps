@@ -59,6 +59,11 @@ pub enum ConfigError {
     RenamedResolverBaseline { path: PathBuf, resolver: String },
 
     #[error(
+        "resolver `{resolver}` sets `same_instance`, which applies only to SQL Server server entries; remove it for PostgreSQL"
+    )]
+    InapplicableSameInstance { resolver: String },
+
+    #[error(
         "resolver profile names must start with an ASCII letter or digit and contain only letters, digits, dots, underscores or hyphens"
     )]
     InvalidResolverName,
@@ -452,6 +457,21 @@ impl Config {
             .any(|name| !resolver::valid_profile_name(name))
         {
             return Err(ConfigError::InvalidResolverName);
+        }
+        if config.dialect == DialectName::Postgres {
+            for (name, profile) in &config.resolvers {
+                if matches!(
+                    profile,
+                    resolver::ResolverProfile::Server {
+                        same_instance: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(ConfigError::InapplicableSameInstance {
+                        resolver: name.clone(),
+                    });
+                }
+            }
         }
         if let Some((name, _)) = config.environments.iter().find(|(_, env)| {
             env.fingerprint_key_env.is_some() && env.fingerprint_key_file.is_some()

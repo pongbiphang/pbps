@@ -205,7 +205,7 @@ for a moment keeps that type.
   [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
 - **Fingerprints.** A module's fingerprint carries `uses_ansi_nulls`,
   `uses_quoted_identifier` and `is_schema_bound`. The database collation and
-  compatibility level are compared as reported facts (`mssql-reported-scope-v1`).
+  compatibility level are compared as reported facts (`mssql-reported-scope-v2`).
 - **Teardown and rebuild order.** A schema-bound reference blocks the
   following:
   - altering a column it reads (errors 5074 and 4922);
@@ -763,14 +763,28 @@ renderer refuses the same dependency before emitting DDL. The legal chain
 `a -> managed -> x` measures error 1767 before managed exists; inventing that
 table during setup is a managed overlap. #2238 will lift this refusal through
 chained staging and subsequent complete comparison. The all-external chain
-is accepted. Same-instance configuration, provenance sealing and explain are
-still #2270; this preparation does not publish evidence.
+is accepted. Same-instance policy and its shared evidence carrier are implemented by #2270;
+this preparation still does not publish evidence before #2143.
 
 The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
 
+The SQL Server server entry accepts `same_instance: refuse | allow`, defaulting
+omission to `refuse`. PostgreSQL rejects an explicit setting; Docker rejects
+the field. A target-database scratch always refuses. A same-instance supplied
+scratch without a file uses only catalog-rendered externals; with a file,
+including an empty file, it requires `allow`. All containment and complete
+staged comparisons still apply. Another instance uses the ordinary gates;
+`outside_writes` is independent.
+
+The shared runtime seals `same_instance: refused | allowed`; explain shows
+both values in human and JSON output. Legacy PostgreSQL omission reads as
+`NotApplicable` and reserializes unchanged. The first SQL Server evidence
+reader (#2143) must require an applicable value and accept only
+`mssql-reported-scope-v2`: missing provenance is never consent (DEC-2270.1).
+
 ## 9. Compatibility on reported facts
 
-`mssql-reported-scope-v1` stays as #611 and #1636 left it:
+`mssql-reported-scope-v2` retains #611 and #1636's non-assembly facts:
 
 - product version, level and family;
 - server and database collation, compatibility level, containment and the
@@ -784,7 +798,7 @@ reaches is an external object. The externals file cannot stage it without
 the assembly's binary, so it refuses by name as an unstaged external object
 (#1517). An assembly nothing reaches binds nothing. #721 (an assembly's
 identity covers only its manifest file) and #718 (an assembly the deployer
-cannot see reads as absent) are closed with that change in #620 (b).
+cannot see reads as absent) are closed with that change in #2270.
 
 #719's telemetry, long-running runtime and Express questions remain
 prerequisites before the complete SQL Server path is advertised.

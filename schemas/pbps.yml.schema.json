@@ -312,6 +312,10 @@
             "outside_writes": {
               "$ref": "#/$defs/OutsideWrites"
             },
+            "same_instance": {
+              "description": "SQL Server only. Keep omission distinct from an explicit setting,\nso PostgreSQL cannot silently accept an inapplicable policy.",
+              "$ref": "#/$defs/SameInstance"
+            },
             "kind": {
               "type": "string",
               "const": "server"
@@ -451,6 +455,14 @@
       "enum": [
         "USAGE",
         "CREATE"
+      ]
+    },
+    "SameInstance": {
+      "description": "Whether an externals file may run on the target's SQL Server instance.",
+      "type": "string",
+      "enum": [
+        "refuse",
+        "allow"
       ]
     },
     "PartitionRunway": {
@@ -775,6 +787,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 54,
+  "x-pbps-schema-version": 55,
   "x-pbps-tool-version": "0.0.0"
 }

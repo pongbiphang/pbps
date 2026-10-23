@@ -20,9 +20,10 @@
 use super::environment::SETTINGS;
 use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{CatalogFacts, FactStatus, RuleVersion, ScopeReport, Side};
+#[cfg(test)]
 use std::collections::BTreeMap;
 
-/// Rule `mssql-reported-scope-v1`, measured on SQL Server 2025 (17.0) for
+/// Rule `mssql-reported-scope-v2`, measured on SQL Server 2025 (17.0) for
 /// Linux. It was `mssql-analysis-scope-v1` while it also compared the
 /// measured profiles' executables (#1636).
 ///
@@ -35,7 +36,7 @@ use std::collections::BTreeMap;
 /// nothing reads it and no earlier identifier is refused;
 /// `the_compared_facts_move_with_the_rule_identifier` is what keeps the first
 /// reader from inheriting a set that moved unnoticed.
-pub const REPORTED_RULE: &str = "mssql-reported-scope-v1";
+pub const REPORTED_RULE: &str = "mssql-reported-scope-v2";
 
 /// The product major versions the rule was measured on. Anything else is
 /// unknown, not incompatible.
@@ -100,7 +101,6 @@ pub fn compare_reported(target: &CatalogFacts, resolver: &CatalogFacts) -> Scope
     }
     editions(target, resolver, &mut report);
     settings(target, resolver, &mut report);
-    assemblies(target, resolver, &mut report);
     visibility(target, resolver, &mut report);
     report
 }
@@ -314,39 +314,6 @@ fn settings(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeRe
         .insert("persisted-module-settings".into(), status);
 }
 
-/// User CLR assemblies are code the engine loads for the database, compared
-/// by content in both directions: one the resolver lacks cannot be bound
-/// through, and one only the resolver has binds names the target does not.
-fn assemblies(target: &CatalogFacts, resolver: &CatalogFacts, report: &mut ScopeReport) {
-    let describe = |e: &pbps_db::resolver::environment::ExtensionFact| {
-        format!(
-            "{} {} {}",
-            e.version,
-            e.schema,
-            e.libraries.first().map_or("-", String::as_str)
-        )
-    };
-    let by_name = |facts: &CatalogFacts| -> BTreeMap<String, String> {
-        facts
-            .extensions
-            .iter()
-            .map(|e| (e.name.clone(), describe(e)))
-            .collect()
-    };
-    let (t, r) = (by_name(target), by_name(resolver));
-    let names: std::collections::BTreeSet<&String> = t.keys().chain(r.keys()).collect();
-    for name in names {
-        let status = match (t.get(name), r.get(name)) {
-            (Some(a), Some(b)) if a == b => FactStatus::Match,
-            (a, b) => FactStatus::Mismatch {
-                target: a.cloned().unwrap_or_else(|| "absent".into()),
-                resolver: b.cloned().unwrap_or_else(|| "absent".into()),
-            },
-        };
-        report.facts.insert(format!("assembly:{name}"), status);
-    }
-}
-
 /// The schemas a bare name binds through must exist the same way on both
 /// sides. A schema the resolver was not asked about is a difference, not a
 /// gap.
@@ -437,45 +404,85 @@ mod tests {
     /// a record and is never edited (DEC-2012.1). The third field names the fact
     /// whose verdict the entry changed under the same name, `None` for an entry
     /// that changes the set of names (#2047).
-    const RULE_HISTORY: &[(&str, &[&str], Option<&str>)] = &[(
-        "mssql-reported-scope-v1",
-        &[
-            "assembly:geo",
-            "database_ansi_null_default",
-            "database_ansi_nulls",
-            "database_ansi_padding",
-            "database_ansi_warnings",
-            "database_arithabort",
-            "database_collation",
-            "database_compatibility_level",
-            "database_concat_null_yields_null",
-            "database_containment",
-            "database_numeric_roundabort",
-            "database_quoted_identifier",
-            "edition",
-            "engine_edition",
-            "host_platform",
-            "persisted-module-settings",
-            "product_level",
-            "product_update_level",
-            "product_update_reference",
-            "product_version",
-            "server_collation",
-            "setting:ansi_null_dflt_on",
-            "setting:ansi_nulls",
-            "setting:ansi_padding",
-            "setting:ansi_warnings",
-            "setting:arithabort",
-            "setting:concat_null_yields_null",
-            "setting:datefirst",
-            "setting:dateformat",
-            "setting:language",
-            "setting:numeric_roundabort",
-            "setting:quoted_identifier",
-            "visibility:app",
-        ],
-        None,
-    )];
+    const RULE_HISTORY: &[(&str, &[&str], Option<&str>)] = &[
+        (
+            "mssql-reported-scope-v1",
+            &[
+                "assembly:geo",
+                "database_ansi_null_default",
+                "database_ansi_nulls",
+                "database_ansi_padding",
+                "database_ansi_warnings",
+                "database_arithabort",
+                "database_collation",
+                "database_compatibility_level",
+                "database_concat_null_yields_null",
+                "database_containment",
+                "database_numeric_roundabort",
+                "database_quoted_identifier",
+                "edition",
+                "engine_edition",
+                "host_platform",
+                "persisted-module-settings",
+                "product_level",
+                "product_update_level",
+                "product_update_reference",
+                "product_version",
+                "server_collation",
+                "setting:ansi_null_dflt_on",
+                "setting:ansi_nulls",
+                "setting:ansi_padding",
+                "setting:ansi_warnings",
+                "setting:arithabort",
+                "setting:concat_null_yields_null",
+                "setting:datefirst",
+                "setting:dateformat",
+                "setting:language",
+                "setting:numeric_roundabort",
+                "setting:quoted_identifier",
+                "visibility:app",
+            ],
+            None,
+        ),
+        (
+            "mssql-reported-scope-v2",
+            &[
+                "database_ansi_null_default",
+                "database_ansi_nulls",
+                "database_ansi_padding",
+                "database_ansi_warnings",
+                "database_arithabort",
+                "database_collation",
+                "database_compatibility_level",
+                "database_concat_null_yields_null",
+                "database_containment",
+                "database_numeric_roundabort",
+                "database_quoted_identifier",
+                "edition",
+                "engine_edition",
+                "host_platform",
+                "persisted-module-settings",
+                "product_level",
+                "product_update_level",
+                "product_update_reference",
+                "product_version",
+                "server_collation",
+                "setting:ansi_null_dflt_on",
+                "setting:ansi_nulls",
+                "setting:ansi_padding",
+                "setting:ansi_warnings",
+                "setting:arithabort",
+                "setting:concat_null_yields_null",
+                "setting:datefirst",
+                "setting:dateformat",
+                "setting:language",
+                "setting:numeric_roundabort",
+                "setting:quoted_identifier",
+                "visibility:app",
+            ],
+            None,
+        ),
+    ];
 
     /// Why a rule history is not a valid record, if it is not. Each entry's names
     /// are read as a set: the list order is only how the history is written, so
@@ -572,7 +579,7 @@ mod tests {
     #[test]
     fn the_compared_facts_move_with_the_rule_identifier() {
         let (current, pinned, _) = RULE_HISTORY.last().unwrap();
-        // A pair that carries an assembly too, or its family would go unpinned.
+        // Carry an assembly too, so its accidental reintroduction changes the set.
         let mut facts = side("17.0.4075.5");
         facts.extensions.push(ExtensionFact {
             name: "geo".into(),
@@ -604,6 +611,30 @@ mod tests {
         // declares the fact whose verdict changed, an identifier is not reused
         // for another set, and no entry lists a name twice.
         assert_eq!(refuse_history(RULE_HISTORY), Ok(()));
+    }
+
+    #[test]
+    fn reported_scope_v2_removes_only_the_assembly_fact_family() {
+        let (old, old_facts, _) = RULE_HISTORY[0];
+        let (new, new_facts, _) = RULE_HISTORY[1];
+        assert_eq!(old, "mssql-reported-scope-v1");
+        assert_eq!(new, "mssql-reported-scope-v2");
+        assert_eq!(REPORTED_RULE, new);
+        let expected: std::collections::BTreeSet<_> = old_facts
+            .iter()
+            .copied()
+            .filter(|name| !name.starts_with("assembly:"))
+            .collect();
+        assert_ne!(old_facts.len(), expected.len());
+        assert_eq!(
+            new_facts
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(old_facts.contains(&"assembly:geo"));
+        assert!(!new_facts.contains(&"assembly:geo"));
     }
 
     #[test]
@@ -765,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clr_assembly_is_compared_by_content_in_both_directions() {
+    fn user_assemblies_are_outside_the_reported_rule() {
         let assembly = |digest: &str| ExtensionFact {
             name: "geo".into(),
             version: "geo, version=1.0.0.0".into(),
@@ -790,7 +821,7 @@ mod tests {
         ] {
             assert_eq!(
                 compare_reported(&target, &resolver).verdict(),
-                Verdict::Mismatch(vec!["assembly:geo".into()])
+                Verdict::Verified
             );
         }
     }

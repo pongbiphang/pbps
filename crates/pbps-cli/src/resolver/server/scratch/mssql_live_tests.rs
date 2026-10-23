@@ -14,6 +14,13 @@ mod catalog_cases {
     ));
 }
 
+fn provenance() -> Provenance {
+    Provenance {
+        same_instance: pbps_model::resolver::SameInstance::Refused,
+        ..Provenance::server()
+    }
+}
+
 fn server(variable: &str) -> String {
     std::env::var(variable)
         .unwrap_or_else(|_| panic!("{variable} must name the owned SQL Server resolver fixture"))
@@ -120,6 +127,15 @@ async fn refusal_inner(target: &str, scratch: &str) -> ProduceError {
 }
 
 async fn refusal_file_inner(target: &str, scratch: &str, externals: Option<&str>) -> ProduceError {
+    refusal_policy_inner(target, scratch, externals, &provenance()).await
+}
+
+async fn refusal_policy_inner(
+    target: &str,
+    scratch: &str,
+    externals: Option<&str>,
+    provenance: &Provenance,
+) -> ProduceError {
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
@@ -155,7 +171,7 @@ async fn refusal_file_inner(target: &str, scratch: &str, externals: Option<&str>
         Some(ENVIRONMENT),
         Standard::Mssql,
         externals,
-        &Provenance::server(),
+        provenance,
     )
     .await
     {
@@ -478,7 +494,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
             let mut admin = Conn::connect(Driver::Mssql, &on).await?;
             let identity = sql::cluster_identity(&mut target).await?;
             let tokens = super::Tokens::generate();
-            let provenance = Provenance::server();
+            let provenance = provenance();
             let (provisioning, mut state) = super::engine::scratch(
                 Driver::Mssql,
                 &mut target,
@@ -1125,7 +1141,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let request=super::super::ScopeRequest { schemas:vec!["dbo".into()],..Default::default() };
         for file in [None,Some("CREATE SCHEMA ext2269 AUTHORIZATION dbo;\nGO\nCREATE TYPE ext2269.amount FROM decimal(9,2) NOT NULL;\nGO\nCREATE TABLE dbo.ext2269(i ext2269.amount CONSTRAINT ext2269_pk PRIMARY KEY);")] {
         let tokens=super::Tokens::generate();
-        let provenance=Provenance::server();
+        let provenance=provenance();
         let identity=sql::cluster_identity(&mut target).await.unwrap();
         let mut admin=connection(&scratch_server).await;
         let (provisioning,mut state)=super::engine::scratch(Driver::Mssql,&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&Standard::Mssql,file,&provenance).await.unwrap();
@@ -1183,7 +1199,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         let binding = BindingRequest { bootstrap: &bootstrap, base: &schema, desired: &schema };
         let request = super::super::ScopeRequest { schemas: vec!["dbo".into()], ..Default::default() };
         let tokens = super::Tokens::generate();
-        let provenance = Provenance::server();
+        let provenance = provenance();
         let identity = sql::cluster_identity(&mut target).await.unwrap();
         let mut admin = connection(&scratch_url).await;
         let (provisioning, mut state) = super::engine::scratch(
@@ -1215,3 +1231,6 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
     drop_database(&scratch_server, &scratch_name).await;
     result.unwrap();
 }
+
+#[path = "same_instance2270_tests.rs"]
+mod same_instance2270;

@@ -4612,6 +4612,7 @@ async fn produce_in_docker(
             image: image.into(),
         },
         outside_writes,
+        same_instance: pbps_model::resolver::SameInstance::NotApplicable,
     };
     super::container::with_container(
         Driver::Postgres,
@@ -4903,6 +4904,7 @@ async fn resolver_docker_records_the_image_as_configured_and_unverified() {
             // A container's superuser provisions its own database.
             layout: pbps_model::resolver::ScratchLayout::RunOwned,
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
+            same_instance: pbps_model::resolver::SameInstance::NotApplicable,
         }
     );
     let runtime = serde_json::to_string(&plan.evidence.qualification().runtime).unwrap();
@@ -5064,6 +5066,7 @@ async fn resolver_externals_outside_writes_allow_keeps_a_created_role() {
                 entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
+                same_instance: pbps_model::resolver::SameInstance::NotApplicable,
             },
         )
         .await;
@@ -5131,6 +5134,7 @@ async fn resolver_supplied_externals_outside_writes_allow_keeps_the_logins_own_d
                 entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
                 outside_writes,
+                same_instance: pbps_model::resolver::SameInstance::NotApplicable,
             },
         )
         .await;

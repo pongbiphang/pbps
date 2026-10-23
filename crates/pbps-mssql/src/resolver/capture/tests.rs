@@ -648,3 +648,93 @@ fn reported_identity_properties_preserve_the_later_observation() {
         .insert("SchemaId".into(), serde_json::json!("unreadable"));
     assert!(select::select(&catalog, &scope).is_err());
 }
+
+#[test]
+fn skipped_children_do_not_enter_authorization_ownership_without_being_roots() {
+    use serde_json::json;
+    let parent = object("dbo", "parent");
+    let child = object("dbo", "child");
+    let owner = json!(super::ObjectIdentity {
+        class: class::PRINCIPAL.into(),
+        name: vec!["dbo".into()],
+        signature: vec![]
+    });
+    let captured = |kind: &str, retained: bool, parented: bool| {
+        let mut properties = BTreeMap::from([
+            ("type".into(), json!(kind)),
+            ("owner".into(), owner.clone()),
+        ]);
+        if parented {
+            properties.insert("parent".into(), json!(parent));
+        }
+        let mut roots = BTreeSet::from([parent.clone()]);
+        if retained {
+            roots.insert(child.clone());
+        }
+        CapturedInputs::new(
+            catalog(),
+            select::Selected {
+                inputs: BTreeMap::from([
+                    (
+                        parent.clone(),
+                        select::Input {
+                            properties: BTreeMap::from([
+                                ("type".into(), json!("U")),
+                                ("owner".into(), owner.clone()),
+                            ]),
+                            bindings: BTreeSet::new(),
+                        },
+                    ),
+                    (
+                        child.clone(),
+                        select::Input {
+                            properties,
+                            bindings: BTreeSet::new(),
+                        },
+                    ),
+                ]),
+                candidates: BTreeMap::new(),
+                runtime: BTreeMap::new(),
+            },
+            CaptureScope {
+                retained: roots,
+                candidates: BTreeSet::new(),
+            },
+        )
+    };
+    for kind in ["C", "D", "F", "TR"] {
+        let ordinary = captured(kind, false, true);
+        assert!(
+            ordinary.objects().any(|id| id == &child),
+            "the full capture remains intact"
+        );
+        let owners = ordinary.effective_owners().unwrap();
+        assert!(owners.contains_key(&parent));
+        assert!(!owners.contains_key(&child), "{kind}");
+        // An explicitly retained child (including a cascade/trigger barrier)
+        // still has to reproduce its owner. Standalone defaults are roots too.
+        assert!(
+            captured(kind, true, true)
+                .effective_owners()
+                .unwrap()
+                .contains_key(&child),
+            "{kind}"
+        );
+        assert!(
+            captured(kind, false, false)
+                .effective_owners()
+                .unwrap()
+                .contains_key(&child),
+            "{kind}"
+        );
+    }
+    for kind in ["PK", "UQ", "future-kind"] {
+        assert!(
+            captured(kind, false, true)
+                .effective_owners()
+                .unwrap()
+                .contains_key(&child),
+            "{kind}"
+        );
+    }
+}

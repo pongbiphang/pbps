@@ -46,6 +46,10 @@ impl CapturedInputs {
                     && input.properties.get("user_defined")
                         == Some(&serde_json::Value::Bool(true))))
                     && input.properties.get("engine") != Some(&serde_json::Value::Bool(true))
+                    // The capture keeps a complete target closure, while staged
+                    // shapes deliberately omit designated children. Their
+                    // absence on scratch is not an ownership change (DEC-2270.2).
+                    && (!super::staged::skipped_child(input) || self.scope.retained.contains(*id))
             })
             .map(|(id, input)| {
                 let owner: ObjectIdentity = input

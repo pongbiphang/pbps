@@ -397,6 +397,7 @@ mod producer {
                 pbps_model::resolver::OutsideWrites::Allowed
             }
         };
+        let same_instance = same_instance(driver, &request.selection.profile);
         let run = async |scratch: &str, standard: &scratch::Standard, provenance: Provenance| {
             scratch::produce_unsealed(
                 driver,
@@ -427,6 +428,7 @@ mod producer {
                     entry: request.selection.name.to_owned(),
                     scratch: pbps_model::resolver::ScratchSource::Server {},
                     outside_writes,
+                    same_instance,
                 };
                 run(
                     &scratch,
@@ -443,6 +445,7 @@ mod producer {
                         image: image.as_str().into(),
                     },
                     outside_writes,
+                    same_instance,
                 };
                 scratch::container::with_container(
                     driver,
@@ -463,6 +466,33 @@ mod producer {
             }
         };
         produced.map_err(|failure| refused(request, failure))
+    }
+
+    /// Omission never grants consent; inapplicability stays distinct from refusal.
+    pub(super) fn same_instance(
+        driver: pbps_db::Driver,
+        profile: &pbps_config::resolver::ResolverProfile,
+    ) -> pbps_model::resolver::SameInstance {
+        use pbps_config::resolver::ResolverProfile;
+        match (driver, profile) {
+            (pbps_db::Driver::Mssql, profile) => {
+                let choice = match profile {
+                    ResolverProfile::Server { same_instance, .. } => {
+                        same_instance.unwrap_or_default()
+                    }
+                    ResolverProfile::Docker { .. } => pbps_config::resolver::SameInstance::Refuse,
+                };
+                match choice {
+                    pbps_config::resolver::SameInstance::Refuse => {
+                        pbps_model::resolver::SameInstance::Refused
+                    }
+                    pbps_config::resolver::SameInstance::Allow => {
+                        pbps_model::resolver::SameInstance::Allowed
+                    }
+                }
+            }
+            (pbps_db::Driver::Postgres, _) => pbps_model::resolver::SameInstance::NotApplicable,
+        }
     }
 
     fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {
@@ -531,6 +561,67 @@ mod producer {
 mod tests {
     use super::*;
     use pbps_model::{Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
+
+    #[test]
+    fn runtime_policy_preserves_applicability_without_implicit_consent() {
+        use pbps_db::Driver;
+        use pbps_model::resolver::SameInstance;
+        for (dialect, driver, entry, expected) in [
+            (
+                "mssql",
+                Driver::Mssql,
+                "{kind: server, url_env: S}",
+                SameInstance::Refused,
+            ),
+            (
+                "mssql",
+                Driver::Mssql,
+                "{kind: server, url_env: S, outside_writes: allow}",
+                SameInstance::Refused,
+            ),
+            (
+                "mssql",
+                Driver::Mssql,
+                "{kind: server, url_env: S, same_instance: refuse}",
+                SameInstance::Refused,
+            ),
+            (
+                "mssql",
+                Driver::Mssql,
+                "{kind: server, url_env: S, same_instance: allow}",
+                SameInstance::Allowed,
+            ),
+            (
+                "mssql",
+                Driver::Mssql,
+                "{kind: docker, image: mssql:2025}",
+                SameInstance::Refused,
+            ),
+            (
+                "postgres",
+                Driver::Postgres,
+                "{kind: server, url_env: S}",
+                SameInstance::NotApplicable,
+            ),
+            (
+                "postgres",
+                Driver::Postgres,
+                "{kind: docker, image: postgres:18}",
+                SameInstance::NotApplicable,
+            ),
+        ] {
+            let config = pbps_config::Config::parse(
+                &format!("dialect: {dialect}\nresolvers:\n  scratch: {entry}\n"),
+                std::path::Path::new("pbps.yml"),
+            )
+            .unwrap();
+            assert_eq!(
+                producer::same_instance(driver, &config.resolvers["scratch"]),
+                expected,
+                "{dialect} {entry}"
+            );
+        }
+    }
 
     // Unix only: the fixture makes Unix symlinks.
     #[test]
@@ -615,6 +706,7 @@ mod tests {
             outside_writes: Default::default(),
         });
         let server = selection(ResolverProfile::Server {
+            same_instance: None,
             url_env: "PBPS_UNUSED".into(),
             standard: None,
             externals: None,
@@ -716,6 +808,7 @@ mod tests {
             name: "local".into(),
             source: pbps_config::resolver::SelectionSource::Cli,
             profile: pbps_config::resolver::ResolverProfile::Server {
+                same_instance: None,
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
                 standard: None,
                 externals: None,

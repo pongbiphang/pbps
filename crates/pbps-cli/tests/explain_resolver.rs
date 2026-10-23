@@ -43,6 +43,7 @@ fn sealed_under(
             scratch: ScratchSource::Server {},
             layout: ScratchLayout::Supplied,
             outside_writes: OutsideWrites::Refused,
+            same_instance: pbps_model::resolver::SameInstance::NotApplicable,
         },
         IdsFile::default(),
     )
@@ -954,6 +955,7 @@ fn resolved_plan_holding(text: &str) -> SavedPlan {
             scratch: ScratchSource::Docker { image: text.into() },
             layout: ScratchLayout::RunOwned,
             outside_writes: OutsideWrites::Refused,
+            same_instance: pbps_model::resolver::SameInstance::NotApplicable,
         },
         IdsFile::default(),
     )
@@ -1293,5 +1295,57 @@ fn a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply() {
         }
         let out = apply_refused_allowing(&artifact, &checksum, &["destructive", "not-null"]);
         assert_inert(&out, &[&fragment], &format!("apply: {what}"));
+    }
+}
+
+// Exercise the shared artifact carrier and presentation through the existing
+// reader fixture. SQL Server qualification/reader admission remains #2143.
+#[test]
+fn same_instance_is_explained_and_tampering_fails_the_approved_checksum() {
+    for policy in [SameInstance::Refused, SameInstance::Allowed] {
+        let plan = sealed(
+            pbps_pg::resolver::compatibility::REPORTED_RULE,
+            Default::default(),
+            ChangeSet::default(),
+            ResolverRuntime::Scratch {
+                entry: "scratch".into(),
+                scratch: ScratchSource::Server {},
+                layout: ScratchLayout::Supplied,
+                outside_writes: OutsideWrites::Refused,
+                same_instance: policy,
+            },
+            IdsFile::default(),
+        );
+        let mut value = serde_json::to_value(&plan).unwrap();
+        let artifact = Artifact::new(&value);
+        let expected = match policy {
+            SameInstance::Refused => "refused",
+            SameInstance::Allowed => "allowed",
+            SameInstance::NotApplicable => unreachable!(),
+        };
+        let out = artifact.explain("text");
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains(&format!("same-instance externals file {expected}")),
+            "{out:?}"
+        );
+        let out = artifact.explain("json");
+        assert!(out.status.success(), "{out:?}");
+        let output: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(output["data"]["resolver"]["same_instance"], expected);
+        value["analysis"]["evidence"]["qualification"]["runtime"]["same_instance"] =
+            if policy == SameInstance::Allowed {
+                "refused".into()
+            } else {
+                "allowed".into()
+            };
+        let tampered = Artifact::new(&value);
+        let out = apply_refused(&tampered, &plan.wire_fingerprint());
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("checksum"),
+            "{out:?}"
+        );
     }
 }

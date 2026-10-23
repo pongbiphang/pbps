@@ -79,6 +79,9 @@ pub(super) async fn scratch<'a>(
     provenance: &'a Provenance,
 ) -> Result<(Provisioning, Scratch<'a>), ProduceError> {
     let result = async {
+        if provenance.same_instance.is_not_applicable() {
+            return Err(Error::Unusable("SQL Server requires an explicit refused or allowed same_instance runtime value".into()));
+        }
         let identity = sql::cluster_identity(target).await.map_err(read)?;
         if identity != planned_identity {
             return Err(Error::Unusable(
@@ -103,9 +106,10 @@ pub(super) async fn scratch<'a>(
                     "the scratch database is the target database".into(),
                 ));
             }
-            sql::Placement::SameInstance if externals.is_some() => {
+            sql::Placement::SameInstance if externals.is_some()
+                && provenance.same_instance != pbps_model::resolver::SameInstance::Allowed => {
                 return Err(Error::Binding(
-                    "a same-instance externals file waits for the explicit policy (#2270)".into(),
+                    "an externals file on the target's SQL Server instance requires `same_instance: allow` on the server resolver entry".into(),
                 ));
             }
             sql::Placement::SameInstance => Provisioning::Supplied,
@@ -348,7 +352,10 @@ impl Scratch<'_> {
             .map_err(read)?;
         let created = externals::created(&before, &after);
         let target_scope = capture::CaptureScope {
-            retained: created.clone(),
+            // Inventory carries children with their new parent. Keep explicit
+            // external roots too, including cascade/trigger barriers that
+            // authorization must still compare (DEC-2270.2).
+            retained: created.union(required.roots()).cloned().collect(),
             candidates: BTreeSet::new(),
         };
         let target_inputs = capture::capture(target_connection, &target_scope)

@@ -45,6 +45,10 @@ pub enum ResolverRuntime {
         /// Whether the baseline's writes outside the scratch database were
         /// refused or allowed (#1674).
         outside_writes: OutsideWrites,
+        /// Omitted only for legacy PostgreSQL evidence. A SQL Server reader
+        /// must require an applicable value; absence is never consent (#2270).
+        #[serde(default, skip_serializing_if = "SameInstance::is_not_applicable")]
+        same_instance: SameInstance,
     },
 }
 
@@ -78,6 +82,22 @@ pub enum ScratchSource {
 pub enum OutsideWrites {
     Refused,
     Allowed,
+}
+
+/// Applicability is separate from consent, preserving legacy PostgreSQL bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SameInstance {
+    #[default]
+    NotApplicable,
+    Refused,
+    Allowed,
+}
+
+impl SameInstance {
+    pub fn is_not_applicable(&self) -> bool {
+        *self == Self::NotApplicable
+    }
 }
 
 /// Environment-keyed fingerprints of the complete qualified observations.
@@ -663,6 +683,7 @@ mod tests {
                     scratch: ScratchSource::Server {},
                     layout: ScratchLayout::Supplied,
                     outside_writes: OutsideWrites::Refused,
+                    same_instance: SameInstance::NotApplicable,
                 },
             },
             AuthorizationCondition {
@@ -796,6 +817,58 @@ mod tests {
                     "{pointer}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn legacy_postgres_runtime_round_trips_without_same_instance() {
+        let legacy = r#"{"kind":"scratch","entry":"scratch","scratch":{"kind":"server"},"layout":"supplied","outside_writes":"refused"}"#;
+        let runtime: ResolverRuntime = serde_json::from_str(legacy).unwrap();
+        let ResolverRuntime::Scratch { same_instance, .. } = &runtime;
+        assert_eq!(*same_instance, SameInstance::NotApplicable);
+        assert_ne!(*same_instance, SameInstance::Allowed);
+        assert_eq!(serde_json::to_string(&runtime).unwrap(), legacy);
+        let original = serde_json::to_string(&plan()).unwrap();
+        let restored: SavedPlan = serde_json::from_str(&original).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), original);
+        for invalid in ["null", "true", "\"allow\"", "\"unknown\""] {
+            let json = legacy.replacen("{", &format!("{{\"same_instance\":{invalid},"), 1);
+            assert!(
+                serde_json::from_str::<ResolverRuntime>(&json).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_instance_choice_is_sealed_in_the_plan_identity() {
+        let mut plan = plan();
+        let PlanAnalysis::Resolved(evidence) = &mut plan.analysis else {
+            panic!("resolved");
+        };
+        let ResolverRuntime::Scratch { same_instance, .. } = &mut evidence.qualification.runtime;
+        *same_instance = SameInstance::Allowed;
+        plan.validate_analysis().unwrap();
+        let checksum = plan.wire_fingerprint();
+        let mut tampered = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            tampered["analysis"]["evidence"]["qualification"]["runtime"]["same_instance"],
+            "allowed"
+        );
+        for policy in [Some("refused"), None] {
+            let runtime = tampered["analysis"]["evidence"]["qualification"]["runtime"]
+                .as_object_mut()
+                .unwrap();
+            match policy {
+                Some(value) => {
+                    runtime.insert("same_instance".into(), value.into());
+                }
+                None => {
+                    runtime.remove("same_instance");
+                }
+            }
+            let changed: SavedPlan = serde_json::from_value(tampered.clone()).unwrap();
+            assert_ne!(changed.wire_fingerprint(), checksum);
         }
     }
 
@@ -1035,6 +1108,7 @@ mod tests {
             },
             layout: ScratchLayout::RunOwned,
             outside_writes: OutsideWrites::Allowed,
+            same_instance: SameInstance::NotApplicable,
         };
         evidence.validate(&plan.changes).unwrap();
         assert_eq!(
@@ -1057,6 +1131,7 @@ mod tests {
                 },
                 layout: ScratchLayout::RunOwned,
                 outside_writes: OutsideWrites::Refused,
+                same_instance: SameInstance::NotApplicable,
             };
             assert_eq!(
                 evidence.validate(&plan.changes),
