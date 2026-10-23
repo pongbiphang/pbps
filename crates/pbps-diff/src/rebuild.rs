@@ -399,3 +399,9 @@ pub fn qualify(
 
 #[cfg(test)]
 mod tests;
+
+// One case table drives pure resolution, offline CLI and both live engines.
+// It must not become a second description of the supported member lifecycle.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub mod member_cases;

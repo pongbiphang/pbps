@@ -205,6 +205,118 @@ fn unreserved_names_still_receive_live_identities() {
     }
 }
 
+#[test]
+fn every_approved_member_change_resolves_without_other_identity_intent() {
+    let base = member_cases::source();
+    let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let mut unresolved = Vec::new();
+    for case in member_cases::cases() {
+        let result = record(
+            side(&base, &ids),
+            &case.desired,
+            &ids,
+            &member_cases::root(),
+            20,
+            &"maintenance".parse().unwrap(),
+            &ctx(),
+        );
+        if let Some(why) = case.refusal {
+            let error = result.expect_err(&case.name);
+            assert!(error.why.contains(why), "{}: {error}", case.name);
+            continue;
+        }
+        let approval = result.expect(&case.name);
+        for resolution in [
+            crate::resolve(&case.desired, &approval, &[], &ctx()),
+            crate::resolve_with_annotations(&case.desired, &approval, &[], 0, &ctx()),
+            crate::resolve_pulled(&case.desired, &approval, &BTreeMap::new(), &ctx()),
+        ] {
+            let resolution = match resolution {
+                Ok(resolution) => resolution,
+                Err(blockers) => {
+                    unresolved.push(format!("{}: {blockers:?}", case.name));
+                    continue;
+                }
+            };
+            assert_eq!(resolution.ids, approval, "{}", case.name);
+            assert_eq!(
+                resolution,
+                crate::Resolution {
+                    ids: approval.clone(),
+                    ..Default::default()
+                },
+                "{}",
+                case.name
+            );
+            resolution.ids.validate().unwrap();
+            let payload = qualify(
+                side(&base, &ids),
+                side(&case.desired, &resolution.ids),
+                &member_cases::root(),
+            )
+            .expect(&case.name);
+            assert_eq!(payload.before, base.tables, "{}", case.name);
+            assert_eq!(payload.after, case.desired.tables, "{}", case.name);
+            assert_eq!(
+                crate::resolve(&case.desired, &resolution.ids, &[], &ctx()).unwrap(),
+                resolution,
+                "{}",
+                case.name
+            );
+        }
+    }
+    assert!(unresolved.is_empty(), "{}", unresolved.join("\n"));
+}
+
+#[test]
+fn only_recorded_members_are_exempt_from_ordinary_drop_intent() {
+    let (mut base, _, mut desired) = fixture();
+    let other = TableName::new("app", "other");
+    base.tables
+        .insert(other.clone(), base.tables[&table()].clone());
+    desired
+        .tables
+        .insert(other.clone(), base.tables[&other].clone());
+    let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let approval = recorded(&base, &ids, &desired);
+    for drop_table in [false, true] {
+        let mut omitted = desired.clone();
+        if drop_table {
+            omitted.tables.remove(&other);
+        } else {
+            omitted
+                .tables
+                .get_mut(&other)
+                .unwrap()
+                .columns
+                .shift_remove("bucket");
+        }
+        let blockers = crate::resolve(&omitted, &approval, &[], &ctx()).unwrap_err();
+        assert!(
+            matches!(&blockers[..], [crate::Blocker::DropTableNeedsReason { table: name }] if drop_table && name == &other)
+                || matches!(&blockers[..], [crate::Blocker::DropColumnNeedsReason { column }] if !drop_table && column == &other.column("bucket")),
+            "{blockers:?}"
+        );
+    }
+    // Removing the recorded permission restores the ordinary drop requirements.
+    let mut withdrawn = approval;
+    withdrawn.rebuilds.clear();
+    desired.tables.remove(&TableName::new("app", "p1"));
+    desired
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .shift_remove("k");
+    let blockers = crate::resolve(&desired, &withdrawn, &[], &ctx()).unwrap_err();
+    assert!(blockers.iter().any(|b| matches!(b, crate::Blocker::DropTableNeedsReason { table: name } if name == &TableName::new("app", "p1"))));
+    assert!(blockers.iter().any(|b| matches!(b, crate::Blocker::DropColumnNeedsReason { column } if column == &table().column("k"))));
+}
+
 fn check_partition_override_is_refused(own: PartitionColumn) {
     let (base, ids, desired) = fixture();
     let approval = recorded(&base, &ids, &desired);

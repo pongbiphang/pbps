@@ -1043,6 +1043,11 @@ whose recorded permission is withdrawn by removing its `moves` entry; no new
 cancel command or allow word is introduced. Reapprove against the changed
 source if a rebuild is still wanted. Identity files are validated before any
 write, and the shared CLI ledger boundary validates every snapshot's IDs.
+Before classifying appeared or disappeared names, resolution treats the union
+of source and replacement membership as owned by the pending expansion.
+Omitted source members keep their live UIDs; new replacement members retain
+only their reserved UIDs. These member changes require no separate identity
+intent and never become ordinary rename candidates or tombstones.
 If a snapshot omits any source table or column, its pending rebuild is omitted
 as a whole; retaining only the parent cannot describe a valid lineage. An
 empty managed RANGE parent is still a rebuildable tree: PostgreSQL permits

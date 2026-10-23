@@ -25,6 +25,9 @@ mod managed_types;
 #[path = "support/type_refs.rs"]
 mod type_refs;
 
+#[path = "support/rebuild_members.rs"]
+mod rebuild_members;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 const REBUILD_ALIAS_SOURCE: &str = "table: app.p\ncolumns:\n  k: {type: int}\n  bucket: {type: int4}\n  label: {type: varchar(20)}\n  spelled: {type: character varying(30)}\n  stamp: {type: timestamptz}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
@@ -234,6 +237,11 @@ fn added_partitions_and_columns_record_and_plan_with_reserved_rebuild_identities
 }
 
 #[test]
+fn every_recorded_member_change_reaches_pending_rebuild_offline() {
+    rebuild_members::check(None);
+}
+
+#[test]
 fn partition_overrides_refuse_rebuild_recording_without_writing_ids() {
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
     for own in ["default: '7'", "nullable: false"] {
@@ -346,6 +354,7 @@ fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
 #[test]
 #[ignore = "needs live pg"]
 fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
+    rebuild_members::live();
     let own = OwnDatabase::new(&server(), "rebuild2298");
     let connection = own.connection();
     on_server(

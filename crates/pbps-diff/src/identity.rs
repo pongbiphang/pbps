@@ -958,14 +958,22 @@ fn resolve_tables(
         .map(|(u, n)| (n.clone(), u.clone()))
         .collect();
 
-    // Replacement names belong to the recorded expansion, including members
-    // absent from the source. Resolving them here would give the same desired
-    // object a second identity before the rebuild can qualify (DEC-2298.2).
+    // The expansion owns the entire member lifecycle: source identities stay
+    // live even when omitted, and replacement names stay reserved even when
+    // new. Neither end is an ordinary addition, deletion or rename candidate
+    // until that expansion consumes the approval (DEC-2298.1, DEC-2298.2).
     let reserved: BTreeSet<TableName> = r
         .ids
         .rebuilds
         .values()
-        .flat_map(|rebuild| rebuild.replacement.tables.values().cloned())
+        .flat_map(|rebuild| {
+            rebuild
+                .source
+                .tables
+                .values()
+                .chain(rebuild.replacement.tables.values())
+                .cloned()
+        })
         .collect();
 
     let mut appeared: BTreeSet<TableName> = declared_names
@@ -975,7 +983,7 @@ fn resolve_tables(
         .collect();
     let mut disappeared: BTreeSet<TableName> = known
         .keys()
-        .filter(|n| !declared_names.contains(n))
+        .filter(|n| !declared_names.contains(n) && !reserved.contains(*n))
         .cloned()
         .collect();
 
@@ -1132,11 +1140,17 @@ fn resolve_columns(
             .or_default()
             .insert(c.name.clone(), u.clone());
     }
-    // Group reservations once as well: only exact replacement names are
-    // reserved, so unrelated additions on the same parent still get UIDs.
+    // Group the whole rebuild membership once as well. Source-only columns
+    // stay live and replacement-only columns stay reserved; unrelated column
+    // additions and deletions on the same parent still need ordinary resolution.
     let mut reserved_by_table: BTreeMap<TableName, BTreeSet<ColumnName>> = BTreeMap::new();
     for rebuild in r.ids.rebuilds.values() {
-        for column in rebuild.replacement.columns.values() {
+        for column in rebuild
+            .source
+            .columns
+            .values()
+            .chain(rebuild.replacement.columns.values())
+        {
             reserved_by_table
                 .entry(column.table.clone())
                 .or_default()
@@ -1167,7 +1181,7 @@ fn resolve_columns(
             .collect();
         let mut disappeared: BTreeSet<ColumnName> = known
             .keys()
-            .filter(|n| !declared_cols.contains(n))
+            .filter(|n| !declared_cols.contains(n) && !reserved.contains(*n))
             .cloned()
             .collect();
 
