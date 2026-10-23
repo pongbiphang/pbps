@@ -242,14 +242,15 @@ fn errors_the_series_adds(
     now: i64,
 ) -> Vec<crate::output::Finding> {
     let errors = |schema| {
-        crate::declaration_policy_findings(project, dialect, schema, None, now)
+        crate::raw_declaration_policy_findings(project, dialect, schema, None, now)
             .into_iter()
-            .filter(|f| f.severity == crate::output::Severity::Error)
+            .filter(|f| f.severity == pbps_model::Severity::Error)
     };
     let had: std::collections::BTreeSet<(String, String)> =
         errors(before).map(|f| (f.id, f.message)).collect();
     errors(after)
         .filter(|f| !had.contains(&(f.id.clone(), f.message.clone())))
+        .map(crate::declaration_finding)
         .collect()
 }
 
@@ -373,5 +374,45 @@ mod tests {
             assert_eq!(added.len(), 1, "{now}: {added:?}");
             assert!(added[0].contains("Ev_2027_01"), "{now}: {added:?}");
         }
+    }
+
+    #[test]
+    fn declaration_keys_stay_raw_until_the_series_has_compared_them() {
+        let raw = "Bad\n\u{1b}[31m\u{9b}\\\u{202e}名前";
+        let literal = raw.replace('\n', r"\n");
+        let dialect = pbps_pg::Postgres::new();
+        let project = project();
+        let before = schema(&[raw]);
+        let keys =
+            crate::raw_declaration_policy_findings(&project, &dialect, &before, None, LONG_AFTER);
+        let key = format!("app.{raw}: table `{raw}` does not match `^[a-z][a-z0-9_]*$`");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].message, key);
+        assert_eq!(
+            keys[0].subject.as_deref(),
+            Some(format!("app.{raw}").as_str())
+        );
+        let presented =
+            crate::declaration_policy_findings(&project, &dialect, &before, None, LONG_AFTER);
+        let shown = pbps_model::escape::Escaped(&key).to_string();
+        assert_eq!(presented[0].message, shown);
+        assert_eq!(
+            serde_json::to_value(&presented[0]).unwrap()["message"],
+            shown
+        );
+        assert!(
+            errors_the_series_adds(&project, &dialect, &before, &before, LONG_AFTER).is_empty()
+        );
+        let after = schema(&[raw, &literal]);
+        let added = errors_the_series_adds(&project, &dialect, &before, &after, LONG_AFTER);
+        assert_eq!(added.len(), 1);
+        let literal_key =
+            format!("app.{literal}: table `{literal}` does not match `^[a-z][a-z0-9_]*$`");
+        assert_eq!(
+            added[0].message,
+            pbps_model::escape::Escaped(&literal_key).to_string()
+        );
+        assert_ne!(added[0].message, shown);
+        assert!(!added[0].message.chars().any(char::is_control));
     }
 }

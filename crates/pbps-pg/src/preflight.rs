@@ -1729,7 +1729,8 @@ fn unprobeable_probe(
              spell the value",
             described.join(", "),
             child = child.shown(),
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(key.as_str()),
         ),
         format!(
             "SELECT {} AS n\n  \
@@ -2282,7 +2283,7 @@ fn planned_key_probes(
                     // the update is one no probe can compare.
                     for c in uncomparable {
                         refused
-                            .entry(c.raw().to_owned())
+                            .entry(c.shown().to_string())
                             .or_default()
                             .insert(row_key.to_string());
                     }
@@ -2342,7 +2343,7 @@ fn planned_key_probes(
                 if !left_unprobeable.is_empty() && !written_null {
                     for c in left_unprobeable {
                         refused
-                            .entry(c.raw().to_owned())
+                            .entry(c.shown().to_string())
                             .or_default()
                             .insert(row_key.to_string());
                     }
@@ -2393,7 +2394,8 @@ fn planned_key_probes(
                  adds on a column it also adds, whose default is what every stored row will hold \
                  there; the key cannot be added once the row is gone{guard_note}",
                 a.child.shown(),
-                table = table.shown()
+                table = table.shown(),
+                key = pbps_model::escape::Escaped(key.as_str()),
             ),
             format!(
                 "SELECT {} AS n;",
@@ -2469,7 +2471,8 @@ fn planned_key_probes(
                  spell the value",
                 a.child.shown(),
                 described.join(", "),
-                table = table.shown()
+                table = table.shown(),
+                key = pbps_model::escape::Escaped(key.as_str()),
             ),
             format!("SELECT {} AS n;", saturated_count(&terms.join(" + "))),
         ));

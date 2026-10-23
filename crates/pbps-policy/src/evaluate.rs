@@ -83,6 +83,8 @@ impl Live<'_> {
 
 /// The declaration rules over the whole schema (the `validate` point).
 pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<Finding> {
+    // These messages are raw comparison keys for partitions extend. The CLI
+    // projects them to prose only after comparing the original (id, message).
     let mut out = Vec::new();
 
     for (id, what) in [
@@ -98,10 +100,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
             // Switched on with nothing to match against says nothing.
             continue;
         };
-        let Ok(re) = regex_lite::Regex::new(&format!(
-            "^(?:{pattern})$",
-            pattern = pbps_model::escape::Escaped(pattern),
-        )) else {
+        let Ok(re) = regex_lite::Regex::new(&format!("^(?:{pattern})$")) else {
             continue; // `check` has already reported it.
         };
         for (name, table) in &schema.tables {
@@ -160,9 +159,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                         Some(&subject),
                         format!(
                             "{name}: {kind} `{n}` does not match `{pattern}`",
-                            name = name.shown(),
-                            n = pbps_model::escape::Escaped(&n),
-                            pattern = pbps_model::escape::Escaped(pattern),
+                            name = name.raw()
                         ),
                     ));
                 }
@@ -186,7 +183,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                         "{name}: {} declared rows is above {max} — this does not look like \
                          reference data, and every plan compares it row by row",
                         data.rows.len(),
-                        name = name.shown()
+                        name = name.raw()
                     ),
                 ));
             }
@@ -209,10 +206,9 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                         Some(&subject),
                         format!(
                             "{name}.{column}: `{}` {advice}",
-                            spec.ty.shown(),
-                            name = name.shown(),
-                            column = column.shown(),
-                            advice = pbps_model::escape::Escaped(advice),
+                            spec.ty.raw(),
+                            name = name.raw(),
+                            column = column.raw(),
                         ),
                     ));
                 }
@@ -1302,6 +1298,95 @@ mod tests {
                     .iter()
                     .any(|(_, f)| f.id == "change.narrowing-on-data")
             );
+        }
+    }
+
+    #[test]
+    fn naming_regexes_match_the_original_program_and_reject_literal_lookalikes() {
+        for (pattern, matching, other) in [
+            (r"item\d+", "item12", r"item\d"),
+            (r"item\\tail", r"item\tail", "itemtail"),
+        ] {
+            let policies: Policies = serde_json::from_value(serde_json::json!({
+                "rules": {"naming.table": {"severity": "error", "pattern": pattern}}
+            }))
+            .unwrap();
+            assert!(policies.check().is_empty());
+            let evaluate = |name: &str| {
+                let mut schema = Schema::default();
+                schema.tables.insert(
+                    pbps_model::TableName::new("app", name),
+                    pbps_model::Table::default(),
+                );
+                declarations(&schema, &policies, &ctx())
+                    .into_iter()
+                    .filter(|finding| finding.id == "naming.table")
+                    .collect::<Vec<_>>()
+            };
+            assert!(evaluate(matching).is_empty(), "{pattern}: {matching}");
+            let rejected = evaluate(other);
+            assert_eq!(rejected.len(), 1, "{pattern}: {other}");
+            assert_eq!(
+                rejected[0].message,
+                format!("app.{other}: table `{other}` does not match `{pattern}`")
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_comparison_keys_retain_the_original_name_bytes() {
+        let policies: Policies = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "naming.table": {"severity": "error", "pattern": "ordinary"},
+                "data.max-rows": {"rows": 0}
+            }
+        }))
+        .unwrap();
+        for name in [
+            "Bad\n\u{1b}[31m\u{9b}\\\u{202e}名前",
+            r"Bad\n",
+            "名前_ünï❤️",
+        ] {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                name.into(),
+                pbps_model::Column::new(pbps_model::ColumnType::simple("image")),
+            );
+            table.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: [(pbps_model::RowKey::from("1"), Default::default())].into(),
+            });
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert(pbps_model::TableName::new("app", name), table);
+            let mut context = ctx();
+            context.deprecated_types = &[("image", "advice")];
+            let findings = declarations(&schema, &policies, &context);
+            assert_eq!(findings.len(), 3);
+            for (rule, expected) in [
+                (
+                    "naming.table",
+                    format!("app.{name}: table `{name}` does not match `ordinary`"),
+                ),
+                (
+                    "data.max-rows",
+                    format!(
+                        "app.{name}: 1 declared rows is above 0 — this does not look like reference data, and every plan compares it row by row"
+                    ),
+                ),
+                (
+                    "column.no-deprecated-type",
+                    format!("app.{name}.{name}: `image` advice"),
+                ),
+            ] {
+                let finding = findings.iter().find(|finding| finding.id == rule).unwrap();
+                assert_eq!(
+                    finding.subject.as_deref(),
+                    Some(format!("app.{name}").as_str())
+                );
+                assert_eq!(finding.message, expected);
+            }
         }
     }
 }

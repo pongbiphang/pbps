@@ -85,9 +85,31 @@ pub fn drift_and_ledger(server: &str, pg: bool) {
         ok(d.run(&["plan"]));
         d.commit();
         let path = d.dir.join("plan.json");
-        ok(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        ok(d.run_with_env(
+            &["plan", "--env", name, "--out", path.to_str().unwrap()],
+            &[("PBPS_STEP5_CONNECTION", connection)],
+        ));
         let plan: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The baseline is opaque Text data; its renderer performs the one escape.
+        let baseline = format!("{name} as queried (entry #1)");
+        assert_eq!(plan.baseline.description.raw(), baseline);
+        let explanation = d.run(&["explain", "--plan", path.to_str().unwrap()]);
+        assert_eq!(
+            code(&explanation),
+            0,
+            "{}{}",
+            stdout(&explanation),
+            stderr(&explanation)
+        );
+        assert!(
+            stdout(&explanation).contains(&format!(
+                "  baseline    {}\n",
+                pbps_model::escape::Escaped(&baseline)
+            )),
+            "{:?}",
+            stdout(&explanation)
+        );
         let checksum = plan.wire_fingerprint();
         let alter = if pg { "TYPE bigint" } else { "bigint NULL" };
         on_server(

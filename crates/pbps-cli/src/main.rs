@@ -2595,6 +2595,21 @@ pub(crate) fn declaration_policy_findings(
     only: Option<std::collections::BTreeSet<String>>,
     now: i64,
 ) -> Vec<output::Finding> {
+    raw_declaration_policy_findings(project, dialect, schema, only, now)
+        .into_iter()
+        .map(declaration_finding)
+        .collect()
+}
+
+/// Declaration messages are comparison data for the partition generator.
+/// Keep their original bytes until its (id, message) comparison is complete.
+pub(crate) fn raw_declaration_policy_findings(
+    project: &Project,
+    dialect: &dyn Dialect,
+    schema: &Schema,
+    only: Option<std::collections::BTreeSet<String>>,
+    now: i64,
+) -> Vec<pbps_model::Finding> {
     let policies = project.config.policies();
     let mut ctx = policy_context_at(project, dialect, false, now);
     ctx.only = only;
@@ -2606,9 +2621,13 @@ pub(crate) fn declaration_policy_findings(
     // type is, the policy says what to think of it (DECISIONS 187).
     let spelled = types_as_the_dialect_spells_them(schema, dialect);
     pbps_policy::declarations(&spelled, &policies, &ctx)
-        .iter()
-        .map(policy_finding)
-        .collect()
+}
+
+/// Show one opaque declaration key, after any comparison of that key.
+/// Plan findings already contain prose; declaration findings retain raw data.
+pub(crate) fn declaration_finding(mut finding: pbps_model::Finding) -> output::Finding {
+    finding.message = pbps_model::escape::Escaped(&finding.message).to_string();
+    policy_finding(&finding)
 }
 
 /// Refuses a command that writes declarations while the `policies:` block is

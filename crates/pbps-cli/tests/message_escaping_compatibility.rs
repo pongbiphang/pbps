@@ -154,3 +154,137 @@ fn trigger_refusals_show_names_once_in_the_sentence_and_its_sql_example() {
         );
     }
 }
+
+mod plan_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/preflight.rs"
+    ));
+}
+
+#[test]
+fn foreign_key_probe_prose_shows_raw_row_keys_and_defaulted_columns_once() {
+    use plan_fixture::FixturePreflight as _;
+    for name in [NAME, r"literal\n", "名前_ünï❤️"] {
+        let shown = pbps_model::escape::Escaped(name).to_string();
+        let child = TableName::new("app", "child");
+        let parent = TableName::new("app", "parent");
+        for insert in [false, true] {
+            let row = if insert {
+                Change::InsertRow {
+                    table: child.clone(),
+                    key_column: "code".into(),
+                    identity_key: false,
+                    key: name.into(),
+                    row: Default::default(),
+                    defaults: [(name.into(), "lower('OLD')".into())].into(),
+                    types: [(name.into(), "text".parse().unwrap())].into(),
+                }
+            } else {
+                Change::UpdateRow {
+                    table: child.clone(),
+                    key_column: "code".into(),
+                    key: name.into(),
+                    columns: [(
+                        name.into(),
+                        (
+                            Cell::Value(Value::Text("old".into())),
+                            Cell::Default("lower('OLD')".into()),
+                        ),
+                    )]
+                    .into(),
+                    unchanged: Default::default(),
+                    types: Default::default(),
+                    after_types: Default::default(),
+                    key_type: None,
+                }
+            };
+            let changes = ChangeSet {
+                changes: vec![
+                    PlannedChange::new(Change::AddForeignKey {
+                        table: child.clone(),
+                        name: "fk".into(),
+                        constraint: Box::new(ForeignKey {
+                            columns: vec![name.into()],
+                            references_table: parent.clone(),
+                            references_columns: vec!["code".into()],
+                            on_delete: ReferentialAction::NoAction,
+                            on_update: ReferentialAction::NoAction,
+                        }),
+                    }),
+                    PlannedChange::new(row),
+                    PlannedChange::new(Change::DeleteRow {
+                        table: parent.clone(),
+                        key_column: "code".into(),
+                        key: name.into(),
+                        cause: pbps_model::change::DeleteCause::Undeclared,
+                        dropped: Default::default(),
+                        row: Default::default(),
+                        types: Default::default(),
+                        after_types: Default::default(),
+                        key_type: None,
+                    }),
+                ],
+            };
+            for dialect in [
+                &pbps_pg::Postgres::new() as &dyn Dialect,
+                &pbps_mssql::Mssql,
+            ] {
+                let report = dialect.fixture_preflight(&changes);
+                let catalog = report
+                    .probes
+                    .iter()
+                    .find(|p| p.description.starts_with("foreign-key column(s)"))
+                    .unwrap_or_else(|| panic!("{report:#?}"));
+                let assigned = if insert && dialect.name() == "postgres" {
+                    format!(
+                        ", a column row `{shown}` leaves to the engine to assign, where the key reaches one"
+                    )
+                } else {
+                    String::new()
+                };
+                assert_eq!(
+                    catalog.description,
+                    format!(
+                        "foreign-key column(s) of app.child that reference app.parent and that this plan writes to a default the probe cannot evaluate, which may be row `{shown}` being deleted: {shown} (row `{shown}`){assigned}; spell the value"
+                    )
+                );
+                assert!(!catalog.description.chars().any(char::is_control));
+                if dialect.name() == "postgres" {
+                    let planned = report
+                        .probes
+                        .iter()
+                        .find(|p| {
+                            p.description
+                                .starts_with("column(s) of the foreign key this plan adds")
+                        })
+                        .unwrap_or_else(|| panic!("{report:#?}"));
+                    assert_eq!(
+                        planned.description,
+                        format!(
+                            "column(s) of the foreign key this plan adds from app.child into app.parent that hold a default the probe cannot evaluate, which may be row `{shown}` being deleted: {shown} (row `{shown}`); spell the value"
+                        )
+                    );
+                    let ordinary = report
+                        .probes
+                        .iter()
+                        .find(|p| {
+                            p.description
+                                .starts_with("rows of app.child that reference")
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        ordinary.description,
+                        format!(
+                            "rows of app.child that reference app.parent row `{shown}` through the foreign key this plan adds on a column it also adds, whose default is what every stored row will hold there; the key cannot be added once the row is gone"
+                        )
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&changes.changes[1].change).unwrap()["key"],
+                    name
+                );
+            }
+        }
+    }
+}

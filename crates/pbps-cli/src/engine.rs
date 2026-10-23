@@ -237,16 +237,17 @@ pub async fn drop_scan_checks(
         return Ok(Vec::new());
     }
     pbps_pg::staged::drop_scan_checks(conn, checks).await?;
-    Ok(checks
-        .iter()
-        .map(|check| {
-            format!(
-                "the staged attach's temporary CHECK `{}` on `{}`",
-                check.name.shown(),
-                check.table.shown()
-            )
-        })
-        .collect())
+    Ok(checks.iter().map(scan_check_removal_note).collect())
+}
+
+// This value is recorded inside opaque StateSnapshot.reason and participates in
+// its original length/truncation check. Preserve the data; stdout shows it once.
+fn scan_check_removal_note(check: &pbps_dialect::ScanCheck) -> String {
+    format!(
+        "the staged attach's temporary CHECK `{}` on `{}`",
+        check.name.raw(),
+        check.table.raw()
+    )
 }
 
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
@@ -6152,4 +6153,43 @@ pub async fn recheck_type_prerequisites(
 /// Column references in a recorded or declared schema.
 pub fn type_references(schema: &Schema) -> BTreeSet<pbps_model::TypeRef> {
     pbps_pg::type_refs::references(&[schema], &ChangeSet::default())
+}
+
+#[cfg(test)]
+mod removal_note_tests {
+    use super::*;
+
+    #[test]
+    fn scan_check_removal_notes_preserve_ledger_data_and_show_names_once() {
+        for name in [
+            "check\n\u{1b}[31m\u{9b}\\\u{202e}名前",
+            r"check\n",
+            "名前_ünï❤️",
+        ] {
+            let check = pbps_dialect::ScanCheck {
+                table: TableName::new("app", name),
+                name: name.into(),
+                step: pbps_dialect::ScanCheckStep::Add,
+            };
+            let note = scan_check_removal_note(&check);
+            let expected = format!("the staged attach's temporary CHECK `{name}` on `app.{name}`");
+            assert_eq!(note, expected);
+            let mut snapshot = pbps_model::StateSnapshot::new(
+                pbps_model::StateKind::Baseline,
+                Default::default(),
+                Default::default(),
+                "operator",
+            );
+            snapshot.reason = Some(format!("adopt (first removed {note})").into());
+            assert_eq!(
+                serde_json::to_value(&snapshot).unwrap()["reason"],
+                format!("adopt (first removed {expected})")
+            );
+            let shown = pbps_model::escape::Escaped(name).to_string();
+            assert_eq!(
+                pbps_model::escape::Escaped(&note).to_string(),
+                format!("the staged attach's temporary CHECK `{shown}` on `app.{shown}`")
+            );
+        }
+    }
 }

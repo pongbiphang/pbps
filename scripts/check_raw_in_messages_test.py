@@ -468,6 +468,7 @@ class TheAllowlist(unittest.TestCase):
             'crates/pbps-cli/src/dependents.rs',
             'crates/pbps-cli/src/dependents/schedule.rs',
             'crates/pbps-cli/src/dependents/split_oracle.rs',
+            'crates/pbps-cli/src/engine.rs',
             'crates/pbps-cli/src/object_order.rs',
             'crates/pbps-cli/src/report.rs',
             'crates/pbps-cli/src/resolver/scope.rs',

@@ -270,10 +270,15 @@ ALLOWED = {
         "writes a Mermaid document label through its own quoted() escaping; document bytes "
         "remain raw",
     ),
+    "crates/pbps-cli/src/engine.rs": (
+        2,
+        "Two operands build a removal note recorded in opaque StateSnapshot.reason and "
+        "compared by its original truncation check. Stdout escapes the single data value.",
+    ),
     "crates/pbps-policy/src/evaluate.rs": (
-        1,
-        "A role subject is a canonical grouping and policy key; human consumers escape that "
-        "single value.",
+        6,
+        "Five operands build raw declaration-finding comparison keys. The CLI compares these "
+        "before projecting them to prose. One role subject is a canonical grouping/policy key.",
     ),
 }
 

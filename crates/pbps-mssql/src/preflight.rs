@@ -1524,7 +1524,8 @@ fn unprobeable_probe(
              spell the value",
             described.join(", "),
             child = child.shown(),
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(key.as_str()),
         ),
         format!(
             "SELECT COUNT(*) AS n\n  \

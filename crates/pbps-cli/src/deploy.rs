@@ -6092,7 +6092,7 @@ pub fn cmd_baseline(
                 finish_transaction(&mut conn, dialect.as_ref(), body).await
             }?;
             for said in &removed {
-                println!("Removed {}.", said);
+                println!("Removed {}.", pbps_model::escape::Escaped(said));
             }
             Ok::<_, anyhow::Error>((id, tables))
         }
@@ -7794,7 +7794,7 @@ pub fn cmd_plan_db(
                 managed.database_collation.clone(),
                 conn.session_zone().cloned(),
             ),
-            format!("{} as queried (entry #{})", pbps_model::escape::Escaped(&target.label), entry.id),
+            format!("{} as queried (entry #{})", target.label, entry.id),
             vec![
                 permission_support,
                 generation_support,
