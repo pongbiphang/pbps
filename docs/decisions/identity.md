@@ -1007,3 +1007,58 @@ either side of attach. Ordinary own defaults use the boundary's column UID.
 There is no new serialized change or expression rewriting. On both engines,
 calling the child's same-named function instead returns the wrong value;
 with no such function, losing the parent's schema fails execution outright.
+
+<a id="dec-2298-1"></a>
+
+**DEC-2298.1. A partitioned-table rebuild requires recorded identity intent.**
+`pbps rebuild-table <table> --reason <why> --max-rows <N>` records a pending
+blocking rewrite in `schema.ids.json`, like `move-rows`: source identities,
+reserved replacement identities, desired-schema fingerprint, positive row
+cap, reason, date and the project repository's operator. Commit this file
+with the declarations; the command never commits for the user. Repeating the
+same approval preserves its audit fields and reserved identities. The git
+HEAD supplies the source tree; unreadable history is an error. Inherited
+partition columns retain their parent's ownership and receive no extra UIDs.
+No risk word or non-interactive identity inference supplies this permission.
+
+PR1 exposes a typed logical payload but refuses planning and saved-plan
+admission of every pending rebuild. Source identities stay live; reservation
+does not authorize an ordinary drop/create. Only the future order expansion
+may install replacement identities, using effects and settle without another
+pass or rank. Execution remains unavailable until the complete route ships.
+That route must show observed rows and `pg_total_relation_size`, call the plan
+a blocking rewrite, run ANALYZE after copying, and refuse publication trees
+and unmanaged dependents by name. Unreadable catalog facts are refusals, not
+empty sets. These connected requirements have no permissive offline default.
+
+<a id="dec-2298-2"></a>
+
+**DEC-2298.2. Pending rebuild source identities remain fixed until permission is withdrawn.**
+Every identity intent targeting a covered table or column is refused by name,
+including declaration annotations and batched decisions. Automatic identity
+resolution may not discard or rename a covered UID either. The remedy names
+the rebuild's source UID: remove its entry from `rebuilds` in the identity
+file and commit the withdrawal before retrying. This follows `move-rows`,
+whose recorded permission is withdrawn by removing its `moves` entry; no new
+cancel command or allow word is introduced. Reapprove against the changed
+source if a rebuild is still wanted. Identity files are validated before any
+write, and the shared CLI ledger boundary validates every snapshot's IDs.
+Before classifying appeared or disappeared names, resolution treats the union
+of source and replacement membership as owned by the pending expansion.
+Omitted source members keep their live UIDs; new replacement members retain
+only their reserved UIDs. These member changes require no separate identity
+intent and never become ordinary rename candidates or tombstones.
+If a snapshot omits any source table or column, its pending rebuild is omitted
+as a whole; retaining only the parent cannot describe a valid lineage. An
+empty managed RANGE parent is still a rebuildable tree: PostgreSQL permits
+it without children, and changing its key still requires replacement.
+
+<a id="dec-2298-3"></a>
+
+**DEC-2298.3. Rebuild approval and qualification fingerprint one canonical schema.**
+The differ owns a shared canonical-schema constructor using the supplied
+dialect's type normalization. Both the recorded target checksum and every
+qualification use this form, including shape comparisons against catalog
+reads. CLI spelling is not an approval boundary: `int` and `integer` must
+agree offline and connected. A different type or modifier still invalidates
+the approval. No alias table or separate CLI fingerprint is maintained.

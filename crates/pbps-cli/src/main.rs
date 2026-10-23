@@ -357,6 +357,15 @@ enum Command {
         reason: String,
     },
 
+    /// Record intent for a blocking partitioned-table rewrite (execution is not available yet)
+    RebuildTable {
+        table: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_rows: u64,
+        #[arg(long)]
+        reason: pbps_model::Reason,
+    },
+
     /// Generate the declarations of a partitioned table's next partitions
     Partitions {
         #[command(subcommand)]
@@ -537,6 +546,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::MoveRows { .. }
+            | Command::RebuildTable { .. }
             | Command::Partitions { .. }
             | Command::Resolver { .. }
             | Command::Docs { .. }
@@ -1220,6 +1230,11 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
+        Command::RebuildTable {
+            table,
+            max_rows,
+            reason,
+        } => cmd_rebuild_table(&project, &table.parse()?, max_rows, &reason),
         Command::Partitions {
             command:
                 PartitionsCommand::Extend {
@@ -2246,6 +2261,12 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
 
 fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
     let path = project.ids_file();
+    ids.validate().with_context(|| {
+        format!(
+            "refusing to write inconsistent identity file `{}`",
+            path.display()
+        )
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -2944,6 +2965,62 @@ pub struct FmtData {
     /// `check` or `write`. The findings mean different things in each, and a
     /// consumer must not have to infer which ran from their severity.
     mode: &'static str,
+}
+
+/// A rewrite needs the committed source shape as well as names. Keep it out of
+/// name-only inference: an allow word cannot authorize replacement identities.
+fn cmd_rebuild_table(
+    project: &Project,
+    table: &TableName,
+    max_rows: u64,
+    reason: &pbps_model::Reason,
+) -> anyhow::Result<()> {
+    let dialect = dialect(project)?;
+    if dialect.name() != "postgres" {
+        bail!("rebuild-table is only supported for PostgreSQL");
+    }
+    let loaded = load(project, dialect.as_ref())?;
+    let problems = declaration_problems(&loaded, dialect.as_ref());
+    if !problems.is_empty() {
+        bail!(
+            "{}",
+            problems
+                .iter()
+                .map(|(_, why)| why.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    if !loaded.intents.is_empty() {
+        bail!("resolve declaration identity annotations before recording a rebuild");
+    }
+    let ids = read_ids(project)?;
+    let baseline = baseline::load(
+        project,
+        &baseline::Source::Git { rev: "HEAD".into() },
+        dialect.as_ref(),
+    )?;
+    let updated = pbps_diff::rebuild::record(
+        pbps_diff::Side {
+            schema: &baseline.schema,
+            ids: &baseline.ids,
+        },
+        &loaded.schema,
+        &ids,
+        table,
+        max_rows,
+        reason,
+        &context(project.root()),
+        dialect.as_ref(),
+    )?;
+    if updated == ids {
+        println!("The identity file is unchanged; this rebuild intent is already recorded.");
+    } else {
+        write_ids(project, &updated)?;
+        println!("updated {}", project.ids_file().display());
+    }
+    println!("Recorded a blocking rewrite; table rebuild execution is not available yet.");
+    Ok(())
 }
 
 /// Resolves every supplied decision together; only a complete answer is written.
@@ -4258,6 +4335,39 @@ pub(crate) fn test_planning<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_writes_refuse_invalid_mappings_before_touching_the_file() {
+        let stage = adopt::Stage::new("invalid-identity-write").unwrap();
+        let config = stage.path().join("pbps.yml");
+        std::fs::write(
+            &config,
+            "dialect: postgres\nids_file: nested/schema.ids.json\n",
+        )
+        .unwrap();
+        let project = Project::load(&config).unwrap();
+        let path = project.ids_file();
+        let mut invalid = IdsFile::default();
+        invalid
+            .tables
+            .insert("t_aaaaaa".parse().unwrap(), "app.t".parse().unwrap());
+        invalid
+            .tables
+            .insert("t_bbbbbb".parse().unwrap(), "app.t".parse().unwrap());
+        assert!(
+            write_ids(&project, &invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent")
+        );
+        assert!(!path.parent().unwrap().exists());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"original identity bytes").unwrap();
+        assert!(write_ids(&project, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original identity bytes");
+        write_ids(&project, &IdsFile::default()).unwrap();
+        assert_eq!(read_ids(&project).unwrap(), IdsFile::default());
+    }
 
     #[test]
     fn declared_loaders_imply_serial_access_only_for_postgres() {

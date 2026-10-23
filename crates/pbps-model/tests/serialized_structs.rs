@@ -99,6 +99,8 @@ fn persisted_structs_refuse_unknown_fields() {
         "StateSnapshot",
         "SavedPlan",
         "IdsFile",
+        "Rebuild",
+        "RebuildIdentities",
         "Role",
         "DataScope",
         "Finding",

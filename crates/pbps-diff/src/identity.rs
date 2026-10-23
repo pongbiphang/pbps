@@ -143,6 +143,13 @@ pub enum Blocker {
         /// A catalog omission is not evidence that the type is gone.
         unrepresentable: Option<String>,
     },
+
+    /// The recorded source must stay intact until its rebuild is withdrawn.
+    PendingRebuild {
+        uid: Uid,
+        table: TableName,
+        object: String,
+    },
 }
 
 /// The half of a rename that two intents fought over.
@@ -248,6 +255,45 @@ pub fn resolve_with_annotations(
     resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
 }
 
+/// Intent cannot silently alter the source of a separately recorded approval.
+fn pending_rebuild_intents(ids: &IdsFile, intents: &[Intent]) -> Vec<Blocker> {
+    let mut covered = BTreeSet::new();
+    for (uid, rebuild) in &ids.rebuilds {
+        for intent in intents {
+            if !rebuild
+                .source
+                .tables
+                .values()
+                .any(|name| intent.concerns_table(name))
+            {
+                continue;
+            }
+            let object = match intent {
+                Intent::RenameTable { from, to } => {
+                    if rebuild.source.tables.values().any(|name| name == from) {
+                        from
+                    } else {
+                        to
+                    }
+                    .raw()
+                    .to_string()
+                }
+                Intent::RenameColumn { table, from, .. } => table.column(from).raw().to_string(),
+                Intent::DropColumn { column, .. } => column.raw().to_string(),
+                Intent::DropTable { table, .. } | Intent::MoveRows { table, .. } => {
+                    table.raw().to_string()
+                }
+                Intent::RenameRole { .. } | Intent::DropRole { .. } => continue,
+            };
+            covered.insert((uid.clone(), ids.tables[uid].clone(), object));
+        }
+    }
+    covered
+        .into_iter()
+        .map(|(uid, table, object)| Blocker::PendingRebuild { uid, table, object })
+        .collect()
+}
+
 /// `annotation_count` is how many leading `intents` came from declaration
 /// annotations; every later one is a current decision. A plain count, not an
 /// `Option`: an unknown provenance is the state #403 found each gate reading
@@ -259,6 +305,10 @@ fn resolve_with_provenance(
     annotation_count: usize,
     ctx: &Context,
 ) -> Result<Resolution, Vec<Blocker>> {
+    let protected = pending_rebuild_intents(ids, intents);
+    if !protected.is_empty() {
+        return Err(protected);
+    }
     let mut r = Resolution {
         ids: ids.clone(),
         ..Default::default()
@@ -441,6 +491,29 @@ fn resolve_with_provenance(
         }
     }
 
+    // Resolution can also change identity without an explicit command, such
+    // as surrendering a table's own column UIDs when attaching a partition.
+    for (uid, rebuild) in &ids.rebuilds {
+        let changed = rebuild
+            .source
+            .tables
+            .iter()
+            .find_map(|(u, name)| {
+                (r.ids.tables.get(u) != Some(name)).then(|| name.raw().to_string())
+            })
+            .or_else(|| {
+                rebuild.source.columns.iter().find_map(|(u, column)| {
+                    (r.ids.columns.get(u) != Some(column)).then(|| column.raw().to_string())
+                })
+            });
+        if let Some(object) = changed {
+            blockers.push(Blocker::PendingRebuild {
+                uid: uid.clone(),
+                table: ids.tables[uid].clone(),
+                object,
+            });
+        }
+    }
     if blockers.is_empty() {
         sort_resolution(&mut r);
         Ok(r)
@@ -484,6 +557,7 @@ fn resolve_with_provenance(
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
                 | Blocker::MissingType { .. }
+                | Blocker::PendingRebuild { .. }
                 | Blocker::MoveNotBesideDefault { .. } => None,
             };
             if let Some(table) = table
@@ -884,14 +958,32 @@ fn resolve_tables(
         .map(|(u, n)| (n.clone(), u.clone()))
         .collect();
 
+    // The expansion owns the entire member lifecycle: source identities stay
+    // live even when omitted, and replacement names stay reserved even when
+    // new. Neither end is an ordinary addition, deletion or rename candidate
+    // until that expansion consumes the approval (DEC-2298.1, DEC-2298.2).
+    let reserved: BTreeSet<TableName> = r
+        .ids
+        .rebuilds
+        .values()
+        .flat_map(|rebuild| {
+            rebuild
+                .source
+                .tables
+                .values()
+                .chain(rebuild.replacement.tables.values())
+                .cloned()
+        })
+        .collect();
+
     let mut appeared: BTreeSet<TableName> = declared_names
         .iter()
-        .filter(|n| !known.contains_key(**n))
+        .filter(|n| !known.contains_key(**n) && !reserved.contains(**n))
         .map(|n| (*n).clone())
         .collect();
     let mut disappeared: BTreeSet<TableName> = known
         .keys()
-        .filter(|n| !declared_names.contains(n))
+        .filter(|n| !declared_names.contains(n) && !reserved.contains(*n))
         .cloned()
         .collect();
 
@@ -1048,9 +1140,27 @@ fn resolve_columns(
             .or_default()
             .insert(c.name.clone(), u.clone());
     }
+    // Group the whole rebuild membership once as well. Source-only columns
+    // stay live and replacement-only columns stay reserved; unrelated column
+    // additions and deletions on the same parent still need ordinary resolution.
+    let mut reserved_by_table: BTreeMap<TableName, BTreeSet<ColumnName>> = BTreeMap::new();
+    for rebuild in r.ids.rebuilds.values() {
+        for column in rebuild
+            .source
+            .columns
+            .values()
+            .chain(rebuild.replacement.columns.values())
+        {
+            reserved_by_table
+                .entry(column.table.clone())
+                .or_default()
+                .insert(column.name.clone());
+        }
+    }
     for (table_name, table) in &declared.tables {
         let declared_cols: BTreeSet<&ColumnName> = table.columns.keys().collect();
         let known = known_by_table.remove(table_name).unwrap_or_default();
+        let reserved = reserved_by_table.remove(table_name).unwrap_or_default();
         // A partition's columns are its parent's, and it declares none, so a
         // table that holds column uids and is declared as a partition is one
         // being attached (#1545, DEC-1545.1): its columns become the
@@ -1066,12 +1176,12 @@ fn resolve_columns(
 
         let mut appeared: BTreeSet<ColumnName> = declared_cols
             .iter()
-            .filter(|n| !known.contains_key(**n))
+            .filter(|n| !known.contains_key(**n) && !reserved.contains(**n))
             .map(|n| (*n).clone())
             .collect();
         let mut disappeared: BTreeSet<ColumnName> = known
             .keys()
-            .filter(|n| !declared_cols.contains(n))
+            .filter(|n| !declared_cols.contains(n) && !reserved.contains(*n))
             .cloned()
             .collect();
 

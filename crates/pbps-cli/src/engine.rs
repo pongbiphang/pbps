@@ -279,6 +279,15 @@ pub async fn baseline_catalog(
 }
 
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
+    // Snapshot, baseline and apply checkpoints share this write boundary.
+    // Never persist an invalid projection that the next ledger read cannot use.
+    snapshot
+        .ids
+        .validate()
+        .map_err(|error| LedgerError::BadEntry {
+            id: 0,
+            message: format!("the snapshot's identity mapping is inconsistent: {error}"),
+        })?;
     match conn.driver() {
         Driver::Mssql => pbps_mssql::state::record(conn, snapshot).await,
         Driver::Postgres => pbps_pg::state::record(conn, snapshot).await,

@@ -1105,6 +1105,9 @@ question to ask. The plan report says, for each such partition, how many rows
 it may take or that it may take none. An entry for a partition that already
 exists is never consulted, since no plan creates it again.
 
+To withdraw permission, remove that partition UID's entry from `moves` in the
+identity file and commit the withdrawal with the declarations.
+
 ---
 
 ## 7. Change classification and the risk gate

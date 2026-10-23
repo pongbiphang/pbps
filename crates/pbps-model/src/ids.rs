@@ -50,6 +50,9 @@ pub enum IdsError {
     #[error("a move is recorded for {uid}, but no live table entry has that uid")]
     OrphanMove { uid: Uid },
 
+    #[error("the rebuild recorded for {uid} has inconsistent source or replacement identities")]
+    InvalidRebuild { uid: Uid },
+
     #[error("{uid} points at `{}`, but the snapshot schema does not hold it", crate::escape::Escaped(.name))]
     NotHeld { uid: Uid, name: String },
 }
@@ -96,6 +99,11 @@ pub struct IdsFile {
     /// without the section allows no move.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub moves: BTreeMap<Uid, Move>,
+
+    /// Pending blocking rewrites, keyed by the source parent's uid. Reserved
+    /// identities become live only through the future order expansion.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rebuilds: BTreeMap<Uid, crate::Rebuild>,
 }
 
 impl Default for IdsFile {
@@ -108,6 +116,7 @@ impl Default for IdsFile {
             types: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
+            rebuilds: BTreeMap::new(),
         }
     }
 }
@@ -221,6 +230,19 @@ impl IdsFile {
             .retain(|_, column| !tables.contains(&column.table));
         let live = kept.tables.clone();
         kept.moves.retain(|uid, _| live.contains_key(uid));
+        let columns = &kept.columns;
+        kept.rebuilds.retain(|_, rebuild| {
+            rebuild
+                .source
+                .tables
+                .iter()
+                .all(|(uid, name)| live.get(uid) == Some(name))
+                && rebuild
+                    .source
+                    .columns
+                    .iter()
+                    .all(|(uid, column)| columns.get(uid) == Some(column))
+        });
         kept
     }
 
@@ -273,6 +295,9 @@ impl IdsFile {
             || self.roles.contains_key(uid)
             || self.types.contains_key(uid)
             || self.tombstones.contains_key(uid)
+            || self.rebuilds.values().any(|r| {
+                r.replacement.tables.contains_key(uid) || r.replacement.columns.contains_key(uid)
+            })
     }
 
     /// Moves a table, and the columns under it, to a new name.
@@ -407,6 +432,39 @@ impl IdsFile {
         for uid in self.moves.keys() {
             if !self.tables.contains_key(uid) {
                 return Err(IdsError::OrphanMove { uid: uid.clone() });
+            }
+        }
+        let mut reserved = BTreeSet::new();
+        for (uid, rebuild) in &self.rebuilds {
+            let source = rebuild.source.as_ids();
+            let target = rebuild.replacement.as_ids();
+            let root = source.tables.get(uid);
+            if rebuild.max_rows == 0
+                || rebuild.target_checksum.len() != 64
+                || !rebuild
+                    .target_checksum
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
+                || source.validate().is_err()
+                || target.validate().is_err()
+                || root.is_none()
+                || root.is_some_and(|name| target.table_uid(name).is_none())
+                || source
+                    .tables
+                    .iter()
+                    .any(|(u, n)| self.tables.get(u) != Some(n))
+                || source
+                    .columns
+                    .iter()
+                    .any(|(u, n)| self.columns.get(u) != Some(n))
+                || target.tables.keys().chain(target.columns.keys()).any(|u| {
+                    self.tables.contains_key(u)
+                        || self.columns.contains_key(u)
+                        || self.tombstones.contains_key(u)
+                        || !reserved.insert(u.clone())
+                })
+            {
+                return Err(IdsError::InvalidRebuild { uid: uid.clone() });
             }
         }
         Ok(())

@@ -387,6 +387,9 @@ pub fn validate_saved_plan(
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         refuse!("unsupported saved-plan version {}", plan.version);
     }
+    if !plan.ids.rebuilds.is_empty() {
+        refuse!("recorded blocking rewrite intent cannot be executed yet");
+    }
     dialect
         .validate_plan_analysis(plan)
         .map_err(AdmissionError::from_error)?;

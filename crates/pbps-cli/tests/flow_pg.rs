@@ -25,7 +25,529 @@ mod managed_types;
 #[path = "support/type_refs.rs"]
 mod type_refs;
 
+#[path = "support/rebuild_members.rs"]
+mod rebuild_members;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
+
+const REBUILD_ALIAS_SOURCE: &str = "table: app.p\ncolumns:\n  k: {type: int}\n  bucket: {type: int4}\n  label: {type: varchar(20)}\n  spelled: {type: character varying(30)}\n  stamp: {type: timestamptz}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+
+/// The same assertions run without a database and inside the owned live test.
+fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&str>) {
+    let rev = Command::new("git")
+        .arg("-C")
+        .arg(&d.dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(rev.status.success());
+    let source = String::from_utf8(rev.stdout).unwrap();
+    let desired = REBUILD_ALIAS_SOURCE.replace("partition_by: [k]", "partition_by: [bucket]");
+    let canonical = desired
+        .replace("type: int}", "type: integer}")
+        .replace("type: int4}", "type: integer}")
+        .replace("type: varchar(20)", "type: character varying(20)")
+        .replace("type: timestamptz", "type: timestamp with time zone");
+    let record = [
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ];
+    let ids_path = d.dir.join("schema.ids.json");
+    let mut approved = None;
+    let check = |expected: &str| {
+        let offline = d.run(&["plan", "--no-dev", "--since", source.trim()]);
+        assert_ne!(code(&offline), 0);
+        assert!(stderr(&offline).contains(expected), "{}", stderr(&offline));
+        if let Some(connection) = connection {
+            let connected = d.run(&["plan", "--db", connection]);
+            assert_ne!(code(&connected), 0);
+            assert!(
+                stderr(&connected).contains(expected),
+                "{}",
+                stderr(&connected)
+            );
+        }
+    };
+    for (spelling, domain_base) in [(&desired, "int"), (&canonical, "integer")] {
+        std::fs::write(path, spelling).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.count.type.yml"),
+            format!("domain: app.count\ntype: {domain_base}\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&record));
+        let bytes = std::fs::read(&ids_path).unwrap();
+        if let Some(before) = &approved {
+            assert_eq!(&bytes, before);
+        } else {
+            approved = Some(bytes);
+        }
+        d.commit();
+        check("recorded intent is valid; table rebuild execution is not available yet");
+    }
+    // A real modifier change is not an alias, even inside the same type family.
+    std::fs::write(
+        path,
+        canonical.replace("character varying(20)", "character varying(21)"),
+    )
+    .unwrap();
+    d.commit();
+    check("approved source lineage or desired fingerprint does not match");
+    std::fs::write(path, &canonical).unwrap();
+    d.commit();
+    check("recorded intent is valid; table rebuild execution is not available yet");
+}
+
+#[test]
+fn rebuild_aliases_record_and_plan_from_one_canonical_schema() {
+    let d = Demo::new("rebuild2298-aliases");
+    d.table(REBUILD_ALIAS_SOURCE);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    std::fs::write(
+        d.dir.join("schema/app.count.type.yml"),
+        "domain: app.count\ntype: integer\n",
+    )
+    .unwrap();
+    // Type DDL is unavailable in slice one. Seed a committed type identity
+    // for this offline baseline, as pull does in the live sibling.
+    let ids_path = d.dir.join("schema.ids.json");
+    let mut ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+    ids.types.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Type),
+        "app.count".parse().unwrap(),
+    );
+    ids.validate().unwrap();
+    std::fs::write(
+        ids_path,
+        format!("{}\n", serde_json::to_string_pretty(&ids).unwrap()),
+    )
+    .unwrap();
+    d.commit();
+    check_rebuild_aliases(&d, &d.dir.join("schema/app.t.yml"), None);
+}
+
+fn check_rebuild_additions(
+    d: &Demo,
+    path: &std::path::Path,
+    column: bool,
+    partition: bool,
+    connection: Option<&str>,
+) {
+    let rev = Command::new("git")
+        .arg("-C")
+        .arg(&d.dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(rev.status.success());
+    let source = String::from_utf8(rev.stdout).unwrap();
+    let ids_path = d.dir.join("schema.ids.json");
+    let before: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+    let mut desired = REBUILD_ALIAS_SOURCE.replace("partition_by: [k]", "partition_by: [bucket]");
+    if column {
+        desired = desired.replace("partition_by:", "  extra: {type: integer}\npartition_by:");
+    }
+    if partition {
+        desired.push_str("  p2: {from: [10], to: [20]}\n");
+    }
+    std::fs::write(path, desired).unwrap();
+    succeeds(d.run(&[
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ]));
+    let recorded = std::fs::read(&ids_path).unwrap();
+    let approved: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
+    approved.validate().unwrap();
+    assert_eq!(approved.tables, before.tables);
+    assert_eq!(approved.columns, before.columns);
+    let replacement = &approved.rebuilds.values().next().unwrap().replacement;
+    let leaf: pbps_model::TableName = "app.p2".parse().unwrap();
+    let extra: pbps_model::ColumnRef = "app.p.extra".parse().unwrap();
+    assert_eq!(replacement.tables.values().any(|n| n == &leaf), partition);
+    assert_eq!(replacement.columns.values().any(|n| n == &extra), column);
+    assert!(approved.table_uid(&leaf).is_none());
+    assert!(approved.column_uid(&extra).is_none());
+    d.commit();
+    let check = || {
+        let mut plans = vec![vec!["plan", "--no-dev", "--since", source.trim()]];
+        if let Some(connection) = connection {
+            plans.push(vec!["plan", "--db", connection]);
+        }
+        for args in plans {
+            let out = d.run(&args);
+            assert_ne!(code(&out), 0, "{args:?}");
+            assert!(
+                stderr(&out).contains(
+                    "recorded intent is valid; table rebuild execution is not available yet"
+                ),
+                "column={column}, partition={partition}, {args:?}: {}",
+                stderr(&out)
+            );
+            assert_eq!(std::fs::read(&ids_path).unwrap(), recorded);
+        }
+    };
+    check();
+    // Snapshot and baseline project existing live identities; neither may
+    // adopt a future replacement member just because it is now declared.
+    if let Some(connection) = connection {
+        for args in [
+            vec!["snapshot", "--db", connection, "--force"],
+            vec!["baseline", "--db", connection, "--reason", "adopt source"],
+        ] {
+            succeeds(d.run(&args));
+            let snapshot = latest_snapshot(connection);
+            snapshot.ids.validate().unwrap();
+            assert_eq!(snapshot.ids, approved);
+            check();
+        }
+    }
+}
+
+fn check_offline_rebuild_additions(column: bool, partition: bool) {
+    let d = Demo::new(&format!("rebuild2298-additions-{column}-{partition}"));
+    d.table(REBUILD_ALIAS_SOURCE);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    check_rebuild_additions(&d, &d.dir.join("schema/app.t.yml"), column, partition, None);
+}
+
+#[test]
+fn added_parent_columns_record_and_plan_with_reserved_rebuild_identities() {
+    check_offline_rebuild_additions(true, false);
+}
+
+#[test]
+fn added_partitions_record_and_plan_with_reserved_rebuild_identities() {
+    check_offline_rebuild_additions(false, true);
+}
+
+#[test]
+fn added_partitions_and_columns_record_and_plan_with_reserved_rebuild_identities() {
+    check_offline_rebuild_additions(true, true);
+}
+
+#[test]
+fn every_recorded_member_change_reaches_pending_rebuild_offline() {
+    rebuild_members::check(None);
+}
+
+#[test]
+fn partition_overrides_refuse_rebuild_recording_without_writing_ids() {
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    for own in ["default: '7'", "nullable: false"] {
+        let overridden = parent.replace(
+            "  p1: {from: [0], to: [10]}",
+            &format!("  p1:\n    from: [0]\n    to: [10]\n    columns:\n      k: {{{own}}}"),
+        );
+        for source_has_override in [false, true] {
+            let d = Demo::new("rebuild2298-overrides");
+            d.table(if source_has_override {
+                &overridden
+            } else {
+                parent
+            });
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            d.table(&overridden.replace("partition_by: [k]", "partition_by: [bucket]"));
+            let ids_path = d.dir.join("schema.ids.json");
+            let before = std::fs::read(&ids_path).unwrap();
+            let out = d.run(&[
+                "rebuild-table",
+                "app.p",
+                "--max-rows",
+                "20",
+                "--reason",
+                "maintenance",
+            ]);
+            assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+            assert!(stderr(&out).contains("app.p1.k"), "{}", stderr(&out));
+            assert!(
+                stderr(&out).contains("partition column override"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(std::fs::read(&ids_path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
+    let d = Demo::new("rebuild2298");
+    let before = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(before);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    d.table(&before.replace("partition_by: [k]", "partition_by: [bucket]"));
+    let path = d.dir.join("schema.ids.json");
+    let original = std::fs::read(&path).unwrap();
+    for (target, cap, reason) in [
+        ("app.p", "0", "x"),
+        ("app.p", "1", "\u{3000}"),
+        ("app.missing", "1", "x"),
+        ("not-qualified", "1", "x"),
+    ] {
+        let out = d.run(&[
+            "rebuild-table",
+            target,
+            "--max-rows",
+            cap,
+            "--reason",
+            reason,
+        ]);
+        assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    assert_ne!(
+        code(&d.run(&["plan", "--no-dev"])),
+        0,
+        "risk approval cannot invent intent"
+    );
+    let operator = "Maintainer with an unbounded audit name".repeat(10);
+    d.git(&["config", "user.name", &operator]);
+    let args = [
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        " maintenance window ",
+    ];
+    let out = succeeds(d.run(&args));
+    assert!(stdout(&out).contains("blocking rewrite"));
+    let recorded = std::fs::read(&path).unwrap();
+    let ids: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
+    let intent = &ids.rebuilds[ids.table_uid(&"app.p".parse().unwrap()).unwrap()];
+    assert_eq!(intent.operator, operator);
+    assert_eq!(intent.reason.as_ref(), " maintenance window ");
+    assert_eq!(intent.max_rows, 20);
+    assert_eq!(intent.allowed_at.len(), 10);
+    d.commit();
+    succeeds(d.run(&args));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+    let committed = Command::new("git")
+        .arg("-C")
+        .arg(&d.dir)
+        .args(["show", "HEAD:schema.ids.json"])
+        .output()
+        .unwrap();
+    assert!(committed.status.success());
+    assert_eq!(committed.stdout, recorded);
+    let plan = d.run(&["plan", "--no-dev"]);
+    assert_ne!(code(&plan), 0);
+    assert!(format!("{}{}", stdout(&plan), stderr(&plan)).contains("blocking rewrite"));
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    assert!(stderr(&d.run(&args)).contains("only supported for PostgreSQL"));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
+}
+
+#[test]
+#[ignore = "needs live pg"]
+fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
+    rebuild_members::live();
+    let own = OwnDatabase::new(&server(), "rebuild2298");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE DOMAIN app.count AS integer; CREATE TABLE app.p(k integer, bucket integer, label varchar(20), spelled varchar(30), stamp timestamptz) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p(k,bucket) VALUES(1,2)",
+    );
+    for (column, partition) in [(true, false), (false, true), (true, true)] {
+        let d = Demo::new(&format!("rebuild2298-live-additions-{column}-{partition}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        let path = d.dir.join("schema/app.p.yml");
+        std::fs::write(&path, REBUILD_ALIAS_SOURCE).unwrap();
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        check_rebuild_additions(&d, &path, column, partition, Some(connection));
+    }
+    let d = Demo::new("rebuild2298-live");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.p.yml");
+    check_rebuild_aliases(&d, &path, Some(connection));
+    let artifact = d.dir.join("refused.json");
+    std::fs::write(&artifact, b"keep existing artifact").unwrap();
+    let out = d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("execution is not available yet"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"keep existing artifact");
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.p WHERE k=1 AND bucket=2"
+        ),
+        1
+    );
+    // Omitting any source member must also omit its pending permission from
+    // each kind of ledger snapshot, while preserving the on-disk intent.
+    let pending = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    on_server(connection, "DROP TABLE app.p1");
+    for args in [
+        vec!["snapshot", "--db", connection, "--force"],
+        vec![
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "accept missing leaf",
+        ],
+    ] {
+        succeeds(d.run(&args));
+        let snapshot = latest_snapshot(connection);
+        snapshot.ids.validate().unwrap();
+        assert!(snapshot.ids.rebuilds.is_empty());
+        assert!(snapshot.ids.table_uid(&"app.p1".parse().unwrap()).is_none());
+        assert!(snapshot.ids.table_uid(&"app.p".parse().unwrap()).is_some());
+    }
+    assert_eq!(
+        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
+        pending
+    );
+}
+
+#[test]
+fn pending_rebuild_intents_refuse_without_poisoning_the_identity_file() {
+    let d = Demo::new("rebuild2298-intents");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    let declaration = d.dir.join("schema/app.t.yml");
+    d.table(parent);
+    let other = d.dir.join("schema/other.yml");
+    std::fs::write(
+        &other,
+        "table: app.other\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let desired = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&desired);
+    succeeds(d.run(&[
+        "rebuild-table",
+        "app.p",
+        "--max-rows",
+        "20",
+        "--reason",
+        "maintenance",
+    ]));
+    let path = d.dir.join("schema.ids.json");
+    let before = std::fs::read(&path).unwrap();
+    let ids: pbps_model::IdsFile = serde_json::from_slice(&before).unwrap();
+    let root = ids.table_uid(&"app.p".parse().unwrap()).unwrap();
+    let cases = [
+        (
+            vec!["rename-table", "app.p", "app.q"],
+            Some(desired.replace("table: app.p", "table: app.q")),
+            "app.p",
+        ),
+        (
+            vec!["rename-table", "app.p1", "app.p2"],
+            Some(desired.replace("p1:", "p2:")),
+            "app.p1",
+        ),
+        (
+            vec!["drop-table", "app.p", "--reason", "retired"],
+            None,
+            "app.p",
+        ),
+        (
+            vec!["drop-table", "app.p1", "--reason", "retired"],
+            Some(desired.split("partitions:").next().unwrap().to_owned()),
+            "app.p1",
+        ),
+        (
+            vec!["rename", "app.p.k", "old_k"],
+            Some(desired.replace("  k:", "  old_k:")),
+            "app.p.k",
+        ),
+        (
+            vec!["drop", "app.p.k", "--reason", "retired"],
+            Some(desired.replace("  k: {type: integer}\n", "")),
+            "app.p.k",
+        ),
+        (
+            vec!["move-rows", "app.p1", "--max-rows", "1", "--reason", "move"],
+            Some(desired.clone()),
+            "app.p1",
+        ),
+        (
+            vec![
+                "intent",
+                "--rename-table",
+                "app.p1",
+                "app.p2",
+                "--rename",
+                "app.p.k",
+                "old_k",
+            ],
+            Some(desired.replace("p1:", "p2:").replace("  k:", "  old_k:")),
+            "app.p.k",
+        ),
+    ];
+    for (args, content, object) in cases {
+        if let Some(content) = content {
+            std::fs::write(&declaration, content).unwrap();
+        } else {
+            std::fs::remove_file(&declaration).unwrap();
+        }
+        let out = d.run(&args);
+        assert_ne!(code(&out), 0, "{args:?}: {}{}", stdout(&out), stderr(&out));
+        for fragment in [
+            object,
+            "pending rebuild of app.p",
+            "rebuilds",
+            "withdraw",
+            "commit",
+            &root.to_string(),
+        ] {
+            assert!(
+                stderr(&out).contains(fragment),
+                "{args:?}: {}",
+                stderr(&out)
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        d.table(&desired);
+    }
+    // A mutation outside the source is still allowed and leaves readable IDs.
+    std::fs::write(
+        &other,
+        "table: app.other2\ncolumns:\n  id: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.other", "app.other2"]));
+    let mut ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    ids.validate().unwrap();
+    // Like moves, permission is withdrawn by a reviewed git edit, not a new
+    // flag supplying a different identity decision.
+    ids.rebuilds.remove(root);
+    std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+    d.commit();
+    d.table(&desired.replace("table: app.p", "table: app.q"));
+    succeeds(d.run(&["rename-table", "app.p", "app.q"]));
+    succeeds(d.run(&["validate"]));
+}
 
 #[path = "support/row_security_roundtrip.rs"]
 mod row_security_roundtrip;

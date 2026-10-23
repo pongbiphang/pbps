@@ -44,6 +44,7 @@ pub mod physical_sources;
 pub mod plan;
 pub mod plan_names;
 pub mod reason;
+pub mod rebuild;
 pub mod rename;
 pub mod resolver;
 pub mod role;
@@ -85,6 +86,7 @@ pub use plan::{
     state_checksum, wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
+pub use rebuild::{Rebuild, RebuildIdentities};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
