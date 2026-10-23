@@ -812,7 +812,7 @@ fn removal_of(
             Part::Policy(_) => {
                 return Err(format!(
                     "{}: explicitly remove or replace the dependent policy in the declarations",
-                    d.described
+                    pbps_model::escape::Escaped(&d.described)
                 ));
             }
             Part::Generated(_) => {

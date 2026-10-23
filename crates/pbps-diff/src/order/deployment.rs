@@ -822,7 +822,7 @@ fn removal_of(
             Part::Policy(_) => {
                 return Err(format!(
                     "{}: explicitly remove or replace the dependent policy in the declarations",
-                    d.described
+                    pbps_model::escape::Escaped(&d.described)
                 ));
             }
             Part::Generated(_) => {
@@ -3368,3 +3368,56 @@ fn truncated(mut part: String) -> String {
 #[cfg(test)]
 #[path = "deployment_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod policy_message_tests {
+    use super::*;
+
+    #[test]
+    fn policy_rebuild_refusals_show_descriptions_once_and_keep_raw_keys() {
+        for (raw, shown) in [
+            (
+                "policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\n\u{1b}[31m\u{202e}名前",
+            ),
+            (
+                r"policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\\n\\u{1b}[31m\\u{202e}名前",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let table = TableName::new("app", "t");
+            let dependent = Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: table.clone(),
+                    part: Part::Policy(raw.into()),
+                },
+            };
+            assert_eq!(
+                removal_of(&dependent, &Schema::default(), None).unwrap_err(),
+                format!(
+                    "{shown}: explicitly remove or replace the dependent policy in the declarations"
+                )
+            );
+            assert_eq!(dependent.described, raw);
+            assert!(
+                matches!(&dependent.holds, Holds::TablePart { part: Part::Policy(name), .. } if name == raw)
+            );
+            let check = Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: table.clone(),
+                    part: Part::Check(raw.into()),
+                },
+            };
+            assert_eq!(
+                removal_of(&check, &Schema::default(), None).unwrap(),
+                Change::DropCheck {
+                    table,
+                    name: raw.into()
+                }
+            );
+        }
+    }
+}

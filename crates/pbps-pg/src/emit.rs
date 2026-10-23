@@ -3117,7 +3117,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         }
 
         Change::DropPolicy { table, name, .. } => one(
-            pg, table, format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
+            pg,
+            table,
+            format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
         Change::CreateType { uid, name, definition } => {
             let address = TableName::new(name.schema(), name.name());
