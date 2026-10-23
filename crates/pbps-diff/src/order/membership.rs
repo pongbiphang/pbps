@@ -758,7 +758,7 @@ fn boundary_endpoint(
         if !t.check.accepts(&parent, &child) {
             return Ok(None);
         }
-        child = t.policy.attach(&m.parent, &parent, &child);
+        child = t.policy.attach(&m.parent, &parent, &child)?;
         for w in &chain[cut..] {
             if w.value.scope == Scope::MembersAtOperation {
                 let next = w.value.policy.apply(&child, w.value.to.known()?);
@@ -989,7 +989,7 @@ fn apply(
                         if !t.check.accepts(p, c.value.known()?) {
                             return Err(format!("attach shape differs at {:?}", t.parent));
                         }
-                        t.policy.attach(&m.parent, p, c.value.known()?)
+                        t.policy.attach(&m.parent, p, c.value.known()?)?
                     } else {
                         Value {
                             ownership: Ownership::Own,

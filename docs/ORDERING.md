@@ -193,6 +193,16 @@ non-executable `Pending` lookup distinguishes pending facts from missing
 sources; it grants no executable authority, as compiler-negative tests pin.
 Its borrowed operations/effects cannot be mutated underneath a live view.
 
+A transfer can carry an engine-supplied `Merge` table over complete parent
+and candidate values (DEC-2296.2). It reads the parent property at its boundary;
+the cut compiler compares each result with the declared child goal. A unique
+side imposes its edge, both compatible sides impose no preference, and neither
+is a named obligation. Concrete replay uses the same merge at the actual
+position. Unknown or overlapping rows never mean preserve-the-candidate.
+PG mappings live in engine effects; the model contains no engine-specific
+merge or catalog query. The soundness, necessity and complete-state determinism
+corpus also enumerates merges and both parent-version cuts.
+
 The contract is not activated for guarded plans yet. `attached()` and
 `detached_names()`, early weave/source projections, shipping engine clauses
 and boundary probe grounding remain the column/part PRs' integration work.
