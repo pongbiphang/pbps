@@ -2644,7 +2644,7 @@ type: an underscore prefix is legal for a collation and reserved on a type
 reference. Names belong to the containing map. `schema/<schema>.<name>.type.yml` follows the module
 file's leading-key rule and the ordinary scalar formatter. The optional
 `types` map adds `y_` uids under identity-file version 1, as `roles` did.
-State 30 records the definitions; states 6–29 remain readable. Published schema
+State 30 records the definitions; states 6–29 remain readable. Saved plan 48 carries the `types` map in its identity file. Published schema
 set 54 adds the two declaration shapes.
 
 PostgreSQL's catalog batch reuses `user_types`' label and constraint readers
