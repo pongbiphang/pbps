@@ -486,3 +486,90 @@ fn postgres_grant_refusals_show_schema_operands_once_without_changing_targets() 
         }
     }
 }
+
+#[test]
+fn bare_routine_grant_refusals_show_single_and_overloaded_signatures_once() {
+    for (part, shown) in [
+        (
+            "name\n\u{1b}[31m\u{202e}名前",
+            r"name\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"name\n\u{1b}[31m\u{202e}名前",
+            r"name\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("名前_ünï", "名前_ünï"),
+    ] {
+        let object = ObjectName::new("app", part);
+        let argument: RoutineArg = format!("types.\"{part}\"").parse().unwrap();
+        assert_eq!(argument.raw(), format!("types.\"{part}\""));
+        let signature = RoutineId::new(object.clone(), vec![argument]);
+        let mut schema = Schema::default();
+        schema.modules.insert(
+            ModuleId::Routine(signature.clone()),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: "() RETURNS integer LANGUAGE sql AS 'SELECT 1'".into(),
+            },
+        );
+        for overloaded in [false, true] {
+            if overloaded {
+                schema.modules.insert(
+                    ModuleId::Routine(RoutineId::new(
+                        object.clone(),
+                        vec!["text".parse().unwrap()],
+                    )),
+                    Module {
+                        kind: ModuleKind::Function,
+                        description: None,
+                        definition: "() RETURNS integer LANGUAGE sql AS 'SELECT 1'".into(),
+                    },
+                );
+            }
+            let mut role = Role {
+                grants: [
+                    (
+                        GrantTarget::Schema("app".into()),
+                        [Permission::Usage].into(),
+                    ),
+                    (
+                        GrantTarget::Object(object.clone()),
+                        [Permission::Execute].into(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let errors = pbps_pg::Postgres::new().validate_role(&"reader".into(), &role, &schema);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let signature_shown = format!("app.{shown}(types.\"{shown}\")");
+            let expected = if overloaded {
+                format!(
+                    "postgres: `app.{shown}` names 2 overloads, so PostgreSQL cannot tell which one this grant is on (`routine name \"app.{shown}\" is not unique`); write the signature instead -- one of app.{shown}(text), {signature_shown}"
+                )
+            } else {
+                format!(
+                    "postgres: `app.{shown}` is a routine, which this engine identifies by its signature and not by its name (ADR-0009 section 1): `pull` reads the grant back as `{signature_shown}`, so a declaration spelling it `app.{shown}` would differ from the database on every plan and each plan would revoke and re-grant it. Write `{signature_shown}` instead"
+                )
+            };
+            assert_eq!(errors[0].to_string(), expected);
+            role.grants.remove(&GrantTarget::Object(object.clone()));
+            role.grants.insert(
+                GrantTarget::Routine(signature.clone()),
+                [Permission::Execute].into(),
+            );
+            assert!(
+                pbps_pg::Postgres::new()
+                    .validate_role(&"reader".into(), &role, &schema)
+                    .is_empty()
+            );
+            assert!(
+                schema
+                    .modules
+                    .contains_key(&ModuleId::Routine(signature.clone()))
+            );
+            assert_eq!(signature.name, object);
+        }
+    }
+}

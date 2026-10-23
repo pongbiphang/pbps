@@ -1349,7 +1349,11 @@ impl Expansion for Weave<'_> {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
                     tail: Vec::new(),
-                    reason: format!("{} depends on `{root}`", d.described, root = root.shown()),
+                    reason: format!(
+                        "{} depends on `{root}`",
+                        pbps_model::escape::Escaped(&d.described),
+                        root = root.shown()
+                    ),
                 })
             }
             Need::Removed { root, k } => {
@@ -1357,7 +1361,7 @@ impl Expansion for Weave<'_> {
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
                 let reason = format!(
                     "{} depends on `{root}`, which this plan drops",
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     root = root.shown()
                 );
                 match find(&view, &parts, &d.holds, partitions, removes) {
@@ -1455,7 +1459,7 @@ impl Expansion for Weave<'_> {
                                 anchor: Anchor::After(after),
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
-                                    d.described,
+                                    pbps_model::escape::Escaped(&d.described),
                                     root = root.shown()
                                 ),
                             })],

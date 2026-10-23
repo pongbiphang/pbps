@@ -511,6 +511,10 @@ fn target_kind(
             .into_iter()
             .collect();
         signatures.sort();
+        let signatures: Vec<_> = signatures
+            .iter()
+            .map(|signature| pbps_model::escape::Escaped(signature).to_string())
+            .collect();
         return Err(invalid(if signatures.len() == 1 {
             format!(
                 "`{object}` is a routine, which this engine identifies by its signature and not \

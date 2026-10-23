@@ -1343,7 +1343,11 @@ impl Expansion for Weave<'_> {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
                     tail: Vec::new(),
-                    reason: format!("{} depends on `{root}`", d.described, root = root.shown()),
+                    reason: format!(
+                        "{} depends on `{root}`",
+                        pbps_model::escape::Escaped(&d.described),
+                        root = root.shown()
+                    ),
                 })
             }
             Need::Removed { root, k } => {
@@ -1351,7 +1355,7 @@ impl Expansion for Weave<'_> {
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
                 let reason = format!(
                     "{} depends on `{root}`, which this plan drops",
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     root = root.shown()
                 );
                 match find(&view, &parts, &d.holds, partitions, removes) {
@@ -1449,7 +1453,7 @@ impl Expansion for Weave<'_> {
                                 anchor: Anchor::After(after),
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
-                                    d.described,
+                                    pbps_model::escape::Escaped(&d.described),
                                     root = root.shown()
                                 ),
                             })],
@@ -8131,45 +8135,81 @@ mod tests {
 
     #[test]
     fn dependency_provenance_keeps_raw_sources_and_shown_reasons() {
-        let part = "x\n\\\u{200b}";
-        let raw = format!("app.{part}");
-        let shown = r"app.x\n\\\u{200b}";
-        let mut schema = Schema::default();
-        schema
-            .modules
-            .insert(id(&raw), module(ModuleKind::View, "SELECT 1 AS id"));
-        schema
-            .modules
-            .insert(id("app.child"), module(ModuleKind::View, "SELECT 1 AS id"));
-        let mut cs = plan(vec![alter(&schema, &raw)]);
-        let found = [(id(&raw), vec![view("app.child")])].into();
-        let ids = IdsFile::default();
-        weave(&mut cs, &found, &schema, &[&ids], pg().as_ref()).unwrap();
-        let origins = crate::report::origins(&cs);
-        assert_eq!(origins.len(), 2);
-        for origin in &origins {
-            assert_eq!(origin.source, raw);
-            let suffix = if origin.role == "teardown" {
-                "drops"
-            } else {
-                "rebuilds"
-            };
-            assert_eq!(
-                origin.reason,
-                format!("view app.child depends on `{shown}`, which this plan {suffix}")
-            );
-            let report = crate::report::changes(&cs);
-            let expected =
-                format!("view app.child depends on `{shown}`, which this plan {suffix}\n");
-            assert!(
-                report.contains(&expected),
-                "expected {expected:?} in {report:?}"
-            );
+        for (part, shown) in [
+            ("x\n\u{1b}[31m\u{202e}名前", r"x\n\u{1b}[31m\u{202e}名前"),
+            (
+                r"x\n\u{1b}[31m\u{202e}名前",
+                r"x\\n\\u{1b}[31m\\u{202e}名前",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let raw = format!("app.{part}");
+            let root = ModuleId::Named(pbps_model::ObjectName::new("app", part));
+            let child =
+                ModuleId::Named(pbps_model::ObjectName::new("app", format!("child_{part}")));
+            let child_raw = format!("app.child_{part}");
+            let description = format!("view {child_raw}");
+            let child_shown = format!("view app.child_{shown}");
+            let mut schema = Schema::default();
+            for id in [&root, &child] {
+                schema
+                    .modules
+                    .insert(id.clone(), module(ModuleKind::View, "SELECT 1 AS id"));
+            }
+            let found = [(
+                root.clone(),
+                vec![Dependent {
+                    described: description.clone(),
+                    holds: Holds::Module(child.clone()),
+                }],
+            )]
+            .into();
+            for split in [false, true] {
+                let mut edits = vec![Change::AlterModule {
+                    id: root.clone(),
+                    module: Box::new(schema.modules[&root].clone()),
+                }];
+                if split {
+                    edits.push(Change::AlterModule {
+                        id: child.clone(),
+                        module: Box::new(schema.modules[&child].clone()),
+                    });
+                }
+                let mut cs = plan(edits);
+                weave(&mut cs, &found, &schema, &[], pg().as_ref()).unwrap();
+                let origins = crate::report::origins(&cs);
+                assert_eq!(origins.len(), 2);
+                for origin in &origins {
+                    assert_eq!(
+                        origin.source,
+                        if split { &child_raw } else { &raw }.as_str()
+                    );
+                    let expected = if split {
+                        format!("{child_shown} depends on `app.{shown}`")
+                    } else {
+                        let suffix = if origin.role == "teardown" {
+                            "drops"
+                        } else {
+                            "rebuilds"
+                        };
+                        format!("{child_shown} depends on `app.{shown}`, which this plan {suffix}")
+                    };
+                    assert_eq!(origin.reason, expected);
+                    let report = crate::report::changes(&cs);
+                    assert!(report.contains(&format!("{expected}\n")), "{report:?}");
+                }
+                let json = serde_json::to_value(&origins).unwrap();
+                assert_eq!(
+                    json[0]["source"],
+                    if split { &child_raw } else { &raw }.as_str()
+                );
+                assert_eq!(json[0]["reason"], origins[0].reason);
+                assert_eq!(found[&root][0].described, description);
+                let once = cs.clone();
+                weave(&mut cs, &found, &schema, &[], pg().as_ref()).unwrap();
+                assert_eq!(cs, once, "shown prose must not become a new identity");
+            }
         }
-        let json = serde_json::to_value(&origins).unwrap();
-        assert_eq!(json[0]["source"], raw);
-        assert!(json[0]["reason"].as_str().unwrap().contains(shown));
-        assert!(!json[0]["reason"].as_str().unwrap().contains(&raw));
     }
 
     /// A chain of views over a rebuilt view: dropped deepest first, created

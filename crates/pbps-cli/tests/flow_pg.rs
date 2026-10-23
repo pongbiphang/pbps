@@ -34706,6 +34706,69 @@ fn step5_connected_module_rebuild_refusals_show_each_name_once() {
         succeeds(apply_plan(&d, connection, &plan, false));
         succeeds(d.run(&["verify", "--db", connection]));
     }
+    for (i, (name, shown)) in [
+        (
+            "child\n\u{1b}[31m\u{202e}名前",
+            r"child\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"child\n\u{1b}[31m\u{202e}名前",
+            r"child\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("child_名前_ünï", "child_名前_ünï"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let own = OwnDatabase::new(&server, &format!("step5_provenance_{i}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app; CREATE VIEW app.root AS SELECT 1 AS id; CREATE VIEW app.{} AS SELECT id FROM app.root",
+                message_boundaries::quote(name, true),
+            ),
+        );
+        let d = Demo::new(&format!("step5-provenance-{i}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let root = d.dir.join("schema/app.root.view.yml");
+        let original = std::fs::read_to_string(&root).unwrap();
+        assert!(original.contains("1 AS id"), "{original}");
+        std::fs::write(&root, original.replace("1 AS id", "2 AS id")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&succeeds(
+            d.run(&["plan", "--db", connection, "--format", "json"]),
+        )))
+        .unwrap();
+        let origins = report["data"]["origins"].as_array().unwrap();
+        assert_eq!(origins.len(), 2, "{report}");
+        for origin in origins {
+            assert_eq!(origin["role"], "split part");
+            let expected = format!("rule _RETURN on view app.\"{shown}\" depends on `app.root`");
+            assert_eq!(origin["reason"], expected);
+            assert_eq!(origin["source"], format!("app.{name}"));
+            assert!(human.contains(&format!("{expected}\n")), "{human:?}");
+        }
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let checksum = plan_checksum(&plan);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "destructive",
+        ]));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
 }
 
 #[test]
