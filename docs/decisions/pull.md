@@ -958,3 +958,45 @@ left out is only known after the read.
 Pinned by `a_partition_with_a_limitation_takes_its_tree_out` (unit, with a
 limited plain table carried as the negative) and, live on 16 and 18, by
 `a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull`.
+
+
+<a id="dec-2179-1"></a>
+
+**DEC-2179.1. Matching cluster and database evidence narrows the pending-drop
+parent refusal to the held partition, never supplies identity (#2179).**
+A′ + F, specified in [ADR-0018](../ADR-0018-catalog-identity-evidence.md).
+Measured on PostgreSQL 16.15 and 18.6 in scratch databases: both the test
+login and an unprivileged LOGIN role can read `pg_control_system()` without
+a grant; a timed read took 0.418 ms and 0.316 ms respectively. Rename and
+rebind preserve relation oids, moving to another parent changes the parent
+oid, and drop/recreate leaves the old oid absent. Dump/restore and template
+copies on the same cluster change database oid, so the cluster identifier
+alone is insufficient. `pg_upgrade` was not attempted and is unmeasured;
+retained relation oids with a new cluster identifier are expected to fall back.
+
+State version 31 records an opaque sidecar for every managed table, parents
+included, at each PostgreSQL apply and baseline, reusing the closing catalog
+read without another round trip. Versions 6–30 remain readable
+without evidence. DEC-1852.1 still matches drop intent and held tables by uid.
+When cluster and database identities both match, a recorded oid still under
+the recorded parent names only that live partition, whatever its name and
+bound; an absent oid permits baseline without reverting intent. A present
+oid outside that parent, missing evidence or either identity mismatch keeps
+DEC-1852.1's parent refusal. Catalog numbers have private fields and no raw
+getter: only the baseline check can turn them into a refusal/drop result;
+Schema, rename detection, diff and plan never read them. Oid reuse can only
+hold back an extra partition: a live held relation's oid cannot be reused,
+and a replacement is accepted as evidence of presence only under that parent.
+The refusal keeps its original explanation and names both remedies:
+`pbps plan` then `pbps apply --plan <plan>` to finish the pending drop, or
+`git revert <drop-intent-commit>` when a manual drop needs its intent undone.
+
+Tests: `only_matching_database_evidence_narrows_the_parent_refusal` (unit,
+including no evidence, each identity mismatch, another/no parent, replacement
+parent and absent oid); `versions_6_through_30_read_without_catalog_evidence`;
+`baseline_catalog_evidence_names_only_the_rebound_held_partition`,
+`baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent`,
+and `baseline_catalog_evidence_keeps_the_parent_refusal_after_database_restore`
+(live, PostgreSQL 16 and 18, the last also covers a template copy and both
+remedy commands). The existing DEC-1852.1 live fixture retains a snapshot
+without evidence to pin the historical fallback and checks apply recording.

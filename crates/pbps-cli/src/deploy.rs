@@ -2843,6 +2843,10 @@ fn cut(
     // finding from one whose owner is somebody else.
     scoped.owners = pulled.owners.clone();
     scoped.session_role = pulled.session_role.clone();
+    scoped.baseline_evidence = pulled
+        .baseline_evidence
+        .as_ref()
+        .map(|evidence| evidence.for_managed(&scoped.schema));
     report_unmanaged(&scoped, unreadable, ids, modules, unmanaged)?;
     Ok(scoped)
 }
@@ -5735,6 +5739,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                 project.root(),
                 StateSnapshot::new(StateKind::Apply, scoped.schema, held, &operator),
             );
+            snapshot.baseline_evidence = scoped.baseline_evidence;
             snapshot.module_deps = loaded.hints.module_deps.clone();
             let tables = snapshot.schema.tables.len();
             let id = crate::engine::record(&mut conn, &snapshot).await?;
@@ -5770,24 +5775,18 @@ fn tables_a_drop_intent_names(ids: &IdsFile) -> Vec<&pbps_model::Uid> {
         .collect()
 }
 
-/// Refuses a baseline that would hand to another tool a partition a drop
-/// intent names while the recorded state still holds it (#1852, DEC-1852.1).
-/// Recorded so, the partition is never dropped, and no later plan takes it
-/// back. Matched by uid: a tombstone the recorded state no longer holds is an
-/// old one. Refused by its parent, matched by uid too, while the scope leaves
-/// any partition of that parent external: which of them the held one now is
-/// cannot be told, since it can have been renamed, rebound or reattached by
-/// hand, and pbps records no identity for a table that outlives that (#2172
-/// review, #2177). Where one has the recorded parent and bound it is named.
-/// An empty ledger holds nothing. A ledger that cannot be read cannot say
-/// which partition an intent names, so the baseline is refused while any is
-/// left external.
+/// Refuses a baseline that would hand over a held partition with pending drop
+/// intent (DEC-1852.1). Uids still decide what is held. ADR-0018's opaque
+/// evidence can narrow that refusal to one live partition, or prove its drop;
+/// missing/mismatched evidence retains the parent-and-bound refusal below.
+/// An unreadable ledger cannot establish what is held and refuses the handover.
 fn refuse_handing_over_held_partitions(
     dropped: &[&pbps_model::Uid],
     working: &IdsFile,
     scoped: &pbps_diff::Scoped,
     previous: Result<Option<pbps_db::LedgerEntry>, pbps_db::LedgerError>,
     label: &str,
+    catalog: Option<&pbps_model::baseline_evidence::BaselineCatalog>,
 ) -> anyhow::Result<()> {
     let lines: Vec<String> = match &previous {
         Ok(None) => return Ok(()),
@@ -5814,6 +5813,34 @@ fn refuse_handing_over_held_partitions(
                         return None;
                     }
                     let entry = previous.id;
+                    if let Some(catalog) = catalog {
+                        use pbps_model::baseline_evidence::HeldPartition;
+                        match catalog.held_partition(
+                            recorded.baseline_evidence.as_ref(),
+                            name,
+                            &of.parent,
+                            parent,
+                        ) {
+                            HeldPartition::Dropped => return None,
+                            HeldPartition::Present(live) => {
+                                if !scoped.external.contains_key(&live) {
+                                    return None;
+                                }
+                                let was = if name == &live {
+                                    String::new()
+                                } else {
+                                    format!(", recorded as {}", name.shown())
+                                };
+                                return Some(format!(
+                                    "{} is named by a drop intent and held by the recorded state \
+                                     (entry #{entry}{was}); this baseline would leave it to its \
+                                     external parent undropped",
+                                    live.shown()
+                                ));
+                            }
+                            HeldPartition::ParentRefusal => {}
+                        }
+                    }
                     Some(
                         match siblings.iter().find(|(_, live)| live.bound == of.bound) {
                             Some((live, _)) => {
@@ -5865,8 +5892,10 @@ fn refuse_handing_over_held_partitions(
     bail!(
         "`{label}` holds {} partition(s) this baseline would hand over:\n  {}\n\
          A drop intent leaves a partition out of the identity file before it is dropped. \
-         Drop or detach it with a plan first, then baseline; if it is already gone from the \
-         database, revert the drop intent so the baseline records it missing (DEC-1852.1).",
+         Finish the pending drop first with `pbps plan` then `pbps apply --plan <plan>` \
+         (keeping the parent's partitions declared), then baseline; if it was dropped by hand, \
+         revert the drop intent with `git revert <drop-intent-commit>` so the baseline records \
+         it missing (DEC-1852.1).",
         lines.len(),
         lines.join("\n  ")
     );
@@ -5926,12 +5955,14 @@ pub fn cmd_baseline(
                 let dropped = tables_a_drop_intent_names(&ids);
                 if !dropped.is_empty() && !scoped.external.is_empty() {
                     let previous = crate::engine::latest(&mut conn).await;
+                    let catalog = crate::engine::baseline_catalog(&mut conn).await?;
                     refuse_handing_over_held_partitions(
                         &dropped,
                         &ids,
                         &scoped,
                         previous,
                         &target.label,
+                        catalog.as_ref(),
                     )?;
                 }
 
@@ -5946,6 +5977,7 @@ pub fn cmd_baseline(
                     project.root(),
                     StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
                 );
+                snapshot.baseline_evidence = scoped.baseline_evidence;
                 snapshot.module_deps = loaded.hints.module_deps.clone();
                 // The note on what was removed rides on the reason only where
                 // the bounded column has room for both: it never turns a reason
@@ -6544,6 +6576,7 @@ pub fn cmd_bootstrap(
                     project.root(),
                     StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
                 );
+                snapshot.baseline_evidence = built.baseline_evidence;
                 snapshot.module_deps = loaded.hints.module_deps.clone();
                 // Every object was created from these declarations, so what was
                 // declared is exactly what bootstrap holds (ADR-0009 §2.2).
@@ -8627,6 +8660,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             plan.ids.clone(),
             operator,
         );
+        snapshot.baseline_evidence = after.baseline_evidence;
         snapshot.module_deps = plan.module_deps.clone();
         snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
         snapshot.plan_checksum = Some(plan_checksum.to_owned());
@@ -9234,6 +9268,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             live_ids.clone(),
             operator,
         );
+        checkpoint.baseline_evidence = after.baseline_evidence;
         checkpoint.module_deps = module_deps;
         // A checkpoint records the database as it stands, and what was
         // declared is what the previous state said until the plan finishes:
@@ -9371,6 +9406,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         plan.ids.clone(),
         operator,
     );
+    snapshot.baseline_evidence = after.baseline_evidence;
     snapshot.module_deps = plan.module_deps.clone();
     snapshot.git_sha = plan.git_sha.clone().or_else(|| db::git_sha(project.root()));
     snapshot.plan_checksum = Some(plan_checksum.to_owned());
@@ -12177,7 +12213,7 @@ mod tests {
         };
         let refuse = |previous| {
             super::refuse_handing_over_held_partitions(
-                &dropped, &working, &scoped, previous, "prod",
+                &dropped, &working, &scoped, previous, "prod", None,
             )
         };
         let e = refuse(Ok(Some(entry(&uid, "ev_a", year(2025), &parent))))
@@ -12233,6 +12269,7 @@ mod tests {
             &elsewhere,
             Ok(Some(entry(&uid, "ev_a", year(2025), &parent))),
             "prod",
+            None,
         )
         .expect("another parent's partitions");
         // The parent the recorded state names is another table that had the
@@ -14589,6 +14626,7 @@ mod tests {
             })],
         };
         let empty = pbps_diff::Scoped {
+            baseline_evidence: None,
             schema: Schema::default(),
             unmanaged: Vec::new(),
             external: Default::default(),
@@ -14647,6 +14685,7 @@ mod tests {
             })],
         };
         let empty = pbps_diff::Scoped {
+            baseline_evidence: None,
             schema: Schema::default(),
             unmanaged: Vec::new(),
             external: Default::default(),
@@ -15261,6 +15300,7 @@ mod tests {
         };
         let object = |t: &TableName| Some(pbps_model::GrantTarget::Object(t.clone()));
         let pulled = Pulled {
+            baseline_evidence: None,
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             warnings: Vec::new(),
@@ -21263,6 +21303,7 @@ mod tests {
 
     fn pulled() -> Pulled {
         Pulled {
+            baseline_evidence: None,
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
             warnings: Vec::new(),

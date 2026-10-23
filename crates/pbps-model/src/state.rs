@@ -136,7 +136,8 @@ use crate::schema::Schema;
 /// 28 records authored policy predicates independently (DEC-1172.2).
 /// Version 29 admits existing user-type references (DEC-1523.2).
 /// Version 30 records declared enums and domains (DEC-1635.1).
-pub const CURRENT_VERSION: u32 = 30;
+/// Version 31 records opaque baseline-only catalog evidence (DEC-2179.1).
+pub const CURRENT_VERSION: u32 = 31;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -272,6 +273,9 @@ impl std::fmt::Display for StateKind {
 #[serde(deny_unknown_fields)]
 pub struct StateSnapshot {
     pub version: u32,
+    /// Absent in versions 6–30: no evidence, so the parent refusal remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_evidence: Option<crate::baseline_evidence::BaselineEvidence>,
     pub kind: StateKind,
 
     /// The schema that environment actually has.
@@ -360,6 +364,7 @@ impl StateSnapshot {
     pub fn new(kind: StateKind, schema: Schema, ids: IdsFile, operator: impl Into<String>) -> Self {
         Self {
             version: CURRENT_VERSION,
+            baseline_evidence: None,
             kind,
             schema,
             ids,
@@ -618,7 +623,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 30);
+        assert_eq!(CURRENT_VERSION, 31);
     }
 
     fn schema_with(ty: &str) -> Schema {
@@ -636,6 +641,23 @@ mod tests {
             },
         );
         s
+    }
+
+    #[test]
+    fn versions_6_through_30_read_without_catalog_evidence() {
+        let snapshot = StateSnapshot::new(
+            StateKind::Baseline,
+            Schema::default(),
+            IdsFile::default(),
+            "o",
+        );
+        let mut json = serde_json::to_value(snapshot).unwrap();
+        assert!(json.get("baseline_evidence").is_none());
+        for version in 6..=30 {
+            json["version"] = serde_json::json!(version);
+            let recorded = StateSnapshot::from_json(&json.to_string()).unwrap();
+            assert!(recorded.baseline_evidence.is_none(), "version {version}");
+        }
     }
 
     #[test]

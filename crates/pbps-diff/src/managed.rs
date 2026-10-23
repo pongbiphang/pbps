@@ -26,6 +26,9 @@ use pbps_model::{ColumnRef, IdsFile, ModuleId, PartitionOf, Schema, TableName, U
 pub struct Scoped {
     /// Only the tables pbps manages. This is what drift and `plan --db` compare.
     pub schema: Schema,
+    /// Opaque snapshot sidecar, filled by the connected caller for recording.
+    /// No catalog-number accessor exists; diff and plan cannot consume it.
+    pub baseline_evidence: Option<pbps_model::baseline_evidence::BaselineEvidence>,
 
     /// Tables the database has that the identity file does not name. Left
     /// untouched — pbps will neither change nor drop them.
@@ -37,7 +40,7 @@ pub struct Scoped {
     /// policy is about tables nobody declared a reason to leave alone. Each
     /// with its parent and bound as the database has them: a baseline refuses
     /// a parent's handover by them, and names the partition they match
-    /// (#1852, DEC-1852.1).
+    /// (#1852, DEC-1852.1; narrowed with opaque evidence by DEC-2179.1).
     pub external: BTreeMap<TableName, PartitionOf>,
 
     /// Tables the identity file names that the database does not have.
@@ -260,6 +263,7 @@ pub fn scope(
         .collect();
 
     Scoped {
+        baseline_evidence: None,
         schema: scoped,
         unmanaged,
         external,
