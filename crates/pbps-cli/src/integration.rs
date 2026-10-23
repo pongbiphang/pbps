@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 54;
+pub const SCHEMA_VERSION: u32 = 55;
+// 55: SQL Server same_instance configuration and explain provenance (#2270).
 // 54: declared enum and domain files (#1635 slice one).
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
@@ -325,6 +326,29 @@ mod tests {
     /// on #1548). Only the lexical half is the schema's to state: `a/..` is
     /// judged on disk, where a symlink can lead it elsewhere, so both accept
     /// it here.
+    #[test]
+    fn same_instance_schema_accepts_only_server_policy_values() {
+        let schema = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for policy in [None, Some("allow"), Some("refuse")] {
+            let mut config = serde_json::json!({"dialect":"mssql","resolvers":{"s":{"kind":"server","url_env":"S"}}});
+            if let Some(policy) = policy {
+                config["resolvers"]["s"]["same_instance"] = policy.into();
+            }
+            assert!(validator.is_valid(&config), "{config}");
+        }
+        for policy in [
+            serde_json::json!("sometimes"),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+        ] {
+            let config = serde_json::json!({"dialect":"mssql","resolvers":{"s":{"kind":"server","url_env":"S","same_instance":policy}}});
+            assert!(!validator.is_valid(&config), "{config}");
+        }
+        let docker = serde_json::json!({"dialect":"mssql","resolvers":{"s":{"kind":"docker","image":"mssql:2025","same_instance":"allow"}}});
+        assert!(!validator.is_valid(&docker));
+    }
+
     #[test]
     fn config_schema_and_loader_agree_on_a_schema_dir_holding_the_project() {
         let document = schema(SchemaKind::Config);

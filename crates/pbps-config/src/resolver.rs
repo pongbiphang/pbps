@@ -57,6 +57,25 @@ impl OutsideWrites {
     }
 }
 
+/// Whether an externals file may run on the target's SQL Server instance.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SameInstance {
+    #[default]
+    Refuse,
+    Allow,
+}
+
 /// Only a configured source can be selected; an image suggestion is not an
 /// acquisition instruction. Neither variant can represent two backends.
 #[derive(
@@ -111,6 +130,15 @@ pub enum ResolverProfile {
         externals: Option<std::path::PathBuf>,
         #[serde(default, skip_serializing_if = "OutsideWrites::is_refuse")]
         outside_writes: OutsideWrites,
+        /// SQL Server only. Keep omission distinct from an explicit setting,
+        /// so PostgreSQL cannot silently accept an inapplicable policy.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "same_instance_policy"
+        )]
+        #[schemars(with = "SameInstance")]
+        same_instance: Option<SameInstance>,
     },
 }
 
@@ -376,6 +404,12 @@ pub(super) fn valid_profile_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
 
+fn same_instance_policy<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<SameInstance>, D::Error> {
+    SameInstance::deserialize(d).map(Some)
+}
+
 fn variable_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let value = String::deserialize(d)?;
     let first = value
@@ -475,6 +509,66 @@ impl Config {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn same_instance_is_explicit_and_sql_server_server_only() {
+        let parse = |dialect: &str, profile: &str| {
+            Config::parse(
+                &format!("dialect: {dialect}\nresolvers:\n  scratch: {profile}\n"),
+                Path::new("pbps.yml"),
+            )
+        };
+        for (field, expected) in [
+            ("", SameInstance::Refuse),
+            (", same_instance: refuse", SameInstance::Refuse),
+            (", same_instance: allow", SameInstance::Allow),
+        ] {
+            let c = parse("mssql", &format!("{{kind: server, url_env: S{field}}}")).unwrap();
+            let ResolverProfile::Server {
+                same_instance,
+                outside_writes,
+                ..
+            } = c.resolvers["scratch"]
+            else {
+                panic!("server");
+            };
+            assert_eq!(same_instance.unwrap_or_default(), expected);
+            assert_eq!(outside_writes, OutsideWrites::Refuse);
+            assert_eq!(same_instance.is_none(), field.is_empty());
+        }
+        for value in ["refuse", "allow"] {
+            let err = parse(
+                "postgres",
+                &format!("{{kind: server, url_env: S, same_instance: {value}}}"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("same_instance")
+                    && err.contains("scratch")
+                    && err.contains("PostgreSQL"),
+                "{err}"
+            );
+            assert!(
+                parse(
+                    "mssql",
+                    &format!("{{kind: docker, image: mssql:2025, same_instance: {value}}}")
+                )
+                .is_err()
+            );
+        }
+        for value in ["sometimes", "null", "true"] {
+            assert!(
+                parse(
+                    "mssql",
+                    &format!("{{kind: server, url_env: S, same_instance: {value}}}")
+                )
+                .is_err(),
+                "{value}"
+            );
+        }
+        assert!(parse("postgres", "{kind: server, url_env: S}").is_ok());
+    }
 
     /// #1636: a selection or an entry naming a measured profile is refused
     /// with a message that says the profiles are gone and names the

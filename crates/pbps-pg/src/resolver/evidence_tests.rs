@@ -41,6 +41,7 @@ fn evidence() -> ResolverEvidence {
                 scratch: ScratchSource::Server {},
                 layout: ScratchLayout::Supplied,
                 outside_writes: OutsideWrites::Refused,
+                same_instance: pbps_model::resolver::SameInstance::NotApplicable,
             },
         },
         AuthorizationCondition {
@@ -115,6 +116,7 @@ fn evidence_sealed_under_another_qualification_rule_is_refused_by_name() {
         "pg-analysis-scope-v1",
         // The other engine's rule is not this adapter's.
         "mssql-reported-scope-v1",
+        "mssql-reported-scope-v2",
     ] {
         let error = validate_evidence(&sealed_under(refused)).unwrap_err();
         assert_eq!(error, EvidenceError::Rule(refused.into()), "{refused}");

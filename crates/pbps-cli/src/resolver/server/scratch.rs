@@ -181,6 +181,7 @@ pub struct Provenance {
     pub entry: String,
     pub scratch: ScratchSource,
     pub outside_writes: OutsideWrites,
+    pub same_instance: pbps_model::resolver::SameInstance,
 }
 
 impl Provenance {
@@ -191,6 +192,7 @@ impl Provenance {
             entry: "scratch".into(),
             scratch: ScratchSource::Server {},
             outside_writes: OutsideWrites::Refused,
+            same_instance: pbps_model::resolver::SameInstance::NotApplicable,
         }
     }
 }
@@ -474,6 +476,7 @@ impl Run<'_> {
                     Provisioning::Supplied => ScratchLayout::Supplied,
                 },
                 outside_writes: self.provenance.outside_writes,
+                same_instance: self.provenance.same_instance,
             },
             target_cluster: self.planned_identity.to_owned(),
             limitations,

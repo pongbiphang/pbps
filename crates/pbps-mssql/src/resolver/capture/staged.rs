@@ -535,6 +535,17 @@ fn barriers(
     kept
 }
 
+/// The staged skip list also bounds authorization subjects. A child omitted
+/// from shape comparison must not become mandatory through owner equality.
+/// Explicit roots (including cascade barriers) are retained by the caller.
+pub(super) fn skipped_child(input: &Input) -> bool {
+    reference(input, "parent").is_some()
+        && matches!(
+            input.properties.get("type").and_then(Value::as_str),
+            Some("C" | "D" | "F" | "TR")
+        )
+}
+
 fn shapes(
     inputs: &BTreeMap<ObjectIdentity, Input>,
     roots: &BTreeSet<ObjectIdentity>,
@@ -561,10 +572,7 @@ fn shapes(
                         .map(|b| b.target.clone()),
                 );
             }
-            let designated = matches!(
-                input.properties.get("type").and_then(Value::as_str),
-                Some("C" | "D" | "F" | "TR")
-            );
+            let designated = skipped_child(input);
             if parent.is_some_and(|p| included.contains(&p))
                 && (!designated || barriers.contains(id))
             {

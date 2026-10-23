@@ -467,3 +467,6 @@ async fn external_depending_on_managed_object_refuses_by_name() {
         f.compare(&all,&[]).await.unwrap();
     }).await;
 }
+
+#[path = "reported2270.rs"]
+mod reported2270;

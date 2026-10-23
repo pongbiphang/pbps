@@ -16,7 +16,7 @@
 
 use pbps_db::DbError;
 use pbps_db::resolver::Observation;
-use pbps_db::resolver::environment::{CatalogFacts, ExtensionFact, SettingFact};
+use pbps_db::resolver::environment::{CatalogFacts, SettingFact};
 use pbps_db::transport::QueryConnection;
 use std::collections::BTreeMap;
 
@@ -119,17 +119,6 @@ pub(crate) const SETTINGS: &[&str] = &[
     "ansi_null_dflt_on",
 ];
 
-/// User-defined CLR assemblies: code the engine loads into its own process
-/// for this database, with its content read from the catalog and hashed by
-/// the engine. A name and a version are not identity; the bytes are.
-const ASSEMBLIES: &str = "\
-SELECT a.name AS name,
-       CONVERT(nvarchar(128), a.clr_name) AS clr_name,
-       CONVERT(nvarchar(64), a.permission_set_desc) AS permission_set,
-       (SELECT CONVERT(nvarchar(64), HASHBYTES('SHA2_256', f.content), 2)
-          FROM sys.assembly_files f WHERE f.assembly_id = a.assembly_id AND f.file_id = 1) AS digest
-FROM sys.assemblies a WHERE a.is_user_defined = 1 ORDER BY a.name;";
-
 pub async fn read(
     conn: &mut impl QueryConnection,
     scope: &Scope<'_>,
@@ -164,23 +153,9 @@ pub async fn read(
 
     let settings = session_settings(conn).await?;
 
-    // Reported through the extension shape: in-process code the database
-    // names, with its content digest where a native library path would be.
-    let mut extensions = Vec::new();
-    for row in conn.query(ASSEMBLIES).await? {
-        let text = |field: &str, what: &str| -> Result<String, DbError> {
-            row.try_get::<&str>(field)?
-                .map(str::to_owned)
-                .ok_or_else(|| DbError::BadRow(format!("a CLR assembly did not report {what}")))
-        };
-        extensions.push(ExtensionFact {
-            name: text("name", "its name")?,
-            version: text("clr_name", "its CLR name")?,
-            schema: text("permission_set", "its permission set")?,
-            requires: Vec::new(),
-            libraries: vec![text("digest", "its content digest")?.to_ascii_lowercase()],
-        });
-    }
+    // CLR objects are unstaged externals when reached, not environment facts.
+    // Reading unused assembly bytes also mistakes hidden metadata for absence
+    // (DEC-619.4, DEC-2270.1).
 
     let mut visibility = BTreeMap::new();
     for schema in scope.schemas {
@@ -192,7 +167,7 @@ pub async fn read(
 
     Ok(CatalogFacts {
         observations,
-        extensions,
+        extensions: Vec::new(),
         available_extensions: BTreeMap::new(),
         collations: Vec::new(),
         settings,

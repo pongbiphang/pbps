@@ -27,6 +27,6 @@ mod recheck;
 mod evidence;
 pub use evidence::{
     AuthorizationCondition, BindingCoverage, EvidenceError, EvidenceHandling, OutsideWrites,
-    PlanAnalysis, Qualification, ResolverEvidence, ResolverRuntime, ScratchLayout, ScratchSource,
-    TargetScope,
+    PlanAnalysis, Qualification, ResolverEvidence, ResolverRuntime, SameInstance, ScratchLayout,
+    ScratchSource, TargetScope,
 };

@@ -7,7 +7,7 @@ use pbps_model::Text;
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::{
     ObjectIdentity, OrderReason, OutsideWrites, Prerequisite, ResolverEvidence, ResolverRuntime,
-    ScratchLayout, ScratchSource, Surface, SurfaceResolution,
+    SameInstance, ScratchLayout, ScratchSource, Surface, SurfaceResolution,
 };
 
 /// What `explain` shows of a resolved plan's evidence.
@@ -27,6 +27,9 @@ pub struct ResolverDetail {
     /// Whether the externals file's writes outside the scratch database were
     /// `refused` or `allowed` (and then not checked).
     pub outside_writes: &'static str,
+    /// The SQL Server same-instance file policy; omitted for PostgreSQL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_instance: Option<&'static str>,
     /// The compatibility rule the scratch was qualified under.
     pub rule: String,
     /// The identifier of the fingerprint key the evidence is keyed with.
@@ -111,6 +114,7 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
         scratch,
         layout,
         outside_writes,
+        same_instance,
     } = &q.runtime;
     let (scratch, image) = match scratch {
         ScratchSource::Server {} => ("server", None),
@@ -136,6 +140,11 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
         outside_writes: match outside_writes {
             OutsideWrites::Refused => "refused",
             OutsideWrites::Allowed => "allowed",
+        },
+        same_instance: match same_instance {
+            SameInstance::NotApplicable => None,
+            SameInstance::Refused => Some("refused"),
+            SameInstance::Allowed => Some("allowed"),
         },
         rule: q.rule.clone(),
         key_id: evidence.before().key_id().to_owned(),
@@ -265,6 +274,9 @@ pub fn line(detail: &ResolverDetail) -> String {
         out.push_str(
             "; the externals file's writes outside the scratch database were allowed, not checked",
         );
+    }
+    if let Some(policy) = detail.same_instance {
+        out.push_str(&format!("; same-instance externals file {policy}"));
     }
     out
 }
@@ -416,6 +428,7 @@ mod tests {
             image: image.map(Into::into),
             layout: "run-owned",
             outside_writes: writes,
+            same_instance: None,
             rule: String::new(),
             key_id: String::new(),
             sealed: Vec::new(),
@@ -424,6 +437,27 @@ mod tests {
             order: Vec::new(),
             prerequisites: Vec::new(),
         }
+    }
+
+    #[test]
+    fn same_instance_policy_is_shown_in_human_and_json_output() {
+        for policy in ["refused", "allowed"] {
+            let mut detail = detail("server", None, "refused");
+            detail.same_instance = Some(policy);
+            assert!(line(&detail).contains(&format!("same-instance externals file {policy}")));
+            assert_eq!(
+                serde_json::to_value(&detail).unwrap()["same_instance"],
+                policy
+            );
+        }
+        let legacy = detail("server", None, "refused");
+        assert!(!line(&legacy).contains("same-instance"));
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("same_instance")
+                .is_none()
+        );
     }
 
     fn record(object: ObjectIdentity) -> Prerequisite {

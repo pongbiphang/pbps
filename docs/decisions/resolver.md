@@ -4164,3 +4164,57 @@ reports surviving permission rows as well as their type without scheduling
 an independent REVOKE.
 This exception is specific to measured type ACLs; it does not relax cleanup
 for other permission classes or certify an unreadable catalog as empty.
+
+<a id="dec-2270-1"></a>
+
+**DEC-2270.1. SQL Server seals an applicable same-instance file policy, and
+reported scope v2 omits user assemblies entirely.** The optional server-entry
+setting distinguishes omission from an explicit PostgreSQL setting, which
+refuses even for `refuse`. Docker rejects the field. SQL Server resolves
+omission to `Refused`; its scratch adapter refuses `NotApplicable` and admits
+a same-instance file, including an empty one, only for `Allowed`. Target
+database refusal precedes file admission. Every sandbox and staged comparison
+still runs, and `outside_writes` supplies no consent for this boundary.
+
+The shared runtime carries `SameInstance::{NotApplicable, Refused, Allowed}`.
+Only `NotApplicable` is omitted on the wire, preserving legacy PostgreSQL
+serialization and plan identity. A missing value reads as `NotApplicable`,
+never `Allowed`. Applicable choices enter the existing qualification/runtime
+identity and plan checksum, and human and JSON explain show both choices.
+The first SQL Server evidence reader (#2143) must require `Refused` or
+`Allowed`, admit only `mssql-reported-scope-v2`, and refuse a missing or
+inapplicable policy. This extends the existing carrier without an evidence
+version bump or enabling the unbuilt SQL Server planning path.
+
+On SQL Server 17.0.4075.5, an unused user assembly has a sys.assemblies row but
+no sys.assembly_modules row. A CLR scalar function is type FS, and a managed
+view records its dependency on that function. Environment reads no longer
+query or hash assembly binaries; v2 removes the assembly fact family and
+retains the v1 history unchanged (DEC-2012.1). Capture still refuses a reached
+CLR object by name because its binary cannot be staged. Binary staging
+remains #2106. This implements DEC-619.4 and closes the manifest-only identity
+and hidden-assembly issues #721 and #718 without treating hidden code as absent.
+
+<a id="dec-2270-2"></a>
+
+**DEC-2270.2. Staged authorization uses the same designated-child skip list
+as staged shape comparison, retaining every explicit child root.** On SQL
+Server 17.0.4075.5 a target table with an authored DEFAULT was rendered without
+that DEFAULT, as the comparison rule requires, but OwnerPartition included
+the captured constraint as another mandatory subject. The target and scratch
+table both had effective owner dbo, their database owners both had SID 0x01
+and login sa, and PrincipalMap mapped dbo to dbo. Only the target partition
+contained the DEFAULT constraint. Removing the DEFAULT made the unchanged
+supplied same-instance path pass; this was a comparison-scope bug, not a
+fixture-owner difference or an engine limit.
+
+Use one predicate for parented DEFAULTs, CHECKs, foreign keys and triggers,
+the existing staged skip list. The complete target capture and its sealed
+facts stay intact; only authorization subjects omit an unretained designated
+child. An explicit root still participates, including the cascade and INSTEAD
+OF trigger prerequisites retained by cascade_scope. The CLI final ownership capture also retains the required external roots,
+because inventory carries a child with its newly created parent. Standalone
+defaults, keys, user types and unknown kinds are not skipped. Ownership and ACLs of
+all retained subjects still compare, and file-supplied ownership is never
+repaired. Filtering only the renderer would leave the same false refusal in
+the other OwnerPartition callers.
