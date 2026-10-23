@@ -18,14 +18,14 @@ pub fn seal(
         .iter()
         .filter_map(|(uid, name)| {
             let definition = desired.types.get(name)?.clone();
-            let before_name = base_ids.types.get(uid).unwrap_or(name);
-            let before = base
-                .types
-                .get(before_name)
-                .map(|definition| DeclaredTypeBefore {
-                    name: before_name.clone(),
-                    definition: definition.clone(),
-                });
+            let before = base_ids.types.get(uid).and_then(|before_name| {
+                base.types
+                    .get(before_name)
+                    .map(|definition| DeclaredTypeBefore {
+                        name: before_name.clone(),
+                        definition: definition.clone(),
+                    })
+            });
             Some(DeclaredTypePin {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -79,58 +79,78 @@ async fn definitions(conn: &mut Conn, within: Within) -> Result<Schema, DbError>
     Ok(read.schema)
 }
 
-/// `initial` checks the approved before-state. Subsequent boundaries accept
-/// an already-created, vetted step on resume, and re-vet it before use.
-pub async fn check(
-    conn: &mut Conn,
+/// Follow the emitter's uid annotation through the executed prefix, including
+/// SET SCHEMA's intermediate name. A final name can still hold another uid.
+fn current<'a>(
+    pin: &'a DeclaredTypePin,
+    executed: &'a [pbps_dialect::Statement],
+) -> Option<(&'a TypeRef, &'a ManagedType, bool)> {
+    if let Some(step) = executed
+        .iter()
+        .rev()
+        .filter_map(|s| s.declared_type.as_ref())
+        .find(|s| s.uid == pin.uid)
+    {
+        step.definition
+            .as_ref()
+            .map(|_| (&step.name, &pin.definition, false))
+    } else {
+        pin.before.as_ref().map(|b| (&b.name, &b.definition, true))
+    }
+}
+
+// A pending creation may still see the approved predecessor. Once the uid's
+// CREATE has run, it must be checked even when its name was handed over.
+#[allow(clippy::wildcard_enum_match_arm)] // Only these changes release a pg_type slot.
+fn pending_predecessor(
+    pin: &DeclaredTypePin,
+    live: &Schema,
+    changes: &pbps_model::ChangeSet,
+    executed: &[pbps_dialect::Statement],
+) -> bool {
+    changes.changes.iter().any(|step| match &step.change {
+        pbps_model::Change::DropType { uid, name, .. }
+        | pbps_model::Change::RenameType {
+            uid, from: name, ..
+        } => {
+            name == &pin.name
+                && !executed
+                    .iter()
+                    .filter_map(|s| s.declared_type.as_ref())
+                    .any(|s| &s.uid == uid)
+        }
+        pbps_model::Change::DropTable { name, .. }
+        | pbps_model::Change::RenameTable { from: name, .. } => {
+            name.schema == pin.name.schema()
+                && name.name == pin.name.name()
+                && live.tables.contains_key(name)
+        }
+        pbps_model::Change::DropModule {
+            id,
+            kind: pbps_model::ModuleKind::View,
+        } => {
+            id.schema() == pin.name.schema()
+                && id.name() == pin.name.name()
+                && live
+                    .modules
+                    .get(id)
+                    .is_some_and(|m| m.kind == pbps_model::ModuleKind::View)
+        }
+        _ => false,
+    })
+}
+
+fn check_definitions(
+    live: &Schema,
     pins: &[DeclaredTypePin],
-    trusted: &BTreeSet<pbps_model::RoleName>,
-    within: Within,
-    initial: bool,
     complete: bool,
     changes: &pbps_model::ChangeSet,
-) -> Result<(), DbError> {
-    if pins.is_empty() {
-        return Ok(());
-    }
-    let live = definitions(conn, within).await?;
+    executed: &[pbps_dialect::Statement],
+) -> Result<(Vec<TypeRef>, Vec<TypeRef>), DbError> {
     let mut present = Vec::new();
+    let mut absent = Vec::new();
     for pin in pins {
-        // Only operations releasing the new name can be its slot predecessor.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        let released = changes.changes.iter().any(|step| match &step.change {
-            pbps_model::Change::DropType { name, .. }
-            | pbps_model::Change::RenameType { from: name, .. } => name == &pin.name,
-            pbps_model::Change::DropTable { name, .. }
-            | pbps_model::Change::RenameTable { from: name, .. } => {
-                name.schema == pin.name.schema() && name.name == pin.name.name()
-            }
-            pbps_model::Change::DropModule {
-                id,
-                kind: pbps_model::ModuleKind::View,
-            } => id.schema() == pin.name.schema() && id.name() == pin.name.name(),
-            _ => false,
-        });
-        if pin.before.is_none() && released && !complete {
-            continue;
-        }
-        let intermediate = pin
-            .before
-            .as_ref()
-            .and_then(|before| TypeRef::new(pin.name.schema(), before.name.name()).ok());
-        let expected = if initial {
-            pin.before.as_ref().map(|b| (&b.name, &b.definition, true))
-        } else if live.types.contains_key(&pin.name) {
-            Some((&pin.name, &pin.definition, false))
-        } else if let Some(name) = intermediate
-            .as_ref()
-            .filter(|n| live.types.contains_key(*n))
-        {
-            Some((name, &pin.definition, false))
-        } else {
-            pin.before.as_ref().map(|b| (&b.name, &b.definition, true))
-        };
-        if let Some((name, definition, before)) = expected {
+        if let Some((name, definition, before)) = current(pin, executed) {
             let actual = live.types.get(name).ok_or_else(|| {
                 failed(format!(
                     "declared type `{}` is absent; plan again",
@@ -138,25 +158,24 @@ pub async fn check(
                 ))
             })?;
             let mut expected = definition.clone();
-            // A declared base follows its uid through an earlier/later rename.
-            // Before statements, retain the exact catalog-to-catalog comparison.
-            if !initial
-                && let ManagedType::Domain { base, .. } = &mut expected
+            // Both before and declared bases follow their own uid. The name
+            // being vacated can still belong to a different base in a chain.
+            if let ManagedType::Domain { base, .. } = &mut expected
                 && let Some(reference) = base.type_ref()
-                && let Some(base_pin) = pins.iter().find(|p| &p.name == reference)
-                && !live.types.contains_key(reference)
-                && let Some(before) = &base_pin.before
+                && let Some(base_pin) = pins.iter().find(|p| {
+                    if before {
+                        p.before.as_ref().is_some_and(|b| &b.name == reference)
+                    } else {
+                        &p.name == reference
+                    }
+                })
+                && let Some((current, _, _)) = current(base_pin, executed)
             {
-                let intermediate = TypeRef::new(base_pin.name.schema(), before.name.name()).ok();
-                let current = intermediate
-                    .as_ref()
-                    .filter(|name| live.types.contains_key(*name))
-                    .unwrap_or(&before.name);
                 let ty = pbps_model::ColumnType::reference(current.clone());
                 *base = if base.is_array() { ty.into_array() } else { ty };
             }
-            if (initial && before && actual != definition)
-                || (!(initial && before) && !matches_declaration(&expected, actual))
+            if (before && actual != &expected)
+                || (!before && !matches_declaration(&expected, actual))
             {
                 return Err(failed(format!(
                     "declared type `{}` changed since planning; plan again",
@@ -171,20 +190,49 @@ pub async fn check(
             }
             present.push(name.clone());
         } else {
-            let reads =
-                crate::user_types::read(conn, within, std::slice::from_ref(&pin.name)).await;
-            if !matches!(reads.as_slice(), [crate::user_types::TypeRead::Absent]) {
-                return Err(failed(format!(
-                    "declared type `{}` must be absent before creation",
-                    pin.name.shown()
-                )));
-            }
             if complete {
                 return Err(failed(format!(
                     "declared type `{}` was not created by its plan",
                     pin.name.shown()
                 )));
             }
+            if !pending_predecessor(pin, live, changes, executed) {
+                if live.types.contains_key(&pin.name) {
+                    return Err(failed(format!(
+                        "declared type `{}` must be absent before creation",
+                        pin.name.shown()
+                    )));
+                }
+                absent.push(pin.name.clone());
+            }
+        }
+    }
+    Ok((present, absent))
+}
+
+/// Check each uid where the executed statements leave it. Untouched definitions
+/// retain catalog-to-catalog drift checks; emitted definitions use SPEC §7.6.
+pub async fn check(
+    conn: &mut Conn,
+    pins: &[DeclaredTypePin],
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    within: Within,
+    complete: bool,
+    changes: &pbps_model::ChangeSet,
+    executed: &[pbps_dialect::Statement],
+) -> Result<(), DbError> {
+    if pins.is_empty() {
+        return Ok(());
+    }
+    let live = definitions(conn, within).await?;
+    let (present, absent) = check_definitions(&live, pins, complete, changes, executed)?;
+    for name in absent {
+        let reads = crate::user_types::read(conn, within, std::slice::from_ref(&name)).await;
+        if !matches!(reads.as_slice(), [crate::user_types::TypeRead::Absent]) {
+            return Err(failed(format!(
+                "declared type `{}` must be absent before creation",
+                name.shown()
+            )));
         }
     }
     input_routines(conn, within, &present, trusted, false).await?;
@@ -253,6 +301,265 @@ pub fn names(pins: &[DeclaredTypePin]) -> BTreeSet<TypeRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enumeration(value: &str) -> ManagedType {
+        ManagedType::Enum {
+            values: vec![value.into()],
+        }
+    }
+
+    fn renamed_pin(seed: &str, from: &str, to: &str, definition: ManagedType) -> DeclaredTypePin {
+        DeclaredTypePin {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Type, seed, 0),
+            name: to.parse().unwrap(),
+            definition: definition.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: from.parse().unwrap(),
+                definition,
+            }),
+        }
+    }
+
+    fn wrote(pin: &DeclaredTypePin, name: &str) -> pbps_dialect::Statement {
+        let mut statement = pbps_dialect::Statement::new("unused");
+        statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+            uid: pin.uid.clone(),
+            name: name.parse().unwrap(),
+            definition: Some(pin.definition.clone()),
+        });
+        statement
+    }
+
+    #[test]
+    fn rename_chains_check_each_uid_at_every_executed_boundary_and_refuse_holder_drift() {
+        let pins = [
+            renamed_pin("a", "app.a", "app.b", enumeration("a")),
+            renamed_pin("b", "app.b", "app.c", enumeration("b")),
+        ];
+        let statements = [wrote(&pins[1], "app.c"), wrote(&pins[0], "app.b")];
+        let mut live = Schema {
+            types: [
+                ("app.a".parse().unwrap(), enumeration("a")),
+                ("app.b".parse().unwrap(), enumeration("b")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        for completed in 0..=statements.len() {
+            let executed = &statements[..completed];
+            check_definitions(
+                &live,
+                &pins,
+                completed == statements.len(),
+                &Default::default(),
+                executed,
+            )
+            .unwrap();
+            for pin in &pins {
+                let name = current(pin, executed).unwrap().0;
+                let mut drift = live.clone();
+                drift.types.insert(name.clone(), enumeration("manual"));
+                assert!(
+                    check_definitions(&drift, &pins, false, &Default::default(), executed).is_err(),
+                    "holder {} after {completed} steps",
+                    name.shown()
+                );
+            }
+            if let Some(statement) = statements.get(completed) {
+                let step = statement.declared_type.as_ref().unwrap();
+                let pin = pins.iter().find(|p| p.uid == step.uid).unwrap();
+                let old = current(pin, executed).unwrap().0;
+                let definition = live.types.remove(old).unwrap();
+                live.types.insert(step.name.clone(), definition);
+            }
+        }
+        assert!(check_definitions(&live, &pins, true, &Default::default(), &[]).is_err());
+    }
+
+    #[test]
+    fn domain_bases_follow_their_uid_even_when_the_final_name_has_another_holder() {
+        let mut pins = vec![
+            renamed_pin("a", "app.a", "app.b", enumeration("a")),
+            renamed_pin("b", "app.b", "app.c", enumeration("b")),
+        ];
+        for (seed, from, to) in [("da", "app.a", "app.b"), ("db", "app.b", "app.c")] {
+            let domain = |name: &str| ManagedType::Domain {
+                base: format!("{name}[]").parse().unwrap(),
+                not_null: false,
+                default: Some("'{}'".into()),
+                checks: Default::default(),
+                collation: None,
+            };
+            let name = format!("app.{seed}");
+            let mut pin = renamed_pin(seed, &name, &name, domain(from));
+            pin.definition = domain(to);
+            pins.push(pin);
+        }
+        let statements = [wrote(&pins[1], "app.c"), wrote(&pins[0], "app.b")];
+        for completed in 0..=2 {
+            let executed = &statements[..completed];
+            let mut live = Schema::default();
+            for pin in &pins {
+                let (name, mut definition, _) = {
+                    let (name, definition, before) = current(pin, executed).unwrap();
+                    (name, definition.clone(), before)
+                };
+                if let ManagedType::Domain { base, .. } = &mut definition {
+                    let base_pin = pins
+                        .iter()
+                        .find(|p| p.before.as_ref().unwrap().name == *base.type_ref().unwrap())
+                        .unwrap();
+                    *base = pbps_model::ColumnType::reference(
+                        current(base_pin, executed).unwrap().0.clone(),
+                    )
+                    .into_array();
+                }
+                live.types.insert(name.clone(), definition);
+            }
+            check_definitions(&live, &pins, completed == 2, &Default::default(), executed).unwrap();
+            let ManagedType::Domain { default, .. } =
+                live.types.get_mut(&"app.da".parse().unwrap()).unwrap()
+            else {
+                unreachable!()
+            };
+            *default = Some("'manual'".into());
+            assert!(check_definitions(&live, &pins, false, &Default::default(), executed).is_err());
+        }
+    }
+
+    #[test]
+    fn a_new_uid_does_not_adopt_the_definition_of_a_name_predecessor() {
+        let old = renamed_pin("old", "app.x", "app.x", enumeration("old"));
+        let new = renamed_pin("new", "app.x", "app.x", enumeration("new"));
+        let base = Schema {
+            types: [(old.name.clone(), old.definition.clone())].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            types: [(new.name.clone(), new.definition.clone())].into(),
+            ..Default::default()
+        };
+        let base_ids = IdsFile {
+            types: [(old.uid.clone(), old.name.clone())].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: [(new.uid.clone(), new.name.clone())].into(),
+            ..Default::default()
+        };
+        let pins = seal(&base, &base_ids, &desired, &ids);
+        assert!(pins[0].before.is_none());
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropType {
+                    uid: old.uid.clone(),
+                    name: old.name.clone(),
+                    definition: Box::new(old.definition.clone()),
+                },
+            )],
+        };
+        check_definitions(&base, &pins, false, &changes, &[]).unwrap();
+        let mut drop = wrote(&old, "app.x");
+        drop.declared_type.as_mut().unwrap().definition = None;
+        assert!(check_definitions(&base, &pins, false, &changes, &[drop.clone()]).is_err());
+        check_definitions(&Schema::default(), &pins, false, &changes, &[drop.clone()]).unwrap();
+        let executed = [drop, wrote(&new, "app.x")];
+        check_definitions(&desired, &pins, true, &changes, &executed).unwrap();
+        assert!(check_definitions(&base, &pins, false, &changes, &executed).is_err());
+    }
+
+    #[test]
+    fn an_intermediate_name_held_by_another_uid_does_not_certify_a_schema_move() {
+        let pins = [
+            renamed_pin("a", "app.a", "dst.b", enumeration("a")),
+            renamed_pin("b", "dst.a", "dst.c", enumeration("b")),
+        ];
+        let statements = [
+            wrote(&pins[1], "dst.c"),
+            wrote(&pins[0], "dst.a"),
+            wrote(&pins[0], "dst.b"),
+        ];
+        let mut live = Schema {
+            types: [
+                ("app.a".parse().unwrap(), enumeration("a")),
+                ("dst.a".parse().unwrap(), enumeration("b")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        for completed in 0..=statements.len() {
+            check_definitions(
+                &live,
+                &pins,
+                completed == statements.len(),
+                &Default::default(),
+                &statements[..completed],
+            )
+            .unwrap();
+            if let Some(step) = statements
+                .get(completed)
+                .and_then(|s| s.declared_type.as_ref())
+            {
+                let pin = pins.iter().find(|p| p.uid == step.uid).unwrap();
+                let name = current(pin, &statements[..completed]).unwrap().0;
+                let definition = live.types.remove(name).unwrap();
+                live.types.insert(step.name.clone(), definition);
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_predecessor_is_checked_for_absence_after_release_and_vetted_after_creation() {
+        let mut pin = renamed_pin("new", "app.x", "app.x", enumeration("new"));
+        pin.before = None;
+        let table = pbps_model::TableName::new("app", "x");
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropTable {
+                    uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "x", 0),
+                    name: table.clone(),
+                    detach_from: None,
+                },
+            )],
+        };
+        let live = Schema {
+            tables: [(table, Default::default())].into(),
+            ..Default::default()
+        };
+        assert!(
+            check_definitions(&live, std::slice::from_ref(&pin), false, &changes, &[])
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            check_definitions(
+                &Schema::default(),
+                std::slice::from_ref(&pin),
+                false,
+                &changes,
+                &[]
+            )
+            .unwrap()
+            .1,
+            vec![pin.name.clone()]
+        );
+        let created = wrote(&pin, "app.x");
+        let mut live = Schema {
+            types: [(pin.name.clone(), pin.definition.clone())].into(),
+            ..Default::default()
+        };
+        check_definitions(
+            &live,
+            std::slice::from_ref(&pin),
+            false,
+            &changes,
+            std::slice::from_ref(&created),
+        )
+        .unwrap();
+        live.types.insert(pin.name.clone(), enumeration("manual"));
+        assert!(check_definitions(&live, &[pin], false, &changes, &[created]).is_err());
+    }
 
     #[test]
     fn readback_expressions_compare_by_presence_while_structural_fields_compare_exactly() {

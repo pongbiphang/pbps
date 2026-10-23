@@ -489,6 +489,7 @@
         "managed_types::declared_type_lifecycles_converge_and_vetting_is_atomic",
         "managed_types::domain_expression_records_converge_without_masking_layout_changes_or_live_drift",
         "managed_types::adopted_domains_and_older_states_keep_engine_expression_text",
+        "managed_types::rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks",
         "managed_types::staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step",
         "managed_types::pg_type_names_refuse_row_types_and_admit_indexes_and_sequences_before_emission",
         "managed_types::type_drops_follow_the_last_table_and_table_names_can_handoff_to_types",

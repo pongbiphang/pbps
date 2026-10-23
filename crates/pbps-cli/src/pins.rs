@@ -24,53 +24,86 @@ const RULE: &str = "pbps/external-routine-pin/v1";
 
 /// Where a check runs, which decides how it reads and what its refusal says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Check {
+pub enum Check<'a> {
     /// Under the lock, before the pre-flight probes, with no transaction open.
     BeforeProbes,
     /// Inside the apply transaction, before a statement.
-    BeforeStatements,
+    BeforeStatements {
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// Inside the apply transaction, after the read-back and before `record`.
-    BeforeRecording,
+    BeforeRecording {
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// After recording, still inside the transaction, before COMMIT.
-    BeforeCommit,
+    BeforeCommit {
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// A staged step, before its statement runs. No transaction is open.
-    BeforeStep { step: usize, total: usize },
+    BeforeStep {
+        step: usize,
+        total: usize,
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// A staged step, after its statement committed and before its checkpoint.
-    AfterStep { step: usize, total: usize },
+    AfterStep {
+        step: usize,
+        total: usize,
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// A staged row write, inside its own transaction, after the statement
     /// and before the commit (#428).
-    BeforeStepCommits { step: usize, total: usize },
+    BeforeStepCommits {
+        step: usize,
+        total: usize,
+        executed: &'a [pbps_dialect::Statement],
+    },
     /// A staged run's closing read, before the ordinary entry that says it
     /// finished. A `--resume` with no step left reaches only this one.
-    BeforeClosing,
+    BeforeClosing {
+        executed: &'a [pbps_dialect::Statement],
+    },
 }
 
-impl Check {
+impl<'a> Check<'a> {
     fn within(self) -> pbps_pg::pins::Within {
         match self {
-            Check::BeforeStatements
-            | Check::BeforeRecording
-            | Check::BeforeCommit
+            Check::BeforeStatements { .. }
+            | Check::BeforeRecording { .. }
+            | Check::BeforeCommit { .. }
             | Check::BeforeStepCommits { .. } => pbps_pg::pins::Within::CallersTransaction,
             Check::BeforeProbes
             | Check::BeforeStep { .. }
             | Check::AfterStep { .. }
-            | Check::BeforeClosing => pbps_pg::pins::Within::OwnTransaction,
+            | Check::BeforeClosing { .. } => pbps_pg::pins::Within::OwnTransaction,
+        }
+    }
+
+    fn executed(self) -> &'a [pbps_dialect::Statement] {
+        match self {
+            Check::BeforeProbes => &[],
+            Check::BeforeStatements { executed }
+            | Check::BeforeRecording { executed }
+            | Check::BeforeCommit { executed }
+            | Check::BeforeClosing { executed }
+            | Check::BeforeStep { executed, .. }
+            | Check::AfterStep { executed, .. }
+            | Check::BeforeStepCommits { executed, .. } => executed,
         }
     }
 
     fn when(self) -> String {
         match self {
             Check::BeforeProbes => "before the pre-flight probes".to_owned(),
-            Check::BeforeStatements => "before a statement".to_owned(),
-            Check::BeforeRecording => "after the statements, before recording".to_owned(),
-            Check::BeforeCommit => "before COMMIT".to_owned(),
-            Check::BeforeStep { step, total } => format!("before statement {step} of {total}"),
-            Check::AfterStep { step, total } => {
+            Check::BeforeStatements { .. } => "before a statement".to_owned(),
+            Check::BeforeRecording { .. } => "after the statements, before recording".to_owned(),
+            Check::BeforeCommit { .. } => "before COMMIT".to_owned(),
+            Check::BeforeStep { step, total, .. } => format!("before statement {step} of {total}"),
+            Check::AfterStep { step, total, .. } => {
                 format!("after statement {step} of {total} committed")
             }
-            Check::BeforeClosing => "before the staged run's closing entry".to_owned(),
-            Check::BeforeStepCommits { step, total } => {
+            Check::BeforeClosing { .. } => "before the staged run's closing entry".to_owned(),
+            Check::BeforeStepCommits { step, total, .. } => {
                 format!("after statement {step} of {total} ran, before it committed")
             }
         }
@@ -92,7 +125,7 @@ pub struct Approved<'a> {
 }
 
 impl Approved<'_> {
-    pub async fn check(&self, conn: &mut Conn, at: Check) -> anyhow::Result<()> {
+    pub async fn check(&self, conn: &mut Conn, at: Check<'_>) -> anyhow::Result<()> {
         check(conn, self.project, self.target, self.plan, self.managed, at).await
     }
 }
@@ -148,7 +181,7 @@ pub async fn check(
     target: &Target,
     plan: &pbps_model::SavedPlan,
     managed: &Managed,
-    at: Check,
+    at: Check<'_>,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
         pbps_pg::type_refs::declared::check(
@@ -156,12 +189,14 @@ pub async fn check(
             &plan.declared_type_pins,
             &project.config.trusted_roles,
             at.within(),
-            matches!(at, Check::BeforeProbes),
             matches!(
                 at,
-                Check::BeforeRecording | Check::BeforeCommit | Check::BeforeClosing
+                Check::BeforeRecording { .. }
+                    | Check::BeforeCommit { .. }
+                    | Check::BeforeClosing { .. }
             ),
             &plan.changes,
+            at.executed(),
         )
         .await?;
     }
@@ -280,7 +315,7 @@ async fn check_selected(
     project: &Project,
     target: &Target,
     plan: &pbps_model::SavedPlan,
-    at: Check,
+    at: Check<'_>,
 ) -> anyhow::Result<()> {
     if project.config.pin_type_routines != plan.pin_type_routines {
         bail!("pin_type_routines changed since planning; plan again against the database");

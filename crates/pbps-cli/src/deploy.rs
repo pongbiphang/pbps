@@ -4540,45 +4540,43 @@ fn refuse_pinned_movement(
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let mut named_before = sequences_named(dialect, before);
+    let mut renamed_types = BTreeMap::new();
     for step in &changes.changes {
         if let pbps_model::Change::RenameType { from, to, .. } = &step.change {
-            let intermediate = pbps_model::TypeRef::new(to.schema(), from.name()).ok();
-            let landed = if after.types.contains_key(to) {
-                Some(to)
-            } else {
-                intermediate
-                    .as_ref()
-                    .filter(|name| after.types.contains_key(*name))
-            };
-            if let Some(landed) = landed {
-                for definition in named_before.to_mut().types.values_mut() {
-                    if let pbps_model::ManagedType::Domain { base, .. } = definition
-                        && (base.type_ref() == Some(from)
-                            || base
-                                .type_ref()
-                                .is_some_and(|r| intermediate.as_ref() == Some(r)))
-                    {
-                        let ty = pbps_model::ColumnType::reference(landed.clone());
-                        *base = if base.is_array() { ty.into_array() } else { ty };
-                    }
-                }
-                for table in named_before.to_mut().tables.values_mut() {
-                    for column in table.columns.values_mut() {
-                        if column.ty.type_ref() == Some(from)
-                            || column
-                                .ty
-                                .type_ref()
-                                .is_some_and(|r| intermediate.as_ref() == Some(r))
-                        {
-                            let ty = pbps_model::ColumnType::reference(landed.clone());
-                            column.ty = if column.ty.is_array() {
-                                ty.into_array()
-                            } else {
-                                ty
-                            };
-                        }
-                    }
-                }
+            renamed_types.insert(from.clone(), to.clone());
+        }
+    }
+    for step in &changes.changes {
+        if let pbps_model::Change::RenameType { from, to, .. } = &step.change
+            && let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name())
+        {
+            renamed_types
+                .entry(intermediate)
+                .or_insert_with(|| to.clone());
+        }
+    }
+    // This read follows the admitted changes (or one emitted staged step).
+    // Map each original reference once: a chain's final names can still be
+    // another uid's original names, and cannot certify execution progress.
+    if !renamed_types.is_empty() {
+        let follow = |ty: &mut pbps_model::ColumnType| {
+            if let Some(to) = ty.type_ref().and_then(|r| renamed_types.get(r)) {
+                let reference = pbps_model::ColumnType::reference(to.clone());
+                *ty = if ty.is_array() {
+                    reference.into_array()
+                } else {
+                    reference
+                };
+            }
+        };
+        for definition in named_before.to_mut().types.values_mut() {
+            if let pbps_model::ManagedType::Domain { base, .. } = definition {
+                follow(base);
+            }
+        }
+        for table in named_before.to_mut().tables.values_mut() {
+            for column in table.columns.values_mut() {
+                follow(&mut column.ty);
             }
         }
     }
@@ -8612,7 +8610,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::BeforeStatements,
+            crate::pins::Check::BeforeStatements { executed: &[] },
         )
         .await?;
         // Last before the first statement, inside the transaction and under
@@ -8663,7 +8661,9 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::BeforeRecording,
+            crate::pins::Check::BeforeRecording {
+                executed: statements.statements(),
+            },
         )
         .await
         .context("Nothing has been applied — the transaction was rolled back.")?;
@@ -8730,7 +8730,9 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::BeforeRecording,
+            crate::pins::Check::BeforeRecording {
+                executed: statements.statements(),
+            },
         )
         .await
         .map_err(|e| {
@@ -8769,7 +8771,9 @@ async fn apply_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::BeforeCommit,
+            crate::pins::Check::BeforeCommit {
+                executed: statements.statements(),
+            },
         )
         .await
         .context("Nothing has been applied — the transaction was rolled back.")?;
@@ -9143,8 +9147,8 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // on a resume — and each statement moves it, using what the emitter said
     // that statement does (`Statement::renames`).
     let mut live_ids = entry.snapshot.ids.clone();
-    // Types have no lifecycle statements in this slice: every planned type
-    // identity already exists and must remain in each checkpoint's scope.
+    // Include adopted types missing from the older state. Each lifecycle
+    // statement updates its uid below before the checkpoint is read.
     live_ids.types = plan.ids.types.clone();
     if !dialect.manages_roles() {
         live_ids.roles = plan.ids.roles.clone();
@@ -9180,7 +9184,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::BeforeStep { step: i + 1, total },
+            crate::pins::Check::BeforeStep {
+                step: i + 1,
+                total,
+                executed: &statements[..i],
+            },
         )
         .await?;
         let executed = if stmt.row_write.is_some() {
@@ -9217,7 +9225,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     target,
                     plan,
                     &pinned_managed,
-                    crate::pins::Check::BeforeStepCommits { step: i + 1, total },
+                    crate::pins::Check::BeforeStepCommits {
+                        step: i + 1,
+                        total,
+                        executed: &statements[..=i],
+                    },
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(())
@@ -9258,7 +9270,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                     target,
                     plan,
                     &pinned_managed,
-                    crate::pins::Check::BeforeStepCommits { step: i + 1, total },
+                    crate::pins::Check::BeforeStepCommits {
+                        step: i + 1,
+                        total,
+                        executed: &statements[..=i],
+                    },
                 )
                 .await
             }
@@ -9340,7 +9356,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 target,
                 plan,
                 &pinned_managed,
-                crate::pins::Check::AfterStep { step: i + 1, total },
+                crate::pins::Check::AfterStep {
+                    step: i + 1,
+                    total,
+                    executed: &statements[..=i],
+                },
             )
             .await?;
             println!(
@@ -9407,7 +9427,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             target,
             plan,
             &pinned_managed,
-            crate::pins::Check::AfterStep { step: i + 1, total },
+            crate::pins::Check::AfterStep {
+                step: i + 1,
+                total,
+                executed: &statements[..=i],
+            },
         )
         .await;
         let id = crate::engine::record(conn, &checkpoint).await?;
@@ -9502,7 +9526,9 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         target,
         plan,
         &pinned_managed,
-        crate::pins::Check::BeforeClosing,
+        crate::pins::Check::BeforeClosing {
+            executed: statements.statements(),
+        },
     )
     .await
     .map_err(|e| {
@@ -10295,7 +10321,12 @@ async fn execute_statement(
     let stmt = &statements[position];
     if let Some(approved) = reviewed {
         approved
-            .check(conn, crate::pins::Check::BeforeStatements)
+            .check(
+                conn,
+                crate::pins::Check::BeforeStatements {
+                    executed: &statements[..position],
+                },
+            )
             .await
             .context("Nothing has been applied — the transaction was rolled back.")?;
     }

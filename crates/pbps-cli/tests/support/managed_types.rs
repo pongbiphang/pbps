@@ -1137,6 +1137,168 @@ fn type_drops_follow_the_last_table_and_table_names_can_handoff_to_types() {
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn rename_chains_keep_distinct_type_holders_through_apply_and_resumed_checks() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for resume in [false, true] {
+            let own = OwnDatabase::new(&server, "rename_chain1635");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.a AS ENUM ('a'); CREATE TYPE app.b AS ENUM ('b'); CREATE DOMAIN app.da AS app.a[]; CREATE DOMAIN app.db AS app.b; CREATE TABLE app.t (a app.a, b app.b[], da app.da, db app.db)",
+            );
+            let d = Demo::new("rename-chain1635");
+            succeeds(d.run(&["pull", "--db", db]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                db,
+                "--reason",
+                "adopt distinct enum holders",
+            ]));
+            // Record two revisions without applying either. The connected
+            // plan must perform both uid-preserving renames in one transaction.
+            std::fs::remove_file(d.dir.join("schema/app.b.type.yml")).unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.c.type.yml"),
+                "enum: app.c\nrenamed_from: app.b\nvalues: [b]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.db.type.yml"),
+                "domain: app.db\ntype: app.c\n",
+            )
+            .unwrap();
+            d.table("table: app.t\ncolumns:\n  a: {type: app.a}\n  b: {type: 'app.c[]'}\n  da: {type: app.da}\n  db: {type: app.db}\n");
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            std::fs::remove_file(d.dir.join("schema/app.a.type.yml")).unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.b.type.yml"),
+                "enum: app.b\nrenamed_from: app.a\nvalues: [a]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.da.type.yml"),
+                "domain: app.da\ntype: app.b[]\n",
+            )
+            .unwrap();
+            d.table("table: app.t\ncolumns:\n  a: {type: app.b}\n  b: {type: 'app.c[]'}\n  da: {type: app.da}\n  db: {type: app.db}\n");
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let path = d.dir.join("chain.plan.json");
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved.changes.changes.len(), 2);
+            assert!(
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::RenameType { from, to, .. } if from.name() == "b" && to.name() == "c")
+            );
+            if resume {
+                // Multi-change plans are transactional. Exercise the type-pin
+                // resume boundary directly across a committed prefix and a
+                // new connection; the staged CLI's single-change resume is
+                // covered by the adjacent cross-schema rename test.
+                let pg = pbps_pg::Postgres::new();
+                let statements: Vec<_> = saved
+                    .changes
+                    .changes
+                    .iter()
+                    .flat_map(|p| pg.fixture_emit(&p.change, p.strategy).unwrap())
+                    .collect();
+                let framing = pbps_dialect::Dialect::transaction_framing(
+                    &pg,
+                    &pbps_model::SessionZone::utc(),
+                );
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let connect = || pbps_db::Conn::connect(pbps_db::Driver::Postgres, db);
+                    let trusted = std::collections::BTreeSet::new();
+                    let mut conn = connect().await.unwrap();
+                    for completed in 0..=statements.len() {
+                        if completed == 1 {
+                            drop(conn);
+                            conn = connect().await.unwrap();
+                        }
+                        pbps_pg::type_refs::declared::check(
+                            &mut conn,
+                            &saved.declared_type_pins,
+                            &trusted,
+                            pbps_pg::pins::Within::OwnTransaction,
+                            completed == statements.len(),
+                            &saved.changes,
+                            &statements[..completed],
+                        )
+                        .await
+                        .unwrap();
+                        if let Some(statement) = statements.get(completed) {
+                            conn.begin(&framing).await.unwrap();
+                            conn.execute(&statement.sql).await.unwrap();
+                            pbps_pg::type_refs::declared::vet(
+                                &mut conn,
+                                statement.declared_type.as_ref().unwrap(),
+                                &trusted,
+                            )
+                            .await
+                            .unwrap();
+                            pbps_pg::type_refs::declared::check(
+                                &mut conn,
+                                &saved.declared_type_pins,
+                                &trusted,
+                                pbps_pg::pins::Within::CallersTransaction,
+                                completed + 1 == statements.len(),
+                                &saved.changes,
+                                &statements[..=completed],
+                            )
+                            .await
+                            .unwrap();
+                            conn.commit(&framing).await.unwrap();
+                        }
+                    }
+                    conn.execute("ALTER TYPE app.b ADD VALUE 'manual'")
+                        .await
+                        .unwrap();
+                    assert!(
+                        pbps_pg::type_refs::declared::check(
+                            &mut conn,
+                            &saved.declared_type_pins,
+                            &trusted,
+                            pbps_pg::pins::Within::OwnTransaction,
+                            true,
+                            &saved.changes,
+                            &statements
+                        )
+                        .await
+                        .is_err()
+                    );
+                });
+            } else {
+                succeeds(d.run(&[
+                    "apply",
+                    "--db",
+                    db,
+                    "--plan",
+                    path.to_str().unwrap(),
+                    "--checksum",
+                    &plan_checksum(&path),
+                    "--allow",
+                    "rename",
+                ]));
+                succeeds(d.run(&["verify", "--db", db]));
+                succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+                let after: pbps_model::SavedPlan =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert!(after.changes.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step() {
     for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
         let own = OwnDatabase::new(&server, "staged_type1635");
