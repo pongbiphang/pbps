@@ -69,8 +69,13 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
             );
         }
     };
-    for spelling in [&desired, &canonical] {
+    for (spelling, domain_base) in [(&desired, "int"), (&canonical, "integer")] {
         std::fs::write(path, spelling).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.count.type.yml"),
+            format!("domain: app.count\ntype: {domain_base}\n"),
+        )
+        .unwrap();
         succeeds(d.run(&record));
         let bytes = std::fs::read(&ids_path).unwrap();
         if let Some(before) = &approved {
@@ -99,6 +104,26 @@ fn rebuild_aliases_record_and_plan_from_one_canonical_schema() {
     let d = Demo::new("rebuild2298-aliases");
     d.table(REBUILD_ALIAS_SOURCE);
     succeeds(d.run(&["plan", "--no-dev"]));
+    std::fs::write(
+        d.dir.join("schema/app.count.type.yml"),
+        "domain: app.count\ntype: integer\n",
+    )
+    .unwrap();
+    // Type DDL is unavailable in slice one. Seed a committed type identity
+    // for this offline baseline, as pull does in the live sibling.
+    let ids_path = d.dir.join("schema.ids.json");
+    let mut ids: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+    ids.types.insert(
+        pbps_model::Uid::generate(pbps_model::UidKind::Type),
+        "app.count".parse().unwrap(),
+    );
+    ids.validate().unwrap();
+    std::fs::write(
+        ids_path,
+        format!("{}\n", serde_json::to_string_pretty(&ids).unwrap()),
+    )
+    .unwrap();
     d.commit();
     check_rebuild_aliases(&d, &d.dir.join("schema/app.t.yml"), None);
 }
@@ -220,7 +245,7 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
     let connection = own.connection();
     on_server(
         connection,
-        "CREATE SCHEMA app; CREATE TABLE app.p(k integer, bucket integer, label varchar(20), spelled varchar(30), stamp timestamptz) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p(k,bucket) VALUES(1,2)",
+        "CREATE SCHEMA app; CREATE DOMAIN app.count AS integer; CREATE TABLE app.p(k integer, bucket integer, label varchar(20), spelled varchar(30), stamp timestamptz) PARTITION BY RANGE(k); CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM(0) TO(10); INSERT INTO app.p(k,bucket) VALUES(1,2)",
     );
     let d = Demo::new("rebuild2298-live");
     succeeds(d.run(&["pull", "--db", connection]));

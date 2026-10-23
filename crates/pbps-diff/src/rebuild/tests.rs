@@ -164,6 +164,78 @@ fn partition_not_null_overrides_refuse_recording_and_qualification() {
 }
 
 #[test]
+fn rebuild_approval_requires_committed_and_unchanged_managed_type_identities() {
+    let (mut base, ids, mut desired) = fixture();
+    let name: pbps_model::TypeRef = "app.count".parse().unwrap();
+    let definition = pbps_model::ManagedType::Enum {
+        values: vec!["one".into()],
+    };
+    base.types.insert(name.clone(), definition.clone());
+    desired.types.insert(name.clone(), definition);
+    let committed = crate::resolve(&base, &ids, &[], &ctx()).unwrap().ids;
+    let error = record(
+        side(&base, &ids),
+        &desired,
+        &committed,
+        &table(),
+        20,
+        &"maintenance".parse().unwrap(),
+        &ctx(),
+    )
+    .unwrap_err();
+    assert!(
+        error.why.contains("commit the source identities"),
+        "{error}"
+    );
+
+    let approval = recorded(&base, &committed, &desired);
+    qualify(side(&base, &committed), side(&desired, &approval), &table()).unwrap();
+    let mut changed = approval.clone();
+    changed.types.clear();
+    changed.types.insert(Uid::generate(UidKind::Type), name);
+    changed.validate().unwrap();
+    let error = qualify(side(&base, &committed), side(&desired, &changed), &table()).unwrap_err();
+    assert!(error.why.contains("lineage"), "{error}");
+}
+
+#[test]
+fn pulled_type_resolution_preserves_pending_rebuild_source_guards() {
+    let (base, ids, mut desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let name: pbps_model::TypeRef = "app.count".parse().unwrap();
+    desired.types.insert(
+        name.clone(),
+        pbps_model::ManagedType::Enum {
+            values: vec!["one".into()],
+        },
+    );
+    let added = crate::resolve_pulled(&desired, &approval, &BTreeMap::new(), &ctx())
+        .unwrap()
+        .ids;
+    assert!(added.type_uid(&name).is_some());
+    assert_eq!(added.tables, approval.tables);
+    assert_eq!(added.columns, approval.columns);
+    assert_eq!(added.rebuilds, approval.rebuilds);
+    added.validate().unwrap();
+    // Pull may mint a type UID, but cannot surrender a covered table's own
+    // columns as part of adopting its new partition ownership.
+    let child = TableName::new("app", "p1");
+    desired.tables.get_mut(&table()).unwrap().partition_of =
+        desired.tables[&child].partition_of.clone();
+    let blockers = crate::resolve_pulled(&desired, &added, &BTreeMap::new(), &ctx()).unwrap_err();
+    assert!(
+        blockers
+            .iter()
+            .any(|b| matches!(b, crate::Blocker::PendingRebuild { .. }))
+    );
+    desired.types.clear();
+    assert!(matches!(
+        &crate::resolve_pulled(&desired, &added, &BTreeMap::new(), &ctx()).unwrap_err()[..],
+        [crate::Blocker::MissingType { .. }]
+    ));
+}
+
+#[test]
 fn trees_without_partition_overrides_still_record_and_qualify() {
     let (base, ids, desired) = fixture();
     let approval = recorded(&base, &ids, &desired);

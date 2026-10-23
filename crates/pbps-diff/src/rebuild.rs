@@ -75,6 +75,13 @@ fn canonical_schema(
     dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> CanonicalSchema {
     let mut schema = schema.clone();
+    for definition in schema.types.values_mut() {
+        if let pbps_model::ManagedType::Domain { base, .. } = definition
+            && let Ok(ty) = dialect.normalize_type(base)
+        {
+            *base = ty;
+        }
+    }
     for table in schema.tables.values_mut() {
         for column in table.columns.values_mut() {
             if let Ok(ty) = dialect.normalize_type(&column.ty) {
@@ -268,6 +275,7 @@ pub fn record(
     if base.ids.tables != ids.tables
         || base.ids.columns != ids.columns
         || base.ids.roles != ids.roles
+        || base.ids.types != ids.types
     {
         return Err(refused(
             table,
@@ -360,6 +368,7 @@ pub fn qualify(
         || base.ids.tables != desired.ids.tables
         || base.ids.columns != desired.ids.columns
         || base.ids.roles != desired.ids.roles
+        || base.ids.types != desired.ids.types
         || intent.source != source_identities(base, table)?
         || intent.replacement.tables.values().collect::<BTreeSet<_>>()
             != tree(desired.schema, table).keys().collect::<BTreeSet<_>>()
