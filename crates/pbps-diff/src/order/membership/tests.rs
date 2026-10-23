@@ -1668,3 +1668,5 @@ fn ordinary_unprovided_requirements_do_not_block_symbolic_boundaries() {
     assert_eq!(f.edges(), BTreeSet::from([(f.ops[0].id(), f.ops[1].id())]));
     graph_and_replay_agree(&f, &graph, &[]);
 }
+
+mod agreement;

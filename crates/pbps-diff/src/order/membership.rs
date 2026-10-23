@@ -247,6 +247,19 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
             }
         }
     }
+    qualify_interactions(graph, &chains, &restores, &moves, base);
+    // Membership scopes are currently flat. Check all declared attach links
+    // together with recorded links: validating each against only the baseline
+    // misses a fresh parent that another operation makes a child.
+    let mut children: BTreeSet<_> = base.members.keys().cloned().collect();
+    let mut parents: BTreeSet<_> = base.members.values().map(|m| m.parent.clone()).collect();
+    for (_, m) in &moves {
+        if m.kind == MoveKind::Attach {
+            children.insert(m.child.clone());
+            parents.insert(m.parent.clone());
+        }
+    }
+    let nested: BTreeSet<_> = children.intersection(&parents).collect();
     let mut seen = BTreeSet::new();
     for (position, m) in moves {
         let id = position.id;
@@ -259,6 +272,11 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
             }
             if !base.tables.contains(&m.child) || !base.tables.contains(&m.parent) {
                 return Err("a membership endpoint has an unknown UID".into());
+            }
+            if nested.contains(&m.parent) || nested.contains(&m.child) {
+                return Err(
+                    "declared moves create an unqualified nested or cyclic membership scope".into(),
+                );
             }
             if m.parent == m.child
                 || base.members.contains_key(&m.parent)
@@ -276,7 +294,19 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
             let mut source_slots = BTreeSet::new();
             let mut target_slots = BTreeSet::new();
             let mut parent_slots = BTreeSet::new();
-            for t in transfers(m)? {
+            let ts = transfers(m)?;
+            // Replay removes the complete source set before installing targets.
+            // A target may overlap another source, but not an untouched cell.
+            let all_sources: BTreeSet<_> = ts.iter().map(|t| &t.from).collect();
+            if m.kind != MoveKind::Drop
+                && ts.iter().any(|t| {
+                    !all_sources.contains(&t.to)
+                        && base.cells.contains_key(&(m.child.clone(), t.to.clone()))
+                })
+            {
+                return Err("transfer target collides with an untouched physical slot".into());
+            }
+            for t in ts {
                 if !source_slots.insert(t.from.clone())
                     || !target_slots.insert(t.to.clone())
                     || !parent_slots.insert(t.parent.clone())
@@ -344,6 +374,163 @@ pub(crate) fn extend(graph: &mut Graph, ops: &[Operation], fx: &[Effects], base:
     // Every symbolic issue must refer to this immutable operation collection.
     for issue in &graph.symbolic_unmet {
         assert!(positions.contains_key(&issue.operation));
+    }
+}
+/// The cut compiler models one parent version chain and its transferred or
+/// stationary targets. Aliasing another chain's physical input needs an
+/// explicit common version contract; endpoint text cannot supply that chain.
+/// Qualification inspects declarations, never a trial operation sequence.
+fn qualify_interactions(
+    graph: &mut Graph,
+    chains: &BTreeMap<Key, Vec<Write<'_>>>,
+    restores: &BTreeMap<(Key, Recorded), Vec<Restore<'_>>>,
+    moves: &[(Position, &s::Move)],
+    base: &State,
+) {
+    let mut moving_children: BTreeMap<Recorded, Vec<&s::Move>> = BTreeMap::new();
+    let mut moving_parents: BTreeMap<Recorded, Vec<&s::Move>> = BTreeMap::new();
+    let mut transfer_inputs = BTreeSet::new();
+    for (_, m) in moves {
+        moving_children.entry(m.child.clone()).or_default().push(m);
+        moving_parents.entry(m.parent.clone()).or_default().push(m);
+        if let Ok(ts) = transfers(m) {
+            transfer_inputs.extend(ts.iter().map(|t| (m.parent.clone(), t.parent.clone())));
+        }
+    }
+    let mut members: BTreeMap<Recorded, Vec<(Recorded, &Membership)>> = BTreeMap::new();
+    for (child, member) in &base.members {
+        members
+            .entry(member.parent.clone())
+            .or_default()
+            .push((child.clone(), member));
+    }
+    // Build footprints first, so cross-chain checks do not depend on key order.
+    let mut footprints: BTreeMap<(Recorded, Property), BTreeSet<Key>> = BTreeMap::new();
+    for (key, chain) in chains {
+        footprints
+            .entry((key.parent.clone(), key.property.clone()))
+            .or_default()
+            .insert(key.clone());
+        if chain
+            .iter()
+            .any(|w| w.value.scope == Scope::MembersAtOperation)
+        {
+            for (child, member) in members.get(&key.parent).into_iter().flatten() {
+                if let Some(property) = member.aliases.get(&key.property) {
+                    footprints
+                        .entry((child.clone(), property.clone()))
+                        .or_default()
+                        .insert(key.clone());
+                }
+            }
+            for m in moving_parents.get(&key.parent).into_iter().flatten() {
+                if m.kind == MoveKind::Attach
+                    && let Ok(ts) = transfers(m)
+                {
+                    for t in ts.iter().filter(|t| t.parent == key.property) {
+                        footprints
+                            .entry((m.child.clone(), t.to.clone()))
+                            .or_default()
+                            .insert(key.clone());
+                    }
+                }
+            }
+        }
+    }
+    let conflicts: BTreeSet<_> = footprints
+        .values()
+        .filter(|keys| keys.len() > 1)
+        .flatten()
+        .collect();
+    for (key, chain) in chains {
+        let checked = (|| -> Result<(), String> {
+            for m in moving_children.get(&key.parent).into_iter().flatten() {
+                if m.child == key.parent
+                    && (m.kind == MoveKind::Drop
+                        || transfers(m)?
+                            .iter()
+                            .any(|t| t.from == key.property || t.to == key.property))
+                {
+                    return Err("recursive input shares a transferred or retired slot without a version chain".into());
+                }
+            }
+            if conflicts.contains(key) {
+                return Err("independent recursive chains alias the same physical input".into());
+            }
+            if !chain
+                .iter()
+                .any(|w| w.value.scope == Scope::MembersAtOperation)
+            {
+                return Ok(());
+            }
+            for m in moving_parents.get(&key.parent).into_iter().flatten() {
+                if !transfers(m)?.iter().any(|t| t.parent == key.property) {
+                    return Err(
+                        "recursive property has no declared membership transfer coverage".into(),
+                    );
+                }
+            }
+            for (child, member) in members.get(&key.parent).into_iter().flatten() {
+                let property = member
+                    .aliases
+                    .get(&key.property)
+                    .ok_or("membership property alias is unavailable")?;
+                if moving_children.contains_key(child) {
+                    continue;
+                }
+                // No move changes this member. Check its whole child lifetime,
+                // rather than only checking the parent's physical source.
+                let mut held = cell(base, child, property)?.clone();
+                held.value.known()?;
+                for w in chain
+                    .iter()
+                    .filter(|w| w.value.scope == Scope::MembersAtOperation)
+                {
+                    let next = w
+                        .value
+                        .policy
+                        .apply(held.value.known()?, w.value.to.known()?);
+                    held.origin = next_origin(
+                        &held,
+                        &next,
+                        w.value.lifetime,
+                        w.position.id,
+                        child,
+                        property,
+                    )?;
+                    held.value = Fact::Known(next);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(why) = checked {
+            graph
+                .symbolic_unmet
+                .push(problem(chain[0].position.id, why));
+        }
+    }
+    for ((key, child), rs) in restores {
+        for r in rs {
+            let slot = (child.clone(), r.value.property.clone());
+            let why = if chains.contains_key(&Key {
+                parent: child.clone(),
+                property: r.value.property.clone(),
+            }) {
+                Some("restoration overwrites a recursive input outside its version chain")
+            } else if transfer_inputs.contains(&slot) {
+                Some("restoration overwrites a transfer parent input outside its version chain")
+            } else if footprints
+                .get(&slot)
+                .is_some_and(|keys| keys.iter().any(|k| k != key))
+            {
+                Some("restoration key does not identify its recursive physical target")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                graph.symbolic_unmet.push(problem(r.position.id, why));
+            }
+        }
     }
 }
 fn restore_edge(graph: &mut Graph, before: Position, after: Position, key: &Key) {

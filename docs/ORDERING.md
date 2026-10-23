@@ -146,6 +146,16 @@ unrelated cycle does not. Clause order inside an indivisible operation stays
 fixed, so an unsatisfied intra-operation boundary is an obligation.
 A restoration must qualify its changed ownership through the matching
 parent/child/property transfer; unrelated moves cannot supply that fact.
+Qualification checks the combined declared membership links for new nesting
+or cycles and checks transfer targets after removing the complete source set;
+source swaps are atomic, while occupied untouched targets are obligations.
+Recursive targets need known aliases, values and physical lifetimes, including
+members with no move. Each changing membership must declare coverage of the
+recursive properties it carries. Overlapping recursive chains, transfers or
+restorations that overwrite a versioned input without a shared version chain
+remain named obligations; matching endpoint text cannot supply that chain.
+Test-only generated contracts enumerate every permitted topological order
+against independent replay, including supported and unqualified declarations.
 `Schedule::of_graph` imports only the symbolic contract's explicit unmet
 obligations. Ordinary `Graph::unmet` requirements remain observational
 `unprovided` facts under DEC-1954.6 and DEC-1956.3, even in a mixed graph.

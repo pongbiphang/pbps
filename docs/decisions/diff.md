@@ -8388,6 +8388,16 @@ Restorations qualify changed ownership only through their matching parent,
 child and property transfer. An uncovered target remains unavailable in both
 compilation and replay. A cycle gets the separate-plans remedy only from
 symbolic edges inside the reported component, not another graph component.
+Qualification checks the combined declared membership links for new nesting
+or cycles and checks transfer targets after removing the complete source set;
+source swaps are atomic, while occupied untouched targets are obligations.
+Recursive targets need known aliases, values and physical lifetimes, including
+members with no move. Each changing membership must declare coverage of the
+recursive properties it carries. Overlapping recursive chains, transfers or
+restorations that overwrite a versioned input without a shared version chain
+remain named obligations; matching endpoint text cannot supply that chain.
+Test-only generated contracts enumerate every permitted topological order
+against independent replay, including supported and unqualified declarations.
 
 Before this contract was written, native SQL measurements on PostgreSQL
 16.15 and 18.6 exercised 44 fixtures: 300 two-order pairs, 600 executions,
