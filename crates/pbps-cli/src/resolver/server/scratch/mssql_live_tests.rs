@@ -1154,3 +1154,64 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
     drop_database(&target_server, &name).await;
     result.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
+    let target_server = server("PBPS_TEST_DB");
+    let scratch_server = target_server.clone();
+    let (target_name, target_url) = create_database(&target_server).await;
+    let (scratch_name, scratch_url) = create_database(&scratch_server).await;
+    let result = tokio::spawn(async move {
+        let mut target = connection(&target_url).await;
+        target.execute("CREATE USER type_owner WITHOUT LOGIN; CREATE USER type_grantor WITHOUT LOGIN; CREATE USER type_denied WITHOUT LOGIN;").await.unwrap();
+        target.execute("CREATE SCHEMA ext2269 AUTHORIZATION dbo;").await.unwrap();
+        target.execute("CREATE TYPE ext2269.granted FROM int NULL; CREATE TYPE ext2269.denied FROM int NULL;").await.unwrap();
+        target.execute("ALTER AUTHORIZATION ON TYPE::ext2269.granted TO type_owner; ALTER AUTHORIZATION ON TYPE::ext2269.denied TO type_owner;").await.unwrap();
+        target.execute("GRANT REFERENCES ON TYPE::ext2269.granted TO type_grantor WITH GRANT OPTION AS type_owner; GRANT REFERENCES ON TYPE::ext2269.granted TO public AS type_grantor; DENY REFERENCES ON TYPE::ext2269.denied TO type_denied AS type_owner;").await.unwrap();
+        target.execute("CREATE TABLE dbo.external2269(g ext2269.granted,d ext2269.denied);").await.unwrap();
+        target.execute("CREATE VIEW dbo.managed2269 AS SELECT g,d FROM dbo.external2269;").await.unwrap();
+        let mut schema = Schema::default();
+        schema.modules.insert("dbo.managed2269".parse().unwrap(), pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            definition: "CREATE VIEW dbo.managed2269 AS SELECT g,d FROM dbo.external2269;".into(),
+        });
+        let ids = IdsFile::default();
+        let side = pbps_diff::Side { schema: &schema, ids: &ids };
+        let bootstrap = pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default()).unwrap();
+        let binding = BindingRequest { bootstrap: &bootstrap, base: &schema, desired: &schema };
+        let request = super::super::ScopeRequest { schemas: vec!["dbo".into()], ..Default::default() };
+        let tokens = super::Tokens::generate();
+        let provenance = Provenance::server();
+        let identity = sql::cluster_identity(&mut target).await.unwrap();
+        let mut admin = connection(&scratch_url).await;
+        let (provisioning, mut state) = super::engine::scratch(
+            Driver::Mssql, &mut target, &mut admin, &tokens, &identity, &scratch_url,
+            &request, &Standard::Mssql, None, &provenance,
+        ).await.unwrap();
+        assert_eq!(provisioning, super::Provisioning::Supplied);
+        let (catalog, authorization) = crate::resolver::scope::read_target(
+            &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
+        ).await.unwrap();
+        let prepared = state.prepare(
+            provisioning, &mut admin, &mut target, &catalog, &authorization,
+            &request.schemas, &binding, &[],
+        ).await.unwrap();
+        let super::engine::Prepared::Mssql(mut prepared) = prepared else { panic!("wrong engine"); };
+        let rows = prepared.compile.query("SELECT p.state_desc,USER_NAME(p.grantee_principal_id) AS grantee,USER_NAME(p.grantor_principal_id) AS grantor,USER_NAME(t.principal_id) AS owner FROM sys.database_permissions p JOIN sys.types t ON p.class=6 AND t.user_type_id=p.major_id;").await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|r| r.try_get::<&str>("state_desc").unwrap()==Some("GRANT")));
+        assert!(rows.iter().any(|r| r.try_get::<&str>("state_desc").unwrap()==Some("DENY")));
+        assert!(rows.iter().all(|r| r.try_get::<&str>("owner").unwrap()!=Some("dbo")));
+        // Drop compile sessions before releasing the supplied database through
+        // the real fresh-session sandbox cleanup path.
+        drop(prepared);
+        state.release(&mut admin).await.unwrap();
+        assert!(sql::inventory::read(&mut admin, None).await.unwrap().is_empty());
+    }).await;
+    // Even a regression panic must release both owned fixtures and their users.
+    drop_database(&target_server, &target_name).await;
+    drop_database(&scratch_server, &scratch_name).await;
+    result.unwrap();
+}

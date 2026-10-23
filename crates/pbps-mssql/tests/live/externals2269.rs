@@ -178,6 +178,22 @@ async fn hidden_inventory_is_not_empty_inventory() {
         assert!(!scratch::inventory::read(&mut admin,Some(SANDBOX)).await.unwrap().is_empty());
     }).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn type_acl_cleanup_refuses_an_unreadable_type_catalog() {
+    case("hidden_type_acl", |mut f| async move {
+        f.file("CREATE USER type_reader WITHOUT LOGIN; CREATE TYPE dbo.amount FROM int NULL; GRANT REFERENCES ON TYPE::dbo.amount TO type_reader;").await.unwrap();
+        let mut admin = connect_live(&f.url).await.unwrap();
+        admin.execute("DENY SELECT ON OBJECT::sys.types TO sandbox2269;").await.unwrap();
+        let error = scratch::inventory::read(&mut f.scratch, Some(SANDBOX)).await.unwrap_err();
+        assert!(error.to_string().contains("sys.types"), "{error}");
+        let errors = scratch::inventory::cleanup(&mut f.scratch, Some(SANDBOX)).await.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("sys.types")), "{errors:?}");
+        let rows = admin.query("SELECT COUNT(*) AS count FROM sys.database_permissions WHERE class=6 AND major_id=TYPE_ID(N'dbo.amount');").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("count").unwrap(), Some(1));
+    }).await;
+}
 #[tokio::test]
 #[ignore]
 async fn unreadable_external_shape_refuses() {

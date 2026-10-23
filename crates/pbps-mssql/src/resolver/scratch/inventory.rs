@@ -108,6 +108,7 @@ type Identity = fn(i32) -> Securable;
 pub struct Inventory {
     pub entries: Vec<Entry>,
     dependencies: BTreeSet<(Securable, Securable)>,
+    type_permissions: BTreeMap<Securable, Vec<String>>,
 }
 
 impl Inventory {
@@ -115,10 +116,36 @@ impl Inventory {
         self.entries
             .iter()
             .map(|entry| entry.name.clone())
+            .chain(self.type_permissions.values().flatten().cloned())
             .collect()
     }
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.type_permissions.is_empty()
+    }
+    fn type_permission(
+        &mut self,
+        type_id: i32,
+        parent: super::super::capture::ObjectIdentity,
+        name: String,
+    ) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.key == Some(Securable::Type(type_id)) && entry.drop.is_some())
+        {
+            // On 17.0, CASCADE can remove another recorded grantor's grant
+            // option, making its later REVOKE fail with 15151 (DEC-2269.2).
+            // DROP TYPE removes all class-6 rows without replay-order assumptions.
+            // Only our recorded type drop owns these rows; the final read
+            // still refuses a failed drop or surviving ACL.
+            self.type_permissions
+                .entry(Securable::Type(type_id))
+                .or_default()
+                .push(name);
+            return;
+        }
+        self.add(name, None, 5, None);
+        self.entries.last_mut().unwrap().staged_parent = Some(parent);
     }
     fn add(&mut self, name: String, drop: Option<String>, rank: u16, key: Option<Securable>) {
         self.entries.push(Entry {
@@ -1407,13 +1434,16 @@ async fn permissions(
     for row in rows(
         conn,
         "database_permissions",
-        "SELECT p.class,p.class_desc,p.permission_name,p.state_desc,\
+        "SELECT p.class,p.class_desc,p.permission_name,p.state_desc,p.major_id,\
          USER_NAME(p.grantee_principal_id) AS grantee, USER_NAME(p.grantor_principal_id) AS \
          grantor,OBJECT_SCHEMA_NAME(p.major_id) AS schema_name, OBJECT_NAME(p.major_id) AS \
          object_name,COL_NAME(p.major_id,p.minor_id) AS column_name, SCHEMA_NAME(p.major_id) \
          AS on_schema,USER_NAME(p.major_id) AS on_principal, CONVERT(int,\
          OBJECTPROPERTYEX(p.major_id,N'IsMSShipped')) AS shipped, CONVERT(int,\
-         OBJECTPROPERTYEX(p.major_id,N'IsView')) AS is_view FROM sys.database_permissions p;",
+         OBJECTPROPERTYEX(p.major_id,N'IsView')) AS is_view,\
+         SCHEMA_NAME(t.schema_id) AS type_schema,t.name AS type_name \
+         FROM sys.database_permissions p LEFT JOIN sys.types t \
+         ON p.class=6 AND t.user_type_id=p.major_id;",
     )
     .await?
     {
@@ -1439,6 +1469,22 @@ async fn permissions(
             if expected.contains(&key) {
                 continue;
             }
+        }
+        if class == 6 {
+            let type_id = row
+                .try_get::<i32>("major_id")?
+                .ok_or_else(|| DbError::BadRow("a type permission has no type id".into()))?;
+            let parent = super::super::capture::ObjectIdentity {
+                class: super::super::capture::class::TYPE.into(),
+                name: vec![text(&row, "type_schema")?, text(&row, "type_name")?],
+                signature: vec![],
+            };
+            result.type_permission(
+                type_id,
+                parent,
+                format!("permission {} {key}", text(&row, "class_desc")?),
+            );
+            continue;
         }
         let on = match class {
             0 => Some(String::new()),
@@ -1597,5 +1643,86 @@ pub async fn drop_sandbox(
         Ok(())
     } else {
         Err(after.names())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_acl_cleanup_requires_its_own_recorded_type_drop() {
+        let mut inventory = Inventory::default();
+        inventory.add(
+            "object".into(),
+            Some("DROP TABLE t;".into()),
+            40,
+            Some(Securable::Object(9)),
+        );
+        inventory.add(
+            "undroppable type".into(),
+            None,
+            65,
+            Some(Securable::Type(10)),
+        );
+        inventory.add(
+            "droppable type".into(),
+            Some("DROP TYPE t;".into()),
+            65,
+            Some(Securable::Type(11)),
+        );
+        for id in [9, 10, 11, 12] {
+            inventory.type_permission(
+                id,
+                super::super::super::capture::ObjectIdentity {
+                    class: super::super::super::capture::class::TYPE.into(),
+                    name: vec!["dbo".into(), format!("t{id}")],
+                    signature: vec![],
+                },
+                format!("type permission {id}"),
+            );
+        }
+        let permissions: Vec<_> = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.name.starts_with("type permission "))
+            .collect();
+        assert_eq!(
+            permissions
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "type permission 9",
+                "type permission 10",
+                "type permission 12"
+            ]
+        );
+        assert!(permissions.iter().all(|entry| entry.drop.is_none()));
+        assert_eq!(
+            inventory
+                .type_permissions
+                .get(&Securable::Type(11))
+                .unwrap(),
+            &["type permission 11"]
+        );
+        assert!(
+            inventory
+                .names()
+                .iter()
+                .any(|name| name == "type permission 11")
+        );
+        assert!(
+            permissions
+                .iter()
+                .all(|entry| entry.staged_parent.as_ref().unwrap().class
+                    == super::super::super::capture::class::TYPE)
+        );
+        inventory.entries.clear();
+        assert!(
+            !inventory.is_empty(),
+            "carried ACL evidence is not an empty inventory"
+        );
+        assert_eq!(inventory.names(), ["type permission 11"]);
     }
 }

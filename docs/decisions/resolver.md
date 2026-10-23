@@ -4139,3 +4139,28 @@ subview as well as sys.objects; effective owner equality remains compared.
 No dependency is removed from comparison and no deferred staging capability
 is fabricated. #2238 lifts the refusal through chained staging, following
 DEC-1778.2, and compares each external after its managed prerequisite exists.
+
+<a id="dec-2269-2"></a>
+
+**DEC-2269.2. Supplied scratch cleanup removes type ACLs with a recorded
+DROP TYPE rather than independently revoking their rows.** On SQL Server
+17.0.4075.5, the real staged replay produces class-6 GRANT, DENY and grant-option
+chains under mapped owners and grantors. REVOKE with the recorded grantor
+works while its capability remains, but revoking a grant option with CASCADE
+first removes downstream rows and that grantor's capability: a later REVOKE
+from the same inventory snapshot then fails with 15151. The catalog scan does
+not promise the reverse grant order. After dependent objects are removed,
+plain DROP TYPE succeeds with those ACLs still present and removes all of
+them. ALTER AUTHORIZATION ON TYPE also clears existing class-6 rows, so trusted
+ownership reconstruction must still precede ACL replay.
+
+Associate each class-6 row with its catalog type identity. Omit its independent
+cleanup entry only when the inventory contains cleanup SQL for that exact
+type ID. An unreadable type name refuses, and a row without its own recorded
+type drop remains an unsupported cleanup entry. The final inventory read is
+mandatory: a failed type drop or any surviving row must still refuse release.
+Parent-carried ACL names remain in the inventory's diagnostics, so that read
+reports surviving permission rows as well as their type without scheduling
+an independent REVOKE.
+This exception is specific to measured type ACLs; it does not relax cleanup
+for other permission classes or certify an unreadable catalog as empty.

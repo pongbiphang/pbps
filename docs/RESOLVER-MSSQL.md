@@ -749,6 +749,13 @@ assemblies and cross-database text are never replayed. File ownership is not
 repaired. Rendered objects receive their mapped ownership before ACL replay,
 and the entered compile session verifies the resulting authorization.
 
+Supplied cleanup carries class-6 ACLs with the exact type it will drop
+(DEC-2269.2). Independently revoking a grant-option chain can invalidate a
+later row's recorded grantor and report 15151; DROP TYPE removes the ACLs
+after dependent objects have been removed. An unreadable type identity or a
+permission without a recorded type drop still refuses. The final inventory
+read must be empty before the sandbox user is removed.
+
 An external or cascade-closure object which needs a managed object cannot
 exist before reconstruction. At a missing scratch prerequisite, the catalog
 check names both objects and says it waits for reconstruction (#2238). The
