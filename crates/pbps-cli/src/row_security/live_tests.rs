@@ -274,7 +274,7 @@ async fn check(connection: String, owner: String) {
         } else {
             let error = result.unwrap_err().to_string();
             assert!(
-                error.contains("tenant_rows") && error.contains("arrives with #1173"),
+                error.contains("tenant_rows") && error.contains("explicitly remove or replace"),
                 "{error}"
             );
         }
@@ -340,7 +340,7 @@ async fn check(connection: String, owner: String) {
     .unwrap_err()
     .to_string();
     assert!(
-        error.contains("tenant_rows") && error.contains("arrives with #1173"),
+        error.contains("tenant_rows") && error.contains("explicitly remove or replace"),
         "{error}"
     );
     policy_sequence_bindings(&mut conn).await;
@@ -418,7 +418,7 @@ async fn policy_sequence_bindings(conn: &mut Conn) {
         assert!(
             error.contains(policy)
                 && error.contains("sequence_owner")
-                && error.contains("arrives with #1173"),
+                && error.contains("explicitly remove or replace"),
             "{error}"
         );
     }

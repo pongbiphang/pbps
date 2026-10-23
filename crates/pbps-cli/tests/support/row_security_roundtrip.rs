@@ -9,7 +9,7 @@ use pbps_db::{Conn, DbError, Driver};
 use pbps_model::{PolicyCommand, PolicyRoles, RowSecurity, TableName};
 use std::time::Instant;
 
-fn versions(mut check: impl FnMut(&str, &str)) {
+pub(super) fn versions(mut check: impl FnMut(&str, &str)) {
     let mut failed = Vec::new();
     for (variable, container, expected) in [
         ("PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_OLD_CONTAINER", 16),
@@ -27,7 +27,7 @@ fn versions(mut check: impl FnMut(&str, &str)) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             check(&base, container);
         }));
-        eprintln!("#1172 PR D PostgreSQL {version}: {:?}", started.elapsed());
+        eprintln!("row-security PostgreSQL {version}: {:?}", started.elapsed());
         if result.is_err() {
             failed.push(version);
         }
@@ -38,20 +38,20 @@ fn versions(mut check: impl FnMut(&str, &str)) {
     );
 }
 
-struct Roles {
+pub(super) struct Roles {
     server: String,
     names: Vec<String>,
 }
 
 impl Roles {
-    fn new(server: &str) -> Self {
+    pub(super) fn new(server: &str) -> Self {
         Self {
             server: server.into(),
             names: Vec::new(),
         }
     }
 
-    fn create(&mut self, suffix: &str, options: &str) -> String {
+    pub(super) fn create(&mut self, suffix: &str, options: &str) -> String {
         let name = format!("pbps_1172d_{suffix}_{}", std::process::id());
         on_server(
             &self.server,
@@ -88,7 +88,7 @@ fn loaded(demo: &Demo) -> pbps_model::Schema {
         .schema
 }
 
-fn assert_noop(demo: &Demo, connection: &str) {
+pub(super) fn assert_noop(demo: &Demo, connection: &str) {
     succeeds(demo.run(&["verify", "--db", connection]));
     let out = succeeds(demo.run(&["plan", "--db", connection, "--format", "json"]));
     let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();

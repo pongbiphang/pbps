@@ -986,7 +986,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("reads_z") && error.contains("arrives with #1173"),
+            error.contains("reads_z") && error.contains("explicitly remove or replace"),
             "{error}"
         );
         found

@@ -6369,7 +6369,7 @@ pub fn cmd_bootstrap(
             .await?;
             // A history retention or a cascading key the server lacks (#1502).
             crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
-            crate::engine::permission_support(&mut conn, &cs).await?;
+            crate::engine::permission_support(&mut conn, &cs, &ids).await?;
             crate::engine::lock(&mut conn, &operator).await?;
             let mut transaction_attempted = false;
             let result = async {
@@ -7552,7 +7552,7 @@ pub fn cmd_plan_db(
         }
 
         findings.extend(policy);
-        let permission_support = crate::engine::permission_support(&mut conn, &cs).await?;
+        let permission_support = crate::engine::permission_support(&mut conn, &cs, &resolved.ids).await?;
         let generation_support =
             crate::engine::generation_support(&mut conn, &cs, &resolved.ids).await?;
         // Asked of the read this plan was built from, not of the connection
@@ -7755,6 +7755,11 @@ pub fn cmd_plan_db(
             }
         };
 
+        if staged && pbps_diff::order::row_security::requires_transaction(&cs) {
+            bail!(
+                "row-security changes require a transactional plan; --staged is unsupported (DEC-1173.3)"
+            );
+        }
         let statements = crate::statements(
             &cs.clone().ordered(plan_mode(staged), dialect.as_ref()),
             &dialect,
@@ -8198,7 +8203,7 @@ fn apply_identified(
 
             // This capability is constant for the connection and needs no ledger
             // lock. Check before any writes, including staged resumes.
-            crate::engine::permission_support(&mut conn, &plan.changes).await?;
+            crate::engine::permission_support(&mut conn, &plan.changes, &plan.ids).await?;
             crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
             // A resolved plan's cluster, constant for the connection like the
             // checks above: the evidence describes one cluster (#616, DEC-1685.1).
@@ -8431,6 +8436,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         );
     }
     refuse_moved_database_collation(conn, plan, &target.label).await?;
+    crate::row_security::check_dropped_policies(&plan.changes, &plan.ids, &scoped.schema)?;
 
     // And the same guard the recording commands use (110): a permission the
     // declarations cannot hold is invisible to the checksum above, so it

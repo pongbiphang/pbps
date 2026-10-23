@@ -276,6 +276,17 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
             },
         ) => *table == target && *name == target_name.raw(),
         (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Policy,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Policy(target_name),
+            },
+        ) => *table == target && *name == target_name,
+        (
             DependencyPart::Default { column, .. },
             Holds::TablePart {
                 table,
@@ -787,7 +798,7 @@ fn removal_of(
             // plan's own expression change can, and `weave` looks for that.
             Part::Policy(_) => {
                 return Err(format!(
-                    "{}: policy rebuild planning arrives with #1173",
+                    "{}: explicitly remove or replace the dependent policy in the declarations",
                     d.described
                 ));
             }
@@ -1226,16 +1237,17 @@ impl Weave<'_> {
         {
             return Ok(None);
         }
-        // A policy removed with its table needs ordering, never a synthesized
-        // DROP POLICY. The final catalog edges below place that owner before
-        // the routine even when the differ put the routine first.
+        // A policy explicitly removed, or removed with its table, needs
+        // ordering, never an automatic rebuild. Final catalog edges place the
+        // release before the routine even when the differ put it later.
         if matches!(
             d.holds,
             Holds::TablePart {
                 part: Part::Policy(_),
                 ..
             }
-        ) && find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some()
+        ) && (find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some()
+            || find(&view, &parts, &d.holds, partitions, removes).is_some())
         {
             return Ok(None);
         }
@@ -1488,7 +1500,9 @@ impl Expansion for Weave<'_> {
                     Holds::TablePart {
                         part: Part::Policy(_),
                         ..
-                    } => find(&view, &parts, &d.holds, partitions, removes_with_its_owner),
+                    } => find(&view, &parts, &d.holds, partitions, removes).or_else(|| {
+                        find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
+                    }),
                     Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
                 };
                 if let Some(i) = release.filter(|i| *i != at.drop_at) {
@@ -4565,6 +4579,90 @@ mod tests {
     }
 
     #[test]
+    fn row_security_explicit_policy_removal_releases_a_routine_without_automatic_policy_rebuilds() {
+        let root = id("app.gate()");
+        let table = TableName::new("app", "t");
+        let found = [(
+            root.clone(),
+            vec![Dependent {
+                described: "policy gate_policy on table app.t".into(),
+                holds: Holds::TablePart {
+                    table: table.clone(),
+                    part: Part::Policy("gate_policy".into()),
+                },
+            }],
+        )]
+        .into();
+        let module = Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "() RETURNS boolean LANGUAGE sql AS 'SELECT false'".into(),
+        };
+        let declared = Schema {
+            tables: [(
+                table.clone(),
+                Table {
+                    row_policies: [("gate_policy".into(), pbps_model::RowPolicy::default())].into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            modules: [(root.clone(), module.clone())].into(),
+            ..Default::default()
+        };
+        let mut changes = ChangeSet {
+            changes: vec![
+                Change::DropModule {
+                    id: root.clone(),
+                    kind: ModuleKind::Function,
+                },
+                Change::CreateModule {
+                    id: root,
+                    module: Box::new(module),
+                },
+                Change::DropPolicy {
+                    table: table.clone(),
+                    name: "gate_policy".into(),
+                    policy: pbps_model::RowPolicy::default(),
+                },
+                Change::CreatePolicy {
+                    table,
+                    name: "gate_policy".into(),
+                    policy: pbps_model::RowPolicy::default(),
+                    origin: pbps_model::RowSecurityOrigin::Standing,
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        weave(
+            &mut changes,
+            &found,
+            &declared,
+            &[],
+            &pbps_pg::Postgres::new(),
+        )
+        .unwrap();
+        assert_eq!(changes.changes.len(), 4);
+        assert!(matches!(
+            changes.changes[0].change,
+            Change::DropPolicy { .. }
+        ));
+        assert!(matches!(
+            changes.changes[3].change,
+            Change::CreatePolicy { .. }
+        ));
+        assert!(unaccounted(&changes, &found, &Partitions::default()).is_empty());
+        changes.changes.swap(0, 1);
+        assert!(
+            unaccounted(&changes, &found, &Partitions::default())
+                .iter()
+                .any(|e| e.contains("gate_policy"))
+        );
+    }
+
+    #[test]
     fn policy_owner_teardown_precedes_routine_removal_and_replacement() {
         let root = id("app.gate()");
         let table = TableName::new("app", "t");
@@ -4606,7 +4704,7 @@ mod tests {
             retained.changes.pop();
             let refused = weave(&mut retained, &found, &declared, &[], &*pg()).unwrap_err();
             assert!(
-                refused.contains("gate_policy") && refused.contains("arrives with #1173"),
+                refused.contains("gate_policy") && refused.contains("explicitly remove or replace"),
                 "{refused}"
             );
             assert_eq!(

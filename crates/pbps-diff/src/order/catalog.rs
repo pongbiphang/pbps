@@ -124,7 +124,7 @@ pub fn unmanaged_refusal(
                 part: Part::Policy(_),
                 ..
             } => format!(
-                "- {} -- planning policy removal and recreation arrives with #1173",
+                "- {} -- explicitly remove or replace this policy in the declarations",
                 d.described
             ),
             Holds::TablePart {

@@ -202,3 +202,61 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
         "{sql}"
     );
 }
+
+#[test]
+fn row_security_standing_sql_quotes_identifiers_and_is_transactional_for_every_flag_transition() {
+    use pbps_model::{Change, PlanMode, PlannedChange, RowSecurity, RowSecurityOrigin};
+    let pg = pbps_pg::Postgres::new();
+    let table = TableName::new("s\"q", "t\"q");
+    let emit = |change| {
+        let ordered =
+            pbps_diff::order::singleton(PlannedChange::new(change), PlanMode::Transactional, &pg);
+        let statements = pg.emit(&ordered, 0).unwrap();
+        assert!(statements.iter().all(|s| s.transactional));
+        statements.into_iter().map(|s| s.sql).collect::<Vec<_>>()
+    };
+    let sql = emit(Change::DropPolicy {
+        table: table.clone(),
+        name: "p\"q".into(),
+        policy: RowPolicy::default(),
+    });
+    assert!(sql[0].contains(r#"DROP POLICY "p""q" ON "s""q"."t""q";"#));
+    assert!(!sql[0].contains("CASCADE") && !sql[0].contains("IF EXISTS"));
+    for a in 0..4 {
+        for b in 0..4 {
+            let from = RowSecurity {
+                enabled: a & 1 != 0,
+                forced: a & 2 != 0,
+            };
+            let to = RowSecurity {
+                enabled: b & 1 != 0,
+                forced: b & 2 != 0,
+            };
+            let sql = emit(Change::SetRowSecurity {
+                uid: "t_117307".parse().unwrap(),
+                table: table.clone(),
+                from,
+                to,
+                origin: RowSecurityOrigin::Standing,
+            });
+            assert_eq!(
+                sql.len(),
+                usize::from(from.enabled != to.enabled) + usize::from(from.forced != to.forced)
+            );
+            if from.enabled != to.enabled {
+                assert!(sql[0].contains(if to.enabled {
+                    " ENABLE ROW"
+                } else {
+                    " DISABLE ROW"
+                }));
+            }
+            if from.forced != to.forced {
+                assert!(sql.last().unwrap().contains(if to.forced {
+                    " FORCE ROW"
+                } else {
+                    " NO FORCE ROW"
+                }));
+            }
+        }
+    }
+}

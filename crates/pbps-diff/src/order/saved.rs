@@ -403,6 +403,11 @@ pub fn validate_saved_plan(
              revision; use a transactional plan for multiple changes."
         );
     }
+    if plan.mode.is_staged() && super::row_security::requires_transaction(&plan.changes) {
+        refuse!(
+            "row-security changes require a transactional plan; --staged is unsupported (DEC-1173.3)"
+        );
+    }
     plan.ids.validate().map_err(|source| {
         #[derive(Debug, thiserror::Error)]
         #[error("the plan's post-apply identity mapping is inconsistent")]

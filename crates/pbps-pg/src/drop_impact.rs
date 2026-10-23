@@ -152,6 +152,7 @@ struct Classes {
     trigger: i64,
     constraint: i64,
     default: i64,
+    policy: i64,
 }
 
 impl Classes {
@@ -162,7 +163,8 @@ impl Classes {
             'pg_catalog.pg_proc'::regclass::int8 AS routine,
             'pg_catalog.pg_trigger'::regclass::int8 AS trigger,
             'pg_catalog.pg_constraint'::regclass::int8 AS constraint,
-            'pg_catalog.pg_attrdef'::regclass::int8 AS default",
+            'pg_catalog.pg_attrdef'::regclass::int8 AS default,
+            'pg_catalog.pg_policy'::regclass::int8 AS policy",
             )
             .await?;
         let row = rows
@@ -174,6 +176,7 @@ impl Classes {
             trigger: required(row, "trigger")?,
             constraint: required(row, "constraint")?,
             default: required(row, "default")?,
+            policy: required(row, "policy")?,
         })
     }
 }
@@ -492,6 +495,7 @@ fn removal_part(change: &Change) -> Option<Removal<'_>> {
         (DependencyPart::Module { id, kind }, Effect::Removed | Effect::Rewritten) => Some(Removal::Module(id, kind)),
         (DependencyPart::Named { table, kind: pbps_model::Part::Check | pbps_model::Part::Unique | pbps_model::Part::ForeignKey, name }, Effect::Removed) => Some(Removal::Part(table, Part::Constraint(name))),
         (DependencyPart::Named { table, kind: pbps_model::Part::Index, name }, Effect::Removed) => Some(Removal::Part(table, Part::Index(name))),
+        (DependencyPart::Named { table, kind: pbps_model::Part::Policy, name }, Effect::Removed) => Some(Removal::Part(table, Part::Policy(name))),
         (DependencyPart::PrimaryKey(table), Effect::Removed | Effect::Rewritten) => Some(Removal::Part(table, Part::PrimaryKey)),
         (DependencyPart::Default { column, change: DefaultChange::Column { from: Some(_), .. } | DefaultChange::Partition { .. } }, _)
         | (DependencyPart::Generated(column), Effect::Rewritten) => Some(Removal::Default(column)),
@@ -726,6 +730,7 @@ async fn module_address(
 
 #[derive(Debug, PartialEq, Eq)]
 enum Part<'a> {
+    Policy(&'a str),
     Constraint(&'a str),
     Index(&'a str),
     PrimaryKey,
@@ -757,6 +762,12 @@ async fn table_part(
             "SELECT oid::int8 AS oid FROM pg_catalog.pg_constraint
          WHERE conrelid=($1::int8)::oid AND conname=$2",
             classes.constraint,
+            name,
+        ),
+        Part::Policy(name) => (
+            "SELECT oid::int8 AS oid FROM pg_catalog.pg_policy
+         WHERE polrelid=($1::int8)::oid AND polname=$2",
+            classes.policy,
             name,
         ),
         Part::PrimaryKey => (
@@ -864,6 +875,27 @@ mod tests {
             dependent_name: format!("object {dependent}"),
             referenced_name: format!("object {referenced}"),
         }
+    }
+
+    #[test]
+    fn policy_removals_enter_the_catalog_release_set_but_creations_do_not() {
+        let table = TableName::new("app", "t");
+        let drop = Change::DropPolicy {
+            table: table.clone(),
+            name: "gate".into(),
+            policy: Default::default(),
+        };
+        assert_eq!(
+            removal_part(&drop),
+            Some(Removal::Part(&table, Part::Policy("gate")))
+        );
+        let create = Change::CreatePolicy {
+            table,
+            name: "gate".into(),
+            policy: Default::default(),
+            origin: pbps_model::RowSecurityOrigin::Standing,
+        };
+        assert_eq!(removal_part(&create), None);
     }
 
     #[test]

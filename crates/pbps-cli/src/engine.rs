@@ -2769,6 +2769,7 @@ async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> an
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,
+    ids: &IdsFile,
 ) -> anyhow::Result<ConnectedCheck> {
     match conn.driver() {
         Driver::Mssql => Ok(ConnectedCheck {
@@ -2780,6 +2781,33 @@ pub async fn permission_support(
                 .to_owned(),
         }),
         Driver::Postgres => {
+            let tables = crate::row_security::standing_owners(changes, ids)?;
+            let ownership = pbps_pg::doctor::table_ownership(conn, &tables)
+                .await
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(format!(
+                        "cannot read effective ownership for row-security tables: {}",
+                        tables
+                            .iter()
+                            .map(|table| table.shown().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+            for (table, present, owned) in ownership {
+                if !present {
+                    anyhow::bail!(
+                        "{}: standing row-security table is absent; plan again",
+                        table.shown()
+                    );
+                }
+                if !owned {
+                    anyhow::bail!(
+                        "{}: the deployer must own the table to change row-security policies or flags",
+                        table.shown()
+                    );
+                }
+            }
             refuse_missing_policy_roles(conn, changes).await?;
             let version = pbps_pg::roles::server_version_num(conn).await?;
             let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();

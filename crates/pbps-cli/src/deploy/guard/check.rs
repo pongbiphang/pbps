@@ -232,11 +232,15 @@ pub(crate) fn table(
             }
         });
     }
-    if !expected.row_security.accepts(&now.row_security)
-        || !expected.row_policies.accepts(&now.row_policies)
-    {
+    if !expected.row_security.accepts(&now.row_security) {
         moved.push(format!(
-            "{} row-security flags or policies changed, and no change of this plan sets them",
+            "{} row-security flags are not the ones this plan leaves",
+            name.shown()
+        ));
+    }
+    if !expected.row_policies.accepts(&now.row_policies) {
+        moved.push(format!(
+            "{} row-security policies changed, and no change of this plan sets them",
             name.shown()
         ));
     }
