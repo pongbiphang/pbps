@@ -1,6 +1,180 @@
 //! Declared shared types through pull, baseline and the plan refusal seam.
 use super::*;
-use pbps_model::ManagedType;
+use pbps_model::{ManagedType, TableName};
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn unrepresentable_types_leave_unrelated_plans_usable_and_declared_dependents_refused() {
+    use pbps_db::catalog::LimitationTarget;
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "type_omission1635");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app;
+             CREATE TYPE app._mood AS ENUM ('ok');
+             CREATE DOMAIN app.positive AS integer NOT NULL
+                 CONSTRAINT positive_check CHECK (VALUE > 0);
+             CREATE TABLE app.t (id integer);
+             CREATE TABLE app.bad (mood text)",
+        );
+        let read = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, db)
+                        .await
+                        .unwrap();
+                    pbps_pg::catalog::introspect(&mut conn).await.unwrap()
+                })
+        };
+        let first = read();
+        assert_eq!(first.schema.types.len(), 1);
+        assert!(first.limitations.iter().any(|l| {
+            l.target == LimitationTarget::Type(TableName::new("app", "_mood"))
+                && l.detail.contains("_mood")
+        }));
+        // PG 18 also stores a NOT NULL constraint row; the actual inventory
+        // excludes it and uses typnotnull, just as on PG 16 (DEC-1635.1).
+        assert!(matches!(
+            &first.schema.types[&"app.positive".parse().unwrap()],
+            ManagedType::Domain { not_null: true, checks, .. }
+                if checks.len() == 1 && checks.contains_key("positive_check")
+        ));
+        let not_null_rows = scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_catalog.pg_constraint WHERE contypid='app.positive'::regtype AND contype='n'",
+        );
+        let major = scalar(
+            db,
+            "SELECT current_setting('server_version_num')::bigint / 10000",
+        );
+        assert_eq!(not_null_rows, i64::from(major >= 17));
+        eprintln!(
+            "PostgreSQL {major}: domain NOT NULL rows={not_null_rows}; pulled not_null=true with one CHECK; _mood is a named limitation"
+        );
+
+        let d = Demo::new("type-omission1635");
+        let out = d.run(&["pull", "--db", db]);
+        assert!(stderr(&out).contains("_mood"), "{}", stderr(&out));
+        succeeds(out);
+        assert!(!d.dir.join("schema/app._mood.type.yml").exists());
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "adopt representable objects",
+        ]));
+        d.table("table: app.t\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n");
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let plan = d.dir.join("omission.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", plan.to_str().unwrap()]));
+        succeeds(apply_plan(&d, db, &plan, false));
+        succeeds(d.run(&["verify", "--db", db]));
+        std::fs::remove_file(&plan).unwrap();
+
+        // #1523 cannot round-trip this reference. Its existing whole-table
+        // omission remains a relation limitation, never a dangling column.
+        on_server(
+            db,
+            "ALTER TABLE app.bad ALTER COLUMN mood TYPE app._mood USING NULL::app._mood",
+        );
+        let pulled = read();
+        assert!(
+            !pulled
+                .schema
+                .tables
+                .contains_key(&TableName::new("app", "bad"))
+        );
+        assert!(pulled.limitations.iter().any(|l| {
+            l.target == LimitationTarget::Relation(TableName::new("app", "bad"))
+                && l.detail.contains("_mood")
+        }));
+        let omitted = Demo::new("type-omission-pull1635");
+        succeeds(omitted.run(&["pull", "--db", db]));
+        assert!(!omitted.dir.join("schema/app.bad.yml").exists());
+        let out = d.run(&["plan", "--db", db, "--out", plan.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("app.bad") && stderr(&out).contains("partial schema"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!plan.exists());
+        on_server(
+            db,
+            "ALTER TABLE app.bad ALTER COLUMN mood TYPE text USING mood::text",
+        );
+
+        // A valid declared name can have an unrepresentable live definition.
+        // Keep its identity in the managed refusal, instead of calling it gone.
+        on_server(
+            db,
+            "DROP DOMAIN app.positive; CREATE DOMAIN app.positive AS app._mood",
+        );
+        let out = d.run(&["plan", "--db", db, "--out", plan.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let message = stderr(&out);
+        assert!(
+            message.contains("app.positive")
+                && message.contains("cannot be represented")
+                && message.contains("partial schema"),
+            "{message}"
+        );
+        assert!(!message.contains("absent in the target"), "{message}");
+        assert!(!plan.exists());
+
+        // #1523 can still hold a reference whose name is representable even
+        // when its definition cannot be a type file. It stays explicitly
+        // external, with a prerequisite pin and the named type limitation.
+        on_server(db, "CREATE TABLE app.external_ref (mood app.positive)");
+        let external = Demo::new("type-omission-external1635");
+        std::fs::write(
+            external.dir.join("schema/app.external_ref.yml"),
+            "table: app.external_ref\ncolumns:\n  mood: {type: app.positive}\n",
+        )
+        .unwrap();
+        succeeds(external.run(&["plan", "--no-dev"]));
+        external.commit();
+        succeeds(external.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "keep the existing external reference",
+        ]));
+        let external_plan = external.dir.join("external.plan.json");
+        let out = external.run(&["plan", "--db", db, "--out", external_plan.to_str().unwrap()]);
+        assert!(stderr(&out).contains("app.positive"), "{}", stderr(&out));
+        succeeds(out);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(external_plan).unwrap()).unwrap();
+        assert!(saved.changes.is_empty());
+        assert!(saved.ids.types.is_empty());
+        assert!(
+            saved
+                .type_pins
+                .iter()
+                .any(|p| p.schema == "app" && p.name == "positive")
+        );
+        on_server(db, "DROP SCHEMA app CASCADE");
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_namespace WHERE nspname='app'"
+            ),
+            0
+        );
+    }
+}
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]

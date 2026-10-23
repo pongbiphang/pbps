@@ -1395,52 +1395,26 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
 
     let mut raw = RawCatalog::default();
     for row in batch.get("types").ok_or_else(|| missing("types"))? {
-        let name = pbps_model::TypeRef::new(text(row, "schema")?, text(row, "name")?)
-            .map_err(|e| DbError::BadRow(e.to_string()))?;
-        let definition = match text(row, "kind")?.as_str() {
-            "e" => pbps_model::ManagedType::Enum {
-                values: strings(row, "labels")?,
-            },
-            "d" => {
-                let mut checks = BTreeMap::new();
-                for check in row
-                    .get("checks")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| missing("domain checks"))?
-                {
-                    if text(check, "contype")? != "c" {
-                        return Err(DbError::BadRow(format!(
-                            "domain `{}` has an unsupported constraint",
-                            name.shown()
-                        )));
-                    }
-                    checks.insert(text(check, "name")?.into(), text(check, "expression")?);
-                }
-                pbps_model::ManagedType::Domain {
-                    base: domain_base(row)?,
-                    not_null: flag(row, "not_null")?,
-                    default: optional_text(row, "default_expr")?,
-                    checks,
-                    collation: optional_text(row, "collation")?
-                        .map(|v| v.parse())
-                        .transpose()
-                        .map_err(|e: pbps_model::TypeParseError| DbError::BadRow(e.to_string()))?,
-                }
+        // Without these query columns there is no identity to attribute a
+        // limitation to. Their failure still means the query and reader differ.
+        let schema = text(row, "schema")?;
+        let name = text(row, "name")?;
+        match decode_managed_type(row, &schema, &name) {
+            Ok((name, definition)) => {
+                raw.types.insert(name, definition);
             }
-            _ => {
-                return Err(DbError::BadRow(format!(
-                    "type `{}` has an unsupported kind",
-                    name.shown()
-                )));
+            Err(error) => {
+                let name = TableName::new(schema, name);
+                warnings.push(Limitation {
+                    detail: format!(
+                        "type `{}` cannot be represented: {error}. It is left out of the pull; \
+                         this is not an absent type.",
+                        name.shown()
+                    ),
+                    target: LimitationTarget::Type(name),
+                });
             }
-        };
-        if !flag(row, "defined")? {
-            return Err(DbError::BadRow(format!(
-                "type `{}` is not defined",
-                name.shown()
-            )));
         }
-        raw.types.insert(name, definition);
     }
     for row in batch.get("tables").ok_or_else(|| missing("tables"))? {
         raw.tables.push(RawTable {
@@ -2636,6 +2610,65 @@ fn deparsed_away(kind: char, schema: &str, name: &str) -> DbError {
          snapshot so that it cannot report half of a change as a whole schema, and this is \
          that guard firing. Run it again when the other change has finished."
     ))
+}
+
+// Only the row identity is decoded outside this boundary: every failure in a
+// type's definition is a named omission, never failure of unrelated types or
+// tables in the same statement snapshot (DEC-1635.1).
+fn decode_managed_type(
+    row: &serde_json::Value,
+    schema: &str,
+    name: &str,
+) -> Result<(pbps_model::TypeRef, pbps_model::ManagedType), DbError> {
+    let name =
+        pbps_model::TypeRef::new(schema, name).map_err(|e| DbError::BadRow(e.to_string()))?;
+    let definition = match text(row, "kind")?.as_str() {
+        "e" => pbps_model::ManagedType::Enum {
+            values: strings(row, "labels")?,
+        },
+        "d" => {
+            let mut checks = BTreeMap::new();
+            for check in row
+                .get("checks")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| missing("domain checks"))?
+            {
+                let contype = text(check, "contype")?;
+                if contype != "c" {
+                    return Err(DbError::BadRow(format!(
+                        "domain `{}` has an unsupported constraint kind `{contype}`",
+                        name.shown()
+                    )));
+                }
+                checks.insert(text(check, "name")?.into(), text(check, "expression")?);
+            }
+            pbps_model::ManagedType::Domain {
+                base: domain_base(row)?,
+                not_null: flag(row, "not_null")?,
+                default: optional_text(row, "default_expr")?,
+                checks,
+                collation: optional_text(row, "collation")?
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|e: pbps_model::TypeParseError| {
+                        DbError::BadRow(format!("invalid domain collation: {e}"))
+                    })?,
+            }
+        }
+        _ => {
+            return Err(DbError::BadRow(format!(
+                "type `{}` has an unsupported kind",
+                name.shown()
+            )));
+        }
+    };
+    if !flag(row, "defined")? {
+        return Err(DbError::BadRow(format!(
+            "type `{}` is not defined",
+            name.shown()
+        )));
+    }
+    Ok((name, definition))
 }
 
 fn domain_base(row: &impl CatalogFields) -> Result<pbps_model::ColumnType, DbError> {
@@ -4778,6 +4811,105 @@ mod tests {
                 .to_string()
                 .contains("types")
         );
+    }
+
+    #[test]
+    fn unrepresentable_types_are_named_omissions_without_losing_the_rest_of_the_batch() {
+        let good_enum = serde_json::json!({
+            "schema": "app", "name": "mood", "kind": "e", "defined": true,
+            "labels": []
+        });
+        let good_domain = serde_json::json!({
+            "schema": "app", "name": "positive", "kind": "d", "defined": true,
+            "base": "integer", "not_null": true, "default_expr": null,
+            "collation": null,
+            "checks": [{"name": "positive_check", "contype": "c", "expression": "VALUE > 0"}]
+        });
+        let mut cases = Vec::new();
+        for (field, value, reason) in [
+            ("name", serde_json::json!("_mood"), "starts with `_`"),
+            ("kind", serde_json::json!("x"), "unsupported kind"),
+            ("defined", serde_json::json!(false), "not defined"),
+            ("labels", serde_json::json!(null), "labels"),
+            ("labels", serde_json::json!([1]), "labels"),
+        ] {
+            let mut row = good_enum.clone();
+            row[field] = value;
+            cases.push((row, reason));
+        }
+        for (field, value, reason) in [
+            ("base", serde_json::json!("app._mood"), "starts with `_`"),
+            ("base", serde_json::json!("int4range"), "base_reference"),
+            ("not_null", serde_json::json!(null), "not_null"),
+            ("default_expr", serde_json::json!(1), "default_expr"),
+            ("collation", serde_json::json!("unqualified"), "collation"),
+            ("checks", serde_json::json!(null), "domain checks"),
+            (
+                "checks",
+                serde_json::json!([{"contype": "x"}]),
+                "unsupported constraint",
+            ),
+            (
+                "checks",
+                serde_json::json!([{"contype": "c", "name": "bad", "expression": null}]),
+                "expression",
+            ),
+            (
+                "checks",
+                serde_json::json!([{"contype": "c", "expression": "true"}]),
+                "name",
+            ),
+        ] {
+            let mut row = good_domain.clone();
+            row[field] = value;
+            cases.push((row, reason));
+        }
+        for (mut bad, reason) in cases {
+            if bad["name"] != "_mood" {
+                bad["name"] = serde_json::json!("bad");
+            }
+            let target = TableName::new("app", bad["name"].as_str().unwrap());
+            let mut batch = empty_catalog_batch();
+            batch.insert(
+                "types".into(),
+                vec![good_enum.clone(), bad, good_domain.clone()],
+            );
+            let (raw, limitations, _) = decode_batch(&batch).unwrap();
+            assert_eq!(raw.types.len(), 2, "{reason}");
+            assert!(raw.types.contains_key(&"app.mood".parse().unwrap()));
+            assert!(matches!(
+                &raw.types[&"app.mood".parse().unwrap()],
+                pbps_model::ManagedType::Enum { values } if values.is_empty()
+            ));
+            assert!(matches!(
+                raw.types[&"app.positive".parse().unwrap()],
+                pbps_model::ManagedType::Domain { not_null: true, .. }
+            ));
+            assert_eq!(limitations.len(), 1, "{reason}");
+            assert_eq!(
+                limitations[0].target,
+                LimitationTarget::Type(target.clone())
+            );
+            assert!(limitations[0].detail.contains(&target.shown().to_string()));
+            assert!(
+                limitations[0].detail.contains(reason),
+                "{}",
+                limitations[0].detail
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_row_without_a_catalog_identity_is_still_a_broken_read() {
+        for row in [
+            serde_json::json!({"name": "mood"}),
+            serde_json::json!({"schema": "app"}),
+            serde_json::json!({"schema": "app", "name": null}),
+        ] {
+            let mut batch = empty_catalog_batch();
+            batch.insert("types".into(), vec![row]);
+            assert!(decode_batch(&batch).is_err());
+        }
     }
 
     #[test]

@@ -2651,8 +2651,11 @@ PostgreSQL's catalog batch reuses `user_types`' label and constraint readers
 inside its existing statement snapshot, excluding extension members and engine
 schemas. Definition state excludes OIDs, owners and constraint validation;
 the existing reference pin retains those facts. A domain's inherited base
-collation is absent, an override is qualified. A catalog base outside the
-column type catalog, such as `int4range` or `int4multirange`, is preserved as a
+collation is absent, an override is qualified. Per-type definition decode
+failures are named type limitations, leaving unrelated objects readable while
+a declared counterpart is refused as unrepresentable rather than absent.
+A catalog base outside the column type catalog, such as `int4range` or
+`int4multirange`, is preserved as a
 qualified reference, including its array marker. This does not admit range
 columns or add range definitions to the model. SQL Server refuses declarations
 by name. Composite definitions and ranges stay outside the managed model;

@@ -2672,6 +2672,7 @@ async fn managed_state_full(
                 Some(name.clone())
             }
             pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::Type(_)
             | pbps_db::catalog::LimitationTarget::SharedModule(_)
             | pbps_db::catalog::LimitationTarget::Module(_)
             | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => None,
@@ -3779,7 +3780,18 @@ pub(crate) fn managed_limitations(
     pulled
         .limitations
         .iter()
-        .filter(|limitation| omission_is_managed(&limitation.target, &managed_tables, modules))
+        .filter(|limitation| match &limitation.target {
+            pbps_db::catalog::LimitationTarget::Type(name) => ids
+                .types
+                .values()
+                .any(|t| t.schema() == name.schema && t.name() == name.name),
+            pbps_db::catalog::LimitationTarget::Relation(_)
+            | pbps_db::catalog::LimitationTarget::SharedModule(_)
+            | pbps_db::catalog::LimitationTarget::Module(_)
+            | pbps_db::catalog::LimitationTarget::UnnameableModule(_) => {
+                omission_is_managed(&limitation.target, &managed_tables, modules)
+            }
+        })
         .map(|limitation| limitation.detail.clone())
         .chain(
             pulled
@@ -6696,6 +6708,14 @@ pub fn cmd_plan_db(
         let mut conn = db::connect(target).await?;
         if !resolved.ids.types.is_empty() {
             let live = crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
+            // An omitted definition is present but unrepresentable. Refuse it
+            // before the lifecycle comparison can misreport it as absent.
+            refuse_managed_limitations(&managed_limitations(
+                &live,
+                &resolved.ids,
+                &managed_modules(None, Some(&loaded.schema)),
+                &pbps_diff::external_parents(&loaded.schema),
+            ))?;
             let managed = Schema {
                 types: live.schema.types.into_iter()
                     .filter(|(name, _)| resolved.ids.type_uid(name).is_some()).collect(),
@@ -21419,6 +21439,45 @@ mod tests {
             5
         );
         assert!(managed_limitations(&pulled, &empty, &modules, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn omitted_types_are_managed_only_by_their_own_declared_identities() {
+        use pbps_db::catalog::{Limitation, LimitationTarget, Pulled};
+        let name = TableName::new("app", "mood");
+        let pulled = Pulled {
+            limitations: vec![Limitation {
+                target: LimitationTarget::Type(name.clone()),
+                detail: "type app.mood cannot be represented".into(),
+            }],
+            ..Default::default()
+        };
+        let mut ids = IdsFile::default();
+        ids.tables.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.mood", 0),
+            name.clone(),
+        );
+        let modules = [ModuleId::Named(name.clone())].into_iter().collect();
+        assert!(managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()).is_empty());
+        ids.types.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Type, "app.mood", 0),
+            "app.mood".parse().unwrap(),
+        );
+        assert_eq!(
+            managed_limitations(&pulled, &ids, &modules, &BTreeSet::new()),
+            ["type app.mood cannot be represented"]
+        );
+        let relation = Pulled {
+            limitations: vec![Limitation {
+                target: LimitationTarget::Relation(name),
+                detail: "table app.mood cannot be represented".into(),
+            }],
+            ..Default::default()
+        };
+        ids.tables.clear();
+        assert!(
+            managed_limitations(&relation, &ids, &BTreeSet::new(), &BTreeSet::new()).is_empty()
+        );
     }
 
     #[test]

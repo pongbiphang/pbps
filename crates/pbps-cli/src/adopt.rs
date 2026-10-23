@@ -248,7 +248,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
                         .or_insert_with(|| (name.clone(), limitation.detail.clone()));
                 }
             }
-            LimitationTarget::SharedModule(_)
+            LimitationTarget::Type(_)
+            | LimitationTarget::SharedModule(_)
             | LimitationTarget::Module(_)
             | LimitationTarget::UnnameableModule(_) => {}
         }
