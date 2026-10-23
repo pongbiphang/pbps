@@ -184,8 +184,9 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        73,
-        "validation sentences, including the #2084 routine-argument refusal, "
+        74,
+        "validation sentences, including the #2084 routine-argument and #2232 "
+        "role-character refusals, "
         "feed whole-escaped DialectError fields; the #1450 declaration note "
         "feeds the whole-escaped `dialect.not-checked` note "
         "until #2084 step 5",
@@ -328,8 +329,8 @@ ALLOWED = {
         "quotes a generated default-constraint name into fixture SQL; SQL remains raw after #2084 step 5",
     ),
     "crates/pbps-mssql/tests/live.rs": (
-        1,
-        "quotes a constraint-name namespace target into fixture SQL; SQL remains raw after #2084 step 5",
+        2,
+        "quotes constraint-name and overlength role-name targets into fixture SQL; SQL remains raw after #2084 step 5",
     ),
     "crates/pbps-pg/src/data_triggers.rs": (
         1,
