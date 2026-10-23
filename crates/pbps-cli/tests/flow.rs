@@ -23117,3 +23117,50 @@ fn a_sql_server_project_refuses_a_declared_type_by_name() {
     let output = d.run(&["validate"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
 }
+
+#[path = "support/state_history.rs"]
+mod state_history;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_round_trips_and_recovers_through_a_new_forward_plan() {
+    state_history::recovery(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_refusals_preserve_the_project_and_distinguish_ledger_states() {
+    state_history::refusals(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_requires_readable_snapshots_but_no_database_write_privileges() {
+    state_history::permissions(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {
+    state_history::hostile_names(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+fn state_history_setup_failures_keep_the_single_json_envelope() {
+    let d = Demo::new("history-setup2289");
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+    for command in ["show", "diff", "export"] {
+        let out = d.run(&["state", command, "1", "--format", "json"]);
+        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["command"], format!("state {command}"));
+        assert_eq!(report["result"], "unanswerable");
+        assert!(report.get("data").is_none());
+    }
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
+    state_history::identities(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

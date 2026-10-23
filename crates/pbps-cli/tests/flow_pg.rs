@@ -34357,3 +34357,46 @@ fn bootstrap_scripts_keep_the_guard_and_session_pin_bytes_from_before_certificat
         assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
     }
 }
+
+#[path = "support/state_history.rs"]
+mod state_history;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_round_trips_and_recovers_through_a_new_forward_plan() {
+    for server in [server(), old_server()] {
+        state_history::recovery(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_refusals_preserve_the_project_and_distinguish_ledger_states() {
+    for server in [server(), old_server()] {
+        state_history::refusals(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_requires_readable_snapshots_but_no_database_write_privileges() {
+    for server in [server(), old_server()] {
+        state_history::permissions(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {
+    for server in [server(), old_server()] {
+        state_history::hostile_names(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
+    for server in [server(), old_server()] {
+        state_history::identities(&server, true);
+    }
+}

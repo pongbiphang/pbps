@@ -155,8 +155,12 @@ Connected (each takes `--db <connection string>` or `--env <name>`): `pull`
 `--checksum` / `--allow` / `--staged` /
 `--resume`), `verify` (`--format json`), `snapshot` (`--force`), `baseline`
 (`--reason`), `bootstrap` (`--sql`), `state list` (`--limit` / `--format json`),
-`state prune` (`--keep`), `unlock`,
-`status` (`--format json`).
+`state show <id>`, `state diff <id> [<id>]`, `state export <id>` (`--force`),
+`state prune` (`--keep`), `unlock`, `status` (`--format json`). The historical
+read/export commands also take `--format json`. Export validates declarations
+before publishing them and preserves the current identity file; recovery continues
+through a reviewed commit, connected plan and ordinary apply. It exports only the
+current snapshot version and cannot recover historical `public_execute`.
 
 All three intent channels now exist: the CLI commands, the YAML annotations, and
 the TTY prompt of SPEC 6.3.

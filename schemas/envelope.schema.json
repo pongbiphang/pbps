@@ -26,6 +26,15 @@
     },
     {
       "$ref": "#/$defs/envelope.state-list"
+    },
+    {
+      "$ref": "#/$defs/envelope.state-show"
+    },
+    {
+      "$ref": "#/$defs/envelope.state-diff"
+    },
+    {
+      "$ref": "#/$defs/envelope.state-export"
     }
   ],
   "$defs": {
@@ -2377,6 +2386,231 @@
           "anyOf": [
             {
               "$ref": "#/$defs/StateListData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "ShowData": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "entry": {
+          "$ref": "#/$defs/Entry"
+        }
+      },
+      "required": [
+        "environment",
+        "entry"
+      ]
+    },
+    "Entry": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "applied_at": {
+          "type": "string"
+        },
+        "snapshot": true
+      },
+      "required": [
+        "id",
+        "applied_at",
+        "snapshot"
+      ]
+    },
+    "envelope.state-show": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "state show"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShowData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "DiffData": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "from_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "to_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "changes": true,
+        "unexpressible": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "environment",
+        "from_id",
+        "to_id",
+        "changes",
+        "unexpressible"
+      ]
+    },
+    "envelope.state-diff": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "state diff"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiffData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
+    "ExportData": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "entry_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "state_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "removed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "environment",
+        "entry_id",
+        "state_version",
+        "files",
+        "removed"
+      ]
+    },
+    "envelope.state-export": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "state export"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExportData"
             },
             {
               "type": "null"

@@ -1708,10 +1708,17 @@ exit 2 before project or connection I/O, and meaningful text is stored verbatim.
 A fourth situation looks similar and is not drift at all: **the change applied
 exactly as planned, and the change itself was wrong.** The database matches its
 declarations, so nothing here fires. The answer is to take a past state out of
-the ledger and go forward into it — `state export` then the ordinary
-`plan --db` / `apply` (14.1) — because what changes is the declarations, so git
-and the database go back together. There is no one-step rollback, and what comes
-back is structure: a column that was dropped returns empty (14.3).
+the ledger and go forward into it. Use `pbps state show <id>` to inspect an
+entry and `pbps state diff <id> [<id>]` to compare entries (the second defaults
+to the newest), then `pbps state export <id>` to write historical declarations.
+Review and commit those files, run `plan --db` or `plan --env`, and apply the
+checksum-pinned approved plan (14.1). Export requires a current-version snapshot
+and refuses existing declarations unless `--force` authorizes replacement,
+including removing stale declaration files. It validates the staged output before
+writing the project and leaves `schema.ids.json` unchanged, preserving every
+later rename and drop intent. Record any new intent through the existing commands.
+These commands read the ledger without changing the database. Recovery restores
+recorded structure and declared reference data, not lost business rows (14.3).
 
 ---
 
@@ -1791,6 +1798,9 @@ full state.
 | `pbps baseline --reason --operator` | Reset the state baseline |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state list` | This environment's history, newest first |
+| `pbps state show <id>` | Read an entry's full schema snapshot and metadata; `--format json` uses the findings envelope |
+| `pbps state diff <id> [<id>]` | Compare recorded entries using typed changes; the destination defaults to the newest entry |
+| `pbps state export <id>` | Write historical declarations for review, commit and a new forward plan; `--force` replaces existing declaration files |
 | `pbps state prune --keep N` | Clean up historical snapshots |
 | `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
 | `pbps resolver externals` | Draft a resolver's externals file from the target, for review: printed, or written to a new `--out` file; `--schema <name>` adds a schema's unmanaged objects (see 9.3.2, DEC-1778.1) |
@@ -3655,7 +3665,7 @@ around the typed plan and its checksum.
 | Discover the declaration format while typing | Users move between YAML and this document, and a misspelled key is found only by running `validate` | Ship versioned JSON Schemas for `pbps.yml` and the declarations, **generated from the loader's own types** so the two cannot drift, plus a `pbps schema` exporter for air-gapped editors, shell completions and generated man pages | **P0** |
 | Apply organization-specific safety rules | Built-in validation cannot express local naming, size or change-window rules | A declarative `policies:` block selects built-in rules and severities. Suppression requires a rule id, a reason and an optional expiry; no embedded code in v1 (14.3). `validate --since` evaluates only changed objects, so a large estate can adopt it gradually. The block is a new format surface and gets an ADR before it is built, as reference data and roles did | **P1** |
 | Know whether a change is operationally expensive | Risk says whether a change *can* fail, never how long it may block or how much it may rewrite | Connected `plan` adds an **estimate**, kept apart from correctness: row and page counts, likely scan or rebuild, lock class, and a confidence. A threshold may *tighten* the gate only when the threshold itself is declared in a reviewed file in the repository; an estimate never loosens one and never reclassifies a dangerous operation as safe. ADR-0003 rules out inferring *behaviour* from table size, and this does not reopen it: the estimate informs a human | **P1** |
-| Recover from a change that applied successfully and turned out to be wrong | Git plus the ledger holds the answer, but reconstructing the historical declarations is manual | `pbps state list` (built) shows the timeline; `pbps state show / diff / export <id>` exposes the ledger and writes a historical state back out as declarations. Recovery is then `export` → commit → `plan --db` → `apply`: because what changes is the **declarations**, git and the database go back together, and the next plan does not try to undo the recovery. There is no one-step rollback and no bypass around the probes or the gate (14.3) | **P1** |
+| Recover from a change that applied successfully and turned out to be wrong | A historical schema must become reviewed declarations with current identity intent preserved | Built: `pbps state list`, `state show <id>`, `state diff <id> [<id>]` and `state export <id>`. Recovery is `export` → review and commit → `plan --db` or `--env` → ordinary approved `apply`. Export preserves `schema.ids.json`, writes recorded reference data but restores no business rows, and requires the current snapshot version. Historical `public_execute` is not recorded: exported PostgreSQL routines omit it and keep the closed default, with a note to review execution permissions. There is no one-step rollback or bypass around the gate (14.3) | **P1** |
 | Bootstrap CI without transcribing documentation | The example pipeline in 10 must be translated by every team | A complete, copy-pastable pipeline per platform lives in the documentation, with the required secrets listed — delivered in [CI.md](CI.md). A generator is deliberately *not* shipped: a generated pipeline that has since been edited can never be upgraded, so the generator ends up maintained for nobody | **P1** |
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet. Every change is classified through the selected dialect's `Dialect::change_risks`, which starts from `Change::intrinsic_risks_with` under that engine's identifier boundary, and its findings are attached to `PlannedChange::risks`. Saved-plan validation re-derives them the same way (DEC-399.1). Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
@@ -3693,8 +3703,8 @@ and `status`; and the interactive prompt of 6.3, which was the last part of
 
 Phase 4 delivered the `policies:` block and the first analyzer catalogue
 ([ADR-0008](ADR-0008-policies.md)), and the documented pipelines are in
-[CI.md](CI.md). What remains in 14.1 is P1 and P2: operational estimates,
-`state show / diff / export` — of which `state list`, the timeline, is built —
+[CI.md](CI.md). Historical `state show / diff / export` is built beside the
+`state list` timeline. What remains in 14.1 is P1 and P2: operational estimates,
 the optional UI (Phase 6) and a versioned CI
 component, and the wider analyzer catalogue. The catalogue is not a phase of
 its own: it is depth over the typed `ChangeSet`, added rule by rule, and the

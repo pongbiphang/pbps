@@ -49,6 +49,8 @@ limitations and deferred findings. Two groups of commands:
 | `apply --staged --checksum` (`--resume`) | Run one logical change outside a transaction, checkpointing each statement |
 | `verify` (`--format json`) | The drift check; exits 2 on drift |
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
+| `state list`, `state show <id>`, `state diff <id> [<id>]` (`--format json`) | Inspect and compare recorded history |
+| `state export <id>` (`--force` / `--format json`) | Write historical declarations for review, commit and a new forward plan; preserve current identity intent |
 | `status` (`--format json`) | One screen across every configured environment |
 | `resolver externals` (`--schema` / `--out` / `--force`) | Draft a resolver's externals file from the target, for review |
 

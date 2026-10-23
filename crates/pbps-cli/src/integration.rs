@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 56;
+pub const SCHEMA_VERSION: u32 = 57;
+// 57: historical state show, diff and export envelopes (issue #2289).
 // 56: declared type rename annotations and deferred domain vetting (#1635 slice two).
 // 55: SQL Server same_instance configuration and explain provenance (#2270).
 // 54: declared enum and domain files (#1635 slice one).
@@ -139,6 +140,9 @@ macro_rules! envelope_branches {
             "verify" => pbps_model::DriftReport,
             "status" => Vec<crate::status::EnvStatus>,
             "state list" => crate::state_list::StateListData,
+            "state show" => crate::state_history::ShowData,
+            "state diff" => crate::state_history::DiffData,
+            "state export" => crate::state_history::ExportData,
         }
     };
 }
