@@ -121,6 +121,8 @@ pub struct Effects {
     pub removes: Vec<Resource>,
     pub rewrites: Vec<Resource>,
     pub requires: Vec<Requirement>,
+    /// Recursion/transfer facts are resolved by order, never endpoint unions.
+    pub symbolic: Vec<super::symbolic::Clause>,
 }
 
 impl Effects {
@@ -129,6 +131,7 @@ impl Effects {
             && self.removes.is_empty()
             && self.rewrites.is_empty()
             && self.requires.is_empty()
+            && self.symbolic.is_empty()
     }
 
     /// What `other` adds, merged: the engine's effects beside the portable
@@ -148,6 +151,11 @@ impl Effects {
         for r in other.requires {
             if !self.requires.contains(&r) {
                 self.requires.push(r);
+            }
+        }
+        for clause in other.symbolic {
+            if !self.symbolic.contains(&clause) {
+                self.symbolic.push(clause);
             }
         }
         self

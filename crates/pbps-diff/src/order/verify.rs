@@ -13,6 +13,8 @@ use super::edges::{Baseline, Checks, Edge, Source, graph};
 /// Why the replay refused an order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
+    /// Symbolic recursion/transfer failed independent concrete replay.
+    Symbolic(super::membership::Problem),
     /// A requirement no earlier operation and no baseline instance satisfies
     /// at the step.
     Unmet {
@@ -72,6 +74,11 @@ pub(crate) fn verify_with(
 ) -> Vec<Violation> {
     assert_eq!(operations.len(), effects.len());
     let mut out = Vec::new();
+    if effects.iter().any(|fx| !fx.symbolic.is_empty())
+        && let Err(problem) = super::membership::project(operations, effects, &baseline.symbolic)
+    {
+        out.push(Violation::Symbolic(problem));
+    }
     // A key some operation ends or produces is replayed; any other stands as
     // the baseline has it, in both senses.
     let touched: BTreeSet<&ObjectKey> = effects

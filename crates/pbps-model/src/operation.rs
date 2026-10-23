@@ -1142,6 +1142,7 @@ mod slots;
 pub use slots::{Address, NameKind, Named, Names, baseline_names, names};
 
 mod effects;
+pub mod symbolic;
 pub use effects::{
     BaseTable, BoundInput, Effects, Requirement, Resource, Snapshot, base_table, base_table_named,
     baseline_keys, column_key, column_types, effects, final_table, holds_unknown, module_key,

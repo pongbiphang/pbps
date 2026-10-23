@@ -8,6 +8,7 @@ pub fn check() {
         ("unbound", "", "dbo.f(@x)", 3),
         ("retarget", "WITH SCHEMABINDING", "dbo.h(@x)", 12),
         ("removed", "WITH SCHEMABINDING", "@x", 2),
+        ("unbound_retype", "", "dbo.f(@x)", 3),
     ] {
         let slug = format!("binding_release_{variant}");
         let own = OwnDatabase::new(&server, &slug);
@@ -28,6 +29,15 @@ pub fn check() {
         for (name, body) in [("f", "@x"), ("g", "dbo.f(@x)"), ("h", "@x + 10")] {
             write(name, &definition("WITH SCHEMABINDING", body));
         }
+        // Exercise an ordinary observational blocker in the active release
+        // settlement. The other variants retain their original declarations.
+        let with_retype = variant == "unbound_retype";
+        let table = |ty: &str| {
+            format!("table: dbo.t\ncolumns:\n  a: {{type: {ty}}}\nchecks:\n  ck_a: 'a > 0'\n")
+        };
+        if with_retype {
+            demo.table(&table("int"));
+        }
         success(demo.run(&["plan"]));
         demo.commit();
         success(demo.run(&["bootstrap", "--db", connection]));
@@ -42,6 +52,9 @@ pub fn check() {
         );
         write("f", &new_f);
         write("g", &definition(options, body));
+        if with_retype {
+            demo.table(&table("bigint"));
+        }
         let preview = demo.dir.join("preview.sql");
         success(demo.run(&["plan", "--no-dev", "--sql", preview.to_str().unwrap()]));
         let script = std::fs::read_to_string(&preview).unwrap();
@@ -93,6 +106,15 @@ pub fn check() {
                 "IF dbo.f(2) <> 3 OR dbo.g(2) <> {result} THROW 51000, 'wrong rewritten result', 1;"
             ),
         );
+        if with_retype {
+            on_server(
+                connection,
+                "IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.t') AND name = N'a' AND system_type_id = TYPE_ID(N'bigint')) THROW 51000, 'retype was not applied', 1; INSERT INTO dbo.t(a) VALUES (7)",
+            );
+            let refused = try_on_server(connection, "INSERT INTO dbo.t(a) VALUES (-1)")
+                .expect_err("the check rebuilt around the retype still enforces");
+            assert!(refused.contains("ck_a"), "{refused}");
+        }
         success(demo.run(&["verify", "--db", connection]));
         success(demo.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
         let next: pbps_model::SavedPlan =

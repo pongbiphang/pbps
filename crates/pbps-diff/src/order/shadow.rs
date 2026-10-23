@@ -303,6 +303,7 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
         .violations
         .iter()
         .map(|v| match v {
+            Violation::Symbolic(problem) => format!("symbolic {problem}"),
             Violation::Unmet {
                 operation,
                 requirement,

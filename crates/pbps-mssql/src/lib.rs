@@ -618,6 +618,9 @@ impl Dialect for Mssql {
 }
 
 #[cfg(test)]
+mod order_observation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

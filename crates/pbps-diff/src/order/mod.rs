@@ -49,6 +49,7 @@ pub mod deployment;
 pub mod edges;
 pub mod expand;
 pub mod generated;
+pub mod membership;
 pub mod new_tables;
 pub(crate) mod normalization;
 pub mod parent_defaults;

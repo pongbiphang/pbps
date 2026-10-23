@@ -87,6 +87,8 @@ pub enum Refusal {
         /// Every step left unordered, ascending: the cycle's members and
         /// what waits on them.
         waiting: Vec<usize>,
+        /// Only symbolic membership participants add this scoped remedy.
+        remedy: Option<String>,
     },
 }
 
@@ -117,7 +119,12 @@ impl Refusal {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Refusal::Kept(keep) => keep.refusal.clone(),
-            Refusal::Cycle { members, edges, .. } => {
+            Refusal::Cycle {
+                members,
+                edges,
+                remedy,
+                ..
+            } => {
                 let members: Vec<String> = members.iter().map(|&i| name(i)).collect();
                 let edges: Vec<String> = edges
                     .iter()
@@ -132,9 +139,12 @@ impl Refusal {
                     })
                     .collect();
                 format!(
-                    "these steps wait on one another: {}; because {}",
+                    "these steps wait on one another: {}; because {}{}",
                     members.join(", "),
-                    edges.join(", ")
+                    edges.join(", "),
+                    remedy
+                        .as_ref()
+                        .map_or_else(String::new, |text| format!("; {text}"))
                 )
             }
         }
@@ -206,6 +216,7 @@ pub struct Schedule {
     constraints: BTreeSet<Constraint>,
     keeps: Vec<Keep>,
     obligations: Vec<Obligation>,
+    symbolic_constraints: BTreeSet<Constraint>,
 }
 
 impl Schedule {
@@ -217,14 +228,35 @@ impl Schedule {
         }
     }
 
-    /// The effect graph's edges over `operations`, each with its reason
-    /// (DEC-1956.1). Its unmet requirements are not obligations here: the
-    /// verifier records them as `unprovided` and the plan stands
-    /// (DEC-1954.6, DEC-1956.3).
+    /// Import edges and the symbolic contract's own obligations (DEC-2296.1).
+    /// Ordinary graph unmet requirements remain observational `unprovided`
+    /// facts: no ordering can meet them (DEC-1954.6, DEC-1956.3).
     pub fn of_graph(graph: &Graph, operations: &[Operation]) -> Self {
         let mut schedule = Self::new(operations.len());
         for e in &graph.edges {
-            schedule.edge(e.before, e.after, e.source, reason(e, operations));
+            let reason = reason(e, operations);
+            schedule.edge(e.before, e.after, e.source, reason);
+            if matches!(e.because, Because::Boundary(_) | Because::Restores(_)) {
+                schedule.symbolic_constraints.insert(Constraint {
+                    before: e.before,
+                    after: e.after,
+                    source: e.source,
+                    reason,
+                });
+            }
+        }
+        for issue in &graph.symbolic_unmet {
+            let at = operations
+                .iter()
+                .position(|op| op.id() == issue.operation)
+                .expect("a symbolic issue belongs to this operation collection");
+            schedule.obligation(
+                at,
+                format!(
+                    "{}: {issue}",
+                    pbps_model::Text::from(operations[at].change().subject()).shown()
+                ),
+            );
         }
         schedule
     }
@@ -455,15 +487,22 @@ impl Schedule {
                 .min()
                 .unwrap_or_default();
             let inside: BTreeSet<usize> = members.iter().copied().collect();
-            let edges = left
+            let edges: Vec<_> = left
                 .iter()
                 .filter(|c| inside.contains(&c.before) && inside.contains(&c.after))
                 .map(|c| (*c).clone())
                 .collect();
+            // Only the reported component can justify this remedy. A
+            // symbolic edge elsewhere cannot explain an ordinary cycle.
+            let remedy = edges
+                .iter()
+                .any(|edge| self.symbolic_constraints.contains(edge))
+                .then(|| super::membership::REMEDY.into());
             return Err(Refusal::Cycle {
                 members,
                 edges,
                 waiting,
+                remedy,
             });
         }
         Ok((emitted, kept))
@@ -586,6 +625,8 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,
         Source::Effect | Source::Lexical | Source::Catalog => match &edge.because {
+            Because::Boundary(_) => OrderReason::Structural,
+            Because::Restores(_) => OrderReason::Restoration,
             Because::Creates(key)
             | Because::Removes(key)
             | Because::Frees(key)

@@ -125,6 +125,89 @@ Bounded namespace search still proposes `Search` edges, and the PostgreSQL
 engine-generated-name trial remains scratch reconstruction rather than a
 generic slot allocator. These are retained limits, not extra scheduling passes.
 
+### Membership-scoped effect contract
+
+`operation::symbolic` declares recursive property writes, membership
+incarnations, transfers and explicit own-value restorations (DEC-2296.1).
+The parent UID and property identify a version chain; operation identities,
+not matching definition text or the current list positions, identify its
+transitions. Binding incarnations, own/inherited/local ownership and physical
+birth are distinct facts. Engines supply normalized definitions and the
+observed overwrite/preserve/adopt policy; the model parses no SQL.
+
+`order::membership` indexes the declarations and compiles each move's allowed
+cuts in those chains. An interval requires its lower predecessor before the
+move and its upper successor after it. A move compatible with both sides
+gets no preference edge. A fork, missing fact, non-convex interval or
+unrepresented disjunction is a named obligation with the separate-plans
+remedy. Other property/dependency constraints may form an ordinary cycle;
+cycles containing these boundary constraints retain that remedy too; an
+unrelated cycle does not. Clause order inside an indivisible operation stays
+fixed, so an unsatisfied intra-operation boundary is an obligation.
+A restoration must qualify its changed ownership through the matching
+parent/child/property transfer; unrelated moves cannot supply that fact.
+Qualification checks the combined declared membership links for new nesting
+or cycles and checks transfer targets after removing the complete source set;
+source swaps are atomic, while occupied untouched targets are obligations.
+Recursive targets need known aliases, values and physical lifetimes, including
+members with no move. Each changing membership must declare coverage of the
+recursive properties it carries. Overlapping recursive chains, transfers or
+restorations that overwrite a versioned input without a shared version chain
+remain named obligations; matching endpoint text cannot supply that chain.
+Test-only generated contracts enumerate every permitted topological order
+against independent replay, including supported and unqualified declarations.
+Restorations are grouped by physical `(child, property)` cell, including
+clauses with different parent keys. The existing declared write/write order
+(operation identity, then clause) chains that cell's restorations; matching
+keys never imply that distinct cells share a dependency. The last restoration
+names its final value and event version. A reaching recursive suffix must
+precede that terminal event, even when it preserves the value. Parent-only
+writes and writes after detach cannot reach the cell and impose no such edge.
+Intermediate restorations may precede later value writes, while retaining
+the existing physical-incarnation boundary across creation/retirement.
+Non-convex restoration cuts remain named obligations. Move cuts must agree on
+the complete physical endpoint, including event version and origin; several
+value-compatible endpoints do not authorize choosing a preferred event and
+remain a named obligation with the separate-plans remedy.
+Test-only determinism checks compare complete final states for every permitted
+order and independently check recursive, transfer and terminal restoration
+goals. They retain event versions, origins, bindings, ownership and membership.
+The corpus varies logical keys independently of physical aliases for recursive
+writes, transfers and restorations. Necessity checks require replay failure
+witnesses or a checked named certificate: another dependency path, same-cell
+write/write order, an intermediate restoration's physical incarnation, or the
+terminal restoration's value/event goal. The last certificate independently
+checks that reversing the edge loses that declared goal; concrete projection
+alone does not check a stationary restoration's terminal event.
+`Schedule::of_graph` imports only the symbolic contract's explicit unmet
+obligations. Ordinary `Graph::unmet` requirements remain observational
+`unprovided` facts under DEC-1954.6 and DEC-1956.3, even in a mixed graph.
+A symbolic contract obligation cannot be discharged by merely observing it.
+
+A concrete projection replays membership at each position and expands a
+recursive write only over the members then present. Transfers retain
+physical origin while changing managed scope; a drop retires the child.
+Independent Final replay checks the actual writes, transfers and goals,
+without importing a concrete child union from graph compilation. The
+non-executable `Pending` lookup distinguishes pending facts from missing
+sources; it grants no executable authority, as compiler-negative tests pin.
+Its borrowed operations/effects cannot be mutated underneath a live view.
+
+The contract is not activated for guarded plans yet. `attached()` and
+`detached_names()`, early weave/source projections, shipping engine clauses
+and boundary probe grounding remain the column/part PRs' integration work.
+Those PRs carry typed obligations to the existing effect settlement; they
+must not choose a preliminary order to construct their effects. Existing
+stages, Sink, brands, wire fields and the release-verifier policy stay intact.
+Test-only small-order enumeration checks soundness and admitted-interval
+completeness; it is not a shipping search/ordering stage.
+
+Every measured silent-difference case in an implementation PR's scope needs
+live readback on PG16/18, not a sample. In a combined transactional plan the
+first parent ALTER holds the tree's ACCESS EXCLUSIVE lock until commit;
+attach validation runs within that longer lock window. The eventual plan
+text must say so, and the operator can still choose separate plans.
+
 ### Base ordering policy
 
 The differ sorts every planned change by, in order:
