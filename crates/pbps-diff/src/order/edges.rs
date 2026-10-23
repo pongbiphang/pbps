@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::ModuleDeps;
 use pbps_model::operation::{
-    Effects, Incarnation, ObjectKey, Operation, OperationId, Requirement, Resource, Snapshot,
-    baseline_keys, holds_unknown,
+    Effects, Incarnation, ObjectKey, Operation, OperationId, Recorded, Requirement, Resource,
+    Snapshot, baseline_bindings, baseline_keys, holds_unknown,
 };
 use pbps_model::plan_names::At;
 
@@ -155,6 +155,7 @@ pub(crate) fn connected_module_release(edge: &Edge, operations: &[Operation]) ->
 #[derive(Debug, Clone, Default)]
 pub struct Baseline {
     held: BTreeSet<ObjectKey>,
+    bindings: BTreeMap<ObjectKey, Recorded>,
     pub(crate) symbolic: pbps_model::operation::symbolic::State,
 }
 
@@ -167,6 +168,10 @@ impl Baseline {
     pub fn of(before: Snapshot<'_>, owners: &dyn pbps_model::operation::Owners) -> Self {
         Self {
             held: baseline_keys(before, owners),
+            bindings: baseline_bindings(before, owners)
+                .into_iter()
+                .map(|b| (b.surface, b.target))
+                .collect(),
             symbolic: Default::default(),
         }
     }
@@ -180,8 +185,13 @@ impl Baseline {
     pub fn from_keys(keys: impl IntoIterator<Item = ObjectKey>) -> Self {
         Self {
             held: keys.into_iter().collect(),
+            bindings: BTreeMap::new(),
             symbolic: Default::default(),
         }
+    }
+
+    pub(crate) fn bound_target(&self, key: &ObjectKey) -> Option<&Recorded> {
+        self.bindings.get(key)
     }
 
     /// `Some(true)` it holds the key, `Some(false)` it does not, `None` it
@@ -257,6 +267,7 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
     };
     Effects {
         symbolic: effects.symbolic.clone(),
+        bindings: effects.bindings.clone(),
         creates: effects.creates.iter().map(merge).collect(),
         removes: effects
             .removes
@@ -275,6 +286,7 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
                 other @ (Requirement::Exists(_)
                 | Requirement::Bound(..)
                 | Requirement::Absent(_)
+                | Requirement::NotBoundTo { .. }
                 | Requirement::Reads(_)
                 | Requirement::BeforeRewrite(_)) => other.clone(),
             })
@@ -497,6 +509,43 @@ pub fn graph(
                                 edge(b, a, Source::Binding, Because::Removes(input.clone()));
                             }
                         }
+                    }
+                }
+                Requirement::NotBoundTo { target, .. } => {
+                    let relevant = |i: usize, incarnation| {
+                        effects[i]
+                            .bound_target(key, incarnation)
+                            .is_none_or(|bound| bound == target)
+                    };
+                    let removers: Vec<_> = index
+                        .removers
+                        .get(key)
+                        .unwrap_or(&none)
+                        .iter()
+                        .copied()
+                        .filter(|&i| relevant(i, Incarnation::Base))
+                        .min_by_key(|&i| operations[i].id())
+                        .into_iter()
+                        .collect();
+                    for &a in &removers {
+                        edge(a, b, Source::Effect, Because::Frees(key.clone()));
+                    }
+                    for &a in creators
+                        .iter()
+                        .filter(|&&i| relevant(i, Incarnation::Final))
+                    {
+                        edge(b, a, Source::Effect, Because::Precedes(key.clone()));
+                    }
+                    if removers.iter().all(|&a| a == b)
+                        && held(key) != Some(false)
+                        && baseline
+                            .bound_target(key)
+                            .is_none_or(|bound| bound == target)
+                    {
+                        unmet.push(Unmet {
+                            operation: b,
+                            requirement: requirement.clone(),
+                        });
                     }
                 }
                 Requirement::Absent(_) => {

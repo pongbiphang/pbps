@@ -402,7 +402,7 @@ requirement is common to all of them, so it is listed once,
 | `RenameColumn` | 3 | The target name free. P: no retained managed policy bound to the column. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: other dependents' text follows the rename | Exists, rewrites |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |
 | `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone; planned policy drops first. P: generated columns reading it gone | Removes the column, frees its name | Absent, Exists, removes |
-| `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name | Absent, Exists, removes |
+| `DropTable` | 6 | No inbound foreign key bound to this UID; dependent modules gone | Removes the table, frees its name | NotBoundTo, Exists, removes |
 | `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) | Exists, removes |
 | `RebuildPartitionedTable` | order expansion only | Recorded source and reserved replacement lineage; no executable root until the complete route ships (DEC-2298.4) | Named unexpanded-root refusal, no fictitious schema resource | refuses |
 | `CopyTableRows` | order effects only | Base source tree/columns and Final replacement tree/columns; reads source values, writes destination values | No name claims; copy completion is an expansion obligation | Is, Reads, rewrites |

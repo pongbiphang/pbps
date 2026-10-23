@@ -1211,8 +1211,9 @@ pub use slots::{Address, NameKind, Named, Names, baseline_names, names};
 mod effects;
 pub mod symbolic;
 pub use effects::{
-    BaseTable, BoundInput, Effects, Requirement, Resource, Snapshot, base_table, base_table_named,
-    baseline_keys, column_key, column_types, effects, final_table, holds_unknown, module_key,
+    BaseTable, BoundInput, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot, base_table,
+    base_table_named, baseline_bindings, baseline_keys, column_key, column_types, effects,
+    final_table, holds_unknown, module_key,
 };
 
 #[cfg(test)]

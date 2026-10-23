@@ -27,6 +27,8 @@
 //! - [`Requirement::Absent`]: nothing of the object stands, because it would
 //!   block the step. A dependent in the way, such as a foreign key into a table
 //!   about to be dropped.
+//! - [`Requirement::NotBoundTo`]: a surface is absent or its live FK binds a
+//!   known different table UID. Unknown bindings still block retirement.
 //! - [`Requirement::Reads`]: the values under a key, after every write of
 //!   them. A check or a key validates the rows, and a tightened NOT NULL reads
 //!   the NULLs the writes before it leave.
@@ -91,6 +93,12 @@ pub enum Requirement {
     Is(ObjectKey, Incarnation),
     Bound(ObjectKey, BoundInput),
     Absent(ObjectKey),
+    /// No live incarnation of this surface may bind the retiring table.
+    /// Missing binding evidence is conservative, not proof of a new target.
+    NotBoundTo {
+        surface: ObjectKey,
+        target: Recorded,
+    },
     /// The values under the key, after every write of them. Not in the
     /// issue's list of four: `Exists` on a table cannot tell a reader of its
     /// rows from a user of its definition (DEC-1954.2).
@@ -104,6 +112,7 @@ impl Requirement {
     /// The key a requirement is about.
     pub fn key(&self) -> &ObjectKey {
         match self {
+            Requirement::NotBoundTo { surface, .. } => surface,
             Requirement::Exists(key)
             | Requirement::Is(key, _)
             | Requirement::Bound(key, _)
@@ -114,9 +123,19 @@ impl Requirement {
     }
 }
 
+/// The target of one incarnation of an FK surface. Absence of this fact is
+/// unknown; conflicting facts are also unknown (DEC-2298.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyBinding {
+    pub surface: ObjectKey,
+    pub incarnation: Incarnation,
+    pub target: Recorded,
+}
+
 /// One step's effects, from its payload and the other end of its change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Effects {
+    pub bindings: Vec<ForeignKeyBinding>,
     pub creates: Vec<Resource>,
     pub removes: Vec<Resource>,
     pub rewrites: Vec<Resource>,
@@ -127,11 +146,24 @@ pub struct Effects {
 
 impl Effects {
     pub fn is_empty(&self) -> bool {
-        self.creates.is_empty()
+        self.bindings.is_empty()
+            && self.creates.is_empty()
             && self.removes.is_empty()
             && self.rewrites.is_empty()
             && self.requires.is_empty()
             && self.symbolic.is_empty()
+    }
+
+    /// A known, unambiguous target; omitted or contradictory evidence refuses
+    /// to prove that a live FK has stopped referring to a retiring table.
+    pub fn bound_target(&self, key: &ObjectKey, incarnation: Incarnation) -> Option<&Recorded> {
+        let mut targets = self
+            .bindings
+            .iter()
+            .filter(|b| &b.surface == key && b.incarnation == incarnation)
+            .map(|b| &b.target);
+        let first = targets.next()?;
+        targets.all(|t| t == first).then_some(first)
     }
 
     /// What `other` adds, merged: the engine's effects beside the portable
@@ -146,6 +178,11 @@ impl Effects {
                 if !mine.contains(&r) {
                     mine.push(r);
                 }
+            }
+        }
+        for binding in other.bindings {
+            if !self.bindings.contains(&binding) {
+                self.bindings.push(binding);
             }
         }
         for r in other.requires {
@@ -307,6 +344,7 @@ pub fn effects(
     }
     cx.by_kind()?;
     cx.type_inputs();
+    cx.binding_facts();
     Ok(cx.fx)
 }
 
@@ -378,6 +416,70 @@ impl Cx<'_> {
         }
         for r in required {
             self.requires(r);
+        }
+    }
+
+    fn binding_facts(&mut self) {
+        for resource in self
+            .fx
+            .creates
+            .iter()
+            .chain(&self.fx.removes)
+            .chain(&self.fx.rewrites)
+        {
+            let Resource::Object(
+                surface @ ObjectKey::Part {
+                    table,
+                    part: PartKey::ForeignKey(name),
+                },
+                incarnation,
+            ) = resource
+            else {
+                continue;
+            };
+            let target = match incarnation {
+                Incarnation::Base => self
+                    .base_of(table)
+                    .and_then(|(_, t)| t.foreign_keys.get(name))
+                    .and_then(|fk| self.base_table(&fk.references_table)),
+                Incarnation::Final => {
+                    // Restoration payloads may use an intermediate address absent
+                    // from both endpoints. The typed payload is authoritative.
+                    let fk = if let Change::AddForeignKey {
+                        name: n,
+                        constraint,
+                        ..
+                    } = self.op.change()
+                    {
+                        (n == name).then_some(constraint.as_ref())
+                    } else if let Change::CreateTable { table, .. } = self.op.change() {
+                        table.foreign_keys.get(name)
+                    } else {
+                        self.final_of(table)
+                            .and_then(|(_, t)| t.foreign_keys.get(name))
+                    };
+                    fk.and_then(|fk| {
+                        if let Change::CreateTable { uid, name, .. } = self.op.change()
+                            && fk.references_table == *name
+                        {
+                            // A same-name replacement's self-reference binds the
+                            // created UID, never the previous name's occupant.
+                            return Some(Recorded(uid.clone()));
+                        }
+                        self.table(&fk.references_table).ok()
+                    })
+                }
+            };
+            if let Some(target) = target {
+                let binding = ForeignKeyBinding {
+                    surface: surface.clone(),
+                    incarnation: *incarnation,
+                    target,
+                };
+                if !self.fx.bindings.contains(&binding) {
+                    self.fx.bindings.push(binding);
+                }
+            }
         }
     }
 
@@ -1499,7 +1601,10 @@ impl Cx<'_> {
             }
         }
         for key in gone {
-            self.requires(Requirement::Absent(key));
+            self.requires(Requirement::NotBoundTo {
+                surface: key,
+                target: owner.clone(),
+            });
         }
     }
 
@@ -2240,6 +2345,27 @@ fn has_expression(source: &ValueSource) -> bool {
         ValueSource::Default(_) | ValueSource::Generated(_) => true,
         ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
     }
+}
+
+/// Known baseline FK targets. Unmanaged/unreadable bindings supply no fact;
+/// consumers must keep that distinct from an absent surface.
+pub fn baseline_bindings(before: Snapshot<'_>, owners: &dyn Owners) -> Vec<ForeignKeyBinding> {
+    let mut out = Vec::new();
+    for (name, table) in &before.schema.tables {
+        let Ok(owner) = owners.table(name, Spelling::Base) else {
+            continue;
+        };
+        for (name, fk) in &table.foreign_keys {
+            if let Ok(target) = owners.table(&fk.references_table, Spelling::Base) {
+                out.push(ForeignKeyBinding {
+                    surface: Cx::part(&Recorded(owner.clone()), PartKey::ForeignKey(name.clone())),
+                    incarnation: Incarnation::Base,
+                    target: Recorded(target),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Every object the baseline holds that a requirement can name, by key.

@@ -1105,3 +1105,16 @@ unreadable reads refuse; SQLSTATE 42501 is retained with its source error.
 Publication membership reads all three raw modes and ancestors: the convenience
 view omits empty partitioned parents. Evidence grants no execution authority;
 PR4 must lock and recertify before execution. No ordering or admission changes.
+
+
+<a id="dec-2298-7"></a>
+
+**DEC-2298.7. Table retirement requires removal of its inbound bindings.**
+An inbound FK surface can retain its declared name while its Final incarnation
+binds a reserved replacement table UID. DropTable requires NotBoundTo the
+retiring UID, rather than absence of that surface. Portable effects carry the
+typed target of each FK incarnation; graph and independent replay use those
+facts. Only a known different UID proves release. Omitted, unreadable or
+contradictory binding evidence remains conservative. Retirement edges order
+old-bound or unknown producers/removers, and ordinary plan byte oracles remain
+unchanged. This grants no rebuild admission or lowering authority.
