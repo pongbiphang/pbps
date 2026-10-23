@@ -76,7 +76,12 @@ async fn managed_types_and_their_columns_survive_pull_recreation_and_repull() {
             .unwrap();
         db.conn.execute(definitions).await.unwrap();
         let second = pbps_pg::catalog::introspect(&mut db.conn).await.unwrap();
-        assert_eq!(first.schema, second.schema);
+        // Roles are cluster-wide, and the suite's other tests create theirs
+        // between the two reads; what recreation must preserve is the schema's
+        // own objects.
+        assert_eq!(first.schema.tables, second.schema.tables);
+        assert_eq!(first.schema.types, second.schema.types);
+        assert_eq!(first.schema.modules, second.schema.modules);
         db.drop().await;
     }
 }
