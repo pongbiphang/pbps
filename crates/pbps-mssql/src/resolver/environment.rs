@@ -162,28 +162,7 @@ pub async fn read(
     };
     observations.insert("host_platform".to_owned(), host);
 
-    let rows = conn.query(SESSION).await?;
-    let [row] = rows.as_slice() else {
-        return Err(DbError::BadRow(
-            "analysis-scope facts expected one session settings row".into(),
-        ));
-    };
-    let mut settings = BTreeMap::new();
-    for &name in SETTINGS {
-        let value = row.try_get::<&str>(name)?.ok_or_else(|| {
-            DbError::BadRow(format!(
-                "analysis-scope facts did not report the session's {name}"
-            ))
-        })?;
-        settings.insert(
-            name.to_owned(),
-            SettingFact {
-                value: value.to_owned(),
-                source: "effective".into(),
-                context: "session".into(),
-            },
-        );
-    }
+    let settings = session_settings(conn).await?;
 
     // Reported through the extension shape: in-process code the database
     // names, with its content digest where a native library path would be.
@@ -219,6 +198,37 @@ pub async fn read(
         settings,
         visibility,
     })
+}
+
+/// The same effective settings feed capture and deployer settlement, so a
+/// successful SET is never mistaken for evidence of the resulting value.
+pub(crate) async fn session_settings(
+    conn: &mut impl QueryConnection,
+) -> Result<BTreeMap<String, SettingFact>, DbError> {
+    let rows = conn.query(SESSION).await?;
+    let [row] = rows.as_slice() else {
+        return Err(DbError::BadRow(
+            "analysis-scope facts expected one session settings row".into(),
+        ));
+    };
+    let mut settings = BTreeMap::new();
+    for &name in SETTINGS {
+        let value = row.try_get::<&str>(name)?.ok_or_else(|| {
+            DbError::BadRow(format!(
+                "analysis-scope facts did not report the session's {name}"
+            ))
+        })?;
+        settings.insert(
+            name.to_owned(),
+            SettingFact {
+                value: value.to_owned(),
+                source: "effective".into(),
+                context: "session".into(),
+            },
+        );
+    }
+
+    Ok(settings)
 }
 
 /// The schemas a bare name inside `schema` binds through, of those that

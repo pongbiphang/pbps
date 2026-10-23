@@ -1949,7 +1949,24 @@
         "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names",
         "scratch2236::assembly_references_drop_dependents_before_providers_as_owner",
         "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys",
-        "scratch2236::unrestorable_built_ins_refuse_unchanged_and_out_of_set_state_passes"
+        "scratch2236::unrestorable_built_ins_refuse_unchanged_and_out_of_set_state_passes",
+        "deployer2267::sandbox_deployer_reproduces_database_context_without_revert",
+        "deployer2267::deployer_cannot_return_to_sandbox_or_login",
+        "deployer2267::object_references_grant_is_replayed",
+        "deployer2267::object_references_deny_is_replayed",
+        "deployer2267::nested_role_denies_and_column_exceptions_are_replayed",
+        "deployer2267::object_grant_option_covers_column_grant_chains_without_extra_acl_rows",
+        "deployer2267::column_grantors_without_captured_capabilities_get_only_the_needed_column_options",
+        "deployer2267::column_revoke_is_preserved",
+        "deployer2267::dbo_deployer_ignores_object_deny_as_on_the_target",
+        "deployer2267::ordinary_deployer_obeys_the_same_object_deny",
+        "deployer2267::trustworthy_scratch_refuses_before_dbo_entry",
+        "deployer2267::dbo_deployer_cannot_leave_scratch",
+        "deployer2267::owner_equality_across_schemas_is_preserved",
+        "deployer2267::equivalent_owner_role_keeps_acl_principals_and_still_detects_extra_grants",
+        "deployer2267::non_equivalent_owner_role_refuses_with_matching_acl_rows",
+        "deployer2267::different_effective_owner_refuses",
+        "deployer2267::ownership_is_replayed_before_object_acl"
       ]
     },
     {
@@ -1966,6 +1983,7 @@
         "darwin"
       ],
       "cases": [
+        "resolver::server::scratch::mssql_live_tests::mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_sandbox",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_owner_needs_no_creation_and_changed_visibility_or_system_context_refuses",
         "resolver::server::scratch::mssql_live_tests::mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract",
         "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_needs_only_login_and_database_creation_privileges",

@@ -31,9 +31,18 @@ use pbps_db::transport::QueryConnection;
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod sandbox;
+mod staged;
+pub use sandbox::{SandboxDeployer, SandboxScope, apply_session_settings, enter_sandbox_deployer};
+pub use staged::{
+    ColumnPermissionState, OwnerPartition, PermissionScope, PermissionState, StagedGrant,
+    StagedObject, read_staged_permissions, reconstruct_owners, replay_staged_permissions,
+    verify_staged_authorization,
+};
+
 /// The versioned name of this authorization rule, measured on SQL Server
 /// 2025 (17.0).
-pub const RULE: &str = "mssql-auth-v1";
+pub const RULE: &str = "mssql-auth-v2";
 
 /// Principals every database has, which a reproduction refers to by their
 /// own name instead of cloning.
@@ -130,6 +139,12 @@ pub struct AuthorizationContext {
     /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
+    /// Object and column permissions in the staged scope (DEC-2267.1).
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "staged::serialize"
+    )]
+    pub staged: Box<BTreeMap<super::capture::ObjectIdentity, StagedObject>>,
 }
 
 impl AuthorizationContext {
@@ -343,6 +358,7 @@ pub async fn read(
         principal_owners: BTreeMap::new(),
         principals: BTreeMap::new(),
         spellings: BTreeMap::new(),
+        staged: Box::default(),
     };
     if !context.principal.superuser {
         context.database_grants = grants(
@@ -536,6 +552,13 @@ fn named_principals(
     named.extend(context.roles.keys().cloned());
     named.extend(context.impersonation.iter().cloned());
     named.extend(context.principal_owners.values().cloned());
+    for object in context.staged.values() {
+        named.insert(object.owner.clone());
+        for grant in &object.grants {
+            named.insert(grant.grantee.clone());
+            named.insert(grant.grantor.clone());
+        }
+    }
     for held in &context.principal_grants {
         named.insert(held.on.clone());
         named.insert(held.grant.grantee.clone());
@@ -638,9 +661,10 @@ impl PrincipalMap {
             .collect()
     }
 
-    /// The scratch user the compilation must `EXECUTE AS`, or `None` when
+    /// The legacy login-based scratch user to `EXECUTE AS`, or `None` when
     /// the deployer is `dbo`: the run login owns its scratch database and is
-    /// already `dbo` there.
+    /// already `dbo` there. Sandbox callers use `enter_sandbox_deployer`,
+    /// which always enters, including for dbo.
     pub fn deployer(&self, context: &AuthorizationContext) -> Option<pbps_model::RoleName> {
         if context.principal.superuser {
             return None;
@@ -659,6 +683,26 @@ pub async fn reconstruct(
     context: &AuthorizationContext,
     run_login: &str,
 ) -> Result<(), DbError> {
+    reconstruct_database(admin, map, context).await?;
+    // The older non-sandbox lifecycle starts a new connection as this login.
+    admin
+        .query(&format!(
+            "ALTER LOGIN {} WITH DEFAULT_LANGUAGE = {};",
+            bracket(run_login),
+            bracket(&context.language)
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Reproduces database authority through the already-entered sandbox. No
+/// server-scoped statement is needed; compile-session settings are restored
+/// separately after irreversible deployer entry (DEC-2267.1).
+pub async fn reconstruct_database(
+    admin: &mut impl QueryConnection,
+    map: &PrincipalMap,
+    context: &AuthorizationContext,
+) -> Result<(), DbError> {
     let missing = |logical: &pbps_model::RoleName| {
         DbError::BadRow(format!(
             "the authorization reconstruction has no run-local principal for {logical}",
@@ -670,7 +714,11 @@ pub async fn reconstruct(
             continue;
         }
         let statement = match context.principals.get(logical) {
-            Some(PrincipalKind::Role) => format!("CREATE ROLE {};", bracket(run.raw())),
+            // The current user is the sandbox now. Without AUTHORIZATION
+            // SQL Server makes it the owner instead of the target's dbo.
+            Some(PrincipalKind::Role) => {
+                format!("CREATE ROLE {} AUTHORIZATION dbo;", bracket(run.raw()))
+            }
             Some(PrincipalKind::User) | None => {
                 format!("CREATE USER {} WITHOUT LOGIN;", bracket(run.raw()))
             }
@@ -726,9 +774,17 @@ pub async fn reconstruct(
             .ok_or_else(|| missing(&schema.owner))?;
         // `dbo` is in every database and cannot be created; a target whose
         // `dbo` schema changed hands has the change replayed instead.
-        let statement = if name == "dbo" {
+        let statement = if !admin
+            .query(&format!(
+                "SELECT name FROM sys.schemas WHERE name={};",
+                literal(name)
+            ))
+            .await?
+            .is_empty()
+        {
             format!(
-                "ALTER AUTHORIZATION ON SCHEMA::[dbo] TO {};",
+                "ALTER AUTHORIZATION ON SCHEMA::{} TO {};",
+                bracket(name),
                 bracket(owner.raw())
             )
         } else {
@@ -742,7 +798,15 @@ pub async fn reconstruct(
             admin.query(&statement).await?;
         }
         let on = format!(" ON SCHEMA::{}", bracket(name));
-        replay(admin, map, &schema.owner, &schema.grants, &on).await?;
+        replay(
+            admin,
+            map,
+            &schema.owner,
+            &schema.grants,
+            &on,
+            &mut BTreeSet::new(),
+        )
+        .await?;
     }
     replay(
         admin,
@@ -750,6 +814,7 @@ pub async fn reconstruct(
         &pbps_model::RoleName::from("dbo"),
         &context.database_grants,
         "",
+        &mut BTreeSet::new(),
     )
     .await?;
     // Grouped by the principal they are on, each group a securable of its
@@ -782,17 +847,8 @@ pub async fn reconstruct(
             (None, "ROLE") => &default_owner,
             (None, _) => logical,
         };
-        replay(admin, map, owner, &grants, &on).await?;
+        replay(admin, map, owner, &grants, &on, &mut BTreeSet::new()).await?;
     }
-    // The scratch session speaks the run login's default language, as the
-    // deployment session speaks the deployment login's.
-    admin
-        .query(&format!(
-            "ALTER LOGIN {} WITH DEFAULT_LANGUAGE = {};",
-            bracket(run_login),
-            bracket(&context.language)
-        ))
-        .await?;
     Ok(())
 }
 
@@ -827,13 +883,15 @@ enum Step<'a> {
 /// deployer can see is replayed as it is. The added row is as invisible to
 /// the scratch deployer as the target's is to the real one, and `verify`
 /// refuses the reconstruction if it ever is not.
+/// `able` retains both replayed and inferred grant options so object options
+/// can seed column replay without adding a narrower grant the target lacks.
 fn replay_order<'a>(
     owner: &pbps_model::RoleName,
     grants: &'a [Grant],
+    able: &mut BTreeSet<(&'a pbps_model::RoleName, &'a str)>,
 ) -> Result<Vec<Step<'a>>, DbError> {
     let mut steps = Vec::new();
     let mut pending: Vec<&Grant> = grants.iter().collect();
-    let mut able: BTreeSet<(&pbps_model::RoleName, &str)> = BTreeSet::new();
     while !pending.is_empty() {
         let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|grant| {
             &grant.grantor == owner
@@ -894,12 +952,13 @@ fn replay_order<'a>(
 
 /// Replays grant rows in [`replay_order`], each under its own grantor, so
 /// the scratch side records who granted what as the target does.
-async fn replay(
+async fn replay<'a>(
     admin: &mut impl QueryConnection,
     map: &PrincipalMap,
     owner: &pbps_model::RoleName,
-    grants: &[Grant],
+    grants: &'a [Grant],
     on: &str,
+    able: &mut BTreeSet<(&'a pbps_model::RoleName, &'a str)>,
 ) -> Result<(), DbError> {
     // `dbo` owns the database-level securable and is named by no row of a
     // context that grants nothing through it, so it may be absent from the map.
@@ -914,7 +973,7 @@ async fn replay(
             ))
         })
     };
-    for step in replay_order(owner, grants)? {
+    for step in replay_order(owner, grants, able)? {
         let statement = match step {
             Step::Enable {
                 grantor,
@@ -948,6 +1007,7 @@ async fn replay(
     Ok(())
 }
 
+/// Legacy reversible entry; sandbox callers use [`enter_sandbox_deployer`].
 /// Switches the connection to the reproduced deployer, once: a second call
 /// on a session already running as it is a no-op. Every check re-enters, a
 /// user may `EXECUTE AS` itself, and each entry would stack one more
@@ -1027,6 +1087,28 @@ fn differences(
     target: &AuthorizationContext,
     reproduced: &AuthorizationContext,
 ) -> Vec<String> {
+    let mut found = differences_except_schema_owners(map, target, reproduced);
+    for (name, want) in &target.schemas {
+        // Legacy verification has no owner partition to establish equivalence;
+        // the engine's own schemas retain their engine-supplied owners.
+        if !SYSTEM_SCHEMAS.contains(&name.as_str())
+            && let Some(got) = reproduced.schemas.get(name)
+            && map
+                .logical_of(&got.owner)
+                .unwrap_or_else(|| got.owner.clone())
+                != want.owner
+        {
+            found.push(format!("schema:{name}:owner"));
+        }
+    }
+    found
+}
+
+fn differences_except_schema_owners(
+    map: &PrincipalMap,
+    target: &AuthorizationContext,
+    reproduced: &AuthorizationContext,
+) -> Vec<String> {
     let logical =
         |name: &pbps_model::RoleName| map.logical_of(name).unwrap_or_else(|| name.to_owned());
     let mapped = |grants: &[Grant]| -> Vec<Grant> {
@@ -1069,12 +1151,8 @@ fn differences(
         if got.permissions != want.permissions {
             found.push(format!("schema:{name}:permissions"));
         }
-        // The engine's own schemas keep the engine's owner on both sides.
         if SYSTEM_SCHEMAS.contains(&name.as_str()) {
             continue;
-        }
-        if logical(&got.owner) != want.owner {
-            found.push(format!("schema:{name}:owner"));
         }
         if mapped(&got.grants) != want.grants {
             found.push(format!("schema:{name}:grants"));
@@ -1209,7 +1287,14 @@ mod tests {
             "GRANT",
         )];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &invisible).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &invisible,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             ["enable EXECUTE for wgo", "GRANT EXECUTE to dep by wgo"]
         );
 
@@ -1236,7 +1321,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &visible).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &visible,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "GRANT_WITH_GRANT_OPTION EXECUTE to wgo by app_owner",
                 "DENY SELECT to dep by app_owner",
@@ -1262,7 +1354,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &half).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &half,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "enable EXECUTE for root",
                 "GRANT_WITH_GRANT_OPTION EXECUTE to mid by root",
@@ -1287,7 +1386,14 @@ mod tests {
             ),
         ];
         assert_eq!(
-            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &other).unwrap()),
+            rows(
+                &replay_order(
+                    &pbps_model::RoleName::from("app_owner"),
+                    &other,
+                    &mut BTreeSet::new()
+                )
+                .unwrap()
+            ),
             [
                 "GRANT_WITH_GRANT_OPTION SELECT to wgo by app_owner",
                 "enable EXECUTE for wgo",
@@ -1330,14 +1436,19 @@ mod tests {
                 "GRANT_WITH_GRANT_OPTION",
             ),
         ];
-        let refused = replay_order(&pbps_model::RoleName::from("app_owner"), &cycle)
-            .unwrap_err()
-            .to_string();
+        let refused = replay_order(
+            &pbps_model::RoleName::from("app_owner"),
+            &cycle,
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(refused.contains("name each other"), "{refused}");
     }
 
     fn context() -> AuthorizationContext {
         AuthorizationContext {
+            staged: Box::default(),
             principal: DeploymentPrincipal {
                 login: "deploy_login".into(),
                 effective: "dep".into(),

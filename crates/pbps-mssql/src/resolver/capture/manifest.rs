@@ -22,6 +22,37 @@ pub struct CapturedInputs {
 }
 
 impl CapturedInputs {
+    /// Effective owners already resolved by `select::Index::owner`: explicit,
+    /// then parent, then schema. Only authorization metadata leaves here.
+    pub(crate) fn effective_owners(
+        &self,
+    ) -> Result<BTreeMap<ObjectIdentity, pbps_model::RoleName>, super::Uncovered> {
+        self.inputs
+            .iter()
+            .filter(|(id, input)| {
+                [super::class::SCHEMA, super::class::OBJECT].contains(&id.class.as_str())
+                    && input.properties.get("engine") != Some(&serde_json::Value::Bool(true))
+            })
+            .map(|(id, input)| {
+                let owner: ObjectIdentity = input
+                    .properties
+                    .get("owner")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .ok_or_else(|| {
+                        super::Uncovered::object(id, "the effective owner was not captured")
+                    })?;
+                match (owner.class.as_str(), owner.name.as_slice()) {
+                    (super::class::PRINCIPAL, [name]) => Ok((id.clone(), name.clone().into())),
+                    _ => Err(super::Uncovered::object(
+                        id,
+                        "the effective owner is not a principal",
+                    )),
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn new(catalog: Catalog, selected: Selected, scope: CaptureScope) -> Self {
         Self {
             major: catalog.major,

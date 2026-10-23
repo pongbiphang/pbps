@@ -225,6 +225,24 @@ pub async fn sandbox_checks(
     databases: &[String],
     scratch: &str,
 ) -> Result<(), DbError> {
+    context_checks(conn, databases, scratch, false).await
+}
+
+pub(crate) async fn deployer_checks(
+    conn: &mut impl ExecuteConnection,
+    databases: &[String],
+    scratch: &str,
+    entered: &super::authorization::SandboxDeployer,
+) -> Result<(), DbError> {
+    context_checks(conn, databases, scratch, entered.is_dbo()).await
+}
+
+async fn context_checks(
+    conn: &mut impl ExecuteConnection,
+    databases: &[String],
+    scratch: &str,
+    dbo: bool,
+) -> Result<(), DbError> {
     // The instance setting overrides is_db_chaining_on even when the
     // scratch database's own option still reports zero.
     let chaining = async {
@@ -275,7 +293,7 @@ pub async fn sandbox_checks(
             )));
         }
     }
-    system::check(conn).await
+    system::check(conn, dbo).await
 }
 
 /// SQL Server's password policy requires more than the shared hex entropy.

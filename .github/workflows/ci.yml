@@ -312,7 +312,7 @@ jobs:
       # the pressure the startup crashes in docs/PITFALLS.md warn about, and
       # it crashed this job the first time it was tried (#611). Skipped by
       # name here; unset, their variable makes them fail rather than pass.
-      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it --skip scratch2236
+      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it --skip scratch2236 --skip deployer2267
         if: matrix.suite == 'dialect'
       # Driver error conversion is a separate test target, ignored by quick.
       - run: cargo test -p pbps-db --test live_mssql -- --ignored
@@ -358,6 +358,7 @@ jobs:
         run: |
           source scripts/resolver-mssql-fixtures.sh
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236
+          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267
           cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests
 
   # The SQL Server TLS fixture starts its own disposable SQL Server (3 GiB

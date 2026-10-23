@@ -140,7 +140,69 @@ fn permission(
     Ok(())
 }
 
-pub(super) async fn check(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+// DENY ONLY entries never add grant reach. This exception is available only
+// after the validated dbo entry, not to the ordinary deployer or sandbox.
+fn user_token_qualifies(token: &[(String, String, String)], dbo: bool) -> bool {
+    let mut base = Vec::new();
+    let mut extras = BTreeSet::new();
+    for (name, kind, usage) in token {
+        if ["guest", "public"].contains(&name.as_str()) {
+            base.push(name.as_str());
+        } else if !(dbo
+            && usage == "DENY ONLY"
+            && ((name == "dbo" && kind == "SQL USER") || (name == "db_owner" && kind == "ROLE"))
+            && extras.insert(name))
+        {
+            return false;
+        }
+    }
+    base.sort();
+    base == ["guest", "public"]
+}
+
+async fn login_token(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    let owner = super::one(
+        conn.query(
+            "SELECT CONVERT(varchar(170),owner_sid,1) AS sid \
+        FROM sys.databases WHERE database_id=DB_ID();",
+        )
+        .await?,
+        "scratch owner SID",
+    )?;
+    let owner = text(&owner, "sid")?;
+    let mut found_owner = false;
+    let mut found_public = false;
+    for row in conn
+        .query("SELECT name,type,RTRIM(usage) AS usage,CONVERT(varchar(170),sid,1) AS sid FROM sys.login_token;")
+        .await?
+    {
+        let name = text(&row, "name")?;
+        let kind = text(&row, "type")?;
+        let usage = text(&row, "usage")?;
+        let is_owner =
+            text(&row, "sid")? == owner && ["SQL LOGIN", "WINDOWS LOGIN"].contains(&kind.as_str());
+        // The engine constructs these server-role entries from the entered
+        // owner's login token. No GRANT-capable entry qualifies, even public.
+        if usage != "DENY ONLY" || !(is_owner || kind == "SERVER ROLE") {
+            return Err(DbError::Refused(format!(
+                "dbo sys.login_token entry {name} ({kind}, {usage}) is not an owner DENY ONLY entry"
+            )));
+        }
+        found_owner |= is_owner;
+        found_public |= name == "public" && kind == "SERVER ROLE";
+    }
+    if !found_owner || !found_public {
+        return Err(DbError::Refused(
+            "dbo sys.login_token did not report the scratch owner and public".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn check(conn: &mut impl ExecuteConnection, dbo: bool) -> Result<(), DbError> {
+    if dbo {
+        login_token(conn).await?;
+    }
     let expected = BTreeSet::from([
         ("guest".to_owned(), "CONNECT".to_owned()),
         (
@@ -166,16 +228,20 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection) -> Result<(), DbErr
             conn,
             database,
             "user_token",
-            "SELECT name FROM sys.user_token ORDER BY name;",
+            "SELECT name,type,RTRIM(usage) AS usage FROM sys.user_token ORDER BY name;",
         )
         .await?
         .iter()
-        .map(|row| text(row, "name"))
-        .collect::<Result<Vec<_>, _>>()?;
-        if token != ["guest", "public"] {
+        .map(|row| Ok((text(row, "name")?, text(row, "type")?, text(row, "usage")?)))
+        .collect::<Result<Vec<_>, DbError>>()?;
+        if !user_token_qualifies(&token, dbo) {
             return Err(DbError::Refused(format!(
                 "{database} guest/public token membership on DATABASE {database} differs: {}",
-                token.join(", ")
+                token
+                    .iter()
+                    .map(|(name, kind, usage)| format!("{name} ({kind}, {usage})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         let mut database_grants = BTreeSet::new();
@@ -202,7 +268,7 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection) -> Result<(), DbErr
             let query = format!(
                 "IF COL_LENGTH(N'sys.{catalog}',N'{owner}') IS NOT NULL EXEC(N'SELECT {name} \
                  AS name,USER_NAME({owner}) AS owner FROM sys.{catalog} WHERE {owner} IN \
-                 (SELECT principal_id FROM sys.user_token)');"
+                 (SELECT principal_id FROM sys.user_token WHERE name IN(N''guest'',N''public''))');"
             );
             for row in read(conn, database, catalog, &query).await? {
                 owned.insert(format!(
@@ -225,6 +291,27 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection) -> Result<(), DbErr
 #[cfg(test)]
 mod tests {
     use super::object_rule;
+
+    #[test]
+    fn dbo_system_tokens_admit_only_the_measured_deny_only_extras() {
+        let base = vec![
+            ("guest".into(), "SQL USER".into(), "GRANT OR DENY".into()),
+            ("public".into(), "ROLE".into(), "GRANT OR DENY".into()),
+        ];
+        assert!(super::user_token_qualifies(&base, false));
+        for (name, kind) in [("dbo", "SQL USER"), ("db_owner", "ROLE")] {
+            let mut token = base.clone();
+            token.push((name.into(), kind.into(), "DENY ONLY".into()));
+            assert!(super::user_token_qualifies(&token, true));
+            assert!(!super::user_token_qualifies(&token, false));
+            token.last_mut().unwrap().2 = "GRANT OR DENY".into();
+            assert!(!super::user_token_qualifies(&token, true));
+        }
+        let mut other = base.clone();
+        other.push(("db_securityadmin".into(), "ROLE".into(), "DENY ONLY".into()));
+        assert!(!super::user_token_qualifies(&other, true));
+        assert!(!super::user_token_qualifies(&base[..1], true));
+    }
 
     #[test]
     fn only_shared_shipped_grants_or_narrowing_denials_qualify() {
