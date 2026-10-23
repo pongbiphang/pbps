@@ -179,6 +179,14 @@ impl Drop for Role {
     }
 }
 
+fn recorded_changes(changes: &pbps_model::ChangeSet) -> pbps_model::ChangeSet {
+    let mut recorded = changes.clone();
+    recorded
+        .changes
+        .retain(|p| !matches!(p.change, pbps_model::Change::PublicExecution { .. }));
+    recorded
+}
+
 pub fn recovery(server: &str, pg: bool) {
     let role = Role {
         server: server.to_owned(),
@@ -291,7 +299,7 @@ pub fn recovery(server: &str, pg: bool) {
     ])));
     assert_eq!(
         compared["data"]["changes"],
-        serde_json::to_value(&forward.changes).unwrap()
+        serde_json::to_value(recorded_changes(&forward.changes)).unwrap()
     );
     let newest = json(ok(d.run(&[
         "state", "diff", &id1, "--db", connection, "--format", "json",
@@ -373,7 +381,7 @@ pub fn recovery(server: &str, pg: bool) {
     let backward = plan(&d, connection, "backward.json");
     assert_eq!(
         reverse["data"]["changes"],
-        serde_json::to_value(&backward.changes).unwrap()
+        serde_json::to_value(recorded_changes(&backward.changes)).unwrap()
     );
     assert!(
         backward
@@ -1120,5 +1128,188 @@ pub fn non_utf8_paths(server: &str, pg: bool) {
     assert!(!stale.exists());
     pbps_load::load_schema_dir(&root.join("schema")).unwrap();
     assert_eq!(std::fs::read(root.join("schema.ids.json")).unwrap(), ids);
+    assert_eq!(records(connection, pg), entries);
+}
+
+pub fn acquired_column_ids(server: &str, pg: bool) {
+    let (own, d) = column_fixture(server, pg, "history-acquired2289");
+    let connection = own.connection();
+    let schema = if pg { "app" } else { "dbo" };
+    let table: pbps_model::TableName = format!("{schema}.product").parse().unwrap();
+    on_server(
+        connection,
+        &format!("ALTER TABLE {schema}.product ADD observed int NULL"),
+    );
+    ok(d.run(&[
+        "baseline",
+        "--reason",
+        "accept observed column",
+        "--db",
+        connection,
+    ]));
+    let entries = records(connection, pg);
+    let (before_id, before_text) = entries.last().unwrap();
+    let before = pbps_model::StateSnapshot::from_json(before_text).unwrap();
+    assert!(before.ids.column_uid(&table.column("observed")).is_none());
+    let path = d.dir.join("schema/product.yml");
+    let declaration = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        declaration.replace("columns:\n", "columns:\n  observed: {type: int}\n"),
+    )
+    .unwrap();
+    ok(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    ok(d.run(&[
+        "baseline",
+        "--reason",
+        "record the unchanged declared column",
+        "--db",
+        connection,
+    ]));
+    let entries = records(connection, pg);
+    let (after_id, after_text) = entries.last().unwrap();
+    let after = pbps_model::StateSnapshot::from_json(after_text).unwrap();
+    assert_eq!(before.schema, after.schema, "fixture changed the database");
+    let uid = after
+        .ids
+        .column_uid(&table.column("observed"))
+        .unwrap()
+        .clone();
+    let project = project_bytes(&d.dir);
+    for (from, to) in [(before_id, after_id), (after_id, before_id)] {
+        let compared = json(ok(d.run(&[
+            "state",
+            "diff",
+            &from.to_string(),
+            &to.to_string(),
+            "--db",
+            connection,
+            "--format",
+            "json",
+        ])));
+        assert!(
+            compared["data"]["changes"]["changes"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{compared}"
+        );
+    }
+    let sql = if pg {
+        format!("ALTER TABLE {schema}.product ALTER COLUMN observed SET DEFAULT 7")
+    } else {
+        format!("ALTER TABLE {schema}.product ADD CONSTRAINT df_observed DEFAULT (7) FOR observed")
+    };
+    on_server(connection, &sql);
+    ok(d.run(&["snapshot", "--force", "--db", connection]));
+    let entries = records(connection, pg);
+    let latest = entries.last().unwrap().0.to_string();
+    for (from, to) in [
+        (before_id.to_string(), latest.clone()),
+        (latest, before_id.to_string()),
+    ] {
+        let compared = json(ok(d.run(&[
+            "state", "diff", &from, &to, "--db", connection, "--format", "json",
+        ])));
+        let changes: pbps_model::ChangeSet =
+            serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
+        assert_eq!(changes.changes.len(), 1, "{changes:?}");
+        assert!(
+            matches!(&changes.changes[0].change,
+            pbps_model::Change::AlterColumnDefault { uid: actual, column, .. }
+                if actual == &uid && column == &table.column("observed")),
+            "{changes:?}"
+        );
+    }
+    assert_eq!(project_bytes(&d.dir), project);
+    assert_eq!(records(connection, pg), entries);
+}
+
+pub fn public_execution_is_unknown(server: &str, pg: bool) {
+    let own = OwnDatabase::new(server, "history-public2289");
+    let connection = own.connection();
+    if pg {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = Demo::new("history-public2289");
+    let path = d.dir.join("schema/function.yml");
+    let declaration = if pg {
+        concat!(
+            "function: app.answer()\npublic_execute: true\ndefinition: |-\n",
+            "  () RETURNS integer LANGUAGE sql AS $$ SELECT 7 $$\n"
+        )
+    } else {
+        concat!(
+            "function: dbo.answer\ndefinition: |-\n",
+            "  () RETURNS int AS BEGIN RETURN 7 END\n"
+        )
+    };
+    std::fs::write(&path, declaration).unwrap();
+    ok(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    ok(d.run(&["bootstrap", "--db", connection]));
+    let first = records(connection, pg)[0].0.to_string();
+    std::fs::write(&path, declaration.replace('7', "8")).unwrap();
+    d.commit();
+    let forward = plan(&d, connection, "public-forward.json");
+    assert_eq!(
+        forward.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::PublicExecution {
+                access: pbps_model::PublicAccess::Kept,
+                ..
+            }
+        )),
+        pg
+    );
+    apply(&d, connection, "public-forward.json", &forward);
+    let entries = records(connection, pg);
+    let second = entries.last().unwrap().0.to_string();
+    let project = project_bytes(&d.dir);
+    for (from, to) in [(&first, &second), (&second, &first), (&second, &second)] {
+        let compared = json(ok(d.run(&[
+            "state", "diff", from, to, "--db", connection, "--format", "json",
+        ])));
+        let changes: pbps_model::ChangeSet =
+            serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
+        assert!(
+            !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::PublicExecution { .. })),
+            "{changes:?}"
+        );
+        if from != to {
+            assert!(
+                changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+            );
+        } else {
+            assert!(changes.is_empty());
+        }
+        assert_eq!(
+            compared["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "state.diff-public-execute"
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Snapshots do not record historical public_execute")),
+            pg,
+            "{compared}"
+        );
+        let human = ok(d.run(&["state", "diff", from, to, "--db", connection]));
+        assert_eq!(
+            format!("{}{}", stdout(&human), stderr(&human))
+                .contains("Snapshots do not record historical public_execute"),
+            pg
+        );
+    }
+    assert_eq!(project_bytes(&d.dir), project);
     assert_eq!(records(connection, pg), entries);
 }

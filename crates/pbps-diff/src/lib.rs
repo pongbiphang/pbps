@@ -18,7 +18,9 @@ pub use identity::{
     Blocker, Context, RenameSide, RenameSource, Resolution, intent_is_absorbed, resolve,
     resolve_pulled, resolve_with_annotations,
 };
-pub use managed::{Scoped, external_parents, observed_ids, own_parts, scope};
+pub use managed::{
+    Scoped, external_parents, observed_ids, observed_ids_reserving, own_parts, scope,
+};
 pub use schema_diff::{
     DiffError, Diffed, Screen, Side, diff, diff_connected, diff_partial, diff_read_back,
     diff_rebuilding,

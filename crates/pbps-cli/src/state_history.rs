@@ -1,6 +1,6 @@
 //! Read recorded states without adopting, applying or rewriting identity intent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context as _;
 use pbps_config::Project;
@@ -227,6 +227,45 @@ fn comparison_schemas(
     }
 }
 
+// Fill only absent name mappings from the other record. Recorded identities,
+// including tombstones and a UID now held by a different name, win over names.
+fn historical_ids(
+    schema: &pbps_model::Schema,
+    recorded: &pbps_model::IdsFile,
+    other: &pbps_model::IdsFile,
+) -> pbps_model::IdsFile {
+    fn missing_by_name<T: Clone + Ord>(
+        own: &mut BTreeMap<pbps_model::Uid, T>,
+        other: &BTreeMap<pbps_model::Uid, T>,
+        taken: &mut BTreeSet<pbps_model::Uid>,
+    ) {
+        let mut names: BTreeSet<_> = own.values().cloned().collect();
+        for (uid, name) in other {
+            if !names.contains(name) && taken.insert(uid.clone()) {
+                own.insert(uid.clone(), name.clone());
+                names.insert(name.clone());
+            }
+        }
+    }
+    let mut ids = recorded.clone();
+    let mut taken = ids
+        .tables
+        .keys()
+        .chain(ids.columns.keys())
+        .chain(ids.roles.keys())
+        .chain(ids.types.keys())
+        .chain(ids.tombstones.keys())
+        .cloned()
+        .collect();
+    missing_by_name(&mut ids.tables, &other.tables, &mut taken);
+    missing_by_name(&mut ids.columns, &other.columns, &mut taken);
+    missing_by_name(&mut ids.roles, &other.roles, &mut taken);
+    missing_by_name(&mut ids.types, &other.types, &mut taken);
+    pbps_diff::observed_ids_reserving(schema, &ids, other)
+}
+
+const PUBLIC_EXECUTE_NOT_RECORDED: &str = "Snapshots do not record historical public_execute.";
+
 pub fn cmd_diff(
     project: &Project,
     target: &db::Target,
@@ -271,10 +310,10 @@ pub fn cmd_diff(
     }
     // Baseline and forced snapshots record what was observed, which can hold
     // columns without identities and retain identities for missing columns.
-    // Complete each side from its own schema while keeping recorded matches.
-    let before_ids = pbps_diff::observed_ids(&before, &from.snapshot.ids);
-    let after_ids = pbps_diff::observed_ids(&after, &to.snapshot.ids);
-    let diffed = pbps_diff::diff_partial(
+    // Match absent identities by name without changing either recorded UID.
+    let before_ids = historical_ids(&before, &from.snapshot.ids, &to.snapshot.ids);
+    let after_ids = historical_ids(&after, &to.snapshot.ids, &from.snapshot.ids);
+    let mut diffed = pbps_diff::diff_partial(
         pbps_diff::Side {
             schema: &before,
             ids: &before_ids,
@@ -286,6 +325,11 @@ pub fn cmd_diff(
         dialect.as_ref(),
         &hints,
     );
+    // This is declaration policy, not a fact retained by StateSnapshot.
+    diffed
+        .changes
+        .changes
+        .retain(|planned| !matches!(planned.change, pbps_model::Change::PublicExecution { .. }));
     let data = DiffData {
         environment: target.label.clone(),
         from_id: from.id,
@@ -293,11 +337,23 @@ pub fn cmd_diff(
         changes: diffed.changes,
         unexpressible: diffed.errors.iter().map(ToString::to_string).collect(),
     };
-    let findings: Vec<_> = data
+    let mut findings: Vec<_> = data
         .unexpressible
         .iter()
         .map(|message| output::Finding::error("change.unexpressible", message))
         .collect();
+    if dialect.creates_public_executable_routines()
+        && before
+            .modules
+            .keys()
+            .chain(after.modules.keys())
+            .any(|id| matches!(id, pbps_model::ModuleId::Routine(_)))
+    {
+        let message = format!(
+            "{PUBLIC_EXECUTE_NOT_RECORDED} Historical diff omits routine PUBLIC execution policy changes."
+        );
+        findings.push(output::Finding::note("state.diff-public-execute", message));
+    }
     if json {
         let report = output::Report::new(COMMAND, findings, Some(&data));
         if !data.unexpressible.is_empty() {
@@ -317,8 +373,8 @@ pub fn cmd_diff(
             println!("No changes.");
         } else {
             print!("{}", crate::report::changes(&data.changes));
-            eprint!("{}", output::human(&findings));
         }
+        eprint!("{}", output::human(&findings));
     }
     if data.unexpressible.is_empty() {
         Ok(())
@@ -504,10 +560,12 @@ fn export(
             .keys()
             .any(|id| matches!(id, pbps_model::ModuleId::Routine(_)))
     {
-        let message = concat!(
-            "Snapshots do not record historical public_execute. ",
-            "Export omits it and keeps the closed default; ",
-            "review routine execution permissions before committing."
+        let message = format!(
+            concat!(
+                "{} Export omits it and keeps the closed default; ",
+                "review routine execution permissions before committing."
+            ),
+            PUBLIC_EXECUTE_NOT_RECORDED
         );
         findings.push(output::Finding::note(
             "state.export-public-execute",
@@ -743,6 +801,129 @@ mod tests {
         assert_eq!(
             serde_json::to_value(pbps_load::schema_files(&project.schema_dir()).unwrap()).unwrap(),
             serde_json::to_value(&data.files).unwrap()
+        );
+    }
+
+    #[test]
+    fn state_history_missing_uids_match_names_without_overriding_recorded_conflicts() {
+        let (_stage, project, entry) = fixture("history-missing-ids");
+        let schema = entry.snapshot.schema;
+        let table = schema.tables.keys().next().unwrap().clone();
+        let mut recorded = pbps_model::IdsFile::default();
+        recorded
+            .tables
+            .insert("t_aaaaaa".parse().unwrap(), table.clone());
+        recorded
+            .columns
+            .insert("c_aaaaaa".parse().unwrap(), table.column("code"));
+        let original = recorded.clone();
+        let empty = pbps_model::IdsFile::default();
+        assert_eq!(historical_ids(&schema, &empty, &recorded), recorded);
+        assert_eq!(historical_ids(&schema, &recorded, &empty), recorded);
+        let mut conflicting = recorded.clone();
+        conflicting.columns.clear();
+        conflicting
+            .columns
+            .insert("c_bbbbbb".parse().unwrap(), table.column("code"));
+        assert_eq!(
+            historical_ids(&schema, &conflicting, &recorded),
+            conflicting
+        );
+        assert_eq!(historical_ids(&schema, &recorded, &conflicting), recorded);
+        let changes = pbps_diff::diff_partial(
+            pbps_diff::Side {
+                schema: &schema,
+                ids: &recorded,
+            },
+            pbps_diff::Side {
+                schema: &schema,
+                ids: &conflicting,
+            },
+            crate::dialect(&project).unwrap().as_ref(),
+            &Default::default(),
+        )
+        .changes;
+        assert_eq!(changes.changes.len(), 2);
+        assert!(
+            changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropColumn { .. }))
+        );
+        assert!(
+            changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
+        );
+        // A UID held under another name, or retired, cannot be borrowed.
+        let mut renamed = recorded.clone();
+        renamed
+            .columns
+            .values_mut()
+            .for_each(|name| *name = table.column("other"));
+        assert_ne!(
+            historical_ids(&schema, &renamed, &recorded).column_uid(&table.column("code")),
+            recorded.column_uid(&table.column("code"))
+        );
+        let mut retired = recorded.clone();
+        retired.columns.clear();
+        retired.tombstones.insert(
+            "c_aaaaaa".parse().unwrap(),
+            pbps_model::Tombstone {
+                was: "dbo.product.code".into(),
+                dropped_at: "2026-10-23".into(),
+                reason: "retired".into(),
+                operator: "test".into(),
+            },
+        );
+        assert_ne!(
+            historical_ids(&schema, &retired, &recorded).column_uid(&table.column("code")),
+            recorded.column_uid(&table.column("code"))
+        );
+        assert_eq!(
+            recorded, original,
+            "comparison mutated recorded identity intent"
+        );
+    }
+
+    #[test]
+    fn state_history_fallback_uids_cannot_reuse_either_records_conflicting_uid() {
+        let (_stage, _project, entry) = fixture("history-reserved-ids");
+        let mut schema = entry.snapshot.schema;
+        let (table, columns) = schema.tables.iter_mut().next().unwrap();
+        columns.columns.insert(
+            "other".into(),
+            pbps_model::Column::new("int".parse().unwrap()),
+        );
+        let table = table.clone();
+        let collision = pbps_model::Uid::derived(
+            pbps_model::UidKind::Column,
+            &table.column("code").raw().to_string(),
+            0,
+        );
+        let mut from = pbps_model::IdsFile::default();
+        from.tables
+            .insert("t_aaaaaa".parse().unwrap(), table.clone());
+        from.columns
+            .insert("c_aaaaaa".parse().unwrap(), table.column("other"));
+        let mut to = from.clone();
+        to.columns.clear();
+        to.columns.insert(collision.clone(), table.column("other"));
+        let before = historical_ids(&schema, &from, &to);
+        let after = historical_ids(&schema, &to, &from);
+        assert_ne!(before.column_uid(&table.column("code")), Some(&collision));
+        assert_eq!(
+            before.column_uid(&table.column("code")),
+            after.column_uid(&table.column("code"))
+        );
+        assert_eq!(
+            before.column_uid(&table.column("other")),
+            from.column_uid(&table.column("other"))
+        );
+        assert_eq!(
+            after.column_uid(&table.column("other")),
+            to.column_uid(&table.column("other"))
         );
     }
 

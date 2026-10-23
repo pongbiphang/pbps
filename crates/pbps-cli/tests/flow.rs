@@ -23189,3 +23189,15 @@ fn state_history_unchanged_snapshots_and_baselines_do_not_restate_authored_sql()
 fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
     state_history::non_utf8_paths(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_matches_an_unrecorded_column_to_its_later_recorded_uid() {
+    state_history::acquired_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit() {
+    state_history::public_execution_is_unknown(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

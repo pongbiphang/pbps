@@ -34433,3 +34433,19 @@ fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
         state_history::non_utf8_paths(&server, true);
     }
 }
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_matches_an_unrecorded_column_to_its_later_recorded_uid() {
+    for server in [server(), old_server()] {
+        state_history::acquired_column_ids(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit() {
+    for server in [server(), old_server()] {
+        state_history::public_execution_is_unknown(&server, true);
+    }
+}
