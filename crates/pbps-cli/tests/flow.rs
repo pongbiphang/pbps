@@ -23274,6 +23274,12 @@ fn forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases(
     pull_publication::protected_aliases(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_directory_outputs_refuse_before_changing_the_project() {
+    pull_publication::output_directories(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 

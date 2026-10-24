@@ -219,3 +219,44 @@ pub fn protected_aliases(server: &str, pg: bool) {
     assert!(stderr(&refused).contains("aliases protected project input"));
     assert_eq!(project_bytes(&d.dir), before);
 }
+
+pub fn output_directories(server: &str, pg: bool) {
+    let variants: &[bool] = if cfg!(unix) { &[false, true] } else { &[false] };
+    for &linked in variants {
+        let (own, d) = prepared(server, pg, &format!("pull2311_directory_{linked}"));
+        let dir = d.dir.join("schema");
+        let output = dir.join(format!("{}.country.yml", schema(pg)));
+        std::fs::rename(&output, dir.join("custom.yml")).unwrap();
+        let directory = if linked {
+            dir.join("directory")
+        } else {
+            output.clone()
+        };
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("notes.txt"), b"keep this directory too\n").unwrap();
+        #[cfg(unix)]
+        if linked {
+            std::os::unix::fs::symlink(directory.file_name().unwrap(), &output).unwrap();
+        }
+        ok(d.run(&["validate"]));
+        let before = project_bytes(&d.dir);
+        let refused = d.run(&["pull", "--force", "--db", own.connection()]);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert_eq!(
+            project_bytes(&d.dir),
+            before,
+            "directory output deleted declarations"
+        );
+        let said = stderr(&refused);
+        assert!(
+            said.contains("is a directory") && said.contains("move it"),
+            "{said}"
+        );
+    }
+}

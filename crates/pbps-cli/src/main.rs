@@ -1847,6 +1847,26 @@ fn cmd_pull(
             pbps_model::Text::new(path.display().to_string()).shown()
         );
     }
+    // A directory at an output filename makes copying fail predictably. Refuse
+    // it before deleting any declarations, including through a directory link.
+    for path in &written {
+        match std::fs::metadata(path) {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.is_dir(),
+                "`{}` is a directory; move it before retrying pull",
+                pbps_model::Text::new(path.display().to_string()).shown()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect `{}`",
+                        pbps_model::Text::new(path.display().to_string()).shown()
+                    )
+                });
+            }
+        }
+    }
     std::fs::create_dir_all(&dir).with_context(|| {
         format!(
             "cannot create `{}`",

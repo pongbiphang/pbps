@@ -34806,6 +34806,14 @@ fn forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases(
     }
 }
 
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_directory_outputs_refuse_before_changing_the_project() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::output_directories(&server, true);
+    }
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 
