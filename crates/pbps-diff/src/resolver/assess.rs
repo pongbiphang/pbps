@@ -263,6 +263,8 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => false,
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
+        | Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

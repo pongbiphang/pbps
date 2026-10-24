@@ -275,6 +275,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

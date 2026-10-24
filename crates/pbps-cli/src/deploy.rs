@@ -4561,12 +4561,25 @@ fn refuse_pinned_movement(
         renames.schema(named_before.to_mut());
         pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
     }
+    pbps_diff::enum_labels::forward_schema(
+        named_before.to_mut(),
+        &desired_ids,
+        changes,
+        dialect,
+        true,
+    );
     let after = named_after.as_ref();
     let before = named_before.as_ref();
     let mut expected_types = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
-            pbps_model::Change::CreateType {
+            pbps_model::Change::AddEnumValue {
+                uid, definition, ..
+            }
+            | pbps_model::Change::RenameEnumValue {
+                uid, definition, ..
+            }
+            | pbps_model::Change::CreateType {
                 uid, definition, ..
             }
             | pbps_model::Change::RenameType {
@@ -6380,6 +6393,7 @@ pub fn cmd_bootstrap(
             // bootstrap emit a dependent module first and fail on declarations that
             // plan perfectly well.
             &pbps_model::Hints {
+                enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
                 // Carried for the same reason, and one more: it is what decides
@@ -8811,6 +8825,13 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         // What the previous state declared, advanced by what this plan wrote:
         // from the plan alone, since `apply --plan` needs nothing else.
         snapshot.declared = entry.snapshot.declared.clone();
+        pbps_diff::enum_labels::forward_declared(
+            &mut snapshot.declared,
+            &entry.snapshot.schema,
+            &entry.snapshot.ids,
+            &plan.changes,
+            dialect,
+        );
         snapshot
             .declared
             .advance_with_partitions(&plan.changes, &snapshot.schema);
@@ -9616,6 +9637,13 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // What the previous state declared, advanced by what this plan wrote: from
     // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
     snapshot.declared = entry.snapshot.declared.clone();
+    pbps_diff::enum_labels::forward_declared(
+        &mut snapshot.declared,
+        &entry.snapshot.schema,
+        &entry.snapshot.ids,
+        &plan.changes,
+        dialect,
+    );
     snapshot
         .declared
         .advance_with_partitions(&plan.changes, &snapshot.schema);

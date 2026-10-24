@@ -302,3 +302,72 @@ fn replacement_warnings_name_both_uids_and_preserve_identity_advice() {
         );
     }
 }
+
+#[test]
+fn approved_label_renames_forward_retained_checks_and_defaults_and_refuse_other_edits() {
+    let before = observed("app.mood");
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(Change::RenameEnumValue {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.mood".parse().unwrap(),
+            from: "sad".into(),
+            to: "blue".into(),
+            ordinal: 0,
+            definition: Box::new(ManagedType::Enum {
+                values: vec!["blue".into(), "ok".into()],
+            }),
+        })],
+    };
+    let ids = pbps_model::IdsFile {
+        types: [("y_000001".parse().unwrap(), "app.mood".parse().unwrap())].into(),
+        ..Default::default()
+    };
+    let pg = pbps_pg::Postgres::new();
+    let mut after = before.clone();
+    pbps_diff::enum_labels::forward_schema(&mut after, &ids, &changes, &pg, true);
+    after.types.insert(
+        "app.mood".parse().unwrap(),
+        ManagedType::Enum {
+            values: vec!["blue".into(), "ok".into()],
+        },
+    );
+    let check = |after: &Schema| {
+        super::super::refuse_pinned_movement(
+            &pg,
+            super::Read::transactional(super::Plan {
+                changes: &changes,
+                ids: &ids,
+            }),
+            &before,
+            after,
+            "label test",
+        )
+    };
+    check(&after).unwrap();
+    let mut edited = after.clone();
+    edited
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .checks
+        .get_mut("allowed")
+        .unwrap()
+        .expression = "v IS NOT NULL".into();
+    assert!(check(&edited).is_err());
+    let mut edited = after.clone();
+    edited
+        .tables
+        .get_mut(&"app.t".parse().unwrap())
+        .unwrap()
+        .columns["v"]
+        .value_source = ValueSource::Default("'blue'::app.mood".into());
+    assert!(check(&edited).is_err());
+    let mut edited = after;
+    edited.types.insert(
+        "app.mood".parse().unwrap(),
+        ManagedType::Enum {
+            values: vec!["blue".into()],
+        },
+    );
+    assert!(check(&edited).is_err());
+}

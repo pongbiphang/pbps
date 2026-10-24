@@ -641,6 +641,8 @@ impl Unchecked {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1154,6 +1156,29 @@ impl Lexicon {
     /// (DEC-1364.1). An unterminated literal ends the scan.
     #[must_use]
     pub fn string_literals(&self, text: &str) -> Vec<String> {
+        self.string_literal_ranges(text)
+            .into_iter()
+            .map(|(_, _, value)| value)
+            .collect()
+    }
+
+    /// Rewrite decoded SQL literals while preserving comments, identifiers and
+    /// every unchanged byte. The suffix permits a caller to require a typed cast.
+    pub fn rewrite_string_literals(
+        &self,
+        text: &str,
+        mut replacement: impl FnMut(&str, &str) -> Option<String>,
+    ) -> String {
+        let mut out = text.to_owned();
+        for (start, end, value) in self.string_literal_ranges(text).into_iter().rev() {
+            if let Some(value) = replacement(&value, &text[end..]) {
+                out.replace_range(start..end, &format!("'{}'", value.replace('\'', "''")));
+            }
+        }
+        out
+    }
+
+    fn string_literal_ranges(&self, text: &str) -> Vec<(usize, usize, String)> {
         let bytes = text.as_bytes();
         let mut out = Vec::new();
         let mut i = 0;
@@ -1215,7 +1240,7 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, i) else {
                     break;
                 };
-                out.push(literal.contents);
+                out.push((i, literal.end, literal.contents));
                 i = literal.end;
             } else if let Some(start) = literal_start(rest)
                 && (start == '\'' || !after_name)
@@ -1232,7 +1257,7 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, at) else {
                     break;
                 };
-                out.push(literal.contents);
+                out.push((i, literal.end, literal.contents));
                 i = literal.end;
             } else {
                 i += ch.len_utf8();
@@ -1241,7 +1266,20 @@ impl Lexicon {
         out
     }
 
+    /// The routine header's language, decoded independently of its body and
+    /// parameter defaults. Quoted names and SQL string spellings are supported.
+    pub fn routine_language(&self, definition: &str) -> Option<String> {
+        self.routine_language_in(definition, &self.header(definition))
+    }
+
     fn has_native_language(&self, definition: &str, header: &str) -> bool {
+        matches!(
+            self.routine_language_in(definition, header).as_deref(),
+            Some("c" | "internal")
+        )
+    }
+
+    fn routine_language_in(&self, definition: &str, header: &str) -> Option<String> {
         let mut cursor = 0;
         let mut depth = 0usize;
         while cursor < header.len() {
@@ -1273,9 +1311,7 @@ impl Lexicon {
                             name[..end].to_ascii_lowercase()
                         }
                     };
-                    if matches!(name.as_str(), "c" | "internal") {
-                        return true;
-                    }
+                    return Some(name);
                 }
             } else {
                 match ch {
@@ -1286,7 +1322,7 @@ impl Lexicon {
                 cursor += ch.len_utf8();
             }
         }
-        false
+        None
     }
 
     fn code_only_inner(&self, definition: &str, scan_bodies: bool) -> String {
@@ -6596,6 +6632,45 @@ mod code_only_tests {
         reserved: never_reserved,
         unicode_identifiers: true,
     };
+    #[test]
+    fn routine_language_comes_from_the_header_including_quoted_spellings() {
+        for language in ["plpgsql", "\"plpgsql\"", "'plpgsql'", "E'plpgsql'"] {
+            let definition =
+                format!("() RETURNS integer LANGUAGE {language} AS $$ BEGIN RETURN 1; END $$");
+            assert_eq!(PG.routine_language(&definition).as_deref(), Some("plpgsql"));
+        }
+        assert_eq!(PG.routine_language("(language integer DEFAULT 1) RETURNS integer LANGUAGE SQL AS $$ SELECT 1 /* LANGUAGE plpgsql */ $$").as_deref(), Some("sql"));
+        assert_eq!(
+            PG.routine_language("() RETURNS text AS $$ LANGUAGE plpgsql $$"),
+            None
+        );
+        assert_eq!(
+            PG.routine_language("() RETURNS text /* LANGUAGE plpgsql */ AS 'x'"),
+            None
+        );
+    }
+
+    #[test]
+    fn literal_rewrites_preserve_comments_identifiers_and_unselected_types() {
+        let sql =
+            "m <> E'sad'::app.e AND text <> 'sad'::text /* 'sad' */ AND \"sad\" IS NULL -- 'sad'\n";
+        let actual = PG.rewrite_string_literals(sql, |value, suffix| {
+            (value == "sad" && suffix.starts_with("::app.e")).then(|| "can't".to_owned())
+        });
+        assert_eq!(
+            actual,
+            "m <> 'can''t'::app.e AND text <> 'sad'::text /* 'sad' */ AND \"sad\" IS NULL -- 'sad'\n"
+        );
+        assert_eq!(PG.rewrite_string_literals(sql, |_, _| None), sql);
+        for spelling in ["'sad'", "E'sad'", "U&'sad'", "$tag$sad$tag$"] {
+            assert_eq!(
+                PG.rewrite_string_literals(spelling, |value, _| (value == "sad")
+                    .then(|| "blue".to_owned())),
+                "'blue'"
+            );
+        }
+    }
+
     const MSSQL: Lexicon = Lexicon {
         whitespace_is_ascii: false,
         quoted_identifiers: &[('[', ']'), ('"', '"')],

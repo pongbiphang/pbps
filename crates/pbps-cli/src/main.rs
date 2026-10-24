@@ -3050,7 +3050,12 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
                     )
                 });
                 (
-                    pbps_load::render_type_with_intents(&t.name, &t.definition, &pending),
+                    pbps_load::render_type_with_value_renames(
+                        &t.name,
+                        &t.definition,
+                        &pending,
+                        &t.value_renames,
+                    ),
                     absorbed,
                 )
             }

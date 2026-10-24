@@ -478,6 +478,9 @@ pub fn validate_saved_plan(
             refuse!("type lifecycle payload disagrees with its declared evidence");
         }
     }
+    if !crate::enum_labels::valid_steps(&plan.changes, &plan.declared_type_pins) {
+        refuse!("enum label steps disagree with their pinned intermediate definitions");
+    }
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
     super::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 

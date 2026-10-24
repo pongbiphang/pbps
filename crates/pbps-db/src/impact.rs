@@ -166,6 +166,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -271,6 +273,31 @@ mod tests {
             to: to.into(),
             table_was: None,
         })
+    }
+
+    #[test]
+    fn label_changes_do_not_acquire_table_rename_targets_or_hide_actual_table_renames() {
+        let add = PlannedChange::new(Change::AddEnumValue {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            value: "blue".into(),
+            placement: None,
+            ordinal: 0,
+            definition: Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["blue".into()],
+            }),
+        });
+        let steps = vec![add, rename_table("t_000001", "app.old", "app.new")];
+        let ids = IdsFile {
+            types: [("y_000001".parse().unwrap(), "app.e".parse().unwrap())].into(),
+            tables: [("t_000001".parse().unwrap(), table("app.new"))].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&steps, &ids).unwrap();
+        let targets = rename_targets(&names, false);
+        assert_eq!(targets, vec![RenameTarget::Table(table("app.old"))]);
+        let names = pbps_model::plan_names::PlanNames::of(&steps[..1], &ids).unwrap();
+        assert!(rename_targets(&names, true).is_empty());
     }
 
     #[test]

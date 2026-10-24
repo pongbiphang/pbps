@@ -458,3 +458,126 @@ async fn replacement_type_slots_apply_new_dependents_and_refuse_retained_binding
         }
     }
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+#[allow(clippy::wildcard_enum_match_arm)] // This fixture contains only label operations.
+async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_prefix() {
+    use pbps_model::{DeclaredTypeBefore, DeclaredTypePin};
+    use pbps_pg::{pins::Within, type_refs::declared};
+    let enumeration = |values: &[&str]| ManagedType::Enum {
+        values: values.iter().map(|v| (*v).into()).collect(),
+    };
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let mut conn =
+            pbps_db::Conn::connect(pbps_db::Driver::Postgres, &std::env::var(variable).unwrap())
+                .await
+                .unwrap();
+        conn.execute(
+            "BEGIN; CREATE SCHEMA label1635; CREATE TYPE label1635.e AS ENUM ('sad','ok')",
+        )
+        .await
+        .unwrap();
+        let name: pbps_model::TypeRef = "label1635.e".parse().unwrap();
+        let pin = DeclaredTypePin {
+            uid: uid(UidKind::Type, "label1635"),
+            name: name.clone(),
+            definition: enumeration(&["blue", "middle", "ok", "end"]),
+            before: Some(DeclaredTypeBefore {
+                name: name.clone(),
+                definition: enumeration(&["sad", "ok"]),
+            }),
+        };
+        let mut executed = Vec::new();
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    from: "sad".into(),
+                    to: "blue".into(),
+                    ordinal: 0,
+                    definition: Box::new(enumeration(&["blue", "ok"])),
+                }),
+                PlannedChange::new(Change::AddEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    value: "middle".into(),
+                    placement: Some(pbps_model::EnumPlacement::After("blue".into())),
+                    ordinal: 1,
+                    definition: Box::new(enumeration(&["blue", "middle", "ok"])),
+                }),
+                PlannedChange::new(Change::AddEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    value: "end".into(),
+                    placement: Some(pbps_model::EnumPlacement::After("ok".into())),
+                    ordinal: 2,
+                    definition: Box::new(pin.definition.clone()),
+                }),
+            ],
+        };
+        let sql = [
+            "ALTER TYPE label1635.e RENAME VALUE 'sad' TO 'blue'",
+            "ALTER TYPE label1635.e ADD VALUE 'middle' AFTER 'blue'",
+            "ALTER TYPE label1635.e ADD VALUE 'end' AFTER 'ok'",
+        ];
+        for (i, step) in changes.changes.iter().enumerate() {
+            declared::check(
+                &mut conn,
+                std::slice::from_ref(&pin),
+                &Default::default(),
+                Within::CallersTransaction,
+                false,
+                &changes,
+                &executed,
+            )
+            .await
+            .unwrap();
+            conn.execute(sql[i]).await.unwrap();
+            let definition = match &step.change {
+                Change::AddEnumValue { definition, .. }
+                | Change::RenameEnumValue { definition, .. } => definition.as_ref().clone(),
+                _ => unreachable!(),
+            };
+            let metadata = pbps_dialect::DeclaredTypeStatement {
+                uid: pin.uid.clone(),
+                name: name.clone(),
+                definition: Some(definition),
+            };
+            declared::vet(&mut conn, &metadata, &Default::default())
+                .await
+                .unwrap();
+            let mut statement = pbps_dialect::Statement::new(sql[i]);
+            statement.declared_type = Some(metadata);
+            executed.push(statement);
+            declared::check(
+                &mut conn,
+                std::slice::from_ref(&pin),
+                &Default::default(),
+                Within::CallersTransaction,
+                i == 2,
+                &changes,
+                &executed,
+            )
+            .await
+            .unwrap();
+            let mut wrong = pin.clone();
+            wrong.uid = uid(UidKind::Type, "wrong label1635");
+            assert!(
+                declared::check(
+                    &mut conn,
+                    &[wrong],
+                    &Default::default(),
+                    Within::CallersTransaction,
+                    true,
+                    &changes,
+                    &executed
+                )
+                .await
+                .is_err()
+            );
+        }
+        conn.execute("ROLLBACK").await.unwrap();
+    }
+}

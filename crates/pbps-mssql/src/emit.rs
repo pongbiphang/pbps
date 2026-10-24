@@ -299,7 +299,9 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             })
         }
 
-        Change::CreateType { name, .. }
+        Change::AddEnumValue { name, .. }
+        | Change::RenameEnumValue { name, .. }
+        | Change::CreateType { name, .. }
         | Change::DropType { name, .. }
         | Change::RenameType { from: name, .. } => Err(DialectError::Unsupported {
             dialect: crate::types::DIALECT,
@@ -5062,5 +5064,58 @@ mod tests {
         ] {
             assert!(!takes_online(&c), "{c:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod enum_label_tests {
+    use super::*;
+    #[test]
+    fn enum_label_changes_refuse_sql_server_by_type_name() {
+        let uid = "y_000001".parse().unwrap();
+        let name = "app.e".parse().unwrap();
+        let definition = Box::new(pbps_model::ManagedType::Enum {
+            values: vec!["blue".into()],
+        });
+        let add = Change::AddEnumValue {
+            uid,
+            name,
+            value: "blue".into(),
+            placement: None,
+            ordinal: 0,
+            definition,
+        };
+        let Change::AddEnumValue {
+            uid,
+            name,
+            definition,
+            ..
+        } = add.clone()
+        else {
+            unreachable!()
+        };
+        let rename = Change::RenameEnumValue {
+            uid,
+            name,
+            from: "sad".into(),
+            to: "blue".into(),
+            ordinal: 0,
+            definition,
+        };
+        for step in [add, rename] {
+            let error = emit(&step, Strategy::default()).unwrap_err().to_string();
+            assert!(error.contains("app.e"), "{error}");
+            assert!(!takes_online(&step));
+        }
+        assert!(
+            emit(
+                &Change::CreateRole {
+                    uid: "r_000001".parse().unwrap(),
+                    name: "reader".into()
+                },
+                Strategy::default()
+            )
+            .is_ok()
+        );
     }
 }
