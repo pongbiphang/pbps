@@ -30,7 +30,7 @@ Referenced PostgreSQL types use potential-path eligibility and opt-in reviewed r
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
-provider. The test and clippy bar is in AGENTS.md's "Taking an issue"; counts
+provider. The test and clippy bar is in AGENTS.md's "Local checks"; counts
 change too often to record here. PostgreSQL is supported from 16, the lowest
 release CI qualifies; an older server is refused by name when the connection
 opens (#2151, DEC-2151.1), and 15 is #2152. The copy-pastable pipelines SPEC 14.1 lists

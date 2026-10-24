@@ -143,6 +143,7 @@ jobs:
       - run: python3 scripts/check_gate_needs_test.py
       - run: python3 scripts/ci_gate_verdict_test.py
       - run: python3 scripts/ci_release_scope_test.py
+      - run: python3 scripts/pr_size_test.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
