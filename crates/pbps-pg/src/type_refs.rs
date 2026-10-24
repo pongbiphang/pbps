@@ -61,7 +61,7 @@ fn reference_uses<'a>(
                 std::iter::once((TypeSide::Desired, &c.cast))
                     .chain(c.source.iter().map(|s| (TypeSide::Base, &s.ty)))
             })),
-            Change::AnalyzeTableTree(_) => {}
+            Change::BuildPartitionedIndex(_) | Change::AnalyzeTableTree(_) => {}
             Change::CreateTable { table, .. }
             | Change::AttachPartition { shape: table, .. }
             | Change::DetachPartition { shape: table, .. } => {

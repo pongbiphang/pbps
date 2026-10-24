@@ -266,6 +266,33 @@ pub fn names(
         names: Names::default(),
     };
     match op.change() {
+        Change::BuildPartitionedIndex(r) => {
+            r.validate().map_err(|why| OwnerError::Rebuild {
+                name: r.parent.name.shown().to_string(),
+                why,
+            })?;
+            let holder = op.key(owners)?;
+            let kind = match r.definition {
+                crate::PartitionIndexDefinition::Index(_) => NameKind::Index,
+                crate::PartitionIndexDefinition::PrimaryKey(_)
+                | crate::PartitionIndexDefinition::Unique(_) => NameKind::Key,
+            };
+            for (relation, name) in std::iter::once((&r.parent, &r.name))
+                .chain(r.clones.iter().map(|c| (&c.leaf, &c.name)))
+            {
+                let table = super::checked_relation(owners, relation, Spelling::Final)?;
+                nx.claim(
+                    Address {
+                        kind,
+                        schema: relation.name.schema.clone(),
+                        table: Some(ObjectKey::Table(table)),
+                        name: name.raw().to_owned(),
+                        signature: None,
+                    },
+                    holder.clone(),
+                );
+            }
+        }
         Change::RebuildPartitionedTable(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {}

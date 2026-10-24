@@ -237,6 +237,7 @@ pub(crate) fn planned_schema_grants(
         }
         let statement = match &p.change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => {
                 return Err(format!(

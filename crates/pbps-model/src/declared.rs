@@ -359,6 +359,7 @@ impl Declared {
         for planned in &changes.changes {
             match &planned.change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
                 Change::CreateType {

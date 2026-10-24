@@ -50,6 +50,8 @@ pub struct SlotEffects {
 /// Every step's slots, and the steps whose names could not be read.
 #[derive(Debug, Clone, Default)]
 pub struct Slots {
+    /// Actual catalog names promoted to their typed action owner for graph AND replay.
+    pub catalog_owned: BTreeMap<SlotKey, ObjectKey>,
     pub effects: Vec<SlotEffects>,
     pub unowned: Vec<(OperationId, OwnerError)>,
     /// Steps whose statements could not be lowered, so their intermediate
@@ -157,6 +159,104 @@ pub fn analyse(
         }
     }
     out
+}
+
+/// Describe exact owned names once; both the shared edge builder and replay consume them.
+pub fn with_catalog_parts(
+    mut slots: Slots,
+    catalog: &super::catalog::graph::Catalog,
+    root: &super::catalog::graph::Root,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<Slots, String> {
+    use super::catalog::{Holds, Part, graph::Held};
+    use pbps_model::operation::{Address, Named, PartKey};
+    let closure = catalog.graph.closure(root)?;
+    for (id, spelling) in catalog
+        .spellings
+        .require("index and constraint spellings")?
+    {
+        if !closure.nodes.contains_key(id) {
+            continue;
+        }
+        let bad = || format!("{}: unsupported part ownership", spelling.table.shown());
+        let Held::Dependent(Holds::TablePart { table, part }) =
+            &closure.nodes[&closure.owners[id]].held
+        else {
+            return Err(bad());
+        };
+        let part = match part {
+            Part::PrimaryKey(_) => PartKey::PrimaryKey,
+            Part::Unique(n) => PartKey::Unique(n.clone()),
+            Part::ForeignKey(n) => PartKey::ForeignKey(n.clone()),
+            Part::Check(n) => PartKey::Check(n.clone()),
+            Part::Index(n) => PartKey::Index(n.clone()),
+            Part::Default(_) | Part::Generated(_) | Part::Policy(_) => return Err(bad()),
+        };
+        let holder = base_table_named(owners, before, table)
+            .ok_or_else(bad)?
+            .part(part);
+        let scope = base_table_named(owners, before, &spelling.table)
+            .ok_or_else(bad)?
+            .table_key();
+        let named = Named {
+            holder: holder.clone(),
+            address: Address {
+                kind: spelling.kind,
+                schema: spelling.table.schema.clone(),
+                table: Some(scope),
+                name: spelling.name.raw().to_owned(),
+                signature: None,
+            },
+        };
+        for slot in slots_of(dialect, &named.address) {
+            if slots.catalog_owned.get(&slot).is_some_and(|h| h != &holder) {
+                return Err(bad());
+            }
+            slots.catalog_owned.insert(slot.clone(), holder.clone());
+            for fx in &mut slots.effects {
+                if fx.releases.iter().any(|(_, h)| h == &holder)
+                    && !fx.releases.contains(&(slot.clone(), holder.clone()))
+                {
+                    fx.releases.push((slot.clone(), holder.clone()));
+                }
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// Names unavailable at a construction boundary. Unknown reads cannot mean vacant.
+pub fn unavailable_names(
+    slots: &Slots,
+    facts: &super::catalog::graph::Fact<CatalogFacts>,
+    namespaces: &[pbps_dialect::slots::Namespace],
+    released: &BTreeSet<ObjectKey>,
+) -> Result<BTreeSet<String>, String> {
+    let facts = facts.require("name-slot occupancy")?;
+    let mut out = BTreeSet::new();
+    for occupant in &facts.occupants {
+        let freed = slots.catalog_owned.get(&occupant.slot).is_some_and(|h| {
+            released.contains(h)
+                && slots
+                    .effects
+                    .iter()
+                    .any(|fx| fx.releases.contains(&(occupant.slot.clone(), h.clone())))
+        });
+        if namespaces.contains(&occupant.slot.namespace) && !freed {
+            out.insert(occupant.slot.name.clone());
+        }
+    }
+    out.extend(
+        slots
+            .effects
+            .iter()
+            .flat_map(|fx| &fx.claims)
+            .filter(|(s, _)| namespaces.contains(&s.namespace))
+            .map(|(s, _)| s.name.clone()),
+    );
+    Ok(out)
 }
 
 fn table_slots(dialect: &(impl Dialect + ?Sized), table: &TableName) -> Vec<SlotKey> {
@@ -418,6 +518,9 @@ fn handovers_of(
     // An occupant holds its name from the start and gives it up at its
     // step; carried to another schema, it takes the name it lands on there.
     for c in carried {
+        if slots.catalog_owned.contains_key(&c.slot) {
+            continue;
+        }
         by_slot
             .entry(&rep[&c.slot])
             .or_default()
@@ -644,6 +747,12 @@ pub fn verify(
                 .into_iter()
                 .map(move |s| (s, named.holder.clone()))
         })
+        .chain(
+            slots
+                .catalog_owned
+                .iter()
+                .map(|(s, h)| (s.clone(), h.clone())),
+        )
         .collect();
     // A baseline name may be the claimed one under the engine's comparison
     // and not by its spelling, so the comparison selects it: a name it may

@@ -163,3 +163,83 @@ fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
             .contains("recorded UID")
     );
 }
+
+#[test]
+fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
+    let (root, base, desired, addresses) = fixture::approval();
+    let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
+        .with_rebuild_addresses(&root, &base, &addresses)
+        .unwrap();
+    let before_schema = Schema {
+        tables: root.before,
+        ..Default::default()
+    };
+    let after_schema = Schema {
+        tables: root.after,
+        ..Default::default()
+    };
+    let before = Snapshot {
+        schema: &before_schema,
+        ids: &base,
+    };
+    let after = Snapshot {
+        schema: &after_schema,
+        ids: &desired,
+    };
+    let mut recipe = fixture::index_recipe();
+    for definition in [
+        recipe.definition.clone(),
+        PartitionIndexDefinition::Unique(UniqueConstraint {
+            columns: vec!["k".into()],
+            storage_parameters: Default::default(),
+        }),
+        PartitionIndexDefinition::PrimaryKey(PrimaryKey {
+            name: Some(recipe.name.clone()),
+            columns: vec!["k".into()],
+            storage_parameters: Default::default(),
+        }),
+    ] {
+        recipe.definition = definition;
+        let ops = Operations::expanded(
+            1,
+            [(
+                Origin::Restoration(Source::Change(0)),
+                PlannedChange::new(Change::BuildPartitionedIndex(Box::new(recipe.clone()))),
+            )],
+            ModuleEdits::InPlace,
+        );
+        let op = &ops.as_slice()[0];
+        let fx = effects(op, &owners, before, after).unwrap();
+        assert!(fx.creates.contains(&Resource::Object(
+            op.key(&owners).unwrap(),
+            Incarnation::Final
+        )));
+        let named = names(op, &owners, before).unwrap();
+        assert_eq!(named.claims.len(), 1 + recipe.clones.len());
+        assert!(
+            named
+                .claims
+                .iter()
+                .all(|n| n.holder == op.key(&owners).unwrap())
+        );
+        assert_eq!(
+            fx.requires
+                .iter()
+                .filter(|r| matches!(r, Requirement::Reads(_)))
+                .count(),
+            1 + recipe.clones.len()
+        );
+    }
+    let mut reused = recipe.clone();
+    reused.clones[0].name = reused.name.clone();
+    assert!(reused.validate().is_err());
+    reused.clones[0].leaf.name.schema = "other".into();
+    assert!(reused.validate().is_ok());
+    let mut bad = recipe.clone();
+    bad.clones.push(bad.clones[0].clone());
+    assert!(bad.validate().is_err());
+    if let PartitionIndexDefinition::PrimaryKey(key) = &mut recipe.definition {
+        key.name = None;
+    }
+    assert!(recipe.validate().is_err());
+}

@@ -926,6 +926,20 @@ mod effects_of_each_kind {
             };
             c.partitions.clear();
         }
+        out.push((
+            "BuildPartitionedIndex",
+            Change::BuildPartitionedIndex(Box::new(pbps_model::BuildPartitionedIndex {
+                parent: pbps_model::RebuildRelation {
+                    uid: uid(UidKind::Table, "t"),
+                    name: tn("t"),
+                },
+                name: "recipe_index".into(),
+                definition: pbps_model::PartitionIndexDefinition::Index(
+                    serde_json::from_str(r#"{"columns":[{"name":"k"}]}"#).unwrap(),
+                ),
+                clones: Vec::new(),
+            })),
+        ));
         out.extend(
             [
                 "RebuildPartitionedTable",

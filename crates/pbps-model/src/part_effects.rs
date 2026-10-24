@@ -96,6 +96,22 @@ impl Change {
         let named =
             |table, kind, name, effect| vec![direct(Part::Named { table, kind, name }, effect)];
         let mut out = match self {
+            Change::BuildPartitionedIndex(r) => vec![direct(
+                match &r.definition {
+                    crate::PartitionIndexDefinition::PrimaryKey(_) => Part::PrimaryKey(&r.parent.name),
+                    crate::PartitionIndexDefinition::Index(_) => Part::Named {
+                        table: &r.parent.name,
+                        kind: crate::Part::Index,
+                        name: r.name.raw(),
+                    },
+                    crate::PartitionIndexDefinition::Unique(_) => Part::Named {
+                        table: &r.parent.name,
+                        kind: crate::Part::Unique,
+                        name: r.name.raw(),
+                    },
+                },
+                Effect::Created,
+            )],
 Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Vec::new(),
             Change::CreateTable { name, table, .. } => {
                 let mut parts = vec![direct(Part::Table(name), Effect::Created)];

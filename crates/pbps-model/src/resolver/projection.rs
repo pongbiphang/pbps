@@ -594,7 +594,7 @@ fn vector_inventory_permitted(
 fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
     use OwnerScope::{Exact, WithChildren};
     let (owner, opening, closing) = match change {
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return None,
+Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return None,
         Change::CreateTable { name, .. } => {
             (WithChildren(Surface::Table(name.clone())), false, true)
         }

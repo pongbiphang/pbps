@@ -6,7 +6,7 @@ use pbps_model::operation::{
 use pbps_model::plan_names::PlanNames;
 use pbps_model::{Change, ChangeSet, Column, ModuleDeps, PlannedChange, Schema, Table};
 #[path = "../../../pbps-model/tests/support/rebuild.rs"]
-mod fixture;
+pub(super) mod fixture;
 
 #[test]
 fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
@@ -98,7 +98,13 @@ fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
 
 #[test]
 fn rebuild_roots_and_partial_parts_cannot_gain_canonical_authority() {
-    for change in fixture::changes() {
+    for change in
+        fixture::changes()
+            .into_iter()
+            .chain(std::iter::once(Change::BuildPartitionedIndex(Box::new(
+                fixture::index_recipe(),
+            ))))
+    {
         let name = change.table().unwrap().shown().to_string();
         let plan = propose(ChangeSet {
             changes: vec![PlannedChange::new(change)],
@@ -169,7 +175,13 @@ fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
         },
         module_deps: &deps,
     };
-    for change in fixture::changes() {
+    for change in
+        fixture::changes()
+            .into_iter()
+            .chain(std::iter::once(Change::BuildPartitionedIndex(Box::new(
+                fixture::index_recipe(),
+            ))))
+    {
         let name = change.table().unwrap().shown().to_string();
         let draft = propose(ChangeSet {
             changes: vec![PlannedChange::new(change)],

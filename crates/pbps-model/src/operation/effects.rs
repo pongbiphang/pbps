@@ -487,6 +487,24 @@ impl Cx<'_> {
     fn by_kind(&mut self) -> Result<(), OwnerError> {
         let op = self.op;
         match op.change() {
+            Change::BuildPartitionedIndex(r) => {
+                r.validate().map_err(|why| OwnerError::Rebuild {
+                    name: r.parent.name.shown().to_string(),
+                    why,
+                })?;
+                let mut parent = op.clone();
+                parent.step.change = r.parent_change();
+                self.fx = effects(&parent, self.owners, self.before, self.after)?;
+                for relation in std::iter::once(&r.parent).chain(r.clones.iter().map(|c| &c.leaf)) {
+                    let key = ObjectKey::Table(super::checked_relation(
+                        self.owners,
+                        relation,
+                        Spelling::Final,
+                    )?);
+                    self.requires(Requirement::Is(key.clone(), Incarnation::Final));
+                    self.requires(Requirement::Reads(key));
+                }
+            }
             Change::RebuildPartitionedTable(r) => {
                 return Err(OwnerError::Rebuild {
                     name: r.table.shown().to_string(),

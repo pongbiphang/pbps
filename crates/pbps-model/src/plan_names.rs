@@ -258,6 +258,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
     let kept = |column: &ColumnRef| Some(column.clone());
     match change {
         Change::RebuildPartitionedTable(_)
+        | Change::BuildPartitionedIndex(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => Other,
         Change::CreateTable {

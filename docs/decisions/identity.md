@@ -1118,3 +1118,34 @@ facts. Only a known different UID proves release. Omitted, unreadable or
 contradictory binding evidence remains conservative. Retirement edges order
 old-bound or unknown producers/removers, and ordinary plan byte oracles remain
 unchanged. This grants no rebuild admission or lowering authority.
+
+
+<a id="dec-2298-8"></a>
+
+**DEC-2298.8. A replacement tree owns its parts before taking its final names.**
+A partitioned-table rebuild copies into the temporary tree before building
+its own indexes, PK/unique constraints, checks and independent leaf indexes.
+ANALYZE follows the copy; effects order it with part construction. The own
+parts and statistics must be complete before the name swap. External binding
+restoration, including incoming FKs, views, routines, triggers and grants,
+follows the swap, and the old tree is dropped last.
+
+Partitioned indexes use an explicit parent-only build, explicitly named leaf
+indexes and explicit ATTACH PARTITION operations. Constraint-backed keys also
+need corresponding leaf constraints before attachment. PostgreSQL does not
+support USING INDEX on a partitioned parent: its parent key uses ALTER TABLE
+ONLY ADD CONSTRAINT; leaf keys can use their explicitly created indexes.
+The typed recipe owns the clones through the parent index and claims their
+slots. It never creates a recursive parent index and adopts a matching leaf
+index. Independent leaf indexes remain unattached and follow the parent-owned
+construction, preserving DEC-1688.1.
+
+Clone allocation uses the engine's default derivation for the final leaf
+name when typed slots prove it free at that boundary, otherwise a
+deterministic suffix. Catalog names and typed definitions supply the facts;
+object-description text is not a name parser. A name still held by the source
+must be released through shared slots before a replacement claims it, by
+moving its holder to a backup name or dropping it. Table renames alone do not
+rename their indexes. Effects, shared slots and settle own every edge; there
+is no additional pass, rank or tie-break. This decision does not enable
+rebuild lowering, certification, admission or execution.

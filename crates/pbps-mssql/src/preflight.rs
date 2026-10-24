@@ -467,7 +467,7 @@ fn build<'v, 'p: 'v>(
     unchecked: &mut Vec<Unchecked>,
 ) -> Result<Vec<Probe>, DialectError> {
     match change {
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
+Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
         Change::AddColumn {
             table,
             name,

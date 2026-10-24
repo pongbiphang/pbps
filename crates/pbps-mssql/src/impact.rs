@@ -69,6 +69,7 @@ pub async fn key_drop_blockers(
         .filter_map(|(index, p)| {
             let (table, kind, name) = match &p.change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => return None,
                 Change::SetPrimaryKey {
@@ -249,6 +250,7 @@ pub async fn key_drop_blockers(
     for (index, p) in names.changes().iter().enumerate() {
         let (table, fk) = match &p.change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => continue,
             Change::DropForeignKey { table, name } => (table, Some(name)),

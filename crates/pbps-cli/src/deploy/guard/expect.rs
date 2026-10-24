@@ -161,6 +161,7 @@ impl<'a> TableChanges<'a> {
         for (at, p) in plan.changes.iter().enumerate() {
             match &p.change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
                 Change::RenameTable { uid, from, to, .. } => {

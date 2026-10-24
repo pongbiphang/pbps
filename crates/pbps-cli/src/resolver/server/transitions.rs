@@ -303,7 +303,7 @@ pub(super) fn derive(
             entry.dropped_before.extend(prior);
         }
         let (surface, children, opening, closing, dropped) = match &step.change {
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return Err(Error::Binding(format!("blocking rewrite for `{}` is unavailable", step.change.table().unwrap().shown()))),
+Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => return Err(Error::Binding(format!("blocking rewrite for `{}` is unavailable", step.change.table().unwrap().shown()))),
             Change::CreateTable { uid, name, .. } => {
                 if tables.values().any(|known| known == uid)
                     || tables.insert(name.clone(), uid.clone()).is_some()

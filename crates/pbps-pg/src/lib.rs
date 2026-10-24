@@ -69,6 +69,7 @@ pub mod impact;
 pub mod input_path;
 pub mod introspect;
 pub mod modules;
+pub mod partition_index;
 mod partition_runway;
 mod partition_series;
 pub mod partman;

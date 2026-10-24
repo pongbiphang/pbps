@@ -517,6 +517,7 @@ impl Unchecked {
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
             Change::RebuildPartitionedTable(_)
+            | Change::BuildPartitionedIndex(_)
             | Change::CopyTableRows(_)
             | Change::AnalyzeTableTree(_) => {
                 pbps_model::escape::Escaped(&change.subject()).to_string()

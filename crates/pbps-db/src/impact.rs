@@ -109,7 +109,7 @@ pub fn rename_targets(
         .changes()
         .iter()
         .filter_map(|p| match &p.change {
-Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
+Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
             Change::RenameTable { uid, .. } => names.table_at(uid, At::Start)
                 .filter(|_| seen.insert(uid)).cloned().map(RenameTarget::Table),
             Change::RenameColumn { uid, .. } => {

@@ -295,6 +295,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
             // drop spelled differently, say) should have to be placed here.
             let contract = match &p.change {
                 Change::RebuildPartitionedTable(_)
+                | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => None,
                 Change::AddColumn { .. } => {

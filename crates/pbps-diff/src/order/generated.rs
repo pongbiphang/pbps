@@ -30,6 +30,12 @@ fn table_use(change: &Change) -> TableUse<'_> {
         ..Default::default()
     };
     match change {
+        Change::BuildPartitionedIndex(r) => TableUse {
+            complete: std::iter::once(&r.parent.name)
+                .chain(r.clones.iter().map(|c| &c.leaf.name))
+                .collect(),
+            ..Default::default()
+        },
 Change::RebuildPartitionedTable(_) => TableUse::default(),
 Change::CopyTableRows(c) => TableUse { complete: std::iter::once(&c.target.name).chain(c.target_partitions.iter().map(|p| &p.name)).collect(), writes: std::iter::once(&c.target.name).chain(c.target_partitions.iter().map(|p| &p.name)).collect(), seed: None },
 Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.name).chain(a.partitions.iter().map(|p| &p.name)).collect(), ..Default::default() },
@@ -498,6 +504,16 @@ fn texts(change: &Change) -> Vec<&str> {
             .collect()
     }
     match change {
+        Change::BuildPartitionedIndex(r) => match &r.definition {
+            pbps_model::PartitionIndexDefinition::Index(i) => i
+                .filter
+                .as_deref()
+                .into_iter()
+                .chain(i.columns.iter().filter_map(|c| c.key.expression()))
+                .collect(),
+            pbps_model::PartitionIndexDefinition::PrimaryKey(_)
+            | pbps_model::PartitionIndexDefinition::Unique(_) => Vec::new(),
+        },
         Change::RebuildPartitionedTable(_) | Change::AnalyzeTableTree(_) => Vec::new(),
         Change::CopyTableRows(c) => c.columns.iter().map(|p| p.cast.base.as_str()).collect(),
 

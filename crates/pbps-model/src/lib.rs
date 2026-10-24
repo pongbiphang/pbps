@@ -90,8 +90,9 @@ pub use plan::{
 pub use reason::{Reason, ReasonError};
 pub use rebuild::{Rebuild, RebuildIdentities};
 pub use rebuild_ops::{
-    AnalyzeTableTree, CopyColumn, CopySource, CopyTableRows, IntermediateAddress,
-    RebuildPartitionedTable, RebuildRelation,
+    AnalyzeTableTree, BuildPartitionedIndex, CopyColumn, CopySource, CopyTableRows,
+    IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition, RebuildPartitionedTable,
+    RebuildRelation,
 };
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};

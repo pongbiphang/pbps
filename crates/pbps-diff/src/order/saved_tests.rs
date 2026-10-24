@@ -170,7 +170,13 @@ fn rebuild_parts_without_an_intent_record_are_still_refused_at_admission() {
         "../../../pbps-model/tests/fixtures/rebuild_operations.json"
     ))
     .unwrap();
-    for change in changes {
+    use super::rebuild_tests::fixture as recipe_fixture;
+    for change in changes
+        .into_iter()
+        .chain([Change::BuildPartitionedIndex(Box::new(
+            recipe_fixture::index_recipe(),
+        ))])
+    {
         let name = change.table().unwrap().shown().to_string();
         let mut plan = wire();
         plan.changes = ChangeSet {

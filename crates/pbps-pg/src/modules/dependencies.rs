@@ -25,6 +25,8 @@ fn ty(id: u64) -> Object {
 
 #[derive(Deserialize)]
 struct Meta {
+    relkind: Option<String>,
+    constraint_kind: Option<String>,
     described: String,
     kind: String,
     schema: String,
@@ -140,6 +142,7 @@ async fn read(
     let mut pending = vec![(start.clone(), true)];
     let mut complete = BTreeSet::new();
     let mut metadata = BTreeMap::new();
+    let mut spellings = BTreeMap::new();
     while let Some((id, walk)) = pending.pop() {
         if complete.contains(&id) || (!walk && metadata.contains_key(&id)) {
             continue;
@@ -262,6 +265,32 @@ async fn read(
             };
             Held::Dependent(holds)
         };
+        let index = m.relkind.as_deref().is_some_and(|k| matches!(k, "i" | "I"));
+        if (id.catalog == "pg_class" && id.attribute == 0 && index)
+            || (id.catalog == "pg_constraint"
+                && m.constraint_kind
+                    .as_deref()
+                    .is_some_and(|k| matches!(k, "p" | "u" | "f" | "c")))
+        {
+            spellings.insert(
+                id.clone(),
+                PartSpelling {
+                    table: table.clone(),
+                    name: m.part.clone().into(),
+                    kind: if index {
+                        pbps_model::operation::NameKind::Index
+                    } else {
+                        pbps_model::operation::NameKind::Constraint
+                    },
+                    index_attributes: index.then(|| {
+                        m.attributes
+                            .iter()
+                            .map(|(_, n, _)| n.clone().into())
+                            .collect()
+                    }),
+                },
+            );
+        }
         if id.catalog == "pg_class" && id.attribute == 0 && m.row_type != 0 {
             if walk && m.kind == "clone" && !source.schema.tables.contains_key(&table) {
                 return Err(DbError::Refused(format!(
@@ -493,6 +522,7 @@ async fn read(
     } else {
         BTreeSet::new()
     };
+    out.spellings = Fact::Present(spellings);
     out.publications = Fact::Present(publications);
     Ok(out)
 }
@@ -506,7 +536,7 @@ const PUBLICATIONS: &str = "WITH RECURSIVE tree AS (SELECT relid FROM pg_catalog
 // LEFT JOINs keep every class total. Unsupported kinds remain named evidence;
 // a disappearing row in a known catalog is a failed read, not an unknown kind.
 const METADATA: &str = "WITH input AS (SELECT $1::text AS catalog, $2::int8::oid AS id, $3::int AS att), facts AS (
- SELECT x.*, c.relkind, c.reltype, c.reltoastrelid, t.typtype,
+ SELECT x.*, c.relkind, con.contype::text AS constraint_kind, c.reltype, c.reltoastrelid, t.typtype,
  CASE
  WHEN x.catalog='pg_class' AND x.att<>0 THEN 'attribute'
  WHEN storage.oid IS NOT NULL OR owner.relkind='t' THEN 'storage'
