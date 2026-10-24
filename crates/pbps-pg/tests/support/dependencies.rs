@@ -626,8 +626,13 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             name: "app.old_p1".parse().unwrap(),
             detach_from: None,
         },
+        Change::DropTable {
+            uid: base.table_uid(&root.table).unwrap().clone(),
+            name: "app.old_p".parse().unwrap(),
+            detach_from: None,
+        },
     ];
-    for order in [[0, 1, 2], [1, 0, 2]] {
+    for order in [[0, 1, 2, 3], [1, 0, 2, 3]] {
         let ops = Operations::expanded(
             1,
             order.map(|i| {
@@ -635,7 +640,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
                     match i {
                         0 => Origin::Restoration(OriginSource::Change(0)),
                         1 => Origin::Teardown(OriginSource::Change(0)),
-                        2 => Origin::SplitPart(0),
+                        2 | 3 => Origin::SplitPart(0),
                         _ => unreachable!(),
                     },
                     PlannedChange::new(parts[i].clone()),
@@ -661,7 +666,23 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
                 .iter()
                 .any(|e| e.before == release && e.after == claim)
         );
-        assert!(!edges.iter().any(|e| e.before == 2 && e.after == claim));
+        assert!(!edges.iter().any(|e| e.before >= 2 && e.after == claim));
+        let mut schedule = pbps_diff::order::Schedule::new(4);
+        slots::schedule(&mut schedule, &edges);
+        for (before, after) in [(claim, 2), (2, 3)] {
+            schedule.edge(
+                before,
+                after,
+                pbps_diff::order::Source::Effect,
+                pbps_model::resolver::OrderReason::Restoration,
+            );
+        }
+        let settled = schedule
+            .settle(pbps_diff::order::propose(ChangeSet {
+                changes: ops.iter().map(|op| op.planned().clone()).collect(),
+            }))
+            .unwrap();
+        assert_eq!(settled.sequence, [release, claim, 2, 3]);
         let (violations, _) = slots::verify(
             ops.as_slice(),
             &enriched,
@@ -698,6 +719,50 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             "the new independent claim reserves its name"
         );
     }
+    // A reintroduced incarnation still belongs to its eventual container drop.
+    let ordinary = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &base);
+    let Change::AddIndex { index, .. } = &parts[0] else {
+        panic!()
+    };
+    let returned = Operations::expanded(
+        1,
+        [
+            (Origin::Teardown(OriginSource::Change(0)), parts[1].clone()),
+            (
+                Origin::Restoration(OriginSource::Change(0)),
+                Change::AddIndex {
+                    table: root.table.clone(),
+                    name: "p_idx".into(),
+                    index: index.clone(),
+                    clustered: false,
+                },
+            ),
+            (
+                Origin::SplitPart(0),
+                Change::DropTable {
+                    uid: base.table_uid(&root.table).unwrap().clone(),
+                    name: root.table.clone(),
+                    detach_from: None,
+                },
+            ),
+        ]
+        .map(|(origin, change)| (origin, PlannedChange::new(change))),
+        ModuleEdits::InPlace,
+    );
+    let returned = slots::with_catalog_parts(
+        slots::analyse(returned.as_slice(), &ordinary, before, &dialect),
+        &catalog,
+        &key,
+        &ordinary,
+        before,
+        &dialect,
+    )
+    .unwrap();
+    assert!(
+        returned.effects[2]
+            .releases
+            .contains(&(slot.clone(), returned.catalog_owned[&slot].clone()))
+    );
     catalog.spellings = Fact::Unreadable("42501".into());
     assert!(
         slots::with_catalog_parts(

@@ -224,6 +224,53 @@ pub fn with_catalog_parts(
             }
         }
     }
+    // An explicit part retirement leaves no such part for a later container
+    // drop to release. Keep graph and replay on this same truthful description.
+    let owned: BTreeSet<_> = slots.catalog_owned.values().cloned().collect();
+    let claimed: BTreeSet<_> = slots
+        .effects
+        .iter()
+        .flat_map(|fx| fx.claims.iter().map(|(_, h)| h.clone()))
+        .collect();
+    let mut separate = BTreeSet::new();
+    for fx in &slots.effects {
+        let containers: BTreeSet<_> = fx
+            .releases
+            .iter()
+            .filter_map(|(_, h)| {
+                if let ObjectKey::Table(t) = h {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        separate.extend(fx.releases.iter().filter_map(|(_, h)| {
+            if let ObjectKey::Part { table, .. } = h {
+                (owned.contains(h) && !claimed.contains(h) && !containers.contains(table))
+                    .then_some(h.clone())
+            } else {
+                None
+            }
+        }));
+    }
+    for fx in &mut slots.effects {
+        let containers: BTreeSet<_> = fx
+            .releases
+            .iter()
+            .filter_map(|(_, h)| {
+                if let ObjectKey::Table(t) = h {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        fx.releases.retain(|(_, h)| {
+            !matches!(h, ObjectKey::Part { table, .. }
+            if separate.contains(h) && containers.contains(table))
+        });
+    }
     Ok(slots)
 }
 
