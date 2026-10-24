@@ -311,3 +311,58 @@ pub fn restrictive_permissions(server: &str, pg: bool) {
         ok(d.run(&["validate"]));
     }
 }
+
+#[cfg(unix)]
+pub fn dangling_output_parent(server: &str, pg: bool) {
+    struct PgRole<'a>(&'a str, String);
+    impl Drop for PgRole<'_> {
+        fn drop(&mut self) {
+            on_server(self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let name = format!("pbps_parent2311_{}", std::process::id());
+    // Drop the private database before the cluster role, including on failure.
+    let _role = pg.then(|| PgRole(server, name.clone()));
+    let own = OwnDatabase::new(server, "pull2311_parent");
+    on_server(own.connection(), "CREATE SCHEMA sales");
+    on_server(
+        own.connection(),
+        "CREATE TABLE sales.country (id int NOT NULL)",
+    );
+    let d = Demo::new("pull2311_parent");
+    ok(d.run(&["pull", "--db", own.connection()]));
+    on_server(own.connection(), &format!("CREATE ROLE {name}"));
+    if pg {
+        on_server(
+            own.connection(),
+            &format!("GRANT USAGE ON SCHEMA sales TO {name}"),
+        );
+    }
+    on_server(
+        own.connection(),
+        &format!("GRANT SELECT ON sales.country TO {name}"),
+    );
+    let roles = d.dir.join("schema/roles");
+    std::os::unix::fs::symlink("missing-roles", &roles).unwrap();
+    ok(d.run(&["validate"]));
+    let before = project_bytes(&d.dir);
+    let refused = d.run(&["pull", "--force", "--db", own.connection()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(
+        project_bytes(&d.dir),
+        before,
+        "output-parent failure deleted declarations"
+    );
+
+    std::fs::remove_file(&roles).unwrap();
+    ok(d.run(&["pull", "--force", "--db", own.connection()]));
+    assert!(roles.join(format!("{name}.yml")).is_file());
+    assert!(d.dir.join("schema/sales.country.yml").is_file());
+    ok(d.run(&["validate"]));
+}

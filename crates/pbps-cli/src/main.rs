@@ -1877,6 +1877,13 @@ fn cmd_pull(
             pbps_model::Text::new(dir.display().to_string()).shown()
         )
     })?;
+    // Create every output parent before removing declarations: a dangling
+    // directory link must fail while the old files are still intact (#2311).
+    for path in &written {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
     // recreation, and a view that became a procedure would leave
@@ -1898,9 +1905,6 @@ fn cmd_pull(
     }
     // Publish the exact bytes that passed validation, without rendering again.
     for path in &written {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let source = stage.path().join(path.strip_prefix(&dir)?);
         let publish = || -> std::io::Result<u64> {
             let Some(permissions) = output_permissions.get(path) else {

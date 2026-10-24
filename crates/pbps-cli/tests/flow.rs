@@ -23287,6 +23287,13 @@ fn forced_pull2311_preserves_restrictive_permissions_when_replacing_data() {
     pull_publication::restrictive_permissions(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_dangling_output_parent_refuses_before_changing_the_project() {
+    pull_publication::dangling_output_parent(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 
