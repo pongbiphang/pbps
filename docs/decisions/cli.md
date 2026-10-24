@@ -1537,3 +1537,24 @@ Pinned by:
   `crates/pbps-docs/src/erd.rs`;
 - `a_column_name_stays_inside_its_cell` in
   `crates/pbps-docs/src/markdown.rs`.
+
+<a id="dec-2330-1"></a>
+
+**DEC-2330.1. Explicit operator attribution must be nonblank before I/O;
+absence keeps the local identity fallback.** CI supplies `PBPS_OPERATOR` from
+the person running the approved deployment, overriding git's runner or bot
+identity. A set but empty or whitespace-only value is a configuration mistake,
+not an instruction to silently name that runner instead. The CLI refuses it
+by variable name with usage exit 2 before discovery, file writes or connections,
+including bootstrap's early catalog reads. A non-Unicode value is likewise
+unreadable configuration, not absence. Meaningful explicit text passes through
+`Reason`'s nonblank invariant and is preserved verbatim; every operator caller
+propagates the same fallible resolution. Environment reads stay in the CLI.
+
+When the variable is absent, git `user.name`, then `$USER`, then `unknown`
+retain their previous behavior, so ordinary local commands need no new setup.
+Persisted operator fields remain text to preserve historical audit records and
+the existing per-engine storage bounds. Attribution changes no plan checksum,
+identity intent or deployment approval. Subprocess tests isolate environment
+changes and pin explicit intent attribution, fallback ordering and pre-I/O
+refusals; the registered engine tests pin ledger attribution and preservation.

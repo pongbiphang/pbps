@@ -361,6 +361,7 @@ jobs:
       - name: apply exactly the approved artifact
         env:
           PBPS_PROD_URL: ${{ secrets.PBPS_PROD_URL }}
+          PBPS_OPERATOR: ${{ github.actor }}
           # Through the environment, never interpolated into the script: an
           # input is text somebody typed.
           CHECKSUM: ${{ inputs.checksum }}
@@ -603,6 +604,8 @@ apply:prod:
   extends: .deploys
   stage: apply
   needs: ['plan:prod']
+  variables:
+    PBPS_OPERATOR: "$GITLAB_USER_LOGIN"
   # `when: manual` decides *when*, never *who*. The environment does that, and
   # only if `production` is configured as a protected environment with its
   # deployers named — see below.
@@ -618,6 +621,14 @@ apply:prod:
 
 `PBPS_PROD_URL` is a masked, protected CI/CD variable; `APPROVED_PLAN_SHA256`
 is supplied by the approver when they run the manual job.
+
+Both apply examples set `PBPS_OPERATOR` from the actor running the approved
+deployment, so the ledger attributes it to that person instead of the runner
+account. This is attribution text, not an approval or identity-intent channel;
+the environment gate and plan checksum still supply approval. A set but blank
+or whitespace-only value is a usage error (exit 2) before any connection.
+When unset, pbps keeps the local fallback: git `user.name`, then `$USER`, then
+`unknown` (DEC-2330.1).
 
 **The GitHub half's containment does not transfer.** There the credential is
 named on individual steps, so the choice was to keep untrusted setup out of

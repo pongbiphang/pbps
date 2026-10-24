@@ -337,6 +337,31 @@ fn identity_batches_keep_annotation_provenance_and_single_edit_workflows() {
     batch_intent::annotations_and_single_edits("mssql");
 }
 
+#[path = "support/audit_operators.rs"]
+mod audit_operators;
+
+#[test]
+fn explicit_operators_are_recorded_verbatim_in_new_audit_intent() {
+    audit_operators::explicit("mssql");
+}
+
+#[test]
+fn unset_operators_keep_git_then_user_attribution() {
+    audit_operators::unset("mssql");
+}
+
+#[test]
+fn blank_operators_refuse_before_project_or_connection_io() {
+    audit_operators::before_io("mssql");
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn ci_operators_are_recorded_and_blank_overrides_leave_the_ledger_unchanged() {
+    let own = OwnDatabase::new(&std::env::var("PBPS_TEST_DB").unwrap(), "operator2330");
+    audit_operators::connected("mssql", own.connection());
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 

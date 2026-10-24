@@ -800,6 +800,45 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Commands that create audit metadata reject a misconfigured CI identity
+    // before discovery, file writes or connections (DEC-2330.1). Read-only
+    // commands can still inspect history while that configuration is repaired.
+    match &cli.command {
+        Command::Init(_)
+        | Command::Plan { .. }
+        | Command::Apply { .. }
+        | Command::Pull { .. }
+        | Command::Snapshot { .. }
+        | Command::Baseline { .. }
+        | Command::Bootstrap { .. }
+        | Command::Intent(_)
+        | Command::Rename { .. }
+        | Command::RenameTable { .. }
+        | Command::RenameRole { .. }
+        | Command::Drop { .. }
+        | Command::DropTable { .. }
+        | Command::DropRole { .. }
+        | Command::MoveRows { .. }
+        | Command::RebuildTable { .. } => {
+            operator_override(std::env::var("PBPS_OPERATOR"))?;
+        }
+        Command::Doctor { .. }
+        | Command::Validate { .. }
+        | Command::Fmt { .. }
+        | Command::Verify { .. }
+        | Command::Status { .. }
+        | Command::Explain { .. }
+        | Command::Schema { .. }
+        | Command::Completions { .. }
+        | Command::Man { .. }
+        | Command::Partitions { .. }
+        | Command::Resolver { .. }
+        | Command::Docs { .. }
+        | Command::Ui
+        | Command::Unlock { .. }
+        | Command::Key { .. }
+        | Command::State { .. } => {}
+    }
     // Validate the heterogeneous option pairs before even discovering a
     // project. A blank reason in the last pair must not admit an earlier one.
     let batch = if let Command::Intent(args) = &cli.command {
@@ -1716,7 +1755,7 @@ fn cmd_pull(
         &pulled.schema,
         &ids,
         &type_limitations,
-        &context(project.root()),
+        &context(project.root())?,
     );
     if let Err(blockers) = &resolution {
         // Only missing human intent permits publishing declarations. An
@@ -2371,11 +2410,11 @@ fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn context(root: &std::path::Path) -> Context {
-    Context {
-        operator: operator(root),
+fn context(root: &std::path::Path) -> anyhow::Result<Context> {
+    Ok(Context {
+        operator: operator(root)?,
         today: today(),
-    }
+    })
 }
 
 /// The schema with every column type in the dialect's canonical spelling.
@@ -3117,7 +3156,7 @@ fn cmd_rebuild_table(
         table,
         max_rows,
         reason,
-        &context(project.root()),
+        &context(project.root())?,
         dialect.as_ref(),
     )?;
     if updated == ids {
@@ -3144,7 +3183,7 @@ fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
         &ids,
         &intents,
         annotation_count,
-        &context(project.root()),
+        &context(project.root())?,
     ) {
         Ok(res) => {
             if res.ids == ids {
@@ -3195,7 +3234,7 @@ fn resolve_with_intent(
         ids,
         &intents,
         annotation_count,
-        &context(project.root()),
+        &context(project.root())?,
     ) {
         Ok(r) => return Ok(Ok(r)),
         Err(b) => b,
@@ -3224,7 +3263,7 @@ fn resolve_with_intent(
                 ids,
                 &intents,
                 annotation_count,
-                &context(project.root()),
+                &context(project.root())?,
             ) {
                 Ok(r) => {
                     // Written now, so the answers survive whatever the rest of
@@ -4298,15 +4337,33 @@ fn oracle_validate_saved_plan(
     Ok(())
 }
 
-/// The operator. An audit asks "who did this", and git's configuration is the
-/// closest thing to the truth available.
-/// Who is running this command: git's `user.name`, else `$USER`, whole.
+/// Validate only new explicit attribution; legacy local fallback stays intact.
+/// `Reason` supplies the nonblank invariant without changing persisted history
+/// or trimming meaningful operator text (DEC-2330.1).
+fn operator_override(
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<pbps_model::Reason>> {
+    match value {
+        Ok(value) => pbps_model::Reason::new(value).map(Some).map_err(|_| {
+            Found::new("error: PBPS_OPERATOR must not be empty or whitespace-only").into()
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(Found::new("error: PBPS_OPERATOR must contain valid Unicode text").into())
+        }
+    }
+}
+
+/// Explicit CI attribution, otherwise git's `user.name`, then `$USER`, whole.
 ///
 /// Not bounded here: a tombstone carries it into the identity file, which has
 /// no column to fit, and each engine's ledger cuts it to its own column in its
 /// own unit when it records (#1205).
-fn operator(root: &std::path::Path) -> String {
-    std::process::Command::new("git")
+fn operator(root: &std::path::Path) -> anyhow::Result<String> {
+    if let Some(operator) = operator_override(std::env::var("PBPS_OPERATOR"))? {
+        return Ok(operator.as_ref().to_owned());
+    }
+    Ok(std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["config", "user.name"])
@@ -4316,7 +4373,7 @@ fn operator(root: &std::path::Path) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "unknown".to_owned())
+        .unwrap_or_else(|| "unknown".to_owned()))
 }
 
 /// One value of `apply --allow`: a risk class, or nothing (#1203).

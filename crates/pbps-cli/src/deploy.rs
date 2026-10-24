@@ -5756,10 +5756,10 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
 
 /// `pbps snapshot` — record the current state, refusing to bless a difference.
 pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::Result<()> {
+    let operator = crate::operator(project.root())?;
     let ids = crate::read_ids(project)?;
     let (declared_modules, declared_data, loaded) =
         declared_scope(project, crate::dialect(project)?.as_ref())?;
-    let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
@@ -5989,10 +5989,10 @@ pub fn cmd_baseline(
     target: &Target,
     reason: &pbps_model::Reason,
 ) -> anyhow::Result<()> {
+    let operator = crate::operator(project.root())?;
     let ids = crate::read_ids(project)?;
     let dialect = crate::dialect(project)?;
     let (declared_modules, declared_data, loaded) = declared_scope(project, dialect.as_ref())?;
-    let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
@@ -6300,6 +6300,7 @@ pub fn cmd_bootstrap(
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    let operator = crate::operator(project.root())?;
     let dialect = crate::dialect(project)?;
     pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
         let mut loaded = crate::load(project, dialect.as_ref())?;
@@ -6505,7 +6506,6 @@ pub fn cmd_bootstrap(
                 .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
             &dialect,
         )?;
-        let operator = crate::operator(project.root());
 
         db::runtime()?.block_on(async {
             let mut conn = db::connect(target).await?;
@@ -6830,7 +6830,7 @@ pub fn cmd_plan_db(
             &ids,
             &loaded.intents,
             loaded.intents.len(),
-            &crate::context(project.root()),
+            &crate::context(project.root())?,
         ) {
             Ok(r) => r,
             Err(blockers) => {
@@ -8095,8 +8095,8 @@ pub fn cmd_apply(
     target: &Target,
     request: &ApplyRequest<'_>,
 ) -> anyhow::Result<()> {
+    let operator = crate::operator(project.root())?;
     let dialect = crate::dialect(project)?;
-    let operator = crate::operator(project.root());
     let plan_path = request.plan_path;
 
     // Before this point there is no artifact to report on: the attempt event

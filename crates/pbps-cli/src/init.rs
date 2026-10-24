@@ -442,7 +442,7 @@ fn mint_ids(schema: &Schema, root: &Path) -> anyhow::Result<IdsFile> {
     // every *other* blocker kind unreachable, but `UnrepresentableName`
     // depends only on what the database handed back, and `init --from` is
     // exactly the second place that can happen (issue #108).
-    pbps_diff::resolve(schema, &IdsFile::default(), &[], &context(root))
+    pbps_diff::resolve(schema, &IdsFile::default(), &[], &context(root)?)
         .map(|resolved| resolved.ids)
         .map_err(|blockers| {
             anyhow::anyhow!(
