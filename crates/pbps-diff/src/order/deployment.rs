@@ -756,7 +756,7 @@ fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<
 }
 
 /// The change that removes a dependent the plan does not remove yet.
-fn removal_of(
+pub(super) fn removal_of(
     d: &Dependent,
     declared: &Schema,
     located: Option<ColumnAt>,
@@ -841,7 +841,7 @@ fn removal_of(
 }
 
 /// The change that puts a declared dependent back.
-fn restoration_of(
+pub(super) fn restoration_of(
     d: &Dependent,
     declared: &Schema,
     located: Option<ColumnAt>,
@@ -923,7 +923,11 @@ fn restoration_of(
 
 /// Only defaults need a column owner when synthesizing a table part. A
 /// missing source remains an error in `default_change`, never a new holder.
-fn default_location(sources: &PhysicalSources<'_>, original: &Holds, at: At) -> Option<ColumnAt> {
+pub(super) fn default_location(
+    sources: &PhysicalSources<'_>,
+    original: &Holds,
+    at: At,
+) -> Option<ColumnAt> {
     let Holds::TablePart {
         table,
         part: Part::Default(column),

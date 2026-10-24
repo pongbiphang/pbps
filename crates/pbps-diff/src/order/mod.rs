@@ -55,6 +55,7 @@ pub mod new_tables;
 pub(crate) mod normalization;
 pub mod parent_defaults;
 mod plan;
+pub mod rebuild;
 pub mod release_inputs;
 pub(crate) mod rename_order;
 pub(crate) mod resolver_finish;
