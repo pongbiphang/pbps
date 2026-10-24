@@ -267,3 +267,29 @@ fn missing_source_and_unaccounted_descriptions_are_shown_once() {
     );
     assert!(weave.dependent(&root, 1).is_err());
 }
+
+#[test]
+fn stored_columns_are_carried_only_when_someone_read_them() {
+    use pbps_model::operation::{MembershipCatalog, StoredColumn};
+    let stored = MembershipCatalog {
+        columns: [(
+            "app.p.d".parse().unwrap(),
+            StoredColumn {
+                default: Some("1".into()),
+                ..Default::default()
+            },
+        )]
+        .into(),
+    };
+    // Nobody asked is not the same as asked and found nothing.
+    assert!(schedule::Facts::default().membership_catalog().is_none());
+    let empty = MembershipCatalog::default();
+    let read = schedule::Facts::default().with_membership_catalog(&empty);
+    assert_eq!(read.membership_catalog(), Some(&empty));
+    let read = read.with_membership_catalog(&stored);
+    assert_eq!(read.membership_catalog(), Some(&stored));
+    // The facts the carrier already held stay put.
+    let dependents = schedule::ModuleDependents::default();
+    let both = read.with_module_dependents(&dependents);
+    assert_eq!(both.membership_catalog(), Some(&stored));
+}

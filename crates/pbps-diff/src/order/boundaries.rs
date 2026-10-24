@@ -2,7 +2,8 @@
 //! A settled permutation alone does not discharge a membership contract.
 use super::membership;
 use pbps_model::operation::{
-    Effects, ModuleEdits, Operation, OperationId, Operations, Origin,
+    Effects, End, Lineage, ModuleEdits, Operation, OperationId, Operations, Origin, Snapshot,
+    Standing,
     symbolic::{Clause, MoveKind, State},
 };
 use pbps_model::{Change, ChangeSet, Uid};
@@ -164,6 +165,39 @@ pub(crate) fn meetings(
         }
     }
     result
+}
+
+fn snapshot(side: crate::Side<'_>) -> Snapshot<'_> {
+    Snapshot {
+        schema: side.schema,
+        ids: side.ids,
+    }
+}
+
+/// Relations whose stored columns the connected seam must read: a parent whose
+/// columns change in the same plan as its membership, and every table that
+/// stands in its family at the baseline. This is a catalog query scope, never
+/// the target of a recursive write.
+pub fn catalog_tables(
+    changes: &ChangeSet,
+    before: crate::Side<'_>,
+    after: crate::Side<'_>,
+) -> BTreeSet<Uid> {
+    let parents: BTreeSet<_> = meetings(before, after, changes)
+        .into_iter()
+        .map(|b| b.parent)
+        .collect();
+    let lineage = Lineage::of(snapshot(before), snapshot(after));
+    lineage
+        .families()
+        .filter(|(p, f)| parents.contains(p.uid()) && f.present(End::Base))
+        .flat_map(|(p, f)| {
+            let held = f
+                .children()
+                .filter(|c| f.standing(c, End::Base) != Standing::Absent);
+            std::iter::once(p).chain(held).map(|r| r.uid().clone())
+        })
+        .collect()
 }
 
 #[cfg(test)]

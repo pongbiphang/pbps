@@ -3891,9 +3891,39 @@ pub async fn account_for_module_dependents<
     // catalog just said depends on the modules this plan drops, then the
     // passes that read nothing.
     let policies = policy_dependents(conn, &changes, sources.after, sources.before.schema).await?;
+    // Only a plan that moves a partition while changing its parent's columns
+    // reads stored column facts. The read stays in this transaction and call,
+    // beside the dependents it is consulted with (DEC-2296.2).
+    let tables = pbps_diff::order::boundary_catalog_tables(
+        &changes,
+        sources.before,
+        pbps_diff::Side {
+            schema: declared,
+            ids: sources.after,
+        },
+    );
+    let stored = if tables.is_empty() {
+        None
+    } else {
+        Some(
+            pbps_pg::modules::dependencies::references(
+                conn,
+                pbps_model::operation::Snapshot {
+                    schema: sources.before.schema,
+                    ids: sources.before.ids,
+                },
+                &tables,
+            )
+            .await?,
+        )
+    };
     let facts = read
         .with_module_dependents(&found)
         .with_policy_dependents(&policies);
+    let facts = match &stored {
+        Some(stored) => facts.with_membership_catalog(stored),
+        None => facts,
+    };
     let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &facts, dialect)?;
     let changes = scheduled.changes;
     pbps_diff::order::row_security::check_releases(&changes, sources.after, &policies)?;

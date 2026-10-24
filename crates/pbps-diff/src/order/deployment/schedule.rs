@@ -60,6 +60,7 @@ pub struct Facts<'a> {
     module_dependents: Option<&'a ModuleDependents>,
     role_members: Option<&'a RoleMembers>,
     policy_dependents: Option<&'a crate::order::row_security::PolicyDependents>,
+    membership_catalog: Option<&'a pbps_model::operation::MembershipCatalog>,
 }
 
 impl<'a> Facts<'a> {
@@ -80,6 +81,24 @@ impl<'a> Facts<'a> {
             policy_dependents: Some(policies),
             ..self
         }
+    }
+
+    /// The stored columns of the partition families whose membership and
+    /// columns change in one plan (`boundary_catalog_tables`), read in the
+    /// same call and transaction as the module dependents.
+    pub fn with_membership_catalog(
+        self,
+        stored: &'a pbps_model::operation::MembershipCatalog,
+    ) -> Self {
+        Self {
+            membership_catalog: Some(stored),
+            ..self
+        }
+    }
+
+    /// What `with_membership_catalog` carried, if anyone asked.
+    pub fn membership_catalog(&self) -> Option<&'a pbps_model::operation::MembershipCatalog> {
+        self.membership_catalog
     }
 
     /// The members of every role the plan drops, as read. A dropped role the

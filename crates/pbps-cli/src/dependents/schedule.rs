@@ -70,9 +70,40 @@ pub(crate) struct Facts<'a> {
     module_dependents: Option<&'a ModuleDependents>,
     role_members: Option<&'a RoleMembers>,
     policy_dependents: Option<&'a crate::row_security::PolicyDependents>,
+    membership_catalog: Option<&'a pbps_model::operation::MembershipCatalog>,
 }
 
 impl<'a> Facts<'a> {
+    /// The same facts, in the form the pure schedule takes.
+    fn owned(&self) -> pbps_diff::order::deployment::schedule::Facts<'a> {
+        let mut read = pbps_diff::order::deployment::schedule::Facts::default();
+        if let Some(found) = self.module_dependents {
+            read = read.with_module_dependents(found);
+        }
+        if let Some(found) = self.role_members {
+            read = read.with_role_members(found);
+        }
+        if let Some(found) = self.policy_dependents {
+            read = read.with_policy_dependents(found);
+        }
+        if let Some(found) = self.membership_catalog {
+            read = read.with_membership_catalog(found);
+        }
+        read
+    }
+
+    /// The stored columns of the partition families a plan moves while it
+    /// changes their parents' columns, as read.
+    pub(crate) fn with_membership_catalog(
+        self,
+        stored: &'a pbps_model::operation::MembershipCatalog,
+    ) -> Self {
+        Self {
+            membership_catalog: Some(stored),
+            ..self
+        }
+    }
+
     /// The dependents of every module the plan drops or rebuilds, as read.
     pub(crate) fn with_module_dependents(self, found: &'a ModuleDependents) -> Self {
         Self {
@@ -164,16 +195,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::E
         },
         module_deps: declared.module_deps,
     };
-    let mut read = owned::schedule::Facts::default();
-    if let Some(found) = facts.module_dependents {
-        read = read.with_module_dependents(found);
-    }
-    if let Some(found) = facts.role_members {
-        read = read.with_role_members(found);
-    }
-    if let Some(found) = facts.policy_dependents {
-        read = read.with_policy_dependents(found);
-    }
+    let read = facts.owned();
     #[cfg(test)]
     let expected = oracle_schedule(
         pbps_diff::order::propose(cs.changes().clone()),
@@ -226,16 +248,7 @@ pub(crate) fn schedule_fixture<S: pbps_diff::order::RouteState<dyn Dialect>>(
         },
         module_deps: declared.module_deps,
     };
-    let mut read = owned::schedule::Facts::default();
-    if let Some(found) = facts.module_dependents {
-        read = read.with_module_dependents(found);
-    }
-    if let Some(found) = facts.role_members {
-        read = read.with_role_members(found);
-    }
-    if let Some(found) = facts.policy_dependents {
-        read = read.with_policy_dependents(found);
-    }
+    let read = facts.owned();
     #[cfg(test)]
     let expected = oracle_schedule(
         pbps_diff::order::propose(cs.changes().clone()),

@@ -72,6 +72,7 @@ pub mod slots;
 pub mod verify;
 pub mod writebacks;
 
+pub use boundaries::catalog_tables as boundary_catalog_tables;
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use plan::singleton;
