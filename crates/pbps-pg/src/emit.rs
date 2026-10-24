@@ -61,6 +61,7 @@ use crate::types::DIALECT;
 use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
+mod rebuild;
 
 #[cfg(test)]
 mod declared_type_emission_tests {
@@ -1390,6 +1391,16 @@ fn create_index(
     index: &Index,
     strategy: Strategy,
 ) -> Result<String, DialectError> {
+    create_index_on(table, name, index, strategy, false)
+}
+
+fn create_index_on(
+    table: &TableName,
+    name: &str,
+    index: &Index,
+    strategy: Strategy,
+    only: bool,
+) -> Result<String, DialectError> {
     // A GIN key has no order: measured on 18.6, `ASC`/`DESC` on one is
     // "access method \"gin\" does not support ASC/DESC options" (DEC-1169.1).
     let ordered = index.method.is_btree();
@@ -1419,7 +1430,7 @@ fn create_index(
         .join(", ");
 
     let mut s = format!(
-        "CREATE {}INDEX {}{} ON {}{} ({keys})",
+        "CREATE {}INDEX {}{} ON {}{}{} ({keys})",
         if index.unique { "UNIQUE " } else { "" },
         if built_concurrently(index, strategy) {
             "CONCURRENTLY "
@@ -1427,6 +1438,7 @@ fn create_index(
             ""
         },
         quote(name)?,
+        if only { "ONLY " } else { "" },
         qualified(table)?,
         if ordered {
             String::new()
@@ -3109,12 +3121,30 @@ name = pbps_model::escape::Escaped(&name),))
     found
 }
 
+pub(crate) fn emit_staged(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
+    if let Some((operation, table)) = change.pending_rebuild() {
+        return Err(DialectError::RebuildUnavailable {
+            operation,
+            table: table.clone(),
+        });
+    }
+    staged_attach(change).unwrap_or_else(|| emit(pg, change, strategy))
+}
+
+fn add_key_sql(table: &TableName, clause: &str, only: bool) -> Result<String, DialectError> {
+    Ok(format!(
+        "ALTER TABLE {}{} ADD {clause};",
+        if only { "ONLY " } else { "" },
+        qualified(table)?
+    ))
+}
+
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
-        Change::RebuildPartitionedTable(_)
-        | Change::BuildPartitionedIndex(_)
-        | Change::CopyTableRows(_)
-        | Change::AnalyzeTableTree(_) => {
+        Change::BuildPartitionedIndex(recipe) => rebuild::build_partitioned_index(pg, recipe),
+        Change::CopyTableRows(copy) => rebuild::copy_table_rows(pg, copy),
+        Change::AnalyzeTableTree(tree) => rebuild::analyze_table_tree(pg, tree),
+        Change::RebuildPartitionedTable(_) => {
             let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
             Err(DialectError::RebuildUnavailable {
                 operation,
@@ -3863,11 +3893,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 out.push(on(
                     pg,
                     table,
-                    &format!(
-                        "ALTER TABLE {} ADD {};",
-                        qualified(table)?,
-                        primary_key_clause(pk)?
-                    ),
+                    &add_key_sql(table, &primary_key_clause(pk)?, false)?,
                 )?);
             }
             Ok(out)
@@ -3895,11 +3921,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         } => one(
             pg,
             table,
-            format!(
-                "ALTER TABLE {} ADD {};",
-                qualified(table)?,
-                unique_clause(name.raw(), constraint)?
-            ),
+            add_key_sql(table, &unique_clause(name.raw(), constraint)?, false)?,
         ),
 
         Change::AddForeignKey {
@@ -5865,21 +5887,22 @@ pub(crate) fn generation_placeholder(ty: &pbps_model::ColumnType) -> Result<Stri
 
 #[cfg(test)]
 #[test]
-fn rebuild_parts_are_refused_by_name_before_sql_emission() {
+fn rebuild_root_and_staged_parts_are_refused_by_name_before_sql_emission() {
     let changes: Vec<Change> = serde_json::from_str(include_str!(
         "../../pbps-model/tests/fixtures/rebuild_operations.json"
     ))
     .unwrap();
-    #[path = "../../pbps-model/tests/support/rebuild.rs"]
-    mod recipe_fixture;
     for change in changes
         .into_iter()
         .chain([Change::BuildPartitionedIndex(Box::new(
-            recipe_fixture::index_recipe(),
+            rebuild::fixture::index_recipe(),
         ))])
     {
         let (operation, table) = change.pending_rebuild().unwrap();
-        let error = emit(&Postgres::default(), &change, Strategy::default()).unwrap_err();
+        if matches!(change, Change::RebuildPartitionedTable(_)) {
+            assert!(emit(&Postgres::default(), &change, Strategy::default()).is_err());
+        }
+        let error = emit_staged(&Postgres::default(), &change, Strategy::default()).unwrap_err();
         assert_eq!(
             error,
             DialectError::RebuildUnavailable {
