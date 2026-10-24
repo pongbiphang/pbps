@@ -147,6 +147,13 @@ pub fn before_changes(desired: &IdsFile, changes: &ChangeSet) -> IdsFile {
             Change::CreateType { uid, .. } => {
                 base.types.remove(uid);
             }
+            Change::AddEnumValue { uid, name, .. } | Change::RenameEnumValue { uid, name, .. } => {
+                // The label operation certifies an existing holder even when
+                // only statement metadata, rather than a pin bundle, is present.
+                base.types
+                    .entry(uid.clone())
+                    .or_insert_with(|| name.clone());
+            }
             Change::DropType { uid, name, .. }
             | Change::RenameType {
                 uid, from: name, ..
@@ -167,7 +174,10 @@ pub fn after_changes(base: &IdsFile, changes: &ChangeSet) -> IdsFile {
             Change::DropType { uid, .. } => {
                 desired.types.remove(uid);
             }
-            Change::CreateType { uid, name, .. } | Change::RenameType { uid, to: name, .. } => {
+            Change::AddEnumValue { uid, name, .. }
+            | Change::RenameEnumValue { uid, name, .. }
+            | Change::CreateType { uid, name, .. }
+            | Change::RenameType { uid, to: name, .. } => {
                 desired.types.insert(uid.clone(), name.clone());
             }
             _ => {}
@@ -179,6 +189,39 @@ pub fn after_changes(base: &IdsFile, changes: &ChangeSet) -> IdsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_only_operations_reconstruct_their_declared_holder_without_inventing_other_types() {
+        let uid: Uid = "y_000001".parse().unwrap();
+        let name: TypeRef = "app.e".parse().unwrap();
+        let steps = ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::RenameEnumValue {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: "old".into(),
+                to: "new".into(),
+                ordinal: 0,
+                definition: Box::new(ManagedType::Enum {
+                    values: vec!["new".into()],
+                }),
+            })],
+        };
+        for ids in [
+            before_changes(&IdsFile::default(), &steps),
+            after_changes(&IdsFile::default(), &steps),
+        ] {
+            let resolver = TypeResolver::new(&ids, &ids);
+            assert_eq!(
+                resolver.resolve(TypeSide::Base, &name),
+                TypeIdentity::Declared(&uid)
+            );
+            let unknown = "app.other".parse().unwrap();
+            assert_eq!(
+                resolver.resolve(TypeSide::Desired, &unknown),
+                TypeIdentity::ExternalOrUnrecorded(&unknown)
+            );
+        }
+    }
 
     #[test]
     fn each_side_resolves_its_uid_and_unrecorded_names_stay_external() {

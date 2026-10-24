@@ -560,7 +560,9 @@ pub fn names(
             nx.claim(role_address(to), holder);
         }
         // A module rebuilt in place keeps its name; the rest take none.
-        Change::AlterModule { .. }
+        Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
+        | Change::AlterModule { .. }
         | Change::AttachPartition { .. }
         | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }

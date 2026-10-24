@@ -2981,7 +2981,11 @@ fn touches(change: &Change, table: &TableName) -> bool {
     // touching every table reverses a type-to-table slot handover.
     if matches!(
         change,
-        Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. }
+        Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
     ) {
         return false;
     }

@@ -227,13 +227,13 @@ The differ sorts every planned change by, in order:
    | Class | Changes |
    |---|---|
    | 0 | `DropPolicy` before every module-drop rank; `DropModule`, `DropRole`; P: `SetReplicaIdentity` to a target that stands, at (0, 1) |
-   | 1 | `RenameTable`, `RenameRole` |
+   | 1 | `RenameTable`, `RenameRole`, `RenameType` |
    | 2 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }`; `DropComputedColumn` at the class's end (2, 4) |
    | 3 | `RenameColumn` |
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
    | 6 | `DropTable`; an `AlterColumnNumbering` giving up, renaming, or (on a column neither tightened nor retyped) turning into an identity an owned sequence, at (6, 1 + its depth in the chain of names they free) |
-   | 7 | `CreateTable` |
+   | 7 | `CreateType`, `AddEnumValue`, `RenameEnumValue` before `CreateTable` |
    | 8 | `AddColumn` |
    | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
@@ -404,6 +404,7 @@ requirement is common to all of them, so it is listed once,
 | `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
 | `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |
+| `AddEnumValue`, `RenameEnumValue` | 7, before tables; approved step ordinal | P: its type standing under its final name; its neighbour or old label present; rename target absent | Rewrites the same type uid at each intermediate definition; rename also changes deparsed constants and returned labels | Exists, rewrites |
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
@@ -829,6 +830,11 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 | DropType of a domain → DropType of its base | dependent domain gone first | reverse baseline domain-base depth rank within class 18, plus `Absent(Type)` effect |
 | Drop/rename a type, table or view → claim its Types name | old holder releases first | existing slot handover edges, including cross-kind class inversions |
 | RenameType chains | free destination first | existing slot edges; cycles/swaps refuse by name in the differ |
+| RenameType → AddEnumValue/RenameEnumValue | final type spelling first | class 1 before class 7; same uid resource |
+| AddEnumValue/RenameEnumValue → typed tables, columns, defaults, checks, modules and dependent domains | labels/spellings first | class 7 type subrank before tables; existing final-type effects and two-write base order; later classes 8/9/13/14 |
+| Label changes on one uid | approved intermediate order | rank by operation ordinal inside the existing type subrank; the existing resource-write edge preserves it |
+| AddEnumValue → any same-plan evaluation of its new label | transactional use refused by name | plan-time refusal (DEC-1635.6), including enum arrays and domains; apply the label first, then the rest |
+| Label changes → reference-data rows or enum-rooted partition bounds | not declarable today | DEC-1523.1 refuses the surface before a use check or ordering obligation; #2346 tracks admission |
 | Independent type operations and all remaining pairs | no dependency | stable class/rank key; no extra pass |
 
 The shadow verifier uses the same type resources, final-incarnation requirements,

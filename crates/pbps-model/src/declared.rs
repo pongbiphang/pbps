@@ -362,7 +362,13 @@ impl Declared {
                 | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
-                Change::CreateType {
+                Change::AddEnumValue {
+                    name, definition, ..
+                }
+                | Change::RenameEnumValue {
+                    name, definition, ..
+                }
+                | Change::CreateType {
                     name, definition, ..
                 } => {
                     self.types.insert(name.clone(), (**definition).clone());

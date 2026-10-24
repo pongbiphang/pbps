@@ -285,13 +285,15 @@ where
     plan.version = 44;
     state.version = 27;
     state.plan_checksum = Some(plan.wire_fingerprint());
-    // Strip the type branches from set 54 (extended in set 56) and the
+    // Strip the type branches from set 54 (extended in sets 56 and 59) and the
     // dependency branch from set 58. Captured legacy branches must still
     // keep their exact contract and bytes.
     let mut declaration_schema =
         serde_json::to_value(schemars::schema_for!(pbps_load::dto::DeclarationFile)).unwrap();
     for name in [
         "EnumTypeDto",
+        "EnumValueDto",
+        "EnumValueIntentDto",
         "DomainTypeDto",
         "DependencyDto",
         "DependencyName",

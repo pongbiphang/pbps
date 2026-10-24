@@ -74,7 +74,7 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{IdsFile, IdsIndex, Move, Tombstone, ValidIds};
 pub use intent::Intent;
-pub use managed_type::ManagedType;
+pub use managed_type::{EnumPlacement, ManagedType};
 pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,
     RoutineArg, RoutineArgError, RoutineId,

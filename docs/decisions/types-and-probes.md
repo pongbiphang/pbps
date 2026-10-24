@@ -2899,3 +2899,70 @@ references, including arrays, preserve rename chains and intermediate-holder
 handoffs, and refuse changed live definitions. Warning tests cover both
 report channels and all three warning negatives. Each repaired site is checked
 by temporarily reverting its behavior with a copy of the file retained aside.
+
+
+<a id="dec-1635-6"></a>
+
+**DEC-1635.6. Slice 3a adds and explicitly renames enum labels; reference-data and partition-key admission stays in #2346.**
+`AddEnumValue` emits ALTER TYPE ADD VALUE, and `RenameEnumValue` emits
+ALTER TYPE RENAME VALUE. A label accepts a string or `{name, renamed_from}`;
+one-shot intent stays beside Schema, never in its equality. Adding a label
+carries no intrinsic risk, as CreateType does. Renaming carries Rename, as
+RenameType does, because existing stored values return a different spelling.
+Both operations use the existing class-7 type subrank and approved ordinal;
+whole-type rename stays class 1. Exists/final-type rewrite effects and the
+existing schedule place labels before their dependents; no pass is added.
+
+Renames execute while the target is free. PostgreSQL 16.15 and 18.6 accept a
+chain with the last destination freed first and reject a direct swap with
+"enum label already exists". As for type names, chains work and cycles or
+occupied targets refuse by name. After renames, retained labels keep their
+relative order. Additions walk the declared order from left to right: AFTER
+the previous desired label, BEFORE the first existing label at the start, or
+no neighbour for the first label of an empty enum. Each operation carries its
+exact intermediate after-definition for per-statement checks, staging and
+resume through the side-specific resolver (DEC-2321.1).
+
+The measured BEGIN/ADD VALUE/use results are the same on PG 16.15 and 18.6:
+
+| Use | enum | enum array | domain over enum | Declaration scope |
+|---|---|---|---|---|
+| Column default | unsafe use refused | unsafe use refused | unsafe use refused | declarable |
+| CHECK | unsafe use refused | unsafe use refused | unsafe use refused | declarable |
+| Row insert | unsafe use refused | unsafe use refused | unsafe use refused | not declarable today (DEC-1523.1, #2346) |
+| LIST partition bound | unsafe use refused | unsafe use refused | unsafe use refused | not declarable today (DEC-1523.1, #2346) |
+
+Creating a domain with its own default or CHECK over an enum or enum array
+also refuses, measured on both versions. Views, SQL string-body functions
+and SQL BEGIN ATOMIC functions also refuse
+same-transaction evaluation. PL/pgSQL functions and procedures are accepted
+at creation because their bodies bind on invocation; they remain admitted.
+Planning refuses the still-declarable uses: column defaults/CHECKs over the
+enum, arrays or domains, a domain's own default/CHECK, and created/altered views
+or SQL-bodied routines containing the quoted label. The named remedy is
+"apply the label first, then the rest". The ordinary table validation rejects
+`data:` on every user-defined reference or array, and rejects reference-valued
+partition keys, before this use check can arise. DEC-1523.1 is unchanged;
+admitting those surfaces belongs to #2346, not slice 3a.
+
+PostgreSQL stores enum constants by oid: renaming sad to blue changes a
+retained `m <> 'sad'` CHECK and a default's catalog text without rebuilding
+either. Comparison forwards only approved labels in typed expected SQL
+constants, including enum-array constants, retaining dimensions, NULL,
+escaping, comments and unrelated text constants. Authored defaults use the
+column's type; uncast authored checks require their referenced columns to
+belong to the enum; catalog comparisons require a bound enum/domain cast.
+The same expression adapter covers already-declarable generated/index/policy/
+module expressions and partition-own defaults on non-reference partition keys,
+so the closing guard does not mistake their OID-driven deparse for drift.
+Expected row values and partition bounds are not forwarded. The declaration
+record advances existing expression provenance without inventing it for adopted
+expressions; raw catalog checksums remain unmodified evidence.
+
+Unannotated label removal and retained-label reordering stay named refusals
+with the #1635 slice 3b remedy. Domain alterations stay slice 4. Saved plan 52
+is retained because its checksum-pinned change payload now includes the two
+label operations and their intermediate definitions. Published schema set 59
+admits the YAML label intent. No row codec, contextual table-validation
+exception, speculative type inventory, absent-type value deferral, transient
+uid or connected value-probe reversal is introduced by this slice.

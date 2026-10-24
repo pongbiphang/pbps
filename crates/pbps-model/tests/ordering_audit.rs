@@ -316,6 +316,32 @@ mod effects_of_each_kind {
         new_table.foreign_keys.insert("f".into(), fk());
         let mut out = vec![
             (
+                "AddEnumValue",
+                Change::AddEnumValue {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    value: "new".into(),
+                    placement: Some(EnumPlacement::After("ok".into())),
+                    ordinal: 0,
+                    definition: Box::new(ManagedType::Enum {
+                        values: vec!["ok".into(), "new".into()],
+                    }),
+                },
+            ),
+            (
+                "RenameEnumValue",
+                Change::RenameEnumValue {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    from: "ok".into(),
+                    to: "fine".into(),
+                    ordinal: 0,
+                    definition: Box::new(ManagedType::Enum {
+                        values: vec!["fine".into()],
+                    }),
+                },
+            ),
+            (
                 "CreateType",
                 Change::CreateType {
                     uid: uid(UidKind::Type, "new_domain"),

@@ -740,6 +740,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::SetColumnDeprecated { .. }
+        | Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -897,6 +899,8 @@ fn changes_catalog(c: &Change) -> bool {
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

@@ -95,7 +95,10 @@ fn reference_uses<'a>(
                 // recorded cells, its carried type is the declared one.
                 types.extend(key_type.iter().map(|ty| (TypeSide::Desired, ty)));
             }
-            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+            Change::AddEnumValue { definition, .. }
+            | Change::RenameEnumValue { definition, .. }
+            | Change::CreateType { definition, .. }
+            | Change::RenameType { definition, .. } => {
                 if let pbps_model::ManagedType::Domain { base, .. } = definition.as_ref()
                     && base.type_ref().is_some_and(|r| r.schema() != "pg_catalog")
                 {
@@ -189,7 +192,10 @@ pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeR
         .collect();
     for planned in &changes.changes {
         match &planned.change {
-            Change::CreateType { name, .. } | Change::DropType { name, .. } => {
+            Change::AddEnumValue { name, .. }
+            | Change::RenameEnumValue { name, .. }
+            | Change::CreateType { name, .. }
+            | Change::DropType { name, .. } => {
                 names.insert(name.clone());
             }
             Change::RenameType { from, to, .. } => {
