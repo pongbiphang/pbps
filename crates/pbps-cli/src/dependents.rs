@@ -767,11 +767,12 @@ fn removal_of(
             // Only a declared module reaches here: an undeclared one the plan
             // does not remove was refused above, and one it does remove is
             // moved rather than synthesized.
-            let kind = declared
-                .modules
-                .get(x)
-                .map(|m| m.kind)
-                .ok_or_else(|| format!("{}: its kind is not declared", d.described))?;
+            let kind = declared.modules.get(x).map(|m| m.kind).ok_or_else(|| {
+                format!(
+                    "{}: its kind is not declared",
+                    pbps_model::escape::Escaped(&d.described)
+                )
+            })?;
             Ok(Change::DropModule {
                 id: x.clone(),
                 kind,
@@ -818,11 +819,14 @@ fn removal_of(
             Part::Generated(_) => {
                 return Err(format!(
                     "{}: a generated column's expression cannot be taken off around the module",
-                    d.described
+                    pbps_model::escape::Escaped(&d.described)
                 ));
             }
         }),
-        Holds::Unrepresentable(why) => Err(format!("{} — {why}", d.described)),
+        Holds::Unrepresentable(why) => Err(format!(
+            "{} — {why}",
+            pbps_model::escape::Escaped(&d.described)
+        )),
     }
 }
 
@@ -836,7 +840,7 @@ fn restoration_of(
     let unsupported = || {
         format!(
             "{}: the declarations hold it, but not in a form pbps can restore",
-            d.described
+            pbps_model::escape::Escaped(&d.described)
         )
     };
     match &d.holds {
@@ -1068,7 +1072,7 @@ fn oracle_weave(
                     "`{root}` is rebuilt while this plan detaches {} from {table}, whose {} \
                      calls it; rebuild it and detach in separate plans",
                     moving.join(", "),
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     table = table.shown(),
                     root = root.shown()
                 ));
@@ -1170,21 +1174,21 @@ impl std::fmt::Display for Named {
             Need::Split { root, .. } => write!(
                 f,
                 "{} is edited in one step and has to be split around `{root}`",
-                self.described,
+                pbps_model::escape::Escaped(&self.described),
                 root = root.shown()
             ),
             Need::Removed { root, .. } => {
                 write!(
                     f,
                     "{} has to be gone before `{root}` is dropped",
-                    self.described,
+                    pbps_model::escape::Escaped(&self.described),
                     root = root.shown()
                 )
             }
             Need::Restored { root, .. } => write!(
                 f,
                 "{} has to come back after `{root}` is created",
-                self.described,
+                pbps_model::escape::Escaped(&self.described),
                 root = root.shown()
             ),
         }
@@ -1379,7 +1383,12 @@ impl Expansion for Weave<'_> {
                         let here = Dependent {
                             described: d.described.clone(),
                             holds: named_at(&view, At::Before(at.drop_at), &d.holds).ok_or_else(
-                                || format!("{}: physical source is unavailable", d.described),
+                                || {
+                                    format!(
+                                        "{}: physical source is unavailable",
+                                        pbps_model::escape::Escaped(&d.described)
+                                    )
+                                },
                             )?,
                         };
                         let final_name = as_declared(&view, d).unwrap_or_else(|| here.clone());
@@ -1437,7 +1446,10 @@ impl Expansion for Weave<'_> {
                     None if at.create_at.is_some() => {
                         let here_at = boundary(changes, after + 1);
                         let here = named_at(&view, here_at, &d.holds).ok_or_else(|| {
-                            format!("{}: physical source is unavailable", d.described)
+                            format!(
+                                "{}: physical source is unavailable",
+                                pbps_model::escape::Escaped(&d.described)
+                            )
                         })?;
                         let change = restoration_of(
                             &kept,
@@ -1468,7 +1480,7 @@ impl Expansion for Weave<'_> {
                         "`{root}` is dropped by this plan, and {} depends on it and is kept by \
                          the declarations. Remove the dependency from its declaration, or keep \
                          `{root}`, and plan again.",
-                        d.described,
+                        pbps_model::escape::Escaped(&d.described),
                         root = root.shown()
                     )),
                 }
@@ -4379,7 +4391,7 @@ pub(crate) fn unaccounted(
             if !removed_first {
                 out.push(format!(
                     "{} depends on `{root}`",
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     root = root.shown()
                 ));
             }
@@ -7304,7 +7316,7 @@ mod tests {
         let found = BTreeMap::from([(
             id("app.f(integer)"),
             vec![Dependent {
-                described: "constraint ev_ck on table app.ev".into(),
+                described: "constraint\n\u{1b}[31m\u{202e}\\n名前_ünï on table app.ev".into(),
                 holds: Holds::TablePart {
                     table: ev.clone(),
                     part: Part::Check("ev_ck".into()),
@@ -7320,10 +7332,9 @@ mod tests {
         };
         let mut cs = plan(vec![alter(&s, "app.f(integer)"), detach]);
         let why = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).expect_err("refused");
-        assert!(
-            why.contains("detaches app.ev_1 from app.ev")
-                && why.contains("rebuild it and detach in separate plans"),
-            "{why}"
+        assert_eq!(
+            why,
+            r"`app.f(integer)` is rebuilt while this plan detaches app.ev_1 from app.ev, whose constraint\n\u{1b}[31m\u{202e}\\n名前_ünï on table app.ev calls it; rebuild it and detach in separate plans"
         );
         // Negative: the rebuild alone, or with the partition dropped, takes
         // the parent's check down and puts it back on the parent.
@@ -8626,7 +8637,9 @@ mod tests {
     #[test]
     fn a_kept_dependent_of_a_function_dropped_for_good_is_refused_not_rebuilt() {
         let (s, ids) = declared();
-        let found = BTreeMap::from([(id("app.f(integer)"), vec![view("app.v0")])]);
+        let mut dependent = view("app.v0");
+        dependent.described = "view app.v0\n\u{1b}[31m\u{202e}\\n名前_ünï".into();
+        let found = BTreeMap::from([(id("app.f(integer)"), vec![dependent])]);
         let drop = || Change::DropModule {
             id: id("app.f(integer)"),
             kind: ModuleKind::Function,
@@ -8635,8 +8648,16 @@ mod tests {
         let mut cs = plan(vec![drop()]);
         assert!(untouched_module_dependents(&cs, &found, &s).is_empty());
         let refused = weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap_err();
-        assert!(refused.contains("view app.v0"), "{refused}");
-        assert!(refused.contains("app.f(integer)"), "{refused}");
+        assert_eq!(
+            refused,
+            "`app.f(integer)` is dropped by this plan, and view app.v0\\n\\u{1b}[31m\\u{202e}\\\\n名前_ünï depends on it and is kept by \
+             the declarations. Remove the dependency from its declaration, or keep \
+             `app.f(integer)`, and plan again."
+        );
+        assert_eq!(
+            found[&id("app.f(integer)")][0].described,
+            "view app.v0\n\u{1b}[31m\u{202e}\\n名前_ünï"
+        );
 
         let rebuilt = plan(vec![alter(&s, "app.f(integer)")]);
         let back: Vec<String> = untouched_module_dependents(&rebuilt, &found, &s)

@@ -933,6 +933,7 @@
         "step5_connected_drift_and_ledger_refusals_show_each_name_once",
         "step5_connected_role_refusals_and_by_hand_sql_preserve_identity",
         "step5_connected_module_rebuild_refusals_show_each_name_once",
+        "late_dependent_descriptions_are_shown_once_in_plan_and_apply",
         "step5_connected_ordering_refusals_show_subjects_and_descriptions_once",
         "step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json"
       ]

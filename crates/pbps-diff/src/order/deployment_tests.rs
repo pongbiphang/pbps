@@ -108,3 +108,162 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
         assert!(restoration_of(&d, &undeclared, None).is_err());
     }
 }
+
+const RAW_DESCRIPTION: &str = "dependent\n\u{1b}[31m\u{202e}\\n名前_ünï";
+const SHOWN_DESCRIPTION: &str = r"dependent\n\u{1b}[31m\u{202e}\\n名前_ünï";
+
+#[test]
+fn unsupported_descriptions_are_shown_once_and_reasons_stay_rendered() {
+    let module = ModuleId::Named(pbps_model::ObjectName::new("app", RAW_DESCRIPTION));
+    let mut declared = Schema::default();
+    for (holds, suffix) in [
+        (Holds::Module(module.clone()), ": its kind is not declared"),
+        (
+            Holds::TablePart {
+                table: TableName::new("app", "t"),
+                part: Part::Generated(RAW_DESCRIPTION.into()),
+            },
+            ": a generated column's expression cannot be taken off around the module",
+        ),
+        (
+            Holds::Unrepresentable(r"already shown `name\n`".into()),
+            r" — already shown `name\n`",
+        ),
+    ] {
+        let d = Dependent {
+            described: RAW_DESCRIPTION.into(),
+            holds,
+        };
+        assert_eq!(
+            removal_of(&d, &declared, None).unwrap_err(),
+            format!("{SHOWN_DESCRIPTION}{suffix}")
+        );
+        assert_eq!(
+            restoration_of(&d, &declared, None).unwrap_err(),
+            format!(
+                "{SHOWN_DESCRIPTION}: the declarations hold it, but not in a form pbps can restore"
+            )
+        );
+        assert_eq!(d.described, RAW_DESCRIPTION);
+    }
+    // A raw hostile identity still selects its declared module for both operations.
+    declared.modules.insert(
+        module.clone(),
+        pbps_model::Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT 1".into(),
+        },
+    );
+    let d = Dependent {
+        described: RAW_DESCRIPTION.into(),
+        holds: Holds::Module(module.clone()),
+    };
+    assert!(
+        matches!(removal_of(&d, &declared, None).unwrap(), Change::DropModule { id, .. } if id == module)
+    );
+    assert!(
+        matches!(restoration_of(&d, &declared, None).unwrap(), Change::CreateModule { id, .. } if id == module)
+    );
+}
+
+#[test]
+fn named_descriptions_are_shown_once_without_changing_obligations() {
+    let root: ModuleId = "app.root".parse().unwrap();
+    for (need, suffix) in [
+        (
+            Need::Split {
+                root: root.clone(),
+                k: 0,
+            },
+            "is edited in one step and has to be split around `app.root`",
+        ),
+        (
+            Need::Removed {
+                root: root.clone(),
+                k: 0,
+            },
+            "has to be gone before `app.root` is dropped",
+        ),
+        (
+            Need::Restored { root, k: 0 },
+            "has to come back after `app.root` is created",
+        ),
+    ] {
+        let named = Named {
+            need,
+            described: RAW_DESCRIPTION.into(),
+        };
+        assert_eq!(named.to_string(), format!("{SHOWN_DESCRIPTION} {suffix}"));
+        assert_eq!(named.described, RAW_DESCRIPTION);
+        assert_ne!(
+            named,
+            Named {
+                described: SHOWN_DESCRIPTION.into(),
+                ..named.clone()
+            }
+        );
+    }
+}
+
+#[test]
+fn missing_source_and_unaccounted_descriptions_are_shown_once() {
+    let root: ModuleId = "app.root".parse().unwrap();
+    let declared = Schema::default();
+    let ids = IdsFile::default();
+    let sources = Sources {
+        before: crate::Side {
+            schema: &declared,
+            ids: &ids,
+        },
+        after: &ids,
+    };
+    let found = BTreeMap::from([(
+        root.clone(),
+        vec![Dependent {
+            described: RAW_DESCRIPTION.into(),
+            holds: Holds::TablePart {
+                table: TableName::new("app", "untracked"),
+                part: Part::Check("ck".into()),
+            },
+        }],
+    )]);
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(Change::DropModule {
+            id: root.clone(),
+            kind: ModuleKind::View,
+        })],
+    };
+    let weave = Weave {
+        roots: vec![root.clone()],
+        found: ModuleAdapter::new(&found),
+        declared: &declared,
+        sources,
+        dialect: &pbps_dialect::MinimalDialect,
+        partitions: Partitions::default(),
+    };
+    let named = Named {
+        need: Need::Removed {
+            root: root.clone(),
+            k: 0,
+        },
+        described: RAW_DESCRIPTION.into(),
+    };
+    assert_eq!(
+        weave.expand(&changes.changes, &named).unwrap_err(),
+        format!("{SHOWN_DESCRIPTION}: physical source is unavailable")
+    );
+    let view = sources.project(&changes.changes).unwrap();
+    assert_eq!(
+        unaccounted(&changes, &found, &Partitions::default(), &view),
+        [format!("{SHOWN_DESCRIPTION} depends on `app.root`")]
+    );
+    let empty = ChangeSet::default();
+    let empty_view = sources.project(&empty.changes).unwrap();
+    assert!(unaccounted(&empty, &found, &Partitions::default(), &empty_view).is_empty());
+    assert_eq!(
+        weave.dependent(&root, 0).unwrap().described,
+        RAW_DESCRIPTION
+    );
+    assert!(weave.dependent(&root, 1).is_err());
+}

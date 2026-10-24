@@ -128,7 +128,9 @@ pub fn unmanaged_refusal(
         .iter()
         .filter(|d| !d.managed(declared))
         .map(|d| match &d.holds {
-            Holds::Unrepresentable(why) => format!("- {} -- {why}", d.described),
+            Holds::Unrepresentable(why) => {
+                format!("- {} -- {why}", pbps_model::escape::Escaped(&d.described))
+            }
             Holds::TablePart {
                 part: Part::Policy(_),
                 ..
@@ -143,11 +145,14 @@ pub fn unmanaged_refusal(
                 "- {} -- a generated column, whose expression no statement can take off and put \
                  back around the rebuild; a plan that changes the expression so it no longer \
                  calls `{id}` releases it",
-                d.described,
+                pbps_model::escape::Escaped(&d.described),
                 id = id.shown()
             ),
             Holds::Module(_) | Holds::TablePart { .. } => {
-                format!("- {} -- this project does not declare it", d.described)
+                format!(
+                    "- {} -- this project does not declare it",
+                    pbps_model::escape::Escaped(&d.described)
+                )
             }
         })
         .collect();
@@ -187,6 +192,47 @@ impl PolicyDependent {
 #[cfg(test)]
 mod policy_message_tests {
     use super::*;
+
+    #[test]
+    fn unmanaged_descriptions_are_shown_once_without_changing_dependents() {
+        let raw = "dependent\n\u{1b}[31m\u{202e}\\n名前_ünï";
+        let shown = r"dependent\n\u{1b}[31m\u{202e}\\n名前_ünï";
+        let root = "app.root".parse().unwrap();
+        let dependents = vec![
+            Dependent {
+                described: raw.into(),
+                holds: Holds::Unrepresentable(r"already shown `name\n`".into()),
+            },
+            Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: pbps_model::TableName::new("app", "t"),
+                    part: Part::Generated(raw.into()),
+                },
+            },
+            Dependent {
+                described: raw.into(),
+                holds: Holds::Module(ModuleId::Named(pbps_model::ObjectName::new("app", raw))),
+            },
+        ];
+        let original = dependents.clone();
+        assert_eq!(
+            unmanaged_refusal(&root, &dependents, &Schema::default()).unwrap(),
+            format!(
+                "`app.root` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so the change is a drop \
+                 and a create (ADR-0009 section 3), and these objects depend on it and this project could not \
+                 put them back:\n- {shown} -- already shown `name\\n`\n\
+                 - {shown} -- a generated column, whose expression no statement can take off and put \
+                 back around the rebuild; a plan that changes the expression so it no longer \
+                 calls `app.root` releases it\n- {shown} -- this project does not declare it\n\
+                 The plan names every object it drops, or it does not drop \
+                 (SPEC 14.3), so `DROP ... CASCADE` is not offered. Declare them, or remove the \
+                 dependency, and plan again."
+            )
+        );
+        assert_eq!(dependents, original);
+        assert!(unmanaged_refusal(&root, &[], &Schema::default()).is_none());
+    }
 
     #[test]
     fn unmanaged_policy_refusals_show_descriptions_once_and_keep_raw_keys() {
