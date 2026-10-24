@@ -6,7 +6,12 @@ use pbps_mssql::resolver::{capture, environment};
 use std::collections::BTreeSet;
 
 async fn assembly_case(reached: bool) {
-    let mut db = TestDb::create("reported2270").await;
+    let mut db = TestDb::create(if reached {
+        "reported2270_reached"
+    } else {
+        "reported2270_unreached"
+    })
+    .await;
     let binary = include_str!("scratch2236-provider.hex").trim();
     let found = db.conn.query(&format!("SELECT COUNT_BIG(*) AS count FROM sys.trusted_assemblies WHERE hash=HASHBYTES('SHA2_512',0x{binary});")).await.unwrap();
     let added_trust = found[0].try_get::<i64>("count").unwrap() == Some(0);

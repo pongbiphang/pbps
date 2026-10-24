@@ -1058,6 +1058,30 @@ fn only_model_lock_contention_is_retried_and_only_so_often() {
 /// exclusively, which also runs the two of them one after the other.
 pub(crate) static SINGLE_USER_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
+fn test_database_name(tag: &str) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // The pid separates test processes; the counter also separates callers
+    // that accidentally share a tag, including collated and ordinary fixtures.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let next = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("pbps_test_{tag}_{}_{next}", std::process::id())
+}
+
+#[test]
+fn reused_database_tags_stay_unique_within_and_between_threads() {
+    assert_ne!(
+        test_database_name("shared2327"),
+        test_database_name("shared2327")
+    );
+    let names = std::thread::scope(|scope| {
+        let first = scope.spawn(|| test_database_name("shared2327"));
+        let second = scope.spawn(|| test_database_name("shared2327"));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(names.0, names.1);
+}
+
 /// A throwaway database that removes itself.
 struct TestDb {
     name: String,
@@ -1066,8 +1090,7 @@ struct TestDb {
 
 impl TestDb {
     async fn create(tag: &str) -> TestDb {
-        // The pid keeps two concurrent `cargo test` runs apart.
-        let name = format!("pbps_test_{tag}_{}", std::process::id());
+        let name = test_database_name(tag);
         let mut conn = connect_live(&conn_str()).await.expect("connect");
         create_database(&mut conn, &format!("CREATE DATABASE [{name}];"))
             .await
@@ -1078,7 +1101,7 @@ impl TestDb {
 
     /// The same, with a default collation of the test's choosing (#1175).
     async fn create_collated(tag: &str, collation: &str) -> TestDb {
-        let name = format!("pbps_test_{tag}_{}", std::process::id());
+        let name = test_database_name(tag);
         let mut conn = connect_live(&conn_str()).await.expect("connect");
         create_database(
             &mut conn,

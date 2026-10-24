@@ -1237,7 +1237,11 @@ async fn pairs_the_effects_call_independent_commute_on_the_engine() {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 async fn schema_bound_callers_block_reversed_edits_and_plain_callers_commute() {
-    let bound = &HELD[0];
+    // The full audit may run HELD[0] in a sibling test at the same time.
+    let bound = &Scenario {
+        name: "bound_callers2192",
+        ..HELD[0]
+    };
     match core::check(&Ms, bound, "pbps_commute").await.pair {
         Err(core::Finding::Stale(_)) => {}
         other => panic!("the effects must order the bound caller: {other:?}"),
