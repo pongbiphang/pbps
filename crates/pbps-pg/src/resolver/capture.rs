@@ -144,6 +144,10 @@ fn input_coercions(value: &nodes::Value, inputs: &mut BTreeSet<u32>) -> Result<(
                 "RELABELTYPE" | "CONVERTROWTYPEEXPR" | "FIELDSELECT" | "FIELDSTORE" | "ROWEXPR"
                 | "ARRAYEXPR" | "COLLATEEXPR" | "NAMEDARGEXPR" | "BOOLEXPR" | "BOOLEANTEST"
                 | "NULLTEST" | "CASEEXPR" | "CASEWHEN" | "COALESCEEXPR" => {}
+                // A column read. A domain's CHECK cannot hold one, so this
+                // only ever admits a recorded conversion's expression, bound
+                // against its one column (#2331): the read copies a value.
+                "VAR" => {}
                 // C1's superuser-installed base-type/operator-class support
                 // boundary applies to these dispatchers (input_path's module
                 // docs). Neither performs an implicit domain input conversion.

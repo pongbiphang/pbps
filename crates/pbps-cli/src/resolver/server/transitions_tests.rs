@@ -362,6 +362,7 @@ fn a_column_edit_carries_its_whole_table_and_nothing_beyond_it() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     let default = Change::AlterColumnDefault {
         uid,
@@ -2022,6 +2023,7 @@ mod column_vector_parent {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AlterColumnNullability {
                 uid: uid.clone(),

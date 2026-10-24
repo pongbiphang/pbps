@@ -247,6 +247,8 @@ pub enum Part {
     },
     /// The declared domain's own DEFAULT.
     Default,
+    /// The expression a recorded conversion retypes a column with (#2331).
+    Conversion,
 }
 
 /// The type and the part of it an expression is in.
@@ -269,6 +271,7 @@ impl fmt::Display for Use {
                 )
             }
             Part::Default => write!(f, "the DEFAULT of `{}`", self.ty),
+            Part::Conversion => write!(f, "the conversion of {}", self.ty),
         }
     }
 }
@@ -834,6 +837,155 @@ async fn pass(
             Err(why) => InputPath::Unreadable(Unreadable::Failed(why)),
         })
         .collect())
+}
+
+/// Binds a recorded conversion's expression, and judges what it bound, before
+/// anything evaluates it (#2331, DEC-2331.1).
+///
+/// The expression runs as the deploying role, in the pre-flight over every row
+/// and then in the `ALTER`, so non-built-in code in it would run before anyone
+/// had judged it. It is bound first against a temporary table holding the one
+/// column, wrapped as `CHECK (((<using>) IS NULL) OR true)`: the engine parses
+/// and resolves it as it will in the `ALTER`, keeps the whole tree unsimplified
+/// in `conbin` (measured on 16 and 18: the user function's `funcid` stays), and
+/// refuses any name but the column's own -- a second column is `column "d" does
+/// not exist`, a subquery `cannot use subquery in check constraint`. Then the
+/// tree goes through the decoder and the judgement of DEC-2181.1: no function,
+/// operator or cast that a role wrote, none on [`RUNS_SQL`], no user-defined or
+/// domain type in it.
+///
+/// In a transaction of its own that is rolled back, so the table never
+/// outlives this call. `Err` is the refusal, in words, with no server text: it
+/// can quote a value.
+pub async fn vet_conversion(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+    from: &pbps_model::ColumnType,
+    using: &str,
+) -> Result<(), String> {
+    let shown = column.shown().to_string();
+    let shown = shown.as_str();
+    let ty = crate::types::normalize(from)
+        .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?
+        .raw()
+        .to_string();
+    let quoted = crate::quote(column.name.raw())
+        .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
+    let (column, ty) = (quoted.as_str(), ty.as_str());
+    const WRITABLE: pbps_dialect::TransactionFraming = pbps_dialect::TransactionFraming {
+        begin: std::borrow::Cow::Borrowed("BEGIN ISOLATION LEVEL REPEATABLE READ;"),
+        commit: std::borrow::Cow::Borrowed("COMMIT;"),
+        rollback: std::borrow::Cow::Borrowed("ROLLBACK;"),
+    };
+    let unvetted = |why: String| format!("the conversion `USING {using}` of {shown} {why}");
+    conn.begin(&WRITABLE)
+        .await
+        .map_err(|_| unvetted("could not be vetted: no transaction to bind it in".into()))?;
+    let result = vet_in_transaction(conn, column, ty, using, shown).await;
+    let closed = conn.rollback(&WRITABLE).await;
+    result?;
+    closed.map_err(|_| unvetted("could not be vetted: its transaction did not close".into()))
+}
+
+async fn vet_in_transaction(
+    conn: &mut Conn,
+    column: &str,
+    ty: &str,
+    using: &str,
+    shown: &str,
+) -> Result<(), String> {
+    let refuse = |why: &str| format!("the conversion `USING {using}` of {shown} {why}");
+    // The write path the statement runs under is the session's own, set by the
+    // apply's pins, so a name binds here as it will there.
+    if let Err(e) = conn
+        .execute(&format!(
+            "CREATE TEMPORARY TABLE pg_temp.pbps_conversion ({column} {ty}, \
+             CONSTRAINT pbps_conversion CHECK ((({using}) IS NULL) OR true)) ON COMMIT DROP"
+        ))
+        .await
+    {
+        let code = e
+            .server_error_code()
+            .unwrap_or_else(|| "unknown".to_owned());
+        return Err(refuse(&format!(
+            "does not bind against the column alone (SQLSTATE {code}): it may use only the \
+             column itself, no other column, subquery or object the engine cannot resolve there"
+        )));
+    }
+    let rows = conn
+        .query(
+            "SELECT c.conbin::pg_catalog.text AS expr
+               FROM pg_catalog.pg_constraint c
+              WHERE c.conrelid OPERATOR(pg_catalog.=) 'pg_temp.pbps_conversion'::pg_catalog.regclass
+                AND c.conname OPERATOR(pg_catalog.=) 'pbps_conversion'",
+        )
+        .await
+        .map_err(|_| refuse("could not be vetted: its bound form could not be read"))?;
+    let text = rows
+        .first()
+        .and_then(|row| row.try_get::<&str>("expr").ok().flatten())
+        .ok_or_else(|| refuse("could not be vetted: its bound form was not stored"))?
+        .to_owned();
+    let major = server_major(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the server version is unreadable"))?;
+    let denied = runs_sql_oids(conn)
+        .await
+        .map_err(|_| refuse("could not be vetted: the audited list could not be read"))?
+        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
+    let bound = bound_objects(&text, major)
+        .map_err(|why| refuse(&format!("could not be vetted: {why}")))?;
+    // Built-in types only: a user-defined or domain type in the tree runs its
+    // own input path (v1 scope).
+    if bound.domain_coercions.iter().any(|_| true)
+        || bound
+            .types
+            .iter()
+            .chain(&bound.input_coercions)
+            .any(|oid| !is_builtin(Oid::from(*oid)))
+    {
+        return Err(refuse(
+            "names a type that is not built into PostgreSQL, or coerces to a domain, which \
+             runs code of its own",
+        ));
+    }
+    let used_by = Use {
+        ty: shown.to_owned(),
+        part: Part::Conversion,
+    };
+    let functions: BTreeMap<Oid, Vec<Use>> = bound
+        .routines
+        .iter()
+        .map(|f| (Oid::from(*f), vec![used_by.clone()]))
+        .collect();
+    let operators: BTreeMap<Oid, Vec<Use>> = bound
+        .operators
+        .iter()
+        .map(|o| (Oid::from(*o), vec![used_by.clone()]))
+        .collect();
+    let row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = bound
+        .row_compares
+        .iter()
+        .map(|(o, f)| ((Oid::from(*o), Oid::from(*f)), vec![used_by.clone()]))
+        .collect();
+    let (reasons, _, _) = unadmitted_routines(conn, &denied, &functions, &operators, &row_compares)
+        .await
+        .map_err(|failure| match failure {
+            Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
+            Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
+        })?;
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}; nothing has been changed",
+            reasons
+                .iter()
+                .map(|r| Reason::Routine(r.clone()).to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ))
+    }
 }
 
 /// `server_version_num` / 10000: 16 or 18, the majors the decoder was measured

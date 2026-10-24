@@ -564,7 +564,8 @@ spelling named — measured, the same declaration stores 2026-01-02 under
 `DateStyle` MDY and 2026-02-01 under DMY, silently either way (DECISIONS 261). A
 type change this engine will not make on its own is refused where the plan is
 built, with `USING` named and the two-step remedy, and never performed under a
-cast nobody declared (ADR-0012 §5, DECISIONS 263), and so is one it *will*
+cast nobody declared (ADR-0012 §5, DECISIONS 263) unless a person recorded the
+expression with `pbps convert` (DEC-2331.1), and so is one it *will*
 make but only by consulting the session: a change that gains or loses the time
 zone stores a different instant depending on the zone the applying session
 happens to hold, so it is refused by name with the zone written out in the

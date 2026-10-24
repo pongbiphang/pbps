@@ -62,6 +62,46 @@ pub enum DiffError {
     )]
     IdentityChangeUnsupported { column: ColumnRef },
 
+    /// A recorded conversion (#2331) written for another starting type than
+    /// this environment's column holds. An expression is written for one
+    /// source type, and applying it to another would transform data nobody
+    /// reviewed the expression for.
+    #[error(
+        "column {column}: a conversion is recorded from `{recorded}` to `{to}`, but this column \
+         is `{actual}`. An expression written for one starting type is never applied to another. \
+         Record one for this start: `pbps convert {column} --using - --from '{actual}'`",
+        column = .column.shown(),
+        recorded = pbps_model::escape::Escaped(.recorded),
+        actual = pbps_model::escape::Escaped(.actual),
+        to = pbps_model::escape::Escaped(.to),
+    )]
+    ConversionFromMismatch {
+        column: ColumnRef,
+        recorded: String,
+        actual: String,
+        to: String,
+    },
+
+    /// A recorded conversion (#2331) for a column this plan also renames: the
+    /// expression names the column, and which name it means would depend on
+    /// the order the two run in.
+    #[error(
+        "column {column}: a conversion is recorded for it, and this plan also renames it. The \
+         expression names the column once, so apply the rename in a plan of its own first and \
+         then plan the type change",
+        column = .column.shown(),
+    )]
+    ConversionWithRename { column: ColumnRef },
+
+    /// The identity file records conversions for an engine that converts
+    /// implicitly and has no `USING` (#2331, ADR-0012 section 5).
+    #[error(
+        "the identity file records {count} conversion(s), but this engine has no `USING` clause \
+         and converts a column's values itself, so nothing would run the expression. Remove \
+         the `conversions` entries from the identity file"
+    )]
+    ConversionsUnsupported { count: usize },
+
     /// A `serial` put on a column of an `UNLOGGED` table, added with it or
     /// given to it (#1631, DEC-1631.1): its sequence is created logged, and
     /// the reader holds a `serial` only where the two agree. Or an owned
@@ -734,6 +774,11 @@ pub(crate) fn diff_partial_rebuilding(
             .into_iter()
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
+    if !dialect.records_conversions() && !declared.ids.conversions.is_empty() {
+        errs.push(DiffError::ConversionsUnsupported {
+            count: declared.ids.conversions.len(),
+        });
+    }
 
     let (label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
@@ -1287,6 +1332,7 @@ pub(crate) fn diff_partial_rebuilding(
             base_table,
             declared_table,
             dialect,
+            &declared.ids.conversions,
             &mut changes,
             &mut errs,
         );
@@ -2437,6 +2483,7 @@ fn diff_columns(
     base_table: &Table,
     declared_table: &Table,
     dialect: &(impl Dialect + ?Sized),
+    conversions: &BTreeMap<Uid, pbps_model::Conversion>,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -2658,6 +2705,37 @@ fn diff_columns(
         // `NOT NULL` after it, so it is checked against the new values rather
         // than the old expression's (DEC-1168.1).
         let tightened_after = recomputed && base_col.nullable && !col.nullable;
+        // The expression a human recorded for exactly this change (#2331,
+        // DEC-2331.1), and only for it: this environment's start must be the
+        // recorded one. An environment already on the declared type has no
+        // change and never reads the record, so each applies it once. One
+        // that starts elsewhere, and needs an expression to get there, is
+        // refused by name rather than converted under text written for
+        // another type.
+        let mut using = None;
+        let spelled = |ty: &ColumnType| ty.raw().to_string();
+        if let Some(record) = conversions
+            .get(uid)
+            .filter(|r| r.to == spelled(&to_ty) && from_ty != to_ty)
+        {
+            if record.from == spelled(&from_ty) {
+                if base_ref.name == declared_ref.name {
+                    using = Some(record.using.clone());
+                } else {
+                    errs.push(DiffError::ConversionWithRename {
+                        column: declared_ref.clone(),
+                    });
+                }
+            } else if dialect.type_change_needs_using(&from_ty, &to_ty) {
+                errs.push(DiffError::ConversionFromMismatch {
+                    column: declared_ref.clone(),
+                    recorded: record.from.clone(),
+                    actual: spelled(&from_ty),
+                    to: record.to.clone(),
+                });
+            }
+        }
+        let converting = using.is_some();
         if retyped {
             changes.push(Change::AlterColumnType {
                 uid: uid.clone(),
@@ -2669,6 +2747,7 @@ fn diff_columns(
                 through_external_partitions: false,
                 from_collation: base_col.collation.clone(),
                 to_collation: col.collation.clone(),
+                using,
             });
             if tightened_after {
                 changes.push(Change::AlterColumnNullability {
@@ -2690,7 +2769,13 @@ fn diff_columns(
                 collation: col.collation.clone(),
             });
         }
-        if old_default != new_default {
+        // A default the expression's result cannot take is refused by the
+        // engine at the retype -- measured on 16 and 18, `default for column
+        // "c" cannot be cast automatically` -- even where its text is
+        // unchanged and the old one was cast across without a word. So a
+        // conversion takes the default down and puts it back, as a changed
+        // one does (#2331).
+        if old_default != new_default || (converting && old_default.is_some()) {
             // A default that is *replaced* on a column this same plan retypes
             // is two changes, because the type change has to run between them.
             // Measured on SQL Server, an `ALTER COLUMN` that changes the type

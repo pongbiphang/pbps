@@ -708,6 +708,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })
         .with_risk(RiskClass::Narrowing);
         let add = PlannedChange::new(Change::AddColumn {
@@ -1149,6 +1150,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert!(
             !widen_and_tighten.risks.contains(&RiskClass::Narrowing),
@@ -1212,6 +1214,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })
         .with_risk(RiskClass::Narrowing);
         let grant = PlannedChange::new(Change::Grant {
@@ -1307,6 +1310,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             });
             change.risks.insert(RiskClass::Narrowing);
             let findings = plan(&cs(vec![change.clone()]), &Policies::default(), &ctx());

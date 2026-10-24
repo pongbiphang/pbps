@@ -3189,6 +3189,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             to,
             from_nullable,
             to_nullable,
+            using,
             ..
         } => {
             let Some(stored) = names.column(column) else {
@@ -3202,6 +3203,31 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // change's probe too.
             if *from_nullable && !*to_nullable {
                 out.push(null_probe(column, &table, &quoted));
+            }
+            // A recorded conversion is evaluated over every stored row, and
+            // the probe fails when the engine does: a value the expression
+            // cannot convert refuses the plan by name before the first
+            // statement runs (DEC-2331.1). Instead of the family's own probe
+            // below, which asks whether a value survives the engine's cast
+            // and is not the cast the expression performs. The count is
+            // always zero: the query is the evaluation, and `count` of the
+            // expression is what makes the engine compute it for each row
+            // rather than plan it away.
+            if let Some(expression) = using {
+                out.push(
+                    Probe::new(
+                        format!(
+                            "the conversion `USING {}` of {column}",
+                            pbps_model::escape::Escaped(expression),
+                            column = column.shown(),
+                        ),
+                        format!(
+                            "SELECT (0 * count(({expression})))::int AS n FROM {table};"
+                        ),
+                    )
+                    .refusing_when_it_fails(),
+                );
+                return Ok(out);
             }
             let (Ok(from), Ok(to)) = (crate::types::normalize(from), crate::types::normalize(to))
             else {
@@ -5491,6 +5517,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let columns = vec![pbps_model::ColumnName::from("v")];
         let constraints = [
@@ -6306,6 +6333,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
                 pbps_model::PlannedChange::new(create.clone()),
             ],
@@ -6377,6 +6405,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
             ),
             (
@@ -6554,6 +6583,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
 
         let alone = probes(&set(vec![check(&table)]));
@@ -6620,6 +6650,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let plan = set(vec![retype.clone(), check.clone()]);
         let told = probes_with(&plan, &partitions);
@@ -7038,6 +7069,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let plan = |retype_change: Change| {
             set(vec![
@@ -7189,6 +7221,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AddForeignKey {
                 table: child.clone(),
@@ -7256,6 +7289,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AddForeignKey {
                 table: child.clone(),

@@ -53,6 +53,14 @@ pub enum IdsError {
     #[error("the rebuild recorded for {uid} has inconsistent source or replacement identities")]
     InvalidRebuild { uid: Uid },
 
+    #[error("a conversion is recorded for {uid}, but no live column entry has that uid")]
+    OrphanConversion { uid: Uid },
+
+    #[error(
+        "the conversion recorded for {uid} is blank, or its `from` and `to` are not two different types"
+    )]
+    InvalidConversion { uid: Uid },
+
     #[error("{uid} points at `{}`, but the snapshot schema does not hold it", crate::escape::Escaped(.name))]
     NotHeld { uid: Uid, name: String },
 }
@@ -104,6 +112,13 @@ pub struct IdsFile {
     /// identities become live only through the future order expansion.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rebuilds: BTreeMap<Uid, crate::Rebuild>,
+
+    /// The conversions a human recorded for a column type change the engine
+    /// cannot make by itself (`pbps convert`, #2331), keyed by the column's
+    /// uid. A compatible evolution under the same version: a file without the
+    /// section records none, and every such change keeps its refusal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conversions: BTreeMap<Uid, Conversion>,
 }
 
 impl Default for IdsFile {
@@ -117,6 +132,7 @@ impl Default for IdsFile {
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
             rebuilds: BTreeMap::new(),
+            conversions: BTreeMap::new(),
         }
     }
 }
@@ -140,6 +156,32 @@ pub struct Move {
     /// `YYYY-MM-DD`
     pub allowed_at: String,
     pub reason: String,
+    pub operator: String,
+}
+
+/// A conversion a human recorded for one column type change (`pbps convert`,
+/// #2331, DEC-2331.1).
+///
+/// What a value becomes when the engine will not pick the cast is data
+/// transformation that nobody may choose but a person (ADR-0012 section 5), and
+/// it is one-time per environment, so it is recorded the way a rename is:
+/// answered once, kept in git beside the identities, covered by the plan's
+/// checksum and dropped by the tool when it stops applying. It is keyed by the
+/// column's uid, so it follows the column through a rename.
+///
+/// `from` and `to` are canonical types as the dialect spells them, so a record
+/// applies to exactly the change it was written for: an environment on another
+/// type is refused by name and never converted under an expression written for
+/// a different starting point.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Conversion {
+    pub from: String,
+    pub to: String,
+    /// The expression, verbatim.
+    pub using: String,
+    /// `YYYY-MM-DD`
+    pub allowed_at: String,
     pub operator: String,
 }
 
@@ -228,6 +270,7 @@ impl IdsFile {
         let live = kept.tables.clone();
         kept.moves.retain(|uid, _| live.contains_key(uid));
         let columns = &kept.columns;
+        kept.conversions.retain(|uid, _| columns.contains_key(uid));
         kept.rebuilds.retain(|_, rebuild| {
             rebuild
                 .source
@@ -428,6 +471,18 @@ impl IdsFile {
         for uid in self.moves.keys() {
             if !self.tables.contains_key(uid) {
                 return Err(IdsError::OrphanMove { uid: uid.clone() });
+            }
+        }
+        // A conversion belongs to a live column, and says what it converts
+        // between: the tool drops one with its column or its type, so a record
+        // left without either was written by hand or a bad merge (#2331).
+        for (uid, c) in &self.conversions {
+            if !self.columns.contains_key(uid) {
+                return Err(IdsError::OrphanConversion { uid: uid.clone() });
+            }
+            let blank = |t: &str| t.trim().is_empty();
+            if blank(&c.using) || blank(&c.from) || blank(&c.to) || c.from == c.to {
+                return Err(IdsError::InvalidConversion { uid: uid.clone() });
             }
         }
         let mut reserved = BTreeSet::new();
@@ -1065,6 +1120,82 @@ mod tests {
             f.validated().unwrap_err(),
             IdsError::OrphanMove { .. }
         ));
+    }
+
+    fn recorded() -> Conversion {
+        Conversion {
+            from: "text".into(),
+            to: "integer".into(),
+            using: "amount::integer".into(),
+            allowed_at: "2026-10-24".into(),
+            operator: "leon".into(),
+        }
+    }
+
+    /// #2331: a conversion joins the file under the same version, as a move
+    /// does: an older file records none and still reads, an empty section is
+    /// not written, and a state for a database without the column drops it.
+    #[test]
+    fn conversions_join_the_file_and_belong_to_a_live_column() {
+        let mut f = sample();
+        let column = f.columns.keys().next().unwrap().clone();
+        f.conversions.insert(column.clone(), recorded());
+        f.validate().unwrap();
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"conversions\""), "{json}");
+        assert_eq!(serde_json::from_str::<IdsFile>(&json).unwrap(), f);
+        let plain = serde_json::to_string(&sample()).unwrap();
+        assert!(!plain.contains("conversions"));
+        assert!(
+            serde_json::from_str::<IdsFile>(&plain)
+                .unwrap()
+                .conversions
+                .is_empty()
+        );
+        let table = f.columns[&column].table.clone();
+        assert!(f.without(&[table]).conversions.is_empty());
+    }
+
+    /// Negative cases: a record for a column the file does not hold, and one
+    /// that converts nothing or has nothing to run, is a hand edit or a bad
+    /// merge and is refused rather than read as a conversion.
+    #[test]
+    fn a_conversion_without_its_column_or_its_expression_is_refused() {
+        let mut f = sample();
+        f.conversions.insert(uid("c_bbbbbb"), recorded());
+        assert!(matches!(
+            f.validate().unwrap_err(),
+            IdsError::OrphanConversion { .. }
+        ));
+        let column = sample().columns.keys().next().unwrap().clone();
+        for broken in [
+            Conversion {
+                using: " \n".into(),
+                ..recorded()
+            },
+            Conversion {
+                from: String::new(),
+                ..recorded()
+            },
+            Conversion {
+                to: "text".into(),
+                ..recorded()
+            },
+        ] {
+            let mut f = sample();
+            f.conversions.insert(column.clone(), broken);
+            assert!(matches!(
+                f.validate().unwrap_err(),
+                IdsError::InvalidConversion { .. }
+            ));
+        }
+        assert!(
+            serde_json::from_str::<IdsFile>(
+                r#"{"version":1,"conversions":{"c_aaaaaa":{"from":"a","to":"b","using":"x","allowed_at":"d","operator":"o","extra":1}}}"#
+            )
+            .is_err(),
+            "an unknown key is not a record"
+        );
     }
 
     #[test]

@@ -304,6 +304,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     through_external_partitions: _,
                     from_collation,
                     to_collation,
+                    using: _,
                 } => {
                     recollated.insert(index, from_collation != to_collation);
                     (uid, column, from, to, *from_nullable, *to_nullable)

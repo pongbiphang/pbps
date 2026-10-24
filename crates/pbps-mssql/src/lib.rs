@@ -664,6 +664,7 @@ mod tests {
             to_collation: Some(pbps_model::Collation::new(
                 "Latin1_General_100_CI_AS_SC_UTF8",
             )),
+            using: None,
         };
         for ty in ["varchar(10)", "char(3)", "text"] {
             assert!(

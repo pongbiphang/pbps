@@ -1050,7 +1050,9 @@ one uid**. On violation it fails and asks a human to decide which uid survives.
 Only two kinds of change need human intent to be planned: **rename** and
 **drop** (when one table both loses and gains a column, the two cannot be told
 apart automatically). A third is needed to apply one: **moving a DEFAULT
-partition's rows** into a new range partition (6.5).
+partition's rows** into a new range partition (6.5). A fourth is needed to
+plan one PostgreSQL change: **what a column's values become** when its type
+changes in a way the engine will not convert by itself (6.6).
 
 There are three equivalent inputs, all of which converge on the ids file.
 
@@ -1257,6 +1259,50 @@ exists is never consulted, since no plan creates it again.
 
 To withdraw permission, remove that partition UID's entry from `moves` in the
 identity file and commit the withdrawal with the declarations.
+
+### 6.6 Converting a column's values
+
+`text` to `integer`, `varchar` to `uuid`, `integer` to `boolean`: PostgreSQL
+refuses the change with `column "c" cannot be cast automatically` and asks for
+`USING`, and so does pbps (ADR-0012 section 5), because a cast pbps chose is a
+transformation nobody declared. `timestamp` to `timestamptz` is refused for the
+reason that the session's `TimeZone` would decide the value (DEC-1916.1). A person
+says what the values become, once, and it is recorded like a rename (DEC-2331.1):
+
+```bash
+echo "nullif(trim(amount), '')::integer" | pbps convert app.orders.amount --using -
+pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
+```
+
+- **Supplied** by the command (offline; `-` reads standard input, one final line
+  ending removed, blank refused before the project is discovered; `--from`
+  defaults to the column's type in the declarations at `HEAD`), or by the prompt
+  of 6.3, which asks once per such change and offers `amount::integer` as an
+  example it never takes for an answer. Without a terminal, and under
+  `plan --check`, `plan` fails with the finding `plan.conversion-required` and the
+  command. No flag of `plan` or `apply` can supply it (14.3).
+- **Recorded** in the ids file's `conversions`, by the column's uid, with the
+  `from` and `to` types as the dialect spells them, the expression verbatim, who
+  recorded it and when. It follows the column through a rename and is in the
+  plan's checksum.
+- **Used** only for that column's change from exactly `from` to exactly `to`. An
+  environment already on `to` has no such change, so each applies it once. An
+  environment on another type that needs an expression to get there is refused by
+  name, with the command that records one for its start. A column renamed in the
+  same plan is refused: split the plan. A partition-key column keeps its
+  refusal (4.3). SQL Server refuses `convert` and the section (the engine converts
+  implicitly).
+- **Dropped by the tool** when identities are written and the column's declared
+  type is no longer `to`, or the column is gone. There is nothing in the YAML to
+  delete.
+- **Applied** as `ALTER COLUMN ... TYPE ... USING <expression>`, shown in full in
+  the plan, `--sql` and `explain`, gated as `destructive` (7.2) beside whatever
+  the pair of types says. Before anything runs it, the apply binds it against a
+  table of the one column and refuses code a role wrote (DEC-2181.1), so it may
+  use only the column itself. The pre-flight evaluates the expression over every
+  stored row before the first statement, and a row it cannot convert refuses the
+  plan with the SQLSTATE and runs nothing. A conversion that names its zone
+  (`ts AT TIME ZONE 'UTC'`) makes a zone-dependent change allowed.
 
 ---
 
@@ -1862,7 +1908,7 @@ recorded structure and declared reference data, not lost business rows (14.3).
 | `pbps plan --check` | CI mode: fail only when intent is missing, never prompt, and never connect |
 | `pbps fmt` / `fmt --check` | Canonicalize the declaration format |
 | `pbps partitions extend <table> --every <step> --until <end> [--from <start>]` | Declare a PostgreSQL RANGE-partitioned table's next partitions in its file, from the last declared range to an end the user states; reads no clock and no database, writes no identity (see 4.3) |
-| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` | Record intent into the ids file |
+| `pbps rename` / `rename-table` / `rename-role` / `drop` / `drop-table` / `drop-role` / `move-rows` / `convert` | Record intent into the ids file |
 | `pbps validate` | Static checks: type validity, FK targets exist, identity consistency (one name may not map to more than one uid, see 5.3), module shape and namespace collisions (4.5), grant targets (4.7), and the declaration rules of the `policies:` block ([ADR-0008](ADR-0008-policies.md)); `--since <rev>` evaluates the rules only for objects whose identity changed since that revision |
 | `pbps docs` | Render documentation and an ERD from the declarations (see 9.4) |
 | `pbps explain --plan <file>` | The deployment gate's view of a saved plan: what, why, how it runs, and the exact approval command (see 9.6) |

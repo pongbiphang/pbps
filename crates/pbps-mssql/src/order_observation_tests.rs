@@ -99,6 +99,7 @@ fn assert_observational(shape: Shape) {
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         }),
     ];
     if matches!(shape, Shape::UnmanagedGrant) {

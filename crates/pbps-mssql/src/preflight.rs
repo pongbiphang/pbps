@@ -2441,6 +2441,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 2, "{sql:?}");
         assert!(sql[0].contains("IS NULL"), "{sql:?}");
@@ -2467,6 +2468,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: to.map(pbps_model::Collation::new),
+            using: None,
         };
         let sql = sql_of(&alter(
             "varchar(5)",
@@ -2598,6 +2600,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
+                using: None,
             })
         };
         let fk = PlannedChange::new(Change::AddForeignKey {
@@ -2651,6 +2654,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: Some(pbps_model::Collation::new("Latin1_General_CS_AS")),
                     to_collation: Some(pbps_model::Collation::new("Latin1_General_CI_AS")),
+                    using: None,
                 }),
                 PlannedChange::new(Change::AddUnique {
                     table: tname("dbo.customer"),
@@ -2695,6 +2699,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(
@@ -2726,6 +2731,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
@@ -2756,6 +2762,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })
             .is_empty()
         );
@@ -2776,6 +2783,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(
@@ -2811,6 +2819,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             });
             assert_eq!(sql.len(), 2, "{from} -> {to}: {sql:?}");
             let expected_len = match from {
@@ -2854,6 +2863,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
@@ -2881,6 +2891,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             });
             assert_eq!(sql.len(), 1, "varchar(20) -> {to}: {sql:?}");
             assert!(!sql[0].contains("LEN("), "{sql:?}");
@@ -2906,6 +2917,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             });
             assert_eq!(sql.len(), 1, "{from} -> {to}: {sql:?}");
             assert!(
@@ -2927,6 +2939,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(
@@ -2968,6 +2981,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 })
                 .is_empty(),
                 "`{from}` -> `{to}` was probed"
@@ -2983,6 +2997,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1, "{sql:?}");
         assert!(sql[0].contains("DATALENGTH([v]) > 8"), "{sql:?}");
@@ -3003,6 +3018,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })
             .is_empty()
         );
@@ -3291,6 +3307,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::UpdateRow {
                 table: tname("dbo.customer"),
@@ -3649,6 +3666,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         assert_eq!(
             probed(vec![
@@ -3673,6 +3691,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
                 index(&["email"], true, Some("[flag] = '01'")),
             ]),

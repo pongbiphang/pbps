@@ -355,6 +355,50 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
     (!intents.is_empty()).then_some(intents)
 }
 
+/// Asks, for each type change the engine cannot make by itself, what the new
+/// value is made from the old one with (`pbps convert`, DEC-2331.1).
+pub fn ask_conversions(
+    needed: &[pbps_diff::conversion::Needed],
+) -> Option<Vec<(pbps_diff::conversion::Needed, String)>> {
+    let stdin = std::io::stdin();
+    ask_conversions_from(needed, stdin.lock())
+}
+
+/// [`ask_conversions`] with the answers coming from anywhere.
+///
+/// The example is a hint on the prompt line and is never what a blank answer
+/// means: the person types the expression, or stops, and a stopped prompt
+/// records nothing. An expression that could be confirmed with a keystroke is
+/// the one nobody read (SPEC section 6.3).
+pub fn ask_conversions_from<R: std::io::BufRead>(
+    needed: &[pbps_diff::conversion::Needed],
+    reader: R,
+) -> Option<Vec<(pbps_diff::conversion::Needed, String)>> {
+    let mut lines = reader.lines();
+    let mut answers = Vec::new();
+    for need in needed {
+        eprintln!();
+        eprintln!(
+            "  {} changes from {} to {}, and the engine cannot convert it by itself",
+            need.column.shown(),
+            pbps_model::escape::Escaped(&need.from),
+            pbps_model::escape::Escaped(&need.to),
+        );
+        eprint!(
+            "  Which expression makes the new value? (for example `{}::{}`; blank to stop) ",
+            need.column.name.shown(),
+            pbps_model::escape::Escaped(&need.to),
+        );
+        let _ = std::io::stderr().flush();
+        let answer = lines.next()?.ok()?;
+        if answer.trim().is_empty() {
+            return None;
+        }
+        answers.push((need.clone(), answer.trim().to_owned()));
+    }
+    (!answers.is_empty()).then_some(answers)
+}
+
 /// Asks why something is being dropped, and refuses to accept nothing.
 ///
 /// The reason is what the tombstone shows an audit (SPEC §6.1). An empty one

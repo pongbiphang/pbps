@@ -747,6 +747,7 @@ mod tests {
                     to_nullable: true,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }
             } else {
                 Change::DropColumn {

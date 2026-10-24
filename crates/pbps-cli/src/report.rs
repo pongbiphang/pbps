@@ -1561,12 +1561,23 @@ pub fn describe(c: &Change) -> String {
             from = from.shown(),
             to = to.shown(),
         ),
+        // The whole expression, never elided: a reviewer approving a plan is
+        // approving what the data becomes, and it is the one text in the
+        // plan that nobody but its author has read (DEC-2331.1).
         Change::AlterColumnType {
-            column, from, to, ..
+            column,
+            from,
+            to,
+            using,
+            ..
         } => {
             format!(
-                "~ {} type {from} -> {to}",
+                "~ {} type {from} -> {to}{}",
                 column.name.shown(),
+                using
+                    .as_ref()
+                    .map(|expression| format!(" USING {}", Escaped(expression)))
+                    .unwrap_or_default(),
                 from = from.shown(),
                 to = to.shown(),
             )
@@ -2960,6 +2971,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         };
         assert_eq!(
             describe(&change),

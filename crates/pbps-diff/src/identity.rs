@@ -421,6 +421,13 @@ fn resolve_with_provenance(
 
     resolve_moves(declared, intents, ctx, &mut r, &mut blockers, &mut used);
 
+    // A column the identities no longer hold takes its recorded conversion
+    // with it, as a dropped table takes its move (#2331): the record is
+    // intent about a column that is gone, and an entry left without it would
+    // fail the file's own validation.
+    let columns = &r.ids.columns;
+    r.ids.conversions.retain(|uid, _| columns.contains_key(uid));
+
     // An intent a conflict has already named is not unused, however many times
     // it was written and whatever the matching loop did with it. Asked by
     // equality rather than by index: the guard's own bookkeeping was the wrong

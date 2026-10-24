@@ -503,6 +503,7 @@ mod effects_of_each_kind {
                     from_collation: None,
                     to_collation: None,
                     through_external_partitions: false,
+                    using: None,
                 },
             ),
             (

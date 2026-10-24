@@ -1702,6 +1702,7 @@ fn numbered_and_retyped(from: pbps_model::ValueSource, to: pbps_model::ValueSour
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             }),
         ],
         before,
@@ -2611,6 +2612,7 @@ fn default_taken_off(then_rename: bool) -> Plan {
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             }),
             "a",
             named("a"),
@@ -2784,6 +2786,7 @@ fn a_retype_of_a_renamed_column_still_waits_for_the_foreign_key_into_it() {
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             }),
             p(Change::DropForeignKey {
                 table: t("c"),
@@ -3756,6 +3759,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             }),
             swap(1, 1, 2),
             swap(2, 2, 1),
@@ -4637,6 +4641,7 @@ fn retype_c() -> PlannedChange {
         from_collation: None,
         to_collation: None,
         through_external_partitions: false,
+        using: None,
     })
 }
 

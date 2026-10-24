@@ -64,6 +64,33 @@ pub async fn execute_staged_statement(
     }
 }
 
+/// Binds and vets every recorded conversion's expression, before the
+/// pre-flight evaluates it over the rows or the `ALTER` runs it (#2331,
+/// DEC-2331.1). Nothing to vet on an engine that records none.
+pub async fn vet_conversions(
+    conn: &mut Conn,
+    changes: &[pbps_model::PlannedChange],
+) -> anyhow::Result<()> {
+    if conn.driver() == Driver::Mssql {
+        return Ok(());
+    }
+    for planned in changes {
+        let pbps_model::Change::AlterColumnType {
+            column,
+            from,
+            using: Some(using),
+            ..
+        } = &planned.change
+        else {
+            continue;
+        };
+        pbps_pg::input_path::vet_conversion(conn, column, from, using)
+            .await
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
+    }
+    Ok(())
+}
+
 /// Recover validation after a staged step's caller has rolled its transaction back.
 pub async fn recover_failed_staged_validation(
     conn: &mut Conn,
@@ -4594,6 +4621,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let recompute = |to: &str| Change::AlterColumnExpression {
             uid: uid("c_dddddd"),
@@ -5059,6 +5087,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         let release = PlannedChange::new(Change::AlterColumnExpression {
             uid: uid("c_dddddd"),
@@ -5661,6 +5690,7 @@ mod tests {
                         through_external_partitions: false,
                         from_collation: None,
                         to_collation: None,
+                        using: None,
                     },
                 )],
             };
@@ -5891,6 +5921,7 @@ mod plan_name_tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             }),
             PlannedChange::new(Change::AlterColumnExpression {
                 uid: generated,

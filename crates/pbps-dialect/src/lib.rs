@@ -488,6 +488,12 @@ pub struct Probe {
     /// Returns exactly one row with one integer column: how many rows would
     /// break. Zero means the change is safe to run on today's data.
     pub sql: String,
+
+    /// The query itself failing is the finding. A probe the engine cannot run
+    /// is ordinarily unchecked, because a predicate may spell a name the plan
+    /// renames; a recorded conversion's expression is evaluated over every
+    /// row, and an error there is a row it cannot convert (#2331).
+    pub refuses_when_it_fails: bool,
 }
 
 impl Probe {
@@ -495,7 +501,14 @@ impl Probe {
         Self {
             description: description.into(),
             sql: sql.into(),
+            refuses_when_it_fails: false,
         }
+    }
+
+    #[must_use]
+    pub fn refusing_when_it_fails(mut self) -> Self {
+        self.refuses_when_it_fails = true;
+        self
     }
 }
 
@@ -2441,6 +2454,22 @@ pub trait Dialect {
     /// *modifier* keeps a base every family claims, so the family reads the
     /// modifier as one the engine would accept and can call it `Safe`.
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk;
+
+    /// Whether this engine takes a recorded conversion (`pbps convert`, #2331).
+    /// Only an engine whose `ALTER COLUMN ... TYPE` has a `USING` clause: the
+    /// other converts implicitly, so a record there would promise an
+    /// expression nothing runs (ADR-0012 section 5).
+    fn records_conversions(&self) -> bool {
+        false
+    }
+
+    /// Whether the engine refuses this retype unless a conversion is recorded
+    /// for it: no automatic cast, or one that reads a session setting where
+    /// the declarations say nothing. Normalized types, as for
+    /// [`Dialect::type_change_risk`]; `false` for an engine that records none.
+    fn type_change_needs_using(&self, _from: &ColumnType, _to: &ColumnType) -> bool {
+        false
+    }
 
     /// Derives the complete risk set for planning and saved-plan verification.
     /// Defaults use this engine's identifier boundary; persisted risks are

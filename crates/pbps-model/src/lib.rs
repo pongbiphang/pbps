@@ -72,7 +72,7 @@ pub use data::{
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
-pub use ids::{IdsFile, IdsIndex, Move, Tombstone, ValidIds};
+pub use ids::{Conversion, IdsFile, IdsIndex, Move, Tombstone, ValidIds};
 pub use intent::Intent;
 pub use managed_type::{EnumPlacement, ManagedType};
 pub use module::{

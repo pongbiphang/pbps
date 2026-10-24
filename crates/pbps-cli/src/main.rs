@@ -360,6 +360,21 @@ enum Command {
         reason: pbps_model::Reason,
     },
 
+    /// Record how a column's values are converted when its type changes in a
+    /// way the engine cannot do by itself (#2331)
+    Convert {
+        /// The fully qualified column, e.g. app.orders.amount
+        column: String,
+        /// The expression that makes the new value from the column's old one,
+        /// e.g. `amount::integer`. `-` reads it from standard input
+        #[arg(long)]
+        using: String,
+        /// The type the column has where this conversion applies. Defaults to
+        /// its type in the declarations at HEAD
+        #[arg(long)]
+        from: Option<String>,
+    },
+
     /// Record intent for a blocking partitioned-table rewrite (execution is not available yet)
     RebuildTable {
         table: String,
@@ -549,6 +564,7 @@ impl Command {
             | Command::RenameRole { .. }
             | Command::DropRole { .. }
             | Command::MoveRows { .. }
+            | Command::Convert { .. }
             | Command::RebuildTable { .. }
             | Command::Partitions { .. }
             | Command::Resolver { .. }
@@ -850,6 +866,7 @@ fn run() -> anyhow::Result<()> {
         | Command::DropTable { .. }
         | Command::DropRole { .. }
         | Command::MoveRows { .. }
+        | Command::Convert { .. }
         | Command::RebuildTable { .. } => {
             operator_override(std::env::var("PBPS_OPERATOR"))?;
         }
@@ -881,6 +898,19 @@ fn run() -> anyhow::Result<()> {
                 )
                 .exit()
         }))
+    } else {
+        None
+    };
+    // The expression is read, and refused if blank, before the project is
+    // discovered, so an unedited remedy changes nothing (DEC-2331.1).
+    let conversion = if let Command::Convert { using, .. } = &cli.command {
+        Some(
+            using_expression(using, &mut std::io::stdin().lock()).unwrap_or_else(|message| {
+                Cli::command()
+                    .error(clap::error::ErrorKind::ValueValidation, message)
+                    .exit()
+            }),
+        )
     } else {
         None
     };
@@ -1345,6 +1375,14 @@ fn run() -> anyhow::Result<()> {
                 reason: reason.to_string(),
             }
             .into(),
+        ),
+        Command::Convert { column, from, .. } => cmd_convert(
+            &project,
+            &column.parse()?,
+            conversion
+                .as_deref()
+                .context("the conversion expression was not read")?,
+            from.as_deref(),
         ),
         Command::RebuildTable {
             table,
@@ -3298,6 +3336,94 @@ fn cmd_rebuild_table(
     Ok(())
 }
 
+/// The expression `--using` names: its text, or standard input for `-`.
+///
+/// Read to the end as UTF-8 with exactly one final line ending removed -- the
+/// one `echo` or a here-document adds -- and nothing else changed, because an
+/// expression's inner spacing and line breaks are its author's. Blank is a usage
+/// error like any other missing intent, and so is input that is not text.
+fn using_expression(raw: &str, stdin: &mut impl std::io::Read) -> Result<String, String> {
+    let text = if raw == "-" {
+        let mut bytes = Vec::new();
+        stdin
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read the expression from standard input: {e}"))?;
+        let mut text = String::from_utf8(bytes)
+            .map_err(|_| "the expression on standard input is not UTF-8".to_owned())?;
+        if text.ends_with("\r\n") {
+            text.truncate(text.len() - 2);
+        } else if text.ends_with('\n') {
+            text.pop();
+        }
+        text
+    } else {
+        raw.to_owned()
+    };
+    if text.trim().is_empty() {
+        return Err("the conversion expression is blank".to_owned());
+    }
+    Ok(text)
+}
+
+/// Records a conversion. It reads the declarations and the base in git, never a
+/// database: what the column was is a fact of the repository, and what it
+/// becomes is the person's to say (DEC-2331.1).
+fn cmd_convert(
+    project: &Project,
+    column: &ColumnRef,
+    using: &str,
+    from: Option<&str>,
+) -> anyhow::Result<()> {
+    let dialect = dialect(project)?;
+    if !dialect.records_conversions() {
+        bail!(
+            "convert is only supported for PostgreSQL: this engine converts a column's values \
+             itself and has no `USING` clause (ADR-0012 section 5)"
+        );
+    }
+    let loaded = load(project, dialect.as_ref())?;
+    let problems = declaration_problems(&loaded, dialect.as_ref());
+    if !problems.is_empty() {
+        bail!(
+            "{}",
+            problems
+                .iter()
+                .map(|(_, why)| why.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    if !loaded.intents.is_empty() {
+        bail!("resolve declaration identity annotations before recording a conversion");
+    }
+    let ids = read_ids(project)?;
+    let baseline = baseline::load(
+        project,
+        &baseline::Source::Git { rev: "HEAD".into() },
+        dialect.as_ref(),
+    )?;
+    let updated = pbps_diff::conversion::record(
+        Side {
+            schema: &baseline.schema,
+            ids: &baseline.ids,
+        },
+        &loaded.schema,
+        &ids,
+        column,
+        using,
+        from,
+        &context(project.root())?,
+        dialect.as_ref(),
+    )?;
+    if updated == ids {
+        println!("The identity file is unchanged; this conversion is already recorded.");
+    } else {
+        write_ids(project, &updated)?;
+        println!("updated {}", project.ids_file().display());
+    }
+    Ok(())
+}
+
 /// Resolves every supplied decision together; only a complete answer is written.
 fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
     let loaded = load(project, dialect(project)?.as_ref())?;
@@ -3314,7 +3440,8 @@ fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
         annotation_count,
         &context(project.root())?,
     ) {
-        Ok(res) => {
+        Ok(mut res) => {
+            pbps_diff::conversion::prune(&mut res.ids, &loaded.schema, dialect(project)?.as_ref());
             if res.ids == ids {
                 println!(
                     "The identity file is unchanged; these intents may have taken effect already."
@@ -3711,6 +3838,12 @@ fn cmd_plan(
             }
         };
 
+        // A record that no longer applies goes with this write: the declared
+        // type has moved on, so an environment still on the old one needs a
+        // conversion for the new pair and is refused by name until it has one
+        // (DEC-2331.1).
+        let mut res = res;
+        pbps_diff::conversion::prune(&mut res.ids, &loaded.schema, dialect.as_ref());
         if res.ids != ids && check {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
@@ -3830,6 +3963,71 @@ fn cmd_plan(
             }
             errors
         })?;
+
+        // A type change the engine refuses without a conversion: asked of a
+        // person when there is one to ask, and named with the command to run
+        // when there is not. Recorded, then planned again from the files, so
+        // the plan is the one the record produces and not a patched copy.
+        let needed = pbps_diff::conversion::needed(&cs.changes().changes, dialect.as_ref());
+        if !needed.is_empty() {
+            if may_prompt && prompt::interactive() {
+                let ctx = context(project.root())?;
+                if let Some(answers) = prompt::ask_conversions(&needed) {
+                    let mut next = res.ids.clone();
+                    for (need, using) in &answers {
+                        pbps_diff::conversion::answer(&mut next, need, using, &ctx);
+                    }
+                    output::or_unanswerable(
+                        "plan",
+                        json,
+                        "identity.unwritable",
+                        write_ids(project, &next),
+                    )?;
+                    println!("updated {}", project.ids_file().display());
+                    return cmd_plan(
+                        project,
+                        source,
+                        PlanOptions {
+                            check,
+                            out,
+                            sql,
+                            dev,
+                            no_dev,
+                            may_prompt,
+                            format,
+                        },
+                    );
+                }
+                eprintln!("\nNothing was recorded.");
+            }
+            let findings: Vec<output::Finding> = needed
+                .iter()
+                .map(|need| {
+                    let command = format!("pbps convert {} --using -", need.column.shown());
+                    output::Finding::error(
+                        "plan.conversion-required",
+                        format!(
+                            "{} changes from `{}` to `{}`, which the engine cannot convert by \
+                             itself, and no conversion is recorded for it. Record the expression \
+                             that makes the new value from the old one (it is read from standard \
+                             input, so it needs no shell quoting), then plan again",
+                            need.column.shown(),
+                            pbps_model::escape::Escaped(&need.from),
+                            pbps_model::escape::Escaped(&need.to),
+                        ),
+                    )
+                    .remedy(command)
+                })
+                .collect();
+            if json {
+                return output::Report::new("plan", findings, None::<PlanData>).emit_json();
+            }
+            eprint!("{}", output::human(&findings));
+            return Err(Found::new(
+                "a type change needs a recorded conversion; record it with the command above and retry",
+            )
+            .into());
+        }
 
         // The order `plan --db` would give these declarations with no catalog to
         // read (#1598): what a new table calls goes ahead of it. The passes that

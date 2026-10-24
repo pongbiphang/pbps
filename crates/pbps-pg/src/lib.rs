@@ -1335,6 +1335,27 @@ impl Dialect for Postgres {
         partition_series::series(request)
     }
 
+    fn records_conversions(&self) -> bool {
+        true
+    }
+
+    fn type_change_needs_using(&self, from: &ColumnType, to: &ColumnType) -> bool {
+        // The three refusals `emit` makes for a change with no recorded
+        // conversion, in one place so the prompt asks for exactly the changes
+        // the emitter would refuse. A reference to a user-defined type is not
+        // among them: no expression retypes it (DEC-1523.1).
+        let (Ok(from), Ok(to)) = (types::normalize(from), types::normalize(to)) else {
+            return false;
+        };
+        if from.type_ref().is_some() || to.type_ref().is_some() {
+            return false;
+        }
+        let risk = types::change_risk(&from, &to);
+        risk == TypeChangeRisk::Incompatible
+            || (from.is_array() && to.is_array() && risk != TypeChangeRisk::Safe)
+            || types::depends_on_the_session_time_zone(&from, &to)
+    }
+
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         // Normalized again here, as the SQL Server dialect does and for the
         // same reason: the trait says the caller normalizes first, but a
