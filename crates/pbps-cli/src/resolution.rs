@@ -156,6 +156,7 @@ fn describe(surface: &pbps_model::resolver::Surface) -> String {
 
 /// Everything case 3 needs from the plan being made.
 pub struct Request<'a> {
+    pub dependencies: &'a pbps_model::dependency::Dependencies,
     pub selection: &'a ResolverSelection,
     pub assessment: &'a Assessment,
     pub target: &'a crate::db::Target,
@@ -350,6 +351,7 @@ mod producer {
         bootstrap: &pbps_diff::order::DiffPlan,
     ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
         let binding = pbps_cli::resolver::server::BindingRequest {
+            dependencies: request.dependencies,
             bootstrap,
             desired: request.desired.schema,
             base: request.base.schema,
@@ -905,7 +907,9 @@ mod tests {
             .unwrap(),
         };
         let hints = Hints::default();
+        let dependencies = Default::default();
         let request = |target_identity| Request {
+            dependencies: &dependencies,
             selection: &selection,
             assessment: &assessment,
             target: &target,
@@ -984,6 +988,7 @@ mod tests {
         let refusal = |connection: &str, driver| {
             let target = crate::db::target_from_connection(connection, driver);
             let request = Request {
+                dependencies: &Default::default(),
                 selection: &selection,
                 assessment: &assessment,
                 target: &target,

@@ -4,6 +4,7 @@
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 
+pub mod companion;
 pub mod inventory;
 pub mod options;
 mod system;

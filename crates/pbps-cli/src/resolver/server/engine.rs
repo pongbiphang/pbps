@@ -50,8 +50,8 @@ impl From<&Standard> for Standard {
 }
 
 pub(super) enum Scratch<'a> {
-    Postgres(postgres::Scratch<'a>),
-    Mssql(mssql::Scratch<'a>),
+    Postgres(Box<postgres::Scratch<'a>>),
+    Mssql(Box<mssql::Scratch<'a>>),
 }
 pub(super) enum Prepared {
     Postgres(postgres::Prepared),
@@ -126,7 +126,7 @@ pub(super) async fn scratch<'a>(
                 provenance,
             )
             .await?;
-            Ok((provisioning, Scratch::Postgres(scratch)))
+            Ok((provisioning, Scratch::Postgres(Box::new(scratch))))
         }
         (Driver::Mssql, Standard::Mssql) => {
             let (provisioning, scratch) = mssql::scratch(
@@ -140,7 +140,7 @@ pub(super) async fn scratch<'a>(
                 provenance,
             )
             .await?;
-            Ok((provisioning, Scratch::Mssql(scratch)))
+            Ok((provisioning, Scratch::Mssql(Box::new(scratch))))
         }
         (Driver::Mssql, Standard::Postgres(_)) | (Driver::Postgres, Standard::Mssql) => {
             Err(ProduceError::Run(Error::Unusable(

@@ -69,6 +69,16 @@ pub async fn compare_staged(
     created: &BTreeSet<ObjectIdentity>,
     managed: &[&Schema],
 ) -> Result<Staged, StageError> {
+    compare_staged_declared(scratch, target, created, managed, &Default::default()).await
+}
+
+pub async fn compare_staged_declared(
+    scratch: &mut impl QueryConnection,
+    target: &mut impl QueryConnection,
+    created: &BTreeSet<ObjectIdentity>,
+    managed: &[&Schema],
+    declarations: &pbps_model::dependency::Dependencies,
+) -> Result<Staged, StageError> {
     let managed: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let mut refused = Vec::new();
     for root in created {
@@ -112,7 +122,7 @@ pub async fn compare_staged(
         .await
         .map_err(StageError::Capture)?;
     scope.retained.extend(created.iter().cloned());
-    let on_target = super::capture(target, &scope)
+    let on_target = super::capture_declared(target, &scope, declarations)
         .await
         .map_err(StageError::Capture)?;
     let held_managed = Names::read(scratch, &target_managed.objects)
@@ -128,7 +138,7 @@ pub async fn compare_staged(
     if !waiting.is_empty() {
         return Err(StageError::Refused(waiting));
     }
-    let staged = super::capture(scratch, &scope)
+    let staged = super::capture_declared(scratch, &scope, declarations)
         .await
         .map_err(StageError::Capture)?;
     let requested: BTreeSet<_> = created
@@ -269,11 +279,19 @@ pub async fn required_externals(
     target: &mut impl QueryConnection,
     managed: &[&Schema],
 ) -> Result<ExternalInputs, CaptureError> {
+    required_externals_declared(target, managed, &Default::default()).await
+}
+
+pub async fn required_externals_declared(
+    target: &mut impl QueryConnection,
+    managed: &[&Schema],
+    declarations: &pbps_model::dependency::Dependencies,
+) -> Result<ExternalInputs, CaptureError> {
     let schemas: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let managed = Managed::read(target, &schemas).await?;
     let mut scope = cascade_scope_for(target, &managed).await?;
     scope.retained.extend(managed.objects.iter().cloned());
-    let captured = super::capture(target, &scope).await?;
+    let captured = super::capture_declared(target, &scope, declarations).await?;
     let roots = captured
         .inputs
         .iter()

@@ -2135,7 +2135,27 @@
         "resolver::server::scratch::mssql_live_tests::same_instance2270::target_database_is_always_refused",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_allow_keeps_containment_and_comparison",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::another_instance_does_not_require_file_consent",
-        "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_automatic_externals_use_catalog_rendering_only"
+        "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_automatic_externals_use_catalog_rendering_only",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_nested_views_preserve_multi_base_write_refusal",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::hidden_temporal_columns_fall_back_under_object_only_visibility",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_computed_columns_preserve_write_refusal",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::object_only_visibility_names_hidden_inner_views_and_tables",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::union_lineage_falls_back_without_claiming_verification",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::hidden_key_types_fall_back_before_guessing_a_replay_type",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::failed_unchanged_replay_records_its_error_and_uses_one_source_group",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::a_renamed_definition_cannot_leave_an_unexpected_view_before_fallback",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::stale_view_output_metadata_records_the_mismatch_and_falls_back",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_instead_of_verbs_preserve_combined_write_admission",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_base_identity_rowversion_and_collation_survive_reconstruction",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::indexed_views_keep_noexpand_name_hints_and_indexes_in_fallback",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::recursive_views_recreate_the_inner_view_index_set",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::a_missing_companion_index_revokes_verification_and_names_the_index",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::catalog_companions_preserve_tables_and_views_and_release_every_support_object",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::unreadable_dependencies_use_declarations_without_claiming_comparison",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::same_instance_binds_the_real_shape_and_leaves_the_other_database_untouched",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::readable_mismatches_and_undeclared_references_refuse_by_name",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::a_companion_collision_never_replaces_or_drops_the_existing_database",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::supplied_scratch_on_another_instance_refuses_the_named_dependency"
       ]
     },
     {
