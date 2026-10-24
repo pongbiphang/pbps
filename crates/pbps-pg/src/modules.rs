@@ -2689,6 +2689,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dependent_graph_keys_and_tie_order_keep_raw_descriptions() {
+        let names = ["view x\n\u{1b}\u{202e}名前", r"view x\n\u{1b}\u{202e}名前"];
+        let found: BTreeMap<_, _> = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).into(),
+                    dependent(
+                        name,
+                        Holds::Module(ModuleId::Named(ObjectName::new("app", *name))),
+                    ),
+                )
+            })
+            .collect();
+        let plain = drop_order(found.clone(), &BTreeMap::new());
+        assert_eq!(
+            plain
+                .iter()
+                .map(|d| d.described.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        let edges = BTreeMap::from([(names[0].into(), BTreeSet::from([names[1].into()]))]);
+        let ordered = drop_order(found.clone(), &edges);
+        assert_eq!(ordered, [found[names[1]].clone(), found[names[0]].clone()]);
+        let cycle = BTreeMap::from([
+            (names[0].into(), BTreeSet::from([names[1].into()])),
+            (names[1].into(), BTreeSet::from([names[0].into()])),
+        ]);
+        let refused = drop_order(found, &cycle);
+        assert_eq!(
+            refused
+                .iter()
+                .map(|d| d.described.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert!(
+            refused
+                .iter()
+                .all(|d| matches!(d.holds, Holds::Unrepresentable(_)))
+        );
+    }
+
     /// "Managed" is a question about the declarations, and it has to be asked
     /// of the exact part: a table this project declares does not make every
     /// constraint on it declared, and a column with no `default:` has no

@@ -766,11 +766,12 @@ fn removal_of(
             // Only a declared module reaches here: an undeclared one the plan
             // does not remove was refused above, and one it does remove is
             // moved rather than synthesized.
-            let kind = declared
-                .modules
-                .get(x)
-                .map(|m| m.kind)
-                .ok_or_else(|| format!("{}: its kind is not declared", d.described))?;
+            let kind = declared.modules.get(x).map(|m| m.kind).ok_or_else(|| {
+                format!(
+                    "{}: its kind is not declared",
+                    pbps_model::escape::Escaped(&d.described)
+                )
+            })?;
             Ok(Change::DropModule {
                 id: x.clone(),
                 kind,
@@ -828,11 +829,14 @@ fn removal_of(
             Part::Generated(_) => {
                 return Err(format!(
                     "{}: a generated column's expression cannot be taken off around the module",
-                    d.described
+                    pbps_model::escape::Escaped(&d.described)
                 ));
             }
         }),
-        Holds::Unrepresentable(why) => Err(format!("{} — {why}", d.described)),
+        Holds::Unrepresentable(why) => Err(format!(
+            "{} — {why}",
+            pbps_model::escape::Escaped(&d.described)
+        )),
     }
 }
 
@@ -845,7 +849,7 @@ fn restoration_of(
     let unsupported = || {
         format!(
             "{}: the declarations hold it, but not in a form pbps can restore",
-            d.described
+            pbps_model::escape::Escaped(&d.described)
         )
     };
     match &d.holds {
@@ -1085,7 +1089,7 @@ pub fn weave(
                     "`{root}` is rebuilt while this plan detaches {} from {table}, whose {} \
                      calls it; rebuild it and detach in separate plans",
                     moving.join(", "),
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     table = table.shown(),
                     root = root.shown()
                 ));
@@ -1178,21 +1182,21 @@ impl std::fmt::Display for Named {
             Need::Split { root, .. } => write!(
                 f,
                 "{} is edited in one step and has to be split around `{root}`",
-                self.described,
+                pbps_model::escape::Escaped(&self.described),
                 root = root.shown()
             ),
             Need::Removed { root, .. } => {
                 write!(
                     f,
                     "{} has to be gone before `{root}` is dropped",
-                    self.described,
+                    pbps_model::escape::Escaped(&self.described),
                     root = root.shown()
                 )
             }
             Need::Restored { root, .. } => write!(
                 f,
                 "{} has to come back after `{root}` is created",
-                self.described,
+                pbps_model::escape::Escaped(&self.described),
                 root = root.shown()
             ),
         }
@@ -1385,7 +1389,12 @@ impl Expansion for Weave<'_> {
                         let here = Dependent {
                             described: d.described.clone(),
                             holds: named_at(&view, At::Before(at.drop_at), &d.holds).ok_or_else(
-                                || format!("{}: physical source is unavailable", d.described),
+                                || {
+                                    format!(
+                                        "{}: physical source is unavailable",
+                                        pbps_model::escape::Escaped(&d.described)
+                                    )
+                                },
                             )?,
                         };
                         let final_name = as_declared(&view, d).unwrap_or_else(|| here.clone());
@@ -1443,7 +1452,10 @@ impl Expansion for Weave<'_> {
                     None if at.create_at.is_some() => {
                         let here_at = boundary(changes, after + 1);
                         let here = named_at(&view, here_at, &d.holds).ok_or_else(|| {
-                            format!("{}: physical source is unavailable", d.described)
+                            format!(
+                                "{}: physical source is unavailable",
+                                pbps_model::escape::Escaped(&d.described)
+                            )
                         })?;
                         let change = restoration_of(
                             &kept,
@@ -1474,7 +1486,7 @@ impl Expansion for Weave<'_> {
                         "`{root}` is dropped by this plan, and {} depends on it and is kept by \
                          the declarations. Remove the dependency from its declaration, or keep \
                          `{root}`, and plan again.",
-                        d.described,
+                        pbps_model::escape::Escaped(&d.described),
                         root = root.shown()
                     )),
                 }
@@ -3047,7 +3059,7 @@ pub fn unaccounted(
             if !removed_first {
                 out.push(format!(
                     "{} depends on `{root}`",
-                    d.described,
+                    pbps_model::escape::Escaped(&d.described),
                     root = root.shown()
                 ));
             }

@@ -35308,3 +35308,99 @@ fn step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json() {
         pbps_model::escape::Escaped(detail).to_string()
     );
 }
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; run through the lane wrapper"]
+fn late_dependent_descriptions_are_shown_once_in_plan_and_apply() {
+    let name = "late\n\u{1b}[31m\u{202e}\\n名前_ünï";
+    let shown = r"late\n\u{1b}[31m\u{202e}\\n名前_ünï";
+    for server in [server(), old_server()] {
+        let own = OwnDatabase::new(&server, "dependent-descriptions");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; CREATE VIEW app.root AS SELECT 1 AS id; CREATE VIEW app.child AS SELECT id FROM app.root",
+        );
+        let d = Demo::new("dependent-descriptions");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let root = d.dir.join("schema/app.root.view.yml");
+        let definition = std::fs::read_to_string(&root).unwrap();
+        assert!(definition.contains("1 AS id"), "{definition}");
+        std::fs::write(&root, definition.replace("1 AS id", "2 AS id")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let qualified = format!("public.{}", message_boundaries::quote(name, true));
+        on_server(
+            connection,
+            &format!("CREATE VIEW {qualified} AS SELECT id FROM app.root"),
+        );
+        let described = format!("rule _RETURN on view public.\"{shown}\"");
+        let planning = format!(
+            "module_dependents (PostgreSQL): `app.root` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so the change is a drop \
+             and a create (ADR-0009 section 3), and these objects depend on it and this project could not \
+             put them back:\n- {described} -- this project does not declare it\n\
+             The plan names every object it drops, or it does not drop \
+             (SPEC 14.3), so `DROP ... CASCADE` is not offered. Declare them, or remove the \
+             dependency, and plan again."
+        );
+        let applying = format!(
+            "module_dependents (PostgreSQL): the database now holds dependents this plan does not \
+             remove before dropping what they depend on, so the engine would refuse the drop:\n  \
+             {described} depends on `app.root`\n\
+             Plan again, so the plan accounts for them where the approver can see it."
+        );
+        for (apply, expected) in [(false, planning), (true, applying)] {
+            // Apply has no JSON mode; planning exposes both renderers.
+            let formats: &[bool] = if apply { &[false] } else { &[false, true] };
+            for &json in formats {
+                let out = if apply {
+                    approved_apply(&d, connection, &plan, &["--allow", "destructive"])
+                } else {
+                    let mut flags = vec!["plan", "--db", connection];
+                    if json {
+                        flags.extend(["--format", "json"]);
+                    }
+                    d.run(&flags)
+                };
+                assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+                if json {
+                    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+                    let finding = report["findings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|f| f["severity"] == "error")
+                        .unwrap();
+                    assert_eq!(finding["message"], expected, "{report}");
+                } else {
+                    // Catalog warnings vary with other databases on the fixture;
+                    // pin the complete refusal, independently of those warnings.
+                    let text = stderr(&out);
+                    let error = text
+                        .rsplit_once("\nerror: ")
+                        .map(|(_, error)| error)
+                        .or_else(|| text.strip_prefix("error: "))
+                        .unwrap();
+                    assert_eq!(error, format!("{expected}\n"));
+                }
+            }
+        }
+        assert_eq!(scalar(connection, "SELECT id::bigint FROM app.root"), 1);
+        on_server(connection, &format!("DROP VIEW {qualified}"));
+        // Replan after the failed apply was recorded, as the ordinary recovery flow does.
+        std::fs::remove_file(&plan).unwrap();
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive"],
+        ));
+        assert_eq!(scalar(connection, "SELECT id::bigint FROM app.child"), 2);
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
