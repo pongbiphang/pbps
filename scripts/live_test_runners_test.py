@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Regressions for live-test execution ownership, without starting fixtures."""
 
+import argparse
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +55,208 @@ def job_commands(workflow, job):
 
 
 class ShardedExecution(unittest.TestCase):
+    def test_available_memory_requires_readable_memavailable(self):
+        with mock.patch.object(SHARDS.subprocess, "check_output", return_value="Mem: 4096 1 2 3 4 3072\n"):
+            self.assertEqual(SHARDS.available_gb(), 3)
+        for output in ("", "Mem: 4096 1\n", "Mem: 1 2 3 4 5 ?\n",
+                       "Mem: 1 2 3 4 5 6\nMem: 1 2 3 4 5 6\n"):
+            with mock.patch.object(SHARDS.subprocess, "check_output", return_value=output):
+                with self.assertRaises(ValueError):
+                    SHARDS.available_gb()
+
+    def test_joint_defaults_reserve_postgresql_before_sql_server(self):
+        for memory, expected in ((64, {"mssql": 3, "pg": 4}),
+                                 (24.96, {"mssql": 3, "pg": 4}),
+                                 (23, {"mssql": 3, "pg": 4}),
+                                 (22, {"mssql": 2, "pg": 4}),
+                                 (18, {"mssql": 2, "pg": 4}),
+                                 (17, {"mssql": 1, "pg": 4}),
+                                 (16, {"mssql": 1, "pg": 4}),
+                                 (11, {"mssql": 1, "pg": 2})):
+            with self.subTest(memory=memory):
+                counts = SHARDS.shard_counts(["mssql", "pg"], memory)
+                self.assertEqual(counts, expected)
+                self.assertLessEqual(SHARDS.mssql_memory(counts["mssql"]) + counts["pg"], memory)
+        self.assertEqual(SHARDS.shard_counts(["pg"], 20), {"pg": 4})
+        self.assertEqual(SHARDS.shard_counts(["mssql"], 24), {"mssql": 3})
+        for memory, overrides in ((9, {}), (17, {"mssql": 2, "pg": 4}),
+                                  (64, {"mssql": 4}),
+                                  (32, {"pg": 0}), (32, {"mssql": -1})):
+            with self.assertRaises(ValueError):
+                SHARDS.shard_counts(["mssql", "pg"], memory, **overrides)
+
+    def test_express_names_are_pinned_and_weights_balance_around_their_load(self):
+        express = sorted(SHARDS.EXPRESS_TESTS)
+        names = express + ["a", "b", "c"]
+        weights = {"bin:" + name: 10 for name in express}
+        weights.update({"bin:a": 20, "bin:b": 15, "bin:c": 5})
+        groups = SHARDS.partition(names, 3, "bin", weights)
+        self.assertEqual(groups, [express, ["a"], ["b", "c"]])
+        SHARDS.verify_express(groups)
+        SHARDS.verify_express(SHARDS.partition(names, 3, "bin", None))
+        with self.assertRaisesRegex(ValueError, "Express"):
+            SHARDS.verify_express([[], express, ["a", "b", "c"]])
+
+    def test_express_classification_fails_before_launch_and_nonzero_shards_start_none(self):
+        result, calls, _, _ = self.fake_run("mssql", 3, "express-missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("classified exact name", result.stderr)
+        self.assertFalse(any(row["command"][0] == "docker" for row in calls))
+        result, calls, summary, receipts = self.fake_run("mssql", 3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started = [row for row in calls if row["command"][:2] == ["docker", "run"]
+                   and "MSSQL_PID=Express" in row["command"]]
+        self.assertEqual([row["environment"]["PBPS_LIVE_SHARD"] for row in started], ["0/3"])
+        for row in receipts:
+            SHARDS.verify_express(row["groups"])
+        self.assertEqual(summary["mssql"]["union"], "exact")
+
+    def test_preflight_refuses_an_express_assignment_on_a_nonzero_shard(self):
+        def listing(command, **kwargs):
+            cargo = tuple(command[1:command.index("--") + 1])
+            names = sorted(SHARDS.EXPRESS_INVENTORY[cargo])
+            output = "\n".join(name + ": test" for name in names)
+            return subprocess.CompletedProcess(command, 0, output + f"\n{len(names)} tests, 0 benchmarks\n")
+
+        with mock.patch.object(SHARDS.subprocess, "run", side_effect=listing) as listed, \
+             mock.patch.object(SHARDS, "partition", return_value=[[], sorted(SHARDS.EXPRESS_TESTS)]):
+            with self.assertRaisesRegex(ValueError, "Express-needing test assigned outside shard zero"):
+                SHARDS.preflight_express(2, {}, os.environ)
+            self.assertEqual(listed.call_count, 1, "refuse during enumeration before any runner starts")
+
+    def test_memory_sampling_keeps_lows_and_reports_unreadable_samples(self):
+        for values, expected, errors in (([21, 13, 20], [32, 21, 13, 20], []),
+                                         ([OSError("free failed")], [32], ["free failed"])):
+            with self.subTest(values=values):
+                stop = mock.Mock()
+                stop.wait.side_effect = [False] * len(values) + [True]
+                samples, observed_errors = [32], []
+                with mock.patch.object(SHARDS, "available_gb", side_effect=values):
+                    SHARDS.sample_memory(stop, samples, observed_errors)
+                self.assertEqual(samples, expected)
+                self.assertEqual(observed_errors, errors)
+                self.assertTrue(all(call == mock.call(15) for call in stop.wait.call_args_list))
+
+    def test_summary_records_memory_minimum_and_shard_wall_times_even_on_failure(self):
+        for errors in ((), ("free failed",)):
+            with self.subTest(errors=errors):
+                code, summary, _, _ = self.overlap_run(memory_values=(21, 12), memory_errors=errors)
+                self.assertEqual(code, int(bool(errors)))
+                self.assertEqual(summary["run"]["minimum_available_gib"], 12)
+                self.assertEqual(summary["run"]["memory_samples"], 3)
+                self.assertEqual(summary["run"]["memory_sample_seconds"], 15)
+                self.assertEqual(summary["run"]["memory_errors"], list(errors))
+                for suite in SHARDS.RUNNERS:
+                    self.assertEqual(summary[suite]["shard_seconds"], {"0": summary[suite]["seconds"]})
+                    self.assertEqual(summary[suite]["union"], "exact")
+
+    def test_unknown_weights_use_the_observed_median(self):
+        groups = SHARDS.partition(list("abcdef"), 2, "bin", {"bin:a": 100, "bin:b": 10})
+        self.assertEqual(groups, [["a", "b", "e"], ["c", "d", "f"]])
+
+    def test_all_suites_overlap_and_a_serial_pool_fails_the_runner_barrier(self):
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                code, summary, events, requested = self.overlap_run(serial=serial)
+                self.assertEqual(requested, [2], "one pool must contain both suites")
+                starts = [events[suite]["start"] for suite in SHARDS.RUNNERS]
+                ends = [events[suite]["end"] for suite in SHARDS.RUNNERS]
+                self.assertEqual(max(starts) < min(ends), not serial)
+                self.assertEqual(code, 1 if serial else 0)
+                self.assertEqual(set(summary) - {"run"}, set(SHARDS.RUNNERS))
+                for suite in SHARDS.RUNNERS:
+                    self.assertEqual(summary[suite]["failed"], 1 if serial else 0)
+
+    def test_both_suites_are_audited_when_one_runner_fails(self):
+        for failing in ("mssql", "malformed"):
+            with self.subTest(failing=failing):
+                code, summary, _, _ = self.overlap_run(failing=failing)
+                self.assertEqual(code, 1)
+                if failing == "mssql":
+                    self.assertEqual(summary["mssql"]["failed"], 1)
+                else:
+                    self.assertEqual(summary["mssql"]["union"], "failed")
+                self.assertEqual(summary["pg"]["passed"], 1)
+                self.assertEqual(summary["pg"]["union"], "exact")
+
+    def test_cross_suite_port_conflicts_refuse_before_either_runner_starts(self):
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            self.overlap_run(overrides={"PBPS_TEST_PG_PORT": "26330"})
+
+    def overlap_run(self, serial=False, failing="", overrides=None, memory_values=(), memory_errors=()):
+        # The runners rendezvous only while both processes are alive. A single
+        # worker cannot satisfy it, regardless of machine speed or test duration.
+        with tempfile.TemporaryDirectory(prefix="pbps-suite-overlap-") as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            runner = root / "runner.py"
+            runner.write_text(r'''
+import json, os, sys, time
+from pathlib import Path
+root = Path(os.environ["PBPS_OVERLAP_ROOT"])
+suite = sys.argv[1]
+peer = "pg" if suite == "mssql" else "mssql"
+started = time.monotonic()
+active = root / (suite + ".active")
+active.touch()
+deadline = started + 1.5
+while not (root / (peer + ".active")).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if (root / (peer + ".active")).exists():
+    (root / (suite + ".seen")).touch()
+while not (root / (peer + ".seen")).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+overlap = (root / (suite + ".seen")).exists() and (root / (peer + ".seen")).exists()
+failed = not overlap or os.environ["PBPS_OVERLAP_FAIL"] == suite
+row = {"args": ["test"], "identity": suite, "listed": ["case"], "groups": [["case"]],
+       "assigned": ["case"], "reported": {"case": {"status": "FAILED" if failed else "ok", "seconds": 1}},
+       "pinned": False, "valid": True}
+if suite == "mssql" and os.environ["PBPS_OVERLAP_FAIL"] == "malformed":
+    row["groups"] = []
+output = Path(os.environ["PBPS_LIVE_SHARD_DIR"])
+output.mkdir(parents=True)
+(output / "case.json").write_text(json.dumps(row))
+(root / (suite + ".json")).write_text(json.dumps({"start": started, "end": time.monotonic()}))
+active.unlink()
+sys.exit(1 if failed else 0)
+''')
+            for suite, filename in SHARDS.RUNNERS.items():
+                (root / "scripts" / filename).write_text(
+                    "exec " + shlex.join([sys.executable, str(runner), suite]) + "\n")
+            env = fixture_environment(PBPS_OVERLAP_ROOT=str(root), PBPS_OVERLAP_FAIL=failing)
+            env.update(overrides or {})
+            args = argparse.Namespace(suite="all", mssql_shards=1, pg_shards=1, prefix="overlap",
+                                      weights=None, measure=None, output=str(root / "output"))
+            executor = SHARDS.ThreadPoolExecutor
+            requested = []
+
+            def pool(max_workers):
+                requested.append(max_workers)
+                return executor(max_workers=1 if serial else max_workers)
+
+            def sample(stop, samples, errors):
+                samples.extend(memory_values)
+                errors.extend(memory_errors)
+
+            with mock.patch.object(SHARDS, "ROOT", root), \
+                 mock.patch.object(SHARDS, "available_gb", return_value=32) as memory, \
+                 mock.patch.object(SHARDS, "ThreadPoolExecutor", side_effect=pool), \
+                 mock.patch.object(SHARDS, "sample_memory", side_effect=sample), \
+                 mock.patch.object(SHARDS, "preflight_express", return_value=sorted(SHARDS.EXPRESS_TESTS)), \
+                 mock.patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()):
+                try:
+                    code = SHARDS.drive(args)
+                except ValueError:
+                    self.assertFalse(list(root.glob("*.active")))
+                    self.assertFalse(list(root.glob("*.seen")))
+                    self.assertFalse(list(root.glob("mssql.json")))
+                    self.assertFalse(list(root.glob("pg.json")))
+                    raise
+                self.assertEqual(memory.call_count, 1)
+            summary = json.loads((root / "output/summary.json").read_text())
+            events = {suite: json.loads((root / (suite + ".json")).read_text()) for suite in SHARDS.RUNNERS}
+            return code, summary, events, requested
+
     def test_partition_is_deterministic_complete_and_rejects_missing_or_duplicate_names(self):
         names = [f"case_{i}" for i in range(40)]
         for weights in (None, {}, {"binary:case_0": 100.0, "binary:case_1": 50.0}):
@@ -217,6 +423,8 @@ with (root / "calls").open("a") as log:
     log.write(json.dumps(record) + "\n")
 if command[:2] == ["docker", "ps"]:
     pass
+elif command[0] == "free":
+    print("Mem: 65536 0 65536 0 0 65536")
 elif command[:2] == ["docker", "exec"]:
     if "SELECT CONVERT" in command[-1]:
         print("SQL_Latin1_General_CP1_CI_AS")
@@ -241,6 +449,9 @@ elif command[0] == "cargo":
         names = ["one_case"]
     else:
         names = [f"{filters[0] if filters else 'fixture'}::case{i:02}" for i in range(12)]
+        if not filters and os.environ["PBPS_SHARD_FAKE_SUITE"] == "mssql" and os.environ["PBPS_SHARD_FAKE_MODE"] != "express-missing":
+            inventory = json.loads(os.environ["PBPS_SHARD_FAKE_EXPRESS"])
+            names += inventory.get(command[command.index("-p") + 1], [])
     if "--list" in command:
         print("\n".join(n + ": test" for n in names))
         print(f"\n{len(names)} tests, 0 benchmarks")
@@ -265,11 +476,14 @@ elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
     raise RuntimeError("unexpected external client: " + repr(command))
 ''')
             fake.chmod(0o755)
-            for name in ("cargo", "docker", "python3", "sleep"):
+            for name in ("cargo", "docker", "python3", "sleep", "free"):
                 (clients / name).symlink_to(fake)
             output = root / "results"
             env = fixture_environment(PATH=str(clients) + os.pathsep + os.environ["PATH"],
-                                      PBPS_SHARD_FAKE_ROOT=str(root), PBPS_SHARD_FAKE_MODE=mode)
+                                      PBPS_SHARD_FAKE_ROOT=str(root), PBPS_SHARD_FAKE_MODE=mode,
+                                      PBPS_SHARD_FAKE_SUITE=suite,
+                                      PBPS_SHARD_FAKE_EXPRESS=json.dumps({cargo[2]: sorted(names)
+                                          for cargo, names in SHARDS.EXPRESS_INVENTORY.items()}))
             if selector is not None:
                 env.update(PBPS_LIVE_SHARD=selector,
                            PBPS_LIVE_SHARD_DIR=str(output / suite / "0"))

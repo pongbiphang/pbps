@@ -49,32 +49,39 @@ export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustS
 # Express, so it stays small beside the first one.
 EXPRESS_NAME=${PBPS_TEST_MSSQL_EXPRESS_NAME:-pbps-test-mssql-express}
 EXPRESS_PORT=${PBPS_TEST_EXPRESS_PORT:-14331}
-containers=$(docker ps -a --format '{{.Names}}')
-if ! grep -Fxq -- "$EXPRESS_NAME" <<< "$containers"; then
-    docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
-        -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
-        -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
-fi
-echo "waiting for the Express SQL Server..."
-# A successful login precedes the asynchronous custom collation change.
-express_ready=false
-for _ in $(seq 1 60); do
-    if docker exec "$EXPRESS_NAME" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
-        -U sa -P "$PASSWORD" -b -Q "IF COALESCE(CONVERT(varchar(128), SERVERPROPERTY('Collation')), '') <> 'Latin1_General_100_CS_AS' THROW 50000, 'fixture collation is not ready', 1;" >/dev/null 2>&1; then
-        express_ready=true
-        break
+if [[ ${PBPS_LIVE_SHARD:-0/1} == 0/* ]]; then
+    containers=$(docker ps -a --format '{{.Names}}')
+    if ! grep -Fxq -- "$EXPRESS_NAME" <<< "$containers"; then
+        docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
+            -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
+            -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
     fi
-    sleep 2
-done
-if [[ "$express_ready" != true ]]; then
-    echo "$EXPRESS_NAME did not reach its configured collation" >&2
-    docker logs "$EXPRESS_NAME" >&2 || true
-    exit 1
+    echo "waiting for the Express SQL Server..."
+    # A successful login precedes the asynchronous custom collation change.
+    express_ready=false
+    for _ in $(seq 1 60); do
+        if docker exec "$EXPRESS_NAME" /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+            -U sa -P "$PASSWORD" -b -Q "IF COALESCE(CONVERT(varchar(128), SERVERPROPERTY('Collation')), '') <> 'Latin1_General_100_CS_AS' THROW 50000, 'fixture collation is not ready', 1;" >/dev/null 2>&1; then
+            express_ready=true
+            break
+        fi
+        sleep 2
+    done
+    if [[ "$express_ready" != true ]]; then
+        echo "$EXPRESS_NAME did not reach its configured collation" >&2
+        docker logs "$EXPRESS_NAME" >&2 || true
+        exit 1
+    fi
+    export PBPS_TEST_EXPRESS_DB="Server=localhost,$EXPRESS_PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
+
+else
+    unset PBPS_TEST_EXPRESS_DB
 fi
-export PBPS_TEST_EXPRESS_DB="Server=localhost,$EXPRESS_PORT;User Id=sa;Password=$PASSWORD;TrustServerCertificate=true"
 
 python3 scripts/check-live-fixture.py --cell mssql2025 --container "$NAME" --port "$PORT"
-python3 scripts/check-live-fixture.py --cell mssql2025-express --container "$EXPRESS_NAME" --port "$EXPRESS_PORT"
+if [[ ${PBPS_LIVE_SHARD:-0/1} == 0/* ]]; then
+    python3 scripts/check-live-fixture.py --cell mssql2025-express --container "$EXPRESS_NAME" --port "$EXPRESS_PORT"
+fi
 
 source scripts/resolver-mssql-fixtures.sh
 

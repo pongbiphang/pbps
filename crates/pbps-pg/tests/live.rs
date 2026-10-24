@@ -18071,54 +18071,62 @@ async fn a_constraint_dropped_between_the_scan_and_the_deparse_says_the_catalog_
     conn.execute(&format!("CREATE TABLE {s}.t (a int)"))
         .await
         .expect("a table");
-    for n in 0..CONSTRAINTS {
-        conn.execute(&format!(
-            "ALTER TABLE {s}.t ADD CONSTRAINT c{n} CHECK (a <> -{})",
-            n + 1_000_000
-        ))
-        .await
-        .expect("a constraint");
-    }
-
-    // The caller's own transaction: ordinary `READ COMMITTED`, exactly as
-    // [`crate::catalog::introspect_within_transaction`]'s own documentation
-    // requires and as the production failure this issue records used it.
-    conn.execute("BEGIN")
-        .await
-        .expect("the caller's own transaction");
-
-    let churn_schema = s.clone();
-    let churn = tokio::spawn(async move {
-        let mut churner = connect().await;
-        for n in 0..CONSTRAINTS {
-            churner
-                .execute(&format!(
-                    "ALTER TABLE {churn_schema}.t DROP CONSTRAINT c{n}"
-                ))
-                .await
-                .expect("drop one constraint");
-        }
-    });
-
     let mut caught = 0usize;
     let mut pulls = 0usize;
-    while !churn.is_finished() {
-        pulls += 1;
-        if let Err(e) = pbps_pg::catalog::introspect_within_transaction(&mut conn).await {
-            let message = e.to_string();
-            assert!(
-                !message.contains("gone out of step"),
-                "a vanished constraint is not a reader out of step with its query: {message}"
-            );
-            assert!(
-                message.contains("the catalog changed while it was being read"),
-                "the pull failed for a reason this test does not cause: {message}"
-            );
-            caught += 1;
+    // A busy shard can miss the entire drop window. Rebuild the fixture for
+    // bounded rounds, while every observed error must still have the right
+    // diagnosis and the final assertion still requires a vanished constraint.
+    for _ in 0..10 {
+        for n in 0..CONSTRAINTS {
+            conn.execute(&format!(
+                "ALTER TABLE {s}.t ADD CONSTRAINT c{n} CHECK (a <> -{})",
+                n + 1_000_000
+            ))
+            .await
+            .expect("a constraint");
+        }
+
+        // The caller's own transaction: ordinary `READ COMMITTED`, exactly as
+        // [`crate::catalog::introspect_within_transaction`]'s own documentation
+        // requires and as the production failure this issue records used it.
+        conn.execute("BEGIN")
+            .await
+            .expect("the caller's own transaction");
+
+        let churn_schema = s.clone();
+        let churn = tokio::spawn(async move {
+            let mut churner = connect().await;
+            for n in 0..CONSTRAINTS {
+                churner
+                    .execute(&format!(
+                        "ALTER TABLE {churn_schema}.t DROP CONSTRAINT c{n}"
+                    ))
+                    .await
+                    .expect("drop one constraint");
+            }
+        });
+
+        while !churn.is_finished() {
+            pulls += 1;
+            if let Err(e) = pbps_pg::catalog::introspect_within_transaction(&mut conn).await {
+                let message = e.to_string();
+                assert!(
+                    !message.contains("gone out of step"),
+                    "a vanished constraint is not a reader out of step with its query: {message}"
+                );
+                assert!(
+                    message.contains("the catalog changed while it was being read"),
+                    "the pull failed for a reason this test does not cause: {message}"
+                );
+                caught += 1;
+            }
+        }
+        churn.await.expect("the churner finished");
+        conn.execute("ROLLBACK").await.expect("rollback");
+        if caught > 0 {
+            break;
         }
     }
-    churn.await.expect("the churner finished");
-    conn.execute("ROLLBACK").await.expect("rollback");
     drop_schema(&mut conn, &s).await;
 
     // Asserted to have fired, for the same reason the module test asserts it:

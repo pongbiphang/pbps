@@ -11,15 +11,31 @@ import os
 from pathlib import Path
 import re
 import shutil
+from statistics import median
 import subprocess
 import sys
 import tempfile
+from threading import Event, Thread
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(__file__).resolve()
 RUNNERS = {"mssql": "live-tests.sh", "pg": "live-tests-pg.sh"}
+MSSQL_SET_GIB = 9
+MSSQL_WITHOUT_EXPRESS_GIB = 5
+PG_SHARD_GIB = 1
+MEMORY_SAMPLE_SECONDS = 15
+EXPRESS_INVENTORY = {
+    ("test", "-p", "pbps-mssql", "--test", "live", "--"): {
+        "binding619::a_global_temporary_table_marks_one_instance_to_every_login_on_it",
+        "resolver_tests::editions611::a_real_express_target_is_an_edition_limitation_and_its_server_collation_a_mismatch",
+    },
+    ("test", "-p", "pbps-cli", "--test", "flow", "--"): {
+        "connected_plan_json_reports_unsupported_online_edition_as_a_finding",
+    },
+}
+EXPRESS_TESTS = set().union(*EXPRESS_INVENTORY.values())
 FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
@@ -65,16 +81,42 @@ def partition(names, count, identity, weights, pinned=False):
         groups[0] = list(names)
     elif weights is not None:
         loads = [0.0] * count
-        for name in sorted(names, key=lambda n: (-weights.get(identity + ":" + n, 1.0), n)):
+        fallback = median(weights.values()) if weights else 1.0
+        groups[0] = sorted(name for name in names if name in EXPRESS_TESTS)
+        loads[0] = sum(weights.get(identity + ":" + name, fallback) for name in groups[0])
+        remaining = [name for name in names if name not in EXPRESS_TESTS]
+        for name in sorted(remaining, key=lambda n: (-weights.get(identity + ":" + n, fallback), n)):
             index = min(range(count), key=lambda i: (loads[i], i))
             groups[index].append(name)
-            loads[index] += weights.get(identity + ":" + name, 1.0)
+            loads[index] += weights.get(identity + ":" + name, fallback)
     else:
         for name in names:
             digest = hashlib.sha256((identity + ":" + name).encode()).digest()
-            groups[int.from_bytes(digest, "big") % count].append(name)
+            index = 0 if name in EXPRESS_TESTS else int.from_bytes(digest, "big") % count
+            groups[index].append(name)
     verify_union(names, groups)
     return [sorted(group) for group in groups]
+
+
+def verify_express(groups):
+    require(not EXPRESS_TESTS.intersection(name for group in groups[1:] for name in group),
+            "Express-needing test assigned outside shard zero")
+
+
+def preflight_express(count, weights, env):
+    # These are fixture inventories, not an alternative runner command list.
+    # Resolve exact names before any runner provisions a database container.
+    real = shutil.which("cargo", path=env.get("PATH"))
+    require(real is not None, "cargo is not installed")
+    for cargo, expected in EXPRESS_INVENTORY.items():
+        result = subprocess.run([real, *cargo, "--ignored", "--list", "--format=pretty", "--color=never"],
+                                env=env, cwd=ROOT, text=True, stdout=subprocess.PIPE)
+        require(result.returncode == 0, "Express fixture inventory failed")
+        names = listed_tests(result.stdout)
+        require(expected.issubset(names), "Express fixture inventory lacks a classified exact name")
+        identity = hashlib.sha256(json.dumps(list(cargo)).encode()).hexdigest()[:24]
+        verify_express(partition(names, count, identity, weights))
+    return sorted(EXPRESS_TESTS)
 
 
 def verify_union(names, groups):
@@ -186,6 +228,7 @@ def cargo_proxy(args):
     names = listed_tests(enumeration.stdout)
     pinned = env.get("PBPS_LIVE_PINNED") == "1"
     groups = partition(names, count, identity, read_weights(env.get("PBPS_LIVE_WEIGHTS")), pinned)
+    verify_express(groups)
     assigned = groups[index]
     print(f"shard {index}/{count} {key}: {len(assigned)}/{len(names)} tests", flush=True)
     reported, code, seconds, valid = {}, 0, 0.0, True
@@ -256,16 +299,57 @@ def audit(suite_root, count):
                 failed += result["status"] == "FAILED"
                 measured[row["identity"] + ":" + name] = result["seconds"]
         verify_union(reference["listed"], groups)
+        verify_express(groups)
     return {"passed": passed, "failed": failed, "union": "exact"}, measured
 
 
 def available_gb():
     # Linux's MemAvailable includes reclaimable cache; MemFree does not.
     output = subprocess.check_output(["free", "-m"], text=True)
-    return int(next(line.split()[-1] for line in output.splitlines() if line.startswith("Mem:"))) / 1024
+    rows = [line.split() for line in output.splitlines() if line.startswith("Mem:")]
+    require(len(rows) == 1 and len(rows[0]) == 7, "unreadable memory availability")
+    return int(rows[0][-1]) / 1024
+
+
+def shard_counts(suites, memory, mssql=None, pg=None):
+    require(math.isfinite(memory) and memory > 0, "available memory must be positive and finite")
+    counts = {}
+    for suite, requested in (("mssql", mssql), ("pg", pg)):
+        if suite in suites and requested is not None:
+            require(requested > 0, "shard count must be positive")
+            require(suite != "mssql" or requested <= 3, "at most three SQL Server shards are supported")
+            counts[suite] = requested
+    if "pg" in suites and "pg" not in counts:
+        reserve = mssql_memory(counts.get("mssql", 1)) if "mssql" in suites else 0
+        counts["pg"] = max(1, min(4, int((memory - reserve) // PG_SHARD_GIB)))
+    if "mssql" in suites and "mssql" not in counts:
+        remaining = memory - PG_SHARD_GIB * counts.get("pg", 0)
+        counts["mssql"] = max(1, min(3, 1 + int((remaining - MSSQL_SET_GIB) // MSSQL_WITHOUT_EXPRESS_GIB)))
+    required = mssql_memory(counts.get("mssql", 0)) + PG_SHARD_GIB * counts.get("pg", 0)
+    require(required <= memory,
+            f"shards need about {required} GiB; only {memory:.2f} GiB is available")
+    return counts
+
+
+def mssql_memory(count):
+    return MSSQL_SET_GIB + (count - 1) * MSSQL_WITHOUT_EXPRESS_GIB if count else 0
+
+
+def sample_memory(stop, samples, errors):
+    while not stop.wait(MEMORY_SAMPLE_SECONDS):
+        try:
+            samples.append(available_gb())
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            errors.append(str(error))
+            return
 
 
 def drive(args):
+    suites = list(RUNNERS) if args.suite == "all" else [args.suite]
+    memory = available_gb()
+    counts = shard_counts(suites, memory, args.mssql_shards, args.pg_shards)
+    print(f"available memory: {memory:.2f} GiB; shards: "
+          + ", ".join(f"{suite}={counts[suite]}" for suite in suites), flush=True)
     output = Path(args.output or tempfile.mkdtemp(prefix="pbps-live-shards-"))
     output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, PBPS_LIVE_PREFIX=args.prefix)
@@ -281,12 +365,9 @@ def drive(args):
         env["PBPS_LIVE_WEIGHTS"] = str(snapshot.resolve())
     summary, measured = {}, {}
     used_names, used_ports = set(), set()
-    for suite in RUNNERS if args.suite == "all" else (args.suite,):
-        count = getattr(args, suite + "_shards")
-        if count is None:
-            count = max(1, min(int(available_gb() // (12 if suite == "mssql" else 1)),
-                               2 if suite == "mssql" else 6))
-        require(count > 0, "shard count must be positive")
+    tasks = []
+    for suite in suites:
+        count = counts[suite]
         suite_root = output / suite
         suite_root.mkdir()
         identities = [fixture_env(suite, i, env) for i in range(count)]
@@ -296,38 +377,81 @@ def drive(args):
             require(len(selected) == len(set(selected)) and not used.intersection(selected),
                     "fixture identities overlap across shards or suites")
             used.update(selected)
+        tasks.extend((suite, index) for index in range(count))
+
+    express = preflight_express(counts["mssql"], weights, env) if "mssql" in suites else []
+
+    def launch(task):
+        suite, index = task
         started = time.monotonic()
-
-        def launch(index):
-            shard_dir = (suite_root / str(index)).resolve()
-            shard_env = dict(env, PBPS_LIVE_SHARD=f"{index}/{count}", PBPS_LIVE_SHARD_DIR=str(shard_dir))
+        suite_root = output / suite
+        shard_dir = (suite_root / str(index)).resolve()
+        shard_env = dict(env, PBPS_LIVE_SHARD=f"{index}/{counts[suite]}",
+                         PBPS_LIVE_SHARD_DIR=str(shard_dir))
+        try:
             with (suite_root / f"{index}.log").open("w") as log:
-                return subprocess.run(["bash", str(ROOT / "scripts" / RUNNERS[suite])], cwd=ROOT,
+                code = subprocess.run(["bash", str(ROOT / "scripts" / RUNNERS[suite])], cwd=ROOT,
                                       env=shard_env, stdout=log, stderr=subprocess.STDOUT).returncode
+        except OSError as error:
+            print(f"{suite}/{index}: {error}", file=sys.stderr, flush=True)
+            code = 1
+        return suite, index, code, started, time.monotonic()
 
-        with ThreadPoolExecutor(max_workers=count) as pool:
-            codes = list(pool.map(launch, range(count)))
+    started = time.monotonic()
+    # Submit every shard before waiting: a slow SQL Server must not delay PG,
+    # and one failed suite must not prevent the other's results being audited.
+    memory_samples, memory_errors = [memory], []
+    stop = Event()
+    sampler = Thread(target=sample_memory, args=(stop, memory_samples, memory_errors))
+    sampler.start()
+    try:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            finished = list(pool.map(launch, tasks))
+    finally:
+        stop.set()
+        sampler.join()
+    failed = bool(memory_errors)
+    for suite in suites:
+        count = counts[suite]
+        suite_root = output / suite
+        runs = [run for run in finished if run[0] == suite]
+        codes = [run[2] for run in runs]
         try:
             result, timings = audit(suite_root, count)
-        except ValueError as error:
-            rows = [json.loads(p.read_text()) for p in suite_root.glob("*/*.json")]
-            statuses = [r["status"] for row in rows for r in row["reported"].values()]
+        except (ValueError, OSError, LookupError, TypeError, AttributeError) as error:
+            statuses = []
+            for path in suite_root.glob("*/*.json"):
+                try:
+                    row = json.loads(path.read_text())
+                    statuses.extend(r["status"] for r in row["reported"].values())
+                except (ValueError, OSError, LookupError, TypeError, AttributeError):
+                    pass
             result = {"passed": statuses.count("ok"), "failed": statuses.count("FAILED"),
                       "union": "failed", "error": str(error)}
             timings = {}
-        result.update(seconds=time.monotonic() - started, shards=count, exits=codes)
+        first = min(run[3] for run in runs)
+        last = max(run[4] for run in runs)
+        result.update(seconds=last - first, shards=count, exits=codes,
+                      shard_seconds={str(run[1]): run[4] - run[3] for run in runs},
+                      start_seconds=first - started, end_seconds=last - started)
         summary[suite] = result
         measured.update(timings)
-        (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print(f"{suite}: {result['passed']} passed; {result['failed']} failed; union {result['union']}; "
               f"{result['seconds']:.2f}s; logs {suite_root}", flush=True)
-        require(not any(codes) and not result["failed"] and result["union"] == "exact",
-                f"{suite} shards failed; inspect {suite_root}")
-    if args.measure:
+        failed |= bool(any(codes) or result["failed"] or result["union"] != "exact")
+    elapsed = time.monotonic() - started
+    summary["run"] = {"seconds": elapsed, "available_gib": memory, "shards": counts,
+                      "minimum_available_gib": min(memory_samples), "memory_samples": len(memory_samples),
+                      "memory_sample_seconds": MEMORY_SAMPLE_SECONDS, "memory_errors": memory_errors}
+    summary["run"]["express_tests_on_shard_zero"] = express
+    (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"total: {elapsed:.2f}s; minimum available memory: {min(memory_samples):.2f} GiB; "
+          f"summary {output / 'summary.json'}", flush=True)
+    if args.measure and not failed:
         weights = weights or {}
         weights.update(measured)
         Path(args.measure).write_text(json.dumps(weights, indent=2, sort_keys=True) + "\n")
-    return 0
+    return int(failed)
 
 
 def main():

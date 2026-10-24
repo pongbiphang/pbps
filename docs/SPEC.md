@@ -3472,14 +3472,21 @@ the named reports must agree with libtest's summary and process exit.
 Direct stderr diagnostics remain in the shard logs, separate from the
 libtest stdout parser.
 
-`python3 scripts/live-shards.py` runs each suite's shards concurrently, with
-the two suites run sequentially. It derives shard counts from available memory
-(approximately 12 GiB per SQL Server set and 1 GiB per PostgreSQL set, capped
-at two and six respectively); `--mssql-shards` and `--pg-shards` override them.
+`python3 scripts/live-shards.py --suite all` runs both suites concurrently in
+one pool. It chooses counts jointly from available memory at startup: reserve
+approximately 1 GiB per PostgreSQL set (up to four by default), then allocate
+9 GiB for SQL Server shard 0, which includes Express, and 5 GiB for each
+additional SQL Server shard without Express (at least one, capped at three).
+`--mssql-shards` and `--pg-shards` override counts within the joint memory budget.
+The chosen counts and available memory are printed before launching runners.
 `--suite mssql|pg` selects one engine. `--output` names a fresh directory for
-per-shard logs, invocation receipts and `summary.json`. The driver independently
+per-shard logs, invocation receipts and `summary.json`, with total and per-suite
+wall times. Both suites are audited and reported even if one fails; either
+failure fails the driver. The driver independently
 requires each invocation's union to equal its `--list` set exactly, including
 duplicate detection, and refuses a missing invocation or unreported test.
+The summary includes each shard's wall time and the lowest available memory
+sampled at startup and every 15 seconds; an unreadable sample fails the run.
 
 Shard fixture names default to `<prefix>s<i>-<kind>` (`--prefix`, default
 `pbps-live`); explicit name overrides instead gain `-s<i>`. SQL Server scratch
@@ -3487,11 +3494,21 @@ still derives from the resolved primary name unless explicitly overridden.
 Shard ports add `10*i` to the existing port overrides, with shard-mode defaults
 26330–26332 and 56320–56322. Name and port collisions refuse before provisioning.
 `--weights file.json` uses positive per-test seconds for deterministic
-longest-first balancing when the file exists; otherwise assignment hashes the
-binary selector and test name. Unreadable or malformed weights refuse. `--measure
+longest-first balancing when the file exists; missing entries use its median
+(one second for an empty file). Keys combine the binary selector's hash and
+qualified test name. Without a weights file, assignment hashes that identity.
+Keep host-specific measurements outside the repository. Unreadable or malformed
+weights refuse. `--measure
 file.json` records sequential result intervals (including process startup for
 the first test) for a subsequent weighted run. Each run snapshots input weights
 before starting shards.
+
+Only SQL Server shard 0 provisions Express. `EXPRESS_INVENTORY` in the driver
+classifies every Express reader by exact libtest name; a preflight enumerates
+their binaries and rejects missing names or a nonzero-shard assignment before
+any runner starts. Both the cargo proxy and the final audit enforce that pin.
+Weighted balancing seeds shard 0 with the pinned tests' load before assigning
+the remainder. Nonzero shards leave `PBPS_TEST_EXPRESS_DB` unset.
 
 The isolation audit retains the existing process-label filter on resolver
 container counts (`scratch::live_tests::scratch_containers`, #2095), run-owned

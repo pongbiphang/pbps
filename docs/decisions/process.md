@@ -1453,3 +1453,21 @@ the canonical CI layout. The equivalent gate preserves test membership and
 fixture admission, not the order of test neighbours, which was never a
 guarantee. Weight-based balancing may change neighbours without changing that
 membership or the serial execution within each shard.
+
+With both suites selected, one pool launches every shard concurrently and
+audits both suites even when one fails. Choose counts from one startup memory
+snapshot: reserve roughly 1 GiB for each PostgreSQL set (up to four by default),
+then allocate 9 GiB for SQL Server shard 0 and 5 GiB for each additional set
+without Express (up to three SQL Server shards). Explicit counts
+must also fit the joint budget. Missing weights use the observed median so an
+unmeasured test does not look artificially cheap.
+Use the measured working budget rather than the containers' worst-case caps;
+record the lowest available memory at startup and 15-second intervals, along
+with per-shard wall times, so the budget remains accountable to live evidence.
+
+Only shard 0 starts Express. Classify its consumers by exact names in the
+driver's fixture inventory, enumerate their binaries and verify the pin before
+launching any runner, then check it again at execution and audit. Seed weighted
+balancing with that pinned load; an Express reader may never fall through to a
+hash-selected nonzero shard. This preserves every test while removing unused
+Express servers from the other shards.
