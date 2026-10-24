@@ -23245,6 +23245,35 @@ fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_li
     state_history::public_execution_is_unknown(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[path = "support/pull_publication.rs"]
+mod pull_publication;
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration() {
+    pull_publication::aliases(&std::env::var("PBPS_TEST_DB").unwrap(), false, true);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_replaces_output_symlinks_before_removing_stale_targets() {
+    pull_publication::aliases(&std::env::var("PBPS_TEST_DB").unwrap(), false, false);
+}
+
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_invalid_staging_leaves_the_project_byte_identical() {
+    pull_publication::invalid_staging(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live SQL Server"]
+fn forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases() {
+    pull_publication::protected_aliases(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 

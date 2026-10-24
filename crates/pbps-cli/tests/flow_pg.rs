@@ -34769,6 +34769,43 @@ fn state_history_preserves_recorded_partition_move_limits_in_json_and_human_outp
     }
 }
 
+#[path = "support/pull_publication.rs"]
+mod pull_publication;
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::aliases(&server, true, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_replaces_output_symlinks_before_removing_stale_targets() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::aliases(&server, true, false);
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_invalid_staging_leaves_the_project_byte_identical() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::invalid_staging(&server, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::protected_aliases(&server, true);
+    }
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 

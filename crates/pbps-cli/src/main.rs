@@ -1786,7 +1786,7 @@ fn cmd_pull(
     // and the only way to know that before touching the project is to have
     // asked about the files themselves (#902).
     let stage = adopt::Stage::new("pull")?;
-    adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
+    let staged = adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
     let loaded =
         adopt::check_staged(stage.path(), dialect.as_ref()).context("pull wrote nothing")?;
     // And the project's own rules, as `validate` evaluates them: a pull into a
@@ -1795,11 +1795,64 @@ fn cmd_pull(
     for f in adopt::refuse_policy_errors(project, &loaded, dialect.as_ref())? {
         eprintln!("{}: {}", f.severity_word(), f.message);
     }
-    drop(stage);
-
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let written = adopt::write_declarations(&dir, &pulled.schema, &pulled.public_execute)?;
-
+    let written: std::collections::BTreeSet<_> = staged
+        .iter()
+        .map(|path| path.strip_prefix(stage.path()).map(|path| dir.join(path)))
+        .collect::<Result<_, _>>()?;
+    // Same reading as the guard above, for the same reason in the other
+    // direction: a failed listing that came back empty would silently skip the
+    // cleanup and leave two files declaring one name. List before publishing
+    // so a read failure also leaves the project untouched.
+    let present = match std::fs::metadata(&dir) {
+        Ok(_) => pbps_load::schema_files(&dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling directory link is present, not an empty destination.
+            match std::fs::symlink_metadata(&dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Ok(_) => bail!(
+                    "`{}` is a dangling link",
+                    pbps_model::Text::new(dir.display().to_string()).shown()
+                ),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+    .with_context(|| {
+        format!(
+            "cannot list `{}`",
+            pbps_model::Text::new(dir.display().to_string()).shown()
+        )
+    })?;
+    let removed: Vec<_> = present
+        .iter()
+        .filter(|path| !written.contains(*path))
+        .cloned()
+        .collect();
+    let root = paths::absolute(&dir)?;
+    // Force replaces declarations, never config or identity inputs reached
+    // through an output name or one of the entries about to be removed.
+    for path in written.iter().chain(&present) {
+        for protected in [project.ids_file(), project.config_file()] {
+            anyhow::ensure!(
+                !paths::same_file(path, &protected)?,
+                "`{}` aliases protected project input `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown(),
+                pbps_model::Text::new(protected.display().to_string()).shown()
+            );
+        }
+        anyhow::ensure!(
+            paths::absolute(path)?.starts_with(&root),
+            "`{}` resolves outside the declaration directory",
+            pbps_model::Text::new(path.display().to_string()).shown()
+        );
+    }
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "cannot create `{}`",
+            pbps_model::Text::new(dir.display().to_string()).shown()
+        )
+    })?;
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
     // recreation, and a view that became a procedure would leave
@@ -1807,20 +1860,30 @@ fn cmd_pull(
     // name, which `validate` refuses and every later load fails on. `--force`
     // already means "replace my declarations with this database"; this is the
     // rest of that sentence.
-    let mut removed = Vec::new();
-    // Same reading as the guard above, for the same reason in the other
-    // direction: a failed listing that came back empty would silently skip the
-    // cleanup and leave exactly the two-files-one-name state this block exists
-    // to prevent.
-    let present = pbps_load::schema_files(&dir)
-        .with_context(|| format!("cannot list `{}`", dir.display()))?;
-    for path in present {
-        if written.contains(&path) {
-            continue;
+    //
+    // Remove all old entries first: a stale spelling can alias an output on a
+    // case-insensitive filesystem. This also unlinks output symlinks instead
+    // of writing through them and then deleting their stale targets (#2311).
+    for path in &present {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "cannot remove old declaration `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown()
+            )
+        })?;
+    }
+    // Publish the exact bytes that passed validation, without rendering again.
+    for path in &written {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("cannot remove the stale `{}`", path.display()))?;
-        removed.push(path);
+        let source = stage.path().join(path.strip_prefix(&dir)?);
+        std::fs::copy(&source, path).with_context(|| {
+            format!(
+                "cannot publish `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown()
+            )
+        })?;
     }
     if !removed.is_empty() {
         eprintln!(
