@@ -4409,15 +4409,16 @@ mod tests {
 
     /// A retype or drop of a column a live generated column reads goes after
     /// the plan's change to that expression which stops reading it, and only
-    /// then (DEC-1316.1). Negatives: an expression that may still read it, a
-    /// column no generated column reads, and a name taken in between.
+    /// then (DEC-1316.1). An omitted disappearing default is required absent,
+    /// even when the engine could fill it before the drop. A nullable input
+    /// without a default has no such requirement and keeps its original order.
     #[test]
-    fn nullable_and_defaulted_released_inputs_keep_their_insert_before_the_release() {
+    fn crossed_inserts_follow_their_actual_default_requirements() {
         use pbps_model::{
             Change, Column, Generated, IdsFile, PlannedChange, Schema, Table, UidKind, ValueSource,
         };
         let table: TableName = "app.t".parse().unwrap();
-        for defaulted in [false, true] {
+        for (nullable, defaulted) in [(true, false), (false, true), (true, true)] {
             let mut shape = Table::default();
             for name in ["id", "a", "b", "g"] {
                 shape
@@ -4425,7 +4426,7 @@ mod tests {
                     .insert(name.into(), Column::new("integer".parse().unwrap()));
             }
             let input = shape.columns.get_mut("a").unwrap();
-            input.nullable = !defaulted;
+            input.nullable = nullable;
             if defaulted {
                 input.value_source = ValueSource::Default("7".into());
             }
@@ -4477,7 +4478,12 @@ mod tests {
                     to: "b * 2".into(),
                 },
             ];
-            let expected = vec![changes[1].clone(), changes[2].clone(), changes[0].clone()];
+            let needs_default_gone = defaulted;
+            let expected = if needs_default_gone {
+                vec![changes[2].clone(), changes[0].clone(), changes[1].clone()]
+            } else {
+                vec![changes[1].clone(), changes[2].clone(), changes[0].clone()]
+            };
             let mut cs = ChangeSet {
                 changes: changes.into_iter().map(PlannedChange::new).collect(),
             };
@@ -4507,11 +4513,42 @@ mod tests {
                 )
             })
             .unwrap();
-            assert_eq!(moved, 1);
+            assert_eq!(moved, if needs_default_gone { 2 } else { 1 });
             assert_eq!(
-                cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>(),
+                cs.changes
+                    .iter()
+                    .map(|p| p.change.clone())
+                    .collect::<Vec<_>>(),
                 expected
             );
+            use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+            let violations = |changes: &ChangeSet| {
+                let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+                let owners = PlanOwners::new(names, &base_ids, &ids);
+                let operations = Operations::of_plan(&changes.changes, ModuleEdits::InPlace);
+                let base = Snapshot {
+                    schema: &before,
+                    ids: &base_ids,
+                };
+                let end = Snapshot {
+                    schema: &after,
+                    ids: &ids,
+                };
+                let effects = pbps_diff::order::analyse(
+                    &operations,
+                    &owners,
+                    base,
+                    end,
+                    &pbps_pg::Postgres::new(),
+                );
+                pbps_diff::order::verify(
+                    operations.as_slice(),
+                    &effects.effects,
+                    &pbps_diff::order::Baseline::of(base, &owners),
+                    &pbps_model::ModuleDeps::new(),
+                )
+            };
+            assert!(violations(&cs).is_empty(), "{:?}", violations(&cs));
         }
     }
 
@@ -4748,7 +4785,7 @@ mod tests {
         ));
         assert!(matches!(cs.changes[1].change, Change::DropColumn { .. }));
         assert!(matches!(cs.changes[2].change, Change::InsertRow { .. }));
-        // Negatives: a nullable or defaulted input lets the row in, a row of
+        // Negatives: a nullable input without a default lets the row in,
         // another table is no concern of the column, and an insert after the
         // release is never passed.
         let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);

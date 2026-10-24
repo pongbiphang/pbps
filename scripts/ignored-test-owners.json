@@ -687,6 +687,7 @@
         "an_expression_change_releases_a_generated_column_from_a_dropped_function",
         "an_expression_change_releases_its_old_input_in_the_same_plan",
         "a_released_input_dropped_past_an_inserted_row_carries_its_consumers",
+        "a_defaulted_generated_input_is_released_before_its_insert",
         "a_dropped_generated_reader_releases_its_required_input_before_inserted_rows",
         "a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger",
         "a_new_reader_of_a_dropped_input_is_refused_before_anything_runs",

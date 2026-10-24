@@ -1,4 +1,4 @@
-//! Carry a delayed insert's consumers through the existing release settlement.
+//! Carry crossed inserts' effects through the existing release settlement.
 
 use std::collections::BTreeSet;
 
@@ -8,7 +8,7 @@ use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 
 use super::{Baseline, Checks, Graph, PlanningPlan, Schedule, analyse, graph};
 
-/// Add the effect closure of inserts held behind a released input's drop.
+/// Add the effect closure of inserts crossed by a released input's drop.
 /// Catalog/lexical waits and unrelated Keeps remain the caller's proposals;
 /// this constructs no execution certificate and adds no settlement stage.
 /// Graph unmet requirements remain observations, as in DEC-1956.3.
@@ -21,7 +21,28 @@ pub fn carry_inserts<S>(
     dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
 ) -> Result<Schedule, String> {
-    if inserts.is_empty() {
+    if inserts.is_empty()
+        && !plan
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::InsertRow { .. }))
+    {
+        return Ok(release);
+    }
+    // Only delayed column drops can introduce this default crossing. Keep
+    // unrelated release calls on their existing no-effect-read fast path.
+    let drops: BTreeSet<_> = release
+        .constraints()
+        .iter()
+        .filter_map(|edge| {
+            matches!(
+                plan.changes[edge.after].change,
+                pbps_model::Change::DropColumn { .. }
+            )
+            .then_some(edge.after)
+        })
+        .collect();
+    if inserts.is_empty() && drops.is_empty() {
         return Ok(release);
     }
     let names = pbps_model::plan_names::PlanNames::of(&plan.changes, after.ids)
@@ -66,7 +87,26 @@ pub fn carry_inserts<S>(
     if let Some(at) = inserts.iter().find(|&&at| at >= operations.len()) {
         return Err(format!("released-input insert {at} is outside the plan"));
     }
-    let moving = consumers(&graph, operations.len(), inserts);
+    // The catalog's required-input set excludes defaults. Use the declared
+    // effect edge to find the omitted-default inserts it misses (DEC-2291.1);
+    // do not widen the catalog's trigger-sensitive NOT NULL selection.
+    let mut inserts = inserts.clone();
+    inserts.extend(graph.edges.iter().filter_map(|edge| {
+        (drops.contains(&edge.before)
+            && matches!(
+                edge.because,
+                super::Because::Frees(pbps_model::operation::ObjectKey::Default(_))
+            )
+            && matches!(
+                operations.as_slice()[edge.after].change(),
+                pbps_model::Change::InsertRow { .. }
+            ))
+        .then_some(edge.after)
+    }));
+    if inserts.is_empty() {
+        return Ok(release);
+    }
+    let moving = consumers(&graph, operations.len(), &inserts);
     // Incoming prerequisites constrain participants too. Edges only between
     // unrelated operations belong to their own existing stages, not this one.
     graph
@@ -182,7 +222,7 @@ mod tests {
             ..Default::default()
         }
     }
-    fn carried(consumer: Change) {
+    fn carried(consumer: Change, defaulted: bool) {
         let mut before = Schema::default();
         before
             .tables
@@ -218,6 +258,16 @@ mod tests {
             .get_mut("a")
             .unwrap()
             .nullable = false;
+        if defaulted {
+            before
+                .tables
+                .get_mut(&table("p"))
+                .unwrap()
+                .columns
+                .get_mut("a")
+                .unwrap()
+                .value_source = pbps_model::ValueSource::Default("7".into());
+        }
         let mut after = before.clone();
         after
             .tables
@@ -283,7 +333,9 @@ mod tests {
         });
         let mut schedule = Schedule::new(4);
         schedule.edge(3, 0, Source::Catalog, OrderReason::Structural);
-        schedule.edge(0, 1, Source::Catalog, OrderReason::Structural);
+        if !defaulted {
+            schedule.edge(0, 1, Source::Catalog, OrderReason::Structural);
+        }
         if matches!(&plan.changes[2].change, Change::AddUnique { .. }) {
             let operations = Operations::of_plan(&plan.changes, ModuleEdits::InPlace);
             let names = pbps_model::plan_names::PlanNames::of(&plan.changes, &ids).unwrap();
@@ -390,24 +442,127 @@ mod tests {
 
     #[test]
     fn a_child_row_follows_an_insert_delayed_by_its_released_input() {
-        carried(row("c", 1, &[("pid", 1)]));
+        for defaulted in [false, true] {
+            carried(row("c", 1, &[("pid", 1)]), defaulted);
+        }
     }
     #[test]
     fn a_later_same_table_row_follows_an_insert_delayed_by_its_released_input() {
-        carried(row("p", 2, &[("b", 4)]));
+        for defaulted in [false, true] {
+            carried(row("p", 2, &[("b", 4)]), defaulted);
+        }
     }
     #[test]
     fn a_key_over_rows_follows_an_insert_delayed_by_its_released_input() {
-        carried(Change::AddUnique {
-            table: table("p"),
-            name: "uq".into(),
-            constraint: pbps_model::UniqueConstraint {
-                columns: vec!["b".into()],
-                storage_parameters: Default::default(),
-            },
-            clustered: false,
-        });
+        for defaulted in [false, true] {
+            carried(
+                Change::AddUnique {
+                    table: table("p"),
+                    name: "uq".into(),
+                    constraint: pbps_model::UniqueConstraint {
+                        columns: vec!["b".into()],
+                        storage_parameters: Default::default(),
+                    },
+                    clustered: false,
+                },
+                defaulted,
+            );
+        }
     }
+    #[test]
+    fn a_base_default_consumer_precedes_its_removal() {
+        use pbps_model::operation::{Effects, Incarnation, ObjectKey, Requirement, Resource};
+        let a = uid("app.p.a", UidKind::Column);
+        let mut shape = shape(&["id", "a"]);
+        shape.columns.get_mut("a").unwrap().value_source =
+            pbps_model::ValueSource::Default("7".into());
+        let mut before = Schema::default();
+        before.tables.insert(table("p"), shape);
+        let mut ids = IdsFile::default();
+        ids.tables.insert(uid("app.p", UidKind::Table), table("p"));
+        ids.columns.insert(a.clone(), column("a"));
+        ids.columns
+            .insert(uid("app.p.id", UidKind::Column), column("id"));
+        let mut after_ids = ids.clone();
+        after_ids.columns.remove(&a);
+        let plan = propose(ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::DropColumn {
+                    uid: a.clone(),
+                    column: column("a"),
+                }),
+                PlannedChange::new(row("p", 1, &[])),
+            ],
+        });
+        let names = pbps_model::plan_names::PlanNames::of(&plan.changes, &after_ids).unwrap();
+        let owners = PlanOwners::new(names, &ids, &after_ids);
+        let baseline = Baseline::of(
+            Snapshot {
+                schema: &before,
+                ids: &ids,
+            },
+            &owners,
+        );
+        let operations = Operations::of_plan(&plan.changes, ModuleEdits::InPlace);
+        let ObjectKey::Column(a) = pbps_model::operation::column_key(&a) else {
+            panic!("a column key was expected");
+        };
+        let default = ObjectKey::Default(a);
+        // This statement consumes the baseline default. InsertRow.defaults
+        // describes final defaults instead, so state this Base read explicitly
+        // at the effect-graph seam rather than inventing a final default.
+        let effects = [
+            Effects {
+                removes: vec![Resource::Object(default.clone(), Incarnation::Base)],
+                ..Default::default()
+            },
+            Effects {
+                requires: vec![Requirement::Is(default.clone(), Incarnation::Base)],
+                ..Default::default()
+            },
+        ];
+        let graph = graph(
+            operations.as_slice(),
+            &effects,
+            &baseline,
+            &ModuleDeps::new(),
+            Checks::ALL,
+        );
+        assert!(graph.edges.iter().any(|edge| edge.before == 1
+            && edge.after == 0
+            && edge.because == super::super::Because::Removes(default.clone())));
+        let settled = Schedule::of_graph(&graph, operations.as_slice())
+            .settle(plan)
+            .unwrap();
+        assert_eq!(settled.sequence, [1, 0]);
+        let ordered = super::super::reordered_operations(&operations, &settled.sequence);
+        assert!(
+            super::super::verify(
+                ordered.as_slice(),
+                &[effects[1].clone(), effects[0].clone()],
+                &baseline,
+                &ModuleDeps::new(),
+            )
+            .is_empty()
+        );
+        assert!(
+            super::super::verify(
+                operations.as_slice(),
+                &effects,
+                &baseline,
+                &ModuleDeps::new(),
+            )
+            .iter()
+            .any(|v| matches!(
+                v,
+                super::super::Violation::Unmet {
+                    requirement: Requirement::Is(ObjectKey::Default(_), Incarnation::Base),
+                    ..
+                }
+            ))
+        );
+    }
+
     #[test]
     fn no_carried_insert_keeps_the_existing_schedule_without_reading_facts() {
         let plan = propose(ChangeSet::default());
