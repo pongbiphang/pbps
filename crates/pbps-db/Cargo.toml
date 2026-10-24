@@ -50,5 +50,13 @@ sha2-hmac.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 
+# Windows current-user integrated authentication (SSPI), for the named-pipe
+# transport LocalDB requires (#2271). Windows only: elsewhere the feature has
+# no backend, and the driver would read `Integrated Security` as SQL
+# authentication, so `mssql.rs` refuses it by name instead. The TLS features
+# stay the workspace's explicit set.
+[target.'cfg(windows)'.dependencies]
+tiberius = { workspace = true, features = ["winauth"] }
+
 [lints]
 workspace = true

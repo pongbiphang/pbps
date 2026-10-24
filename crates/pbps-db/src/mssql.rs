@@ -30,6 +30,169 @@ fn name_session(config: &mut Config, connection_string: &str) {
     }
 }
 
+/// The transport a connection string asks for, decided before anything opens
+/// (#2271).
+///
+/// The driver defaults silently: a server it cannot read as a host becomes a
+/// host name, and an `Integrated Security` it was not built to honour becomes
+/// SQL authentication with an empty login. Both would turn "use this pipe, as
+/// this Windows user" into a different connection, so the string is admitted
+/// here first and anything that is not exactly one of the two supported
+/// shapes is refused by name. No refusal falls back to the other transport or
+/// to the other kind of authentication (DEC-2271.1).
+#[derive(Debug, PartialEq, Eq)]
+enum Endpoint {
+    /// A host and port, with SQL authentication.
+    Tcp,
+    /// A local named pipe (`\\.\pipe\...`), with the current Windows user's
+    /// integrated authentication. This is the only way LocalDB accepts a
+    /// connection.
+    Pipe(String),
+}
+
+const SERVER_KEYS: [&str; 2] = ["server", "data source"];
+/// Every spelling of "use Windows authentication" that ADO.NET knows. The
+/// driver reads only the first two.
+const INTEGRATED_KEYS: [&str; 3] = [
+    "integrated security",
+    "integratedsecurity",
+    "trusted_connection",
+];
+const CREDENTIAL_KEYS: [&str; 6] = ["uid", "username", "user", "user id", "password", "pwd"];
+/// Substrings that make a string this module must inspect. A string whose
+/// quoting this module's parser rejects is not parsed, so these decide whether
+/// it can be passed on unread.
+const ADMISSION_WORDS: [&str; 5] = ["integrated", "trusted", "np:", "localdb", "pipe"];
+
+fn refuse(reason: &str) -> DbError {
+    DbError::Refused(reason.to_owned())
+}
+
+impl Endpoint {
+    /// `windows` is a parameter so the Windows rules are testable anywhere;
+    /// production passes `cfg!(windows)`.
+    fn admit(connection_string: &str, windows: bool) -> Result<Self, DbError> {
+        let Ok(options) = connection_string.parse::<connection_string::AdoNetString>() else {
+            // The driver reads quoting this parser does not (single-quoted
+            // values), so an unparsed string may still be one the driver
+            // accepts. It can be passed on only if nothing in it concerns the
+            // transport or the authentication: otherwise a key this module
+            // never saw could select a pipe or integrated authentication.
+            let lowered = connection_string.to_ascii_lowercase();
+            return if ADMISSION_WORDS.iter().any(|word| lowered.contains(word)) {
+                Err(refuse(
+                    "the connection string names a transport or integrated authentication, \
+                     but its quoting cannot be inspected; quote values with braces or double quotes",
+                ))
+            } else {
+                Ok(Self::Tcp)
+            };
+        };
+        let value = |keys: &[&str]| keys.iter().find_map(|key| options.get(*key));
+
+        let pipe = match value(&SERVER_KEYS).map(|server| server.trim()) {
+            Some(server) if server.to_ascii_lowercase().contains("(localdb)") => {
+                return Err(refuse(
+                    "a LocalDB `(localdb)` selector is not a driver endpoint; \
+                     connect to the instance's named pipe with `Server=np:\\\\.\\pipe\\<name>`",
+                ));
+            }
+            Some(server)
+                if server
+                    .get(..3)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("np:")) =>
+            {
+                Some(local_pipe(&server[3..])?)
+            }
+            Some(server) if server.starts_with("\\\\") => {
+                return Err(refuse(
+                    "a pipe server must be written `np:\\\\.\\pipe\\<name>`",
+                ));
+            }
+            _ => None,
+        };
+
+        let spelled: Vec<&str> = INTEGRATED_KEYS
+            .into_iter()
+            .filter(|key| options.contains_key(*key))
+            .collect();
+        let integrated = match spelled[..] {
+            [] => false,
+            [key] => match options[key].trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "sspi" => true,
+                "false" | "no" => false,
+                _ => {
+                    return Err(refuse(
+                        "`Integrated Security` is not true, false, yes, no or SSPI",
+                    ));
+                }
+            },
+            // The driver reads the first spelling it finds, so two that
+            // disagree would be read as SQL authentication.
+            _ => {
+                return Err(refuse(
+                    "the connection string spells `Integrated Security` more than once",
+                ));
+            }
+        };
+
+        if pipe.is_some() && !windows {
+            return Err(refuse(
+                "a named-pipe connection is only available on Windows",
+            ));
+        }
+        if integrated && CREDENTIAL_KEYS.iter().any(|key| options.contains_key(*key)) {
+            return Err(refuse(
+                "`Integrated Security` uses the current Windows user and cannot be \
+                 combined with a user name or password",
+            ));
+        }
+        match (pipe, integrated) {
+            (None, false) => Ok(Self::Tcp),
+            (None, true) => Err(refuse(
+                "integrated authentication is only supported over a local named pipe, \
+                 `Server=np:\\\\.\\pipe\\<name>`",
+            )),
+            (Some(_), false) => Err(refuse(
+                "a named pipe requires `Integrated Security=SSPI`; \
+                 SQL authentication is not offered over a pipe",
+            )),
+            (Some(path), true) => {
+                if spelled == ["trusted_connection"] {
+                    return Err(refuse(
+                        "spell it `Integrated Security=SSPI`; the driver does not read `Trusted_Connection`",
+                    ));
+                }
+                Ok(Self::Pipe(path))
+            }
+        }
+    }
+}
+
+/// `\\.\pipe\<segments>` on this machine, and nothing else.
+///
+/// A remote pipe would send the Windows identity to another host, and a
+/// segment such as `..` would leave the pipe namespace, so the path is spelled
+/// out from a short alphabet rather than screened for known-bad pieces.
+fn local_pipe(path: &str) -> Result<String, DbError> {
+    const PREFIX: &str = "\\\\.\\pipe\\";
+    let name = path
+        .get(..PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+        .map(|_| &path[PREFIX.len()..])
+        .ok_or_else(|| refuse("only a local pipe, `np:\\\\.\\pipe\\<name>`, is supported"))?;
+    let allowed = |c: char| c.is_ascii_alphanumeric() || "$#_-.@~".contains(c);
+    let ok = name.split('\\').all(|segment| {
+        !segment.is_empty() && !segment.chars().all(|c| c == '.') && segment.chars().all(allowed)
+    });
+    if !ok {
+        return Err(refuse(
+            "the pipe name must be non-empty segments of letters, digits and `$#_-.@~`",
+        ));
+    }
+    Ok(path.to_owned())
+}
+
 /// One row as this driver hands it back.
 pub struct Row(tiberius::Row);
 
@@ -66,19 +229,29 @@ impl Conn {
     /// Connects using an ADO.NET-style connection string
     /// (`Server=host,1433;Database=x;User Id=u;Password=p;` — the form every
     /// SQL Server tool already asks for, so users can paste what they have).
+    ///
+    /// `Server=np:\\.\pipe\<name>;Integrated Security=SSPI` connects over a
+    /// local named pipe as the current Windows user instead (#2271); see
+    /// [`Endpoint`] for what is refused.
     pub(crate) async fn connect(connection_string: &str) -> Result<Self, DbError> {
+        let endpoint = Endpoint::admit(connection_string, cfg!(windows))?;
         let mut config = Config::from_ado_string(connection_string)
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
         name_session(&mut config, connection_string);
-        Self::connect_config(config).await
+        match endpoint {
+            Endpoint::Tcp => Self::connect_config(config).await,
+            Endpoint::Pipe(path) => {
+                // The driver read the pipe as a host name. Nothing dials it,
+                // but TLS verifies the server certificate against the host, so
+                // it is set to a real name; `HostNameInCertificate` still
+                // overrides it.
+                config.host("localhost");
+                Self::connect_pipe(config, &path, crate::CONNECT_TIMEOUT).await
+            }
+        }
     }
 
-    async fn connect_config(mut config: Config) -> Result<Self, DbError> {
-        // A 30-second per-response timeout was added in tiberius 0.13. Long
-        // DDL and lock waits were unbounded before this driver switch. Keep
-        // that deployment behavior explicit; the TCP and handshake bounds
-        // remain independent of statement execution (DEC-861.1).
-        config.command_timeout(None);
+    async fn connect_config(config: Config) -> Result<Self, DbError> {
         let addr = config.get_addr().to_owned();
         // A firewall that drops rather than refuses leaves the OS retrying for
         // over two minutes. Waiting that long for a pipeline to say "I could
@@ -100,7 +273,26 @@ impl Conn {
             addr: config.get_addr().to_owned(),
             reason,
         })?;
-        let stream: crate::transport::BoxedStream = Box::new(tcp);
+        Self::handshake(config, Box::new(tcp)).await
+    }
+
+    async fn connect_pipe(
+        config: Config,
+        path: &str,
+        budget: std::time::Duration,
+    ) -> Result<Self, DbError> {
+        Self::handshake(config, open_pipe(path, budget).await?).await
+    }
+
+    async fn handshake(
+        mut config: Config,
+        stream: crate::transport::BoxedStream,
+    ) -> Result<Self, DbError> {
+        // A 30-second per-response timeout was added in tiberius 0.13. Long
+        // DDL and lock waits were unbounded before this driver switch. Keep
+        // that deployment behavior explicit; the transport and handshake
+        // bounds remain independent of statement execution (DEC-861.1).
+        config.command_timeout(None);
         let client = Client::connect(config, stream.compat_write()).await?;
         Ok(Self { client })
     }
@@ -149,6 +341,56 @@ impl Conn {
         let result = self.client.execute(sql, &bound).await?;
         Ok(result.rows_affected().iter().sum())
     }
+}
+
+/// Opens the local pipe, waiting out a busy one.
+///
+/// A pipe whose instances are all in use refuses with `ERROR_PIPE_BUSY` until a
+/// server instance is free, which is the documented cue to try again; any
+/// other failure, a missing pipe included, is final. The wait shares one
+/// `budget` so a pipe that stays busy ends like an address that stays silent.
+#[cfg(windows)]
+async fn open_pipe(
+    path: &str,
+    budget: std::time::Duration,
+) -> Result<crate::transport::BoxedStream, DbError> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let attempts = async {
+        loop {
+            match ClientOptions::new().open(path) {
+                Ok(pipe) => return Ok(pipe),
+                Err(busy) if busy.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(reason) => {
+                    return Err(DbError::Connect {
+                        addr: path.to_owned(),
+                        reason,
+                    });
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(budget, attempts).await {
+        Ok(opened) => Ok(Box::new(opened?)),
+        Err(_) => Err(DbError::ConnectTimeout {
+            addr: path.to_owned(),
+            after: budget,
+        }),
+    }
+}
+
+/// [`Endpoint::admit`] refuses a pipe off Windows first; this is the same
+/// refusal for a caller that reaches the opener some other way.
+#[cfg(not(windows))]
+async fn open_pipe(
+    _path: &str,
+    _budget: std::time::Duration,
+) -> Result<crate::transport::BoxedStream, DbError> {
+    Err(refuse(
+        "a named-pipe connection is only available on Windows",
+    ))
 }
 
 /// Borrows a bound value as something this driver can bind.
@@ -295,5 +537,386 @@ mod transport_tests {
             .is_err()
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const PIPE: &str = r"\\.\pipe\LOCALDB#8A1B2C3D\tsql\query";
+
+    fn admit(connection_string: &str, windows: bool) -> Result<Endpoint, String> {
+        Endpoint::admit(connection_string, windows).map_err(|e| e.to_string())
+    }
+
+    fn refusal(connection_string: &str, windows: bool) -> String {
+        match Endpoint::admit(connection_string, windows) {
+            Err(DbError::Refused(reason)) => reason,
+            other => panic!("expected a refusal for `{connection_string}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_host_with_sql_authentication_stays_tcp_on_every_platform() {
+        for windows in [false, true] {
+            for string in [
+                "Server=tcp:db.example,1433;User Id=u;Password=p",
+                "Data Source=db.example\\inst;uid=u;pwd=p;Encrypt=true",
+                "Server=db;Integrated Security=false;User Id=u;Password=p",
+                "Server=db;IntegratedSecurity=no;User Id=u;Password=p",
+                "Server=np-host.example,1433;User Id=u;Password=p",
+            ] {
+                assert_eq!(admit(string, windows), Ok(Endpoint::Tcp), "{string}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_pipe_with_integrated_authentication_is_admitted_on_windows() {
+        for string in [
+            format!("Server=np:{PIPE};Integrated Security=SSPI"),
+            format!("server=NP:{PIPE};IntegratedSecurity=true;Encrypt=false"),
+            format!("Data Source=np:{PIPE};Integrated Security=yes;Database=scratch"),
+            r"Server=np:\\.\PIPE\sql\query;Integrated Security=sspi".to_owned(),
+            r"Server=np:\\.\pipe\MSSQL$SQLEXPRESS\sql\query;Integrated Security=SSPI".to_owned(),
+        ] {
+            assert!(
+                matches!(admit(&string, true), Ok(Endpoint::Pipe(_))),
+                "{string}"
+            );
+        }
+        let admitted = admit(&format!("Server=np:{PIPE};Integrated Security=SSPI"), true);
+        assert_eq!(admitted, Ok(Endpoint::Pipe(PIPE.to_owned())));
+    }
+
+    #[test]
+    fn a_pipe_request_is_refused_off_windows_without_reaching_a_host() {
+        let reason = refusal(&format!("Server=np:{PIPE};Integrated Security=SSPI"), false);
+        assert!(reason.contains("only available on Windows"), "{reason}");
+        // Windows-only is decided before authentication is looked at, so the
+        // refusal names the platform even for a string that is also wrong.
+        let reason = refusal(&format!("Server=np:{PIPE};User Id=u;Password=p"), false);
+        assert!(reason.contains("only available on Windows"), "{reason}");
+    }
+
+    #[test]
+    fn a_pipe_that_is_not_a_local_pipe_is_refused() {
+        for server in [
+            r"np:\\remote\pipe\sql\query",
+            r"np:\\.\mailslot\x",
+            r"np:\\?\pipe\x",
+            r"np:pipe\sql\query",
+            r"np:\\.\pipe\\",
+            r"np:\\.\pipe\a\..\b",
+            r"np:\\.\pipe\..\b",
+            r"np:\\.\pipe\a\.\b",
+            r"np:\\.\pipe\a\\b",
+            r"np:\\.\pipe\a/b",
+            r"np:\\.\pipe\a,1433",
+            r"np:\\.\pipe\a b",
+            r"np:\\.\pipe\",
+            r"np:",
+        ] {
+            let string = format!("Server={server};Integrated Security=SSPI");
+            let reason = refusal(&string, true);
+            assert!(reason.contains("pipe"), "{server}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_must_be_spelled_with_its_protocol_prefix() {
+        let reason = refusal(r"Server=\\.\pipe\sql\query;Integrated Security=SSPI", true);
+        assert!(reason.contains("np:"), "{reason}");
+    }
+
+    #[test]
+    fn a_localdb_selector_is_not_a_driver_endpoint() {
+        for server in [
+            r"(localdb)\MSSQLLocalDB",
+            r"(LocalDB)\.\Shared",
+            r"np:(localdb)\x",
+            r"tcp:(localdb)\x",
+        ] {
+            for windows in [false, true] {
+                let reason = refusal(
+                    &format!("Server={server};Integrated Security=SSPI"),
+                    windows,
+                );
+                assert!(reason.contains("LocalDB"), "{server}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn sql_credentials_cannot_accompany_integrated_authentication() {
+        for credential in [
+            "uid=u",
+            "User Id=u",
+            "username=u",
+            "user=u",
+            "Password=p",
+            "pwd=p",
+            "pwd=",
+        ] {
+            let string = format!("Server=np:{PIPE};Integrated Security=SSPI;{credential}");
+            let reason = refusal(&string, true);
+            assert!(
+                reason.contains("cannot be combined"),
+                "{credential}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_never_repeats_a_secret_from_the_string() {
+        let string = format!(
+            "Server=np:{PIPE};Integrated Security=SSPI;User Id=svc-account;Password=hunter2"
+        );
+        let reason = refusal(&string, true);
+        assert!(
+            !reason.contains("hunter2") && !reason.contains("svc-account"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_pipe_without_integrated_authentication_is_refused() {
+        for auth in [
+            "",
+            ";Integrated Security=false",
+            ";Integrated Security=no",
+            ";User Id=u;Password=p",
+        ] {
+            let reason = refusal(&format!("Server=np:{PIPE}{auth}"), true);
+            assert!(
+                reason.contains("requires `Integrated Security=SSPI`"),
+                "{auth}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn integrated_authentication_over_tcp_is_refused_rather_than_read_as_sql() {
+        for auth in [
+            "Integrated Security=SSPI",
+            "IntegratedSecurity=true",
+            "Integrated Security=yes",
+            "Trusted_Connection=yes",
+        ] {
+            for windows in [false, true] {
+                let reason = refusal(&format!("Server=db.example,1433;{auth}"), windows);
+                assert!(
+                    reason.contains("only supported over a local named pipe"),
+                    "{auth}: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_integrated_setting_the_driver_would_misread_is_refused() {
+        // Two spellings: the driver reads one of them and ignores the other.
+        let reason = refusal(
+            &format!("Server=np:{PIPE};IntegratedSecurity=false;Integrated Security=SSPI"),
+            true,
+        );
+        assert!(reason.contains("more than once"), "{reason}");
+        // An unreadable value is neither true nor false.
+        for value in ["maybe", "", "1"] {
+            let reason = refusal(&format!("Server=db;Integrated Security={value}"), true);
+            assert!(
+                reason.contains("not true, false, yes, no or SSPI"),
+                "{value:?}: {reason}"
+            );
+        }
+        // The driver does not read this spelling, so on a pipe it would
+        // silently authenticate with SQL authentication.
+        let reason = refusal(&format!("Server=np:{PIPE};Trusted_Connection=yes"), true);
+        assert!(reason.contains("Trusted_Connection"), "{reason}");
+    }
+
+    #[test]
+    fn a_string_that_cannot_be_inspected_is_refused_only_when_it_could_matter() {
+        // An apostrophe inside an unquoted value is read by the driver and
+        // rejected by the parser used here. Without a transport or
+        // authentication word the string passes through for the driver to
+        // read; with one, a key this module never saw could select a pipe
+        // or integrated authentication.
+        let plain = "Server=db;User Id=u;Password=it's";
+        assert!(
+            Config::from_ado_string(plain).is_ok(),
+            "the driver accepts this string"
+        );
+        assert!(plain.parse::<connection_string::AdoNetString>().is_err());
+        assert_eq!(admit(plain, true), Ok(Endpoint::Tcp));
+        for word in [
+            "Integrated Security=SSPI",
+            "Trusted_Connection=yes",
+            "Server=np:x",
+            "Server=(localdb)\\x",
+        ] {
+            let string = format!("Password=it's;{word}");
+            let reason = refusal(&string, true);
+            assert!(reason.contains("cannot be inspected"), "{string}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connecting_never_falls_back_when_admission_refuses() {
+        // A listener on the pipe's would-be host proves no TCP attempt is
+        // made, and the integrated string must not be sent as SQL login.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move { listener.accept().await.is_ok() });
+        for string in [
+            format!("Server=127.0.0.1,{port};Integrated Security=SSPI"),
+            format!("Server=np:{PIPE},{port};Integrated Security=SSPI"),
+            format!("Server=np:{PIPE};User Id=u;Password=p;Integrated Security=SSPI"),
+        ] {
+            assert!(
+                matches!(Conn::connect(&string).await, Err(DbError::Refused(_))),
+                "{string}"
+            );
+        }
+        assert!(
+            !accepted.is_finished(),
+            "a refused string must not open a socket"
+        );
+        accepted.abort();
+    }
+}
+
+/// The pipe transport itself. Only Windows has named pipes, so these run only
+/// there; the admission rules above run everywhere.
+#[cfg(all(test, windows))]
+mod pipe_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+    fn unique_pipe(tag: &str) -> String {
+        format!(r"\\.\pipe\pbps-test-{}-{tag}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn a_missing_pipe_is_a_connect_error_and_never_a_tcp_attempt() {
+        // The listener stands where a fallback would dial. The pipe's own
+        // name is the only address the failure may mention.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name = unique_pipe("missing");
+        let started = Instant::now();
+        let result = Conn::connect(&format!(
+            "Server=np:{name},{};Integrated Security=SSPI",
+            listener.local_addr().unwrap().port()
+        ))
+        .await;
+        match result {
+            Err(DbError::Refused(_)) => {}
+            Err(other) => panic!("a comma-suffixed pipe is not a pipe name, got: {other}"),
+            Ok(_) => panic!("a comma-suffixed pipe must not connect"),
+        }
+        let result = Conn::connect(&format!("Server=np:{name};Integrated Security=SSPI")).await;
+        match result {
+            Err(DbError::Connect { addr, reason }) => {
+                assert_eq!(addr, name);
+                assert_eq!(reason.kind(), std::io::ErrorKind::NotFound);
+            }
+            Err(other) => panic!("expected a connect error, got: {other}"),
+            Ok(_) => panic!("a missing pipe must not connect"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "nothing may dial TCP after a pipe fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_pipe_ends_at_the_budget_instead_of_waiting_forever() {
+        let name = unique_pipe("busy");
+        let _server = ServerOptions::new().max_instances(1).create(&name).unwrap();
+        // The only server instance is taken by this client, so a second open
+        // sees `ERROR_PIPE_BUSY` until the budget runs out.
+        let _holder = ClientOptions::new().open(&name).unwrap();
+        let started = Instant::now();
+        let config = Config::from_ado_string("Server=localhost;User Id=u;Password=p").unwrap();
+        let result = Conn::connect_pipe(config, &name, Duration::from_millis(300)).await;
+        match result {
+            Err(DbError::ConnectTimeout { addr, after }) => {
+                assert_eq!(addr, name);
+                assert_eq!(after, Duration::from_millis(300));
+            }
+            Err(other) => panic!("expected a connect timeout, got: {other}"),
+            Ok(_) => panic!("a busy pipe must not connect"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_handshake_over_a_pipe_is_reported_as_a_driver_timeout() {
+        let name = unique_pipe("stalled");
+        let server = ServerOptions::new().create(&name).unwrap();
+        let held = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut config = Config::from_ado_string(
+            "Server=localhost;User Id=synthetic;Password=marker;Encrypt=true",
+        )
+        .unwrap();
+        config.handshake_timeout(Some(Duration::from_millis(100)));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            Conn::connect_pipe(config, &name, Duration::from_secs(1)),
+        )
+        .await
+        .expect("the driver handshake must terminate within its bound");
+        held.abort();
+        match result {
+            Err(DbError::Driver { message, .. }) => {
+                assert!(message.contains("connection handshake"), "{message}");
+            }
+            Err(other) => panic!("expected a driver timeout, got: {other}"),
+            Ok(_) => panic!("a stalled handshake must not connect"),
+        }
+    }
+
+    /// The first byte of a PRELOGIN is the TDS packet type; a plaintext LOGIN7
+    /// (0x10) after a server that declines encryption would leak the login.
+    #[tokio::test]
+    async fn tds_encryption_refusal_over_a_pipe_cannot_elicit_a_plaintext_login() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let name = unique_pipe("noencrypt");
+        let mut server = ServerOptions::new().create(&name).unwrap();
+        let served = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let mut header = [0; 8];
+            server.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x12);
+            let mut payload = vec![0; usize::from(u16::from_be_bytes([header[2], header[3]])) - 8];
+            server.read_exact(&mut payload).await.unwrap();
+            server
+                .write_all(&[0x04, 1, 0, 15, 0, 0, 1, 0, 1, 0, 6, 0, 1, 0xff, 2])
+                .await
+                .unwrap();
+            let mut next = [0];
+            if server.read(&mut next).await.unwrap() != 0 {
+                assert_eq!(
+                    next[0], 0x12,
+                    "plaintext authentication followed TLS refusal"
+                );
+            }
+        });
+        let config =
+            Config::from_ado_string("Server=localhost;User Id=synthetic;Password=marker").unwrap();
+        assert!(
+            Conn::connect_pipe(config, &name, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        served.await.unwrap();
     }
 }
