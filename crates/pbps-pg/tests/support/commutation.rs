@@ -20,6 +20,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "two_policies_created_in_their_own_namespace",
         pair: ["CreatePolicy", "CreatePolicy"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -64,6 +65,7 @@ row_policies:
         name: "independent_flags_on_two_created_tables",
         pair: ["SetRowSecurity", "SetRowSecurity"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -107,6 +109,7 @@ row_policies:
         name: "a_foreign_key_added_beside_an_index",
         pair: ["AddForeignKey", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.p
 columns:
@@ -167,6 +170,7 @@ data:
         name: "an_index_and_a_check_dropped_from_one_table",
         pair: ["DropIndex", "DropCheck"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -203,6 +207,7 @@ data:
         name: "a_column_dropped_beside_storage_parameters",
         pair: ["DropColumn", "SetStorageParameters"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -237,6 +242,7 @@ data:
         name: "a_column_renamed_beside_a_dropped_unique_constraint",
         pair: ["RenameColumn", "DropUnique"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -270,6 +276,7 @@ data:
         name: "a_column_retyped_beside_a_new_column",
         pair: ["AlterColumnType", "AddColumn"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -302,6 +309,7 @@ data:
         name: "a_column_made_not_null_beside_a_dropped_foreign_key",
         pair: ["AlterColumnNullability", "DropForeignKey"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.p
 columns:
@@ -359,6 +367,7 @@ data:
         name: "a_default_changed_beside_a_deprecation",
         pair: ["AlterColumnDefault", "SetColumnDeprecated"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -390,6 +399,7 @@ data:
         name: "identity_options_beside_a_replica_identity",
         pair: ["AlterColumnNumbering", "SetReplicaIdentity"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -424,6 +434,7 @@ data:
         name: "a_generation_expression_beside_storage_parameters",
         pair: ["AlterColumnExpression", "SetStorageParameters"],
         gap: None,
+        min_server_version: Some(pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN),
         base: r#"
 table: app.t
 columns:
@@ -459,6 +470,7 @@ data:
         name: "persistence_beside_index_storage_parameters",
         pair: ["SetTablePersistence", "SetIndexStorageParameters"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -499,6 +511,7 @@ data:
         name: "a_primary_key_renamed_beside_a_check",
         pair: ["SetPrimaryKey", "AddCheck"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.k
 columns:
@@ -520,6 +533,7 @@ checks:
         name: "a_row_inserted_beside_an_index",
         pair: ["InsertRow", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -555,6 +569,7 @@ data:
         name: "a_row_deleted_beside_an_index",
         pair: ["DeleteRow", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -588,6 +603,7 @@ data:
         name: "a_data_mode_changed_beside_an_index",
         pair: ["SetDataMode", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -622,6 +638,7 @@ data:
         name: "ensure_keys_beside_a_check",
         pair: ["SetEnsureKeys", "AddCheck"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -654,6 +671,7 @@ data:
         name: "a_table_created_beside_a_view",
         pair: ["CreateTable", "CreateModule"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -695,6 +713,7 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_table_dropped_beside_a_view_redefined",
         pair: ["DropTable", "AlterModule"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -740,6 +759,7 @@ definition: SELECT t.id, t.b FROM app.t
         name: "a_table_renamed_beside_a_view_dropped",
         pair: ["RenameTable", "DropModule"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -788,6 +808,7 @@ primary_key: [id]
         name: "a_grant_beside_a_revoke",
         pair: ["Grant", "Revoke"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -841,6 +862,7 @@ grants:
         name: "public_execution_beside_an_index",
         pair: ["PublicExecution", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -880,6 +902,7 @@ definition: |-
         name: "a_partition_attached_beside_a_check",
         pair: ["AttachPartition", "AddCheck"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -938,6 +961,7 @@ partitions:
         name: "a_partition_detached_beside_an_index",
         pair: ["DetachPartition", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -997,6 +1021,7 @@ columns:
         name: "a_partition_default_beside_a_partition_not_null",
         pair: ["SetPartitionDefault", "SetPartitionNotNull"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.m
 columns:
@@ -1022,6 +1047,7 @@ partitions:
         name: "an_index_dropped_beside_a_row_update",
         pair: ["DropIndex", "UpdateRow"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1056,6 +1082,7 @@ data:
         name: "a_view_created_beside_a_column_added",
         pair: ["CreateModule", "AddColumn"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1092,6 +1119,7 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_unique_constraint_dropped_beside_another_added",
         pair: ["DropUnique", "AddUnique"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1127,6 +1155,7 @@ data:
         name: "a_grant_beside_a_column_added",
         pair: ["Grant", "AddColumn"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1183,6 +1212,7 @@ const HELD: &[Scenario] = &[
         name: "held_a_column_added_to_a_renamed_table",
         pair: ["RenameTable", "AddColumn"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.u
 columns:
@@ -1202,6 +1232,7 @@ primary_key: [id]
         name: "held_an_index_over_a_renamed_column",
         pair: ["RenameColumn", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1224,6 +1255,7 @@ indexes:
         name: "held_a_column_dropped_with_its_index",
         pair: ["DropIndex", "DropColumn"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1245,6 +1277,7 @@ primary_key: [id]
         name: "held_an_index_over_a_new_column",
         pair: ["AddColumn", "AddIndex"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1266,6 +1299,7 @@ indexes:
         name: "held_a_default_for_a_retyped_column",
         pair: ["AlterColumnType", "AlterColumnDefault"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.t
 columns:
@@ -1285,6 +1319,7 @@ primary_key: [id]
         name: "held_a_key_into_a_new_primary_key",
         pair: ["SetPrimaryKey", "AddForeignKey"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.p
 columns:
@@ -1319,6 +1354,7 @@ foreign_keys:
         name: "held_a_parent_row_deleted_after_the_key_into_it",
         pair: ["DropForeignKey", "DeleteRow"],
         gap: None,
+        min_server_version: None,
         base: r#"
 table: app.p
 columns:
@@ -1492,5 +1528,11 @@ async fn with_role<F: std::future::Future<Output = ()>>(run: impl FnOnce(String)
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn pairs_the_effects_call_independent_commute_on_the_engine() {
     let pg = Pg(pbps_pg::Postgres::new());
-    with_role(|role| async move { core::suite(&pg, SCENARIOS, HELD, &role).await }).await;
+    let mut conn = super::connect().await;
+    let version = super::server_version_num(&mut conn).await;
+    drop(conn);
+    with_role(|role| async move {
+        core::suite(&pg, SCENARIOS, HELD, &role, Some(version)).await;
+    })
+    .await;
 }

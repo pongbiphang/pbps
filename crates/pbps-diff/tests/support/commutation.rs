@@ -52,6 +52,9 @@ pub struct Scenario {
     /// The issue of a known gap: a pair the effects call independent and the
     /// engine does not.
     pub gap: Option<u32>,
+    /// A server-version floor for SQL the engine cannot run on older releases.
+    /// `None` covers every release in that engine's supported range.
+    pub min_server_version: Option<i64>,
     pub base: &'static str,
     pub desired: &'static str,
 }
@@ -848,19 +851,45 @@ pub async fn audit<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> (u
 /// pair it ordered and the engine refuses or ends otherwise. They run only
 /// in the audit, so they cost the merge group nothing and the cap does not
 /// count them.
-pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], held: &[Scenario], role: &str) {
+pub async fn suite<E: Engine>(
+    engine: &E,
+    scenarios: &[Scenario],
+    held: &[Scenario],
+    role: &str,
+    server_version: Option<i64>,
+) {
+    use std::io::Write as _;
     assert!(
         scenarios.len() <= CAP,
         "the sample is capped at {CAP} pairs"
     );
     let started = std::time::Instant::now();
     let (mut swaps, mut failures) = (0, Vec::new());
+    let (mut executed, mut skipped) = (0, 0);
     let all: Vec<&Scenario> = if audits() {
         scenarios.iter().chain(held).collect()
     } else {
         scenarios.iter().collect()
     };
     for scenario in all {
+        if let Some(minimum) = scenario.min_server_version {
+            let actual = server_version
+                .expect("a version-dependent scenario needs the connected server version");
+            if actual < minimum {
+                // Direct stderr stays visible when libtest captures a passing
+                // test: a skipped scenario must never look like one that ran.
+                writeln!(
+                    std::io::stderr(),
+                    "SKIP commutation ({}): {} requires server_version_num >= {minimum}; connected server_version_num = {actual}",
+                    engine.name(),
+                    scenario.name,
+                )
+                .expect("write the scenario's skip notice");
+                skipped += 1;
+                continue;
+            }
+        }
+        executed += 1;
         if audits() {
             let (ran, found) = audit(engine, scenario, role).await;
             swaps += ran;
@@ -869,18 +898,15 @@ pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], held: &[Scenar
             failures.push(failure);
         }
     }
-    eprintln!(
-        "commutation {} ({}): {} scenarios, {} swapped pairs, in {:.1}s",
+    writeln!(
+        std::io::stderr(),
+        "commutation {} ({}): {executed} scenarios executed, {skipped} skipped, {} swapped pairs, in {:.1}s",
         if audits() { "audit" } else { "suite" },
         engine.name(),
-        if audits() {
-            scenarios.len() + held.len()
-        } else {
-            scenarios.len()
-        },
-        if audits() { swaps } else { scenarios.len() },
+        if audits() { swaps } else { executed },
         started.elapsed().as_secs_f64()
-    );
+    )
+    .expect("write the suite's execution counts");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
@@ -893,6 +919,7 @@ mod verdict_tests {
             name: "s",
             pair: ["AddColumn", "AddColumn"],
             gap,
+            min_server_version: None,
             base: "",
             desired: "",
         }
