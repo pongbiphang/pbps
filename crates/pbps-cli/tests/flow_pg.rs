@@ -16673,6 +16673,186 @@ fn doctor_reports_an_adopted_routine_grant_whatever_the_argument_spelling() {
     }
 }
 
+/// #2249: adopted sequence ACLs need the same original-grantor authority
+/// doctor already checks for relations and routines. The physical sequence
+/// name is deliberately unrelated to the column address used by the plan.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_predicts_the_adopted_serial_sequence_grant_the_plan_cannot_revoke() {
+    let mut failed_versions = Vec::new();
+    for (version, server) in [
+        (16, std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()),
+        (18, server()),
+    ] {
+        // Exercise both engines even when a mutation breaks the first one.
+        let result = std::panic::catch_unwind(|| {
+            let deployer = format!("pbps_d2249_dep_{version}_{}", std::process::id());
+            let grantor = format!("pbps_d2249_grant_{version}_{}", std::process::id());
+            let reader = format!("pbps_d2249_read_{version}_{}", std::process::id());
+            let _roles = ClusterRoles {
+                server: server.clone(),
+                names: vec![reader.clone(), grantor.clone(), deployer.clone()],
+            };
+            let own = OwnDatabase::new(&server, &format!("doctor-sequence2249-{version}"));
+            let connection = own.connection();
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT current_setting('server_version_num')::bigint / 10000"
+                ),
+                version
+            );
+            on_server(
+                connection,
+                &format!(
+                    "CREATE ROLE {deployer} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'trigger-test'; \
+                 CREATE ROLE {grantor} NOSUPERUSER; CREATE ROLE {reader} NOSUPERUSER; \
+                 CREATE SCHEMA app AUTHORIZATION {deployer}; \
+                 GRANT CREATE ON SCHEMA public TO {deployer}"
+                ),
+            );
+            let login = as_role(connection, &deployer);
+            on_server(
+                &login,
+                "CREATE TABLE app.t (id serial PRIMARY KEY); ALTER SEQUENCE app.t_id_seq RENAME TO custom2249",
+            );
+            let d = Demo::new(&format!("doctor-sequence2249-{version}"));
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_FLOW_PG_DEV\n",
+            )
+            .unwrap();
+            d.table("table: app.t\ncolumns:\n  id: {type: serial, sequence: {name: custom2249}}\nprimary_key: {name: t_pkey, columns: [id]}\n");
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                &login,
+                "--reason",
+                "existing serial table",
+            ]));
+
+            // The table is recorded before the recipient is managed. Neither
+            // declarations nor ledger contain this ACL; adoption of the newly
+            // managed role must reach the planner's revocability check.
+            on_server(
+                &login,
+                &format!(
+                    "GRANT USAGE ON SCHEMA app TO {grantor}; \
+                 GRANT USAGE ON SEQUENCE app.custom2249 TO {grantor} WITH GRANT OPTION"
+                ),
+            );
+            on_server(
+                connection,
+                &format!(
+                    "SET ROLE {grantor}; GRANT USAGE ON SEQUENCE app.custom2249 TO {reader}; RESET ROLE"
+                ),
+            );
+            std::fs::write(d.dir.join("schema/reader.yml"), format!("role: {reader}\n")).unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let target: pbps_model::GrantTarget = "sequence::app.t.id".parse().unwrap();
+            let unrevocable = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &login)
+                        .await
+                        .unwrap();
+                    pbps_pg::catalog::introspect(&mut conn)
+                        .await
+                        .unwrap()
+                        .unrevocable
+                });
+            assert!(
+                unrevocable.iter().any(|g| g.role.raw() == reader
+                    && g.target == target
+                    && g.permission == pbps_model::Permission::Usage),
+                "{unrevocable:?}"
+            );
+            let diagnose = || {
+                let output = d.run_with_env(
+                    &["doctor", "--format", "json"],
+                    &[("PBPS_FLOW_PG_DEV", login.as_str())],
+                );
+                let json: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+                (output, json)
+            };
+            let (diagnosis, json) = diagnose();
+            let plan = d.dir.join("plan.json");
+            let planning = ["plan", "--db", &login, "--out", plan.to_str().unwrap()];
+            let refused = d.run(&planning);
+            assert_eq!(
+                code(&refused),
+                1,
+                "{}{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            let why = stderr(&refused);
+            for needle in ["unrevocable_grants", "app.custom2249", grantor.as_str()] {
+                assert!(why.contains(needle), "{needle}: {why}");
+            }
+            assert!(!plan.exists(), "a refused plan must not be saved");
+            eprintln!("PG {version}: plan refuses the original-grantor ACL on sequence::app.t.id");
+            let gap = "USAGE WITH GRANT OPTION on SEQUENCE owned by app.t.id";
+            assert_eq!(code(&diagnosis), 2, "PG {version}: {json}");
+            let gaps = json["data"]["environments"][0]["missing_permissions"]
+                .as_array()
+                .unwrap();
+            assert!(
+                gaps.iter().any(|g| {
+                    let g = g.as_str().unwrap();
+                    g.starts_with(gap) && g.contains(&grantor)
+                }),
+                "PG {version}: {json}"
+            );
+            eprintln!("PG {version}: doctor reports the same owning-column authority gap");
+
+            // Only the original grantor changes. The owner's otherwise
+            // identical ACL is revocable and must produce no doctor gap.
+            on_server(
+                connection,
+                &format!(
+                    "SET ROLE {grantor}; REVOKE USAGE ON SEQUENCE app.custom2249 FROM {reader}; RESET ROLE"
+                ),
+            );
+            on_server(
+                &login,
+                &format!("GRANT USAGE ON SEQUENCE app.custom2249 TO {reader}"),
+            );
+            let (_, json) = diagnose();
+            let gaps = json["data"]["environments"][0]["missing_permissions"]
+                .as_array()
+                .unwrap();
+            assert!(gaps.is_empty(), "PG {version}: {json}");
+            assert_ne!(
+                json["data"]["environments"][0]["permissions_unknown"], true,
+                "{json}"
+            );
+            succeeds(d.run(&planning));
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+            assert!(saved.changes.changes.iter().any(|p| matches!(&p.change,
+                pbps_model::Change::Revoke { role, target: found, permissions }
+                    if role.raw() == reader && found == &target && permissions.contains(&pbps_model::Permission::Usage)
+            )), "{:?}", saved.changes);
+            eprintln!(
+                "PG {version}: the revocable control has no gap and plans the same sequence target"
+            );
+        });
+        if result.is_err() {
+            failed_versions.push(version);
+        }
+    }
+    assert!(
+        failed_versions.is_empty(),
+        "failed PostgreSQL versions: {failed_versions:?}"
+    );
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
