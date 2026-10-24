@@ -67,6 +67,9 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
+        | Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }

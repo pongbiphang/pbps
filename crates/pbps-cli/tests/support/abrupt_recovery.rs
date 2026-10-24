@@ -783,3 +783,49 @@ impl Running {
         running
     }
 }
+
+/// Stop a real process after its sole type statement has committed, been
+/// vetted, and acquired a durable checkpoint, but before the closing entry.
+/// The shared SQL Server test binary does not use PostgreSQL type fixtures.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(super) fn interrupt_after_type_checkpoint(
+    connection: &str,
+    d: &super::Demo,
+    args: &[&str],
+) -> pbps_model::StateSnapshot {
+    let e = Engine::new(Driver::Postgres, connection);
+    let baseline = e.latest();
+    let (mut gate, blocker) = e.gate();
+    let mut child = Running::checkpoint(d, args);
+    let session = e.await_request(blocker, &mut child, true);
+    assert_eq!(e.latest(), baseline);
+    child.pipe.as_mut().unwrap().arm();
+    e.execute(&mut gate, "ROLLBACK");
+    child.await_pipe_write();
+    let start = Instant::now();
+    let recorded = loop {
+        assert!(child.child.try_wait().unwrap().is_none());
+        let recorded = e.latest();
+        if recorded.staged.is_some() {
+            break recorded;
+        }
+        assert_eq!(recorded, baseline);
+        assert!(
+            start.elapsed() < LIMIT,
+            "type checkpoint did not become durable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let progress = recorded.staged.as_ref().unwrap();
+    assert_eq!((progress.completed, progress.total), (1, 1));
+    assert_eq!(e.entries("apply"), 0);
+    child.child.kill().unwrap();
+    child.child.wait().unwrap();
+    child.pipe.as_mut().unwrap().release();
+    assert!(!child.finish().status.success());
+    e.session_gone(session);
+    assert_eq!(e.latest(), recorded);
+    succeeds(d.run(&["unlock", "--db", connection]));
+    recorded
+}

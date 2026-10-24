@@ -375,6 +375,12 @@ engine's rule, or the catalog's answer under a collation (DEC-1964.1).
 - replays the order and refuses a claim on a name still held;
 - refuses a move whose intermediate name is held at that statement.
 
+PostgreSQL also has `Types(schema)`, separate from `Relations(schema)`.
+Declared enums/domains hold only Types; tables and views hold both; indexes
+and sequences hold only Relations. Catalog composites hold Types. Cross-schema
+table moves claim both intermediate names; type moves claim intermediate Types
+names, observed from the emitter. Generated array names retain #1503's rule.
+
 ## What each change requires
 
 `P` is PostgreSQL and `S` is SQL Server; no marker means both. Every change
@@ -385,6 +391,9 @@ requirement is common to all of them, so it is listed once,
 | Change | Class | Requires before it | Creates, removes or rewrites | Effects (checked) |
 |---|---|---|---|---|
 | `DropModule` | 0 | Its dependents gone. Planned policy drops first. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
+| `CreateType` | 7, before tables; domain-base depth first | P: its declared base's final incarnation; its Types name free | Creates the type | Is, creates |
+| `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
+| `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
@@ -795,3 +804,23 @@ schema/trust context with a certified lowered plan. Its immutable script keeps
 that engine and the existing guard-before-DDL bytes; it adds no ordering stage
 or executable operation. Bootstrap's per-statement prerequisite checks select
 positions from the certified collection (DEC-1959.5, DEC-2181.1).
+
+## Declared type pairs (DEC-1635.3)
+
+| Pair | Decision | Mechanism |
+|---|---|---|
+| CreateType → CreateTable/AddColumn/AlterColumnType using it | final type must exist | class 7 (type subrank before tables) before 8/9; declared `Is(Type, Final)` effect |
+| CreateType → CreateType domain over it | base first | domain-base depth rank within class 7, plus `Is(Type, Final)` |
+| RenameType → typed column creation/retype and dependent type rename | final spelling first | class 1, domain-base depth rank and final type effect |
+| Type creation/rename → defaults, checks, modules and grants naming it | final name first | classes 1/7 before defaults/checks/modules/grants (9/13/14/16) |
+| DropTable/DropColumn/retype away → DropType | last column released first | classes 6/5/9 before 18; `Absent` table/column or final-column `Is` effects |
+| DropModule/drop default/drop check → DropType | dependent gone first | classes 0/9/2 before 18 |
+| DropType of a domain → DropType of its base | dependent domain gone first | reverse baseline domain-base depth rank within class 18, plus `Absent(Type)` effect |
+| Drop/rename a type, table or view → claim its Types name | old holder releases first | existing slot handover edges, including cross-kind class inversions |
+| RenameType chains | free destination first | existing slot edges; cycles/swaps refuse by name in the differ |
+| Independent type operations and all remaining pairs | no dependency | stable class/rank key; no extra pass |
+
+The shadow verifier uses the same type resources, final-incarnation requirements,
+slot claims and releases; pending Types handovers join the existing
+`after_the_rebuilds` slot settlement, which also carries their dependents.
+The release verifier remains unchanged.

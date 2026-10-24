@@ -65,6 +65,89 @@ use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
 
+#[cfg(test)]
+mod declared_type_emission_tests {
+    use super::*;
+
+    #[test]
+    fn type_lifecycle_sql_quotes_names_and_labels_and_preserves_domain_attributes() {
+        let pg = Postgres::new();
+        let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
+        let name = pbps_model::TypeRef::new("app", "mood\"").unwrap();
+        let definition = pbps_model::ManagedType::Enum {
+            values: vec!["can't".into(), "ok".into()],
+        };
+        let create = Change::CreateType {
+            uid: uid.clone(),
+            name: name.clone(),
+            definition: Box::new(definition.clone()),
+        };
+        let sql = emit(&pg, &create, Strategy::default()).unwrap();
+        assert!(
+            sql[0]
+                .sql
+                .contains("CREATE TYPE \"app\".\"mood\"\"\" AS ENUM ('can''t', 'ok')"),
+            "{}",
+            sql[0].sql
+        );
+        assert!(sql[0].declared_type.is_some());
+        let drop = Change::DropType {
+            uid: uid.clone(),
+            name: name.clone(),
+            definition: Box::new(definition.clone()),
+        };
+        assert!(
+            emit(&pg, &drop, Strategy::default()).unwrap()[0]
+                .sql
+                .contains("DROP TYPE")
+        );
+        let rename = Change::RenameType {
+            uid: uid.clone(),
+            from: name,
+            to: "other.feeling".parse().unwrap(),
+            definition: Box::new(definition),
+        };
+        let statements = emit(&pg, &rename, Strategy::default()).unwrap();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].sql.contains("SET SCHEMA \"other\""));
+        assert!(statements[1].sql.contains("RENAME TO \"feeling\""));
+        assert!(
+            statements
+                .iter()
+                .all(|s| s.transactional && s.declared_type.is_some())
+        );
+        let definition = pbps_model::ManagedType::Domain {
+            base: "varchar(20)".parse().unwrap(),
+            not_null: true,
+            default: Some("'0'".into()),
+            checks: [("positive".into(), "VALUE <> ''".into())].into(),
+            collation: Some("pg_catalog.\"C\"".parse().unwrap()),
+        };
+        let create = Change::CreateType {
+            uid,
+            name: "app.phone".parse().unwrap(),
+            definition: Box::new(definition),
+        };
+        let sql = &emit(&pg, &create, Strategy::default()).unwrap()[0].sql;
+        assert!(sql.replace('\n', "").contains("CREATE DOMAIN \"app\".\"phone\" AS character varying(20) COLLATE \"pg_catalog\".\"C\" DEFAULT '0' NOT NULL CONSTRAINT \"positive\" CHECK (VALUE <> '')"), "{sql}");
+        assert!(!sql.contains("CASCADE"));
+        assert!(
+            emit(
+                &pg,
+                &Change::CreateType {
+                    uid: "y_bbbbbb".parse().unwrap(),
+                    name: "app.empty".parse().unwrap(),
+                    definition: Box::new(pbps_model::ManagedType::Enum { values: Vec::new() })
+                },
+                Strategy::default()
+            )
+            .unwrap()[0]
+                .sql
+                .contains("AS ENUM ()")
+        );
+    }
+}
+
 /// Compensation for the artifact left by this statement's failed build.
 pub(crate) fn drop_failed_index(build: &pbps_dialect::IndexBuild) -> Result<String, DialectError> {
     Ok(format!(
@@ -3044,6 +3127,46 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::DropPolicy { table, name, .. } => one(
             pg, table, format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
+        Change::CreateType { uid, name, definition } => {
+            let address = TableName::new(name.schema(), name.name());
+            let sql = match definition.as_ref() {
+                pbps_model::ManagedType::Enum { values } => format!("CREATE TYPE {} AS ENUM ({});", qualified(&address)?, values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")),
+                pbps_model::ManagedType::Domain { base, not_null, default, checks, collation } => {
+                    let mut sql = format!("CREATE DOMAIN {} AS {}", qualified(&address)?, sql_type(base)?);
+                    if let Some(c) = collation { sql.push_str(&format!(" COLLATE {}.{}", quote(c.schema())?, quote(c.name())?)); }
+                    if let Some(text) = default { sql.push_str(&format!(" DEFAULT {}", verbatim(text))); }
+                    if *not_null { sql.push_str(" NOT NULL"); }
+                    for (constraint, text) in checks { sql.push_str(&format!(" CONSTRAINT {} CHECK ({})", quote(constraint.raw())?, verbatim(text))); }
+                    sql.push(';'); sql
+                }
+            };
+            let mut statement = scoped(pg, name.schema(), &sql)?;
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: name.clone(), definition: Some((**definition).clone()) });
+            Ok(vec![statement])
+        }
+        Change::DropType { uid, name, definition } => {
+            let mut statement = scoped(pg, name.schema(), &format!("DROP {} {}.{};", if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) { "DOMAIN" } else { "TYPE" }, quote(name.schema())?, quote(name.name())?))?;
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: name.clone(), definition: None });
+            Ok(vec![statement])
+        }
+
+        Change::RenameType { uid, from, to, definition } => {
+            let kind = if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) { "DOMAIN" } else { "TYPE" };
+            let mut at = from.clone();
+            let mut out = Vec::new();
+            if from.schema() != to.schema() {
+                let mut statement = scoped(pg, at.schema(), &format!("ALTER {kind} {}.{} SET SCHEMA {};", quote(at.schema())?, quote(at.name())?, quote(to.schema())?))?;
+                at = pbps_model::TypeRef::new(to.schema(), from.name()).map_err(|e| invalid(e.to_string()))?;
+                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: at.clone(), definition: Some((**definition).clone()) });
+                out.push(statement);
+            }
+            if at.name() != to.name() {
+                let mut statement = scoped(pg, at.schema(), &format!("ALTER {kind} {}.{} RENAME TO {};", quote(at.schema())?, quote(at.name())?, quote(to.name())?))?;
+                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: to.clone(), definition: Some((**definition).clone()) });
+                out.push(statement);
+            }
+            Ok(out)
+        }
         Change::CreatePolicy { table, name, policy, .. } => {
             let targets = match &policy.to {
                 pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),

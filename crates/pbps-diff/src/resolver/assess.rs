@@ -263,6 +263,9 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => false,
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
+        | Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }

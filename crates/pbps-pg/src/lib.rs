@@ -2018,6 +2018,10 @@ impl Dialect for Postgres {
     /// after a table are all refused with `relation "..." already exists` —
     /// the constraint cases because a named primary key or unique constraint
     /// is backed by an index of that name.
+    fn relations_have_row_types(&self) -> bool {
+        true
+    }
+
     fn indexes_share_namespace_with_tables(&self) -> bool {
         true
     }
@@ -2450,6 +2454,19 @@ impl Dialect for Postgres {
         Ok(pbps_dialect::lower::intermediate_tables(&emit::emit(
             self, change, strategy,
         )?))
+    }
+
+    fn intermediate_types(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<pbps_model::TypeRef>, DialectError> {
+        let statements = emit::emit(self, change, strategy)?;
+        Ok(statements
+            .iter()
+            .take(statements.len().saturating_sub(1))
+            .filter_map(|s| s.declared_type.as_ref().map(|t| t.name.clone()))
+            .collect())
     }
 
     /// What this plan implies about the data, asked before its first

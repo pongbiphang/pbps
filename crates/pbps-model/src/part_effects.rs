@@ -275,6 +275,9 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }

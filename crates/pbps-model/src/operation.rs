@@ -292,6 +292,7 @@ pub enum Grantee {
 /// [`Change`] carries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectKey {
+    Type(Recorded),
     Table(Recorded),
     Column(ColumnKey),
     Role(Recorded),
@@ -403,6 +404,13 @@ pub enum OwnerError {
 /// Who owns a name a step spells: ownership, which is all the models supply
 /// to a step (#1776's step-local rule).
 pub trait Owners {
+    fn managed_type(&self, name: &crate::TypeRef, spelling: Spelling) -> Result<Uid, OwnerError> {
+        Err(OwnerError::Unmanaged {
+            name: name.shown().to_string(),
+            spelling,
+        })
+    }
+
     /// The uid of the table a step spells as `name`.
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError>;
     /// The uid of the column a step spells as `column`.
@@ -460,6 +468,28 @@ fn held(holder: Holder<'_>, name: String, spelling: Spelling) -> Result<Uid, Own
 }
 
 impl Owners for PlanOwners<'_> {
+    fn managed_type(&self, name: &crate::TypeRef, spelling: Spelling) -> Result<Uid, OwnerError> {
+        match spelling {
+            Spelling::Base | Spelling::Final => {
+                let ids = if spelling == Spelling::Base {
+                    &self.base
+                } else {
+                    &self.desired
+                };
+                ids.type_uid(name)
+                    .cloned()
+                    .ok_or_else(|| OwnerError::Unmanaged {
+                        name: name.shown().to_string(),
+                        spelling,
+                    })
+            }
+            Spelling::At(_) => Err(OwnerError::Unmanaged {
+                name: name.shown().to_string(),
+                spelling,
+            }),
+        }
+    }
+
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
         if self.rebuild.is_some() && matches!(spelling, Spelling::At(_)) {
             self.inside(spelling)?;
@@ -607,6 +637,9 @@ impl Operation {
                 ObjectKey::Table(checked_relation(owners, &a.parent, Spelling::Final)?)
             }
 
+            Change::CreateType { uid, .. }
+            | Change::DropType { uid, .. }
+            | Change::RenameType { uid, .. } => ObjectKey::Type(recorded(uid)),
             Change::CreateTable { uid, .. }
             | Change::DropTable { uid, .. }
             | Change::DetachPartition { uid, .. }
@@ -801,7 +834,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
                 }
                 out
             }
-            Change::DropTable { .. }
+            Change::DropType { .. }
+            | Change::DropTable { .. }
             | Change::DropColumn { .. }
             | Change::DropComputedColumn { .. }
             | Change::DropUnique { .. }
@@ -812,7 +846,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::DeleteRow { .. }
             | Change::DropModule { .. }
             | Change::DropRole { .. } => exists(true, false)?,
-            Change::AddComputedColumn { .. }
+            Change::CreateType { .. }
+            | Change::AddComputedColumn { .. }
             | Change::AddUnique { .. }
             | Change::AddForeignKey { .. }
             | Change::CreatePolicy { .. }
@@ -837,7 +872,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             },
             // Renames move an address, and the rest rewrite the instance that
             // stands: neither starts or ends one.
-            Change::DetachPartition { .. }
+            Change::RenameType { .. }
+            | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
             | Change::RenameTable { .. }
             | Change::RenameColumn { .. }

@@ -16,6 +16,12 @@ pub struct BatchArgs {
     /// Rename a role
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["FROM", "TO"])]
     rename_role: Vec<String>,
+    /// Rename a declared type
+    #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["FROM", "TO"])]
+    rename_type: Vec<String>,
+    /// Drop a declared type with its own nonblank audit reason
+    #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["TYPE", "REASON"])]
+    drop_type: Vec<String>,
     /// Drop a column with its own nonblank audit reason
     #[arg(long, num_args = 2, action = ArgAction::Append, value_names = ["COLUMN", "REASON"])]
     drop: Vec<String>,
@@ -51,6 +57,8 @@ impl BatchArgs {
             ("--rename", &self.rename),
             ("--rename-table", &self.rename_table),
             ("--rename-role", &self.rename_role),
+            ("--rename-type", &self.rename_type),
+            ("--drop-type", &self.drop_type),
             ("--drop", &self.drop),
             ("--drop-table", &self.drop_table),
             ("--drop-role", &self.drop_role),
@@ -76,6 +84,14 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
                 to: second.to_owned().into(),
             }
         }
+        "--rename-type" => Intent::RenameType {
+            from: first.parse()?,
+            to: second.parse()?,
+        },
+        "--drop-type" => Intent::DropType {
+            name: first.parse()?,
+            reason: second.parse()?,
+        },
         "--rename-table" => Intent::RenameTable {
             from: first.parse()?,
             to: second.parse()?,

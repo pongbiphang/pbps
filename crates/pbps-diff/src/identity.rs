@@ -39,6 +39,13 @@ use pbps_model::{
 /// A situation that cannot be decided automatically and needs a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
+    AmbiguousTypes {
+        disappeared: Vec<pbps_model::TypeRef>,
+        appeared: Vec<pbps_model::TypeRef>,
+    },
+    DropTypeNeedsReason {
+        name: pbps_model::TypeRef,
+    },
     /// A later diagnosis depends on this contested table rename having won.
     /// Keep the diagnosis visible without presenting declaration order as intent.
     ProvisionalTableIdentity {
@@ -58,22 +65,30 @@ pub enum Blocker {
         appeared: Vec<TableName>,
     },
     /// A column vanished from the declarations with no reason for dropping it.
-    DropColumnNeedsReason { column: ColumnRef },
+    DropColumnNeedsReason {
+        column: ColumnRef,
+    },
     /// A table vanished from the declarations with no reason for dropping it.
-    DropTableNeedsReason { table: TableName },
+    DropTableNeedsReason {
+        table: TableName,
+    },
     /// Roles both disappeared and appeared (ADR-0005).
     AmbiguousRoles {
         disappeared: Vec<pbps_model::RoleName>,
         appeared: Vec<pbps_model::RoleName>,
     },
     /// A role vanished from the declarations with no reason for dropping it.
-    DropRoleNeedsReason { role: pbps_model::RoleName },
+    DropRoleNeedsReason {
+        role: pbps_model::RoleName,
+    },
     /// An intent was given that matches nothing in either the declarations or the
     /// identity file — almost always a typo.
     ///
     /// Ignoring it silently would leave the user facing an ambiguity error they
     /// cannot explain.
-    UnusedIntent { intent: Intent },
+    UnusedIntent {
+        intent: Intent,
+    },
     /// Two or more rename intents claim one name: one source renamed to two
     /// targets, or two sources renamed onto one name.
     ///
@@ -94,7 +109,9 @@ pub enum Blocker {
     /// A rename's target is already occupied by a name that remains in the
     /// declarations. The source is left available so a companion drop intent
     /// can still account for it, instead of making the rename look absorbed.
-    RenameTargetExists { target: String },
+    RenameTargetExists {
+        target: String,
+    },
     /// A schema, table, column, or module (view/routine/trigger) name pbps's
     /// own `.`-joined format cannot carry: it contains the separator that
     /// format reserves, and minting an identity for it — or, for a module,
@@ -136,7 +153,9 @@ pub enum Blocker {
     /// A move was allowed for a table that is not a range or list partition
     /// whose parent declares a DEFAULT partition, so no rows can ever move
     /// into it (#1788, #1632).
-    MoveNotBesideDefault { table: TableName },
+    MoveNotBesideDefault {
+        table: TableName,
+    },
     /// Pull cannot retire a recorded type until its drop lifecycle exists.
     MissingType {
         name: pbps_model::TypeRef,
@@ -184,6 +203,9 @@ pub struct Resolution {
     pub added_columns: Vec<(Uid, ColumnRef)>,
     pub dropped_columns: Vec<(Uid, ColumnRef)>,
     pub renamed_columns: Vec<(Uid, ColumnRef, ColumnRef)>,
+    pub created_types: Vec<(Uid, pbps_model::TypeRef)>,
+    pub dropped_types: Vec<(Uid, pbps_model::TypeRef)>,
+    pub renamed_types: Vec<(Uid, pbps_model::TypeRef, pbps_model::TypeRef)>,
     pub created_roles: Vec<(Uid, pbps_model::RoleName)>,
     pub dropped_roles: Vec<(Uid, pbps_model::RoleName)>,
     /// `(uid, old name, new name)`
@@ -283,7 +305,12 @@ fn pending_rebuild_intents(ids: &IdsFile, intents: &[Intent]) -> Vec<Blocker> {
                 Intent::DropTable { table, .. } | Intent::MoveRows { table, .. } => {
                     table.raw().to_string()
                 }
-                Intent::RenameRole { .. } | Intent::DropRole { .. } => continue,
+                // `concerns_table` already excludes these; the arm only keeps
+                // the match exhaustive.
+                Intent::RenameRole { .. }
+                | Intent::DropRole { .. }
+                | Intent::RenameType { .. }
+                | Intent::DropType { .. } => continue,
             };
             covered.insert((uid.clone(), ids.tables[uid].clone(), object));
         }
@@ -316,14 +343,15 @@ fn resolve_with_provenance(
     let mut blockers = Vec::new();
     let mut used: BTreeSet<usize> = BTreeSet::new();
 
-    // Slice one records identity but never infers a rename or a drop. The
-    // differ refuses every lifecycle difference by name (DEC-1635.2).
-    for name in declared.types.keys() {
-        if r.ids.type_uid(name).is_none() {
-            let uid = fresh_uid(&r.ids, UidKind::Type);
-            r.ids.types.insert(uid, name.clone());
-        }
-    }
+    resolve_types(
+        declared,
+        intents,
+        annotation_count,
+        ctx,
+        &mut r,
+        &mut blockers,
+        &mut used,
+    );
 
     resolve_tables(
         declared,
@@ -444,7 +472,9 @@ fn resolve_with_provenance(
                         })
                     })
             }
-            Intent::RenameTable { .. }
+            Intent::RenameType { .. }
+            | Intent::DropType { .. }
+            | Intent::RenameTable { .. }
             | Intent::DropTable { .. }
             | Intent::RenameRole { .. }
             | Intent::DropRole { .. }
@@ -469,6 +499,7 @@ fn resolve_with_provenance(
         let absorbed = match intent {
             Intent::RenameTable { .. }
             | Intent::RenameColumn { .. }
+            | Intent::RenameType { .. }
             | Intent::RenameRole { .. }
                 if current_decision =>
             {
@@ -476,9 +507,11 @@ fn resolve_with_provenance(
             }
             Intent::RenameTable { .. }
             | Intent::RenameColumn { .. }
+            | Intent::RenameType { .. }
             | Intent::RenameRole { .. }
             | Intent::DropTable { .. }
             | Intent::DropColumn { .. }
+            | Intent::DropType { .. }
             | Intent::DropRole { .. }
             | Intent::MoveRows { .. } => {
                 intent_is_absorbed(original_intent.as_ref().unwrap_or(intent), ids, source)
@@ -539,7 +572,9 @@ fn resolve_with_provenance(
                     Intent::DropColumn { column, .. } => Some(column.table.clone()),
                     Intent::RenameTable { .. }
                     | Intent::DropTable { .. }
+                    | Intent::RenameType { .. }
                     | Intent::RenameRole { .. }
+                    | Intent::DropType { .. }
                     | Intent::DropRole { .. }
                     | Intent::MoveRows { .. } => None,
                 },
@@ -553,6 +588,8 @@ fn resolve_with_provenance(
                 | Blocker::AmbiguousTables { .. }
                 | Blocker::DropTableNeedsReason { .. }
                 | Blocker::AmbiguousRoles { .. }
+                | Blocker::AmbiguousTypes { .. }
+                | Blocker::DropTypeNeedsReason { .. }
                 | Blocker::DropRoleNeedsReason { .. }
                 | Blocker::RenameTargetExists { .. }
                 | Blocker::UnrepresentableName { .. }
@@ -722,6 +759,10 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
         // is still declared, which is a contradiction the author must hear.
         Intent::DropTable { table, .. } => !has_table(table),
         Intent::DropColumn { column, .. } => !has_column(column),
+        Intent::RenameType { from, to } => {
+            ids.type_uid(to).is_some() && vacated(ids.type_uid(from).is_some())
+        }
+        Intent::DropType { name, .. } => ids.type_uid(name).is_none(),
         Intent::RenameRole { from, to } => has_role(to) && vacated(has_role(from)),
         Intent::DropRole { role, .. } => !has_role(role),
         // Recorded already, with this bound.
@@ -774,11 +815,13 @@ impl RenameSource {
                 .tables
                 .get(table)
                 .is_some_and(|t| t.columns.contains_key(from)),
+            Intent::RenameType { from, .. } => declared.types.contains_key(from),
             Intent::RenameRole { from, .. } => declared.roles.contains_key(from),
             // A drop vacates no name, and its absorption does not ask; nor
             // does a move.
             Intent::DropTable { .. }
             | Intent::DropColumn { .. }
+            | Intent::DropType { .. }
             | Intent::DropRole { .. }
             | Intent::MoveRows { .. } => false,
         };
@@ -790,10 +833,154 @@ impl RenameSource {
     }
 }
 
-/// Roles, by the same rules as tables (ADR-0005): a name on both sides is the
-/// same role, a rename needs intent, and a drop needs a reason. Membership is
-/// what drop + add would destroy, which is why a role is on this side of the
-/// line at all.
+/// Shared types follow table identity rules: only explicit intent preserves
+/// identity across a name change, and removing one needs a recorded reason.
+fn resolve_types(
+    declared: &Schema,
+    intents: &[Intent],
+    annotation_count: usize,
+    ctx: &Context,
+    r: &mut Resolution,
+    blockers: &mut Vec<Blocker>,
+    used: &mut BTreeSet<usize>,
+) {
+    let declared_names: BTreeSet<&pbps_model::TypeRef> = declared.types.keys().collect();
+    let known: BTreeMap<pbps_model::TypeRef, Uid> = r
+        .ids
+        .types
+        .iter()
+        .map(|(u, n)| (n.clone(), u.clone()))
+        .collect();
+
+    let mut appeared: BTreeSet<pbps_model::TypeRef> = declared_names
+        .iter()
+        .filter(|n| !known.contains_key(**n))
+        .map(|n| (*n).clone())
+        .collect();
+    let mut disappeared: BTreeSet<pbps_model::TypeRef> = known
+        .keys()
+        .filter(|n| !declared_names.contains(n))
+        .cloned()
+        .collect();
+
+    let claims: Vec<Claim<'_, &pbps_model::TypeRef>> = intents
+        .iter()
+        .filter_map(|intent| {
+            let Intent::RenameType { from, to } = intent else {
+                return None;
+            };
+            (disappeared.contains(from) && appeared.contains(to)).then_some(Claim {
+                intent,
+                source: from,
+                target: to,
+            })
+        })
+        .collect();
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims, |n| n.raw().to_string());
+    blockers.extend(rename_blockers);
+
+    // A target that is already known and still declared is not in `appeared`,
+    // so this rename cannot match. Report that specific collision before the
+    // matching loop and leave `from` in `disappeared`; a companion drop intent
+    // must still be able to account for the source. Only a leading annotation
+    // may defer to another matchable claim for that source; an appended current
+    // decision must be judged on its own, or the annotation's match can make a
+    // different command report success. A leading annotation paired with a
+    // drop is stale provenance. Account for these recognized annotations here,
+    // since the final absorption check describes the input identities. Deduplicate
+    // by target so two statements against one occupied name describe one
+    // collision rather than repeating the same diagnosis.
+    let mut occupied_targets = BTreeSet::new();
+    for (i, intent) in intents.iter().enumerate() {
+        let Intent::RenameType { from, to } = intent else {
+            continue;
+        };
+        let current_decision = i >= annotation_count;
+        let stale_annotation = i < annotation_count
+            && intents.iter().any(
+                |candidate| matches!(candidate, Intent::DropType { name, .. } if name == from),
+            );
+        if disappeared.contains(from) && declared_names.contains(&to) && known.contains_key(to) {
+            if (current_decision || !claims.iter().any(|claim| claim.source == from))
+                && !stale_annotation
+                && occupied_targets.insert(to.clone())
+            {
+                blockers.push(Blocker::RenameTargetExists {
+                    target: to.raw().to_string(),
+                });
+            }
+            used.insert(i);
+        }
+    }
+
+    // Raised, and then everything below runs as it always did. Returning here
+    // was the obvious move and the wrong one: the loop's decision is discarded
+    // anyway — `resolve` throws `r` away when it returns `Err` — while
+    // returning early strands every *other* intent of this kind unmatched, and
+    // the sweep at the end then calls a perfectly good annotation a likely
+    // typo. The contenders are already marked used, which is what the sweep
+    // has to be told; the bystanders match their way to the same place.
+    for (i, intent) in intents.iter().enumerate() {
+        if let Intent::RenameType { from, to } = intent
+            && disappeared.contains(from)
+            && appeared.contains(to)
+        {
+            disappeared.remove(from);
+            appeared.remove(to);
+            let uid = known[from].clone();
+            r.ids.types.insert(uid.clone(), to.clone());
+            r.renamed_types.push((uid, from.clone(), to.clone()));
+            used.insert(i);
+        }
+    }
+
+    for (i, intent) in intents.iter().enumerate() {
+        if let Intent::DropType { name, reason } = intent
+            && disappeared.remove(name)
+        {
+            let uid = known[name].clone();
+            r.ids.types.remove(&uid);
+            r.ids.tombstones.insert(
+                uid.clone(),
+                Tombstone {
+                    was: name.raw().to_string(),
+                    dropped_at: ctx.today.clone(),
+                    reason: reason.to_string(),
+                    operator: ctx.operator.clone(),
+                },
+            );
+            r.dropped_types.push((uid, name.clone()));
+            used.insert(i);
+        }
+    }
+
+    // The conflict already accounts for these sources. Offering the losing
+    // source again would make ambiguity candidates depend on intent order.
+    disappeared.retain(|role| !conflicting.sources.contains(&role.raw().to_string()));
+    let candidates: Vec<_> = appeared
+        .iter()
+        .filter(|role| !conflicting.targets.contains(&role.raw().to_string()))
+        .cloned()
+        .collect();
+    if !candidates.is_empty() && !disappeared.is_empty() {
+        blockers.push(Blocker::AmbiguousTypes {
+            disappeared: disappeared.into_iter().collect(),
+            appeared: candidates,
+        });
+        return;
+    }
+
+    for name in disappeared {
+        blockers.push(Blocker::DropTypeNeedsReason { name });
+    }
+
+    for name in appeared {
+        let uid = fresh_uid(&r.ids, UidKind::Type);
+        r.ids.types.insert(uid.clone(), name.clone());
+        r.created_types.push((uid, name));
+    }
+}
+
 fn resolve_roles(
     declared: &Schema,
     intents: &[Intent],
@@ -1795,9 +1982,12 @@ mod tests {
                 unrepresentable: Some(why.into()),
             }]
         );
-        // File-based planning still reaches the differ's single retained-uid
-        // lifecycle refusal instead of adding a second diagnosis here.
-        assert_eq!(resolve(&declared, &ids, &[], &ctx()).unwrap().ids, ids);
+        // A declaration removed from a file is now a gated lifecycle drop;
+        // pull still refuses an absent catalog object without inventing intent.
+        assert_eq!(
+            resolve(&declared, &ids, &[], &ctx()).unwrap_err(),
+            vec![Blocker::DropTypeNeedsReason { name: name.clone() }]
+        );
         declared.types.insert(
             name.clone(),
             ManagedType::Enum {

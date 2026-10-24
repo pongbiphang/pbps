@@ -20,6 +20,12 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 // (DEC-2084.1); only their embedded command arguments stay raw.
 pub fn intent(i: &Intent) -> String {
     match i {
+        Intent::RenameType { from, to } => {
+            format!("rename type {} -> {}", from.shown(), to.shown())
+        }
+        Intent::DropType { name, reason } => {
+            format!("drop type {} (reason: {reason})", name.shown())
+        }
         Intent::RenameTable { from, to } => format!(
             "rename table {from} -> {to}",
             from = from.shown(),
@@ -100,6 +106,8 @@ pub fn blocker_findings(list: &[Blocker]) -> Vec<crate::output::Finding> {
 
 fn decision_count(blocker: &Blocker) -> Option<usize> {
     match blocker {
+        Blocker::AmbiguousTypes { disappeared, .. } => Some(disappeared.len()),
+        Blocker::DropTypeNeedsReason { .. } => Some(1),
         Blocker::AmbiguousColumns { disappeared, .. } => Some(disappeared.len()),
         Blocker::AmbiguousRoles { disappeared, .. } => Some(disappeared.len()),
         Blocker::AmbiguousTables { disappeared, .. } => Some(disappeared.len()),
@@ -127,6 +135,18 @@ fn pair_flag(flag: &str, first: &str, second: &str, second_name: &str) -> String
 
 fn supplied_flag(intent: &Intent) -> Option<String> {
     Some(match intent {
+        Intent::RenameType { from, to } => pair_flag(
+            "--rename-type",
+            &from.raw().to_string(),
+            &to.raw().to_string(),
+            "new",
+        ),
+        Intent::DropType { name, reason } => pair_flag(
+            "--drop-type",
+            &name.raw().to_string(),
+            reason.as_ref(),
+            "why",
+        ),
         Intent::RenameColumn { table, from, to } => pair_flag(
             "--rename",
             &format!(
@@ -215,6 +235,25 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         ));
     };
     match blocker {
+        Blocker::AmbiguousTypes {
+            disappeared,
+            appeared,
+        } => {
+            for from in disappeared {
+                alternatives(
+                    "--rename-type",
+                    "--drop-type",
+                    &from.raw().to_string(),
+                    appeared.iter().map(|n| n.raw().to_string()).collect(),
+                );
+            }
+        }
+        Blocker::DropTypeNeedsReason { name } => fixed.push(pair_flag(
+            "--drop-type",
+            &name.raw().to_string(),
+            "<why>",
+            "why",
+        )),
         Blocker::AmbiguousColumns {
             table,
             disappeared,
@@ -573,6 +612,8 @@ mod batch_tests {
 pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
     fn id(b: &Blocker) -> &'static str {
         match b {
+            Blocker::AmbiguousTypes { .. } => "identity.ambiguous-types",
+            Blocker::DropTypeNeedsReason { .. } => "identity.drop-type-needs-reason",
             Blocker::ProvisionalTableIdentity { blocker, .. } => id(blocker),
             Blocker::AmbiguousColumns { .. } => "identity.ambiguous-columns",
             Blocker::AmbiguousTables { .. } => "identity.ambiguous-tables",
@@ -606,6 +647,27 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
 fn one_blocker(b: &Blocker) -> String {
     let why = placeholder("why");
     match b {
+        Blocker::AmbiguousTypes {
+            disappeared,
+            appeared,
+        } => format!(
+            "  types {} disappeared; {} are new. Record a rename with renamed_from or pbps intent --rename-type, or supply pbps intent --drop-type <type> <reason>.\n",
+            disappeared
+                .iter()
+                .map(|n| n.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            appeared
+                .iter()
+                .map(|n| n.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Blocker::DropTypeNeedsReason { name } => format!(
+            "  type {} disappeared; record its reason with pbps intent --drop-type {} <reason>\n",
+            name.shown(),
+            name.shown()
+        ),
         Blocker::MissingType {
             name,
             unrepresentable,
@@ -615,8 +677,8 @@ fn one_blocker(b: &Blocker) -> String {
                 None => "is absent from the pulled schema".into(),
             };
             format!(
-                "  type `{name}` {why}; its identity remains recorded; type lifecycle \
-                 arrives in later slices of #1635, so pull cannot record a drop\n",
+                "  type `{name}` {why}; its identity remains recorded; \
+                 pull cannot record a drop without explicit human intent\n",
                 name = name.shown()
             )
         }
@@ -894,6 +956,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
+        Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1264,6 +1327,15 @@ pub fn describe(c: &Change) -> String {
                 "pending blocking rewrite: {operation} for {} (unavailable)",
                 c.subject()
             )
+        }
+        Change::CreateType {
+            name, definition, ..
+        } => format!("+ create {} {}", definition.kind(), name.raw()),
+        Change::DropType {
+            name, definition, ..
+        } => format!("- drop {} {}", definition.kind(), name.raw()),
+        Change::RenameType { from, to, .. } => {
+            format!("~ rename type {} -> {}", from.raw(), to.raw())
         }
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -2721,11 +2793,7 @@ mod tests {
             let finding = blocker_finding(&blocker);
             assert_eq!(finding.id, "identity.missing-type");
             assert!(finding.message.contains("app.mood"), "{finding:?}");
-            assert!(
-                finding
-                    .message
-                    .contains("type lifecycle arrives in later slices of #1635")
-            );
+            assert!(finding.message.contains("pull cannot record a drop"));
             assert_eq!(finding.message.contains("is absent"), detail.is_none());
             assert_eq!(
                 finding.message.contains("is unrepresentable"),

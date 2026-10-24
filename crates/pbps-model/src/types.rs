@@ -479,6 +479,9 @@ impl<'de> serde::Deserialize<'de> for TypeRef {
 pub struct CollationName(TypeRef);
 
 impl CollationName {
+    pub fn schema(&self) -> &str {
+        self.0.schema()
+    }
     pub fn name(&self) -> &str {
         self.0.name()
     }

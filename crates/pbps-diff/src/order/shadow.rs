@@ -406,31 +406,32 @@ pub(crate) fn judge_slots(
     use super::slots::{SlotViolation, analyse, verify};
     let slots = analyse(ops, owners, before, dialect);
     let (violations, skipped) = verify(ops, &slots, dialect, facts, owners, before);
-    // The class order has not visited after_the_rebuilds yet. Record only
-    // the companion-slot handovers that pass owns as pending here; its
-    // output and the final order must satisfy them (DEC-2100.1).
+    // The class order has not visited after_the_rebuilds yet. Type and
+    // constraint-trigger handovers join that existing slot settlement;
+    // every subsequent replay must satisfy them (DEC-1635.3, DEC-2100.1).
     let pending: Vec<_> = if stage == Stage::BeforeSchedule {
         super::slots::edges(&slots, None, &[])
             .into_iter()
             .filter(|e| {
-                matches!(
-                    ops[e.before].change(),
-                    pbps_model::Change::AlterModule {
-                        id: pbps_model::ModuleId::Trigger { .. },
-                        ..
-                    } | pbps_model::Change::DropModule {
-                        id: pbps_model::ModuleId::Trigger { .. },
-                        ..
-                    }
-                ) && matches!(
-                    ops[e.after].change(),
-                    pbps_model::Change::AddCheck { .. }
-                        | pbps_model::Change::AddForeignKey { .. }
-                        | pbps_model::Change::AddUnique { .. }
-                        | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
-                        | pbps_model::Change::CreateTable { .. }
-                        | pbps_model::Change::AttachPartition { .. }
-                )
+                matches!(e.slot.namespace, pbps_dialect::slots::Namespace::Types(_))
+                    || (matches!(
+                        ops[e.before].change(),
+                        pbps_model::Change::AlterModule {
+                            id: pbps_model::ModuleId::Trigger { .. },
+                            ..
+                        } | pbps_model::Change::DropModule {
+                            id: pbps_model::ModuleId::Trigger { .. },
+                            ..
+                        }
+                    ) && matches!(
+                        ops[e.after].change(),
+                        pbps_model::Change::AddCheck { .. }
+                            | pbps_model::Change::AddForeignKey { .. }
+                            | pbps_model::Change::AddUnique { .. }
+                            | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
+                            | pbps_model::Change::CreateTable { .. }
+                            | pbps_model::Change::AttachPartition { .. }
+                    ))
             })
             .collect()
     } else {
@@ -449,7 +450,13 @@ pub(crate) fn judge_slots(
         } => pending.iter().any(|e| {
             ops[e.before].id() == *before && ops[e.after].id() == *after && e.slot == *slot
         }),
-        SlotViolation::Contested { .. } | SlotViolation::IntermediateHeld { .. } => false,
+        SlotViolation::Contested { .. } => false,
+        // Even a true collision belongs to the scheduled refusal, so the
+        // differ can return its logical input without a debug-only panic.
+        SlotViolation::IntermediateHeld { slot, .. } => {
+            stage == Stage::BeforeSchedule
+                && matches!(slot.namespace, pbps_dialect::slots::Namespace::Types(_))
+        }
     };
     let name = |id: OperationId| {
         ops.iter().find(|o| o.id() == id).map_or_else(

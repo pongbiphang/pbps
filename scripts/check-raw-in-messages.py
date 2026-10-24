@@ -179,7 +179,7 @@ ALLOWED = {
     # adapters and fixture builders are counted too, so a new raw message in
     # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        70,
+        74,
         "Canonical shell arguments and describe() names stay raw: the latter is "
         "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",

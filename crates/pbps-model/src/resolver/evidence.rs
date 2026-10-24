@@ -319,6 +319,9 @@ impl ResolverEvidence {
                     Change::Grant { .. }
                         | Change::Revoke { .. }
                         | Change::PublicExecution { .. }
+                        | Change::CreateType { .. }
+                        | Change::DropType { .. }
+                        | Change::RenameType { .. }
                         | Change::CreateRole { .. }
                         | Change::RenameRole { .. }
                         | Change::DropRole { .. }

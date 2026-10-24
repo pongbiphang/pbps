@@ -2961,6 +2961,14 @@ fn names_column(
 /// that names no table is held to anything.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn touches(change: &Change, table: &TableName) -> bool {
+    // A shared type has its own identity. Treating its table-less change as
+    // touching every table reverses a type-to-table slot handover.
+    if matches!(
+        change,
+        Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. }
+    ) {
+        return false;
+    }
     if crate::order::generated::needs_complete(change, table) {
         return true;
     }

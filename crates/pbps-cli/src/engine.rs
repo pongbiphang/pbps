@@ -811,6 +811,8 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// object's holder away (#1767, DEC-1957.2). What it read is returned, for
 /// [`NameFacts::order_and_refuse`] again once the module passes, which may
 /// plan the revision afresh in the differ's order, have run.
+/// Type occupants are retained here and refused only by that settled replay.
+#[allow(clippy::wildcard_enum_match_arm)] // Only type creators/renames add pg_type queries.
 pub async fn refuse_created_name_occupants<S: Clone>(
     conn: &mut Conn,
     cs: &mut PlanningPlan<S>,
@@ -878,12 +880,40 @@ pub async fn refuse_created_name_occupants<S: Clone>(
                     .filter(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
                     .flat_map(|p| crate::deploy::relation_names_created(&p.change)),
             );
+            let mut type_names = asked.clone();
+            type_names.extend(cs.changes.iter().flat_map(|p| match &p.change {
+                pbps_model::Change::CreateType { name, .. } => {
+                    vec![TableName::new(name.schema(), name.name())]
+                }
+                pbps_model::Change::RenameType { from, to, .. } => vec![
+                    TableName::new(to.schema(), to.name()),
+                    TableName::new(to.schema(), from.name()),
+                ],
+                _ => Vec::new(),
+            }));
+            let type_occupants = pbps_pg::catalog::type_names_at(conn, &type_names)
+                .await?
+                .into_iter()
+                .filter(|name| {
+                    !plan.base.schema.tables.contains_key(name)
+                        && !plan.base.schema.modules.iter().any(|(id, m)| {
+                            m.kind == pbps_model::ModuleKind::View && id.object_name() == *name
+                        })
+                        && !plan
+                            .base
+                            .schema
+                            .types
+                            .keys()
+                            .any(|t| t.schema() == name.schema && t.name() == name.name)
+                })
+                .collect();
             let facts = NameFacts {
+                type_occupants,
                 relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
                 occupants,
                 detach_releases,
             };
-            facts.order_and_refuse(cs, label, plan)?;
+            facts.order_relations_and_refuse(cs, label, plan)?;
             Ok(Some(facts))
         }
         Driver::Mssql => Ok(None),
@@ -894,6 +924,7 @@ pub async fn refuse_created_name_occupants<S: Clone>(
 /// name occupants the plan's names and moves meet, and the tables and views
 /// at the carried names.
 pub struct NameFacts {
+    type_occupants: Vec<TableName>,
     occupants: Vec<pbps_pg::catalog::NameOccupant>,
     relations: Vec<(TableName, &'static str)>,
     detach_releases: std::collections::BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid>,
@@ -913,6 +944,51 @@ impl NameFacts {
     /// holders away, by the plan's name handovers (#1767, #1957,
     /// DEC-1957.2), then refuses what is left (#951, #1749, #1765).
     pub fn order_and_refuse<S: Clone>(
+        &self,
+        cs: &mut PlanningPlan<S>,
+        label: &str,
+        plan: Planned<'_>,
+    ) -> anyhow::Result<()> {
+        self.order_relations_and_refuse(cs, label, plan)?;
+        let slots = self.slots();
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, plan.desired.ids)?;
+        let owners = pbps_model::operation::PlanOwners::new(names, plan.base.ids, plan.desired.ids);
+        let operations = pbps_model::operation::Operations::of_plan(
+            &cs.changes,
+            pbps_model::operation::ModuleEdits::Rebuilt,
+        );
+        let before = pbps_model::operation::Snapshot {
+            schema: plan.base.schema,
+            ids: plan.base.ids,
+        };
+        let effects =
+            pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, plan.dialect);
+        for violation in pbps_diff::order::slots::verify(
+            operations.as_slice(),
+            &effects,
+            plan.dialect,
+            Some(&slots),
+            &owners,
+            before,
+        )
+        .0
+        {
+            if let pbps_diff::order::slots::SlotViolation::Contested { slot, .. }
+            | pbps_diff::order::slots::SlotViolation::IntermediateHeld { slot, .. } = violation
+                && matches!(slot.namespace, pbps_dialect::slots::Namespace::Types(_))
+            {
+                anyhow::bail!(
+                    "pg_type name `{}` is already occupied; rename the declaration or release its holder in the plan",
+                    pbps_model::escape::Escaped(&slot.to_string())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // Catalog reads precede shared scheduling. Only the historical relation
+    // pass runs there; Types claims are judged by order_and_refuse afterwards.
+    fn order_relations_and_refuse<S: Clone>(
         &self,
         cs: &mut PlanningPlan<S>,
         label: &str,
@@ -939,8 +1015,91 @@ impl NameFacts {
     /// The occupants as name slots, for the slot replay (#1964, DEC-1964.2).
     pub fn slots(&self) -> pbps_dialect::slots::CatalogFacts {
         let mut slots = crate::deploy::occupant_slots(&self.occupants);
+        slots
+            .occupants
+            .extend(
+                self.type_occupants
+                    .iter()
+                    .map(|name| pbps_dialect::slots::Occupant {
+                        slot: pbps_dialect::slots::SlotKey {
+                            namespace: pbps_dialect::slots::Namespace::Types(name.schema.clone()),
+                            name: name.name.clone(),
+                        },
+                        kind: "type".to_owned(),
+                        owner: None,
+                        column: None,
+                    }),
+            );
         slots.detach_releases.clone_from(&self.detach_releases);
         slots
+    }
+}
+
+#[cfg(test)]
+mod type_slot_tests {
+    use super::*;
+
+    #[test]
+    fn a_type_move_refuses_an_undeclared_intermediate_catalog_holder_by_name() {
+        use pbps_model::{Change, ChangeSet, IdsFile, ManagedType, PlannedChange, Schema};
+        let from: pbps_model::TypeRef = "app.a".parse().unwrap();
+        let to: pbps_model::TypeRef = "dst.b".parse().unwrap();
+        let uid: pbps_model::Uid = "y_000001".parse().unwrap();
+        let definition = ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let base = Schema {
+            types: [(from.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let desired = Schema {
+            types: [(to.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        let base_ids = IdsFile {
+            types: [(uid.clone(), from.clone())].into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: [(uid.clone(), to.clone())].into(),
+            ..Default::default()
+        };
+        let dialect = pbps_pg::Postgres::new();
+        let plan = Planned {
+            base: pbps_diff::Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            desired: pbps_diff::Side {
+                schema: &desired,
+                ids: &ids,
+            },
+            dialect: &dialect,
+        };
+        let mut cs = pbps_diff::order::propose(ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameType {
+                uid,
+                from,
+                to,
+                definition: Box::new(definition),
+            })],
+        });
+        let mut facts = NameFacts {
+            type_occupants: vec![TableName::new("dst", "a")],
+            occupants: vec![],
+            relations: vec![],
+            detach_releases: Default::default(),
+        };
+        let error = facts
+            .order_and_refuse(&mut cs, "target", plan)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "pg_type name `dst.a (type)` is already occupied; rename the declaration or release its holder in the plan"
+        );
+        facts.type_occupants.clear();
+        facts.order_and_refuse(&mut cs, "target", plan).unwrap();
     }
 }
 
@@ -2332,6 +2491,9 @@ fn after_the_alterations(change: &pbps_model::Change) -> bool {
             | pbps_model::Change::AddIndex { .. }
             | pbps_model::Change::CreateModule { .. }
             | pbps_model::Change::AlterModule { .. }
+            | pbps_model::Change::CreateType { .. }
+            | pbps_model::Change::DropType { .. }
+            | pbps_model::Change::RenameType { .. }
             | pbps_model::Change::CreateRole { .. }
             | pbps_model::Change::Grant { .. }
             | pbps_model::Change::PublicExecution { .. }
@@ -5864,6 +6026,8 @@ pub async fn check_type_pins(
             .type_pins
             .iter()
             .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
+            && !pbps_pg::type_refs::declared::names(&plan.declared_type_pins).contains(reference)
+            && !pbps_pg::type_refs::managed_names(&[], &plan.changes).contains(reference)
         {
             anyhow::bail!(
                 "plan has no type pin for `{reference}`; plan again against the database",
@@ -5879,7 +6043,14 @@ pub async fn check_type_pins(
                 pbps_pg::pins::Within::OwnTransaction
             };
             pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
-            pbps_pg::type_refs::check(conn, within, &plan.type_pins, &plan.changes).await?;
+            pbps_pg::type_refs::check(
+                conn,
+                within,
+                &plan.type_pins,
+                &plan.declared_type_pins,
+                &plan.changes,
+            )
+            .await?;
         }
         Driver::Mssql if plan.type_pins.is_empty() && trusted.is_empty() => {}
         Driver::Mssql => {
@@ -5939,7 +6110,7 @@ pub async fn recheck_type_prerequisites(
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
-            pbps_pg::type_refs::check(conn, within, expected, changes).await?;
+            pbps_pg::type_refs::check(conn, within, expected, &[], changes).await?;
             type_input_routines(conn, expected, trusted, false, inside).await?;
         }
         Driver::Mssql if expected.is_empty() => {}

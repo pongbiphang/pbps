@@ -119,9 +119,22 @@ pub fn analyse(
                 Ok(lowered) => {
                     fx.intermediate = lowered
                         .into_iter()
-                        .filter_map(|t| table_slot(dialect, &t))
+                        .flat_map(|t| table_slots(dialect, &t))
                         .collect();
                 }
+                Err(_) => out.unlowered.push(op.id()),
+            }
+        }
+        if let Change::RenameType { from, to, .. } = op.change()
+            && from.schema() != to.schema()
+        {
+            match dialect.intermediate_types(op.change(), op.planned().strategy) {
+                Ok(names) => fx
+                    .intermediate
+                    .extend(names.into_iter().map(|name| SlotKey {
+                        namespace: pbps_dialect::slots::Namespace::Types(name.schema().to_owned()),
+                        name: name.name().to_owned(),
+                    })),
                 Err(_) => out.unlowered.push(op.id()),
             }
         }
@@ -146,8 +159,8 @@ pub fn analyse(
     out
 }
 
-fn table_slot(dialect: &(impl Dialect + ?Sized), table: &TableName) -> Option<SlotKey> {
-    // A table's name is one slot in its schema.
+fn table_slots(dialect: &(impl Dialect + ?Sized), table: &TableName) -> Vec<SlotKey> {
+    // PostgreSQL tables also hold their row-type name during a schema move.
     slots_of(
         dialect,
         &pbps_model::operation::Address {
@@ -158,8 +171,6 @@ fn table_slot(dialect: &(impl Dialect + ?Sized), table: &TableName) -> Option<Sl
             signature: None,
         },
     )
-    .into_iter()
-    .next()
 }
 
 /// An edge a name's handover implies: `before` gives the name up, `after`
@@ -847,7 +858,8 @@ fn leaves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
 fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
     match key {
         ObjectKey::Column(c) | ObjectKey::Default(c) => Some(c),
-        ObjectKey::Table(_)
+        ObjectKey::Type(_)
+        | ObjectKey::Table(_)
         | ObjectKey::Role(_)
         | ObjectKey::Module(_)
         | ObjectKey::NotNull(_)

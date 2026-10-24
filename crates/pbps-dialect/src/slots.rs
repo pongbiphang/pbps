@@ -30,6 +30,8 @@ use crate::Dialect;
 pub enum Namespace {
     /// A schema's objects that share one namespace with its tables.
     Relations(String),
+    /// Declared types and relations with row types; indexes and sequences do not occupy it.
+    Types(String),
     /// A schema's routines, where they do not share the tables' namespace.
     Routines(String),
     /// One table's names of one kind, by the table's identity: a table keeps
@@ -60,6 +62,7 @@ impl std::fmt::Display for SlotKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.namespace {
             Namespace::Relations(schema) => write!(f, "{schema}.{}", self.name),
+            Namespace::Types(schema) => write!(f, "{schema}.{} (type)", self.name),
             Namespace::Routines(schema) => write!(f, "{schema}.{} (routine)", self.name),
             Namespace::Table(table, space) => write!(f, "{} ({space:?}) on {table:?}", self.name),
             Namespace::Roles => write!(f, "role {}", self.name),
@@ -389,6 +392,13 @@ pub fn slots(dialect: &(impl Dialect + ?Sized), address: &Address) -> Vec<SlotKe
     };
     let mut name = address.name.clone();
     let mut namespaces = match address.kind {
+        NameKind::Type => vec![Namespace::Types(address.schema.clone())],
+        NameKind::Table if dialect.relations_have_row_types() => {
+            vec![schema(), Namespace::Types(address.schema.clone())]
+        }
+        NameKind::Module(ModuleKind::View) if dialect.relations_have_row_types() => {
+            vec![schema(), Namespace::Types(address.schema.clone())]
+        }
         NameKind::Table => vec![schema()],
         NameKind::Module(kind) if dialect.shares_namespace_with_tables(kind) => vec![schema()],
         NameKind::Module(ModuleKind::Trigger) => vec![table(TableSpace::Triggers)],

@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 55;
+pub const SCHEMA_VERSION: u32 = 56;
+// 56: declared type rename annotations and deferred domain vetting (#1635 slice two).
 // 55: SQL Server same_instance configuration and explain provenance (#2270).
 // 54: declared enum and domain files (#1635 slice one).
 // 27: a table's `unlogged:` (issue #1443).

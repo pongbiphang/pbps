@@ -137,7 +137,8 @@ use crate::schema::Schema;
 /// Version 29 admits existing user-type references (DEC-1523.2).
 /// Version 30 records declared enums and domains (DEC-1635.1).
 /// Version 31 records opaque baseline-only catalog evidence (DEC-2179.1).
-pub const CURRENT_VERSION: u32 = 31;
+/// Version 32 records authored domain expressions beside catalog definitions (DEC-1635.4).
+pub const CURRENT_VERSION: u32 = 32;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -623,7 +624,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 31);
+        assert_eq!(CURRENT_VERSION, 32);
     }
 
     fn schema_with(ty: &str) -> Schema {
@@ -944,6 +945,55 @@ mod tests {
         ))
         .unwrap();
         assert!(newer.check_version().unwrap_err().contains("newer pbps"));
+    }
+
+    #[test]
+    fn a_version_30_state_keeps_catalog_domain_text_without_a_declaration_record() {
+        let name: crate::TypeRef = "app.choice".parse().unwrap();
+        let schema = Schema {
+            types: [(
+                name,
+                crate::ManagedType::Domain {
+                    base: "text".parse().unwrap(),
+                    not_null: false,
+                    default: Some("'a'::text".into()),
+                    checks: [(
+                        "allowed".into(),
+                        "(VALUE = ANY (ARRAY['a'::text, 'b'::text]))".into(),
+                    )]
+                    .into(),
+                    collation: None,
+                },
+            )]
+            .into(),
+            ..Schema::default()
+        };
+        let mut snapshot = StateSnapshot::new(
+            StateKind::Apply,
+            schema.clone(),
+            IdsFile::default(),
+            "tester",
+        );
+        snapshot.version = 30;
+        // Version 30 can have table provenance, but cannot have domain provenance.
+        snapshot
+            .declared
+            .expressions
+            .defaults
+            .insert("app.t".parse().unwrap(), [("v".into(), "0".into())].into());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["declared"].get("types").is_none());
+        let read = StateSnapshot::read_json(&json.to_string()).unwrap();
+        assert!(read.declared.types.is_empty());
+        assert_eq!(read.declared.overlay(&read.schema), schema);
+        assert_eq!(read, snapshot);
+
+        snapshot.version = CURRENT_VERSION;
+        snapshot.declared = Declared::from_schema(&schema);
+        let round_trip =
+            StateSnapshot::read_json(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(round_trip, snapshot);
+        assert!(!round_trip.declared.types.is_empty());
     }
 
     #[test]

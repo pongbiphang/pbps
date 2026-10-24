@@ -2667,12 +2667,9 @@ the tables. Pull preserves existing type identities across recreation. Type
 files use the same encoding and pre-write case-collision refusal as other
 declarations (DECISIONS 135); diagnostics retain both original file spellings.
 
-The approved declared-domain owner-trust exemption is deferred for this slice.
-The potential-path gate and reviewed routine pins now span planning, bootstrap,
-apply, staged execution and resume (DEC-2181.1–4); changing only plan-time trust
-would grant an exemption replay does not share. Declaration alone changes none
-of today's eligibility, ownership, pin or routine-review rules. External
-references retain the same rules as before.
+Declared definitions now supply checksum-pinned evidence across plan, apply,
+staged execution, resume and bootstrap, with bound domain code vetted inside
+the applying transaction; see DEC-1635.4. External reference rules are unchanged.
 
 Tests: `declared_types_round_trip_ordered_labels_and_verbatim_domain_text`,
 `invalid_type_shapes_and_duplicate_labels_are_refused`,
@@ -2711,7 +2708,7 @@ can compare a git/file baseline, but cannot obtain live proof; a declared type
 absent from that baseline is refused, and reference prerequisite restrictions
 remain unchanged.
 
-Tests: `every_type_lifecycle_difference_refuses_a_plan_by_name` covers enum
+Tests in slice one: `every_type_lifecycle_difference_refuses_a_plan_by_name` covered enum
 addition, removal, reorder and rename, domain base, collation, NOT NULL,
 default and named-check differences, kind replacement, missing and removed
 definitions, and equal-definition negatives.
@@ -2722,3 +2719,135 @@ after both the declaration and live definition have disappeared.
 pull/recreate/re-pull, equal plans, first-time type adoption through an
 unrelated staged column change, and each refusal through the CLI on 16 and
 18, requiring that no rejected plan artifact is written.
+
+Lifecycle refusals are superseded by DEC-1635.3. The retained attribute refusals
+are now pinned by `type_attribute_changes_remain_refused_by_name` and
+`pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql`.
+
+
+<a id="dec-1635-3"></a>
+
+**DEC-1635.3. Whole declared types use uid identity, ordinary drop intent and two overlapping PostgreSQL name namespaces.**
+CreateType creates an enum or domain, DropType removes it without CASCADE, and
+RenameType preserves the uid and dependent columns, including SET SCHEMA before
+RENAME. Explicit annotations or recorded intent supply identity. Formatting
+retains a pending renamed_from annotation and strips it only after identity
+absorption, as for tables and roles. A type drop
+requires the same nonblank reason, tombstone and destructive risk approval as a
+table drop. Swaps refuse by name. Existing enum label, domain attribute, base
+and collation differences still refuse by name with their slice 3/4 boundary.
+An unrecorded, undeclared type remains unmanaged. Offline git/file comparison
+can preview lifecycle changes and mint identities, but has no target evidence
+and cannot make an applicable plan.
+
+Measured on PostgreSQL 16.15 and 18.6, `pg_class.reltype <> 0` is:
+
+| relkind | row type |
+|---|---|
+| table r, partitioned table p, view v, materialized view m, composite c | yes |
+| index i, sequence S | no |
+
+CREATE TYPE beside a same-named index or sequence succeeds; beside a table it
+fails. Therefore a type cannot share Relations(schema), which already contains
+indexes and sequences. A new Types(schema) slot holds declared types; tables
+and views hold both slots, while indexes/sequences hold only Relations.
+Catalog composites occupy Types. Live pg_type occupants are checked even when
+pg_class has no counterpart; generated array names retain #1503's behavior.
+The existing slot machinery orders release/claim handovers, including a dropped
+table followed by a same-named type, and checks intermediate move names.
+
+Creation is class 7 before tables, ranked by domain-base depth. Rename is
+class 1 with domain-base depth rank; drop is class 18 after defaults, checks and modules, ranked by reverse
+baseline domain-base depth so dependent domains disappear first. Typed columns and
+domains require their declared type's final incarnation. Drops require the
+last dependent table/column/domain to disappear, or the column's final retype.
+Those effects and name-slot edges join the existing schedule and shadow
+verifier. Type handovers join after_the_rebuilds, including a class-18 type drop
+before a class-7 table; type changes do not inherit the old table-less blanket
+dependency on every table. No new ordering pass is introduced. ORDERING.md
+records all pairs.
+
+Tests: `type_identity_drives_creation_removal_and_rename_while_swaps_refuse`,
+`fmt_keeps_a_pending_type_rename_and_removes_only_absorbed_intent`,
+`a_created_type_precedes_its_table_in_the_schedule_and_shadow_verifier`,
+`a_dropped_type_follows_its_last_table_in_the_schedule_and_shadow_verifier`,
+`domain_bases_are_created_first_and_dropped_last_even_when_names_sort_the_other_way`,
+`a_type_meets_table_and_view_row_types_but_not_indexes_or_sequences`,
+`a_table_to_type_handoff_is_an_existing_slot_edge_and_the_reverse_is_rejected`,
+`pg_type_names_refuse_row_types_and_admit_indexes_and_sequences_before_emission`,
+and `type_drops_follow_the_last_table_and_table_names_can_handoff_to_types`
+cover emission-independent names, both verifier orders and real 16/18 plans.
+
+<a id="dec-1635-4"></a>
+
+**DEC-1635.4. Declared definitions are approved evidence; a domain's bound code is vetted in its creating transaction.**
+A saved plan carries each desired type's uid and definition, and the actual
+before-definition/name when it exists. The checksum pins this evidence; rename
+follows the uid. External references keep DEC-2181's live OID/definition/routine
+pins and every existing negative case. Existing declared types keep the same
+owner rule, and a newly created type is naturally owned by the deployer; no
+owner-trust exception is added. Saved plan 49, state 32 (declared type expression
+provenance), and schema set 56 carry these additions.
+
+Plan seals declarations without creating scratch objects or scanning SQL for
+code. An enum executes no code. Human and JSON output explicitly defer domain
+checks/defaults to apply. Before statements, existing declarations must equal
+the recorded before-definition, and new names must be absent after any planned
+slot predecessor releases them. Right after each CREATE/ALTER, apply re-reads
+the live type in the same transaction. Enum labels and their order compare
+exactly. A domain's normalized base type, collation, NOT NULL and CHECK-name
+set compare exactly; the default and each check expression compare by presence,
+not text, following SPEC §7.6's read-back rule. The statement that ran is the
+checksum-pinned plan's text, and another session cannot replace this uncommitted
+creation. Security is checked on what was actually bound: the existing
+input-path reader vets conbin/typdefaultbin with its built-in-only decoder.
+The catalog's deparsed spelling is retained in snapshots and the original in
+Declared provenance, as for table expressions. Before-statement drift compares
+catalog evidence against the recorded catalog evidence, including expression
+text; expression presence is only the declared-versus-read-back comparison.
+
+Domain convergence follows decisions 207 and 208: `Declared.types`, keyed by
+qualified type name, retains the applied default and named CHECK texts.
+CreateType records its declaration, RenameType moves an existing record, and
+DropType forgets it. Rename never invents provenance for an adopted domain.
+Bootstrap records authored text; pull/baseline adopt the engine's text without
+claiming it was authored. `Declared::overlay` restores only expressions still
+present in the verified read-back before type differences are computed. It
+does not restore missing defaults/checks or overwrite base, collation, NOT NULL
+or names. Layout-only declaration edits remain differences (and domain edits
+still refuse until slice 4). The checksum compares unmodified catalog readings
+before overlay, so real CHECK/default drift cannot be hidden by provenance.
+State 31 adds this record to state 30; older readable states have no domain
+record and fall back to engine text, with no migration.
+
+The existing built-in-only decoder and owner check are reused, not copied.
+A domain calling a non-built-in function refuses at apply and rolls back the
+whole transaction, before dependent statements. This accepted limitation is
+explicit; scratch-based plan-time vetting belongs to #2309. Staged type DDL
+always opens a transaction and vets before commit; checkpoints record its uid
+and current name. Resume checks the checkpoint and re-vets the already-created
+type. Immediate bootstrap uses the same executor and trusted roles. Offline
+bootstrap SQL admits enums and code-free domains but retains DEC-2181.1's
+refusal for domains with checks/defaults, since there is no connection to vet
+their bound code. Slices 3/4 can reuse the statement metadata and declared pins.
+
+Tests: `declared_evidence_follows_the_uid_and_records_absence_without_a_catalog_pin`,
+`readback_expressions_compare_by_presence_while_structural_fields_compare_exactly`,
+`declared_type_bootstrap_scripts_admit_enums_and_refuse_unvetted_domain_code`,
+`staged_type_creation_vets_before_commit_and_resume_accepts_a_vetted_step`,
+and `declared_type_lifecycles_converge_and_vetting_is_atomic` pin checksum
+identity, missing versus existing evidence, full enum/domain/table creation,
+convergence, rename/data preservation, before-definition drift and transactional
+refusal on PostgreSQL 16/18. DEC-2181's external-reference tests retain their
+existing assertions.
+
+Tests: `domain_expression_records_follow_creation_rename_and_drop_without_adopting_text`,
+`domain_overlay_restores_only_existing_expressions_and_preserves_catalog_structure`,
+`a_version_30_state_keeps_catalog_domain_text_without_a_declaration_record`,
+`domain_expression_records_converge_without_masking_layout_changes_or_live_drift`,
+and `adopted_domains_and_older_states_keep_engine_expression_text` pin the
+declaration record, serialized round-trip and old-state fallback. On both
+PostgreSQL 16 and 18, handwritten `VALUE > 0`, `VALUE IN ('a','b')`, and default
+`'a'` converge after apply, layout changes remain differences, rename preserves
+the authored spelling, and hand-altered CHECKs refuse as drift. Disabling the
+domain overlay makes the convergence test fail before the next plan can seal.

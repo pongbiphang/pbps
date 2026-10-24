@@ -822,17 +822,50 @@ gate. Composite and range definitions and SQL Server alias definitions remain
 outside the managed model. Standalone composites continue to work by reference;
 ranges remain refused by the reference reader.
 
-Slice one of #1635 models and pulls these objects but emits no type DDL. Every
-creation, removal or definition difference refuses the plan by name, explaining
-that lifecycle support arrives in later slices (DEC-1635.2). An equal live type
-needs no operation. A live type outside the identities remains unmanaged under
-§8.2's policy. Offline planning can compare definitions supplied by a git/file
-baseline; it cannot prove a target's definition, and missing baseline types
-are refused. Existing offline reference eligibility restrictions remain.
-Declared domains retain the current external-type eligibility gate in this
-slice: declaration alone grants no owner-trust exemption. The approved trust
-rule needs coordinated plan, apply, staged, resume and prerequisite changes;
-that work is deferred rather than introducing a partial exemption.
+Declared enums and domains are created, dropped and renamed as whole objects
+(DEC-1635.3). A uid and explicit `renamed_from:` or recorded intent carry rename
+identity; names are never guessed. Cross-schema moves use SET SCHEMA followed
+by RENAME when needed. Swaps refuse by name. Drops require a recorded nonblank
+reason, a tombstone and destructive approval, like table drops, and follow the
+last dependent's removal or retype. Enum label changes require slice 3; domain
+check/default/NOT NULL changes require slice 4. Base and collation changes
+remain unsupported and refuse by name.
+
+Applied domain default and named CHECK texts are retained in the declaration
+record, as table expressions are (decisions 207/208, DEC-1635.4). After the
+catalog checksum has verified drift, this text overlays the existing domain
+expressions for diffing. Create records it, rename carries it, and drop removes
+it. A layout-only edit remains a declaration difference. Pull/baseline and
+older states without a record compare the engine's text. The catalog read-back
+itself is unchanged and remains the evidence for drift.
+
+PostgreSQL type names occupy `Types(schema)`. Tables (including partitioned
+tables), views and materialized views also hold this slot for their row type;
+standalone composites occupy it in the catalog. Indexes and sequences share
+only `Relations(schema)` and may have the same name as an enum/domain. A
+collision with either a declaration or live occupant refuses before emission,
+unless an earlier planned drop/rename hands the slot over. Existing name-slot
+edges order that handover; there is no extra reordering pass.
+
+A declared type's checksum-pinned evidence is its uid and desired definition,
+plus its actual before-definition when it already exists (DEC-1635.4). Planning
+reports that a domain's checks/default are vetted at apply. Right after its
+CREATE/ALTER, inside the same transaction and before dependents, apply re-reads
+its definition and vets its bound stored trees with the existing built-in-only
+input-path decoder. Enum labels/order and domain base/collation/NOT NULL/CHECK
+names compare exactly; rewritten default/check text compares by presence,
+following §7.6. Before-statement drift compares full catalog definitions. Failure rolls back the creating transaction. Staging never
+separates creation from vetting, and resume accepts committed, vetted steps.
+Existing declared types keep the existing owner-trust rule; created types are
+owned by the deployer. External references keep their existing pins and gate.
+`bootstrap --sql` admits declared enums, but refuses domains with checks/defaults
+because a script has no connection for this vetting.
+
+Offline planning compares supplied git/file definitions and now previews whole
+object changes and mints their identities. It supplies no live evidence or
+applicable saved plan; connected planning is still required for apply. An equal
+live type needs no operation. An unrecorded, undeclared live type remains under
+§8.2's unmanaged policy. External-reference offline restrictions remain.
 
 ## 5. The identity file (`schema.ids.json`)
 

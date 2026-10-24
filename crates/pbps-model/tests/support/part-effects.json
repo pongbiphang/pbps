@@ -662,6 +662,49 @@
     }
   },
   {
+    "name": "CreateType",
+    "change": {
+      "op": "create_type",
+      "uid": "y_aaaaaa",
+      "name": "app.mood",
+      "definition": {
+        "kind": "enum",
+        "values": [
+          "ok"
+        ]
+      }
+    }
+  },
+  {
+    "name": "DropType",
+    "change": {
+      "op": "drop_type",
+      "uid": "y_aaaaaa",
+      "name": "app.mood",
+      "definition": {
+        "kind": "enum",
+        "values": [
+          "ok"
+        ]
+      }
+    }
+  },
+  {
+    "name": "RenameType",
+    "change": {
+      "op": "rename_type",
+      "uid": "y_aaaaaa",
+      "from": "app.mood",
+      "to": "app.feeling",
+      "definition": {
+        "kind": "enum",
+        "values": [
+          "ok"
+        ]
+      }
+    }
+  },
+  {
     "name": "CreateRole",
     "change": {
       "op": "create_role",

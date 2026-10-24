@@ -83,6 +83,13 @@ impl<'a> Staged<'a> {
             *from = statement_from.clone();
             *to = statement_to.clone();
         }
+        if let [change] = changes.changes.as_mut_slice()
+            && let Change::RenameType { uid, to, .. } = &mut change.change
+            && let Some(emitted) = &statement.declared_type
+        {
+            ids.types.insert(uid.clone(), emitted.name.clone());
+            *to = emitted.name.clone();
+        }
         StatementPlan { changes, ids }
     }
 }
@@ -304,6 +311,79 @@ mod tests {
             )
             .expect_err("declared structure and already-recorded expression text stay held");
             assert!(format!("{error:#}").contains("index `ix`"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_type_schema_move_uses_the_emitted_uid_address_for_its_checkpoint() {
+        use crate::certified_fixture::FixtureEmission;
+        let uid = pbps_model::Uid::derived(pbps_model::UidKind::Type, "old", 0);
+        let definition = pbps_model::ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let from: pbps_model::TypeRef = "app.old".parse().unwrap();
+        let to: pbps_model::TypeRef = "archive.new".parse().unwrap();
+        let planned = changes(vec![Change::RenameType {
+            uid: uid.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            definition: Box::new(definition.clone()),
+        }]);
+        let mut baseline = schema(
+            &TableName::new("app", "t"),
+            Table {
+                columns: [("v".into(), Column::new("app.old[]".parse().unwrap()))].into(),
+                ..Default::default()
+            },
+        );
+        baseline.types.insert(from, definition.clone());
+        let mut ids = super::super::fixture_ids(&planned, &baseline);
+        ids.types.insert(uid.clone(), to);
+        let staged = Staged::new(Plan {
+            changes: &planned,
+            ids: &ids,
+        })
+        .unwrap();
+        let pg = pbps_pg::Postgres::new();
+        let statements = pg
+            .fixture_emit_staged(&planned.changes[0].change, planned.changes[0].strategy)
+            .unwrap();
+        assert_eq!(statements.len(), 2);
+        let mut before = baseline;
+        for (i, statement) in statements.iter().enumerate() {
+            let emitted = statement.declared_type.as_ref().unwrap();
+            let at_statement = staged.statement(statement);
+            assert_eq!(at_statement.ids.types[&uid], emitted.name);
+            let mut after = before.clone();
+            after.types.clear();
+            after.types.insert(emitted.name.clone(), definition.clone());
+            after.tables.values_mut().next().unwrap().columns["v"].ty =
+                pbps_model::ColumnType::reference(emitted.name.clone()).into_array();
+            let read = StagedRead::Checkpoint {
+                completed: i + 1,
+                total: statements.len(),
+            };
+            refuse_pinned_movement(
+                &pg,
+                at_statement.staged().read(read),
+                &before,
+                &after,
+                "test",
+            )
+            .unwrap();
+            let mut drift = after.clone();
+            drift.tables.values_mut().next().unwrap().columns["v"].ty = "text".parse().unwrap();
+            assert!(
+                refuse_pinned_movement(
+                    &pg,
+                    at_statement.staged().read(read),
+                    &before,
+                    &drift,
+                    "test"
+                )
+                .is_err()
+            );
+            before = after;
         }
     }
 

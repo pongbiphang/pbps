@@ -876,6 +876,9 @@ name = name.raw(),
         | Change::SetEnsureKeys { .. }
         // A permission change fails on nothing in the data; the engine refuses
         // an impossible grant inside the transaction.
+        | Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
         | Change::CreateRole { .. }
         | Change::DropRole { .. }
         | Change::RenameRole { .. }

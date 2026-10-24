@@ -157,6 +157,11 @@ impl Bindings {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Declared {
+    /// Applied type declarations, keyed by their current name. Only domain
+    /// expression text is overlaid; catalog structure and drift evidence remain
+    /// untouched (DECISIONS 207–208, DEC-1635.4).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<crate::TypeRef, crate::ManagedType>,
     /// Each managed module's definition as declared when it was last written
     /// (ADR-0009 §2.2). A module absent here was never written through this
     /// tool — adopted, or created by hand — and is compared by its read-back.
@@ -223,14 +228,20 @@ fn rekey_nested<K: Ord + Clone, V>(
 
 impl Declared {
     pub fn is_empty(&self) -> bool {
-        self.modules.is_empty() && self.expressions.is_empty() && self.bindings.is_empty()
+        self.types.is_empty()
+            && self.modules.is_empty()
+            && self.expressions.is_empty()
+            && self.bindings.is_empty()
     }
 
     /// Every module text and expression a schema declares, recorded as
     /// declared. What `bootstrap` records, since it creates everything from
     /// the declarations it holds; bindings are the dialect's to add.
     pub fn from_schema(schema: &Schema) -> Self {
-        let mut d = Self::default();
+        let mut d = Self {
+            types: schema.types.clone(),
+            ..Self::default()
+        };
         for (id, module) in &schema.modules {
             d.modules.insert(id.clone(), module.definition.clone());
         }
@@ -350,6 +361,22 @@ impl Declared {
                 Change::RebuildPartitionedTable(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
+                Change::CreateType {
+                    name, definition, ..
+                } => {
+                    self.types.insert(name.clone(), (**definition).clone());
+                }
+                Change::DropType { name, .. } => {
+                    self.types.remove(name);
+                }
+                Change::RenameType { from, to, .. } => {
+                    // A rename writes no expression. Adopted domains and old
+                    // states must retain their engine-text fallback.
+                    if let Some(definition) = self.types.remove(from) {
+                        self.types.insert(to.clone(), definition);
+                    }
+                }
+
                 Change::CreateTable { name, table, .. } => {
                     let fresh = Self::from_schema(&Schema {
                         tables: [(name.clone(), (**table).clone())].into_iter().collect(),
@@ -698,6 +725,29 @@ impl Declared {
     /// the movement guard also see.
     pub fn overlay(&self, read_back: &Schema) -> Schema {
         let mut base = read_back.clone();
+        for (name, definition) in &self.types {
+            if let (
+                Some(crate::ManagedType::Domain {
+                    default, checks, ..
+                }),
+                crate::ManagedType::Domain {
+                    default: declared_default,
+                    checks: declared_checks,
+                    ..
+                },
+            ) = (base.types.get_mut(name), definition)
+            {
+                if default.is_some() && declared_default.is_some() {
+                    *default = declared_default.clone();
+                }
+                for (key, value) in checks {
+                    if let Some(text) = declared_checks.get(key) {
+                        *value = text.clone();
+                    }
+                }
+            }
+        }
+
         for (id, module) in &mut base.modules {
             if let Some(declared) = self.modules.get(id) {
                 module.definition = declared.clone();
@@ -811,6 +861,107 @@ mod tests {
     use crate::module::{Module, ModuleKind};
     use crate::name::ColumnRef;
     use crate::schema::{CheckConstraint, Column, Index, IndexColumn, Table};
+
+    fn domain(default: Option<&str>, check: &str) -> crate::ManagedType {
+        crate::ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null: false,
+            default: default.map(str::to_owned),
+            checks: [("allowed".into(), check.to_owned())].into(),
+            collation: None,
+        }
+    }
+
+    #[test]
+    fn domain_expression_records_follow_creation_rename_and_drop_without_adopting_text() {
+        let from: crate::TypeRef = "app.choice".parse().unwrap();
+        let to: crate::TypeRef = "other.selected".parse().unwrap();
+        let definition = domain(Some("'a'"), "VALUE IN ('a','b')");
+        let uid = crate::Uid::generate(crate::UidKind::Type);
+        let create = Change::CreateType {
+            uid: uid.clone(),
+            name: from.clone(),
+            definition: Box::new(definition.clone()),
+        };
+        let rename = Change::RenameType {
+            uid: uid.clone(),
+            from: from.clone(),
+            to: to.clone(),
+            // A rename must carry the prior record, not replace its spelling.
+            definition: Box::new(domain(
+                Some("'a'::text"),
+                "(VALUE = ANY (ARRAY['a'::text, 'b'::text]))",
+            )),
+        };
+        let mut record = Declared::default();
+        record.advance(&changes(vec![create]));
+        assert_eq!(record.types.get(&from), Some(&definition));
+        record.advance(&changes(vec![rename.clone()]));
+        assert!(!record.types.contains_key(&from));
+        assert_eq!(record.types.get(&to), Some(&definition));
+        record.advance(&changes(vec![Change::DropType {
+            uid,
+            name: to,
+            definition: Box::new(definition),
+        }]));
+        assert!(record.is_empty());
+
+        // Baseline/pull and older snapshots have no authored text to move.
+        record.advance(&changes(vec![rename]));
+        assert!(record.is_empty());
+    }
+
+    #[test]
+    fn domain_overlay_restores_only_existing_expressions_and_preserves_catalog_structure() {
+        let name: crate::TypeRef = "app.choice".parse().unwrap();
+        let declared = Schema {
+            types: [(name.clone(), domain(Some("'a'"), "VALUE IN ('a','b')"))].into(),
+            ..Schema::default()
+        };
+        let record = Declared::from_schema(&declared);
+        let mut read_back = declared.clone();
+        read_back.types.insert(
+            name.clone(),
+            domain(
+                Some("'a'::text"),
+                "(VALUE = ANY (ARRAY['a'::text, 'b'::text]))",
+            ),
+        );
+        let catalog = read_back.clone();
+        assert_eq!(record.overlay(&read_back), declared);
+        assert_eq!(
+            read_back, catalog,
+            "overlay must leave drift evidence unchanged"
+        );
+
+        let crate::ManagedType::Domain {
+            base,
+            not_null,
+            default,
+            checks,
+            collation,
+        } = read_back.types.get_mut(&name).unwrap()
+        else {
+            unreachable!()
+        };
+        *base = "varchar(9)".parse().unwrap();
+        *not_null = true;
+        *default = None;
+        *collation = Some("pg_catalog.\"C\"".parse().unwrap());
+        checks.remove("allowed");
+        checks.insert("manual".into(), "(VALUE <> 'z'::text)".into());
+        assert_eq!(record.overlay(&read_back), read_back);
+        read_back.types.remove(&name);
+        assert_eq!(record.overlay(&read_back), read_back);
+        read_back.types.insert(
+            name,
+            crate::ManagedType::Enum {
+                values: vec!["a".into()],
+            },
+        );
+        assert_eq!(record.overlay(&read_back), read_back);
+        assert_eq!(Declared::default().overlay(&catalog), catalog);
+    }
 
     /// A partition's own default is recorded as declared and put back in
     /// place of the engine's spelling, under the partition and the column

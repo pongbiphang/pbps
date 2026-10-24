@@ -1524,3 +1524,24 @@ five slices; module, grant and row policy stays with its existing owner.
 **DEC-2181.2. User-written input-path roots require explicit source review and pins.** Plan 46 and schema set 53 carry them; referenced-type state is 29 (DEC-1523.2). `pin_type_routines` defaults false, is saved and must match at apply. Any language is eligible only with complete catalog source in the saved plan and human/JSON output; selected roots, including superuser-held ones, reuse DEC-319.1's canonical catalog HMAC (including `prosqlbody`, `proconfig`, `prosecdef`, owner and signature). Unreadable nodes, audited SQL-running built-ins and owner/actor trust remain unchanged. Immediate bootstrap and pre-review resolver execution refuse roots requiring review; plan-time probes remain unchecked. A referenced input path containing any non-immutable routine, including built-ins classified by `pg_proc.provolatile`, also leaves plan-time probes unchecked; rollback cannot undo `nextval`, measured on 16 and 18. Apply verifies eligibility and pins around probes, before statements and settle, and before commit; transactional staged steps check before commit, nontransactional steps before and after committing, before checkpoint, including resume. PostgreSQL cannot lock routine definitions against replacement, so nontransactional checks detect changes rather than prevent execution (DEC-319.1).
 
 Pinned by `any_language_roots_require_source_review_and_the_saved_opt_in`, `superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees`, `partition_default_parsing_runs_domain_checks_only_after_source_approval`, `bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence`, `plan_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths`, `bootstrap_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths` and the staged type-routine regressions, live on 16 and 18.
+
+<a id="dec-1635-5"></a>
+
+**DEC-1635.5. Compare saved catalog SQL after forwarding only approved type casts.**
+On PostgreSQL 16 and 18, an enum or domain rename and schema transfer change
+`pg_get_expr`, `pg_get_constraintdef` and `pg_get_viewdef` text in dependent
+domain defaults/checks, column defaults/generated expressions, table checks,
+policies, views, bound SQL routine bodies/defaults and index expressions/predicates;
+the bound trees remain unchanged. An OID constant of `regtype` also deparses its
+type name inside a literal, so only that typed literal follows the same map. Enum LIST and domain RANGE partition bounds keep their text. Saved schemas and declared
+type before-pins contain text without bound trees, so their comparison copies
+forward qualified casts through the approved rename map. Type pins use the
+executed statement prefix; read-back guards use the admitted change endpoints,
+including a staged schema-transfer endpoint. A renamed type retains its exact
+before-catalog definition, since RENAME writes no expression; only a CREATE
+switches to declaration-presence comparisons. Apply each original name once,
+so rename chains do not follow a new holder. The scanner preserves literals,
+comments and same-named functions or columns. Compare every other byte and all
+structural fields normally: a different default or check is still drift.
+Record the actual read-back for subsequent drift/checksum comparisons, and
+keep the declaration record's authored spelling (decisions 207/208).

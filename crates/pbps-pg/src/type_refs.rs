@@ -1,5 +1,8 @@
 //! Prerequisites of columns that reference existing types (DEC-1523.1–3).
 
+pub mod declared;
+pub mod renames;
+
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
@@ -20,6 +23,20 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .iter()
         .flat_map(|s| s.tables.values())
         .flat_map(|t| t.columns.values().map(|c| &c.ty))
+        .chain(
+            schemas
+                .iter()
+                .flat_map(|s| s.types.values())
+                .filter_map(|t| match t {
+                    pbps_model::ManagedType::Domain { base, .. }
+                        if base.type_ref().is_some_and(|r| r.schema() != "pg_catalog") =>
+                    {
+                        Some(base)
+                    }
+                    pbps_model::ManagedType::Enum { .. }
+                    | pbps_model::ManagedType::Domain { .. } => None,
+                }),
+        )
         .collect();
     for planned in &changes.changes {
         match &planned.change {
@@ -62,6 +79,13 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
                 types.extend(after_types.values());
                 types.extend(key_type);
             }
+            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+                if let pbps_model::ManagedType::Domain { base, .. } = definition.as_ref()
+                    && base.type_ref().is_some_and(|r| r.schema() != "pg_catalog")
+                {
+                    types.push(base);
+                }
+            }
             Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::DropColumn { .. }
@@ -94,6 +118,7 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::DropType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }
@@ -106,6 +131,27 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .into_iter()
         .filter_map(|ty| ty.type_ref().cloned())
         .collect()
+}
+
+/// Managed definitions are certified by their checksum-pinned declarations.
+#[allow(clippy::wildcard_enum_match_arm)] // Only type lifecycle changes add managed names.
+pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef> {
+    let mut names: BTreeSet<_> = schemas
+        .iter()
+        .flat_map(|s| s.types.keys().cloned())
+        .collect();
+    for planned in &changes.changes {
+        match &planned.change {
+            Change::CreateType { name, .. } | Change::DropType { name, .. } => {
+                names.insert(name.clone());
+            }
+            Change::RenameType { from, to, .. } => {
+                names.extend([from.clone(), to.clone()]);
+            }
+            _ => {}
+        }
+    }
+    names
 }
 
 pub(crate) async fn read(
@@ -161,6 +207,56 @@ pub async fn trusted_roles(
     Ok(())
 }
 
+fn check_defaults(schema: &Schema, types: &[UserType]) -> Result<(), String> {
+    for (table, definition) in &schema.tables {
+        let check_default = |column: &ColumnName, spec: &Column| {
+            let ty = &spec.ty;
+            let Some(reference) = ty.type_ref() else {
+                return Ok(());
+            };
+            if fill(spec) == Fill::Null
+                && (ty.is_array()
+                    || match schema.types.get(reference) {
+                        // Declared types have no external pin, but their kind still
+                        // decides whether PostgreSQL preserves the column default.
+                        Some(pbps_model::ManagedType::Enum { .. }) => true,
+                        Some(pbps_model::ManagedType::Domain { .. }) => false,
+                        None => types.iter().any(|ty| {
+                            ty.reference() == reference && ty.kind() != user_types::Kind::Domain
+                        }),
+                    })
+            {
+                return Err(format!(
+                    "column `{table}.{column}` has a NULL default the engine does not keep; declare no default",
+                    table = table.shown(),
+                    column = column.shown()
+                ));
+            }
+            Ok(())
+        };
+        for (column, spec) in &definition.columns {
+            if matches!(&spec.value_source, ValueSource::Default(_)) {
+                check_default(column, spec)?;
+            }
+        }
+        // Partitions declare only overrides; their column types live on the parent.
+        if let Some(part) = &definition.partition_of
+            && let Some(parent) = schema.tables.get(&part.parent)
+        {
+            for (column, own) in &part.columns {
+                if let Some(spec) = parent.columns.get(column)
+                    && let Some(expr) = &own.default
+                {
+                    let mut override_column = Column::new(spec.ty.clone());
+                    override_column.value_source = ValueSource::Default(expr.clone());
+                    check_default(column, &override_column)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn seal(
     conn: &mut Conn,
     schemas: &[&Schema],
@@ -168,49 +264,14 @@ pub async fn seal(
     trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Vec<TypePin>, DbError> {
     trusted_roles(conn, trusted).await?;
-    let references: Vec<_> = references(schemas, changes).into_iter().collect();
+    let managed = managed_names(schemas, changes);
+    let references: Vec<_> = references(schemas, changes)
+        .into_iter()
+        .filter(|r| !managed.contains(r))
+        .collect();
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
-        for (table, definition) in &schema.tables {
-            let check_default = |column: &ColumnName, spec: &Column| {
-                let ty = &spec.ty;
-                let Some(reference) = ty.type_ref() else {
-                    return Ok(());
-                };
-                if fill(spec) == Fill::Null
-                    && (ty.is_array()
-                        || types.iter().any(|ty| {
-                            ty.reference() == reference && ty.kind() != user_types::Kind::Domain
-                        }))
-                {
-                    return Err(failed(format!(
-                        "column `{table}.{column}` has a NULL default the engine does not keep; declare no default",
-                        table = table.shown(),
-                        column = column.shown()
-                    )));
-                }
-                Ok(())
-            };
-            for (column, spec) in &definition.columns {
-                if matches!(&spec.value_source, ValueSource::Default(_)) {
-                    check_default(column, spec)?;
-                }
-            }
-            // Partitions declare only overrides; their column types live on the parent.
-            if let Some(part) = &definition.partition_of
-                && let Some(parent) = schema.tables.get(&part.parent)
-            {
-                for (column, own) in &part.columns {
-                    if let Some(spec) = parent.columns.get(column)
-                        && let Some(expr) = &own.default
-                    {
-                        let mut override_column = Column::new(spec.ty.clone());
-                        override_column.value_source = ValueSource::Default(expr.clone());
-                        check_default(column, &override_column)?;
-                    }
-                }
-            }
-        }
+        check_defaults(schema, &types).map_err(failed)?;
     }
     // Names alone conflate overloads and objects in different system catalogs.
     let mut managed_modules = BTreeSet::new();
@@ -256,14 +317,19 @@ pub async fn check(
     conn: &mut Conn,
     within: Within,
     expected: &[TypePin],
+    declared: &[pbps_model::DeclaredTypePin],
     changes: &ChangeSet,
 ) -> Result<(), DbError> {
     let references: Vec<_> = expected
         .iter()
         .map(|p| TypeRef::new(&p.schema, &p.name).map_err(|e| failed(e.to_string())))
         .collect::<Result<_, _>>()?;
-    for reference in self::references(&[], changes) {
-        if !references.contains(&reference) {
+    let managed = managed_names(&[], changes)
+        .union(&self::declared::names(declared))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for reference in self::references(&[], changes).difference(&managed) {
+        if !references.contains(reference) {
             return Err(failed(format!(
                 "plan has no type pin for `{reference}`; plan again against the database",
                 reference = reference.shown(),
@@ -381,7 +447,14 @@ pub fn bootstrap_guard(
     schema: &Schema,
     trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Option<String>, pbps_dialect::DialectError> {
-    let refs = references(&[schema], &ChangeSet::default());
+    check_defaults(schema, &[]).map_err(|feature| pbps_dialect::DialectError::Unsupported {
+        dialect: "PostgreSQL",
+        feature,
+    })?;
+    let refs: BTreeSet<_> = references(&[schema], &ChangeSet::default())
+        .into_iter()
+        .filter(|r| !schema.types.contains_key(r))
+        .collect();
     if refs.is_empty() && trusted.is_empty() {
         return Ok(None);
     }
@@ -412,6 +485,117 @@ pub fn bootstrap_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn declared_default_schema(definition: pbps_model::ManagedType, array: bool) -> Schema {
+        let reference = "app.value".parse().unwrap();
+        let scalar = ColumnType::reference(reference);
+        let mut column = Column::new(if array { scalar.into_array() } else { scalar });
+        column.value_source = ValueSource::Default("NULL".into());
+        Schema {
+            types: [("app.value".parse().unwrap(), definition)].into(),
+            tables: [(
+                pbps_model::TableName::new("app", "t"),
+                pbps_model::Table {
+                    columns: [("value".into(), column)].into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn declared_enum_null_defaults_refuse_by_column_name_while_domains_keep_them() {
+        for domain in [false, true] {
+            let definition = if domain {
+                pbps_model::ManagedType::Domain {
+                    base: "integer".parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                }
+            } else {
+                pbps_model::ManagedType::Enum {
+                    values: vec!["ok".into()],
+                }
+            };
+            for array in [false, true] {
+                let mut schema = declared_default_schema(definition.clone(), array);
+                let table = pbps_model::TableName::new("app", "t");
+                let ty = schema.tables[&table].columns[&ColumnName::from("value")]
+                    .ty
+                    .clone();
+                let canonical = ty.raw().to_string();
+                for expression in ["NULL".into(), format!("NULL::{canonical}")] {
+                    schema.tables.get_mut(&table).unwrap().columns[&ColumnName::from("value")]
+                        .value_source = ValueSource::Default(expression);
+                    let result = check_defaults(&schema, &[]);
+                    if domain && !array {
+                        result.unwrap();
+                        assert_eq!(bootstrap_guard(&schema, &BTreeSet::new()).unwrap(), None);
+                    } else {
+                        let refusal = result.unwrap_err();
+                        assert!(refusal.contains("app.t.value"), "{refusal}");
+                        assert!(refusal.contains("NULL default the engine does not keep"));
+                        assert!(bootstrap_guard(&schema, &BTreeSet::new()).is_err());
+                    }
+                }
+                // The kind check must not refuse a declaration with no default.
+                schema.tables.get_mut(&table).unwrap().columns[&ColumnName::from("value")]
+                    .value_source = ValueSource::None;
+                check_defaults(&schema, &[]).unwrap();
+                assert_eq!(bootstrap_guard(&schema, &BTreeSet::new()).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn declared_enum_partition_null_defaults_refuse_by_partition_name() {
+        let mut schema = declared_default_schema(
+            pbps_model::ManagedType::Enum {
+                values: vec!["ok".into()],
+            },
+            false,
+        );
+        let parent = pbps_model::TableName::new("app", "t");
+        schema.tables.get_mut(&parent).unwrap().columns[&ColumnName::from("value")].value_source =
+            ValueSource::None;
+        schema.tables.insert(
+            pbps_model::TableName::new("app", "low"),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent,
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "value".into(),
+                        pbps_model::PartitionColumn {
+                            default: Some("NULL".into()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Default::default()
+            },
+        );
+        let refusal = check_defaults(&schema, &[]).unwrap_err();
+        assert!(refusal.contains("app.low.value"), "{refusal}");
+        assert!(bootstrap_guard(&schema, &BTreeSet::new()).is_err());
+        schema.types.insert(
+            "app.value".parse().unwrap(),
+            pbps_model::ManagedType::Domain {
+                base: "integer".parse().unwrap(),
+                not_null: false,
+                default: None,
+                checks: Default::default(),
+                collation: None,
+            },
+        );
+        check_defaults(&schema, &[]).unwrap();
+        assert_eq!(bootstrap_guard(&schema, &BTreeSet::new()).unwrap(), None);
+    }
 
     #[test]
     fn defaults_and_stored_generated_fills_share_the_same_cast_checked_shapes() {

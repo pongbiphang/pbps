@@ -257,6 +257,26 @@ mod effects_of_each_kind {
         // The desired state: `x` takes another default, `y` is relaxed and
         // the check is gone, so the kinds that read what the plan takes away
         // have something to read.
+        schema.types.insert(
+            "app.base".parse().unwrap(),
+            ManagedType::Enum {
+                values: vec!["ok".into()],
+            },
+        );
+        schema.types.insert(
+            "app.old".parse().unwrap(),
+            ManagedType::Domain {
+                base: "app.base".parse().unwrap(),
+                not_null: false,
+                default: None,
+                checks: BTreeMap::new(),
+                collation: None,
+            },
+        );
+        ids.types
+            .insert(uid(UidKind::Type, "base"), "app.base".parse().unwrap());
+        ids.types
+            .insert(uid(UidKind::Type, "old"), "app.old".parse().unwrap());
         let mut after = schema.clone();
         let at = after.tables.get_mut(&tn("t")).unwrap();
         at.columns.get_mut("x").unwrap().value_source = ValueSource::Default("9".into());
@@ -295,6 +315,53 @@ mod effects_of_each_kind {
         let mut new_table = table(&[("id", Column::new(int()).not_null())]);
         new_table.foreign_keys.insert("f".into(), fk());
         let mut out = vec![
+            (
+                "CreateType",
+                Change::CreateType {
+                    uid: uid(UidKind::Type, "new_domain"),
+                    name: "app.new_domain".parse().unwrap(),
+                    definition: Box::new(ManagedType::Domain {
+                        base: "app.base".parse().unwrap(),
+                        not_null: false,
+                        default: None,
+                        checks: BTreeMap::new(),
+                        collation: None,
+                    }),
+                },
+            ),
+            (
+                "DropType",
+                Change::DropType {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum { values: vec![] }),
+                },
+            ),
+            (
+                "CreateType",
+                Change::CreateType {
+                    uid: uid(UidKind::Type, "new"),
+                    name: "app.new".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum { values: vec![] }),
+                },
+            ),
+            (
+                "DropType",
+                Change::DropType {
+                    uid: uid(UidKind::Type, "old"),
+                    name: "app.old".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum { values: vec![] }),
+                },
+            ),
+            (
+                "RenameType",
+                Change::RenameType {
+                    uid: uid(UidKind::Type, "old"),
+                    from: "app.old".parse().unwrap(),
+                    to: "app.renamed".parse().unwrap(),
+                    definition: Box::new(ManagedType::Enum { values: vec![] }),
+                },
+            ),
             (
                 "CreateTable",
                 Change::CreateTable {

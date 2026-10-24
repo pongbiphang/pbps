@@ -331,7 +331,10 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(from.clone()),
             Some(to.clone()),
         )),
-        Change::AddComputedColumn { .. }
+        Change::CreateType { .. }
+        | Change::DropType { .. }
+        | Change::RenameType { .. }
+        | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }

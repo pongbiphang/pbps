@@ -95,6 +95,7 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             assert_ne!(managed.digest, external.digest);
         };
         distinct_pins(&saved.type_pins);
+        let external_before = saved.type_pins.clone();
         for name in hostile_names {
             assert!(
                 saved
@@ -129,8 +130,32 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(next).unwrap()).unwrap();
         assert!(saved.changes.is_empty(), "{:?}", saved.changes);
-        assert_eq!(saved.type_pins.len(), 6);
-        distinct_pins(&saved.type_pins);
+        // Adopted enums/domains now carry uid/definition evidence. The
+        // undeclared composite and Ext.Mood retain their exact external pins.
+        assert_eq!(saved.type_pins.len(), 2);
+        assert_eq!(saved.declared_type_pins.len(), 4);
+        for pin in &saved.type_pins {
+            assert!(external_before.contains(pin));
+            let reference = pbps_model::TypeRef::new(&pin.schema, &pin.name).unwrap();
+            assert!(saved.ids.type_uid(&reference).is_none());
+        }
+        assert!(
+            saved
+                .type_pins
+                .iter()
+                .any(|pin| pin.schema == "Ext" && pin.name == "Mood")
+        );
+        assert!(
+            saved
+                .type_pins
+                .iter()
+                .any(|pin| pin.schema == "app" && pin.name == "pair")
+        );
+        for pin in &saved.declared_type_pins {
+            assert_eq!(saved.ids.types.get(&pin.uid), Some(&pin.name));
+            assert_eq!(loaded.schema.types.get(&pin.name), Some(&pin.definition));
+            assert!(pin.before.is_some());
+        }
         assert!(saved.ids.type_uid(&external).is_none());
         assert!(saved.ids.type_uid(&"app.mood".parse().unwrap()).is_some());
         // Explicitly prove schema cleanup on each major, in addition to the
@@ -730,6 +755,100 @@ fn a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_ar
                 stdout(&out),
                 stderr(&out)
             );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn declared_enum_null_defaults_refuse_planning_without_applying_while_domains_converge() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_declared_null");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("refs-declared-null");
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        std::fs::write(
+            d.dir.join("schema/app.mood.type.yml"),
+            "enum: app.mood\nvalues: [ok]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.value.type.yml"),
+            "domain: app.value\ntype: integer\n",
+        )
+        .unwrap();
+        let normal = "  mood: {type: app.mood}\n  value: {type: app.value, default: 'NULL'}\n";
+        let erased = normal.replace(
+            "mood: {type: app.mood}",
+            "mood: {type: app.mood, default: 'NULL'}",
+        );
+        let refused_plan = d.dir.join("refused.plan.json");
+        // Check both a pending creation and an existing declared enum. Neither
+        // has an external type pin from which sealing could recover its kind.
+        for present in [false, true] {
+            d.table(&declarations(&erased));
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let out = d.run(&["plan", "--db", db, "--out", refused_plan.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{}", stdout(&out));
+            let message = stderr(&out);
+            assert!(
+                message.contains("app.t.mood")
+                    && message.contains("NULL default the engine does not keep"),
+                "{message}"
+            );
+            assert!(!refused_plan.try_exists().unwrap());
+            assert_eq!(
+                scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                if present { 2 } else { 1 },
+                "refused planning must not record a deployment"
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typname IN ('mood','value')"
+                ),
+                if present { 2 } else { 0 }
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app' AND c.relname='t'"
+                ),
+                i64::from(present)
+            );
+            if !present {
+                d.table(&declarations(normal));
+                succeeds(d.run(&["plan", "--no-dev"]));
+                d.commit();
+                let path = plan(&d, db);
+                succeeds(apply_plan(&d, db, &path, false));
+                succeeds(d.run(&["verify", "--db", db]));
+                let next: pbps_model::SavedPlan =
+                    serde_json::from_slice(&std::fs::read(plan(&d, db)).unwrap()).unwrap();
+                assert!(
+                    next.changes.is_empty(),
+                    "the declared domain NULL default converges"
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_catalog.pg_attrdef d JOIN pg_catalog.pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE d.adrelid='app.t'::regclass AND a.attname='value'"
+                    ),
+                    1
+                );
+            } else {
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_catalog.pg_attrdef d JOIN pg_catalog.pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum WHERE d.adrelid='app.t'::regclass AND a.attname='mood'"
+                    ),
+                    0,
+                    "refused planning must not install the enum default"
+                );
+            }
         }
     }
 }

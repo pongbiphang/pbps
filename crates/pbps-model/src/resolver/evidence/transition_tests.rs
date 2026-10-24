@@ -1390,6 +1390,9 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::CreateType { .. }
+            | Change::DropType { .. }
+            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::DropRole { .. }
             | Change::RenameRole { .. }

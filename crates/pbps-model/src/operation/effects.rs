@@ -306,10 +306,81 @@ pub fn effects(
         }
     }
     cx.by_kind()?;
+    cx.type_inputs();
     Ok(cx.fx)
 }
 
 impl Cx<'_> {
+    fn type_input(&mut self, ty: &crate::ColumnType) {
+        if let Some(name) = ty.type_ref()
+            && let Ok(uid) = self.owners.managed_type(name, Spelling::Final)
+        {
+            self.requires(Requirement::Is(
+                ObjectKey::Type(Recorded(uid)),
+                Incarnation::Final,
+            ));
+        }
+    }
+
+    // Only operations that introduce a typed input consume this requirement.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn type_inputs(&mut self) {
+        match self.op.change() {
+            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+                if let crate::ManagedType::Domain { base, .. } = definition.as_ref() {
+                    self.type_input(base);
+                }
+            }
+            Change::CreateTable { table, .. } => {
+                for column in table.columns.values() {
+                    self.type_input(&column.ty);
+                }
+            }
+            Change::AddColumn { column, .. } => self.type_input(&column.ty),
+            Change::AlterColumnType { to, .. } => self.type_input(to),
+            _ => {}
+        }
+    }
+
+    fn type_releases(&mut self, name: &crate::TypeRef) {
+        let mut required = Vec::new();
+        for (table_name, table) in &self.before.schema.tables {
+            let Some(table_uid) = self.before.ids.table_uid(table_name) else {
+                continue;
+            };
+            for (column_name, column) in &table.columns {
+                if column.ty.type_ref() != Some(name) {
+                    continue;
+                }
+                if !self.after.ids.tables.contains_key(table_uid) {
+                    required.push(Requirement::Absent(ObjectKey::Table(Recorded(
+                        table_uid.clone(),
+                    ))));
+                } else if let Some(uid) =
+                    self.before.ids.column_uid(&table_name.column(column_name))
+                {
+                    let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));
+                    if self.after.ids.columns.contains_key(uid) {
+                        required.push(Requirement::Is(key, Incarnation::Final));
+                    } else {
+                        required.push(Requirement::Absent(key));
+                    }
+                }
+            }
+        }
+        for (other_name, definition) in &self.before.schema.types {
+            if let crate::ManagedType::Domain { base, .. } = definition
+                && base.type_ref() == Some(name)
+                && let Some(uid) = self.before.ids.type_uid(other_name)
+            {
+                required.push(Requirement::Absent(ObjectKey::Type(Recorded(uid.clone()))));
+            }
+        }
+        for r in required {
+            self.requires(r);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn by_kind(&mut self) -> Result<(), OwnerError> {
         let op = self.op;
@@ -364,6 +435,16 @@ impl Cx<'_> {
                     self.requires(Requirement::Is(key.clone(), Incarnation::Final));
                     self.requires(Requirement::Reads(key));
                 }
+            }
+            Change::CreateType { .. } => {}
+            Change::DropType { uid, name, .. } => {
+                self.exists(ObjectKey::Type(Recorded(uid.clone())));
+                self.type_releases(name);
+            }
+            Change::RenameType { uid, .. } => {
+                let key = ObjectKey::Type(Recorded(uid.clone()));
+                self.exists(key.clone());
+                self.rewrites(Resource::Object(key, Incarnation::Final));
             }
 
             Change::CreateTable {
@@ -2204,6 +2285,14 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
             });
         }
     }
+    held.extend(
+        before
+            .ids
+            .types
+            .iter()
+            .filter(|(_, name)| before.schema.types.contains_key(*name))
+            .map(|(uid, _)| ObjectKey::Type(Recorded(uid.clone()))),
+    );
     held.extend(before.schema.modules.keys().cloned().map(ObjectKey::Module));
     held.extend(
         before
@@ -2225,6 +2314,7 @@ pub fn holds_unknown(key: &ObjectKey) -> bool {
         | ObjectKey::NotNull(ColumnKey::Partition { .. }) => true,
         ObjectKey::Table(_)
         | ObjectKey::Column(ColumnKey::Recorded(_))
+        | ObjectKey::Type(_)
         | ObjectKey::Role(_)
         | ObjectKey::Default(_)
         | ObjectKey::Module(_)

@@ -111,8 +111,10 @@ reason: they are user-defined *objects* with their own creation, ownership and d
 semantics, not spellings of a built-in, and modelling them is a separate ADR.
 `pull` holds existing enums, domains and standalone composites by qualified
 reference, scalar or array (#1523, DEC-1523.1). Slice one of #1635 now models
-and pulls declared enums and domains (DEC-1635.1); pbps still creates, alters
-and drops no type. Lifecycle support belongs to later slices of #1635.
+and pulls declared enums and domains (DEC-1635.1). Whole-object creation, drop
+and uid-based rename are supported (DEC-1635.3/4); enum label edits and domain
+alterations await slices 3/4. Base-type and collation alterations and managed
+composite/range definitions remain unsupported.
 
 ## 2. `TypeChangeRisk` answers its question, and it answers it correctly
 

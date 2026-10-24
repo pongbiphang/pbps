@@ -3990,6 +3990,46 @@ pub async fn relations_at(
     Ok(out)
 }
 
+/// Names reserved in pg_type, including row types of relations the model
+/// cannot declare. Generated array names yield to real objects (DEC-1503.1).
+pub async fn type_names_at(
+    conn: &mut Conn,
+    names: &[TableName],
+) -> Result<Vec<TableName>, DbError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = names
+        .iter()
+        .flat_map(|name| {
+            [
+                Param::Str(name.schema.as_str()),
+                Param::Str(name.name.as_str()),
+            ]
+        })
+        .collect();
+    let values = (0..names.len())
+        .map(|i| format!("(${}::text,${}::text)", i * 2 + 1, i * 2 + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH wanted(s,n) AS (VALUES {values}) SELECT ns.nspname::text AS schema_name,t.typname::text AS type_name FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace ns ON ns.oid=t.typnamespace JOIN wanted w ON w.s=ns.nspname AND w.n=t.typname WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_type e WHERE e.typarray=t.oid)"
+    );
+    conn.query_with(&sql, &params)
+        .await?
+        .iter()
+        .map(|row| {
+            let schema = row
+                .try_get::<&str>("schema_name")?
+                .ok_or_else(|| missing("type schema"))?;
+            let name = row
+                .try_get::<&str>("type_name")?
+                .ok_or_else(|| missing("type name"))?;
+            Ok(TableName::new(schema, name))
+        })
+        .collect()
+}
+
 /// A name in a schema that an unnamed primary key's index cannot take
 /// (#1645): a relation's of any kind, a composite type's included, or a
 /// constraint's in that schema, on any of its tables. Measured on 16 and 18:

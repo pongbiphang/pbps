@@ -25,6 +25,7 @@ use crate::{Change, ModuleId, ModuleKind, Table, TableName};
 /// The kind of a name. The dialect maps each to the namespace that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NameKind {
+    Type,
     Table,
     Module(ModuleKind),
     Index,
@@ -268,6 +269,18 @@ pub fn names(
         Change::RebuildPartitionedTable(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {}
+        Change::CreateType { uid, name, .. } => {
+            nx.claim(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
+        }
+        Change::DropType { uid, name, .. } => {
+            nx.release(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
+        }
+        Change::RenameType { uid, from, to, .. } => {
+            let holder = ObjectKey::Type(Recorded(uid.clone()));
+            nx.release(type_address(from), holder.clone());
+            nx.claim(type_address(to), holder);
+        }
+
         Change::CreateTable {
             uid, name, table, ..
         } => {
@@ -547,6 +560,16 @@ pub fn names(
     Ok(nx.names)
 }
 
+fn type_address(name: &crate::TypeRef) -> Address {
+    Address {
+        kind: NameKind::Type,
+        schema: name.schema().to_owned(),
+        table: None,
+        name: name.name().to_owned(),
+        signature: None,
+    }
+}
+
 fn role_address(name: &crate::RoleName) -> Address {
     Address {
         kind: NameKind::Role,
@@ -562,6 +585,14 @@ fn role_address(name: &crate::RoleName) -> Address {
 pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<Named> {
     let table = |name: &TableName| owners.table(name, Spelling::Base).ok().map(Recorded);
     let mut out = Vec::new();
+    for name in before.schema.types.keys() {
+        if let Ok(uid) = owners.managed_type(name, Spelling::Base) {
+            out.push(Named {
+                address: type_address(name),
+                holder: ObjectKey::Type(Recorded(uid)),
+            });
+        }
+    }
     for (name, t) in &before.schema.tables {
         let Some(owner) = table(name) else {
             continue;

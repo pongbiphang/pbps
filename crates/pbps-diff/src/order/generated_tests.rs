@@ -26,6 +26,42 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             "{change:?}"
         );
     };
+    let type_uid: Uid = "y_000001".parse().unwrap();
+    let type_name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+    let definition = Box::new(pbps_model::ManagedType::Enum {
+        values: vec!["ok".into()],
+    });
+    pin(
+        Change::CreateType {
+            uid: type_uid.clone(),
+            name: type_name.clone(),
+            definition: definition.clone(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
+        Change::DropType {
+            uid: type_uid.clone(),
+            name: type_name.clone(),
+            definition: definition.clone(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
+        Change::RenameType {
+            uid: type_uid,
+            from: type_name,
+            to: "app.feeling".parse().unwrap(),
+            definition,
+        },
+        vec![],
+        vec![],
+        None,
+    );
     pin(
         Change::CreateTable {
             uid: uid.clone(),

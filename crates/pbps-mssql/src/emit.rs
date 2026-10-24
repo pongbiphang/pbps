@@ -302,6 +302,12 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             })
         }
 
+        Change::CreateType { name, .. }
+        | Change::DropType { name, .. }
+        | Change::RenameType { from: name, .. } => Err(DialectError::Unsupported {
+            dialect: crate::types::DIALECT,
+            feature: format!("declared type {}", name.shown()),
+        }),
         // The first statement is the one that brings the table into being;
         // it says so, and a staged checkpoint adopts the table from there.
         Change::CreateTable { name, table, .. } => {

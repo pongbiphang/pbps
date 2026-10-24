@@ -32,6 +32,14 @@ use crate::name::{ColumnRef, TableName};
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "intent", rename_all = "snake_case")]
 pub enum Intent {
+    RenameType {
+        from: crate::TypeRef,
+        to: crate::TypeRef,
+    },
+    DropType {
+        name: crate::TypeRef,
+        reason: Reason,
+    },
     RenameTable {
         from: TableName,
         to: TableName,
@@ -81,7 +89,10 @@ impl Intent {
             | Intent::DropTable { table, .. }
             | Intent::MoveRows { table, .. } => table == t,
             Intent::DropColumn { column, .. } => &column.table == t,
-            Intent::RenameRole { .. } | Intent::DropRole { .. } => false,
+            Intent::RenameType { .. }
+            | Intent::DropType { .. }
+            | Intent::RenameRole { .. }
+            | Intent::DropRole { .. } => false,
         }
     }
 }
@@ -111,6 +122,7 @@ mod tests {
             ("drop_table", "table", "app.t"),
             ("drop_column", "column", "app.t.old"),
             ("drop_role", "role", "reader"),
+            ("drop_type", "name", "app.old"),
         ] {
             for reason in ["", " ", "\t\n", "\u{3000}"] {
                 let value = serde_json::json!({"intent": kind, target: name, "reason": reason});

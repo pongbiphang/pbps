@@ -54,6 +54,7 @@ pub enum ChoiceKind {
     DropColumn(ColumnRef),
     DropTable(TableName),
     DropRole(pbps_model::RoleName),
+    DropType(pbps_model::TypeRef),
 }
 
 /// The candidates for one blocker, best first.
@@ -63,6 +64,30 @@ pub enum ChoiceKind {
 pub fn choices(b: &Blocker) -> Vec<Choice> {
     let mut out = Vec::new();
     match b {
+        Blocker::AmbiguousTypes {
+            disappeared,
+            appeared,
+        } => {
+            for from in disappeared {
+                for to in appeared {
+                    out.push(Choice {
+                        label: format!("type {} was renamed to {}", from.shown(), to.shown()),
+                        kind: ChoiceKind::Rename(Intent::RenameType {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }),
+                    });
+                }
+                out.push(Choice {
+                    label: format!("type {} was dropped (you will be asked why)", from.shown()),
+                    kind: ChoiceKind::DropType(from.clone()),
+                });
+            }
+        }
+        Blocker::DropTypeNeedsReason { name } => out.push(Choice {
+            label: format!("type {} was dropped (you will be asked why)", name.shown()),
+            kind: ChoiceKind::DropType(name.clone()),
+        }),
         // A choice under a contested identity could record a decision about
         // the wrong table. Re-resolution asks it once the identity is settled.
         Blocker::ProvisionalTableIdentity { .. } => {}
@@ -317,6 +342,10 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
                 table: table.clone(),
                 reason: reason(&mut lines, &table.shown().to_string())?,
             },
+            ChoiceKind::DropType(name) => Intent::DropType {
+                name: name.clone(),
+                reason: reason(&mut lines, &format!("type {}", name.shown()))?,
+            },
             ChoiceKind::DropRole(role) => Intent::DropRole {
                 role: role.clone(),
                 reason: reason(&mut lines, &format!("role {role}", role = role.shown(),))?,
@@ -344,6 +373,10 @@ fn reason<R: std::io::BufRead>(
 
 fn question(b: &Blocker) -> String {
     match b {
+        Blocker::AmbiguousTypes { .. } => {
+            "Types disappeared and appeared; record their identity decisions".to_owned()
+        }
+        Blocker::DropTypeNeedsReason { name } => format!("type {} disappeared", name.shown()),
         Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
             "if {from} -> {to} is what you meant (provisional table identity): {}",
             question(blocker),
