@@ -1073,7 +1073,8 @@ change like any other.
 *What a pin holds.* One entry per schema, keyed by the schema's OID. Each is
 an HMAC under the environment's key (DEC-952.1), with rule
 `pbps/external-routine-pin/v1` and the namespace OID as component. The input
-is the canonical list of the schema's in-scope routines, in OID order. Each
+is the canonical list of the schema's in-scope routines, in OID order. (Since
+DEC-2333.1 each routine has its own entry; see the amendment below.) Each
 routine contributes:
 - its OID and its **whole `pg_proc` row**, read with `to_jsonb` minus `oid`
   and minus `proacl`. That covers the body, volatility, `proparallel`,
@@ -1208,6 +1209,15 @@ exactly what an operator should look at before running approved DDL.
 The live tests are in `crates/pbps-cli/tests/flow_pg.rs`. Each check was
 disabled in turn, and so was the `READ COMMITTED` framing, and the test for it
 failed each time.
+
+*Amendment (DEC-2333.1, #2333): one pin per routine.* A pin is now one HMAC per
+routine, not one per schema, and the plan carries a map from the routine's
+`pg_proc` OID to its signature and digest, in plan version 51. Everything above
+about what is pinned, what a pin's input holds, the key, the recheck points and
+the staged and resume checks is unchanged: the same canonical catalog row is
+digested, only the unit of digest is smaller. The digest rule is
+`pbps/external-routine-pin/v2`, with the OID as component beside the row.
+A refusal names every changed, added and removed routine.
 
 <a id="dec-1687-2"></a>
 
@@ -1545,3 +1555,63 @@ comments and same-named functions or columns. Compare every other byte and all
 structural fields normally: a different default or check is still drift.
 Record the actual read-back for subsequent drift/checksum comparisons, and
 keep the declaration record's authored spelling (decisions 207/208).
+
+<a id="dec-2333-1"></a>
+
+**DEC-2333.1. Routine pins are one keyed digest per routine, so a refusal can say which routine changed.**
+DEC-319.1 pinned one HMAC per schema. A mismatch could therefore name a schema
+and two counts, and a routine that was removed could not be named at all, because
+the plan held no trace of it. The refusal is a security alarm: a routine the plan
+can run was replaced between approval and apply. The obvious remedy, planning
+again, re-pins whatever the catalog holds now, and unmanaged routines never appear
+in a plan's diff (SPEC §8.2). An operator told only "something in `ext` changed"
+cannot tell a routine that was upgraded from one that was swapped, and would
+re-pin a replaced routine unseen. So the unit of the pin is the routine, and the
+refusal lists every routine that changed, was added or was removed, each by
+its schema-qualified name and argument types, through the model's routine
+identity (`RoutineId::raw` stored, `Escaped` shown).
+
+*Why still keyed.* A per-routine digest is more exposed to guessing than a
+per-schema one, since it covers a single body. It stays an HMAC under the
+environment's key (DEC-952.1), so the plan file tests no guess about a body or a
+literal in it. The plan carries each routine's signature in the clear, which is
+what the catalog already shows to any role and is no body. The key, key
+identifier and server version checks are unchanged and still come first.
+
+*Why the entry is keyed by OID and carries the signature.* The signature is the
+text an operator reads, but it cannot be the identity: measured under DEC-319.1,
+an approved rename of a schema or of a table whose row type appears in an
+argument list changes the signature's spelling and leaves the routine untouched,
+so a signature-keyed map would blame the approved rename on an outside change.
+The OID is stable through `CREATE OR REPLACE`, through those renames and through
+`ALTER FUNCTION … OWNER`, and it is already in the digest's input. A routine
+dropped and created again gets a new OID and reads as removed and added under one
+signature, which is what happened to it. Two overloads of one name have
+different OIDs and different argument lists, so they never collide.
+
+*What is unchanged.* The pin set (every unmanaged routine not held only by
+superusers), the canonical row, the recheck points (under the lock before the
+probes, before the first statement, before recording, before COMMIT, around each
+staged step and on resume), the empty `search_path` read and the `READ COMMITTED`
+framing. Selected type-routine roots (DEC-2181.2) and the reviewed type
+pins reuse the same digest and the same comparison, so their refusal names the
+routine as well. Absent, empty and unreadable stay distinct: an unreadable
+catalog is an error before any comparison, never an empty set. A plan that must
+pin a routine is still refused without a key; a database whose every unmanaged
+routine is held only by superusers records no pins. A `removed` routine is one
+that left the pin set, whether it was dropped or its owner became a superuser's
+alone.
+
+*Format.* Plan version 51. A version 50 plan is refused as an older format with
+the ordinary replan remedy before any pin is read. A saved plan grows by one
+entry per pinned routine, about 150 bytes each, where it grew by one per schema
+before; an extension that brings hundreds of routines adds tens of kilobytes.
+
+Pinned by `one_changed_routine_among_several_is_the_only_one_named`,
+`an_overload_changing_is_named_by_its_own_signature` and the other unit tests in
+`crates/pbps-cli/src/pins.rs`, and live on 16 and 18 by the tests in
+`crates/pbps-cli/tests/flow_pg.rs` named in DEC-2333.1's revert witnesses
+(`a_refusal_names_only_the_routine_that_changed_among_several`,
+`a_routine_added_or_removed_after_approval_is_named`,
+`an_overload_replaced_after_approval_is_named_by_its_signature` and
+`an_approved_schema_rename_does_not_read_as_a_routine_change`).

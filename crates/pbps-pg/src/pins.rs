@@ -16,9 +16,10 @@ use pbps_dialect::TransactionFraming;
 /// One routine in the pin set, as the catalog holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Routine {
-    /// `pg_namespace.oid`, which keys the pin: a schema the plan renames
-    /// keeps it.
-    pub namespace: i64,
+    /// `pg_proc.oid`, which keys the pin: an approved rename of a schema or of
+    /// a type in the argument list changes the spelling of the signature but
+    /// not the OID (DEC-2333.1).
+    pub oid: i64,
     /// The schema's name when this was read, for messages only.
     pub schema: String,
     pub name: String,
@@ -26,7 +27,7 @@ pub struct Routine {
     /// (`format_type` under the empty `search_path`), so that the caller can
     /// tell a managed routine from an unmanaged one.
     pub args: Vec<String>,
-    /// The canonical JSON this routine contributes to its schema's pin.
+    /// The canonical JSON this routine's pin is made over.
     pub input: String,
 }
 
@@ -84,7 +85,7 @@ fn pinned_routines_query() -> String {
 
 fn routines_query(selected: Option<&[i64]>) -> String {
     let columns = if selected.is_some() {
-        "p.oid::int8 AS oid, pg_catalog.pg_get_functiondef(p.oid) AS definition,"
+        "pg_catalog.pg_get_functiondef(p.oid) AS definition,"
     } else {
         ""
     };
@@ -105,7 +106,7 @@ fn routines_query(selected: Option<&[i64]>) -> String {
                  WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
                    AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
                    AND d.deptype = 'e')
-         SELECT {columns} p.pronamespace::int8 AS namespace,
+         SELECT {columns} p.oid::int8 AS oid,
                 n.nspname AS schema_name,
                 p.proname AS name,
                 pg_catalog.to_jsonb(ARRAY(
@@ -221,9 +222,7 @@ async fn read_under_canonical_path(
             .zip(&routines)
             .map(|(row, routine)| {
                 Ok(pbps_model::TypeRoutine {
-                    oid: row
-                        .try_get::<i64>("oid")?
-                        .ok_or_else(|| null_column("oid"))?,
+                    oid: routine.oid,
                     schema: routine.schema.clone(),
                     name: routine.name.clone(),
                     arguments: routine.args.clone(),
@@ -248,9 +247,9 @@ fn routine(row: &Row) -> Result<Routine, DbError> {
     let args: Vec<String> = serde_json::from_str(&args)
         .map_err(|e| DbError::BadRow(format!("a routine's argument list is not JSON: {e}")))?;
     Ok(Routine {
-        namespace: row
-            .try_get::<i64>("namespace")?
-            .ok_or_else(|| null_column("namespace"))?,
+        oid: row
+            .try_get::<i64>("oid")?
+            .ok_or_else(|| null_column("oid"))?,
         schema: text(row, "schema_name")?,
         name: text(row, "name")?,
         args,
