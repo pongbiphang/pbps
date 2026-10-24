@@ -34,6 +34,42 @@ fn verification(observed: &Observation) -> &Verification {
 
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn hidden_temporal_columns_fall_back_under_object_only_visibility() {
+    fixture(DependencyKind::Table, true, |case| async move {
+        let mut owner = connection(&case.other).await;
+        owner.execute("ALTER TABLE dbo.dep2323 ADD CONSTRAINT pk2323 PRIMARY KEY(id); ALTER TABLE dbo.dep2323 ADD period_start datetime2(7) GENERATED ALWAYS AS ROW START HIDDEN NOT NULL DEFAULT SYSUTCDATETIME(), period_end datetime2(7) GENERATED ALWAYS AS ROW END HIDDEN NOT NULL DEFAULT CONVERT(datetime2(7),N'9999-12-31 23:59:59.9999999'), PERIOD FOR SYSTEM_TIME(period_start,period_end); ALTER TABLE dbo.dep2323 SET (SYSTEM_VERSIONING=ON (HISTORY_TABLE=dbo.history2323));").await.unwrap();
+        let periods = owner.query("SELECT generated_always_type,is_hidden FROM sys.columns WHERE object_id=OBJECT_ID(N'dbo.dep2323') AND name IN(N'period_start',N'period_end') ORDER BY generated_always_type;").await.unwrap();
+        assert_eq!(periods.len(), 2);
+        for (row, generated) in periods.iter().zip([1_u8, 2]) {
+            assert_eq!(row.try_get::<u8>("generated_always_type").unwrap(), Some(generated));
+            assert_eq!(row.try_get::<bool>("is_hidden").unwrap(), Some(true));
+        }
+        let temporal = owner.query("SELECT temporal_type FROM sys.tables WHERE object_id=OBJECT_ID(N'dbo.dep2323');").await.unwrap();
+        assert_eq!(temporal[0].try_get::<u8>("temporal_type").unwrap(), Some(2));
+        grant_catalog(&case, false).await;
+        let permissions = connection(&format!("{};Database={}",case.target,case.other_name)).await.query("SELECT HAS_PERMS_BY_NAME(DB_NAME(),N'DATABASE',N'VIEW DEFINITION') AS database_definition,HAS_PERMS_BY_NAME(N'dbo.dep2323',N'OBJECT',N'VIEW DEFINITION') AS object_definition,HAS_PERMS_BY_NAME(N'dbo.dep2323',N'OBJECT',N'SELECT') AS data_read;").await.unwrap();
+        for (permission, expected) in [("database_definition",0),("object_definition",1),("data_read",0)] {
+            assert_eq!(permissions[0].try_get::<i32>(permission).unwrap(), Some(expected));
+        }
+        let mut shapes = declarations(&case.other_name, DependencyKind::Table);
+        for name in ["period_start", "period_end"] {
+            shapes.values_mut().next().unwrap().columns.insert(name.into(), DependencyColumn {
+                ty: "datetime2(7)".parse().unwrap(), nullable: false,
+            });
+        }
+        let probe = format!("CREATE VIEW dbo.visible_period2323 AS SELECT id,name FROM [{}].dbo.dep2323;",case.other_name);
+        let result = prepare_probe(&case, &case.scratch_server, shapes, Some(probe)).await.unwrap();
+        assert!(result.rehearsals.values().all(|r| matches!(r, Rehearsal::CompanionRendered { source: ShapeSource::Catalog, .. })));
+        assert!(matches!(verification(&result), Verification::PartiallyUnverified { limitation: Limitation::Replay { object, code: None, reason } } if object.database==case.other_name && object.schema=="dbo" && object.name=="dep2323" && reason.contains("generated, hidden")), "{:?}",verification(&result));
+        assert_eq!(result.write_error, None);
+        assert_eq!(result.kind, "U");
+        assert_eq!(result.columns.len(), 4);
+        assert_eq!(result.private_tables, 0);
+    }).await;
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn readable_nested_views_preserve_multi_base_write_refusal() {
     fixture(DependencyKind::View, false, |case| async move {
         let mut owner = connection(&case.other).await;

@@ -219,7 +219,7 @@ async fn prepare_probe(
         let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else { panic!("wrong engine"); };
         // This connection is the companion's managed scratch, never target.
         let write_error = if let Some(sql) = write_probe {
-            prepared.compile.execute(&sql).await.err().and_then(|e| e.server_error_code())
+            prepared.compile.execute(&sql).await.err().map(|e| e.server_error_code().unwrap_or_else(|| e.to_string()))
         } else { None };
         prepared.compile.execute(&format!("CREATE VIEW dbo.rehearsed2323 AS SELECT * FROM [{database}].dbo.dep2323;")).await.unwrap();
         let scope = capture::CaptureScope {

@@ -4333,3 +4333,11 @@ expected relation exists before committing it. Otherwise roll back that DDL
 and retain the replay limitation before building the fallback. This keeps an
 unexpected CREATE name from leaving an untracked support view; the target
 still receives catalog reads only.
+
+Output-shape fallback materializes unsupported generated, hidden, sparse,
+column-set, graph and masked columns as ordinary columns, retaining their
+native output type, collation and nullability. Alias columns use their readable
+native base type, and incomplete identity metadata omits identity rather than
+guessing its specification. Strict replay still refuses unsupported facets;
+fallback retains that original replay limitation and never grants verification.
+Unreadable native types and unsafe collation names still refuse rendering.

@@ -11,6 +11,7 @@ pub(super) struct Column {
     pub name: String,
     pub column_id: i32,
     pub type_name: String,
+    pub system_type_name: Option<String>,
     pub type_schema: String,
     pub user_defined: bool,
     pub max_length: i16,
@@ -27,6 +28,10 @@ pub(super) struct Column {
     pub not_for_replication: Option<bool>,
     pub generated_always: u8,
     pub hidden: bool,
+    pub sparse: bool,
+    pub column_set: bool,
+    pub graph_type: Option<u8>,
+    pub masked: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -84,11 +89,13 @@ fn relation_query(name: &ObjectName) -> String {
 CONVERT(bit,COALESCE(HAS_PERMS_BY_NAME({local},N'OBJECT',N'VIEW DEFINITION'),0)) AS readable,
 m.definition,m.uses_ansi_nulls AS ansi_nulls,m.uses_quoted_identifier AS quoted_identifier,m.is_schema_bound AS schema_bound,
 JSON_QUERY(COALESCE((SELECT c.name,c.column_id,t.name AS type_name,s.name AS type_schema,
+TYPE_NAME(c.system_type_id) AS system_type_name,
 t.is_user_defined AS user_defined,c.max_length,c.precision,c.scale,c.collation_name AS collation,
 c.is_nullable AS nullable,c.is_identity AS [identity],c.is_computed AS computed,
 cc.definition AS computed_definition,cc.is_persisted AS persisted,
 CONVERT(nvarchar(100),ic.seed_value) AS seed,CONVERT(nvarchar(100),ic.increment_value) AS increment,
-ic.is_not_for_replication AS not_for_replication,c.generated_always_type AS generated_always,c.is_hidden AS hidden
+ic.is_not_for_replication AS not_for_replication,c.generated_always_type AS generated_always,c.is_hidden AS hidden,
+c.is_sparse AS sparse,c.is_column_set AS column_set,c.graph_type,c.is_masked AS masked
 FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id
 JOIN sys.schemas s ON s.schema_id=t.schema_id
 LEFT JOIN sys.computed_columns cc ON cc.object_id=c.object_id AND cc.column_id=c.column_id

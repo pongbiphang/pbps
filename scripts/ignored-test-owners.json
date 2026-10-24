@@ -2132,6 +2132,7 @@
         "resolver::server::scratch::mssql_live_tests::same_instance2270::another_instance_does_not_require_file_consent",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_automatic_externals_use_catalog_rendering_only",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_nested_views_preserve_multi_base_write_refusal",
+        "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::hidden_temporal_columns_fall_back_under_object_only_visibility",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::readable_computed_columns_preserve_write_refusal",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::object_only_visibility_names_hidden_inner_views_and_tables",
         "resolver::server::scratch::mssql_live_tests::dependencies2323::closure::union_lineage_falls_back_without_claiming_verification",

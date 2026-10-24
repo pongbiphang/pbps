@@ -17,6 +17,19 @@ fn invalid(reason: &str) -> DbError {
 
 fn column_sql(column: &catalog::Column, output_shape: bool) -> Result<String, DbError> {
     let name = ident(&column.name);
+    if !output_shape
+        && (column.generated_always != 0
+            || column.hidden
+            || column.user_defined
+            || column.sparse
+            || column.column_set
+            || column.graph_type.is_some()
+            || column.masked)
+    {
+        return Err(invalid(
+            "generated, hidden, user-defined, sparse, column-set, graph or masked columns have no V4 template",
+        ));
+    }
     if column.computed && !output_shape {
         let expression = column
             .computed_definition
@@ -31,13 +44,18 @@ fn column_sql(column: &catalog::Column, output_shape: bool) -> Result<String, Db
             }
         ));
     }
-    if column.generated_always != 0 || column.hidden || column.user_defined {
-        return Err(invalid(
-            "generated, hidden or user-defined columns have no V4 template",
-        ));
-    }
+    // A fallback keeps output metadata without claiming to reproduce these
+    // facets. Alias types need their native base, not an absent scratch type.
+    let type_name = if output_shape && column.user_defined {
+        column
+            .system_type_name
+            .as_deref()
+            .ok_or_else(|| invalid("the user-defined type's native base is unreadable"))?
+    } else {
+        &column.type_name
+    };
     let ty = crate::introspect::catalog_column_type(
-        &column.type_name,
+        type_name,
         column.max_length,
         column.precision,
         column.scale,
@@ -55,30 +73,47 @@ fn column_sql(column: &catalog::Column, output_shape: bool) -> Result<String, Db
         Some(_) => return Err(invalid("invalid catalog collation")),
         None => String::new(),
     };
-    let identity = if column.identity {
-        let seed = column.seed.as_deref().unwrap_or("1");
-        let increment = column.increment.as_deref().unwrap_or("1");
-        seed.parse::<i128>()
-            .map_err(|_| invalid("invalid identity seed"))?;
-        increment
-            .parse::<i128>()
-            .map_err(|_| invalid("invalid identity increment"))?;
-        format!(
-            " IDENTITY({seed},{increment}){}",
-            if column.not_for_replication == Some(true) {
-                " NOT FOR REPLICATION"
-            } else {
-                ""
-            }
-        )
+    let identity = identity_sql(column);
+    // Incomplete identity metadata must not prevent an ordinary output shape.
+    // The strict replay error remains the dependency's verification limitation.
+    let identity = if output_shape {
+        identity.unwrap_or_default()
     } else {
-        String::new()
+        identity?
     };
     Ok(format!(
         "{name} {}{collation}{identity} {}",
         ty.raw(),
         if column.nullable { "NULL" } else { "NOT NULL" }
     ))
+}
+
+fn identity_sql(column: &catalog::Column) -> Result<String, DbError> {
+    if column.identity {
+        let seed = column
+            .seed
+            .as_deref()
+            .ok_or_else(|| invalid("identity seed is unreadable"))?;
+        let increment = column
+            .increment
+            .as_deref()
+            .ok_or_else(|| invalid("identity increment is unreadable"))?;
+        seed.parse::<i128>()
+            .map_err(|_| invalid("invalid identity seed"))?;
+        increment
+            .parse::<i128>()
+            .map_err(|_| invalid("invalid identity increment"))?;
+        Ok(format!(
+            " IDENTITY({seed},{increment}){}",
+            if column.not_for_replication == Some(true) {
+                " NOT FOR REPLICATION"
+            } else {
+                ""
+            }
+        ))
+    } else {
+        Ok(String::new())
+    }
 }
 
 fn table_sql(
@@ -593,7 +628,8 @@ mod tests {
             "name":"c]", "column_id":1,"type_name":"nvarchar","type_schema":"sys","user_defined":false,
             "max_length":100,"precision":0,"scale":0,"collation":"Latin1_General_BIN2","nullable":false,
             "identity":false,"computed":false,"computed_definition":null,"persisted":null,"seed":null,
-            "increment":null,"not_for_replication":null,"generated_always":0,"hidden":false
+            "increment":null,"not_for_replication":null,"generated_always":0,"hidden":false,
+            "system_type_name":"nvarchar","sparse":false,"column_set":false,"graph_type":null,"masked":false
         })).unwrap()
     }
 
@@ -635,6 +671,145 @@ mod tests {
         );
         c.hidden = true;
         assert!(column_sql(&c, false).is_err());
+    }
+
+    fn ordinary_fallback(c: &catalog::Column, expected: &str) {
+        assert!(
+            column_sql(c, false).is_err(),
+            "strict replay accepted {c:?}"
+        );
+        assert_eq!(column_sql(c, true).unwrap(), expected);
+    }
+
+    #[test]
+    fn every_generated_always_kind_and_hidden_column_has_an_ordinary_fallback() {
+        for generated in 1..=u8::MAX {
+            let mut c = column();
+            c.generated_always = generated;
+            ordinary_fallback(
+                &c,
+                "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+            );
+        }
+        let mut c = column();
+        c.hidden = true;
+        ordinary_fallback(
+            &c,
+            "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+        );
+    }
+
+    #[test]
+    fn sparse_columns_have_an_ordinary_nullable_fallback() {
+        let mut c = column();
+        c.sparse = true;
+        c.nullable = true;
+        ordinary_fallback(&c, "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NULL");
+    }
+
+    #[test]
+    fn column_sets_have_an_ordinary_xml_fallback() {
+        let mut c = column();
+        c.column_set = true;
+        c.type_name = "xml".into();
+        c.collation = None;
+        c.nullable = true;
+        ordinary_fallback(&c, "[c]]] xml NULL");
+    }
+
+    #[test]
+    fn graph_pseudo_columns_do_not_need_a_computed_expression_for_fallback() {
+        for graph_type in 1..=u8::MAX {
+            let mut c = column();
+            c.graph_type = Some(graph_type);
+            c.computed = true;
+            c.computed_definition = Some("(1)".into());
+            ordinary_fallback(
+                &c,
+                "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+            );
+            c.computed_definition = None;
+            ordinary_fallback(
+                &c,
+                "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+            );
+        }
+    }
+
+    #[test]
+    fn masked_columns_keep_their_output_type_and_collation_in_fallback() {
+        let mut c = column();
+        c.masked = true;
+        ordinary_fallback(
+            &c,
+            "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+        );
+    }
+
+    #[test]
+    fn alias_columns_use_their_native_base_in_fallback_without_replaying_the_alias() {
+        let mut c = column();
+        c.user_defined = true;
+        c.type_schema = "custom".into();
+        c.type_name = "alias2323".into();
+        ordinary_fallback(
+            &c,
+            "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+        );
+        c.system_type_name = None;
+        assert!(column_sql(&c, true).is_err());
+    }
+
+    #[test]
+    fn unavailable_identity_facets_fall_back_without_guessing_seed_or_increment() {
+        for (seed, increment) in [
+            (None, Some("2")),
+            (Some("7"), None),
+            (Some("1); DROP TABLE t;"), Some("2")),
+            (Some("7"), Some("bad")),
+        ] {
+            let mut c = column();
+            c.type_name = "int".into();
+            c.collation = None;
+            c.identity = true;
+            c.seed = seed.map(str::to_owned);
+            c.increment = increment.map(str::to_owned);
+            ordinary_fallback(&c, "[c]]] int NOT NULL");
+        }
+        let mut c = column();
+        c.type_name = "int".into();
+        c.collation = None;
+        c.identity = true;
+        c.seed = Some("7".into());
+        c.increment = Some("2".into());
+        assert_eq!(
+            column_sql(&c, true).unwrap(),
+            "[c]]] int IDENTITY(7,2) NOT NULL"
+        );
+    }
+
+    #[test]
+    fn unreadable_computed_expressions_materialize_only_the_output_metadata() {
+        let mut c = column();
+        c.computed = true;
+        ordinary_fallback(
+            &c,
+            "[c]]] nvarchar(50) COLLATE Latin1_General_BIN2 NOT NULL",
+        );
+    }
+
+    #[test]
+    fn fallback_still_refuses_unsafe_collations_and_unknown_native_types() {
+        let mut c = column();
+        c.collation = Some("Latin1_General_BIN2; DROP TABLE t;".into());
+        for output_shape in [false, true] {
+            assert!(column_sql(&c, output_shape).is_err());
+        }
+        c.collation = None;
+        c.type_name = "unknown2323".into();
+        for output_shape in [false, true] {
+            assert!(column_sql(&c, output_shape).is_err());
+        }
     }
 
     #[test]
