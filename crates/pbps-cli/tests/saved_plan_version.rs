@@ -211,3 +211,45 @@ fn ordinary_current_artifacts_keep_their_checksum_and_approval_gate() {
         "{diagnostic}"
     );
 }
+
+/// Version 50 retains schema-set routine pins while adding cross-database
+/// shape pins (DEC-2322.1). Its `routine_pins` no longer decodes, and the
+/// refusal must name the old version and replan remedy (DEC-2333.1).
+#[test]
+fn a_v50_schema_pin_plan_is_refused_before_target_contact() {
+    let plan = SavedPlan::new(
+        PlanOrigin::Database,
+        "mssql",
+        "fixture",
+        PlanBaseline {
+            time_zone: None,
+            description: "fixture".into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        ChangeSet::default(),
+        IdsFile::default(),
+    );
+    let mut value = serde_json::to_value(&plan).unwrap();
+    value["version"] = serde_json::json!(50);
+    value["routine_pins"] = serde_json::json!({
+        "key_id": "0011223344556677",
+        "server_version": "180006",
+        "schemas": [{
+            "namespace": 2200,
+            "schema": "ext",
+            "routines": 1,
+            "digest": "ab".repeat(32),
+        }],
+    });
+    let raw = serde_json::to_string_pretty(&value).unwrap();
+    for command in ["text", "json", "apply"] {
+        let diagnostic = refused(&Artifact::new(&raw).run(command, &"00".repeat(32)));
+        assert!(
+            diagnostic.contains("version 50 plan"),
+            "{command}: {diagnostic}"
+        );
+        assert!(diagnostic.contains("pbps plan --db"), "{diagnostic}");
+        assert!(!diagnostic.contains("not a pbps plan"), "{diagnostic}");
+    }
+}

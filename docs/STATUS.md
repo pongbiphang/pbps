@@ -342,8 +342,9 @@ connecting (#616).
 
 Every PostgreSQL plan pins the routines outside its managed set that a role
 short of a superuser can replace (DEC-319.1, #319). The pins are one HMAC per
-schema under the environment's key, sealed into the plan with the key
-identifier. `apply` refuses a changed pin before the probes, before the first
+routine under the environment's key in plan format 51 (DEC-2333.1), sealed
+into the plan with the key identifier, and a refusal names each routine that
+changed. `apply` refuses a changed pin before the probes, before the first
 statement and before recording, and a staged run checks before and after each
 step. Open follow-ups: #984 (SQL Server), #989 (narrower pin sets for keyless
 environments), #994 (managed routines' owner and ACL) and #995 (NULL versus

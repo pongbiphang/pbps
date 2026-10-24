@@ -14,13 +14,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, bail};
 use pbps_db::fingerprint::FingerprintKey;
 use pbps_db::{Conn, Driver};
-use pbps_model::{ModuleId, RoutineArg, RoutineId, RoutinePins, SchemaPin, TableName};
+use pbps_model::escape::Escaped;
+use pbps_model::{ModuleId, RoutineArg, RoutineId, RoutinePin, RoutinePins, TableName};
 
 use crate::db::Target;
 use pbps_config::Project;
 
-/// The versioned rule every pin digest is made under.
-const RULE: &str = "pbps/external-routine-pin/v1";
+/// The versioned rule every pin digest is made under. v2 is one digest per
+/// routine (DEC-2333.1); a v1 digest covered a schema's routines together.
+const RULE: &str = "pbps/external-routine-pin/v2";
 
 /// Where a check runs, which decides how it reads and what its refusal says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,8 +200,8 @@ pub async fn seal(
     let read = pbps_pg::pins::read(conn, pbps_pg::pins::Within::OwnTransaction)
         .await
         .context("could not read the routines this plan pins (DEC-319.1)")?;
-    let schemas = unmanaged_by_schema(read.routines, managed);
-    if schemas.is_empty() {
+    let routines = unmanaged(read.routines, managed);
+    if routines.is_empty() {
         return Ok(None);
     }
     let key = key(project, target).map_err(|why| {
@@ -210,13 +212,13 @@ pub async fn seal(
              with `pbps key generate`, give it to this environment as `fingerprint_key_env` \
              or `fingerprint_key_file` in pbps.yml, and plan again.",
             target.label,
-            schema_names(&schemas)
+            schema_names(&routines)
         )
     })?;
     Ok(Some(RoutinePins {
         key_id: key.id().as_str().to_owned(),
         server_version: read.server_version,
-        schemas: digests(&key, &schemas),
+        routines: digests(&key, &routines),
     }))
 }
 
@@ -276,7 +278,7 @@ pub async fn check(
                 at.when()
             )
         })?;
-    let now = unmanaged_by_schema(read.routines, &managed.modules);
+    let now = unmanaged(read.routines, &managed.modules);
     let refuse = |what: String| -> anyhow::Error {
         anyhow::anyhow!(
             "{what}, found {} on `{}`.\nA routine this plan can run was changed after the plan \
@@ -292,8 +294,12 @@ pub async fn check(
         }
         return Err(refuse(format!(
             "the plan pinned no routine, and {} now holds routines a role short of a \
-             superuser can replace",
-            schema_names(&now)
+             superuser can replace: {}",
+            schema_names(&now),
+            Differences {
+                added: now.values().map(|r| r.signature.clone()).collect(),
+                ..Differences::default()
+            }
         )));
     };
     if read.server_version != pins.server_version {
@@ -320,15 +326,11 @@ pub async fn check(
             key.id()
         );
     }
-    let recomputed = digests(&key, &now);
-    let changed = differing(&pins.schemas, &recomputed);
+    let changed = differing(&pins.routines, &digests(&key, &now));
     if changed.is_empty() {
         return Ok(());
     }
-    Err(refuse(format!(
-        "pinned routines changed in {}",
-        changed.join(", ")
-    )))
+    Err(refuse(format!("pinned routines changed: {changed}")))
 }
 
 /// Seal reviewed roots with the same canonical catalog rows and HMAC as
@@ -360,7 +362,7 @@ pub async fn seal_selected(
     let pins = RoutinePins {
         key_id: key.id().as_str().to_owned(),
         server_version: read.server_version,
-        schemas: digests(&key, &unmanaged_by_schema(read.routines, &BTreeSet::new())),
+        routines: digests(&key, &unmanaged(read.routines, &BTreeSet::new())),
     };
     Ok((sources, Some(pins)))
 }
@@ -396,14 +398,20 @@ async fn check_selected(
     let (read, sources) =
         pbps_pg::pins::selected(conn, at.within(), &roots.into_iter().collect::<Vec<_>>()).await?;
     let key = key(project, target).map_err(anyhow::Error::msg)?;
-    let now = digests(&key, &unmanaged_by_schema(read.routines, &BTreeSet::new()));
+    let now = digests(&key, &unmanaged(read.routines, &BTreeSet::new()));
+    let changed = differing(&pins.routines, &now);
     if pins.key_id != key.id().as_str()
         || pins.server_version != read.server_version
-        || pins.schemas != now
+        || !changed.is_empty()
         || sources != plan.type_routines
     {
+        let which = if changed.is_empty() {
+            String::new()
+        } else {
+            format!(": {changed}")
+        };
         bail!(
-            "reviewed type routines changed, found {} on `{}`; plan again (DEC-2181.2)",
+            "reviewed type routines changed{which}, found {} on `{}`; plan again (DEC-2181.2)",
             at.when(),
             target.label
         );
@@ -430,24 +438,63 @@ pub fn reviewed_sources(routines: &[pbps_model::TypeRoutine]) -> String {
     out
 }
 
-/// Each schema's routines that the plan does not manage, as the canonical
-/// inputs of their pins.
-fn unmanaged_by_schema(
+/// One routine in the pin set, ready to be digested.
+struct Unmanaged {
+    schema: String,
+    /// Schema-qualified name and argument types, for messages (see
+    /// [`signature`]).
+    signature: String,
+    /// The canonical catalog row the digest is made over.
+    input: String,
+}
+
+/// The routines that the plan does not manage, keyed by `pg_proc.oid`.
+fn unmanaged(
     routines: Vec<pbps_pg::pins::Routine>,
     managed: &BTreeSet<ModuleId>,
-) -> BTreeMap<i64, (String, Vec<String>)> {
-    let mut schemas: BTreeMap<i64, (String, Vec<String>)> = BTreeMap::new();
-    for routine in routines {
-        if is_managed(&routine, managed) {
-            continue;
-        }
-        schemas
-            .entry(routine.namespace)
-            .or_insert_with(|| (routine.schema.clone(), Vec::new()))
-            .1
-            .push(routine.input);
+) -> BTreeMap<i64, Unmanaged> {
+    routines
+        .into_iter()
+        .filter(|routine| !is_managed(routine, managed))
+        .map(|routine| {
+            (
+                routine.oid,
+                Unmanaged {
+                    signature: signature(&routine),
+                    schema: routine.schema,
+                    input: routine.input,
+                },
+            )
+        })
+        .collect()
+}
+
+/// The routine's identity as the model spells it, so that overloads differ and
+/// a name is escaped once, where it is shown. An argument list the model's
+/// identity cannot hold still gets a signature, joined as the catalog gave it.
+fn signature(routine: &pbps_pg::pins::Routine) -> String {
+    match routine_id(routine) {
+        Some(id) => id.raw().to_string(),
+        None => format!(
+            "{}.{}({})",
+            routine.schema,
+            routine.name,
+            routine.args.join(",")
+        ),
     }
-    schemas
+}
+
+fn routine_id(routine: &pbps_pg::pins::Routine) -> Option<RoutineId> {
+    let args = routine
+        .args
+        .iter()
+        .map(|a| a.parse::<RoutineArg>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    Some(RoutineId::new(
+        TableName::new(&routine.schema, &routine.name),
+        args,
+    ))
 }
 
 /// Whether the plan manages this routine, by the identity the pull gives it.
@@ -456,69 +503,94 @@ fn unmanaged_by_schema(
 /// be a managed routine's, so it is pinned: a failure to match errs towards
 /// pinning, never towards leaving out.
 fn is_managed(routine: &pbps_pg::pins::Routine, managed: &BTreeSet<ModuleId>) -> bool {
-    let Ok(args) = routine
-        .args
-        .iter()
-        .map(|a| a.parse::<RoutineArg>())
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return false;
-    };
-    managed.contains(&ModuleId::Routine(RoutineId::new(
-        TableName::new(&routine.schema, &routine.name),
-        args,
-    )))
+    routine_id(routine).is_some_and(|id| managed.contains(&ModuleId::Routine(id)))
 }
 
-fn digests(key: &FingerprintKey, schemas: &BTreeMap<i64, (String, Vec<String>)>) -> Vec<SchemaPin> {
-    schemas
+/// One digest per routine. The OID is a component beside the input, which
+/// carries it too, so a digest cannot be moved to another entry.
+fn digests(key: &FingerprintKey, routines: &BTreeMap<i64, Unmanaged>) -> BTreeMap<i64, RoutinePin> {
+    routines
         .iter()
-        .map(|(namespace, (schema, inputs))| {
-            let component = namespace.to_string();
-            let mut parts: Vec<&[u8]> = vec![RULE.as_bytes(), component.as_bytes()];
-            parts.extend(inputs.iter().map(|i| i.as_bytes()));
-            let mac = key.mac(&parts);
-            SchemaPin {
-                namespace: *namespace,
-                schema: schema.clone(),
-                routines: inputs.len(),
-                digest: mac.iter().map(|b| format!("{b:02x}")).collect(),
-            }
+        .map(|(oid, routine)| {
+            let component = oid.to_string();
+            let mac = key.mac(&[
+                RULE.as_bytes(),
+                component.as_bytes(),
+                routine.input.as_bytes(),
+            ]);
+            (
+                *oid,
+                RoutinePin {
+                    signature: routine.signature.clone(),
+                    digest: mac.iter().map(|b| format!("{b:02x}")).collect(),
+                },
+            )
         })
         .collect()
 }
 
-/// The schemas whose pins differ, named as the plan recorded them or, for one
-/// the plan never saw, as the catalog has it now.
-fn differing(planned: &[SchemaPin], now: &[SchemaPin]) -> Vec<String> {
-    let planned: BTreeMap<i64, &SchemaPin> = planned.iter().map(|p| (p.namespace, p)).collect();
-    let now: BTreeMap<i64, &SchemaPin> = now.iter().map(|p| (p.namespace, p)).collect();
-    let mut changed = Vec::new();
-    for namespace in planned.keys().chain(now.keys()).collect::<BTreeSet<_>>() {
-        match (planned.get(namespace), now.get(namespace)) {
-            (Some(p), Some(n)) if p.digest == n.digest && p.routines == n.routines => {}
-            (Some(p), Some(n)) => changed.push(format!(
-                "`{}` ({} routine(s) pinned, {} now)",
-                p.schema, p.routines, n.routines
-            )),
-            (Some(p), None) => changed.push(format!(
-                "`{}` (its {} pinned routine(s) are gone from the set)",
-                p.schema, p.routines
-            )),
-            (None, Some(n)) => changed.push(format!(
-                "`{}` ({} routine(s) the plan never pinned)",
-                n.schema, n.routines
-            )),
-            (None, None) => unreachable!("the key came from one of the two maps"),
-        }
-    }
-    changed
+/// What differs between the pinned routines and the ones found now.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Differences {
+    /// Pinned, present, and digested differently.
+    changed: Vec<String>,
+    /// Present now and never pinned.
+    added: Vec<String>,
+    /// Pinned and gone from the set.
+    removed: Vec<String>,
 }
 
-fn schema_names(schemas: &BTreeMap<i64, (String, Vec<String>)>) -> String {
+impl Differences {
+    fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+impl std::fmt::Display for Differences {
+    /// Every routine, named as the plan recorded it or, for one the plan never
+    /// saw, as the catalog has it now. A signature is shown escaped.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        for (what, names) in [
+            ("changed", &self.changed),
+            ("added", &self.added),
+            ("removed", &self.removed),
+        ] {
+            if !names.is_empty() {
+                let names: Vec<_> = names.iter().map(|n| format!("`{}`", Escaped(n))).collect();
+                parts.push(format!("{what} {}", names.join(", ")));
+            }
+        }
+        f.write_str(&parts.join("; "))
+    }
+}
+
+fn differing(planned: &BTreeMap<i64, RoutinePin>, now: &BTreeMap<i64, RoutinePin>) -> Differences {
+    let mut found = Differences::default();
+    for (oid, pin) in planned {
+        match now.get(oid) {
+            Some(current) if current.digest == pin.digest => {}
+            Some(_) => found.changed.push(pin.signature.clone()),
+            None => found.removed.push(pin.signature.clone()),
+        }
+    }
+    for (oid, current) in now {
+        if !planned.contains_key(oid) {
+            found.added.push(current.signature.clone());
+        }
+    }
+    found
+}
+
+/// The schemas holding pinned routines, with a count each.
+fn schema_names(routines: &BTreeMap<i64, Unmanaged>) -> String {
+    let mut schemas: BTreeMap<&str, usize> = BTreeMap::new();
+    for routine in routines.values() {
+        *schemas.entry(&routine.schema).or_default() += 1;
+    }
     schemas
-        .values()
-        .map(|(schema, inputs)| format!("`{schema}` ({})", inputs.len()))
+        .into_iter()
+        .map(|(schema, n)| format!("`{}` ({n})", Escaped(schema)))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -552,14 +624,14 @@ mod tests {
     use super::*;
 
     fn routine(
-        namespace: i64,
+        oid: i64,
         schema: &str,
         name: &str,
         args: &[&str],
         input: &str,
     ) -> pbps_pg::pins::Routine {
         pbps_pg::pins::Routine {
-            namespace,
+            oid,
             schema: schema.to_owned(),
             name: name.to_owned(),
             args: args.iter().map(|a| (*a).to_owned()).collect(),
@@ -576,8 +648,15 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
-    fn pins(key: &FingerprintKey, routines: Vec<pbps_pg::pins::Routine>) -> Vec<SchemaPin> {
-        digests(key, &unmanaged_by_schema(routines, &BTreeSet::new()))
+    fn pins(
+        key: &FingerprintKey,
+        routines: Vec<pbps_pg::pins::Routine>,
+    ) -> BTreeMap<i64, RoutinePin> {
+        digests(key, &unmanaged(routines, &BTreeSet::new()))
+    }
+
+    fn named(planned: &BTreeMap<i64, RoutinePin>, now: &BTreeMap<i64, RoutinePin>) -> String {
+        differing(planned, now).to_string()
     }
 
     #[test]
@@ -587,11 +666,11 @@ mod tests {
             vec!["integer".parse().unwrap()],
         ))]
         .into();
-        let schemas = unmanaged_by_schema(
+        let found = unmanaged(
             vec![
                 routine(1, "app", "f", &["integer"], "managed"),
                 routine(
-                    1,
+                    2,
                     "app",
                     "f",
                     &["text"],
@@ -600,7 +679,8 @@ mod tests {
             ],
             &managed,
         );
-        assert_eq!(schemas[&1].1, vec!["an overload the plan does not manage"]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), [&2]);
+        assert_eq!(found[&2].input, "an overload the plan does not manage");
     }
 
     #[test]
@@ -612,44 +692,50 @@ mod tests {
         .into();
         let odd = routine(1, "app", "f", &[""], "unparseable");
         assert!(!is_managed(&odd, &managed));
+        assert_eq!(unmanaged(vec![odd], &managed)[&1].signature, "app.f()");
     }
 
     #[test]
-    fn any_change_to_a_routine_input_changes_its_schemas_pin_and_no_other() {
+    fn one_changed_routine_among_several_is_the_only_one_named() {
         let k = key(7);
         let before = pins(
             &k,
             vec![
-                routine(1, "a", "f", &[], "one"),
-                routine(2, "b", "g", &[], "two"),
+                routine(1, "ext", "f", &[], "one"),
+                routine(2, "ext", "g", &[], "two"),
+                routine(3, "other", "h", &[], "three"),
             ],
         );
         let after = pins(
             &k,
             vec![
-                routine(1, "a", "f", &[], "one"),
-                routine(2, "b", "g", &[], "TWO"),
+                routine(1, "ext", "f", &[], "one"),
+                routine(2, "ext", "g", &[], "TWO"),
+                routine(3, "other", "h", &[], "three"),
             ],
         );
-        assert_eq!(
-            differing(&before, &after),
-            vec!["`b` (1 routine(s) pinned, 1 now)"]
-        );
+        assert_eq!(named(&before, &after), "changed `ext.g()`");
         assert!(differing(&before, &before).is_empty());
     }
 
     #[test]
-    fn a_routine_arriving_or_leaving_is_a_change() {
+    fn an_added_and_a_removed_routine_are_each_named() {
         let k = key(7);
         let one = pins(&k, vec![routine(1, "a", "f", &[], "one")]);
         let two = pins(
             &k,
             vec![
                 routine(1, "a", "f", &[], "one"),
-                routine(1, "a", "g", &[], "two"),
+                routine(2, "a", "g", &[], "two"),
             ],
         );
-        assert_eq!(differing(&one, &two).len(), 1);
+        assert_eq!(named(&one, &two), "added `a.g()`");
+        assert_eq!(named(&two, &one), "removed `a.g()`");
+        assert_eq!(
+            named(&one, &BTreeMap::new()),
+            "removed `a.f()`",
+            "a schema that lost its last routine still names it"
+        );
         let elsewhere = pins(
             &k,
             vec![
@@ -657,42 +743,104 @@ mod tests {
                 routine(3, "c", "h", &[], "new"),
             ],
         );
-        assert_eq!(
-            differing(&one, &elsewhere),
-            vec!["`c` (1 routine(s) the plan never pinned)"]
+        assert_eq!(named(&one, &elsewhere), "added `c.h()`");
+    }
+
+    #[test]
+    fn every_kind_of_difference_is_listed_in_one_sentence() {
+        let k = key(7);
+        let before = pins(
+            &k,
+            vec![
+                routine(1, "a", "f", &[], "one"),
+                routine(2, "a", "g", &[], "two"),
+                routine(3, "a", "h", &[], "three"),
+            ],
+        );
+        let after = pins(
+            &k,
+            vec![
+                routine(1, "a", "f", &[], "ONE"),
+                routine(3, "a", "h", &[], "three"),
+                routine(4, "a", "i", &[], "four"),
+            ],
         );
         assert_eq!(
-            differing(&one, &[]),
-            vec!["`a` (its 1 pinned routine(s) are gone from the set)"]
+            named(&before, &after),
+            "changed `a.f()`; added `a.i()`; removed `a.g()`"
         );
     }
 
     #[test]
-    fn moving_the_boundary_between_two_routine_inputs_changes_the_pin() {
+    fn an_overload_changing_is_named_by_its_own_signature() {
+        let k = key(7);
+        let rows = |text_body: &str| {
+            vec![
+                routine(1, "app", "f", &["integer"], "int body"),
+                routine(2, "app", "f", &["text"], text_body),
+                routine(3, "app", "f", &["integer", "text"], "pair body"),
+            ]
+        };
+        assert_eq!(
+            named(&pins(&k, rows("old")), &pins(&k, rows("new"))),
+            "changed `app.f(text)`"
+        );
+    }
+
+    #[test]
+    fn a_routine_replaced_under_the_same_signature_reads_as_removed_and_added() {
+        let k = key(7);
+        let before = pins(&k, vec![routine(1, "a", "f", &["integer"], "one")]);
+        let after = pins(&k, vec![routine(9, "a", "f", &["integer"], "one")]);
+        assert_eq!(
+            named(&before, &after),
+            "added `a.f(integer)`; removed `a.f(integer)`"
+        );
+    }
+
+    #[test]
+    fn a_signature_that_carries_a_line_break_is_shown_escaped() {
+        let k = key(7);
+        let before = pins(&k, vec![routine(1, "a", "f\nforged: ok", &[], "one")]);
+        let shown = named(&before, &BTreeMap::new());
+        assert!(!shown.contains('\n'), "{shown}");
+        assert!(shown.contains("\\n"), "{shown}");
+    }
+
+    #[test]
+    fn moving_the_boundary_between_two_routine_inputs_changes_neither_pin_into_the_other() {
         let k = key(7);
         let split = pins(
             &k,
             vec![
                 routine(1, "a", "f", &[], "ab"),
-                routine(1, "a", "g", &[], "c"),
+                routine(2, "a", "g", &[], "c"),
             ],
         );
         let moved = pins(
             &k,
             vec![
                 routine(1, "a", "f", &[], "a"),
-                routine(1, "a", "g", &[], "bc"),
+                routine(2, "a", "g", &[], "bc"),
             ],
         );
-        assert_ne!(split[0].digest, moved[0].digest);
+        assert_eq!(named(&split, &moved), "changed `a.f()`, `a.g()`");
+    }
+
+    #[test]
+    fn a_digest_made_for_one_routine_does_not_pass_for_another() {
+        let k = key(7);
+        let first = pins(&k, vec![routine(1, "a", "f", &[], "same")]);
+        let second = pins(&k, vec![routine(2, "a", "f", &[], "same")]);
+        assert_ne!(first[&1].digest, second[&2].digest);
     }
 
     #[test]
     fn the_same_routines_under_another_key_give_another_pin() {
         let routines = || vec![routine(1, "a", "f", &[], "one")];
         assert_ne!(
-            pins(&key(7), routines())[0].digest,
-            pins(&key(8), routines())[0].digest
+            pins(&key(7), routines())[&1].digest,
+            pins(&key(8), routines())[&1].digest
         );
         assert_eq!(pins(&key(7), routines()), pins(&key(7), routines()));
     }

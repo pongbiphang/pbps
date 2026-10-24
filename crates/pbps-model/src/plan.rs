@@ -263,7 +263,9 @@ use crate::zone::SessionZone;
 /// 48 adds the identity file's `types` map to `SavedPlan.ids` (DEC-1635.1).
 /// 49 pins declared type definitions and lifecycle payloads (DEC-1635.4).
 /// 50 pins declared cross-database shapes and their comparison (DEC-2322.1).
-pub const CURRENT_VERSION: u32 = 50;
+/// 51 pins each routine under its own digest instead of one per schema, so a
+/// refusal can name the routine (DEC-2333.1).
+pub const CURRENT_VERSION: u32 = 51;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -505,35 +507,35 @@ pub struct TypePin {
     pub digest: String,
 }
 
-/// The routines a plan pins, keyed per schema (DEC-319.1).
+/// The routines a plan pins, one keyed digest each (DEC-319.1, DEC-2333.1).
 ///
-/// Each digest is an HMAC under the environment's fingerprint key over the
-/// schema's routines as the catalog holds them. The key is not in the file
-/// (DEC-952.1), and without it a digest tests no guess about a body.
+/// Each digest is an HMAC under the environment's fingerprint key over one
+/// routine as the catalog holds it. The key is not in the file (DEC-952.1), and
+/// without it a digest tests no guess about a body.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutinePins {
     /// The identifier of the key the digests were made under. `apply` under
     /// another key refuses with a replan remedy rather than reporting every
-    /// schema as changed.
+    /// routine as changed.
     pub key_id: String,
     /// `server_version_num` at plan time. Another release renders the same
     /// catalog row differently, so a mismatch refuses before any digest does.
     pub server_version: String,
-    /// One entry per schema, in namespace OID order.
-    pub schemas: Vec<SchemaPin>,
+    /// One entry per routine, keyed by `pg_proc.oid`: the OID survives an
+    /// approved rename of the routine's schema or of a type in its argument
+    /// list, which a signature does not (DEC-2333.1).
+    pub routines: BTreeMap<i64, RoutinePin>,
 }
 
-/// One schema's pinned routines.
+/// One pinned routine.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SchemaPin {
-    /// `pg_namespace.oid`, the key: a schema the plan renames keeps it.
-    pub namespace: i64,
-    /// The schema's name at plan time. For messages only.
-    pub schema: String,
-    /// How many routines the digest covers.
-    pub routines: usize,
+pub struct RoutinePin {
+    /// The routine's schema-qualified name and argument types at plan time.
+    /// For messages only: it is what lets a refusal name a routine that is
+    /// gone now.
+    pub signature: String,
     /// Hex HMAC-SHA256.
     pub digest: String,
 }
@@ -813,7 +815,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 50);
+        assert_eq!(CURRENT_VERSION, 51);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -840,21 +842,30 @@ mod tests {
         pinned.routine_pins = Some(RoutinePins {
             key_id: "0011223344556677".into(),
             server_version: "180006".into(),
-            schemas: vec![SchemaPin {
-                namespace: 2200,
-                schema: "ext".into(),
-                routines: 1,
-                digest: "ab".repeat(32),
-            }],
+            routines: [(
+                16400,
+                RoutinePin {
+                    signature: "ext.helper(integer)".into(),
+                    digest: "ab".repeat(32),
+                },
+            )]
+            .into(),
         });
         let text = serde_json::to_string(&pinned).unwrap();
         assert_eq!(serde_json::from_str::<SavedPlan>(&text).unwrap(), pinned);
         assert_ne!(plan.wire_fingerprint(), pinned.wire_fingerprint());
         let mut other = pinned.clone();
-        other.routine_pins.as_mut().unwrap().schemas[0].digest = "cd".repeat(32);
+        other
+            .routine_pins
+            .as_mut()
+            .unwrap()
+            .routines
+            .get_mut(&16400)
+            .unwrap()
+            .digest = "cd".repeat(32);
         assert_ne!(pinned.wire_fingerprint(), other.wire_fingerprint());
         // An unknown field in a pin is a broken file, not an ignorable extra.
-        let tampered = text.replace("\"routines\":1", "\"routines\":1,\"extra\":true");
+        let tampered = text.replace("\"signature\":", "\"extra\":true,\"signature\":");
         assert!(serde_json::from_str::<SavedPlan>(&tampered).is_err());
     }
 
@@ -1146,7 +1157,7 @@ mod tests {
         plan.type_routine_pins = Some(RoutinePins {
             key_id: "key".into(),
             server_version: "180006".into(),
-            schemas: Vec::new(),
+            routines: BTreeMap::new(),
         });
         assert_ne!(before, plan.wire_fingerprint());
         let json = serde_json::to_string(&plan).unwrap();

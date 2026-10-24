@@ -23016,7 +23016,7 @@ fn an_inherited_trigger_function_owner_cannot_use_the_deployers_privileges() {
         // before the probes, ahead of this guard (DEC-319.1). The guard's own
         // refusal is what stopped the plan above.
         assert!(
-            stderr(&refused).contains("pinned routines changed in `hook`"),
+            stderr(&refused).contains("pinned routines changed: changed `hook."),
             "{}",
             stderr(&refused)
         );
@@ -26002,6 +26002,26 @@ impl PinnedHelper {
              WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'label'",
         ) == 1
     }
+
+    /// Runs `sql` as the helper's non-superuser owner, so that what it
+    /// creates is in the pin set.
+    fn as_owner(&self, sql: &str) {
+        on_server(
+            self.db.connection(),
+            &format!("SET ROLE {}; {sql}; RESET ROLE", self.owner),
+        );
+    }
+
+    /// An overload of `ext.helper` and two more routines, all pinned beside
+    /// `ext.helper(integer)`.
+    fn several(&self) {
+        self.as_owner(
+            "CREATE FUNCTION ext.helper(text) RETURNS boolean LANGUAGE sql AS 'SELECT true'; \
+             CREATE FUNCTION ext.other(text) RETURNS boolean LANGUAGE sql AS 'SELECT true'; \
+             CREATE FUNCTION ext.pair(integer, text) RETURNS boolean LANGUAGE sql \
+               AS 'SELECT true'",
+        );
+    }
 }
 
 impl Drop for PinnedHelper {
@@ -26027,11 +26047,11 @@ fn a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statemen
         serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
     let pins = saved.routine_pins.expect("the helper is pinned");
     assert_eq!(
-        pins.schemas
-            .iter()
-            .map(|s| s.schema.as_str())
+        pins.routines
+            .values()
+            .map(|r| r.signature.as_str())
             .collect::<Vec<_>>(),
-        ["ext"],
+        ["ext.helper(integer)"],
         "only the unmanaged, non-superuser routine is pinned"
     );
     let raw = std::fs::read_to_string(&plan).unwrap();
@@ -26041,7 +26061,7 @@ fn a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statemen
     let refused = h.apply(&plan, false, &key);
     assert_ne!(code(&refused), 0, "{}", stdout(&refused));
     assert!(
-        stderr(&refused).contains("pinned routines changed in `ext`")
+        stderr(&refused).contains("pinned routines changed: changed `ext.helper(integer)`")
             && stderr(&refused).contains("before the pre-flight probes"),
         "{}",
         stderr(&refused)
@@ -26053,6 +26073,185 @@ fn a_routine_replaced_after_approval_refuses_the_apply_before_its_first_statemen
     let plan = h.plan(false, &key);
     succeeds(h.apply(&plan, false, &key));
     assert!(h.label_exists());
+}
+
+/// The refusal's routine list, without the rest of the sentence.
+fn routines_named(refusal: &str) -> String {
+    let after = refusal
+        .split("pinned routines changed: ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no routine list in: {refusal}"));
+    after.split(", found").next().unwrap().to_owned()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_refusal_names_only_the_routine_that_changed_among_several() {
+    let h = PinnedHelper::new("pin_one_of_several");
+    h.several();
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let mut signatures: Vec<_> = saved
+        .routine_pins
+        .expect("the routines are pinned")
+        .routines
+        .into_values()
+        .map(|r| r.signature)
+        .collect();
+    signatures.sort();
+    assert_eq!(
+        signatures,
+        [
+            "ext.helper(integer)",
+            "ext.helper(text)",
+            "ext.other(text)",
+            "ext.pair(integer,text)"
+        ]
+    );
+
+    h.as_owner(
+        "CREATE OR REPLACE FUNCTION ext.other(text) RETURNS boolean LANGUAGE sql \
+         AS 'SELECT false'",
+    );
+    let refused = h.apply(&plan, false, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert_eq!(
+        routines_named(&stderr(&refused)),
+        "changed `ext.other(text)`"
+    );
+    assert!(!h.label_exists(), "no statement ran");
+
+    // Negative: with nothing replaced since, the same four routines pass.
+    let plan = h.plan(false, &key);
+    succeeds(h.apply(&plan, false, &key));
+    assert!(h.label_exists());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn an_overload_replaced_after_approval_is_named_by_its_signature() {
+    let h = PinnedHelper::new("pin_overload");
+    h.several();
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    h.as_owner(
+        "CREATE OR REPLACE FUNCTION ext.helper(text) RETURNS boolean LANGUAGE sql \
+         AS 'SELECT false'",
+    );
+    let refused = h.apply(&plan, false, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert_eq!(
+        routines_named(&stderr(&refused)),
+        "changed `ext.helper(text)`",
+        "the integer overload is not named"
+    );
+    assert!(!h.label_exists());
+
+    // Negative: replacing the other overload names that one instead.
+    let plan = h.plan(false, &key);
+    h.replace_helper();
+    let refused = h.apply(&plan, false, &key);
+    assert_eq!(
+        routines_named(&stderr(&refused)),
+        "changed `ext.helper(integer)`"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn a_routine_added_or_removed_after_approval_is_named() {
+    let h = PinnedHelper::new("pin_added_removed");
+    h.several();
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    h.as_owner(
+        "DROP FUNCTION ext.pair(integer, text); \
+         CREATE FUNCTION ext.late(integer) RETURNS boolean LANGUAGE sql AS 'SELECT true'",
+    );
+    let refused = h.apply(&plan, false, &key);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert_eq!(
+        routines_named(&stderr(&refused)),
+        "added `ext.late(integer)`; removed `ext.pair(integer,text)`"
+    );
+    assert!(!h.label_exists());
+
+    // A routine that left the set without being dropped is removed too: its
+    // owner is now a superuser nobody else holds.
+    let plan = h.plan(false, &key);
+    on_server(
+        h.db.connection(),
+        "ALTER FUNCTION ext.other(text) OWNER TO CURRENT_USER",
+    );
+    let refused = h.apply(&plan, false, &key);
+    assert_eq!(
+        routines_named(&stderr(&refused)),
+        "removed `ext.other(text)`"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn an_approved_table_rename_does_not_read_as_a_routine_change() {
+    let h = PinnedHelper::new("pin_row_type_rename");
+    // `ext.on_row(app.t)` spells its argument by the table's name, which the
+    // approved rename changes; the routine itself is untouched (DEC-2333.1).
+    on_server(
+        h.db.connection(),
+        &format!(
+            "CREATE FUNCTION ext.on_row(app.t) RETURNS boolean LANGUAGE sql AS 'SELECT true'; \
+             ALTER FUNCTION ext.on_row(app.t) OWNER TO {}",
+            h.owner
+        ),
+    );
+    h.demo
+        .table(&TWO_COLUMNS.replace("table: app.t", "table: app.t2"));
+    succeeds(h.demo.run(&["rename-table", "app.t", "app.t2"]));
+    let key = fingerprint_key(1);
+    let plan = h.plan(false, &key);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    assert!(
+        saved
+            .routine_pins
+            .unwrap()
+            .routines
+            .values()
+            .any(|r| r.signature == "ext.on_row(app.t)")
+    );
+    let checksum = plan_checksum(&plan);
+    let applied = h.run(
+        &[
+            "apply",
+            "--env",
+            "dev",
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "rename",
+        ],
+        Some(&key),
+    );
+    assert_eq!(
+        code(&applied),
+        0,
+        "{}{}",
+        stdout(&applied),
+        stderr(&applied)
+    );
+    assert_eq!(
+        scalar(
+            h.db.connection(),
+            "SELECT count(*) FROM pg_proc WHERE proname = 'on_row' \
+             AND pg_get_function_identity_arguments(oid) LIKE '%t2'"
+        ),
+        1,
+        "the table was renamed under the routine"
+    );
 }
 
 #[test]
@@ -26413,7 +26612,7 @@ fn a_routine_replaced_during_a_staged_step_is_caught_after_its_checkpoint() {
     assert!(
         err.contains("after statement 1 of 1 committed")
             && err.contains("checkpoint #")
-            && err.contains("pinned routines changed in `ext`"),
+            && err.contains("pinned routines changed: changed `ext.helper(integer)`"),
         "{err}"
     );
     assert!(h.label_exists(), "the step committed");
@@ -26931,7 +27130,7 @@ fn a_trigger_function_replaced_between_the_check_and_the_row_write_is_rolled_bac
         let refused = child.wait_with_output();
         assert_ne!(code(&refused), 0, "{slug}: {}", stdout(&refused));
         assert!(
-            stderr(&refused).contains("pinned routines changed in `hook`"),
+            stderr(&refused).contains("pinned routines changed: changed `hook."),
             "{slug}: {}",
             stderr(&refused)
         );

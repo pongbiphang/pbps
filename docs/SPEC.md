@@ -1557,9 +1557,11 @@ Missing, undefined and unreadable types refuse separately before DDL.
 
 **External-routine pins (DEC-319.1):** every PostgreSQL plan also
 pins, under the environment's fingerprint key, every unmanaged routine not
-held only by superusers. `apply` refuses a changed pin under the lock before
-pre-flight, again inside the transaction before the first statement, and again
-before recording. A staged plan is checked before and after each step; a
+held only by superusers, one digest per routine in plan format 51 (DEC-2333.1).
+A version 50 schema-set pin plan requires replanning. `apply` refuses
+a changed pin, naming each changed, added and removed routine, under the lock
+before pre-flight, again inside the transaction before the first statement,
+and again before recording. A staged plan is checked before and after each step; a
 mismatch found after a step committed records that step's checkpoint, then
 stops. This detects a replaced routine; it does not lock one. A plan that must pin
 a routine is refused unless its environment has a fingerprint key, and a bare

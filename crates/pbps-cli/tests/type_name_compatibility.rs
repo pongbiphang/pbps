@@ -137,7 +137,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
         plan.type_routine_pins = Some(RoutinePins {
             key_id: "fixture".into(),
             server_version: "180006".into(),
-            schemas: Vec::new(),
+            routines: Default::default(),
         });
     }
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
