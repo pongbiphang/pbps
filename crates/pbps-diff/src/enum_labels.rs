@@ -469,21 +469,33 @@ pub(crate) fn unsafe_uses(
                     ManagedType::Enum { .. } => false,
                 },
                 Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                    let lexicon = dialect.lexicon();
                     let deferred = matches!(
                         module.kind,
                         pbps_model::ModuleKind::Function | pbps_model::ModuleKind::Procedure
-                    ) && dialect
-                        .lexicon()
-                        .routine_language(&module.definition)
-                        .as_deref()
+                    ) && lexicon.routine_language(&module.definition).as_deref()
                         == Some("plpgsql");
-                    !deferred
-                        && (text(&module.definition)
-                            || dialect
-                                .lexicon()
+                    let whole_definition = || {
+                        text(&module.definition)
+                            || lexicon
                                 .string_literals(&module.definition)
                                 .iter()
-                                .any(|body| text(body)))
+                                .any(|body| text(body))
+                    };
+                    if deferred {
+                        // Only the PL/pgSQL body binds on invocation. Parameter
+                        // defaults and other clauses bind when it is created.
+                        // An unreadable body keeps the conservative whole scan.
+                        lexicon.routine_body(&module.definition).map_or_else(
+                            whole_definition,
+                            |body| {
+                                text(&module.definition[..body.start])
+                                    || text(&module.definition[body.end..])
+                            },
+                        )
+                    } else {
+                        whole_definition()
+                    }
                 }
                 _ => false,
             };
@@ -986,6 +998,101 @@ mod tests {
                     &pbps_dialect::MinimalDialect,
                 );
                 assert_eq!(errors.is_empty(), value == "old", "{ty}: {errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plpgsql_parameter_defaults_bind_at_creation_while_only_the_body_is_deferred() {
+        use pbps_model::{Module, ModuleKind};
+
+        for (kind, definition, refused) in [
+            (
+                ModuleKind::Function,
+                "(x app.e DEFAULT 'new') RETURNS app.e LANGUAGE plpgsql AS 'BEGIN RETURN x; END'",
+                true,
+            ),
+            (
+                ModuleKind::Function,
+                "(x app.e DEFAULT 'new'::app.e) RETURNS app.e LANGUAGE plpgsql AS 'BEGIN RETURN x; END'",
+                true,
+            ),
+            (
+                ModuleKind::Function,
+                "(x app.e = 'new') RETURNS app.e LANGUAGE plpgsql AS 'BEGIN RETURN x; END'",
+                true,
+            ),
+            (
+                ModuleKind::Procedure,
+                "(x app.e DEFAULT 'new') LANGUAGE plpgsql AS 'BEGIN END'",
+                true,
+            ),
+            (
+                ModuleKind::Procedure,
+                "(x app.e = 'new'::app.e) LANGUAGE plpgsql AS 'BEGIN END'",
+                true,
+            ),
+            (
+                ModuleKind::Function,
+                "(x integer DEFAULT 1) RETURNS app.e AS 'BEGIN RETURN ''new''::app.e; END' LANGUAGE plpgsql",
+                false,
+            ),
+            (
+                ModuleKind::Function,
+                "(x app.e DEFAULT 'old') RETURNS app.e LANGUAGE plpgsql AS 'BEGIN RETURN x; END'",
+                false,
+            ),
+            (
+                ModuleKind::Function,
+                "(x app.e DEFAULT 'old') RETURNS app.e AS 'BEGIN RETURN ''new''::app.e; END' LANGUAGE plpgsql",
+                false,
+            ),
+            (
+                ModuleKind::Procedure,
+                "(x app.e DEFAULT 'old') LANGUAGE plpgsql AS 'BEGIN PERFORM ''new''::app.e; END'",
+                false,
+            ),
+        ] {
+            for alter in [false, true] {
+                let (mut steps, errors, schema, ids) = planned(&["old"], &["old", "new"], &[]);
+                assert!(errors.is_empty());
+                let id = if kind == ModuleKind::Procedure {
+                    "app.p(app.e)"
+                } else if definition.starts_with("(x integer") {
+                    "app.f(integer)"
+                } else {
+                    "app.f(app.e)"
+                }
+                .parse()
+                .unwrap();
+                let module = Box::new(Module {
+                    kind,
+                    description: None,
+                    definition: definition.into(),
+                });
+                steps.changes.push(PlannedChange::new(if alter {
+                    Change::AlterModule { id, module }
+                } else {
+                    Change::CreateModule { id, module }
+                }));
+                let errors = unsafe_uses(
+                    &steps,
+                    Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    &pbps_dialect::MinimalDialect,
+                );
+                assert_eq!(
+                    !errors.is_empty(),
+                    refused,
+                    "alter={alter}: {definition}: {errors:?}"
+                );
+                if refused {
+                    assert!(
+                        matches!(&errors[..], [DiffError::EnumValueUse { name, label, .. }] if name.raw().to_string() == "app.e" && label == "new")
+                    );
+                }
             }
         }
     }

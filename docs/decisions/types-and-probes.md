@@ -2935,11 +2935,18 @@ The measured BEGIN/ADD VALUE/use results are the same on PG 16.15 and 18.6:
 Creating a domain with its own default or CHECK over an enum or enum array
 also refuses, measured on both versions. Views, SQL string-body functions
 and SQL BEGIN ATOMIC functions also refuse
-same-transaction evaluation. PL/pgSQL functions and procedures are accepted
-at creation because their bodies bind on invocation; they remain admitted.
+same-transaction evaluation. Only the bodies of PL/pgSQL functions and
+procedures are deferred until invocation. Their parameter defaults bind at
+creation: both cast and uncast defaults using a newly added label refuse with
+unsafe use on PG 16.15 and 18.6, including procedure defaults. A PL/pgSQL body
+containing the new label with an existing-label parameter default is accepted.
+Planning therefore exempts only the AS string or dollar-quoted body, located
+with the existing lexicon; quoted labels elsewhere in the definition remain
+subject to the same conservative use check, including DEFAULT and = defaults.
 Planning refuses the still-declarable uses: column defaults/CHECKs over the
 enum, arrays or domains, a domain's own default/CHECK, and created/altered views
-or SQL-bodied routines containing the quoted label. The named remedy is
+or SQL-bodied routines containing the quoted label, plus function/procedure
+parameter defaults even when the language is PL/pgSQL. The named remedy is
 "apply the label first, then the rest". The ordinary table validation rejects
 `data:` on every user-defined reference or array, and rejects reference-valued
 partition keys, before this use check can arise. DEC-1523.1 is unchanged;

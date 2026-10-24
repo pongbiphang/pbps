@@ -3125,6 +3125,116 @@ fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_p
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_plpgsql_parameter_defaults_refuse_before_sql_and_succeed_after_a_label_only_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for kind in ["function", "procedure"] {
+            for default in ["DEFAULT 'new'", "DEFAULT 'new'::app.e", "= 'new'"] {
+                let own = OwnDatabase::new(&server, "label_parameter1635");
+                let db = own.connection();
+                on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
+                let d = Demo::new("label-parameter1635");
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                d.commit();
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "adopt enum before parameter default",
+                ]));
+                std::fs::write(
+                    d.dir.join("schema/app.e.type.yml"),
+                    "enum: app.e\nvalues: [old, new]\n",
+                )
+                .unwrap();
+                let (name, tail) = if kind == "function" {
+                    (
+                        "app.f",
+                        "RETURNS app.e LANGUAGE plpgsql AS $$ BEGIN RETURN x; END; $$",
+                    )
+                } else {
+                    ("app.p", "LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$")
+                };
+                let module =
+                    format!("{kind}: {name}(app.e)\ndefinition: |\n  (x app.e {default}) {tail}\n");
+                let module_file = d.dir.join("schema/app.routine.yml");
+                std::fs::write(&module_file, &module).unwrap();
+                d.commit();
+                let path = d.dir.join("parameter-label.plan.json");
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0, "{kind}: {default}");
+                assert!(
+                    stderr(&out).contains(name)
+                        && stderr(&out).contains("app.e")
+                        && stderr(&out).contains("new")
+                        && stderr(&out).contains("apply the label first, then the rest"),
+                    "{kind}: {default}: {}",
+                    stderr(&out)
+                );
+                assert!(!path.exists());
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid='app.e'::regtype AND enumlabel='new'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_proc WHERE pronamespace='app'::regnamespace"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                    1
+                );
+
+                std::fs::remove_file(&module_file).unwrap();
+                d.commit();
+                let first = label_plan(&d, db, &path);
+                assert!(
+                    matches!(&first.changes.changes[..], [step] if matches!(step.change, pbps_model::Change::AddEnumValue { .. }))
+                );
+                succeeds(apply_plan(&d, db, &path, false));
+                std::fs::write(&module_file, &module).unwrap();
+                d.commit();
+                let second = label_plan(&d, db, &path);
+                assert!(
+                    second
+                        .changes
+                        .changes
+                        .iter()
+                        .any(|step| matches!(step.change, pbps_model::Change::CreateModule { .. }))
+                );
+                assert!(
+                    !second
+                        .changes
+                        .changes
+                        .iter()
+                        .any(|step| matches!(step.change, pbps_model::Change::AddEnumValue { .. }))
+                );
+                succeeds(apply_plan(&d, db, &path, false));
+                if kind == "function" {
+                    assert_eq!(
+                        scalar(db, "SELECT count(*)::bigint WHERE app.f()::text='new'"),
+                        1
+                    );
+                } else {
+                    on_server(db, "CALL app.p()");
+                }
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resume() {
     for server in [
         server(),

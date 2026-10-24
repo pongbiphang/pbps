@@ -839,8 +839,10 @@ requires `rename` approval because queries see different text.
 A plan cannot also evaluate its newly added label in a column default or
 CHECK over that enum, its array or a domain over it, in a domain's own default
 or CHECK, or in a created/altered view or SQL routine body. Apply the label
-first, then the rest. PL/pgSQL routine creation binds its body at invocation
-and remains admitted. An updated CHECK/default is rebuilt or altered by the ordinary diff, and
+first, then the rest. Only a PL/pgSQL routine's body is exempt because it binds
+at invocation. Function and procedure parameter defaults, in DEFAULT or =
+spelling, bind at creation and are checked even for PL/pgSQL. An updated
+CHECK/default is rebuilt or altered by the ordinary diff, and
 those changes appear in the plan. No SQL text is rewritten through label
 renames. DropCheck precedes the rename; defaults and AddCheck follow it in the
 same transaction. AddCheck scans its table under ACCESS EXCLUSIVE until
