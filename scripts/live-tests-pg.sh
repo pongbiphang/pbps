@@ -11,6 +11,10 @@
 #   "${PBPS_TEST_PG_SCRATCH_NAME:-pbps-test-pg-scratch}"
 set -euo pipefail
 
+if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
+    exec python3 scripts/live-shards.py shard pg "$@"
+fi
+
 NAME=${PBPS_TEST_PG_NAME:-pbps-test-pg}
 # Overridable for the same reason as the SQL Server one: a developer machine
 # often already has PostgreSQL on 5432, and "the tests will not start" is a bad
@@ -120,7 +124,11 @@ cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1 "$
 # has no other live suite of its own, so this is the one place its `From`
 # impls are ever run against a real server.
 cargo test -p pbps-db --test live_pg -- --ignored "$@"
-python3 scripts/live-transport.py pg
+if [[ -z ${PBPS_LIVE_SHARD:-} ]]; then
+    python3 scripts/live-transport.py pg
+elif [[ ${PBPS_LIVE_SHARD%%/*} == 0 ]]; then
+    PBPS_LIVE_PINNED=1 python3 scripts/live-transport.py pg
+fi
 # And the CLI's own PostgreSQL-dependent test, which lives in the bin target
 # rather than in `tests/`: `deploy::preflight` and `deploy::run_probes` are
 # private, and the thing under test is that the second pins the session before

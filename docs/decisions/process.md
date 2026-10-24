@@ -1427,3 +1427,29 @@ tokens. Unreadable quoted tokens and node properties or aliases outside this
 bounded grammar are refused as unsupported flow mappings. Reading a text `#`
 as a comment could hide a later scheduling key, so uncertainty must refuse,
 never accept while hiding that key.
+
+<a id="dec-2357-1"></a>
+
+**DEC-2357.1. The local sharded live driver qualifies as the full gate when
+each invocation's union is exact and fixture-sensitive tests remain isolated.**
+The maintainer accepts `scripts/live-shards.py` as the live portion of the
+AGENTS.md full gate on two conditions: each cargo invocation's shard union
+equals its authoritative `--list` set exactly, and tests that count containers
+or select fixture names are isolated by owned identities or pinned to one
+shard. The driver runs the same repository runners and immutable images;
+unset shard mode retains their existing commands. It replaces each invocation's
+filters with assigned exact names, runs one test thread per shard, and requires
+each assigned name to report `ok` or `FAILED` exactly once with a matching
+libtest summary and exit status. An empty invocation assignment is skipped,
+never passed as an empty filter; a shard empty for its entire suite fails.
+Missing, duplicate or extra tests and unreadable evidence fail the union audit.
+
+Resolver container-count assertions already filter by their process's unique
+label (#2095), SQL Server removal assertions inspect run-owned IDs, and psql
+and pg_dump cases consume the runner's exported container names. Keep those
+contracts. TLS transport runs once on shard 0, with its repeated trust variants
+retained as distinct invocation obligations. The merge group still executes
+the canonical CI layout. The equivalent gate preserves test membership and
+fixture admission, not the order of test neighbours, which was never a
+guarantee. Weight-based balancing may change neighbours without changing that
+membership or the serial execution within each shard.

@@ -3462,6 +3462,45 @@ Unset or empty overrides retain the defaults; the SQL Server scratch name
 defaults to the resolved primary name plus `-scratch`. Supply distinct names
 and the existing port overrides for separate fixture sets on a shared host.
 
+`PBPS_LIVE_SHARD=i/N` selects zero-based shard `i` of a local live suite.
+Unset shard mode retains the ordinary runner commands. In shard mode the
+same scripts enumerate each cargo invocation with its original filters,
+partition the names deterministically, and execute assigned exact names with
+one test thread. Empty invocation assignments are skipped; a shard empty for
+the entire suite fails. Every assigned test must report `ok` or `FAILED`, and
+the named reports must agree with libtest's summary and process exit.
+Direct stderr diagnostics remain in the shard logs, separate from the
+libtest stdout parser.
+
+`python3 scripts/live-shards.py` runs each suite's shards concurrently, with
+the two suites run sequentially. It derives shard counts from available memory
+(approximately 12 GiB per SQL Server set and 1 GiB per PostgreSQL set, capped
+at two and six respectively); `--mssql-shards` and `--pg-shards` override them.
+`--suite mssql|pg` selects one engine. `--output` names a fresh directory for
+per-shard logs, invocation receipts and `summary.json`. The driver independently
+requires each invocation's union to equal its `--list` set exactly, including
+duplicate detection, and refuses a missing invocation or unreported test.
+
+Shard fixture names default to `<prefix>s<i>-<kind>` (`--prefix`, default
+`pbps-live`); explicit name overrides instead gain `-s<i>`. SQL Server scratch
+still derives from the resolved primary name unless explicitly overridden.
+Shard ports add `10*i` to the existing port overrides, with shard-mode defaults
+26330–26332 and 56320–56322. Name and port collisions refuse before provisioning.
+`--weights file.json` uses positive per-test seconds for deterministic
+longest-first balancing when the file exists; otherwise assignment hashes the
+binary selector and test name. Unreadable or malformed weights refuse. `--measure
+file.json` records sequential result intervals (including process startup for
+the first test) for a subsequent weighted run. Each run snapshots input weights
+before starting shards.
+
+The isolation audit retains the existing process-label filter on resolver
+container counts (`scratch::live_tests::scratch_containers`, #2095), run-owned
+container IDs in SQL Server cleanup tests, and the exported PostgreSQL container
+variables used by psql and pg_dump tests. No default container or port is assumed
+by these paths. The separate TLS transport script runs once on shard 0; its
+individual cargo obligations remain enumerated and checked, including repeated
+trust variants. Canonical CI scheduling is unchanged (DEC-2357.1).
+
 The accepted resolver extension has additional, **not yet implemented**
 acceptance tests in [ADR-0016](ADR-0016-engine-assisted-planning.md#acceptance-tests).
 They must demonstrate correct binding decisions, refusal on missing evidence,

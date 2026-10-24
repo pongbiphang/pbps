@@ -7,6 +7,10 @@
 #   "${PBPS_TEST_MSSQL_SCRATCH_NAME:-${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}-scratch}"
 set -euo pipefail
 
+if [[ -n ${PBPS_LIVE_SHARD:-} && ${PBPS_LIVE_ACTIVE:-} != 1 ]]; then
+    exec python3 scripts/live-shards.py shard mssql "$@"
+fi
+
 NAME=${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}
 # Overridable: a developer machine often already has a SQL Server container
 # holding the default port, and "the tests will not start" is a bad way to find
@@ -99,7 +103,11 @@ cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 m
 # sentence, so this is a regression guard rather than a fix — see
 # `crates/pbps-db/src/mssql.rs` for the comparison against the PostgreSQL side.
 cargo test -p pbps-db --test live_mssql -- --ignored "$@"
-python3 scripts/live-transport.py mssql
+if [[ -z ${PBPS_LIVE_SHARD:-} ]]; then
+    python3 scripts/live-transport.py mssql
+elif [[ ${PBPS_LIVE_SHARD%%/*} == 0 ]]; then
+    PBPS_LIVE_PINNED=1 python3 scripts/live-transport.py mssql
+fi
 # `--test-threads=1`: these share one SQL Server, and the deployment lock is a
 # single row in it. Two tests taking it concurrently make each other fail, and
 # the failure reads as a bug in the lock rather than in the test schedule.

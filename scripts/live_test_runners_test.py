@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regressions for live-test execution ownership, without starting fixtures."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("live_shards", ROOT / "scripts/live-shards.py")
+SHARDS = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(SHARDS)
 FIXTURE_NAMES = {
     "PBPS_TEST_MSSQL_NAME": "pbps-test-mssql",
     "PBPS_TEST_MSSQL_EXPRESS_NAME": "pbps-test-mssql-express",
@@ -28,7 +32,7 @@ def fixture_environment(**overrides):
     # Host-local lane settings must not turn default-name regressions into
     # custom-name runs or silently change the endpoints asserted below.
     env = {key: value for key, value in os.environ.items()
-           if key != "NAME" and not key.startswith("PBPS_TEST_")}
+           if key != "NAME" and not key.startswith(("PBPS_TEST_", "PBPS_LIVE_"))}
     env.update(overrides)
     return env
 
@@ -44,6 +48,243 @@ def job_commands(workflow, job):
             return [shlex.split(command) for command in
                     re.findall(r"^      - run: (.+)$", body, re.MULTILINE)]
     return []
+
+
+class ShardedExecution(unittest.TestCase):
+    def test_partition_is_deterministic_complete_and_rejects_missing_or_duplicate_names(self):
+        names = [f"case_{i}" for i in range(40)]
+        for weights in (None, {}, {"binary:case_0": 100.0, "binary:case_1": 50.0}):
+            with self.subTest(weighted=bool(weights)):
+                groups = SHARDS.partition(names, 3, "binary", weights)
+                self.assertEqual(groups, SHARDS.partition(list(reversed(names)), 3, "binary", weights))
+                SHARDS.verify_union(names, groups)
+                dropped = json.loads(json.dumps(groups))
+                next(group for group in dropped if group).pop()
+                with self.assertRaisesRegex(ValueError, "union"):
+                    SHARDS.verify_union(names, dropped)
+                with self.assertRaisesRegex(ValueError, "union"):
+                    SHARDS.verify_union(names, [*groups, [names[0]]])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            SHARDS.partition(["same", "same"], 2, "binary", {})
+
+    def test_weighted_balance_puts_the_long_poles_on_different_shards(self):
+        groups = SHARDS.partition(["a", "b", "c"], 2, "bin", {"bin:a": 10, "bin:b": 9})
+        self.assertEqual(groups, [["a"], ["b", "c"]])
+        self.assertEqual(SHARDS.partition(["a", "b", "c"], 2, "bin", {}), [["a", "c"], ["b"]])
+
+    def test_shard_identities_are_disjoint_and_invalid_or_colliding_values_refuse(self):
+        for suite in SHARDS.RUNNERS:
+            first = SHARDS.fixture_env(suite, 0, {})
+            second = SHARDS.fixture_env(suite, 1, {})
+            for name, port, _, _ in SHARDS.FIXTURES[suite]:
+                self.assertNotEqual(first[name], second[name])
+                self.assertEqual(int(second[port]) - int(first[port]), 10)
+            name_a, port_a, *_ = SHARDS.FIXTURES[suite][0]
+            name_b, port_b, *_ = SHARDS.FIXTURES[suite][1]
+            for overrides in ({name_a: "bad name"}, {name_a: "same", name_b: "same"},
+                              {port_a: "65536"}, {port_a: "12345", port_b: "12345"}):
+                with self.subTest(suite=suite, overrides=overrides):
+                    with self.assertRaises((ValueError, TypeError)):
+                        SHARDS.fixture_env(suite, 0, overrides)
+        for value in ("", "1/1", "-1/2", "0/0", "0/two"):
+            with self.assertRaises(ValueError):
+                SHARDS.selector(value)
+
+    def test_one_shard_preserves_the_canonical_invocation_sequence(self):
+        for suite in SHARDS.RUNNERS:
+            with self.subTest(suite=suite):
+                plain, baseline, _, _ = self.fake_run(suite, None)
+                result, calls, summary, receipts = self.fake_run(suite, 1)
+                self.assertEqual(plain.returncode, 0, plain.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                base = [r["command"][1:] for r in baseline if r["command"][0] == "cargo"]
+                executed = [r["command"][1:] for r in calls if r["command"][0] == "cargo"
+                            and "--list" not in r["command"]]
+                self.assertEqual([c[:c.index("--")] for c in base],
+                                 [c[:c.index("--")] for c in executed])
+                self.assertCountEqual([r["args"] for r in receipts], base)
+                self.assertEqual(summary[suite]["union"], "exact")
+                self.assertTrue(all("--exact" in c and "--test-threads=1" in c for c in executed))
+
+    def test_parallel_shards_skip_empty_invocations_and_execute_each_assignment_once(self):
+        result, calls, summary, receipts = self.fake_run("pg", 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(summary["pg"]["union"], "exact")
+        self.assertGreater(summary["pg"]["passed"], 0)
+        self.assertEqual(summary["pg"]["failed"], 0)
+        empty = [r for r in receipts if not r["assigned"]]
+        self.assertTrue(empty, "the one-test type_slots invocation leaves one assignment empty")
+        self.assertTrue(all(not r["reported"] for r in empty))
+        runs = [r for r in calls if r["command"][0] == "cargo" and "--list" not in r["command"]]
+        # Each nonempty invocation runs once; an empty filter must never reach
+        # cargo because libtest would interpret it as selecting the whole binary.
+        self.assertEqual(len(runs), sum(bool(r["assigned"]) for r in receipts))
+        for record in runs:
+            self.assertIn("--exact", record["command"])
+        for index in range(2):
+            names = {r["environment"]["PBPS_TEST_PG_NAME"] for r in calls
+                     if r["environment"].get("PBPS_LIVE_SHARD") == f"{index}/2"}
+            self.assertEqual(names, {f"pbps-test-shards{index}-pg"})
+        transport = [r for r in calls if r["command"][:2] == ["python3", "scripts/live-transport.py"]]
+        self.assertEqual(len(transport), 1)
+
+    def test_missing_duplicate_failed_or_empty_libtest_reports_fail_the_driver(self):
+        for mode in ("missing", "duplicate", "failed", "empty"):
+            with self.subTest(mode=mode):
+                result, _, summary, _ = self.fake_run("pg", 1, mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(summary)
+                self.assertTrue(summary["pg"]["failed"] or summary["pg"]["union"] == "failed")
+
+    def test_direct_stderr_diagnostics_cannot_split_a_named_libtest_result(self):
+        result, _, summary, _ = self.fake_run("pg", 1, "stderr")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(summary["pg"]["union"], "exact")
+        self.assertEqual(summary["pg"]["failed"], 0)
+
+    def test_an_accepted_zero_index_keeps_the_shard_zero_transport_obligation(self):
+        result, calls, _, _ = self.fake_run("pg", None, selector="00/1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        transport = [r for r in calls if r["command"][:2] == ["python3", "scripts/live-transport.py"]]
+        self.assertEqual(len(transport), 1)
+        self.assertEqual(transport[0]["environment"]["PBPS_LIVE_SHARD"], "0/1")
+
+    def test_whole_suite_empty_shard_fails_even_when_each_union_is_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for i, assigned in enumerate((["one"], [])):
+                (root / str(i)).mkdir()
+                row = {"args": [], "identity": "bin", "listed": ["one"],
+                       "groups": [["one"], []], "assigned": assigned, "pinned": False,
+                       "reported": {n: {"status": "ok", "seconds": 1} for n in assigned},
+                       "valid": True}
+                (root / str(i) / "call.json").write_text(json.dumps(row))
+            with self.assertRaisesRegex(ValueError, "empty for the whole suite"):
+                SHARDS.audit(root, 2)
+
+    def test_receipt_audit_independently_rejects_missing_duplicate_and_unreported_tests(self):
+        for second in ("b", "c", "a", None):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                groups = [["a"], [second or "b"]]
+                for index, assigned in enumerate(groups):
+                    (root / str(index)).mkdir()
+                    row = {"args": [], "identity": "bin", "listed": ["a", "b"],
+                           "groups": groups, "assigned": assigned, "pinned": False,
+                           "reported": {name: {"status": "ok", "seconds": 1} for name in assigned},
+                           "valid": True}
+                    if second is None and index == 1:
+                        row["reported"] = {}
+                    (root / str(index) / "call.json").write_text(json.dumps(row))
+                if second == "b":
+                    summary, _ = SHARDS.audit(root, 2)
+                    self.assertEqual(summary, {"passed": 2, "failed": 0, "union": "exact"})
+                else:
+                    with self.assertRaises(ValueError):
+                        SHARDS.audit(root, 2)
+
+    def test_unreadable_lists_and_invalid_weights_are_not_empty_successes(self):
+        for listing in ("", "one: test\n", "one: test\n2 tests, 0 benchmarks\n",
+                        "one: test\none: test\n2 tests, 0 benchmarks\n"):
+            with self.assertRaises(ValueError):
+                SHARDS.listed_tests(listing)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.json"
+            self.assertIsNone(SHARDS.read_weights(path))
+            path.write_text("{}")
+            self.assertEqual(SHARDS.read_weights(path), {})
+            for content in ("{", "[]", '{"bin:one": -1}', '{"bin:one": "slow"}', '{"x": NaN}'):
+                path.write_text(content)
+                with self.assertRaises(ValueError):
+                    SHARDS.read_weights(path)
+
+    def fake_run(self, suite, count, mode="ok", selector=None):
+        with tempfile.TemporaryDirectory(prefix="pbps-shard-regression-") as directory:
+            root = Path(directory)
+            clients = root / "clients"
+            clients.mkdir()
+            fake = clients / "client"
+            fake.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, shutil, subprocess, sys
+from pathlib import Path
+root = Path(os.environ["PBPS_SHARD_FAKE_ROOT"])
+command = [Path(sys.argv[0]).name, *sys.argv[1:]]
+if command[0] == "python3" and Path(command[1]).name == "live-shards.py":
+    sys.exit(subprocess.run([sys.executable, *command[1:]]).returncode)
+record = {"command": command, "environment": {k: v for k, v in os.environ.items()
+          if k.startswith(("PBPS_TEST_", "PBPS_LIVE_"))}}
+with (root / "calls").open("a") as log:
+    log.write(json.dumps(record) + "\n")
+if command[:2] == ["docker", "ps"]:
+    pass
+elif command[:2] == ["docker", "exec"]:
+    if "SELECT CONVERT" in command[-1]:
+        print("SQL_Latin1_General_CP1_CI_AS")
+elif command[:2] == ["docker", "run"] or command[0] == "sleep":
+    pass
+elif command[:2] == ["python3", "scripts/live-transport.py"]:
+    for name in ("tls_a", "tls_b"):
+        subprocess.run(["cargo", "test", "-p", "pbps-db", "--test", "live_transport", "--",
+                        "--ignored", "--exact", name, "--test-threads=1", "--format=pretty",
+                        "--color=never"], check=True)
+elif command[0] == "cargo":
+    tail = iter(command[command.index("--") + 1:])
+    filters = []
+    for arg in tail:
+        if arg in ("--skip", "--test-threads", "--format", "--color"):
+            next(tail)
+        elif not arg.startswith("-"):
+            filters.append(arg)
+    if "--exact" in command:
+        names = filters
+    elif "type_slots" in command:
+        names = ["one_case"]
+    else:
+        names = [f"{filters[0] if filters else 'fixture'}::case{i:02}" for i in range(12)]
+    if "--list" in command:
+        print("\n".join(n + ": test" for n in names))
+        print(f"\n{len(names)} tests, 0 benchmarks")
+    else:
+        mode = os.environ["PBPS_SHARD_FAKE_MODE"]
+        selected = names[1:] if mode == "missing" else ([] if mode == "empty" else names)
+        print(f"\nrunning {len(selected)} tests")
+        for index, name in enumerate(selected):
+            if mode == "stderr":
+                print(f"test {name} ... ", end="", flush=True)
+                print("controlled direct stderr diagnostic", file=sys.stderr, flush=True)
+                print("ok", flush=True)
+            else:
+                print(f"test {name} ... {'FAILED' if mode == 'failed' and index == 0 else 'ok'}")
+            if mode == "duplicate" and index == 0:
+                print(f"test {name} ... ok")
+        failed = int(mode == "failed" and bool(selected))
+        print(f"\ntest result: {'FAILED' if failed else 'ok'}. {len(selected)-failed} passed; "
+              f"{failed} failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+        sys.exit(101 if failed else 0)
+elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
+    raise RuntimeError("unexpected external client: " + repr(command))
+''')
+            fake.chmod(0o755)
+            for name in ("cargo", "docker", "python3", "sleep"):
+                (clients / name).symlink_to(fake)
+            output = root / "results"
+            env = fixture_environment(PATH=str(clients) + os.pathsep + os.environ["PATH"],
+                                      PBPS_SHARD_FAKE_ROOT=str(root), PBPS_SHARD_FAKE_MODE=mode)
+            if selector is not None:
+                env.update(PBPS_LIVE_SHARD=selector,
+                           PBPS_LIVE_SHARD_DIR=str(output / suite / "0"))
+            if count is None:
+                command = ["bash", "scripts/" + SHARDS.RUNNERS[suite]]
+            else:
+                command = [sys.executable, "scripts/live-shards.py", "--suite", suite,
+                           "--" + suite + "-shards", str(count), "--prefix", "pbps-test-shard",
+                           "--output", str(output), "--measure", str(root / "weights.json")]
+            result = subprocess.run(command, cwd=ROOT, env=env, text=True,
+                                    capture_output=True, timeout=60)
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            summary = json.loads((output / "summary.json").read_text()) if (output / "summary.json").exists() else {}
+            receipts = [json.loads(p.read_text()) for p in output.glob("*/*/*.json")]
+            return result, calls, summary, receipts
 
 
 class LiveExecution(unittest.TestCase):
