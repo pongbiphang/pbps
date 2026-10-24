@@ -414,6 +414,19 @@ async fn publication_modes_missing_trees_and_unreadable_catalogs_are_named() {
             .checked(&root(), &pulled.schema)
             .is_ok()
     );
+    db.conn.execute("CREATE SCHEMA empty_names; CREATE DOMAIN app.d AS integer CONSTRAINT shared_name CHECK(VALUE>0); CREATE TABLE app.other(k integer CONSTRAINT shared_name CHECK(k>0)); CREATE SEQUENCE app.seq; CREATE VIEW app.v AS SELECT 1 AS k").await.unwrap();
+    let schemas = ["app".into(), "empty_names".into(), "missing_names".into()].into();
+    let names = pbps_pg::partition_index::collect_names(&mut db.conn, &schemas)
+        .await
+        .unwrap();
+    let names = names.require("all schemas").unwrap();
+    assert!(names["app"].types.contains_key("d"));
+    assert!(names["app"].types.contains_key("_other"));
+    assert!(names["app"].relations.contains_key("seq"));
+    assert!(names["app"].relations.contains_key("v"));
+    assert_eq!(names["app"].constraints["shared_name"].len(), 2);
+    assert!(names["empty_names"].exists && names["empty_names"].relations.is_empty());
+    assert!(!names["missing_names"].exists);
     for definition in [
         "FOR TABLE app.parent WITH (publish_via_partition_root=true)",
         "FOR ALL TABLES",
@@ -452,12 +465,24 @@ async fn publication_modes_missing_trees_and_unreadable_catalogs_are_named() {
     );
     db.conn.execute("DROP PUBLICATION pub2298").await.unwrap();
     let role = format!("catalog2298_reader_{}", std::process::id());
-    for catalog in ["pg_depend", "pg_publication"] {
+    for catalog in [
+        "pg_depend",
+        "pg_publication",
+        "pg_class",
+        "pg_type",
+        "pg_constraint",
+    ] {
         db.conn.execute("SAVEPOINT permissions").await.unwrap();
         db.conn.execute(&format!("CREATE ROLE {role}; GRANT USAGE ON SCHEMA app TO {role}; REVOKE SELECT ON pg_catalog.{catalog} FROM PUBLIC; SET LOCAL ROLE {role}")).await.unwrap();
-        let error = collect(&mut db.conn, &root(), source(&child_schema, &ids))
-            .await
-            .unwrap_err();
+        let error = if ["pg_class", "pg_type", "pg_constraint"].contains(&catalog) {
+            pbps_pg::partition_index::collect_names(&mut db.conn, &schemas)
+                .await
+                .unwrap_err()
+        } else {
+            collect(&mut db.conn, &root(), source(&child_schema, &ids))
+                .await
+                .unwrap_err()
+        };
         assert!(error.to_string().contains("42501"), "{error:?}");
         let mut cause = &error;
         while let pbps_db::DbError::Context { source, .. } = cause {
@@ -467,6 +492,10 @@ async fn publication_modes_missing_trees_and_unreadable_catalogs_are_named() {
             matches!(cause,pbps_db::DbError::Driver{code:Some(code),..} if code=="42501"),
             "{error:?}"
         );
+        if ["pg_class", "pg_type", "pg_constraint"].contains(&catalog) {
+            assert!(error.to_string().contains("unreadable"), "{error}");
+            assert!(format!("{error:?}").contains("42501"));
+        }
         db.conn.execute("ROLLBACK TO permissions").await.unwrap();
     }
     db.conn
@@ -501,7 +530,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
     let dialect = pbps_pg::Postgres::new();
     use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
     use pbps_model::operation::NameKind;
-    let (root, base, desired, addresses) = fixture::approval();
+    let (mut root, base, desired, addresses) = fixture::approval();
     let mut schema = Schema {
         tables: root.before.clone(),
         ..Default::default()
@@ -512,8 +541,13 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         .find(|n| **n != root.table)
         .unwrap()
         .clone();
+    root.after.get_mut(&leaf).unwrap().partition_of = Some(PartitionOf {
+        parent: root.table.clone(),
+        bound: PartitionBound::Default,
+        columns: Default::default(),
+    });
     let r = fixture::index_recipe();
-    let pbps_model::PartitionIndexDefinition::Index(index) = r.definition else {
+    let pbps_model::PartitionIndexDefinition::Index(index) = r.definition.clone() else {
         panic!()
     };
     schema
@@ -667,6 +701,147 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
                 .any(|e| e.before == release && e.after == claim)
         );
         assert!(!edges.iter().any(|e| e.before >= 2 && e.after == claim));
+        let mut allocation_slots = enriched.clone();
+        allocation_slots.effects[claim].claims.clear();
+        let occupancy = Fact::Present(
+            [(
+                "app".into(),
+                NamespaceNames {
+                    exists: true,
+                    relations: [("p1_k_idx".into(), obj(3))].into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        );
+        let freed = allocation_slots.effects[release]
+            .releases
+            .iter()
+            .map(|(_, h)| h.clone())
+            .collect();
+        let definition = fixture::index_recipe().definition;
+        let mut allocator = pbps_pg::partition_index::Allocation::new(
+            &root,
+            &catalog,
+            &occupancy,
+            &allocation_slots,
+            &desired,
+            &freed,
+        );
+        assert_eq!(
+            allocator.clones(&r.part(), &definition).unwrap()[0]
+                .name
+                .raw(),
+            "p1_k_idx"
+        );
+        assert_eq!(
+            allocator.clones(&r.part(), &definition).unwrap()[0]
+                .name
+                .raw(),
+            "p1_k_idx1"
+        );
+        let allocate = |root: &RebuildPartitionedTable,
+                        catalog: &Catalog,
+                        naming: &Naming,
+                        definition: &PartitionIndexDefinition| {
+            pbps_pg::partition_index::Allocation::new(
+                root,
+                catalog,
+                naming,
+                &allocation_slots,
+                &desired,
+                &freed,
+            )
+            .clones(&r.part(), definition)
+        };
+        let Fact::Present(mut occupied) = occupancy.clone() else {
+            panic!()
+        };
+        occupied
+            .get_mut("app")
+            .unwrap()
+            .constraints
+            .insert("p1_k_idx".into(), [obj(21), obj(22)].into());
+        let occupied = Fact::Present(occupied);
+        assert_eq!(
+            allocate(&root, &catalog, &occupied, &definition).unwrap()[0]
+                .name
+                .raw(),
+            "p1_k_idx1"
+        );
+        for (missing, expected) in [
+            (Fact::Absent, "absent"),
+            (Fact::Unreadable("42501".into()), "42501"),
+            (Fact::Present(Default::default()), "app.p1"),
+        ] {
+            assert!(
+                allocate(&root, &catalog, &missing, &definition)
+                    .unwrap_err()
+                    .contains(expected)
+            );
+        }
+        let PartitionIndexDefinition::Index(mut duplicates) = definition.clone() else {
+            panic!()
+        };
+        duplicates.columns.push(duplicates.columns[0].clone());
+        assert_eq!(
+            allocate(
+                &root,
+                &catalog,
+                &occupancy,
+                &PartitionIndexDefinition::Index(duplicates)
+            )
+            .unwrap()[0]
+                .name
+                .raw(),
+            "p1_k_k1_idx"
+        );
+        let PartitionIndexDefinition::Index(mut expression) = definition.clone() else {
+            panic!()
+        };
+        expression.columns[0].key = IndexKey::Expression("lower(k::text)".into());
+        let expression = PartitionIndexDefinition::Index(expression);
+        let mut approved = root.clone();
+        let PartitionIndexDefinition::Index(index) = &expression else {
+            panic!()
+        };
+        approved
+            .before
+            .get_mut(&root.table)
+            .unwrap()
+            .indexes
+            .insert("p_idx".into(), index.clone());
+        let mut labels = catalog.clone();
+        let Fact::Present(spellings) = &mut labels.spellings else {
+            panic!()
+        };
+        spellings.insert(
+            obj(2),
+            PartSpelling {
+                table: root.table.clone(),
+                name: "p_idx".into(),
+                kind: NameKind::Index,
+                index_attributes: Some(vec!["lower".into()]),
+            },
+        );
+        assert_eq!(
+            allocate(&approved, &labels, &occupancy, &expression).unwrap()[0]
+                .name
+                .raw(),
+            "p1_lower_idx"
+        );
+        assert!(
+            allocate(&root, &labels, &occupancy, &expression)
+                .unwrap_err()
+                .contains("new or changed expression")
+        );
+        labels.spellings = Fact::Unreadable("42501".into());
+        assert!(
+            allocate(&approved, &labels, &occupancy, &expression)
+                .unwrap_err()
+                .contains("42501")
+        );
+
         let mut schedule = pbps_diff::order::Schedule::new(4);
         slots::schedule(&mut schedule, &edges);
         for (before, after) in [(claim, 2), (2, 3)] {

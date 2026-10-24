@@ -1468,7 +1468,7 @@ async fn read_extension_ties(
 /// this needs the caller's, because the lock it takes has to still be held when
 /// the `DROP` runs. Both failures are the same class — a read that means
 /// something different from what it looks like — so both are refused by name.
-async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError> {
+pub(crate) async fn require_the_callers_transaction(conn: &mut Conn) -> Result<(), DbError> {
     let token = crate::catalog::probe_token();
     conn.query(&crate::catalog::probe_set(&token)).await?;
     let rows = conn.query(crate::catalog::PROBE_READ).await?;

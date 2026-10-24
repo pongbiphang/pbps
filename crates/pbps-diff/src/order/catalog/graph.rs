@@ -309,3 +309,14 @@ impl Catalog {
         Ok(closure)
     }
 }
+
+/// Complete namespace reads, including objects outside the managed tree.
+/// Constraint names are not unique within a schema: every holder must leave.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamespaceNames {
+    pub exists: bool,
+    pub relations: BTreeMap<pbps_model::ObjectLocalName, Object>,
+    pub types: BTreeMap<pbps_model::ObjectLocalName, Object>,
+    pub constraints: BTreeMap<pbps_model::ObjectLocalName, BTreeSet<Object>>,
+}
+pub type Naming = Fact<BTreeMap<String, NamespaceNames>>;
