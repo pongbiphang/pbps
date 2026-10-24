@@ -1128,12 +1128,19 @@ pub fn plan(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
 /// hand-made plan could otherwise put a line of its own in it. The line breaks
 /// here are the literals; none comes from a value.
 pub fn changes(cs: &ChangeSet) -> String {
+    changes_with_remedy(cs, None)
+}
+
+fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
     let mut out = String::new();
     let mut current = None;
     for p in &cs.changes {
         let table = p.change.subject();
         if current.as_deref() != Some(table.as_str()) {
             out.push_str(&format!("\n  {}\n", Escaped(&table)));
+            if let Some(remedy) = remedy {
+                out.push_str(&format!("    {remedy}\n"));
+            }
             current = Some(table);
         }
         let risks = if p.risks.is_empty() {
@@ -1207,6 +1214,12 @@ pub fn origins(cs: &ChangeSet) -> Vec<StepOrigin> {
         .collect()
 }
 
+/// Shared by human drift subjects and the existing JSON finding remedies.
+pub const DRIFT_REMEDY: &str = "Three ways out (SPEC 8.3): accept the change with `pbps pull` \
+    and merge by hand; restore the database to the declarations, then run a fresh \
+    `pbps plan --db` and `pbps apply --plan`; or rebaseline with \
+    `pbps baseline --reason …`.";
+
 /// A drift report as prose.
 ///
 /// The changes are phrased as "what the database has grown", because that is
@@ -1242,6 +1255,7 @@ pub fn drift(r: &DriftReport) -> String {
         ));
         for e in &r.unexpressible {
             out.push_str(&format!("    {e}\n"));
+            out.push_str(&format!("      {DRIFT_REMEDY}\n"));
         }
     }
     if !r.changes.is_empty() {
@@ -1249,7 +1263,7 @@ pub fn drift(r: &DriftReport) -> String {
         // The plan's own vocabulary, indented, minus its `--allow` advice: a
         // reader who has read one plan can read this without learning a second
         // vocabulary, but nothing here is waiting to be approved.
-        for line in changes(&r.changes).lines() {
+        for line in changes_with_remedy(&r.changes, Some(DRIFT_REMEDY)).lines() {
             if line.trim().is_empty() {
                 out.push('\n');
             } else {
@@ -1266,10 +1280,9 @@ pub fn drift(r: &DriftReport) -> String {
              state_json by hand.\n",
         );
     }
-    out.push_str(
-        "\n  Three ways out (SPEC 8.3): fold it into the declarations (`pbps pull`), put the\n  \
-         database back (`pbps plan --db` then `apply`), or accept it (`pbps baseline --reason`).\n",
-    );
+    if r.changes.is_empty() && r.unexpressible.is_empty() {
+        out.push_str(&format!("\n  {DRIFT_REMEDY}\n"));
+    }
     out
 }
 
@@ -1967,6 +1980,61 @@ fn sequence_options(options: &pbps_model::SequenceOptions) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn each_drift_subject_has_the_same_three_ways_out_and_clean_reports_have_none() {
+        let mut report = pbps_model::DriftReport {
+            version: pbps_model::drift::CURRENT_VERSION,
+            environment: "prod".into(),
+            checked_at: "2026-10-24".into(),
+            baseline: pbps_model::DriftBaseline {
+                entry_id: 1,
+                applied_at: "2026-10-24".into(),
+                checksum: "before".into(),
+            },
+            live_checksum: "after".into(),
+            changes: set(vec![
+                Change::DropTable {
+                    uid: uid(UidKind::Table, "a"),
+                    name: "app.a".parse().unwrap(),
+                    detach_from: None,
+                },
+                Change::DropTable {
+                    uid: uid(UidKind::Table, "b"),
+                    name: "app.b".parse().unwrap(),
+                    detach_from: None,
+                },
+            ]),
+            unmanaged: Vec::new(),
+            unexpressible: vec!["app.c: unsupported difference".into()],
+        };
+        let text = drift(&report);
+        assert!(report.has_drift());
+        for command in [
+            "`pbps pull`",
+            "`pbps plan --db`",
+            "`pbps apply --plan`",
+            "`pbps baseline --reason …`",
+        ] {
+            assert!(text.contains(command), "{text}");
+        }
+        assert_eq!(text.matches(DRIFT_REMEDY).count(), 3, "{text}");
+        for subject in ["app.a", "app.b", "app.c: unsupported difference"] {
+            let after = text.split_once(subject).unwrap().1;
+            assert!(
+                after.lines().nth(1).unwrap().contains(DRIFT_REMEDY),
+                "{text}"
+            );
+        }
+        assert!(!changes(&report.changes).contains(DRIFT_REMEDY));
+        report.changes = ChangeSet::default();
+        report.unexpressible.clear();
+        report.live_checksum = report.baseline.checksum.clone();
+        assert!(!report.has_drift());
+        let clean = drift(&report);
+        assert!(clean.contains("No drift"));
+        assert!(!clean.contains("Three ways out"));
+    }
+
     /// A numbering change's line shows the options each side sets, so an
     /// options-only retune reads as the change it is (#2015). The negative
     /// case: a retune of the start alone shows no options.

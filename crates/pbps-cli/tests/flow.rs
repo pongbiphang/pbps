@@ -29,6 +29,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 #[path = "support/dependencies2322.rs"]
 mod dependencies2322;
+#[path = "support/refusal_next_steps.rs"]
+mod refusal_next_steps;
 
 #[path = "support/raised_messages.rs"]
 mod raised_messages;

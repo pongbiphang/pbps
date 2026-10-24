@@ -2139,6 +2139,17 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["replacement_type_slots_apply_new_dependents_and_refuse_retained_bindings"]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "refusal_next_steps::alias_time_zones_refuse_with_exact_spelling_guidance_and_exit_one",
+        "refusal_next_steps::each_drifted_object_prints_three_remedies_without_changing_exit_two_or_json_ids",
+        "refusal_next_steps::partial_index_estimates_explain_the_write_lock_and_unfiltered_neighbours_do_not"
+      ]
     }
   ]
 }

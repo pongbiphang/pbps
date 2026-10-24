@@ -153,9 +153,19 @@ fn resolves(root: &Path, rev: &str) -> bool {
 /// declarations nobody has touched (DECISIONS 113).
 fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
     if rev != "HEAD" || resolves(root, "HEAD") {
+        // Only a failed lookup needs this diagnostic; successful historical
+        // reads must not pay for another Git process.
+        let shallow = if git(root, &["rev-parse", "--is-shallow-repository"])
+            .is_ok_and(|answer| answer.trim() == "true")
+        {
+            "\nThis is a shallow clone; fetch the missing history. In CI, set `fetch-depth: 0`."
+        } else {
+            ""
+        };
         anyhow::bail!(
             "`{rev}` is not a revision this repository has.\n\
-             Name one that exists, or leave it out to compare against `HEAD`."
+             Name one that exists, or leave it out to compare against `HEAD`.{shallow}",
+            rev = pbps_model::escape::Escaped(rev),
         );
     }
     Ok(())

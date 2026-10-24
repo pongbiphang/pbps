@@ -751,7 +751,17 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             // takes the heavier one, which is the direction that surprises an
             // operator.
             e(
-                format!("building the index {name}", name = name.shown(),),
+                format!(
+                    "building the index {name}{guidance}",
+                    name = name.shown(),
+                    guidance = if index.filter.is_some() {
+                        "; this partial index holds a write-blocking lock while it builds: its \
+                         filter requires a pinned search_path, which cannot share a batch with \
+                         CONCURRENTLY (decision 262)"
+                    } else {
+                        ""
+                    },
+                ),
                 table,
                 Rewrite::No,
                 Reads::EveryRow,
@@ -2295,6 +2305,21 @@ mod tests {
         // batch with the path a filter binds under (DECISIONS 262). The
         // estimate has to follow the emitter, not the request.
         assert_eq!(lock(&index(Some("v > 0")), online), Lock::Share);
+        for strategy in [Strategy::default(), online] {
+            let partial = estimate(&index(Some("v > 0")), strategy).unwrap();
+            for text in [
+                "write-blocking lock while it builds",
+                "filter requires a pinned search_path",
+                "cannot share a batch with CONCURRENTLY",
+                "decision 262",
+            ] {
+                assert!(partial.about.contains(text), "{}", partial.about);
+            }
+            assert_eq!(partial.reads, Reads::EveryRow);
+            let ordinary = estimate(&index(None), strategy).unwrap();
+            assert!(!ordinary.about.contains("partial index"));
+            assert!(!ordinary.about.contains("decision 262"));
+        }
         assert_eq!(Lock::Share.blocks(), "writes");
         assert_eq!(
             Lock::ShareUpdateExclusive.blocks(),
