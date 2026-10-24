@@ -133,7 +133,7 @@ async fn automatic_externals(default: &'static str) {
         let ids = IdsFile::default();
         let side = pbps_diff::Side { schema: &schema, ids: &ids };
         let bootstrap = pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default()).unwrap();
-        let binding = BindingRequest { bootstrap: &bootstrap, base: &schema, desired: &schema };
+        let binding = BindingRequest { dependencies: &Default::default(), bootstrap: &bootstrap, base: &schema, desired: &schema };
         let request = super::super::super::ScopeRequest { schemas: vec!["dbo".into()], ..Default::default() };
         let tokens = super::super::Tokens::generate();
         let p = policy(SameInstance::Refused);

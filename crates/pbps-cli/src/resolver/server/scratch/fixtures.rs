@@ -193,6 +193,7 @@ pub(crate) fn ids(schema: &Schema, previous: &IdsFile) -> IdsFile {
 }
 
 pub(crate) struct Inputs {
+    dependencies: pbps_model::dependency::Dependencies,
     base: Schema,
     desired: Schema,
     base_ids: IdsFile,
@@ -225,6 +226,7 @@ impl Inputs {
         )
         .unwrap();
         Self {
+            dependencies: Default::default(),
             base,
             desired,
             base_ids,
@@ -236,6 +238,7 @@ impl Inputs {
 
     pub(crate) fn binding(&self) -> BindingRequest<'_> {
         BindingRequest {
+            dependencies: &self.dependencies,
             bootstrap: &self.bootstrap,
             desired: &self.desired,
             base: &self.base,

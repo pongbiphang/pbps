@@ -566,6 +566,7 @@ mod tests {
         let provenance = Provenance::server();
         for disagrees in [false, true] {
             let binding = BindingRequest {
+                dependencies: &Default::default(),
                 bootstrap: &pbps_diff::diff(
                     pbps_diff::Side {
                         schema: &pbps_model::Schema::default(),

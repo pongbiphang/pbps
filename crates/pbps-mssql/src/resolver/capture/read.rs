@@ -200,6 +200,7 @@ pub(super) enum Baseline {
 pub(super) type WholeRow = BTreeMap<String, Option<String>>;
 
 pub(super) struct Catalog {
+    pub declarations: pbps_model::dependency::Dependencies,
     pub major: u32,
     pub session: Session,
     pub baseline: Baseline,
@@ -1317,6 +1318,7 @@ pub(super) async fn read(
         return Err(CaptureError::EnvironmentChanged);
     }
     Ok(Catalog {
+        declarations: Default::default(),
         major,
         session: session_before,
         baseline,

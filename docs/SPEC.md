@@ -902,8 +902,38 @@ them `declared, not compared`. Apply re-reads no dependency. The engine binds
 three-part references when it creates managed objects inside the transaction;
 a missing object or column fails there and rolls the transaction back.
 Changes to the other database are outside this project's drift boundary.
-Resolver rehearsal over declared companions remains #2323; the resolver's
-existing refusal of undeclared three-part references is unchanged.
+SQL Server preparation rehearses declared dependencies in run-owned,
+same-named companion databases on another instance. Same-instance scratch
+binds the real other database without creating a companion. Supplied scratch
+on another instance and companion-name collisions refuse by name.
+
+For a readable declared view, preparation follows object-visible dependency
+references recursively. It rebuilds readable tables with their native types,
+collation, nullability, computed expressions, identity and rowversion, replays
+view definitions unchanged and stages INSTEAD OF trigger presence. Readable
+view indexes retain their names, uniqueness, clustered/nonclustered kind,
+ordered and directed keys, and included columns; the unique clustered index
+is created first. It compares the companion output metadata and index set,
+and obtains source lineage in the companion.
+An unreadable closure object, failed replay, output mismatch or unavailable
+source grouping falls back to a single source group and retains a named,
+typed partially-unverified limitation. An unreadable declared object uses
+the declaration and retains `declared, not compared`. A fallback also limits
+any other declared dependency that uses that object. No write statement or
+NOEXEC, PARSEONLY or FMTONLY probe is sent to the target.
+
+An indexed fallback remains schema-bound and keeps its readable indexes
+where reconstruction succeeds. An unreadable, unrecreated or mismatched
+index is a limitation naming both view and index, retaining the earlier
+fallback cause. If even that fallback cannot supply an index, a managed
+index hint or `NOEXPAND` can fail rehearsal by name; apply still binds the
+real object under the ordinary transaction boundary.
+
+The per-dependency placement, shape source and verification outcome live in
+SQL Server's typed preparation handoff (DEC-2323.1). This adds no saved-plan
+field or Schema member; #2238 seals the outcome later. The resolver's refusal
+of undeclared managed three-part references and DEC-619.3's sandbox boundary
+are unchanged. Apply continues to bind the real objects in its transaction.
 
 ## 5. The identity file (`schema.ids.json`)
 

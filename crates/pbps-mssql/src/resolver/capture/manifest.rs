@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Serialize or digest getter: a definition read here leaves only as a keyed
 /// fingerprint, and only its producer seals it.
 pub struct CapturedInputs {
+    pub(super) declarations: pbps_model::dependency::Dependencies,
     major: u32,
     session: Session,
     baseline: Baseline,
@@ -94,6 +95,7 @@ impl CapturedInputs {
 
     pub(super) fn new(catalog: Catalog, selected: Selected, scope: CaptureScope) -> Self {
         Self {
+            declarations: catalog.declarations,
             major: catalog.major,
             session: catalog.session,
             baseline: catalog.baseline,

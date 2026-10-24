@@ -40,7 +40,8 @@ pub use object_properties::{OBJECT_PROPERTIES, PropertyDisposition, property_dis
 pub use ownership::RecordedOwnership;
 pub use pbps_db::resolver::capture::{CaptureError, ObjectIdentity, Uncovered};
 pub use staged::{
-    ExternalInputs, StageError, Staged, cascade_scope, compare_staged, required_externals,
+    ExternalInputs, StageError, Staged, cascade_scope, compare_staged, compare_staged_declared,
+    required_externals, required_externals_declared,
 };
 
 use std::collections::BTreeSet;
@@ -150,7 +151,18 @@ pub async fn capture(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
 ) -> Result<CapturedInputs, CaptureError> {
+    capture_declared(connection, scope, &Default::default()).await
+}
+
+/// Capture with the explicitly declared cross-database reference boundary.
+/// This admits names, not proof of the other database's contents (DEC-2323.1).
+pub async fn capture_declared(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    declarations: &pbps_model::dependency::Dependencies,
+) -> Result<CapturedInputs, CaptureError> {
     let mut catalog = read::read(connection, &select::lookups(scope)).await?;
+    catalog.declarations = declarations.clone();
     let selected = select::select(&catalog, scope)?;
     // Only reached objects are asked about: an unrelated broken module must
     // not turn a scoped capture into a database-wide refusal.
@@ -206,7 +218,7 @@ pub async fn recapture(
     ),
     CaptureError,
 > {
-    let current = capture(connection, previous.scope()).await?;
+    let current = capture_declared(connection, previous.scope(), &previous.declarations).await?;
     let differences = previous.compare(&current);
     Ok((current, differences))
 }

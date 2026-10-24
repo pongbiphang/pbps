@@ -7,6 +7,7 @@
 pub mod authorization;
 pub mod capture;
 pub mod compatibility;
+pub mod dependencies;
 pub mod environment;
 pub mod externals;
 pub mod scratch;

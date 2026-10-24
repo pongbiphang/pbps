@@ -68,6 +68,8 @@ pub struct BindingRequest<'a> {
     pub desired: &'a pbps_model::Schema,
     /// The target's managed side, by the names pbps's own model gives it.
     pub base: &'a pbps_model::Schema,
+    /// Cross-database assumptions, separate from both managed sides (DEC-2322.1).
+    pub dependencies: &'a pbps_model::dependency::Dependencies,
 }
 
 /// Complete same-capture qualified plan. It contains only ordered typed

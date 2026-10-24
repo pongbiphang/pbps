@@ -159,6 +159,7 @@ async fn refusal_policy_inner(
         target,
         &identity,
         &BindingRequest {
+            dependencies: &Default::default(),
             bootstrap: &bootstrap,
             base: &schema,
             desired: &schema,
@@ -521,6 +522,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
                     &authorization,
                     &[],
                     &BindingRequest {
+                        dependencies: &Default::default(),
                         bootstrap: &bootstrap,
                         base: &schema,
                         desired: &schema,
@@ -1137,7 +1139,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let ids=IdsFile::default();
         let side=pbps_diff::Side { schema:&schema,ids:&ids };
         let bootstrap=pbps_diff::resolver::ordinary(side,side,&pbps_mssql::Mssql,&Hints::default()).unwrap();
-        let binding=BindingRequest { bootstrap:&bootstrap,base:&schema,desired:&schema };
+        let binding=BindingRequest { dependencies: &Default::default(), bootstrap:&bootstrap,base:&schema,desired:&schema };
         let request=super::super::ScopeRequest { schemas:vec!["dbo".into()],..Default::default() };
         for file in [None,Some("CREATE SCHEMA ext2269 AUTHORIZATION dbo;\nGO\nCREATE TYPE ext2269.amount FROM decimal(9,2) NOT NULL;\nGO\nCREATE TABLE dbo.ext2269(i ext2269.amount CONSTRAINT ext2269_pk PRIMARY KEY);")] {
         let tokens=super::Tokens::generate();
@@ -1196,7 +1198,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         let ids = IdsFile::default();
         let side = pbps_diff::Side { schema: &schema, ids: &ids };
         let bootstrap = pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default()).unwrap();
-        let binding = BindingRequest { bootstrap: &bootstrap, base: &schema, desired: &schema };
+        let binding = BindingRequest { dependencies: &Default::default(), bootstrap: &bootstrap, base: &schema, desired: &schema };
         let request = super::super::ScopeRequest { schemas: vec!["dbo".into()], ..Default::default() };
         let tokens = super::Tokens::generate();
         let provenance = provenance();
@@ -1234,3 +1236,6 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
 
 #[path = "same_instance2270_tests.rs"]
 mod same_instance2270;
+
+#[path = "dependencies2323_tests.rs"]
+mod dependencies2323;
