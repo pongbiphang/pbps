@@ -279,11 +279,7 @@ impl<'a> Allocation<'a> {
             (IndexPart::Unique(_), PartitionIndexDefinition::Unique(k)) => k.columns.clone(),
             (IndexPart::Index(name), PartitionIndexDefinition::Index(index)) => {
                 if index.holds_expression() {
-                    let label = format!(
-                        "{} index {}",
-                        self.root.table.shown(),
-                        escape::Escaped(name.raw())
-                    );
+                    let label = format!("{} index {}", self.root.table.shown(), name.shown());
                     if self.root.before[&self.root.table].indexes.get(name) != Some(index) {
                         return Err(format!(
                             "{label}: new or changed expression labels require engine evidence; rebuild is refused"
