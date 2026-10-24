@@ -1795,10 +1795,16 @@ fn cmd_pull(
     for f in adopt::refuse_policy_errors(project, &loaded, dialect.as_ref())? {
         eprintln!("{}: {}", f.severity_word(), f.message);
     }
-    let written: std::collections::BTreeSet<_> = staged
+    let copies: Vec<_> = staged
         .iter()
-        .map(|path| path.strip_prefix(stage.path()).map(|path| dir.join(path)))
+        .map(|source| {
+            source
+                .strip_prefix(stage.path())
+                .map(|relative| (source.clone(), dir.join(relative)))
+        })
         .collect::<Result<_, _>>()?;
+    let written: std::collections::BTreeSet<_> =
+        copies.iter().map(|(_, path)| path.clone()).collect();
     // Same reading as the guard above, for the same reason in the other
     // direction: a failed listing that came back empty would silently skip the
     // cleanup and leave two files declaring one name. List before publishing
@@ -1871,6 +1877,19 @@ fn cmd_pull(
             }
         }
     }
+    // Check every destination, including entries the lowercase extension listing
+    // missed. Listed aliases are admitted by file identity, not by spelling.
+    for path in &written {
+        paths::require_removable_output(path, &present)?;
+    }
+    // Identity validation/serialization must not discover a refusal after
+    // declarations have already been removed. Keep unchanged JSON byte-exact.
+    let ids_json = match &resolution {
+        Ok(res) if existing_ids.is_none() || res.ids != ids => {
+            Some(serialize_ids(project, &res.ids)?)
+        }
+        _ => None,
+    };
     std::fs::create_dir_all(&dir).with_context(|| {
         format!(
             "cannot create `{}`",
@@ -1883,6 +1902,11 @@ fn cmd_pull(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+    }
+    if ids_json.is_some()
+        && let Some(parent) = project.ids_file().parent()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
@@ -1904,16 +1928,15 @@ fn cmd_pull(
         })?;
     }
     // Publish the exact bytes that passed validation, without rendering again.
-    for path in &written {
-        let source = stage.path().join(path.strip_prefix(&dir)?);
+    for (source, path) in &copies {
         let publish = || -> std::io::Result<u64> {
             let Some(permissions) = output_permissions.get(path) else {
-                return std::fs::copy(&source, path);
+                return std::fs::copy(source, path);
             };
             // Replacing an entry must not broaden its access, especially with
             // `--data`. Set the old permissions while the replacement is empty,
             // before copying any validated bytes; chmod after copying is too late.
-            let mut input = std::fs::File::open(&source)?;
+            let mut input = std::fs::File::open(source)?;
             let mut output = std::fs::File::create_new(path)?;
             output.set_permissions(permissions.clone())?;
             std::io::copy(&mut input, &mut output)
@@ -1963,8 +1986,13 @@ fn cmd_pull(
         }
     };
     // Leave even the original JSON formatting intact for an unchanged pull.
-    if existing_ids.is_none() || res.ids != ids {
-        write_ids(project, &res.ids)?;
+    if let Some(json) = ids_json {
+        std::fs::write(project.ids_file(), json).with_context(|| {
+            format!(
+                "cannot write identity file `{}`",
+                pbps_model::Text::new(project.ids_file().display().to_string()).shown()
+            )
+        })?;
     }
     let minted = res.created_tables.len()
         + res.added_columns.len()
@@ -2499,20 +2527,24 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
     Ok(read_ids_opt(project)?.unwrap_or_default())
 }
 
-fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
-    let path = project.ids_file();
+fn serialize_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<String> {
     ids.validate().with_context(|| {
         format!(
             "refusing to write inconsistent identity file `{}`",
-            path.display()
+            pbps_model::Text::new(project.ids_file().display().to_string()).shown()
         )
     })?;
+    // A trailing newline, so the file never shows "\ No newline at end of file" in
+    // a diff.
+    Ok(format!("{}\n", serde_json::to_string_pretty(ids)?))
+}
+
+fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
+    let json = serialize_ids(project, ids)?;
+    let path = project.ids_file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    // A trailing newline, so the file never shows "\ No newline at end of file" in
-    // a diff.
-    let json = format!("{}\n", serde_json::to_string_pretty(ids)?);
     std::fs::write(&path, json)
         .with_context(|| format!("cannot write identity file `{}`", path.display()))?;
     Ok(())
