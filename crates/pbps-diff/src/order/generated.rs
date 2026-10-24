@@ -120,6 +120,8 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         // existing owner/name is needed, not a generated installation's prefix.
         | Change::DropPolicy { .. }
         | Change::DropModule { .. }
+        | Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
@@ -594,6 +596,8 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
+        | Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

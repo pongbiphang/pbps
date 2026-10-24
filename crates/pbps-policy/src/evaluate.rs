@@ -391,6 +391,8 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::CreateModule { .. }
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
+                | Change::AddEnumValue { .. }
+                | Change::RenameEnumValue { .. }
                 | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }
@@ -586,6 +588,39 @@ pub fn parse_window(s: &str) -> Result<Window, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn enum_labels_do_not_become_table_expand_contract_operations() {
+        let add = PlannedChange::new(Change::AddEnumValue {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            value: "blue".into(),
+            placement: None,
+            ordinal: 0,
+            definition: Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["blue".into()],
+            }),
+        });
+        let drop = drop_column("old");
+        assert!(
+            plan(
+                &cs(vec![add.clone(), drop.clone()]),
+                &Policies::default(),
+                &ctx()
+            )
+            .is_empty()
+        );
+        let findings = plan(
+            &cs(vec![add, add_column("new"), drop]),
+            &Policies::default(),
+            &ctx(),
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|(_, f)| f.id == "change.expand-contract")
+        );
+    }
 
     #[test]
     fn grant_policy_keys_stay_raw_while_shared_sentences_show_names_once() {

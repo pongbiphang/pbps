@@ -1693,7 +1693,7 @@
         "values": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/EnumValueDto"
           },
           "uniqueItems": true
         }
@@ -1702,6 +1702,35 @@
       "required": [
         "enum",
         "values"
+      ]
+    },
+    "EnumValueDto": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/EnumValueIntentDto"
+        }
+      ]
+    },
+    "EnumValueIntentDto": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
       ]
     },
     "DomainTypeDto": {
@@ -1754,6 +1783,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 58,
+  "x-pbps-schema-version": 59,
   "x-pbps-tool-version": "0.0.0"
 }

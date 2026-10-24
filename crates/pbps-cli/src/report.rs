@@ -954,7 +954,9 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
+        Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
+        | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1324,6 +1326,33 @@ pub fn describe(c: &Change) -> String {
                 Escaped(&c.subject())
             )
         }
+        Change::AddEnumValue {
+            name,
+            value,
+            placement,
+            ..
+        } => {
+            let position = match placement {
+                Some(pbps_model::EnumPlacement::Before(label)) => {
+                    format!(" before {}", Escaped(label))
+                }
+                Some(pbps_model::EnumPlacement::After(label)) => {
+                    format!(" after {}", Escaped(label))
+                }
+                None => String::new(),
+            };
+            format!(
+                "+ add enum value {} to {}{position}",
+                Escaped(value),
+                name.shown()
+            )
+        }
+        Change::RenameEnumValue { name, from, to, .. } => format!(
+            "~ rename enum value {} -> {} in {}",
+            Escaped(from),
+            Escaped(to),
+            name.shown()
+        ),
         Change::CreateType {
             name, definition, ..
         } => format!("+ create {} {}", definition.kind(), name.shown()),
@@ -1967,6 +1996,40 @@ fn sequence_options(options: &pbps_model::SequenceOptions) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enum_label_lines_show_placement_and_escaped_rename_without_inventing_a_neighbour() {
+        use pbps_model::{Change, EnumPlacement, ManagedType};
+        let name: pbps_model::TypeRef = "app.e".parse().unwrap();
+        let uid: pbps_model::Uid = "y_000001".parse().unwrap();
+        let definition = Box::new(ManagedType::Enum {
+            values: vec!["new\nline".into()],
+        });
+        let add = |placement| Change::AddEnumValue {
+            uid: uid.clone(),
+            name: name.clone(),
+            value: "new\nline".into(),
+            placement,
+            ordinal: 0,
+            definition: definition.clone(),
+        };
+        assert_eq!(
+            super::describe(&add(Some(EnumPlacement::Before("old".into())))),
+            "+ add enum value new\\nline to app.e before old"
+        );
+        assert!(!super::describe(&add(None)).contains("before"));
+        assert_eq!(
+            super::describe(&Change::RenameEnumValue {
+                uid,
+                name,
+                from: "old".into(),
+                to: "new\nline".into(),
+                ordinal: 0,
+                definition
+            }),
+            "~ rename enum value old -> new\\nline in app.e"
+        );
+    }
+
     /// A numbering change's line shows the options each side sets, so an
     /// options-only retune reads as the change it is (#2015). The negative
     /// case: a retune of the start alone shows no options.

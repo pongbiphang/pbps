@@ -7813,3 +7813,53 @@ mod script_oracle {
         "/../pbps-dialect/tests/support/script_oracle.rs"
     ));
 }
+
+#[cfg(test)]
+mod enum_surface_refusal_tests {
+    use super::*;
+    #[test]
+    fn enum_data_and_list_keys_remain_named_refusals_while_defaults_stay_admitted() {
+        for ty in ["app.e", "app.e[]", "app.d"] {
+            let yaml = format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: '{ty}'}}\nprimary_key: [id]\ndata: {{mode: ensure, rows: {{}}}}\n"
+            );
+            let loaded = pbps_load::load_table_str(std::path::Path::new("t.yml"), &yaml).unwrap();
+            let mut table = loaded.table;
+            let pg = Postgres::new();
+            let refused = pg
+                .validate_table(&loaded.name, &table)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                refused.contains(ty)
+                    && refused.contains("column `m`")
+                    && refused.contains("user-defined type reference"),
+                "{refused}"
+            );
+            table.data = None;
+            table.primary_key = None;
+            table.partition_by = Some(pbps_model::PartitionBy {
+                strategy: pbps_model::PartitionStrategy::List,
+                columns: vec!["m".into()],
+                external: false,
+            });
+            let refused = pg
+                .validate_table(&loaded.name, &table)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                refused.contains("partition key")
+                    && refused.contains("partition key `m`")
+                    && refused.contains("user-defined type reference"),
+                "{refused}"
+            );
+            table.partition_by = None;
+            table.columns["m"].value_source = pbps_model::ValueSource::Default("'old'".into());
+            assert!(pg.validate_table(&loaded.name, &table).is_empty());
+        }
+    }
+}

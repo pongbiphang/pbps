@@ -590,6 +590,8 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

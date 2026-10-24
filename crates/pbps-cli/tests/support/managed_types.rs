@@ -842,12 +842,7 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         let mood = pbps_load::load_type_str(&mood_path, &mood_text).unwrap();
         let phone = pbps_load::load_type_str(&phone_path, &phone_text).unwrap();
         let mut variants = Vec::new();
-        for labels in [
-            vec!["sad", "ok", "happy"],
-            vec!["sad"],
-            vec!["ok", "sad"],
-            vec!["blue", "ok"],
-        ] {
+        for labels in [vec!["sad"], vec!["ok", "sad"], vec!["blue", "ok"]] {
             variants.push((
                 mood_path.clone(),
                 mood.name.clone(),
@@ -2375,6 +2370,685 @@ fn external_references_do_not_borrow_a_dropped_types_declared_identity() {
                 ),
                 0
             );
+        }
+    }
+}
+
+fn label_plan(d: &Demo, db: &str, path: &std::path::Path) -> pbps_model::SavedPlan {
+    succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_additions_preserve_all_positions_through_apply_pull_and_repull() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for values in [
+            "[first, sad, ok]",
+            "[sad, middle, ok]",
+            "[sad, ok, last]",
+            "[sad, adjacent_one, adjacent_two, ok]",
+            "[first, second, sad, middle_one, middle_two, ok, last]",
+        ] {
+            let own = OwnDatabase::new(&server, "label_positions1635");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('sad','ok')",
+            );
+            let d = Demo::new("label-positions1635");
+            succeeds(d.run(&["pull", "--db", db, "--force"]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt enum order"]));
+            let file = d.dir.join("schema/app.e.type.yml");
+            std::fs::write(&file, format!("enum: app.e\nvalues: {values}\n")).unwrap();
+            d.commit();
+            let path = d.dir.join("labels.plan.json");
+            let plan = label_plan(&d, db, &path);
+            assert!(!plan.changes.is_empty());
+            assert!(plan.changes.changes.iter().all(|p| matches!(
+                p.change,
+                pbps_model::Change::AddEnumValue { .. }
+            ) && p.risks.is_empty()));
+            succeeds(apply_plan(&d, db, &path, false));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            let wanted = pbps_load::load_schema_dir(&d.dir.join("schema"))
+                .unwrap()
+                .schema
+                .types;
+            for _ in 0..2 {
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                assert_eq!(
+                    pbps_load::load_schema_dir(&d.dir.join("schema"))
+                        .unwrap()
+                        .schema
+                        .types,
+                    wanted
+                );
+            }
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_rebuilds() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for authored in [false, true] {
+            let own = OwnDatabase::new(&server, "label_rename1635");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("label-rename1635");
+            let file = d.dir.join("schema/app.e.type.yml");
+            std::fs::write(&file, "enum: app.e\nvalues: [sad, ok, happy]\n").unwrap();
+            d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  m: {type: app.e, default: \"'sad'\"}\nprimary_key: [id]\nchecks: {allowed: \"m <> 'happy'\"}\n");
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            on_server(db, "INSERT INTO app.t(id,m) VALUES (1,'sad')");
+            if !authored {
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                d.commit();
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "compare adopted catalog expressions",
+                ]));
+            }
+            // A retained check and default both bind the renamed constants.
+            for path in std::fs::read_dir(d.dir.join("schema"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+            {
+                if path != file {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap()
+                        .replace("sad", "blue")
+                        .replace("happy", "joyful");
+                    std::fs::write(path, text).unwrap();
+                }
+            }
+            std::fs::write(&file, "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, ok, {name: joyful, renamed_from: happy}]\n").unwrap();
+            d.commit();
+            let path = d.dir.join("rename-labels.plan.json");
+            let plan = label_plan(&d, db, &path);
+            assert_eq!(plan.changes.changes.len(), 2, "{:?}", plan.changes);
+            assert!(plan.changes.changes.iter().all(|p| matches!(
+                p.change,
+                pbps_model::Change::RenameEnumValue { .. }
+            ) && p.risks
+                == [pbps_model::RiskClass::Rename].into()));
+            let denied = apply_plan(&d, db, &path, false);
+            assert_ne!(code(&denied), 0);
+            succeeds(d.run(&[
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&path),
+                "--allow",
+                "rename",
+            ]));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM app.t WHERE m::text='blue'"
+                ),
+                1
+            );
+            assert!(try_on_server(db, "INSERT INTO app.t VALUES (2,'joyful')").is_err());
+            on_server(db, "INSERT INTO app.t(id) VALUES (3)");
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM app.t WHERE m::text='blue'"
+                ),
+                2
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            std::fs::write(&file, "enum: app.e\nvalues: [blue, ok, joyful]\n").unwrap();
+            d.commit();
+            assert!(
+                label_plan(&d, db, &path).changes.is_empty(),
+                "provenance must survive removal of the one-shot annotations"
+            );
+        }
+        let own = OwnDatabase::new(&server, "label_array_constants1635");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('sad','ok'); CREATE TABLE app.arrays (m app.e[] DEFAULT '{sad}'::app.e[], CONSTRAINT c CHECK (m <> '{sad}'::app.e[]))",
+        );
+        let d = Demo::new("label-array-constants1635");
+        succeeds(d.run(&["pull", "--db", db]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "adopt enum array defaults and checks",
+        ]));
+        for path in std::fs::read_dir(d.dir.join("schema"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+        {
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("sad", "blue");
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, ok]\n",
+        )
+        .unwrap();
+        d.commit();
+        let path = d.dir.join("array-constants.plan.json");
+        assert_eq!(label_plan(&d, db, &path).changes.changes.len(), 1);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "rename",
+        ]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_removals_reorders_missing_sources_and_swaps_refuse_without_sql() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "label_refusals1635");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a','b')");
+        let d = Demo::new("label-refusals1635");
+        succeeds(d.run(&["pull", "--db", db, "--force"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt labels"]));
+        let file = d.dir.join("schema/app.e.type.yml");
+        let path = d.dir.join("refused-labels.plan.json");
+        for (values, expected) in [
+            ("[a]", "3b"),
+            ("[b, a]", "3b"),
+            ("[{name: x, renamed_from: absent}, b]", "absent"),
+            (
+                "[{name: x, renamed_from: a}, {name: red, renamed_from: a}]",
+                "two labels",
+            ),
+            (
+                "[{name: b, renamed_from: a}, {name: a, renamed_from: b}]",
+                "swap",
+            ),
+        ] {
+            std::fs::write(&file, format!("enum: app.e\nvalues: {values}\n")).unwrap();
+            d.commit();
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0);
+            assert!(
+                stderr(&out).contains("app.e") && stderr(&out).contains(expected),
+                "{}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid='app.e'::regtype AND enumlabel IN ('a','b')"
+                ),
+                2
+            );
+            assert_eq!(
+                scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                1
+            );
+        }
+        std::fs::write(
+            &file,
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, {name: c, renamed_from: b}]\n",
+        )
+        .unwrap();
+        d.commit();
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(plan.changes.changes.len(), 2);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "rename",
+        ]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for ty in ["app.e", "app.e[]", "app.d"] {
+            for kind in ["default", "check"] {
+                let own = OwnDatabase::new(&server, "label_use1635");
+                let db = own.connection();
+                on_server(
+                    db,
+                    "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old'); CREATE DOMAIN app.d AS app.e",
+                );
+                let d = Demo::new("label-use1635");
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                d.commit();
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "adopt enum before evaluation",
+                ]));
+                let enum_file = d.dir.join("schema/app.e.type.yml");
+                std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+                let literal = if ty.ends_with("[]") {
+                    "ARRAY['new'::app.e]"
+                } else if ty == "app.d" {
+                    "'new'::app.d"
+                } else {
+                    "'new'"
+                };
+                let mut table = format!(
+                    "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: '{ty}'"
+                );
+                if kind == "default" {
+                    table.push_str(&format!(", default: \"{literal}\""));
+                }
+                table.push_str("}\n");
+                table.push_str("primary_key: [id]\n");
+                match kind {
+                    "check" => table.push_str(&format!(
+                        "checks: {{allowed: \"{}\"}}\n",
+                        if ty == "app.d" {
+                            "m::app.e <> 'new'::app.e".to_owned()
+                        } else {
+                            format!("m <> {literal}")
+                        }
+                    )),
+                    "default" => {}
+                    _ => unreachable!(),
+                }
+                d.table(&table);
+                // Offline planning mints new table/column identities, while
+                // the new-label refusal itself must also apply offline.
+                std::fs::write(&enum_file, "enum: app.e\nvalues: [old]\n").unwrap();
+                succeeds(d.run(&["plan", "--no-dev"]));
+                std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+                d.commit();
+                let path = d.dir.join("unsafe-label.plan.json");
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0, "{ty} {kind}");
+                assert!(
+                    stderr(&out).contains("new")
+                        && stderr(&out).contains("apply the label first, then the rest"),
+                    "{ty} {kind}: {}",
+                    stderr(&out)
+                );
+                assert!(!path.exists());
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid='app.e'::regtype AND enumlabel='new'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_class WHERE relnamespace='app'::regnamespace AND relname='t'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                    1
+                );
+                std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+                // A refused plan cannot leave identities for removed files.
+                let ids_file = d.dir.join("schema.ids.json");
+                let mut ids: pbps_model::IdsFile =
+                    serde_json::from_slice(&std::fs::read(&ids_file).unwrap()).unwrap();
+                ids.tables.clear();
+                ids.columns.clear();
+                std::fs::write(
+                    &ids_file,
+                    format!("{}\n", serde_json::to_string_pretty(&ids).unwrap()),
+                )
+                .unwrap();
+                d.commit();
+                let first = label_plan(&d, db, &path);
+                assert_eq!(first.changes.changes.len(), 1);
+                succeeds(apply_plan(&d, db, &path, false));
+                d.table(&table);
+                succeeds(d.run(&["plan", "--no-dev"]));
+                d.commit();
+                assert!(!label_plan(&d, db, &path).changes.is_empty());
+                let checksum = plan_checksum(&path);
+                let out = d.run(&[
+                    "apply",
+                    "--db",
+                    db,
+                    "--plan",
+                    path.to_str().unwrap(),
+                    "--checksum",
+                    &checksum,
+                    "--allow",
+                    "constraint",
+                ]);
+                succeeds(out);
+                assert!(label_plan(&d, db, &path).changes.is_empty(), "{ty} {kind}");
+            }
+        }
+        for base in ["app.e", "app.e[]"] {
+            for kind in ["default", "check"] {
+                let own = OwnDatabase::new(&server, "label_domain_use1635");
+                let db = own.connection();
+                on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
+                let d = Demo::new("label-domain-use1635");
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                d.commit();
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    db,
+                    "--reason",
+                    "adopt enum before domain evaluation",
+                ]));
+                let enum_file = d.dir.join("schema/app.e.type.yml");
+                let domain_file = d.dir.join("schema/app.used.type.yml");
+                let literal = if base.ends_with("[]") {
+                    "ARRAY['new'::app.e]"
+                } else {
+                    "'new'::app.e"
+                };
+                let clause = if kind == "default" {
+                    format!("default: \"{literal}\"\n")
+                } else {
+                    format!("checks: {{kept: \"VALUE <> {literal}\"}}\n")
+                };
+                let domain = format!("domain: app.used\ntype: '{base}'\n{clause}");
+                std::fs::write(&domain_file, &domain).unwrap();
+                succeeds(d.run(&["plan", "--no-dev"]));
+                std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+                d.commit();
+                let path = d.dir.join("domain-label.plan.json");
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0);
+                assert!(
+                    stderr(&out).contains("new")
+                        && stderr(&out).contains("apply the label first, then the rest"),
+                    "{}",
+                    stderr(&out)
+                );
+                assert!(!path.exists());
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid='app.e'::regtype AND enumlabel='new'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_type WHERE typnamespace='app'::regnamespace AND typname='used'"
+                    ),
+                    0
+                );
+                std::fs::remove_file(&domain_file).unwrap();
+                let ids_file = d.dir.join("schema.ids.json");
+                let mut ids: pbps_model::IdsFile =
+                    serde_json::from_slice(&std::fs::read(&ids_file).unwrap()).unwrap();
+                ids.types
+                    .retain(|_, name| name.raw().to_string() != "app.used");
+                std::fs::write(&ids_file, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+                d.commit();
+                label_plan(&d, db, &path);
+                succeeds(apply_plan(&d, db, &path, false));
+                std::fs::write(&domain_file, &domain).unwrap();
+                succeeds(d.run(&["plan", "--no-dev"]));
+                d.commit();
+                label_plan(&d, db, &path);
+                succeeds(apply_plan(&d, db, &path, false));
+                assert!(
+                    label_plan(&d, db, &path).changes.is_empty(),
+                    "{base} {kind}"
+                );
+            }
+        }
+        for (kind, definition) in [
+            ("view", "SELECT 'new'::app.e AS m"),
+            (
+                "function",
+                "() RETURNS app.e LANGUAGE sql AS $$ SELECT 'new'::app.e $$",
+            ),
+            (
+                "function",
+                "() RETURNS app.e LANGUAGE sql BEGIN ATOMIC SELECT 'new'::app.e; END",
+            ),
+        ] {
+            let own = OwnDatabase::new(&server, "label_module1635");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
+            let d = Demo::new("label-module1635");
+            succeeds(d.run(&["pull", "--db", db, "--force"]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                db,
+                "--reason",
+                "adopt enum before module",
+            ]));
+            std::fs::write(
+                d.dir.join("schema/app.e.type.yml"),
+                "enum: app.e\nvalues: [old, new]\n",
+            )
+            .unwrap();
+            let module_file = d.dir.join("schema/app.f.yml");
+            let module = format!(
+                "{kind}: app.f{}\ndefinition: |\n  {definition}\n",
+                if kind == "function" { "()" } else { "" }
+            );
+            std::fs::write(&module_file, &module).unwrap();
+            d.commit();
+            let path = d.dir.join("module-label.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0);
+            assert!(
+                stderr(&out).contains("apply the label first, then the rest"),
+                "{}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+            std::fs::remove_file(&module_file).unwrap();
+            d.commit();
+            label_plan(&d, db, &path);
+            succeeds(apply_plan(&d, db, &path, false));
+            std::fs::write(&module_file, &module).unwrap();
+            d.commit();
+            label_plan(&d, db, &path);
+            succeeds(apply_plan(&d, db, &path, false));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resume() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "label_plpgsql1635");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old')");
+        let d = Demo::new("label-plpgsql1635");
+        succeeds(d.run(&["pull", "--db", db, "--force"]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "adopt enum before PL/pgSQL",
+        ]));
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [old, new]\n",
+        )
+        .unwrap();
+        std::fs::write(d.dir.join("schema/app.f.yml"), "function: app.f()\ndefinition: |\n  () RETURNS app.e LANGUAGE plpgsql AS $$ BEGIN RETURN 'new'::app.e; END $$\n").unwrap();
+        d.commit();
+        let path = d.dir.join("plpgsql-label.plan.json");
+        label_plan(&d, db, &path);
+        succeeds(apply_plan(&d, db, &path, false));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint WHERE app.f()::text='new'"),
+            1
+        );
+        #[cfg(target_os = "linux")]
+        for rename in [false, true] {
+            let own = OwnDatabase::new(&server, "label_staged1635");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("label-staged1635");
+            d.table("table: app.t\ncolumns:\n  m: {type: app.e, default: \"'old'\"}\nchecks:\n  kept: m <> 'old'\n");
+            std::fs::write(
+                d.dir.join("schema/app.e.type.yml"),
+                "enum: app.e\nvalues: [old]\n",
+            )
+            .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let file = d.dir.join("schema/app.e.type.yml");
+            let yaml = if rename {
+                "enum: app.e\nvalues: [{name: renamed, renamed_from: old}]\n"
+            } else {
+                "enum: app.e\nvalues: [old, staged]\n"
+            };
+            std::fs::write(&file, yaml).unwrap();
+            if rename {
+                d.table("table: app.t\ncolumns:\n  m: {type: app.e, default: \"'renamed'\"}\nchecks:\n  kept: m <> 'renamed'\n");
+            }
+            d.commit();
+            let path = d.dir.join("staged-label.plan.json");
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]));
+            let checksum = plan_checksum(&path);
+            let mut args = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--staged",
+            ];
+            if rename {
+                args.extend(["--allow", "rename"]);
+            }
+            let _checkpoint =
+                super::abrupt_recovery::interrupt_after_type_checkpoint(db, &d, &args);
+            args.push("--resume");
+            succeeds(d.run(&args));
+            succeeds(d.run(&["verify", "--db", db]));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+fn enum_data_and_list_keys_keep_named_refusals_before_label_use_checks() {
+    for ty in ["app.e", "app.e[]", "app.d"] {
+        for partition in [false, true] {
+            let d = Demo::new("enum-surfaces-deferred2346");
+            let enum_file = d.dir.join("schema/app.e.type.yml");
+            std::fs::write(&enum_file, "enum: app.e\nvalues: [old]\n").unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.d.type.yml"),
+                "domain: app.d\ntype: app.e\n",
+            )
+            .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+            let tail = if partition {
+                "partition_by: {list: [m]}\n"
+            } else {
+                "primary_key: [id]\ndata: {mode: ensure, rows: {1: {m: new}}}\n"
+            };
+            d.table(&format!("table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: '{ty}'}}\n{tail}"));
+            let path = d.dir.join("refused.plan.json");
+            // The connected route validates before opening any connection.
+            // Offline previews are advisory on master; validate owns that check.
+            let unreachable = "host=127.0.0.1 port=1 user=postgres dbname=unused sslmode=disable";
+            for args in [
+                vec!["validate"],
+                vec!["plan", "--db", unreachable, "--out", path.to_str().unwrap()],
+            ] {
+                let out = d.run(&args);
+                assert_ne!(code(&out), 0);
+                let why = format!("{}\n{}", stdout(&out), stderr(&out));
+                assert!(
+                    why.contains("app.t")
+                        && why.contains(if partition {
+                            "partition key `m`"
+                        } else {
+                            "column `m`"
+                        })
+                        && (partition || why.contains(ty)),
+                    "{why}"
+                );
+                assert!(why.contains("user-defined type reference"), "{why}");
+                assert!(
+                    !why.contains("apply the label first, then the rest"),
+                    "{why}"
+                );
+                assert!(!path.exists());
+            }
         }
     }
 }

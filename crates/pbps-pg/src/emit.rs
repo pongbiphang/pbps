@@ -67,6 +67,58 @@ mod declared_type_emission_tests {
     use super::*;
 
     #[test]
+    fn label_sql_quotes_values_and_certifies_each_intermediate_definition() {
+        let uid = "y_000001".parse().unwrap();
+        let name = pbps_model::TypeRef::new("app", "e\"").unwrap();
+        let definition = Box::new(pbps_model::ManagedType::Enum {
+            values: vec!["can't".into(), "ok".into()],
+        });
+        let change = Change::AddEnumValue {
+            uid,
+            name,
+            value: "can't".into(),
+            placement: Some(pbps_model::EnumPlacement::Before("ok".into())),
+            ordinal: 0,
+            definition: definition.clone(),
+        };
+        let output = emit(&Postgres::new(), &change, Strategy::default()).unwrap();
+        assert_eq!(output.len(), 1);
+        assert!(
+            output[0]
+                .sql
+                .contains("ALTER TYPE \"app\".\"e\"\"\" ADD VALUE E'can''t' BEFORE E'ok';"),
+            "{}",
+            output[0].sql
+        );
+        assert_eq!(
+            output[0]
+                .declared_type
+                .as_ref()
+                .unwrap()
+                .definition
+                .as_ref(),
+            Some(definition.as_ref())
+        );
+        assert!(output[0].transactional);
+        let Change::AddEnumValue { uid, name, .. } = change else {
+            unreachable!()
+        };
+        let renamed = Change::RenameEnumValue {
+            uid,
+            name,
+            from: "can't".into(),
+            to: "blue".into(),
+            ordinal: 1,
+            definition: Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["blue".into(), "ok".into()],
+            }),
+        };
+        let output = emit(&Postgres::new(), &renamed, Strategy::default()).unwrap();
+        assert!(output[0].sql.contains("RENAME VALUE E'can''t' TO E'blue';"));
+        assert!(!output[0].sql.contains("ADD VALUE"));
+    }
+
+    #[test]
     fn type_lifecycle_sql_quotes_names_and_labels_and_preserves_domain_attributes() {
         let pg = Postgres::new();
         let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
@@ -3126,6 +3178,67 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             table,
             format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
+        Change::AddEnumValue {
+            uid,
+            name,
+            value,
+            placement,
+            definition,
+            ..
+        } => {
+            let position = match placement {
+                Some(pbps_model::EnumPlacement::Before(value)) => {
+                    format!(" BEFORE {}", value_literal(value))
+                }
+                Some(pbps_model::EnumPlacement::After(value)) => {
+                    format!(" AFTER {}", value_literal(value))
+                }
+                None => String::new(),
+            };
+            let mut statement = scoped(
+                pg,
+                name.schema(),
+                &format!(
+                    "ALTER TYPE {}.{} ADD VALUE {}{};",
+                    quote(name.schema())?,
+                    quote(name.name())?,
+                    value_literal(value),
+                    position
+                ),
+            )?;
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Some((**definition).clone()),
+            });
+            Ok(vec![statement])
+        }
+        Change::RenameEnumValue {
+            uid,
+            name,
+            from,
+            to,
+            definition,
+            ..
+        } => {
+            let mut statement = scoped(
+                pg,
+                name.schema(),
+                &format!(
+                    "ALTER TYPE {}.{} RENAME VALUE {} TO {};",
+                    quote(name.schema())?,
+                    quote(name.name())?,
+                    value_literal(from),
+                    value_literal(to)
+                ),
+            )?;
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Some((**definition).clone()),
+            });
+            Ok(vec![statement])
+        }
         Change::CreateType {
             uid,
             name,

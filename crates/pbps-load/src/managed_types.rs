@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fmt::Write, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+    path::Path,
+};
 
 use pbps_model::{ColumnType, ManagedType, TypeRef};
 
@@ -13,6 +17,7 @@ pub struct LoadedType {
     pub name: TypeRef,
     pub definition: ManagedType,
     pub renamed_from: Option<TypeRef>,
+    pub value_renames: BTreeMap<String, String>,
 }
 
 pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadError>> {
@@ -23,24 +28,38 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
         }]
     };
     let probe: KindProbe = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
+    let mut value_renames = BTreeMap::new();
     let (name, definition, renamed_from) = match (probe.enumeration, probe.domain) {
         (Some(_), None) => {
             let dto: EnumTypeDto = serde_saphyr::from_str(text).map_err(|e| fail(e.to_string()))?;
             let mut seen = BTreeSet::new();
-            for value in &dto.values {
-                if !seen.insert(value) {
+            let mut sources = BTreeSet::new();
+            let mut values = Vec::new();
+            for entry in dto.values {
+                let (value, from) = match entry {
+                    crate::dto::EnumValueDto::Label(value) => (value, None),
+                    crate::dto::EnumValueDto::Renamed(value) => (value.name, value.renamed_from),
+                };
+                if let Some(from) = from {
+                    if !sources.insert(from.clone()) {
+                        return Err(fail(format!(
+                            "enum `{}`: two labels claim renamed_from `{}`",
+                            pbps_model::escape::Escaped(&dto.name),
+                            pbps_model::escape::Escaped(&from)
+                        )));
+                    }
+                    value_renames.insert(value.clone(), from);
+                }
+                if !seen.insert(value.clone()) {
                     return Err(fail(format!(
                         "enum `{}` declares value `{}` twice",
                         pbps_model::escape::Escaped(&dto.name),
-                        pbps_model::escape::Escaped(value)
+                        pbps_model::escape::Escaped(&value)
                     )));
                 }
+                values.push(value);
             }
-            (
-                dto.name,
-                ManagedType::Enum { values: dto.values },
-                dto.renamed_from,
-            )
+            (dto.name, ManagedType::Enum { values }, dto.renamed_from)
         }
         (None, Some(_)) => {
             let dto: DomainTypeDto =
@@ -88,6 +107,7 @@ pub fn load_type_str(path: &Path, text: &str) -> Result<LoadedType, Vec<LoadErro
         name,
         definition,
         renamed_from,
+        value_renames,
     })
 }
 
@@ -101,6 +121,15 @@ pub fn render_type_with_intents(
     name: &TypeRef,
     definition: &ManagedType,
     pending: &[pbps_model::Intent],
+) -> String {
+    render_type_with_value_renames(name, definition, pending, &BTreeMap::new())
+}
+
+pub fn render_type_with_value_renames(
+    name: &TypeRef,
+    definition: &ManagedType,
+    pending: &[pbps_model::Intent],
+    value_renames: &BTreeMap<String, String>,
 ) -> String {
     let mut out = format!(
         "{}: {}\n",
@@ -116,7 +145,15 @@ pub fn render_type_with_intents(
     }
     match definition {
         ManagedType::Enum { values } => {
-            let values: Vec<_> = values.iter().map(|v| scalar(v)).collect();
+            let values: Vec<_> = values
+                .iter()
+                .map(|v| match value_renames.get(v) {
+                    Some(from) => {
+                        format!("{{name: {}, renamed_from: {}}}", scalar(v), scalar(from))
+                    }
+                    None => scalar(v),
+                })
+                .collect();
             let _ = writeln!(out, "values: [{}]", values.join(", "));
         }
         ManagedType::Domain {
@@ -150,6 +187,37 @@ pub fn render_type_with_intents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_annotations_round_trip_beside_schema_and_refuse_ambiguous_sources() {
+        let yaml = "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, ok]\n";
+        let loaded = load_type_str(Path::new("enum.yml"), yaml).unwrap();
+        let plain =
+            load_type_str(Path::new("enum.yml"), "enum: app.e\nvalues: [blue, ok]\n").unwrap();
+        assert_eq!(loaded.definition, plain.definition);
+        assert_eq!(loaded.value_renames["blue"], "sad");
+        let rendered = render_type_with_value_renames(
+            &loaded.name,
+            &loaded.definition,
+            &[],
+            &loaded.value_renames,
+        );
+        assert_eq!(
+            load_type_str(Path::new("enum.yml"), &rendered).unwrap(),
+            loaded
+        );
+        for yaml in [
+            "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, {name: red, renamed_from: sad}]\n",
+            "enum: app.e\nvalues: [blue, {name: blue, renamed_from: sad}]\n",
+            "enum: app.e\nvalues: [{name: blue, renamed_form: sad}]\n",
+            "enum: app.e\nvalues: [{renamed_from: sad}]\n",
+        ] {
+            assert!(
+                load_type_str(Path::new("enum.yml"), yaml).is_err(),
+                "{yaml}"
+            );
+        }
+    }
 
     #[test]
     fn declared_types_round_trip_ordered_labels_and_verbatim_domain_text() {

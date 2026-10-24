@@ -259,7 +259,11 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         let type_change = |change: &Change| {
             matches!(
                 change,
-                Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. }
+                Change::AddEnumValue { .. }
+                    | Change::RenameEnumValue { .. }
+                    | Change::CreateType { .. }
+                    | Change::DropType { .. }
+                    | Change::RenameType { .. }
             )
         };
         if cs.changes.iter().any(|p| type_change(&p.change))
