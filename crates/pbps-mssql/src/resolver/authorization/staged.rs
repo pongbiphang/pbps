@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::resolver::capture::{CapturedInputs, ObjectIdentity, Uncovered, class};
+use pbps_model::escape::Escaped;
 
 pub(super) fn serialize<S: serde::Serializer>(
     staged: &BTreeMap<ObjectIdentity, StagedObject>,
@@ -182,6 +183,10 @@ fn permission_class(id: &ObjectIdentity) -> Result<(&'static str, u8), DbError> 
     }
 }
 
+fn absent_staged_object(name: &str) -> String {
+    format!("staged object {} is absent or unreadable", Escaped(name))
+}
+
 /// Trusted setup only, before any ACL replay. A file's resulting owners use
 /// `OwnerPartition::verify` instead. ALTER AUTHORIZATION clears object ACLs.
 pub async fn reconstruct_owners(
@@ -237,9 +242,7 @@ pub async fn reconstruct_owners(
                      OBJECT_NAME(parent_object_id) AS parent_name FROM sys.objects WHERE object_id=OBJECT_ID({});", literal(&name)
                 )).await?;
                 let [row] = rows.as_slice() else {
-                    return Err(DbError::Refused(format!(
-                        "staged object {name} is absent or unreadable"
-                    )));
+                    return Err(DbError::Refused(absent_staged_object(&name)));
                 };
                 if let (Some(schema), Some(parent)) = (
                     row.try_get::<&str>("parent_schema")?,
@@ -315,9 +318,7 @@ pub async fn read_staged_permissions(
         let catalog_id = format!("{kind}_ID({})", literal(&name));
         let rows = conn.query(&format!("SELECT {catalog_id} AS id;")).await?;
         if rows.len() != 1 || rows[0].try_get::<i32>("id")?.is_none() {
-            return Err(DbError::Refused(format!(
-                "staged object {name} is absent or unreadable"
-            )));
+            return Err(DbError::Refused(absent_staged_object(&name)));
         }
         let mut effective = BTreeSet::new();
         for row in conn
@@ -514,6 +515,27 @@ pub async fn verify_staged_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_refusal_shows_the_name_once_while_sql_identity_stays_raw() {
+        let id = crate::resolver::capture::object("app", "na\n\u{1b}\u{202e}\\n\\u{202e}雪']");
+        let before = id.clone();
+        let name = securable_name(&id).unwrap();
+        assert_eq!(name, "[app].[na\n\u{1b}\u{202e}\\n\\u{202e}雪']]]");
+        assert_eq!(
+            literal(&name),
+            "N'[app].[na\n\u{1b}\u{202e}\\n\\u{202e}雪'']]]'"
+        );
+        assert_eq!(
+            absent_staged_object(&name),
+            r"staged object [app].[na\n\u{1b}\u{202e}\\n\\u{202e}雪']]] is absent or unreadable"
+        );
+        assert_eq!(id, before);
+        assert_eq!(
+            absent_staged_object("[app].[café雪]"),
+            "staged object [app].[café雪] is absent or unreadable"
+        );
+    }
 
     #[test]
     fn trusted_rendered_ownership_never_repairs_file_schemas() {

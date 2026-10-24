@@ -2034,6 +2034,7 @@
         "scratch2236::assembly_references_drop_dependents_before_providers_as_owner",
         "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys",
         "scratch2236::unrestorable_built_ins_refuse_unchanged_and_out_of_set_state_passes",
+        "deployer2267::staged_refusals_show_hostile_names_while_lookups_and_recorded_identities_stay_raw",
         "deployer2267::sandbox_deployer_reproduces_database_context_without_revert",
         "deployer2267::deployer_cannot_return_to_sandbox_or_login",
         "deployer2267::object_references_grant_is_replayed",
