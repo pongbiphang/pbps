@@ -181,7 +181,10 @@ pub fn with_catalog_parts(
     before: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Slots, String> {
-    use super::catalog::{Holds, Part, graph::Held};
+    use super::catalog::{
+        Holds, Part,
+        graph::{Held, Ownership, Root},
+    };
     use pbps_model::operation::{Address, Named, PartKey};
     let closure = catalog.graph.closure(root)?;
     for (id, spelling) in catalog
@@ -189,6 +192,24 @@ pub fn with_catalog_parts(
         .require("index and constraint spellings")?
     {
         if !closure.nodes.contains_key(id) {
+            continue;
+        }
+        // DEC-2298.10: closure has already validated every node/read and owner.
+        // OID-allocated engine storage is not an independently reusable part.
+        let mut owner = id;
+        let mut storage = false;
+        while let Held::Owned { by, kind } = &closure.nodes[owner].held {
+            storage |= *kind == Ownership::Storage;
+            owner = by;
+        }
+        if storage
+            && let Held::Root(Root::Table(uid)) = &closure.nodes[owner].held
+            && before
+                .ids
+                .tables
+                .get(uid)
+                .is_some_and(|name| before.schema.tables.contains_key(name))
+        {
             continue;
         }
         let bad = || format!("{}: unsupported part ownership", spelling.table.shown());

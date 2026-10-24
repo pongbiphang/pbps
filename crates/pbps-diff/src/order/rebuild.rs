@@ -10,6 +10,8 @@ use pbps_dialect::{
 use pbps_model::operation::Source as OriginSource;
 use pbps_model::{operation::*, plan_names::PlanNames, *};
 use std::collections::{BTreeMap, BTreeSet};
+mod run;
+pub use run::{Expanded, expand};
 
 /// Engine naming receives shared release facts and the validated proposed ledger.
 /// Its recipes are checked against every approved part and reserved member.
@@ -187,7 +189,10 @@ pub fn prepare(
             .map_err(|e| e.to_string())?;
     let r = input.root;
     let catalog_root = Root::Table(input.before.ids.table_uid(&r.table).unwrap().clone());
-    let closure = input.catalog.checked(&catalog_root, input.before.schema)?;
+    let closure = input
+        .catalog
+        .checked(&catalog_root, input.before.schema)
+        .map_err(|why| format!("{}: {why}", r.table.shown()))?;
     let naming = input
         .naming
         .require(&format!("{}: namespace occupancy", r.table.shown()))?;
@@ -404,21 +409,6 @@ pub fn prepare(
             );
         }
     }
-    for uid in r.intent.source.tables.keys() {
-        let relation = rule.address(uid);
-        let parent = (uid != input.before.ids.table_uid(&r.table).unwrap()).then(|| {
-            rule.address(input.before.ids.table_uid(&r.table).unwrap())
-                .name
-        });
-        rule.add(
-            Change::DropTable {
-                uid: uid.clone(),
-                name: relation.name,
-                detach_from: parent,
-            },
-            Purpose::Retire,
-        );
-    }
     let sources = super::deployment::Sources {
         before: input.before,
         after: input.desired.ids,
@@ -586,6 +576,22 @@ pub fn prepare(
                 Purpose::Restoration,
             );
         }
+    }
+    // Declare implicit content removals last for the existing write-write contract.
+    for uid in r.intent.source.tables.keys() {
+        let relation = rule.address(uid);
+        let parent = (uid != input.before.ids.table_uid(&r.table).unwrap()).then(|| {
+            rule.address(input.before.ids.table_uid(&r.table).unwrap())
+                .name
+        });
+        rule.add(
+            Change::DropTable {
+                uid: uid.clone(),
+                name: relation.name,
+                detach_from: parent,
+            },
+            Purpose::Retire,
+        );
     }
     rule.out.slots = rule.describe()?;
     Ok(rule.out)
