@@ -28,6 +28,7 @@ pub mod change;
 mod column_wire;
 pub mod data;
 pub mod declared;
+pub mod dependency;
 pub mod diagnostic;
 pub mod drift;
 pub mod escape;

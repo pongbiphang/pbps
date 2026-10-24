@@ -7,6 +7,7 @@
 //! [`docs/ADR-0001`](../../../docs/ADR-0001-yaml-crate.md).
 
 pub mod convert;
+mod dependencies;
 pub mod dto;
 pub mod error;
 pub mod fmt;
@@ -17,6 +18,7 @@ use std::path::Path;
 use pbps_model::{Hints, Schema, TableName};
 
 pub use convert::{LoadedModule, LoadedRole, LoadedTable};
+pub use dependencies::{LoadedDependency, load_dependency_str, render_dependency};
 pub use error::{LoadError, Semantic, SourceFile};
 pub use fmt::{render, render_module, render_partitioned, render_role};
 pub use managed_types::{LoadedType, load_type_str, render_type, render_type_with_intents};
@@ -30,6 +32,7 @@ pub use pbps_model::Intent;
 /// states — see inviolable constraint 1.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loaded {
+    pub dependencies: pbps_model::dependency::Dependencies,
     pub schema: Schema,
     pub intents: Vec<Intent>,
     /// Only what was declared; absence means the default.
@@ -86,6 +89,7 @@ pub fn inspect_schema_dir(dir: &Path) -> Result<DiagnosticSchema, Vec<LoadError>
 /// What one declaration file turned out to hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadedFile {
+    Dependency(Box<LoadedDependency>),
     Type(Box<LoadedType>),
     Table(Box<LoadedTable>),
     Module(Box<LoadedModule>),
@@ -140,6 +144,9 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
             message: e.to_string(),
         }]
     })?;
+    if probe.dependency.is_some() {
+        return load_dependency_str(path, text).map(|d| LoadedFile::Dependency(Box::new(d)));
+    }
     if probe.enumeration.is_some() || probe.domain.is_some() {
         return load_type_str(path, text).map(|t| LoadedFile::Type(Box::new(t)));
     }
@@ -159,7 +166,7 @@ pub fn load_file_str(path: &Path, text: &str) -> Result<LoadedFile, Vec<LoadErro
     Err(vec![LoadError::Yaml {
         path: path.to_owned(),
         message: "a declaration file starts with `table:`, `view:`, `procedure:`, `function:`, \
-                  `trigger:`, `role:`, `enum:` or `domain:`"
+                  `trigger:`, `role:`, `enum:`, `domain:` or `dependency:`"
             .to_owned(),
     }])
 }
@@ -241,6 +248,10 @@ fn collect_schema_dir(
         std::collections::BTreeMap::new();
     let mut seen_types: std::collections::BTreeMap<pbps_model::TypeRef, std::path::PathBuf> =
         std::collections::BTreeMap::new();
+    let mut seen_dependencies: std::collections::BTreeMap<
+        pbps_model::dependency::DependencyName,
+        std::path::PathBuf,
+    > = std::collections::BTreeMap::new();
 
     for path in files {
         let file = match load(&path) {
@@ -252,6 +263,19 @@ fn collect_schema_dir(
         };
 
         let file = match file {
+            LoadedFile::Dependency(d) => {
+                if let Some(first) = seen_dependencies.get(&d.name) {
+                    errs.push(already(
+                        &path,
+                        &format!("dependency `{}`", d.name.shown()),
+                        first,
+                    ));
+                    continue;
+                }
+                seen_dependencies.insert(d.name.clone(), path);
+                loaded.dependencies.insert(d.name, d.declaration);
+                continue;
+            }
             LoadedFile::Type(t) => {
                 if let Some(first) = seen_types.get(&t.name) {
                     errs.push(already(&path, &format!("type `{}`", t.name.shown()), first));
@@ -338,7 +362,7 @@ fn collect_schema_dir(
                 loaded.schema.modules.insert(m.id, m.module);
             }
             // Merged above, in its own namespace.
-            LoadedFile::Role(_) | LoadedFile::Type(_) => {}
+            LoadedFile::Role(_) | LoadedFile::Type(_) | LoadedFile::Dependency(_) => {}
         }
     }
 
@@ -1276,7 +1300,10 @@ indexes:
         let f = load_file_str(Path::new("r.yml"), "role: app.reader\n").unwrap();
         match f {
             LoadedFile::Role(r) => assert_eq!(r.name, "app.reader".into()),
-            other @ (LoadedFile::Table(_) | LoadedFile::Module(_) | LoadedFile::Type(_)) => {
+            other @ (LoadedFile::Table(_)
+            | LoadedFile::Module(_)
+            | LoadedFile::Type(_)
+            | LoadedFile::Dependency(_)) => {
                 panic!("not a role: {other:?}")
             }
         }

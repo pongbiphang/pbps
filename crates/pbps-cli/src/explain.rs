@@ -37,6 +37,8 @@ use crate::{db, output, report};
 /// change list would be a second implementation of the gate's own arithmetic.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Explanation {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dependencies: pbps_model::dependency::PlannedDependencies,
     /// Database-derived, with or without resolver evidence (#616). This
     /// does not assert that the target or risk approval is ready.
     pub applyable: bool,
@@ -420,6 +422,7 @@ fn explain(
         }
     }
     Ok(Explanation {
+        dependencies: plan.dependencies.clone(),
         type_routines: plan.type_routines.clone(),
         type_routine_approval: (!plan.type_routines.is_empty())
             .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
@@ -626,6 +629,7 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
 /// are escaped here, once, when placed beside that prose.
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
+    out.push_str(&crate::dependencies::render(&plan.dependencies));
     out.push_str(&crate::pins::reviewed_sources(&plan.type_routines));
     out.push_str(&format!(
         "  origin      {}\n",

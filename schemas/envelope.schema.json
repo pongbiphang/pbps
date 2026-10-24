@@ -131,6 +131,15 @@
       "description": "What `plan` produced, for `--format json`.\n\nThe changes are counted rather than listed: the typed change set is what\n`--out` writes, and `explain` is what renders it. Two spellings of the same\nlist, one of them abbreviated, is how a consumer comes to read the wrong one.",
       "type": "object",
       "properties": {
+        "dependencies": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[^.]+\\.[^.]+\\.[^.]+$": {
+              "$ref": "#/$defs/PlannedDependency"
+            }
+          }
+        },
         "baseline": {
           "type": "string"
         },
@@ -233,6 +242,71 @@
         "modules",
         "roles",
         "risks"
+      ]
+    },
+    "PlannedDependency": {
+      "type": "object",
+      "properties": {
+        "declaration": {
+          "$ref": "#/$defs/Dependency"
+        },
+        "comparison": {
+          "$ref": "#/$defs/Comparison"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "declaration",
+        "comparison"
+      ]
+    },
+    "Dependency": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/DependencyKind"
+        },
+        "columns": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DependencyColumn"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "columns"
+      ]
+    },
+    "DependencyKind": {
+      "type": "string",
+      "enum": [
+        "table",
+        "view"
+      ]
+    },
+    "DependencyColumn": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "nullable"
+      ]
+    },
+    "Comparison": {
+      "type": "string",
+      "enum": [
+        "compared",
+        "declared, not compared"
       ]
     },
     "ConnectedCheck": {
@@ -1109,6 +1183,15 @@
       "description": "What `explain` found, for `--format json`.\n\nSerialized rather than re-derived by a consumer: the optional UI of ADR-0006\nrenders exactly this, and a UI that recomputed \"which risks apply\" from the\nchange list would be a second implementation of the gate's own arithmetic.",
       "type": "object",
       "properties": {
+        "dependencies": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[^.]+\\.[^.]+\\.[^.]+$": {
+              "$ref": "#/$defs/PlannedDependency"
+            }
+          }
+        },
         "applyable": {
           "description": "Database-derived, with or without resolver evidence (#616). This\ndoes not assert that the target or risk approval is ready.",
           "type": "boolean"
@@ -2622,6 +2705,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 57,
+  "x-pbps-schema-version": 58,
   "x-pbps-tool-version": "0.0.0"
 }

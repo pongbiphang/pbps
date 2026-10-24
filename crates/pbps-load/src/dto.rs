@@ -23,6 +23,8 @@ use pbps_model::{ColumnName, ReferentialAction};
 /// "unknown field `colunms`" from whichever variant happened to be tried first.
 #[derive(Debug, serde::Deserialize)]
 pub struct KindProbe {
+    #[serde(default)]
+    pub dependency: Option<String>,
     #[serde(default, rename = "enum")]
     pub enumeration: Option<String>,
     #[serde(default)]
@@ -39,6 +41,28 @@ pub struct KindProbe {
     pub trigger: Option<String>,
     #[serde(default)]
     pub role: Option<pbps_model::RoleName>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyDto {
+    pub dependency: pbps_model::dependency::DependencyName,
+    pub kind: pbps_model::dependency::DependencyKind,
+    #[schemars(extend("minProperties" = 1))]
+    pub columns: BTreeMap<ColumnName, DependencyColumnDto>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyColumnDto {
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(default = "dependency_nullable")]
+    pub nullable: bool,
+}
+
+fn dependency_nullable() -> bool {
+    true
 }
 
 /// A shared enum: label order is semantic state.
@@ -1389,6 +1413,7 @@ pub enum IndexOrder {
 #[serde(untagged)]
 #[schemars(title = "pbps declaration")]
 pub enum DeclarationFile {
+    Dependency(Box<DependencyDto>),
     // Boxed for their sizes: the enum is only ever a schema, and a box is
     // transparent to it.
     Table(Box<TableDto>),

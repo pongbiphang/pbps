@@ -329,6 +329,8 @@ fn load_from_git(
                 schema.types.insert(t.name, t.definition);
                 count += 1;
             }
+            // Dependencies describe assumptions, never baseline schema state.
+            Ok(pbps_load::LoadedFile::Dependency(_)) => {}
             Err(errs) => {
                 // The baseline is a historical version. Its being broken should not
                 // halt current work, but it does have to be reported.

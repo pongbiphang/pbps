@@ -262,7 +262,8 @@ use crate::zone::SessionZone;
 /// 47 adds standing policy operations and gated row-security risks (DEC-1173.1).
 /// 48 adds the identity file's `types` map to `SavedPlan.ids` (DEC-1635.1).
 /// 49 pins declared type definitions and lifecycle payloads (DEC-1635.4).
-pub const CURRENT_VERSION: u32 = 49;
+/// 50 pins declared cross-database shapes and their comparison (DEC-2322.1).
+pub const CURRENT_VERSION: u32 = 50;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -359,6 +360,10 @@ pub struct PlanBaseline {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedPlan {
+    /// Declared cross-database assumptions and their plan-time comparison.
+    /// Apply binds managed SQL normally and never re-reads these objects.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: crate::dependency::PlannedDependencies,
     pub version: u32,
 
     pub origin: PlanOrigin,
@@ -543,6 +548,7 @@ impl SavedPlan {
         ids: IdsFile,
     ) -> Self {
         Self {
+            dependencies: BTreeMap::new(),
             version: CURRENT_VERSION,
             origin,
             analysis: crate::resolver::PlanAnalysis::Ordinary,
@@ -807,7 +813,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 49);
+        assert_eq!(CURRENT_VERSION, 50);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

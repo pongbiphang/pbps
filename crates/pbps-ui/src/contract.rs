@@ -104,6 +104,8 @@ pub struct Baseline {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Explanation {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dependencies: std::collections::BTreeMap<String, Dependency>,
     pub applyable: bool,
     pub dialect: String,
     pub created_at: String,
@@ -125,6 +127,43 @@ pub struct Explanation {
     /// A resolved plan's sealed evidence (#1517); absent for any other plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolver: Option<Resolver>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dependency {
+    pub declaration: DependencyDeclaration,
+    pub comparison: DependencyComparison,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyDeclaration {
+    pub kind: DependencyKind,
+    pub columns: std::collections::BTreeMap<String, DependencyColumn>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyKind {
+    Table,
+    View,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum DependencyComparison {
+    #[serde(rename = "compared")]
+    Compared,
+    #[serde(rename = "declared, not compared")]
+    NotCompared,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyColumn {
+    #[serde(rename = "type")]
+    pub ty: String,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -372,6 +411,23 @@ mod tests {
         assert!(parse("status", &serde_json::to_vec(&unknown_finding).unwrap(), 0).is_err());
         assert!(parse("status", b"not JSON", 1).is_err());
         assert!(parse("apply", b"{}", 0).is_err());
+    }
+
+    #[test]
+    fn dependencies_retain_the_declared_shape_and_refuse_unknown_outcomes_and_kinds() {
+        for kind in ["table", "view"] {
+            for comparison in ["compared", "declared, not compared"] {
+                let value = json!({"declaration": {"kind": kind, "columns": {"id": {"type": "int", "nullable": false}}}, "comparison": comparison});
+                let parsed: Dependency = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+                let mut bad = value.clone();
+                bad["comparison"] = "verified".into();
+                assert!(serde_json::from_value::<Dependency>(bad).is_err());
+                let mut bad = value;
+                bad["declaration"]["kind"] = "procedure".into();
+                assert!(serde_json::from_value::<Dependency>(bad).is_err());
+            }
+        }
     }
 
     #[test]

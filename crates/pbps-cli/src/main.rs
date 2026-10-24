@@ -9,6 +9,7 @@ mod computed_order;
 mod cost;
 mod db;
 mod declaration_file;
+mod dependencies;
 mod dependents;
 mod deploy;
 mod dev;
@@ -2203,7 +2204,7 @@ fn declaration_problems_with_sources(
         modules,
         roles,
     } = schema;
-    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut out = dependencies::problems(&loaded.dependencies, dialect);
     for (name, definition) in types {
         for error in dialect.validate_type(name, definition) {
             out.push((
@@ -2832,7 +2833,8 @@ fn fmt_declared(files: &[PathBuf]) -> Schema {
             Ok(pbps_load::LoadedFile::Type(t)) => {
                 declared.types.insert(t.name, t.definition);
             }
-            Ok(pbps_load::LoadedFile::Module(_)) | Err(_) => {}
+            Ok(pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_))
+            | Err(_) => {}
         }
     }
     declared
@@ -3019,7 +3021,7 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
             pbps_load::LoadedFile::Type(t) => {
                 declared.types.insert(t.name.clone(), t.definition.clone());
             }
-            pbps_load::LoadedFile::Module(_) => {}
+            pbps_load::LoadedFile::Module(_) | pbps_load::LoadedFile::Dependency(_) => {}
         }
     }
 
@@ -3031,6 +3033,10 @@ fn cmd_fmt(project: &Project, check: bool, format: OutputFormat) -> anyhow::Resu
     } in staged
     {
         let (rendered, absorbed): (String, Vec<Intent>) = match loaded {
+            pbps_load::LoadedFile::Dependency(d) => (
+                pbps_load::render_dependency(&d.name, &d.declaration),
+                Vec::new(),
+            ),
             pbps_load::LoadedFile::Type(t) => {
                 let intents = t.renamed_from.into_iter().map(|from| Intent::RenameType {
                     from,
@@ -3335,6 +3341,8 @@ fn resolve_with_intent(
 /// list, one of them abbreviated, is how a consumer comes to read the wrong one.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct PlanData {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    dependencies: pbps_model::dependency::PlannedDependencies,
     baseline: String,
     /// The zone a connected plan read every offset-less date/time value in,
     /// and the one its apply pins and requires (DEC-1916.1). Absent offline
@@ -3515,6 +3523,23 @@ fn cmd_plan(
         dialect(project),
     )?;
     pbps_cli::with_plan_dialect!(dialect, |dialect| {
+        // Dependencies live outside Schema, so the differ cannot reject their
+        // dialect or types before this preview writes identities and artifacts.
+        let problems = dependencies::problems(&loaded.dependencies, dialect.as_ref());
+        if !problems.is_empty() {
+            let report = output::Report::plain(
+                "plan",
+                problems
+                    .into_iter()
+                    .map(|(id, problem)| output::Finding::error(id, problem))
+                    .collect(),
+            );
+            if json {
+                return report.emit_json();
+            }
+            eprint!("{}", output::human(&report.findings));
+            return report.outcome();
+        }
         // The declarations were loaded before the dialect was known, so the
         // routine-identity pass `load` runs comes here instead — on this side now,
         // and on the baseline inside `baseline::load`. Skipped on either side, a
@@ -3821,6 +3846,11 @@ fn cmd_plan(
             .clone()
             .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
 
+        let dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
+        if !json {
+            print!("{}", crate::dependencies::render(&dependencies));
+        }
+
         if let Some(path) = out {
             // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
             // §7.3's "a plan computed offline is never accepted by apply" has to be
@@ -3840,6 +3870,7 @@ fn cmd_plan(
                 res.ids.clone(),
             );
             plan.module_deps = loaded.hints.module_deps.clone();
+            plan.dependencies = dependencies.clone();
             plan.trusted_roles = project.config.trusted_roles.clone();
             plan.git_sha = db::git_sha(project.root());
             let plan = pbps_diff::order::seal(ordered.clone(), plan)?;
@@ -3969,6 +4000,7 @@ fn cmd_plan(
                 "plan",
                 findings,
                 Some(PlanData {
+                    dependencies,
                     baseline: base.description.clone(),
                     time_zone: None,
                     changes: cs.changes.len(),
@@ -4609,6 +4641,7 @@ mod tests {
             schema.tables.insert(parent.name, parent.table);
             schema.tables.insert(child.name, child.table);
             pbps_load::Loaded {
+                dependencies: Default::default(),
                 schema,
                 intents: Vec::new(),
                 hints: Default::default(),
@@ -4652,6 +4685,7 @@ mod tests {
             schema.tables.insert(versioned.name, versioned.table);
             schema.tables.insert(child.name, child.table);
             pbps_load::Loaded {
+                dependencies: Default::default(),
                 schema,
                 intents: Vec::new(),
                 hints: Default::default(),

@@ -979,32 +979,41 @@ fn qualified_name(s: &str, mut i: usize) -> Option<(Vec<String>, usize)> {
 /// plus lengths. This mapping plus [`types::normalize`] is what makes a pulled
 /// schema comparable with a declared one.
 fn column_type(c: &RawColumn) -> Result<ColumnType, DialectError> {
-    let name = c.type_name.to_ascii_lowercase();
+    catalog_column_type(&c.type_name, c.max_length, c.precision, c.scale)
+}
+
+pub(crate) fn catalog_column_type(
+    name: &str,
+    max_length: i16,
+    precision: u8,
+    scale: u8,
+) -> Result<ColumnType, DialectError> {
+    let name = name.to_ascii_lowercase();
     let ty = match name.as_str() {
         // max_length is bytes; the n-types store UTF-16, two bytes a character.
         "nchar" | "nvarchar" => {
-            if c.max_length == -1 {
+            if max_length == -1 {
                 ColumnType::new(name, vec![TypeArg::Max])
             } else {
-                ColumnType::new(name, vec![TypeArg::Int(i64::from(c.max_length) / 2)])
+                ColumnType::new(name, vec![TypeArg::Int(i64::from(max_length) / 2)])
             }
         }
         "char" | "varchar" | "binary" | "varbinary" => {
-            if c.max_length == -1 {
+            if max_length == -1 {
                 ColumnType::new(name, vec![TypeArg::Max])
             } else {
-                ColumnType::new(name, vec![TypeArg::Int(i64::from(c.max_length))])
+                ColumnType::new(name, vec![TypeArg::Int(i64::from(max_length))])
             }
         }
         "decimal" | "numeric" => ColumnType::new(
             name,
             vec![
-                TypeArg::Int(i64::from(c.precision)),
-                TypeArg::Int(i64::from(c.scale)),
+                TypeArg::Int(i64::from(precision)),
+                TypeArg::Int(i64::from(scale)),
             ],
         ),
         "datetime2" | "datetimeoffset" | "time" => {
-            ColumnType::new(name, vec![TypeArg::Int(i64::from(c.scale))])
+            ColumnType::new(name, vec![TypeArg::Int(i64::from(scale))])
         }
         _ => ColumnType::simple(name),
     };
