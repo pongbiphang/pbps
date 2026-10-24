@@ -2085,6 +2085,9 @@ table of the model, declared under `system_time:`. Only the history layout
 the engine builds is read, and until #1177 every change to such a table is
 refused (#1176).**
 
+*Amended by [DEC-1177.1](#dec-1177-1): the blanket change refusal is lifted
+for adding a nullable column; every other change to the pair stays refused.*
+
 Measured on 17.0.4075.5, Developer and Express editions:
 
 - `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))` builds
@@ -2306,6 +2309,9 @@ fails it, and so does ranking it at 0. The pass-level behaviour is pinned by
 partitions in its own file; each partition is a table of the model holding
 only its parent and bound. A tree is read whole or not at all, and until
 #1171 it is created whole and never changed (#1170).**
+
+*Amended by [DEC-1171.1](#dec-1171-1): the blanket change refusal is lifted
+for adding and dropping partitions under a standing parent.*
 
 Measured on 18.6 and 16.15:
 
@@ -2636,6 +2642,9 @@ without the claim check. Also pinned by the unit
 in the parent's file, and the reader reads them as its own by catalog
 parentage; the parent's clones stay the parent's (#1577).**
 
+*Amended by [DEC-1581.1](#dec-1581-1): the refusal below is lifted for adding
+and dropping a standing partition's own checks and indexes.*
+
 Leon chose the slice on #1532: read back and create, with the declaration in
 the parent's file. Changing them on a standing partition stays refused by name
 until #1581.
@@ -2717,6 +2726,9 @@ the tree out; it is declared and read as the partition's own.*
 **DEC-1578.1. A partition declares its own column defaults and NOT NULLs under
 its entry's `columns:`, held on `PartitionOf` and never as columns of its own;
 the reader reads one only where it is not the parent's (#1578).**
+
+*Amended by [DEC-1581.1](#dec-1581-1): the refusal below for changing a
+standing partition's own defaults and NOT NULLs is lifted.*
 
 The second of #1532's four slices: read back and create, the declaration in
 the parent's file. Changing one on a standing partition stays refused by name
@@ -2915,6 +2927,9 @@ grant case and `a_grant_on_a_relation_kind_this_model_does_not_declare_is_report
 **DEC-1580.1. A partition's persistence and storage parameters are its own,
 declared under its entry as a table's and created in its `CREATE TABLE … PARTITION OF`
 (#1580).**
+
+*Amended by [DEC-1581.1](#dec-1581-1): the refusal below for changing a
+standing partition's own persistence and storage parameters is lifted.*
 
 The last of #1532's four slices: read back and create. Changing either on a
 standing partition stays refused by name until #1581.

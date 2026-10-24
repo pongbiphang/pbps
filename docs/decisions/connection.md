@@ -820,6 +820,10 @@ here.
      before scratch DDL or evidence acceptance. No admission capability or
      binding path is enabled by this primitive alone (ADR-0016 decisions 4–5).
 
+*Superseded by [DEC-1636.1](resolver.md#dec-1636-1): the peer-verified
+connection type has been removed; the resolver uses whatever TLS each
+connection string asks for.*
+
 <a id="decision-500"></a>
 
 500. **A still-starting engine's refused login is retried; everything else it

@@ -76,9 +76,11 @@ scalar-to-array changes and `data:` beside an array are refused by name.
 Existing enums, domains and standalone composites are referenced as
 `schema.type`, scalar or array; declared enums and domains also have
 `.type.yml` files and `types` identities
-(#1635 slice one). Their lifecycle changes are refused by name until later
-slices; references retain the current eligibility gate. References are
-pinned at replay; retypes, row data and partition keys over them are refused
+(#1635 slice one). Declared enums and domains can be created, dropped and
+renamed (#1635 slice two, DEC-1635.3); existing enum label, domain attribute,
+base and collation changes remain refused by name. References retain the
+current eligibility gate. References are pinned at replay; retypes, row data
+and partition keys over them are refused
 (#1523, DEC-1523.1).
 
 A SQL Server table declares `system_time:`, its period and its system
@@ -347,6 +349,9 @@ Existing rebind protections remain until their replacements pass ADR-0016's
 acceptance tests; this decision does not resolve PR #542 by documentation.
 
 ### Artifact format versions reset at the first release
+
+Before the first release, the plan, state and schema-set formats carry no
+compatibility promise.
 
 The plan file, the state snapshot and the published editor schemas are each
 several versions in, and the snapshot reader carries an upgrade path from the

@@ -503,15 +503,15 @@ other numbers before landing. Some records still mention them as proposals.
 | 487 | [compose-and-ui](compose-and-ui.md#decision-487) | Compose checks ref type before publishing and HEAD's immediate target before installing the index (issues #385 and #386). |
 | 488 | [data/row-writes](data/row-writes.md#decision-488) | Operational row work is shared; storage mechanics remain engine-specific (issue #255). |
 | 489 | [data/pre-delete](data/pre-delete.md#decision-489) | A referential-action lock follows the engine's inheritance boundary. |
-| 490 | [resolver](resolver.md#decision-490) | Engine-assisted planning is optional infrastructure, but required evidence cannot be waived (accepted design; not implemented). |
+| 490 | [resolver](resolver.md#decision-490) | Engine-assisted planning: PostgreSQL resolver planning and apply delivered. Superseded in part by DEC-952.1, DEC-1515.1, DEC-1528.1 and DEC-1636.1. |
 | 491 | [pull](pull.md#decision-491) | The source-default collation reminder follows emitted character columns. |
 | 492 | [resolver](resolver.md#decision-492) | Ship advisory resolver discovery before qualification, without a verified state. |
 | 493 | [types-and-probes](types-and-probes.md#decision-493) | Unicode conversion probes measure the capacity ALTER enforces. |
 | 494 | [resolver](resolver.md#decision-494) | Select a named resolver policy without acquiring or certifying it. |
-| 495 | [connection](connection.md#decision-495) | Peer-verified TLS is a connection primitive, not resolver admission. |
+| 495 | [connection](connection.md#decision-495) | Peer-verified TLS is a connection primitive, not resolver admission. Superseded by DEC-1636.1. |
 | 496 | [diff](diff.md#decision-496) | Table renames and the drops that release their names form specific dependencies, and a moved drop carries its execution address. |
-| 497 | [resolver](resolver.md#decision-497) | Docker resolver admission holds native runtime capabilities across a source-free bootstrap gate. |
-| 498 | [resolver](resolver.md#decision-498) | Authenticate socket-activated Docker through its accepted Unix peer, not the listener creator's credentials. |
+| 497 | [resolver](resolver.md#decision-497) | Docker resolver admission holds native runtime capabilities across a source-free bootstrap gate. Superseded by DEC-1636.1. |
+| 498 | [resolver](resolver.md#decision-498) | Authenticate socket-activated Docker through its accepted Unix peer, not the listener creator's credentials. Superseded by DEC-1636.1. |
 | 499 | [modules](modules.md#decision-499) | A module rebuild re-resolves its name once the lock is held (issue #232). |
 | 500 | [connection](connection.md#decision-500) | A still-starting engine's refused login is retried; everything else it says is reported once (issue #638). |
 | 501 | [process](process.md#decision-501) | CI is triggered by the pull request again; the gate is a check run, not a commit status. |
@@ -527,22 +527,22 @@ other numbers before landing. Some records still mention them as proposals.
 | 511 | [data/pre-delete](data/pre-delete.md#decision-511) | The delete count's children are found in the catalog, because that is where the probe finds them. |
 | 512 | [doctor](doctor.md#decision-512) | A table moving between schemas is asked about at two securables, because the move drops the permissions on it. |
 | 513 | [doctor](doctor.md#decision-513) | A key the declarations no longer name carries no demand, because the plan drops it before anything reads it. |
-| 514 | [resolver](resolver.md#decision-514) | A supplied scratch server is a known container layout reached through the Docker profile's forwarder, not an arbitrary runtime proved contained from outside. |
+| 514 | [resolver](resolver.md#decision-514) | A supplied scratch server is a known container layout reached through the Docker profile's forwarder, not an arbitrary runtime proved contained from outside. Superseded by DEC-1636.1. |
 | 515 | [types-and-probes](types-and-probes.md#decision-515) | A retype asks the catalog for the keys standing on its column, not only for the keys the plan drops (issue #503). |
 | 516 | [types-and-probes](types-and-probes.md#decision-516) | The guard a narrowing key's probe carries is the condition of a `CASE`, not a conjunct beside the `CAST` it protects (issue #435). |
 | 517 | [roles](roles.md#decision-517) | A routine arrives closed to `PUBLIC`, and a declaration is what opens it again (issue #318). |
 | 518 | [roles](roles.md#decision-518) | A `REVOKE` carries one privilege, and revocability is decided per privilege. |
 | 519 | [rename-impact](rename-impact.md#decision-519) | A rename impact report resolves its relation once, and an absent one is a refusal rather than an empty report. |
-| 520 | [resolver](resolver.md#decision-520) | The analysis scope is qualified by comparing measured facts, reproducing the deployer, and reading loaded executable content — not by trusting versions (issue #610, ADR-0016 cases 5, 14, 16, 21, 23). |
-| 521 | [resolver](resolver.md#decision-521) | SQL Server's analysis scope is qualified by the engine's own answers: a family gate, an edition limitation, mapped packages as the engine, and grants run only after the reproduction is verified (issue #611, ADR-0016 cases 5, 14, 16, 21, 23). |
-| 522 | [resolver](resolver.md#decision-522) | A process walk passes over a child that is *over*, and refuses anything still alive. |
+| 520 | [resolver](resolver.md#decision-520) | The analysis scope is qualified by comparing measured facts, reproducing the deployer, and reading loaded executable content — not by trusting versions (issue #610, ADR-0016 cases 5, 14, 16, 21, 23). Superseded in part by DEC-1528.1 and DEC-1636.1; reported compatibility and deployment-context checks remain. |
+| 521 | [resolver](resolver.md#decision-521) | SQL Server's analysis scope is qualified by the engine's own answers: a family gate, an edition limitation, mapped packages as the engine, and grants run only after the reproduction is verified (issue #611, ADR-0016 cases 5, 14, 16, 21, 23). Superseded in part by DEC-1636.1; the catalog comparison remains as mssql-reported-scope-v1. |
+| 522 | [resolver](resolver.md#decision-522) | A process walk passes over a child that is *over*, and refuses anything still alive. Superseded by DEC-1636.1. |
 | 527 | [compose-and-ui](compose-and-ui.md#decision-527) | Compose owns an isolated candidate and a new output branch, not the source checkout. |
-| 528 | [resolver](resolver.md#decision-528) | Observe a pinned PID-namespace procfs view without claiming a complete process tree (issue #740). |
-| 529 | [resolver](resolver.md#decision-529) | Container admission checks tasks through their held namespace view; process identity and privilege exceptions do not use a bare PID (#741). |
+| 528 | [resolver](resolver.md#decision-528) | Observe a pinned PID-namespace procfs view without claiming a complete process tree (issue #740). Superseded by DEC-1636.1. |
+| 529 | [resolver](resolver.md#decision-529) | Container admission checks tasks through their held namespace view; process identity and privilege exceptions do not use a bare PID (#741). Superseded by DEC-1636.1. |
 | 530 | [compose-and-ui](compose-and-ui.md#decision-530) | A compose preview owns its input bytes and output tree before it owns confirmation (issue #745). |
-| 531 | [resolver](resolver.md#decision-531) | The launch drops to a shared workload identity before bootstrap; the root deadline retains a separate, necessary authority (#742). |
+| 531 | [resolver](resolver.md#decision-531) | The launch drops to a shared workload identity before bootstrap; the root deadline retains a separate, necessary authority (#742). Superseded by DEC-1636.1. |
 | 532 | [compose-and-ui](compose-and-ui.md#decision-532) | A compose result records authorization separately from observation. |
-| 533 | [resolver](resolver.md#decision-533) | A socket holder is observed; target identity is positively bound under trusted provisioning, not proved by an exhaustive census (#743). |
+| 533 | [resolver](resolver.md#decision-533) | A socket holder is observed; target identity is positively bound under trusted provisioning, not proved by an exhaustive census (#743). Superseded by DEC-1636.1. |
 | 534 | [compose-and-ui](compose-and-ui.md#decision-534) | Compose network pushes rely on ordinary direct-branch server semantics. |
 | 535 | [compose-and-ui](compose-and-ui.md#decision-535) | Compose retires acknowledged resources independently of publication. |
 | 536 | [compose-and-ui](compose-and-ui.md#decision-536) | Completed capture rejection retires pre-check ownership without revoking an unexposed handle. |
@@ -551,5 +551,5 @@ other numbers before landing. Some records still mention them as proposals.
 | 539 | [data/row-writes](data/row-writes.md#decision-539) | A key restored on a column the baseline does not have is refused with its own diagnostic, not as a moved key. |
 | 540 | [data/declared](data/declared.md#decision-540) | SQL Server floats are rendered through a bounded `varchar(99)` before widening to `nvarchar(max)`. |
 | 541 | [compose-and-ui](compose-and-ui.md#decision-541) | A compose destination is a credential-free identity; authentication is reacquired per invocation, and an endpoint that cannot be represented without a secret is refused. |
-| 542 | [resolver](resolver.md#decision-542) | The resolver qualifies inherited seccomp behavior before releasing its fixed bootstrap, without tracing processes (#633). |
+| 542 | [resolver](resolver.md#decision-542) | The resolver qualifies inherited seccomp behavior before releasing its fixed bootstrap, without tracing processes (#633). Superseded by DEC-1636.1. |
 | 543 | [connection](connection.md#decision-543) | A PostgreSQL connection string that names no `sslmode` is connected with verified TLS, not the driver's `prefer`. |

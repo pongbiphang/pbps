@@ -879,7 +879,8 @@ column, the batch-wide outage the rest of this entry removes.
 **DEC-952.1. External-input fingerprints are HMAC-SHA256 under a per-environment
 key that pbps generates and checks but does not keep; nothing a resolver plan
 records is a verifier to hide, so the ledger stores it as it stores any plan
-(#952; supersedes DEC-868.1 and DEC-878.1, amends ADR-0016 decision 5).**
+(#952; supersedes DECISIONS 490 in part, DEC-868.1 and DEC-878.1,
+amends ADR-0016 decision 5).**
 The secret was never the fingerprint. A bare SHA-256 over a definition that
 carries a literal is a guessing oracle for anyone who can compute it, and
 DEC-868.1 answered by hiding the oracle. It kept the checksum in a protected
