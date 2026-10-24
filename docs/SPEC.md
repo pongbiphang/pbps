@@ -840,9 +840,14 @@ A plan cannot also evaluate its newly added label in a column default or
 CHECK over that enum, its array or a domain over it, in a domain's own default
 or CHECK, or in a created/altered view or SQL routine body. Apply the label
 first, then the rest. PL/pgSQL routine creation binds its body at invocation
-and remains admitted. A retained CHECK/default differing only by the approved
-label rename compares equal, including enum-array constants, and its
-declaration record follows the new spelling; raw catalog drift remains checked.
+and remains admitted. An updated CHECK/default is rebuilt or altered by the ordinary diff, and
+those changes appear in the plan. No SQL text is rewritten through label
+renames. DropCheck precedes the rename; defaults and AddCheck follow it in the
+same transaction. AddCheck scans its table under ACCESS EXCLUSIVE until
+commit; #2354 tracks an engine-typed, scan-free approach. Plan-time expression
+probes defer by the resolved enum type when its label is renamed, including
+arrays and domains. The engine enforces the declaration at apply, with the
+existing vet and readback checks.
 `data:` rows and partition bounds over user-defined references remain refused
 by DEC-1523.1 before the label-use check can arise; #2346 tracks admitting
 those surfaces. Arrays also remain refused under `data:`. Domain

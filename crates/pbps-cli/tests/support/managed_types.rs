@@ -2516,7 +2516,7 @@ fn enum_applied_label_chains_keep_annotations_when_adding_labels_and_converge() 
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_rebuilds() {
+fn enum_label_renames_keep_rows_and_rebuild_updated_checks_and_defaults() {
     for server in [
         server(),
         std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
@@ -2561,12 +2561,33 @@ fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_
             d.commit();
             let path = d.dir.join("rename-labels.plan.json");
             let plan = label_plan(&d, db, &path);
-            assert_eq!(plan.changes.changes.len(), 2, "{:?}", plan.changes);
-            assert!(plan.changes.changes.iter().all(|p| matches!(
-                p.change,
-                pbps_model::Change::RenameEnumValue { .. }
-            ) && p.risks
-                == [pbps_model::RiskClass::Rename].into()));
+            assert_eq!(plan.changes.changes.len(), 5, "{:?}", plan.changes);
+            assert_eq!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .filter(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::DropCheck { .. }))
+            );
+            assert!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AddCheck { .. }))
+            );
+            assert!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
+            );
             let denied = apply_plan(&d, db, &path, false);
             assert_ne!(code(&denied), 0);
             succeeds(d.run(&[
@@ -2578,7 +2599,7 @@ fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_
                 "--checksum",
                 &plan_checksum(&path),
                 "--allow",
-                "rename",
+                "rename,constraint",
             ]));
             assert_eq!(
                 scalar(
@@ -2603,6 +2624,24 @@ fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_
                 label_plan(&d, db, &path).changes.is_empty(),
                 "provenance must survive removal of the one-shot annotations"
             );
+            if !authored {
+                // Pull adopts catalog text. Deliberate authored-layout changes
+                // remain differences under DEC-1635.4; do not guess equality.
+                succeeds(d.run(&["pull", "--db", db, "--force"]));
+                let pulled = pbps_load::load_schema_dir(&d.dir.join("schema"))
+                    .unwrap()
+                    .schema;
+                assert!(
+                    matches!(&pulled.tables[&"app.t".parse().unwrap()].columns["m"].value_source, pbps_model::ValueSource::Default(text) if text.contains("'blue'"))
+                );
+                d.commit();
+                let next = label_plan(&d, db, &path);
+                assert!(
+                    next.changes.is_empty(),
+                    "authored={authored}: {:?}",
+                    next.changes
+                );
+            }
         }
         let own = OwnDatabase::new(&server, "label_array_constants1635");
         let db = own.connection();
@@ -2636,7 +2675,7 @@ fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_
         .unwrap();
         d.commit();
         let path = d.dir.join("array-constants.plan.json");
-        assert_eq!(label_plan(&d, db, &path).changes.changes.len(), 1);
+        assert_eq!(label_plan(&d, db, &path).changes.changes.len(), 4);
         succeeds(d.run(&[
             "apply",
             "--db",
@@ -2646,9 +2685,107 @@ fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_
             "--checksum",
             &plan_checksum(&path),
             "--allow",
-            "rename",
+            "rename,constraint",
         ]));
         assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_renames_leave_unrelated_check_text_and_refuse_stale_bound_checks() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for stale in [false, true] {
+            let own = OwnDatabase::new(&server, "label_no_rewrite2b");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("label-no-rewrite2b");
+            let file = d.dir.join("schema/app.e.type.yml");
+            std::fs::write(&file, "enum: app.e\nvalues: [sad, ok]\n").unwrap();
+            let check = if stale {
+                "m <> 'sad'"
+            } else {
+                "m IS NOT NULL AND 'sad' <> 'other'"
+            };
+            d.table(&format!(
+                "table: app.t\ncolumns:\n  m: {{type: app.e}}\nchecks: {{kept: \"{check}\"}}\n"
+            ));
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let initial = latest_snapshot(db);
+            std::fs::write(
+                &file,
+                "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, ok]\n",
+            )
+            .unwrap();
+            d.commit();
+            let path = d.dir.join("label-no-rewrite.plan.json");
+            let plan = label_plan(&d, db, &path);
+            assert_eq!(plan.changes.changes.len(), 1, "{:?}", plan.changes);
+            assert!(matches!(
+                plan.changes.changes[0].change,
+                pbps_model::Change::RenameEnumValue { .. }
+            ));
+            let apply = || {
+                d.run(&[
+                    "apply",
+                    "--db",
+                    db,
+                    "--plan",
+                    path.to_str().unwrap(),
+                    "--checksum",
+                    &plan_checksum(&path),
+                    "--allow",
+                    "rename",
+                ])
+            };
+            if stale {
+                let result = apply();
+                assert_ne!(
+                    code(&result),
+                    0,
+                    "stale bound CHECK must never be silently recorded: {}",
+                    stdout(&result)
+                );
+                assert!(stderr(&result).contains("app.t"), "{}", stderr(&result));
+                let failed = latest_snapshot(db);
+                assert_eq!(failed.kind, pbps_model::StateKind::Failed);
+                assert_eq!(failed.schema, initial.schema);
+                assert_eq!(failed.declared, initial.declared);
+                assert_eq!(failed.ids, initial.ids);
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid='app.e'::regtype AND enumlabel='sad'"
+                    ),
+                    1
+                );
+                let next = label_plan(&d, db, &path);
+                assert_eq!(
+                    next.changes.changes.len(),
+                    1,
+                    "the failed transaction leaves the rename pending"
+                );
+                let again = apply();
+                assert_ne!(code(&again), 0);
+                assert!(stderr(&again).contains("app.t"), "{}", stderr(&again));
+            } else {
+                succeeds(apply());
+                let snapshot = latest_snapshot(db);
+                let live =
+                    &snapshot.schema.tables[&"app.t".parse().unwrap()].checks["kept"].expression;
+                assert!(live.contains("'sad'::text"), "{live}");
+                assert_eq!(
+                    snapshot.declared.expressions.checks[&"app.t".parse().unwrap()]["kept"],
+                    check
+                );
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+            }
+        }
     }
 }
 
@@ -3027,7 +3164,13 @@ fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resum
             let db = own.connection();
             on_server(db, "CREATE SCHEMA app");
             let d = Demo::new("label-staged1635");
-            d.table("table: app.t\ncolumns:\n  m: {type: app.e, default: \"'old'\"}\nchecks:\n  kept: m <> 'old'\n");
+            // Staged apply admits one logical change. Expression rebuilds
+            // belong to the transactional fixture above (DEC-1635.6).
+            if rename {
+                d.table("table: app.t\ncolumns:\n  m: {type: app.e}\n");
+            } else {
+                d.table("table: app.t\ncolumns:\n  m: {type: app.e, default: \"'old'\"}\nchecks:\n  kept: m <> 'old'\n");
+            }
             std::fs::write(
                 d.dir.join("schema/app.e.type.yml"),
                 "enum: app.e\nvalues: [old]\n",
@@ -3043,9 +3186,6 @@ fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resum
                 "enum: app.e\nvalues: [old, staged]\n"
             };
             std::fs::write(&file, yaml).unwrap();
-            if rename {
-                d.table("table: app.t\ncolumns:\n  m: {type: app.e, default: \"'renamed'\"}\nchecks:\n  kept: m <> 'renamed'\n");
-            }
             d.commit();
             let path = d.dir.join("staged-label.plan.json");
             succeeds(d.run(&[

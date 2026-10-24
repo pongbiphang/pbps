@@ -3229,7 +3229,18 @@ pub(crate) async fn refuse_misspelt(
     unasked: &mut Vec<String>,
     type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    let mut found = crate::engine::misspelt(conn, schema, at, type_routines_need_review)
+    refuse_misspelt_with_probe(conn, schema, schema, at, unasked, type_routines_need_review).await
+}
+
+async fn refuse_misspelt_with_probe(
+    conn: &mut Conn,
+    schema: &Schema,
+    probe_schema: &Schema,
+    at: &pbps_db::catalog::CatalogNames,
+    unasked: &mut Vec<String>,
+    type_routines_need_review: bool,
+) -> anyhow::Result<Schema> {
+    let mut found = crate::engine::misspelt(conn, probe_schema, at, type_routines_need_review)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     unasked.extend(found.defaults_unasked.iter().map(|why| {
@@ -4561,13 +4572,6 @@ fn refuse_pinned_movement(
         renames.schema(named_before.to_mut());
         pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
     }
-    pbps_diff::enum_labels::forward_schema(
-        named_before.to_mut(),
-        &desired_ids,
-        changes,
-        dialect,
-        true,
-    );
     let after = named_after.as_ref();
     let before = named_before.as_ref();
     let mut expected_types = BTreeMap::new();
@@ -6982,9 +6986,15 @@ pub fn cmd_plan_db(
             ));
         }
         let mut unasked = Vec::new();
-        let refused = refuse_misspelt(
+        let probe_schema = pbps_diff::enum_labels::probe_schema(
+            pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
+            pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+            &loaded.hints,
+        );
+        let refused = refuse_misspelt_with_probe(
             &mut conn,
             &loaded.schema,
+            &probe_schema,
             &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
             &mut unasked,
             type_routines_need_review,
@@ -8825,13 +8835,6 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         // What the previous state declared, advanced by what this plan wrote:
         // from the plan alone, since `apply --plan` needs nothing else.
         snapshot.declared = entry.snapshot.declared.clone();
-        pbps_diff::enum_labels::forward_declared(
-            &mut snapshot.declared,
-            &entry.snapshot.schema,
-            &entry.snapshot.ids,
-            &plan.changes,
-            dialect,
-        );
         snapshot
             .declared
             .advance_with_partitions(&plan.changes, &snapshot.schema);
@@ -9637,13 +9640,6 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // What the previous state declared, advanced by what this plan wrote: from
     // the plan alone, since `apply --plan` needs nothing else (SPEC §7.3).
     snapshot.declared = entry.snapshot.declared.clone();
-    pbps_diff::enum_labels::forward_declared(
-        &mut snapshot.declared,
-        &entry.snapshot.schema,
-        &entry.snapshot.ids,
-        &plan.changes,
-        dialect,
-    );
     snapshot
         .declared
         .advance_with_partitions(&plan.changes, &snapshot.schema);

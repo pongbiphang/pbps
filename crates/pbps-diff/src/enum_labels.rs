@@ -1,4 +1,4 @@
-//! Executable enum label changes and their bounded comparison adapter (DEC-1635.6).
+//! Executable enum labels and type-based plan probe deferral (DEC-1635.6).
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
@@ -197,39 +197,98 @@ pub(crate) fn changes(
 
 /// Resolve arrays and domain bases through the identity map of this side.
 pub fn uses_enum(ty: &ColumnType, uid: &Uid, schema: &Schema, ids: &IdsFile) -> bool {
-    enum_shape(ty, uid, schema, ids).is_some()
-}
-
-fn enum_shape(ty: &ColumnType, uid: &Uid, schema: &Schema, ids: &IdsFile) -> Option<bool> {
     let resolver = TypeResolver::new(ids, ids);
     let mut reference = ty.type_ref();
-    let mut array = ty.is_array();
     let mut seen = BTreeSet::new();
     while let Some(name) = reference {
         if !seen.insert(name) {
-            return None;
+            return false;
         }
         let TypeIdentity::Declared(at) = resolver.resolve(TypeSide::Desired, name) else {
-            return None;
+            return false;
         };
         if at == uid {
-            return Some(array);
+            return true;
         }
-        let name = resolver.name(TypeSide::Desired, at)?;
+        let Some(name) = resolver.name(TypeSide::Desired, at) else {
+            return false;
+        };
         reference = match schema.types.get(name) {
-            Some(ManagedType::Domain { base, .. }) => {
-                array |= base.is_array();
-                base.type_ref()
-            }
+            Some(ManagedType::Domain { base, .. }) => base.type_ref(),
             Some(ManagedType::Enum { .. }) | None => None,
         };
     }
-    None
+    false
+}
+
+/// A probe view only: the declaration used for diffing and recording stays intact.
+/// A pending label's spelling does not exist yet. Defer expressions by their
+/// resolved enum identity instead of inspecting or reversing their SQL text.
+#[allow(clippy::wildcard_enum_match_arm)] // Only label renames defer probes.
+pub fn probe_schema(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Schema {
+    let renamed: BTreeSet<_> = changes(base, desired, hints)
+        .0
+        .into_iter()
+        .filter_map(|change| match change {
+            Change::RenameEnumValue { uid, .. } => Some(uid),
+            _ => None,
+        })
+        .collect();
+    let deferred = |ty: &ColumnType| {
+        renamed
+            .iter()
+            .any(|uid| uses_enum(ty, uid, desired.schema, desired.ids))
+    };
+    let mut probe = desired.schema.clone();
+    for (name, table) in &mut probe.tables {
+        let mut owner = &desired.schema.tables[name];
+        let mut seen = BTreeSet::new();
+        while let Some(of) = &owner.partition_of {
+            if !seen.insert(&of.parent) {
+                break;
+            }
+            let Some(parent) = desired.schema.tables.get(&of.parent) else {
+                break;
+            };
+            owner = parent;
+        }
+        if owner.columns.values().any(|c| deferred(&c.ty)) {
+            // CHECKs belong to the table. Determining which column arbitrary
+            // SQL reads would reintroduce the lexical binding guess.
+            table.checks.clear();
+        }
+        for column in table.columns.values_mut() {
+            if deferred(&column.ty) && matches!(column.value_source, ValueSource::Default(_)) {
+                column.value_source = ValueSource::None;
+            }
+        }
+        if let Some(of) = &mut table.partition_of {
+            for (name, own) in &mut of.columns {
+                if owner.columns.get(name).is_some_and(|c| deferred(&c.ty)) {
+                    own.default = None;
+                }
+            }
+        }
+    }
+    for definition in probe.types.values_mut() {
+        if let ManagedType::Domain {
+            base,
+            default,
+            checks,
+            ..
+        } = definition
+            && deferred(base)
+        {
+            *default = None;
+            checks.clear();
+        }
+    }
+    probe
 }
 
 // Enum-array constants deparse as array text, including bounds and quoted or
 // backslash-escaped elements. NULL is not an enum label unless it is quoted.
-fn array_items(text: &str) -> Option<Vec<(usize, usize, Option<String>)>> {
+fn array_items(text: &str) -> Option<Vec<Option<String>>> {
     let mut i = text.find('{')?;
     if i > 0 && !(text.starts_with('[') && text[..i].ends_with('=')) {
         return None;
@@ -257,7 +316,6 @@ fn array_items(text: &str) -> Option<Vec<(usize, usize, Option<String>)>> {
                 if depth == 0 {
                     return None;
                 }
-                let start = i;
                 let quoted = ch == '"';
                 if quoted {
                     i += 1;
@@ -292,7 +350,7 @@ fn array_items(text: &str) -> Option<Vec<(usize, usize, Option<String>)>> {
                 } else {
                     Some(value.trim().to_owned())
                 };
-                out.push((start, i, value));
+                out.push(value);
             }
         }
     }
@@ -301,30 +359,7 @@ fn array_items(text: &str) -> Option<Vec<(usize, usize, Option<String>)>> {
 
 fn literal_uses(value: &str, label: &str) -> bool {
     value == label
-        || array_items(value)
-            .is_some_and(|items| items.iter().any(|(_, _, v)| v.as_deref() == Some(label)))
-}
-
-fn rename_array(value: &str, from: &str, to: &str) -> Option<String> {
-    let mut out = value.to_owned();
-    let mut changed = false;
-    for (start, end, element) in array_items(value)?.into_iter().rev() {
-        if element.as_deref() == Some(from) {
-            let quoted = to.is_empty()
-                || to.eq_ignore_ascii_case("NULL")
-                || to
-                    .chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\'));
-            let replacement = if quoted {
-                format!("\"{}\"", to.replace('\\', "\\\\").replace('"', "\\\""))
-            } else {
-                to.to_owned()
-            };
-            out.replace_range(start..end, &replacement);
-            changed = true;
-        }
-    }
-    changed.then_some(out)
+        || array_items(value).is_some_and(|items| items.iter().any(|v| v.as_deref() == Some(label)))
 }
 
 fn text_uses(text: &str, label: &str, dialect: &(impl Dialect + ?Sized)) -> bool {
@@ -462,241 +497,6 @@ pub(crate) fn unsafe_uses(
         }
     }
     errors
-}
-
-// Read only the two identifier parts and the array marker of a cast. Quoted
-// identifiers may contain whitespace or punctuation; splitting on spaces would
-// silently lose the type's uid in precisely those cases.
-fn cast_type(suffix: &str) -> Option<ColumnType> {
-    fn identifier(text: &str) -> Option<usize> {
-        if text.starts_with('"') {
-            let mut i = 1;
-            while i < text.len() {
-                if text.as_bytes()[i] == b'"' {
-                    i += 1;
-                    if text.as_bytes().get(i) == Some(&b'"') {
-                        i += 1;
-                    } else {
-                        return Some(i);
-                    }
-                } else {
-                    i += text[i..].chars().next()?.len_utf8();
-                }
-            }
-            None
-        } else {
-            let len = text
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$' || !c.is_ascii())
-                .map(char::len_utf8)
-                .sum();
-            (len > 0).then_some(len)
-        }
-    }
-    let suffix = suffix.trim_start();
-    let text = if let Some(text) = suffix.strip_prefix("::") {
-        text.trim_start()
-    } else if suffix
-        .get(..2)
-        .is_some_and(|word| word.eq_ignore_ascii_case("as"))
-        && suffix[2..].starts_with(char::is_whitespace)
-    {
-        suffix[2..].trim_start()
-    } else {
-        return None;
-    };
-    let first = identifier(text)?;
-    let rest = text[first..].trim_start();
-    let rest = rest.strip_prefix('.')?.trim_start();
-    let second = identifier(rest)?;
-    let end = text.len() - rest.len() + second;
-    let array = text[end..].trim_start().starts_with("[]");
-    format!(
-        "{}.{}{}",
-        &text[..first],
-        &rest[..second],
-        if array { "[]" } else { "" }
-    )
-    .parse()
-    .ok()
-}
-
-fn uncast_comparison(text: &str, dialect: &(impl Dialect + ?Sized)) -> bool {
-    let code = dialect.lexicon().header(text);
-    if code.contains("::") {
-        return false;
-    }
-    for (at, _) in code.match_indices('(') {
-        let before = code[..at].trim_end();
-        let word: String = before
-            .chars()
-            .rev()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        if !word.is_empty() && !["in", "any", "all"].contains(&word.to_ascii_lowercase().as_str()) {
-            return false;
-        }
-    }
-    true
-}
-
-fn plain_literal(text: &str, dialect: &(impl Dialect + ?Sized)) -> bool {
-    dialect
-        .lexicon()
-        .header(text)
-        .chars()
-        .all(|c| c.is_whitespace() || matches!(c, '(' | ')'))
-}
-
-/// Forward only expected expressions containing approved enum constants. Enum definitions are checked
-/// independently against the exact executed statement's intermediate payload.
-pub fn forward_schema(
-    schema: &mut Schema,
-    ids: &IdsFile,
-    changes: &ChangeSet,
-    dialect: &(impl Dialect + ?Sized),
-    catalog: bool,
-) {
-    for step in &changes.changes {
-        let Change::RenameEnumValue { uid, from, to, .. } = &step.change else {
-            continue;
-        };
-        let world = schema.clone();
-        let typed = |ty: &ColumnType| uses_enum(ty, uid, &world, ids);
-        let shape = |ty: &ColumnType| enum_shape(ty, uid, &world, ids);
-        let rewrite = |text: &str, contextual: Option<bool>| {
-            dialect
-                .lexicon()
-                .rewrite_string_literals(text, |value, suffix| {
-                    let bound = cast_type(suffix).and_then(|ty| shape(&ty));
-                    let uncast = !suffix.trim_start().starts_with("::")
-                        && !suffix.trim_start().to_ascii_lowercase().starts_with("as ");
-                    let shape =
-                        bound.or_else(|| (!catalog && uncast).then_some(contextual).flatten())?;
-                    if shape {
-                        rename_array(value, from, to)
-                    } else {
-                        (value == from).then(|| to.clone())
-                    }
-                })
-        };
-        for table in schema.tables.values_mut() {
-            for column in table.columns.values_mut() {
-                let contextual = shape(&column.ty);
-                if let ValueSource::Default(text) = &mut column.value_source {
-                    *text = rewrite(text, contextual.filter(|_| plain_literal(text, dialect)));
-                }
-                if let ValueSource::Generated(g) = &mut column.value_source {
-                    g.expression = rewrite(&g.expression, None);
-                }
-            }
-            for check in table.checks.values_mut() {
-                let mentioned: Vec<_> = table
-                    .columns
-                    .iter()
-                    .filter(|(n, _)| dialect.may_name(&check.expression, n.raw()))
-                    .collect();
-                let contextual = !mentioned.is_empty()
-                    && mentioned.iter().all(|(_, c)| typed(&c.ty))
-                    && uncast_comparison(&check.expression, dialect);
-                check.expression = rewrite(
-                    &check.expression,
-                    contextual.then(|| mentioned.iter().any(|(_, c)| shape(&c.ty) == Some(true))),
-                );
-            }
-            for index in table.indexes.values_mut() {
-                if let Some(text) = &mut index.filter {
-                    *text = rewrite(text, None);
-                }
-                for column in &mut index.columns {
-                    if let pbps_model::IndexKey::Expression(text) = &mut column.key {
-                        *text = rewrite(text, None);
-                    }
-                }
-            }
-            for policy in table.row_policies.values_mut() {
-                for text in [&mut policy.using, &mut policy.with_check]
-                    .into_iter()
-                    .flatten()
-                {
-                    *text = rewrite(text.raw(), None).into();
-                }
-            }
-            if let Some(of) = &mut table.partition_of
-                && let Some(parent) = world.tables.get(&of.parent)
-            {
-                for (column, own) in &mut of.columns {
-                    if let Some(spec) = parent.columns.get(column)
-                        && let Some(text) = &mut own.default
-                    {
-                        *text = rewrite(text, shape(&spec.ty));
-                    }
-                }
-            }
-        }
-        for definition in schema.types.values_mut() {
-            if let ManagedType::Domain {
-                base,
-                default,
-                checks,
-                ..
-            } = definition
-            {
-                let contextual = shape(base);
-                if let Some(text) = default {
-                    *text = rewrite(text, contextual.filter(|_| plain_literal(text, dialect)));
-                }
-                for text in checks.values_mut() {
-                    *text = rewrite(
-                        text,
-                        contextual.filter(|_| uncast_comparison(text, dialect)),
-                    );
-                }
-            }
-        }
-        for module in schema.modules.values_mut() {
-            module.definition = rewrite(&module.definition, None);
-        }
-    }
-}
-
-/// Advance only provenance that already exists; adopting a catalog expression
-/// must not manufacture an authored declaration record.
-pub fn forward_declared(
-    record: &mut pbps_model::Declared,
-    state: &Schema,
-    ids: &IdsFile,
-    changes: &ChangeSet,
-    dialect: &(impl Dialect + ?Sized),
-) {
-    let mut schema = record.overlay(state);
-    forward_schema(&mut schema, ids, changes, dialect, false);
-    let forwarded = pbps_model::Declared::from_schema(&schema);
-    macro_rules! expressions {
-        ($($field:ident),*) => { $(
-            for (table, values) in &mut record.expressions.$field {
-                for (name, value) in values {
-                    if let Some(now) = forwarded.expressions.$field.get(table).and_then(|values| values.get(name)) { *value = now.clone(); }
-                }
-            }
-        )* };
-    }
-    expressions!(
-        defaults, generated, computed, checks, filters, keys, policies
-    );
-    for (name, value) in &mut record.types {
-        if let Some(now) = forwarded.types.get(name) {
-            *value = now.clone();
-        }
-    }
-    for (name, value) in &mut record.modules {
-        if let Some(now) = forwarded.modules.get(name) {
-            *value = now.clone();
-        }
-    }
 }
 
 /// Replay label payloads against approved before-definitions. A saved artifact
@@ -910,40 +710,6 @@ mod tests {
         let (noop, errors, _, _) = planned(&["b", "c"], &["b", "c"], &hints);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(noop.is_empty());
-
-        // Reused b is already the first label's final identity. Raw hints must
-        // not forward its constants to c when the computed plan only adds d.
-        let (mut schema, ids) = world(&["b", "c"]);
-        schema.tables.insert(
-            "app.t".parse().unwrap(),
-            Table {
-                columns: [(
-                    "m".into(),
-                    Column {
-                        value_source: ValueSource::Default("'b'::app.e".into()),
-                        ..Column::new("app.e".parse().unwrap())
-                    },
-                )]
-                .into(),
-                checks: [(
-                    "kept".into(),
-                    pbps_model::CheckConstraint {
-                        expression: "m <> 'b'::app.e".into(),
-                    },
-                )]
-                .into(),
-                ..Default::default()
-            },
-        );
-        let before = schema.clone();
-        forward_schema(
-            &mut schema,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-            true,
-        );
-        assert_eq!(schema, before);
     }
 
     #[test]
@@ -1019,99 +785,139 @@ mod tests {
     }
 
     #[test]
-    fn comparison_forwards_bound_constants_and_typed_authored_expressions_without_hiding_other_literals()
-     {
-        let (steps, errors, mut schema, ids) =
-            planned(&["sad", "ok"], &["blue", "ok"], &[("blue", "sad")]);
-        assert!(errors.is_empty());
-        schema.tables.insert(
-            "app.t".parse().unwrap(),
-            Table {
-                columns: [
-                    (
+    fn pending_label_renames_defer_only_expressions_with_the_renamed_type_identity() {
+        let (mut base, mut ids) = world(&["sad", "ok"]);
+        ids.types
+            .insert("y_000002".parse().unwrap(), "app.other".parse().unwrap());
+        ids.types
+            .insert("y_000003".parse().unwrap(), "app.d".parse().unwrap());
+        base.types
+            .insert("app.other".parse().unwrap(), enumeration(&["sad", "ok"]));
+        base.types.insert(
+            "app.d".parse().unwrap(),
+            ManagedType::Domain {
+                base: "app.e[]".parse().unwrap(),
+                not_null: false,
+                default: Some("'{sad}'".into()),
+                checks: [("kept".into(), "VALUE <> '{sad}'".into())].into(),
+                collation: None,
+            },
+        );
+        for (name, ty) in [
+            ("direct", "app.e"),
+            ("array", "app.e[]"),
+            ("domain", "app.d"),
+            ("other", "app.other"),
+            ("text", "text"),
+        ] {
+            base.tables.insert(
+                format!("app.{name}").parse().unwrap(),
+                Table {
+                    columns: [(
                         "m".into(),
                         Column {
                             value_source: ValueSource::Default("'sad'".into()),
-                            ..Column::new("app.e".parse().unwrap())
+                            ..Column::new(ty.parse().unwrap())
                         },
-                    ),
-                    ("text".into(), Column::new("text".parse().unwrap())),
-                ]
-                .into(),
-                checks: [
-                    (
-                        "typed".into(),
+                    )]
+                    .into(),
+                    checks: [(
+                        "kept".into(),
                         pbps_model::CheckConstraint {
                             expression: "m <> 'sad'".into(),
                         },
-                    ),
-                    (
-                        "text".into(),
-                        pbps_model::CheckConstraint {
-                            expression: "text <> 'sad'".into(),
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            );
+        }
+        base.tables.insert(
+            "app.child".parse().unwrap(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.direct".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: [(
+                        "m".into(),
+                        pbps_model::PartitionColumn {
+                            default: Some("'sad'".into()),
+                            not_null: false,
                         },
-                    ),
-                ]
-                .into(),
+                    )]
+                    .into(),
+                }),
                 ..Default::default()
             },
         );
-        let original = schema.clone();
-        forward_schema(
-            &mut schema,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-            false,
+        let mut desired = base.clone();
+        desired
+            .types
+            .insert("app.e".parse().unwrap(), enumeration(&["blue", "ok"]));
+        let hints = Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                [("blue".into(), "sad".into())].into(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let original = desired.clone();
+        let probe = probe_schema(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            Side {
+                schema: &desired,
+                ids: &ids,
+            },
+            &hints,
         );
-        let table = &schema.tables[&"app.t".parse().unwrap()];
+        for name in ["direct", "array", "domain"] {
+            let table = &probe.tables[&format!("app.{name}").parse().unwrap()];
+            assert_eq!(table.columns["m"].value_source, ValueSource::None, "{name}");
+            assert!(table.checks.is_empty(), "{name}");
+        }
+        for name in ["other", "text"] {
+            let name = format!("app.{name}").parse().unwrap();
+            assert_eq!(probe.tables[&name], desired.tables[&name]);
+        }
+        assert!(
+            probe.tables[&"app.child".parse().unwrap()]
+                .partition_of
+                .as_ref()
+                .unwrap()
+                .columns["m"]
+                .default
+                .is_none()
+        );
+        let ManagedType::Domain {
+            default, checks, ..
+        } = &probe.types[&"app.d".parse().unwrap()]
+        else {
+            panic!("domain")
+        };
+        assert!(default.is_none() && checks.is_empty());
         assert_eq!(
-            table.columns["m"].value_source,
-            ValueSource::Default("'blue'".into())
-        );
-        assert_eq!(table.checks["typed"].expression, "m <> 'blue'");
-        assert_eq!(table.checks["text"].expression, "text <> 'sad'");
-        let mut catalog = original.clone();
-        catalog
-            .tables
-            .get_mut(&"app.t".parse().unwrap())
-            .unwrap()
-            .checks
-            .get_mut("typed")
-            .unwrap()
-            .expression = "m <> 'sad'::app.e AND text <> 'sad'::text /* 'sad' */".into();
-        forward_schema(
-            &mut catalog,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-            true,
+            desired, original,
+            "probe deferral must not change what is planned or recorded"
         );
         assert_eq!(
-            catalog.tables[&"app.t".parse().unwrap()].checks["typed"].expression,
-            "m <> 'blue'::app.e AND text <> 'sad'::text /* 'sad' */"
+            probe_schema(
+                Side {
+                    schema: &desired,
+                    ids: &ids
+                },
+                Side {
+                    schema: &desired,
+                    ids: &ids
+                },
+                &hints
+            ),
+            desired,
+            "already-applied annotations defer nothing"
         );
-        let mut record = pbps_model::Declared::from_schema(&original);
-        forward_declared(
-            &mut record,
-            &original,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-        );
-        assert_eq!(
-            record.expressions.checks[&"app.t".parse().unwrap()]["typed"],
-            "m <> 'blue'"
-        );
-        let mut adopted = pbps_model::Declared::default();
-        forward_declared(
-            &mut adopted,
-            &schema,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-        );
-        assert_eq!(adopted, pbps_model::Declared::default());
     }
 
     #[test]
@@ -1249,36 +1055,6 @@ mod tests {
                 assert_eq!(errors.is_empty(), value == "old", "{errors:?}");
             }
         }
-        let (renames, errors, _, _) = planned(&["old"], &["renamed"], &[("renamed", "old")]);
-        assert!(errors.is_empty());
-        schema
-            .tables
-            .get_mut(&child)
-            .unwrap()
-            .partition_of
-            .as_mut()
-            .unwrap()
-            .columns
-            .insert(
-                "m".into(),
-                pbps_model::PartitionColumn {
-                    default: Some("'old'::app.e".into()),
-                    not_null: false,
-                },
-            );
-        forward_schema(
-            &mut schema,
-            &ids,
-            &renames,
-            &pbps_dialect::MinimalDialect,
-            true,
-        );
-        assert_eq!(
-            schema.tables[&child].partition_of.as_ref().unwrap().columns["m"]
-                .default
-                .as_deref(),
-            Some("'renamed'::app.e")
-        );
     }
 
     #[test]
@@ -1331,94 +1107,19 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn enum_array_defaults_and_checks_follow_oid_renames_without_rewriting_text_constants() {
-        let (steps, errors, mut schema, ids) =
-            planned(&["sad", "ok"], &["blue", "ok"], &[("blue", "sad")]);
-        assert!(errors.is_empty());
-        schema.tables.insert(
-            "app.t".parse().unwrap(),
-            Table {
-                columns: [
-                    (
-                        "a".into(),
-                        Column {
-                            value_source: ValueSource::Default(
-                                "'[0:1]={sad,NULL}'::app.e[]".into(),
-                            ),
-                            ..Column::new("app.e[]".parse().unwrap())
-                        },
-                    ),
-                    ("text".into(), Column::new("text".parse().unwrap())),
-                ]
-                .into(),
-                checks: [(
-                    "kept".into(),
-                    pbps_model::CheckConstraint {
-                        expression: "a <> '{sad,ok}'::app.e[] AND text <> 'sad'::text".into(),
-                    },
-                )]
-                .into(),
-                ..Default::default()
-            },
-        );
-        forward_schema(
-            &mut schema,
-            &ids,
-            &steps,
-            &pbps_dialect::MinimalDialect,
-            true,
-        );
-        let table = &schema.tables[&"app.t".parse().unwrap()];
-        assert_eq!(
-            table.columns["a"].value_source,
-            ValueSource::Default("'[0:1]={blue,NULL}'::app.e[]".into())
-        );
-        assert_eq!(
-            table.checks["kept"].expression,
-            "a <> '{blue,ok}'::app.e[] AND text <> 'sad'::text"
-        );
-    }
 }
 
 #[cfg(test)]
 mod array_tests {
     use super::*;
     #[test]
-    fn array_labels_preserve_dimensions_nulls_escaping_and_unrelated_elements() {
-        assert_eq!(
-            rename_array("[0:2]={sad,NULL,ok}", "sad", "blue"),
-            Some("[0:2]={blue,NULL,ok}".into())
-        );
-        assert_eq!(
-            rename_array("{{sad,ok},{sad,sad}}", "sad", "NULL"),
-            Some("{{\"NULL\",ok},{\"NULL\",\"NULL\"}}".into())
-        );
-        assert_eq!(
-            rename_array(r#"{"a,b","a\"b","a\\b"}"#, "a,b", "x,y"),
-            Some(r#"{"x,y","a\"b","a\\b"}"#.into())
-        );
+    fn new_label_use_reads_array_elements_instead_of_matching_substrings() {
+        for value in ["[0:2]={sad,NULL,ok}", "{{sad,ok},{sad,sad}}", "{\"sad\"}"] {
+            assert!(literal_uses(value, "sad"));
+        }
         assert!(literal_uses(r#"{"a,b"}"#, "a,b"));
         assert!(!literal_uses("{NULL}", "NULL"));
         assert!(!literal_uses("{sadness}", "sad"));
-        assert_eq!(rename_array("{ok}", "sad", "blue"), None);
-        assert_eq!(rename_array("not an array", "sad", "blue"), None);
-    }
-
-    #[test]
-    fn cast_names_keep_quoted_whitespace_and_do_not_accept_unqualified_or_broken_names() {
-        assert_eq!(
-            cast_type("::\"weird schema\".\"e.x\"[] AND true").unwrap(),
-            "\"weird schema\".\"e.x\"[]".parse::<ColumnType>().unwrap()
-        );
-        assert!(cast_type("::text").is_none());
-        assert!(cast_type("::\"unfinished").is_none());
-        assert!(cast_type(" AS text").is_none());
-        assert_eq!(
-            cast_type(" AS app.e)").unwrap(),
-            "app.e".parse::<ColumnType>().unwrap()
-        );
-        assert!(cast_type(" ASide app.e").is_none());
+        assert!(!literal_uses("not an array", "sad"));
     }
 }

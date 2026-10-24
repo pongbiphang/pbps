@@ -220,17 +220,6 @@ fn check_definitions(
                 // Pins hold only the saved catalog text. Follow exactly the
                 // approved moves already executed, including expression casts.
                 renames.definition(&mut expected);
-                let mut schema = live.clone();
-                schema.types.insert(name.clone(), expected);
-                let prefix = executed_label_changes(changes, executed);
-                pbps_diff::enum_labels::forward_schema(
-                    &mut schema,
-                    &positioned,
-                    &prefix,
-                    &crate::Postgres::new(),
-                    true,
-                );
-                expected = schema.types.remove(name).expect("comparison definition");
             } else if let ManagedType::Domain { base, .. } = &mut expected {
                 desired_resolver.remap(base, TypeSide::Base, TypeSide::Desired);
             }
@@ -350,33 +339,6 @@ pub async fn vet(
         None => {}
     }
     Ok(())
-}
-
-/// The approved label prefix is selected by emitter metadata, never SQL text.
-#[allow(clippy::wildcard_enum_match_arm)]
-pub fn executed_label_changes(
-    changes: &pbps_model::ChangeSet,
-    executed: &[pbps_dialect::Statement],
-) -> pbps_model::ChangeSet {
-    pbps_model::ChangeSet {
-        changes: changes
-            .changes
-            .iter()
-            .filter(|p| match &p.change {
-                pbps_model::Change::AddEnumValue {
-                    uid, definition, ..
-                }
-                | pbps_model::Change::RenameEnumValue {
-                    uid, definition, ..
-                } => executed
-                    .iter()
-                    .filter_map(|s| s.declared_type.as_ref())
-                    .any(|s| &s.uid == uid && s.definition.as_ref() == Some(definition.as_ref())),
-                _ => false,
-            })
-            .cloned()
-            .collect(),
-    }
 }
 
 pub fn names(pins: &[DeclaredTypePin]) -> BTreeSet<TypeRef> {
