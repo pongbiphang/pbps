@@ -48,12 +48,36 @@ pub(crate) fn changes(
             }
             continue;
         };
-        if old == wanted {
+        if old == wanted
+            && hints
+                .enum_value_renames
+                .get(name)
+                .is_none_or(BTreeMap::is_empty)
+        {
             continue;
         }
         let mut current = old.clone();
         let mut pending = BTreeMap::new();
         if let Some(renames) = hints.enum_value_renames.get(name) {
+            let graph: BTreeMap<_, _> = renames.iter().map(|(to, from)| (from, to)).collect();
+            let targets: BTreeSet<_> = renames.keys().collect();
+            let mut applied_sources = BTreeSet::new();
+            // A completed chain reuses its intermediate source names as final
+            // labels. Absorb the whole chain before testing pairs individually;
+            // cycles have no head and must still reach the occupied-target check.
+            for head in graph.keys().copied().filter(|head| !targets.contains(head)) {
+                let mut at = head;
+                let mut chain = Vec::new();
+                let mut applied = !old.contains(head);
+                while let Some(&to) = graph.get(&at) {
+                    chain.push(at);
+                    applied &= old.contains(to);
+                    at = to;
+                }
+                if applied {
+                    applied_sources.extend(chain);
+                }
+            }
             let mut sources = BTreeSet::new();
             for (to, from) in renames {
                 if !sources.insert(from) {
@@ -80,6 +104,8 @@ pub(crate) fn changes(
                             pbps_model::escape::Escaped(from)
                         ),
                     ));
+                } else if applied_sources.contains(&from) {
+                    continue;
                 } else if current.contains(from) {
                     pending.insert(from.clone(), to.clone());
                 } else if !current.contains(to) {
@@ -869,6 +895,95 @@ mod tests {
         ));
         assert!(
             matches!(&steps.changes[1].change, Change::AddEnumValue { placement: Some(EnumPlacement::After(v)), .. } if v == "a")
+        );
+    }
+
+    #[test]
+    fn applied_label_chains_absorb_every_pair_before_planning_new_labels() {
+        let hints = [("b", "a"), ("c", "b")];
+        let (steps, errors, _, _) = planned(&["b", "c"], &["b", "c", "d"], &hints);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(steps.changes.len(), 1);
+        assert!(matches!(&steps.changes[0].change,
+            Change::AddEnumValue { value, placement: Some(EnumPlacement::After(neighbour)), .. }
+                if value == "d" && neighbour == "c"));
+        let (noop, errors, _, _) = planned(&["b", "c"], &["b", "c"], &hints);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(noop.is_empty());
+
+        // Reused b is already the first label's final identity. Raw hints must
+        // not forward its constants to c when the computed plan only adds d.
+        let (mut schema, ids) = world(&["b", "c"]);
+        schema.tables.insert(
+            "app.t".parse().unwrap(),
+            Table {
+                columns: [(
+                    "m".into(),
+                    Column {
+                        value_source: ValueSource::Default("'b'::app.e".into()),
+                        ..Column::new("app.e".parse().unwrap())
+                    },
+                )]
+                .into(),
+                checks: [(
+                    "kept".into(),
+                    pbps_model::CheckConstraint {
+                        expression: "m <> 'b'::app.e".into(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let before = schema.clone();
+        forward_schema(
+            &mut schema,
+            &ids,
+            &steps,
+            &pbps_dialect::MinimalDialect,
+            true,
+        );
+        assert_eq!(schema, before);
+    }
+
+    #[test]
+    fn incomplete_label_chains_keep_only_remaining_links_and_do_not_absorb_occupied_targets() {
+        let (steps, errors, _, _) = planned(&["a", "c"], &["b", "c"], &[("b", "a"), ("c", "b")]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(steps.changes.len(), 1);
+        assert!(
+            matches!(&steps.changes[0].change, Change::RenameEnumValue { from, to, .. } if from == "a" && to == "b")
+        );
+
+        let (steps, errors, _, _) = planned(
+            &["b", "c", "x", "z"],
+            &["b", "c", "y", "z", "d"],
+            &[("b", "a"), ("c", "b"), ("y", "x"), ("z", "y")],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(steps.changes.len(), 2);
+        assert!(
+            matches!(&steps.changes[0].change, Change::RenameEnumValue { from, to, .. } if from == "x" && to == "y")
+        );
+        assert!(
+            matches!(&steps.changes[1].change, Change::AddEnumValue { value, .. } if value == "d")
+        );
+
+        for wanted in [vec!["b", "a"], vec!["a", "b"]] {
+            let (_, errors, _, _) = planned(&["a", "b"], &wanted, &[("b", "a"), ("a", "b")]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.to_string().contains("cycle (swap)")),
+                "{errors:?}"
+            );
+        }
+        let (_, errors, _, _) = planned(&["a", "c"], &["c"], &[("c", "a")]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.to_string().contains("occupied target")),
+            "{errors:?}"
         );
     }
 

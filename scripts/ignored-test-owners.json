@@ -531,6 +531,7 @@
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "managed_types::enum_label_additions_preserve_all_positions_through_apply_pull_and_repull",
+        "managed_types::enum_applied_label_chains_keep_annotations_when_adding_labels_and_converge",
         "managed_types::enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_rebuilds",
         "managed_types::enum_label_removals_reorders_missing_sources_and_swaps_refuse_without_sql",
         "managed_types::enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan",
