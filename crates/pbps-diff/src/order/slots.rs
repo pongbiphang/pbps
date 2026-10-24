@@ -38,6 +38,8 @@ use pbps_model::{Change, TableName};
 /// One step's slots: what it claims and releases, each with its holder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlotEffects {
+    /// Holder-qualified input requirements, interpreted by edges AND replay.
+    pub reads: Vec<(SlotKey, ObjectKey)>,
     pub claims: Vec<(SlotKey, ObjectKey)>,
     pub releases: Vec<(SlotKey, ObjectKey)>,
     /// A partition's arrival inherits these names from a standing module.
@@ -71,6 +73,15 @@ pub fn analyse(
         let mut fx = SlotEffects::default();
         match names(dialect, op, owners, before, operations) {
             Ok(n) => {
+                fx.reads = n
+                    .reads
+                    .iter()
+                    .flat_map(|r| {
+                        slots_of(dialect, &r.address)
+                            .into_iter()
+                            .map(|s| (s, r.holder.clone()))
+                    })
+                    .collect();
                 fx.claims = n
                     .claims
                     .iter()
@@ -454,6 +465,7 @@ fn groups(
     // reports alike with it.
     let mut all: BTreeSet<&SlotKey> = BTreeSet::new();
     for fx in &slots.effects {
+        all.extend(fx.reads.iter().map(|(s, _)| s));
         all.extend(fx.claims.iter().map(|(s, _)| s));
         all.extend(fx.releases.iter().map(|(s, _)| s));
     }
@@ -586,6 +598,28 @@ fn handovers_of(
         }
     }
     let mut out = BTreeSet::new();
+    for (reader, fx) in slots.effects.iter().enumerate() {
+        for (s, holder) in &fx.reads {
+            if let Some(holders) = by_slot.get(&rep[s])
+                && let Some((claims, releases)) = holders.get(&Holder::Managed(holder))
+            {
+                for (before, after) in claims
+                    .iter()
+                    .map(|&c| (c, reader))
+                    .chain(releases.iter().map(|&r| (reader, r)))
+                {
+                    if before != after {
+                        out.insert(SlotEdge {
+                            before,
+                            after,
+                            slot: rep[s].clone(),
+                            catalog: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
     for (s, holders) in &by_slot {
         for (holder, (claims, releases)) in holders {
             let others = holders.iter().filter(|(h, _)| *h != holder);
@@ -688,6 +722,12 @@ pub fn handovers(
 /// Why the replay refused a claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotViolation {
+    /// An input address does not hold its required identity at this position.
+    MissingInput {
+        operation: OperationId,
+        slot: SlotKey,
+        holder: ObjectKey,
+    },
     /// A step claims a name another object still holds, and that object
     /// gives it up later in the plan: another order would have it free.
     Held {
@@ -770,7 +810,15 @@ pub fn verify(
     let mut seen: BTreeSet<(&SlotKey, &ObjectKey)> = BTreeSet::new();
     for fx in &slots.effects {
         for (s, h) in &fx.releases {
-            if seen.insert((s, h)) {
+            if seen.insert((s, h))
+                && !slots.effects.iter().any(|fx| {
+                    fx.reads
+                        .iter()
+                        .any(|(rs, rh)| rh == h && same(dialect, facts, rs, s) != Same::No)
+                })
+            {
+                // Qualified inputs start from actual baseline holders, never
+                // from a release encountered first in a misordered fragment.
                 held.push((s.clone(), Occupier::Managed(h.clone())));
             }
         }
@@ -785,7 +833,13 @@ pub fn verify(
     let wanted: BTreeSet<&SlotKey> = slots
         .effects
         .iter()
-        .flat_map(|fx| fx.claims.iter().map(|(s, _)| s).chain(&fx.intermediate))
+        .flat_map(|fx| {
+            fx.claims
+                .iter()
+                .chain(&fx.reads)
+                .map(|(s, _)| s)
+                .chain(&fx.intermediate)
+        })
         .collect();
     let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(dialect, owners, before)
         .into_iter()
@@ -883,8 +937,21 @@ pub fn verify(
         None
     };
     for (op, fx) in operations.iter().zip(&slots.effects) {
+        for (s, h) in &fx.reads {
+            if !held.iter().any(|(slot, who)| {
+                same(dialect, facts, slot, s) == Same::Yes && who == &Occupier::Managed(h.clone())
+            }) {
+                violations.push(SlotViolation::MissingInput {
+                    operation: op.id(),
+                    slot: s.clone(),
+                    holder: h.clone(),
+                });
+            }
+        }
         for (s, h) in &fx.releases {
-            held.retain(|(hs, who)| !(hs == s && *who == Occupier::Managed(h.clone())));
+            held.retain(|(hs, who)| {
+                !(same(dialect, facts, hs, s) == Same::Yes && *who == Occupier::Managed(h.clone()))
+            });
         }
         // A catalog occupant goes with its table: out with a drop, and into
         // the new schema with a move, where it claims its name again.

@@ -452,7 +452,7 @@ pub(crate) fn judge_slots(
         } => pending.iter().any(|e| {
             ops[e.before].id() == *before && ops[e.after].id() == *after && e.slot == *slot
         }),
-        SlotViolation::Contested { .. } => false,
+        SlotViolation::MissingInput { .. } | SlotViolation::Contested { .. } => false,
         // Even a true collision belongs to the scheduled refusal, so the
         // differ can return its logical input without a debug-only panic.
         SlotViolation::IntermediateHeld { slot, .. } => {
@@ -478,6 +478,11 @@ pub(crate) fn judge_slots(
     let mut lines: Vec<String> = violations
         .iter()
         .map(|v| match v {
+            SlotViolation::MissingInput {
+                operation,
+                slot,
+                holder,
+            } => format!("slot input {} needs {holder:?} at {slot}", name(*operation)),
             SlotViolation::Held {
                 operation,
                 slot,

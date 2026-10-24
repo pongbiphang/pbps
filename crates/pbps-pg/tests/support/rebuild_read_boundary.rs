@@ -1,4 +1,4 @@
-//! The first expansion blocker: origins do not encode per-input read boundaries.
+//! Shared slot-qualified inputs and value lifetimes within one logical expansion.
 use pbps_diff::{
     Side,
     order::{self, Baseline, Checks, Schedule, Source},
@@ -6,7 +6,7 @@ use pbps_diff::{
 use pbps_model::{operation::*, plan_names::PlanNames, *};
 
 #[test]
-fn one_split_origin_cannot_order_source_temp_and_backup_reads() {
+fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
     let dialect = pbps_pg::Postgres::new();
     let schema = pbps_diff::rebuild::member_cases::source();
     let parent = pbps_diff::rebuild::member_cases::root();
@@ -132,7 +132,7 @@ fn one_split_origin_cannot_order_source_temp_and_backup_reads() {
     };
     let drop_old = Change::DropTable {
         uid: old.uid.clone(),
-        name: parent.clone(),
+        name: address(&old.uid).name,
         detach_from: None,
     };
     let backup_read = Change::DropTable {
@@ -155,90 +155,127 @@ fn one_split_origin_cannot_order_source_temp_and_backup_reads() {
         ids: &target,
     };
     let baseline = Baseline::of(before, &owners);
-    let graph_for = |changes: Vec<Change>| {
-        let ops = Operations::expanded(
-            1,
-            changes
-                .into_iter()
-                .map(|c| (Origin::SplitPart(0), PlannedChange::new(c))),
-            ModuleEdits::Rebuilt,
-        );
-        // Portable edges alone already conflict; engine effects are additive.
-        let fx = ops
-            .iter()
-            .map(|op| effects(op, &owners, before, after).unwrap())
-            .collect::<Vec<_>>();
-        let graph = order::graph(
-            ops.as_slice(),
-            &fx,
-            &baseline,
-            &Default::default(),
-            Checks::ALL,
-        );
-        assert!(graph.unmet.is_empty(), "{:?}", graph.unmet);
-        (ops, graph)
-    };
-    {
-        let parts = vec![
-            create_parent.clone(),
-            create_leaf.clone(),
-            copy.clone(),
-            analyze.clone(),
-            old_swap.clone(),
-            new_swap.clone(),
-        ];
-        let (ops, graph) = graph_for(parts);
-        let at = |change: &Change| ops.iter().position(|op| op.change() == change).unwrap();
-        let copy = at(&copy);
-        let analyze = at(&analyze);
-        let old_swap = at(&old_swap);
-        let new_swap = at(&new_swap);
-        let has = |a, b| graph.edges.iter().any(|e| e.before == a && e.after == b);
-        // These directions contradict the names carried by the typed payloads.
+    let parts = vec![
+        create_parent,
+        create_leaf,
+        copy,
+        analyze,
+        old_swap,
+        new_swap,
+        backup_read,
+        drop_old,
+    ];
+    let ops = Operations::expanded(
+        1,
+        parts
+            .into_iter()
+            .map(|c| (Origin::SplitPart(0), PlannedChange::new(c))),
+        ModuleEdits::Rebuilt,
+    );
+    let fx = ops
+        .iter()
+        .map(|op| effects(op, &owners, before, after).unwrap())
+        .collect::<Vec<_>>();
+    let graph = order::graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &Default::default(),
+        Checks::ALL,
+    );
+    assert!(graph.unmet.is_empty(), "{:?}", graph.unmet);
+    let slots = order::slots::analyse(ops.as_slice(), &owners, before, &dialect);
+    assert!(slots.unowned.is_empty(), "{:?}", slots.unowned);
+    let slot_edges = order::slots::edges(&slots, None, &[]);
+    for (a, b) in [(0, 2), (2, 4), (2, 5), (3, 5), (4, 6)] {
         assert!(
-            has(old_swap, copy),
-            "source-name read follows the source rename"
+            slot_edges.iter().any(|e| e.before == a && e.after == b),
+            "missing address edge {a} -> {b}"
         );
-        assert!(
-            has(new_swap, copy),
-            "temporary target read follows the final rename"
-        );
-        assert!(
-            has(new_swap, analyze),
-            "temporary ANALYZE follows the final rename"
-        );
-        assert!(
-            has(copy, analyze),
-            "the ordinary row-value edge is already correct"
-        );
-        assert!(!graph.has_cycle(ops.len()));
-        let mut schedule = Schedule::of_graph(&graph, ops.as_slice());
-        for (a, b) in [(copy, analyze), (analyze, old_swap), (analyze, new_swap)] {
-            schedule.edge(
-                a,
-                b,
-                Source::Effect,
-                pbps_model::resolver::OrderReason::Restoration,
-            );
-        }
-        assert!(matches!(
-            schedule.settle(order::propose(ChangeSet {
-                changes: ops.iter().map(|op| op.planned().clone()).collect()
-            })),
-            Err(order::Refusal::Cycle { .. })
-        ));
     }
-    let (ops, graph) = graph_for(vec![old_swap.clone(), backup_read]);
-    assert!(graph.edges.iter().any(|e| e.before == 0 && e.after == 1));
-    assert!(
-        !graph.has_cycle(ops.len()),
-        "the backup address correctly follows its rename"
-    );
-    let (_, graph) = graph_for(vec![create_parent, create_leaf, copy, drop_old]);
     assert!(graph.edges.iter().any(|e| e.before == 2 && e.after == 3));
-    assert!(graph.edges.iter().any(|e| e.before == 3 && e.after == 2));
+    assert!(graph.edges.iter().any(|e| e.before == 2 && e.after == 7));
+    assert!(!graph.edges.iter().any(|e| e.before == 7 && e.after == 2));
+    let mut schedule = Schedule::of_graph(&graph, ops.as_slice());
+    order::slots::schedule(&mut schedule, &slot_edges);
+    // These are completion obligations, not a new sorting stage or rank.
+    for (a, b) in [(3, 4), (5, 6)] {
+        schedule.edge(
+            a,
+            b,
+            Source::Effect,
+            pbps_model::resolver::OrderReason::Restoration,
+        );
+    }
+    let settled = schedule
+        .settle(order::propose(ChangeSet {
+            changes: ops.iter().map(|o| o.planned().clone()).collect(),
+        }))
+        .unwrap();
+    assert_eq!(settled.sequence, [0, 1, 2, 3, 4, 5, 6, 7]);
+    let violations = order::verify::verify(ops.as_slice(), &fx, &baseline, &Default::default());
+    assert!(violations.is_empty(), "{violations:?}");
+    let (violations, skipped) =
+        order::slots::verify(ops.as_slice(), &slots, &dialect, None, &owners, before);
     assert!(
-        graph.has_cycle(4),
-        "source Reads waits for the same lifetime's value-removing DROP"
+        violations.is_empty() && skipped.is_empty(),
+        "{violations:?} / {skipped:?}"
     );
+    let reverse: Vec<_> = (0..ops.len()).rev().collect();
+    let reversed = order::reordered_operations(&ops, &reverse);
+    let reversed_fx: Vec<_> = reverse.iter().map(|&i| fx[i].clone()).collect();
+    let reversed_graph = order::graph(
+        reversed.as_slice(),
+        &reversed_fx,
+        &baseline,
+        &Default::default(),
+        Checks::ALL,
+    );
+    let reversed_slots = order::slots::analyse(reversed.as_slice(), &owners, before, &dialect);
+    let mut schedule = Schedule::of_graph(&reversed_graph, reversed.as_slice());
+    order::slots::schedule(
+        &mut schedule,
+        &order::slots::edges(&reversed_slots, None, &[]),
+    );
+    for (a, b) in [(3, 4), (5, 6)] {
+        schedule.edge(
+            7 - a,
+            7 - b,
+            Source::Effect,
+            pbps_model::resolver::OrderReason::Restoration,
+        );
+    }
+    let settled = schedule
+        .settle(order::propose(ChangeSet {
+            changes: reversed.iter().map(|o| o.planned().clone()).collect(),
+        }))
+        .unwrap();
+    assert_eq!(settled.sequence, reverse);
+    // Independent slot replay rejects both sides of each boundary, including
+    // a release seen before its creator. It must not seed a phantom holder.
+    for order in [
+        vec![4, 0, 1, 2, 3, 5, 6, 7],
+        vec![0, 1, 5, 2, 3, 4, 6, 7],
+        vec![6, 0, 1, 2, 3, 4, 5, 7],
+    ] {
+        let reordered: Vec<_> = order.iter().map(|&i| ops.as_slice()[i].clone()).collect();
+        let reordered_slots = order::slots::Slots {
+            effects: order.iter().map(|&i| slots.effects[i].clone()).collect(),
+            ..Default::default()
+        };
+        let (violations, _) = order::slots::verify(
+            &reordered,
+            &reordered_slots,
+            &dialect,
+            None,
+            &owners,
+            before,
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, order::slots::SlotViolation::MissingInput { .. })),
+            "{order:?}: {violations:?}"
+        );
+    }
 }

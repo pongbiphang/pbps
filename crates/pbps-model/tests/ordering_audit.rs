@@ -966,6 +966,7 @@ mod effects_of_each_kind {
         }
         for r in &fx.requires {
             out.insert(match r {
+                Requirement::Holds(_) => "Holds",
                 Requirement::Exists(_) => "Exists",
                 Requirement::Is(..) => "Is",
                 Requirement::Bound(..) => "Bound",

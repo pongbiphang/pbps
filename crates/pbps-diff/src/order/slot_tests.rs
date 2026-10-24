@@ -20,8 +20,8 @@ use super::slots::{Skipped, SlotEdge, SlotViolation, analyse, carried, edges, ve
 /// table's old name in the new schema, as PostgreSQL's `SET SCHEMA` and SQL
 /// Server's `TRANSFER` do. `exact` is whether it compares names by their
 /// spelling (PostgreSQL) or under a collation (SQL Server).
-struct Slotted {
-    exact: bool,
+pub(super) struct Slotted {
+    pub(super) exact: bool,
 }
 
 impl Dialect for Slotted {
@@ -288,6 +288,7 @@ fn held(violations: &[SlotViolation]) -> Vec<String> {
     violations
         .iter()
         .map(|v| match v {
+            SlotViolation::MissingInput { slot, .. } => format!("input {slot}"),
             SlotViolation::Held { slot, .. } => format!("held {slot}"),
             SlotViolation::IntermediateHeld { slot, .. } => format!("intermediate {slot}"),
             SlotViolation::Edge { slot, .. } => format!("edge {slot}"),

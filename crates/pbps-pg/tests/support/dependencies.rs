@@ -858,9 +858,16 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
             }))
             .unwrap();
         assert_eq!(settled.sequence, [release, claim, 2, 3]);
+        // This clone-slot fragment omits temp-tree creation and name swaps.
+        // Keep its original claim/release oracle independent of input-lifetime
+        // coverage, which the complete rebuild_read_boundary proof supplies.
+        let mut clone_slots = enriched.clone();
+        for fx in &mut clone_slots.effects {
+            fx.reads.clear();
+        }
         let (violations, _) = slots::verify(
             ops.as_slice(),
-            &enriched,
+            &clone_slots,
             &dialect,
             Some(&facts),
             &owners,
