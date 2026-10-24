@@ -79,6 +79,46 @@ pub fn stdin_reasons(dialect: &str) {
             cfg!(windows)
         );
     }
+    batch_stdin_reason(schema);
+}
+
+/// One reason of a batch comes from stdin verbatim; the others stay
+/// arguments, and both decisions are recorded together.
+fn batch_stdin_reason(schema: &str) {
+    let d = Demo::new("stdin2332-batch");
+    d.table(&format!("table: {schema}.t\ncolumns:\n  id: {{type: int, nullable: false}}\n  a: {{type: int}}\n  b: {{type: int}}\nprimary_key: [id]\n"));
+    assert_eq!(code(&d.run(&["plan", "--no-dev"])), 0);
+    d.commit();
+    d.table(&format!(
+        "table: {schema}.t\ncolumns:\n  id: {{type: int, nullable: false}}\nprimary_key: [id]\n"
+    ));
+    let (a, b) = (format!("{schema}.t.a"), format!("{schema}.t.b"));
+    let reason = " 核准\n ticket ";
+    let out = piped(
+        &d.dir,
+        &[
+            "intent",
+            "--drop",
+            &a,
+            "-",
+            "--drop",
+            &b,
+            "kept as argument",
+        ],
+        format!("{reason}\n").as_bytes(),
+    );
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let recorded: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    let reason_of = |was: &str| {
+        recorded
+            .tombstones
+            .values()
+            .find(|t| t.was == was)
+            .map(|t| t.reason.to_string())
+    };
+    assert_eq!(reason_of(&a).as_deref(), Some(reason));
+    assert_eq!(reason_of(&b).as_deref(), Some("kept as argument"));
 }
 
 pub fn refusal_before_io(dialect: &str) {
@@ -102,14 +142,28 @@ pub fn refusal_before_io(dialect: &str) {
             assert!(!stderr(&out).contains("pbps.yml"));
         }
     }
-    for value in ["-", "-ticket"] {
-        let out = piped(
-            &missing,
-            &["intent", "--drop", "app.t.old", value],
+    // A batch reads at most one reason from stdin; every refusal comes
+    // before discovery.
+    for (args, input, expected) in [
+        (
+            vec!["--drop", "app.t.old", "-ticket"],
+            b"approved\n".as_slice(),
+            "hyphen-leading",
+        ),
+        (vec!["--drop", "app.t.old", "-"], b" \t\r\n", "reason"),
+        (
+            vec!["--drop", "app.t.a", "-", "--drop", "app.t.b", "-"],
             b"approved\n",
+            "only one reason",
+        ),
+    ] {
+        let out = piped(&missing, &[&["intent"], args.as_slice()].concat(), input);
+        assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains(expected),
+            "{args:?}: {}",
+            stderr(&out)
         );
-        assert_eq!(code(&out), 2, "{}", stderr(&out));
-        assert!(stderr(&out).contains("single commands"), "{}", stderr(&out));
         assert!(!stderr(&out).contains("pbps.yml"));
     }
     for command in ["plan", "apply"] {

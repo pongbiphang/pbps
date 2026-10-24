@@ -2,9 +2,13 @@
 
 use anyhow::{Context as _, ensure};
 use clap::{ArgAction, Args};
-use pbps_model::{ColumnRef, Intent};
+use pbps_model::{ColumnRef, Intent, Reason};
 
-pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values, including '-'; use the single commands pbps drop, drop-table, drop-role, move-rows or rebuild-table with --reason - for stdin reasons.";
+pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values; a single '-' as one drop reason reads that reason from stdin, and the single commands pbps drop, drop-table, drop-role, move-rows or rebuild-table accept --reason - too.";
+
+/// The reason options. Only their second value is audit text, so only there
+/// can `-` stand for stdin.
+const REASON_FLAGS: [&str; 4] = ["--drop-type", "--drop", "--drop-table", "--drop-role"];
 
 #[derive(Args)]
 #[group(required = true, multiple = true)]
@@ -36,6 +40,7 @@ pub struct BatchArgs {
 }
 
 /// The command boundary cannot ask resolution to record an empty answer.
+#[derive(Debug)]
 pub struct IntentBatch(Vec<Intent>);
 
 impl IntentBatch {
@@ -54,8 +59,16 @@ impl BatchArgs {
     /// Parse both members before discovery. A per-value clap parser cannot
     /// distinguish a qualified name from the reason beside it (DEC-1791.1).
     pub fn parse(&self) -> anyhow::Result<IntentBatch> {
-        let mut intents = Vec::new();
-        for (flag, values) in [
+        self.parse_with(crate::reason_input::from_stdin)
+    }
+
+    /// Stdin is one stream, so at most one reason can come from it. Every
+    /// value is checked, and a second `-` refused, before stdin is read.
+    fn parse_with(
+        &self,
+        stdin: impl FnOnce() -> Result<Reason, String>,
+    ) -> anyhow::Result<IntentBatch> {
+        let options = [
             ("--rename", &self.rename),
             ("--rename-table", &self.rename_table),
             ("--rename-role", &self.rename_role),
@@ -64,14 +77,36 @@ impl BatchArgs {
             ("--drop", &self.drop),
             ("--drop-table", &self.drop_table),
             ("--drop-role", &self.drop_role),
-        ] {
-            ensure!(
-                !values.iter().any(|value| value.starts_with('-')),
-                "{flag}: {SINGLE_REASON_HELP}"
-            );
+        ];
+        let mut piped = 0;
+        for (flag, values) in options {
             let (pairs, remainder) = values.as_chunks::<2>();
             ensure!(remainder.is_empty(), "{flag} requires two values");
             for [first, second] in pairs {
+                let from_stdin = second == "-" && REASON_FLAGS.contains(&flag);
+                piped += usize::from(from_stdin);
+                ensure!(
+                    !first.starts_with('-') && (from_stdin || !second.starts_with('-')),
+                    "{flag}: {SINGLE_REASON_HELP}"
+                );
+            }
+        }
+        ensure!(
+            piped <= 1,
+            "only one reason in a batch can be '-': stdin is read once"
+        );
+        let mut stdin = Some(stdin);
+        let mut intents = Vec::new();
+        for (flag, values) in options {
+            for [first, second] in values.as_chunks::<2>().0 {
+                let reason;
+                let second = if second == "-" && REASON_FLAGS.contains(&flag) {
+                    let read = stdin.take().expect("one '-' per batch, counted above");
+                    reason = read().map_err(anyhow::Error::msg)?;
+                    reason.as_ref()
+                } else {
+                    second.as_str()
+                };
                 intents.push(parse_pair(flag, first, second).with_context(|| flag)?);
             }
         }
@@ -156,6 +191,77 @@ mod tests {
             panic!("wrong command")
         };
         assert_eq!(args.parse().unwrap().into_vec().len(), 3);
+    }
+
+    fn batch(args: &[&str]) -> BatchArgs {
+        let cli = crate::Cli::try_parse_from(["pbps", "intent"].iter().chain(args)).unwrap();
+        let crate::Command::Intent(args) = cli.command else {
+            panic!("wrong command")
+        };
+        args
+    }
+
+    fn unread() -> Result<Reason, String> {
+        panic!("stdin must not be read")
+    }
+
+    #[test]
+    fn one_dash_reason_in_a_batch_reads_stdin_verbatim() {
+        let parsed = batch(&["--drop", "app.t.a", "-", "--drop", "app.t.b", "kept"])
+            .parse_with(|| Ok(" 核准?\n ticket ".parse().unwrap()))
+            .unwrap()
+            .into_vec();
+        assert_eq!(
+            parsed,
+            vec![
+                Intent::DropColumn {
+                    column: "app.t.a".parse().unwrap(),
+                    reason: " 核准?\n ticket ".parse().unwrap(),
+                },
+                Intent::DropColumn {
+                    column: "app.t.b".parse().unwrap(),
+                    reason: "kept".parse().unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_dash_is_refused_before_stdin_is_read() {
+        let error = batch(&["--drop", "app.t.a", "-", "--drop-role", "reader", "-"])
+            .parse_with(unread)
+            .unwrap_err();
+        assert!(error.to_string().contains("only one reason"), "{error:#}");
+    }
+
+    #[test]
+    fn dash_outside_a_reason_and_other_hyphen_values_are_refused_unread() {
+        for args in [
+            ["--rename-role", "reader", "-"],
+            ["--rename-table", "-", "app.t"],
+            ["--drop", "-", "approved"],
+        ] {
+            let error = batch(&args).parse_with(unread).unwrap_err();
+            assert!(
+                error.to_string().contains("hyphen-leading"),
+                "{args:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stdin_failure_refuses_the_whole_batch() {
+        let error = batch(&[
+            "--rename-role",
+            "reader",
+            "auditor",
+            "--drop",
+            "app.t.a",
+            "-",
+        ])
+        .parse_with(|| Err("reason must not be blank".into()))
+        .unwrap_err();
+        assert!(error.to_string().contains("blank"), "{error:#}");
     }
 
     #[test]

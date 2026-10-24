@@ -6,13 +6,20 @@ pub fn resolve(reason: &mut Reason) -> Result<(), String> {
     if reason.as_ref() != "-" {
         return Ok(());
     }
-    *reason = read(std::io::stdin().lock())?;
+    *reason = from_stdin()?;
+    Ok(())
+}
+
+/// The reason piped on stdin, shared by the single commands and the one `-`
+/// a `pbps intent` batch may carry.
+pub fn from_stdin() -> Result<Reason, String> {
+    let reason = read(std::io::stdin().lock())?;
     if encoding_warning(reason.as_ref(), cfg!(windows)) {
         eprintln!(
             "warning: Windows PowerShell 5.1 can replace piped non-ASCII text with '?'; pass the reason as an argument or use PowerShell 7."
         );
     }
-    Ok(())
+    Ok(reason)
 }
 
 fn read(mut input: impl std::io::Read) -> Result<Reason, String> {

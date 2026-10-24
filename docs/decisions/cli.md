@@ -1573,9 +1573,10 @@ also fall back to an empty argument, never an invented audit explanation.
 Only `drop`, `drop-table`, `drop-role`, `move-rows` and `rebuild-table` read
 `--reason -` from stdin. Read UTF-8 to EOF, remove exactly one final LF or CRLF,
 then use the same nonblank validator while preserving everything else. Decode,
-read and blank-input errors are usage errors before project discovery. Batch
-values remain non-hyphen-leading and do not consume stdin; refusal points to
-single commands. These conveniences change how a human supplies intent, never
+read and blank-input errors are usage errors before project discovery. In a
+`pbps intent` batch, one drop reason may be `-` and is read the same way; stdin
+is one stream, so a second `-` is a usage error raised before stdin is read.
+Every other hyphen-leading batch value is refused. These conveniences change how a human supplies intent, never
 allow a plan/apply flag to choose it or change the identity recording path.
 Compose passes its explicitly supplied literal `-` reason through stdin so its
 existing reason input remains unchanged.

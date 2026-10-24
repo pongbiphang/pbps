@@ -1035,8 +1035,9 @@ For `drop`, `drop-table`, `drop-role`, `move-rows` and `rebuild-table`,
 removed; all other characters, including surrounding whitespace and embedded
 newlines, are recorded verbatim. Empty, whitespace-only or non-UTF-8 input is
 a usage error (exit 2) before project discovery or writes. The literal `-`
-selects stdin only on these single commands; batch `pbps intent` does not read
-stdin. In PowerShell, use PowerShell 7 or set
+selects stdin on these single commands and on one drop reason of a
+`pbps intent` batch; a second `-` in a batch is a usage error before stdin is
+read. In PowerShell, use PowerShell 7 or set
 `$OutputEncoding = [System.Text.UTF8Encoding]::new()` before piping non-ASCII
 text. On Windows a stdin reason containing `?` prints an encoding hint because
 PowerShell 5.1's default US-ASCII output can have replaced characters; the hint
