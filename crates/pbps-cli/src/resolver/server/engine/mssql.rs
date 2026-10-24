@@ -7,8 +7,10 @@ use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
-use pbps_mssql::resolver::{self, authorization as auth, capture, externals, scratch as sql};
-use std::collections::BTreeSet;
+use pbps_mssql::resolver::{
+    self, authorization as auth, capture, dependencies, externals, scratch as sql,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 enum Created {
     Nothing,
@@ -33,10 +35,16 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     request: &'a ScopeRequest,
     // Preserve the selected source for #2270's evidence handoff.
     _provenance: &'a Provenance,
-    _placement: sql::Placement,
+    placement: sql::Placement,
+    companions: Vec<sql::companion::Companion>,
 }
 
 pub(in crate::resolver::server) struct Prepared {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#2238 seals dependency rehearsal placement")
+    )]
+    pub(in crate::resolver::server) dependencies: dependencies::Rehearsals,
     #[cfg_attr(
         not(test),
         expect(
@@ -133,7 +141,8 @@ pub(super) async fn scratch<'a>(
                 externals,
                 request,
                 _provenance: provenance,
-                _placement: placement,
+                placement,
+                companions: Vec::new(),
             },
         ))
     }
@@ -158,6 +167,19 @@ impl Scratch<'_> {
                 "the scratch connection changed backend after separation".into(),
             ));
         }
+        if self.placement == sql::Placement::SeparateInstance
+            && provisioning == Provisioning::Supplied
+            && !binding.dependencies.is_empty()
+        {
+            return Err(Error::Externals(binding.dependencies.keys().map(|name| format!(
+                "dependency `{}` requires a companion database; supplied scratch on another instance cannot create it", name.shown()
+            )).collect()));
+        }
+        let real = self.placement == sql::Placement::SameInstance;
+        let mut dependency_inputs =
+            dependencies::read(target_connection, binding.dependencies, real)
+                .await
+                .map_err(read)?;
         let recipe = scope::recipe(Driver::Mssql, target)
             .map_err(|error| Error::Scope(error.to_string()))?;
         let (reference, database, databases) = match provisioning {
@@ -185,7 +207,74 @@ impl Scratch<'_> {
                     names: names.clone(),
                     reference: None,
                 };
+                for database in dependency_inputs.databases() {
+                    let companion = sql::companion::Companion::create(admin, &database)
+                        .await
+                        .map_err(read)?;
+                    self.companions.push(companion);
+                    let mut owner = Conn::connect(Driver::Mssql, self.connection)
+                        .await
+                        .map_err(read)?;
+                    if !sql::marked(&mut owner, &self.mark).await.map_err(read)? {
+                        return Err(Error::Unusable(
+                            "the companion connection changed instance".into(),
+                        ));
+                    }
+                    self.companions
+                        .last_mut()
+                        .expect("recorded companion")
+                        .acquire(&mut owner)
+                        .await
+                        .map_err(read)?;
+                }
                 let databases = sql::database_names(admin).await.map_err(read)?;
+                let mut companion_sessions = BTreeMap::new();
+                for companion in &self.companions {
+                    let mut owner = Conn::connect(Driver::Mssql, self.connection)
+                        .await
+                        .map_err(read)?;
+                    if !sql::marked(&mut owner, &self.mark).await.map_err(read)? {
+                        return Err(Error::Unusable(
+                            "the companion staging connection changed instance".into(),
+                        ));
+                    }
+                    companion.verify(&mut owner).await.map_err(read)?;
+                    let inventory = sql::inventory::read(&mut owner, None).await.map_err(read)?;
+                    if !inventory.is_empty() {
+                        return Err(Error::Unusable(format!(
+                            "dependency companion {} is not empty: {}",
+                            companion.name(),
+                            inventory.names().join(", ")
+                        )));
+                    }
+                    let actual = sql::options::read(&mut owner, companion.name())
+                        .await
+                        .map_err(read)?;
+                    let differences = sql::options::differences(&actual, &reference);
+                    if !differences.is_empty() {
+                        return Err(Error::Unusable(format!(
+                            "dependency companion {} differs from a fresh database: {}",
+                            companion.name(),
+                            differences.join(", ")
+                        )));
+                    }
+                    let sandbox = format!("pbps_sandbox_{:032x}", rand::random::<u128>());
+                    sql::create_sandbox(&mut owner, &sandbox)
+                        .await
+                        .map_err(read)?;
+                    sql::enter_sandbox(&mut owner, &sandbox)
+                        .await
+                        .map_err(read)?;
+                    sql::sandbox_checks(&mut owner, &databases, companion.name())
+                        .await
+                        .map_err(read)?;
+                    companion_sessions.insert(companion.name().to_owned(), owner);
+                }
+                let token = format!("{:032x}", rand::random::<u128>());
+                dependency_inputs
+                    .stage(&mut companion_sessions, admin, &token)
+                    .await
+                    .map_err(read)?;
                 (reference, names.database().to_owned(), databases)
             }
             Provisioning::Supplied => {
@@ -269,9 +358,10 @@ impl Scratch<'_> {
             )));
         }
         let managed = [binding.base, binding.desired];
-        let required = capture::required_externals(target_connection, &managed)
-            .await
-            .map_err(capture_error)?;
+        let required =
+            capture::required_externals_declared(target_connection, &managed, binding.dependencies)
+                .await
+                .map_err(capture_error)?;
         let waiting = required.waiting();
         if !waiting.is_empty() {
             return Err(Error::Externals(waiting));
@@ -293,9 +383,10 @@ impl Scratch<'_> {
             retained: required.roots().clone(),
             candidates: BTreeSet::new(),
         };
-        let initial = capture::capture(target_connection, &external_scope)
-            .await
-            .map_err(capture_error)?;
+        let initial =
+            capture::capture_declared(target_connection, &external_scope, binding.dependencies)
+                .await
+                .map_err(capture_error)?;
         let initial_owners = auth::OwnerPartition::from_capture(&initial, &context)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
@@ -331,9 +422,15 @@ impl Scratch<'_> {
         let from_file = externals::created(&before, &middle);
         // Validate all file roots before filling; absence/overlap and hidden
         // shape errors name the file's object rather than a renderer failure.
-        capture::compare_staged(&mut owner, target_connection, &from_file, &[])
-            .await
-            .map_err(stage_error)?;
+        capture::compare_staged_declared(
+            &mut owner,
+            target_connection,
+            &from_file,
+            &[],
+            binding.dependencies,
+        )
+        .await
+        .map_err(stage_error)?;
         let items = externals::render::missing(&required, &from_file).map_err(Error::Externals)?;
         auth::reconstruct_missing_schemas(&mut owner, &map, &context)
             .await
@@ -358,9 +455,10 @@ impl Scratch<'_> {
             retained: created.union(required.roots()).cloned().collect(),
             candidates: BTreeSet::new(),
         };
-        let target_inputs = capture::capture(target_connection, &target_scope)
-            .await
-            .map_err(capture_error)?;
+        let target_inputs =
+            capture::capture_declared(target_connection, &target_scope, binding.dependencies)
+                .await
+                .map_err(capture_error)?;
         let target_owners = auth::OwnerPartition::from_capture(&target_inputs, &context)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         auth::read_staged_permissions(target_connection, &mut context, &target_owners)
@@ -383,9 +481,10 @@ impl Scratch<'_> {
                 .deployer(&context)
                 .ok_or_else(|| Error::Scope("no mapped deployer".into()))?;
         }
-        let current_inputs = capture::capture(&mut owner, &target_scope)
-            .await
-            .map_err(capture_error)?;
+        let current_inputs =
+            capture::capture_declared(&mut owner, &target_scope, binding.dependencies)
+                .await
+                .map_err(capture_error)?;
         let current_owners = auth::OwnerPartition::from_capture(&current_inputs, &local)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         target_owners.verify(&current_owners).map_err(read)?;
@@ -407,9 +506,15 @@ impl Scratch<'_> {
         )
         .await
         .map_err(read)?;
-        let staged = capture::compare_staged(&mut owner, target_connection, &created, &managed)
-            .await
-            .map_err(stage_error)?;
+        let staged = capture::compare_staged_declared(
+            &mut owner,
+            target_connection,
+            &created,
+            &managed,
+            binding.dependencies,
+        )
+        .await
+        .map_err(stage_error)?;
         let mut compile = self.bounded(&database, &sandbox, &databases).await?;
         auth::enter_sandbox_deployer(
             &mut compile,
@@ -445,6 +550,7 @@ impl Scratch<'_> {
             .await
             .map_err(read)?;
         Ok(Prepared {
+            dependencies: dependency_inputs.rehearsals(),
             compile,
             map: scope::Principals::Mssql(map),
             inventory: after,
@@ -482,6 +588,34 @@ impl Scratch<'_> {
     }
 
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
+        let mut failed = self.release_scratch(admin).await.err().unwrap_or_default();
+        if !self.companions.is_empty() {
+            if !matches!(sql::on_backend(admin, &self.backend).await, Ok(true)) {
+                failed.extend(self.companions.iter().map(|db| {
+                    format!(
+                        "dependency companion {}: cleanup backend changed or is unreadable",
+                        db.name()
+                    )
+                }));
+            } else {
+                for companion in std::mem::take(&mut self.companions) {
+                    if let Err(error) = companion.release(admin).await {
+                        failed.push(format!(
+                            "dependency companion {} ({error})",
+                            companion.name()
+                        ));
+                    }
+                }
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed)
+        }
+    }
+
+    async fn release_scratch(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
         let entered = std::mem::take(&mut self.entered);
         match std::mem::replace(&mut self.created, Created::Nothing) {
             Created::Nothing => Ok(()),

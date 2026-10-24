@@ -583,6 +583,16 @@ impl Builder<'_> {
                 });
         }
         for dependency in catalog.dependencies.iter().filter(|d| d.referencing == id) {
+            if let Some(target) = super::references::declared(catalog, dependency) {
+                // Cross-database IDs are not database-local IDs. Retain the
+                // declared name without following it through the local catalog.
+                bindings.insert(Binding {
+                    node: "sys.sql_expression_dependencies".into(),
+                    path: target.name.clone(),
+                    target,
+                });
+                continue;
+            }
             if dependency.caller_dependent {
                 self.result
                     .runtime

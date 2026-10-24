@@ -7338,6 +7338,7 @@ pub fn cmd_plan_db(
                         Err(crate::resolution::Refused::Unanswerable(error)) => return Err(error),
                     };
                 let request = crate::resolution::Request {
+                    dependencies: &loaded.dependencies,
                     selection,
                     assessment: &assessment,
                     target,

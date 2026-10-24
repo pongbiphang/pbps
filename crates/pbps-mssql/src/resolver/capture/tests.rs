@@ -17,6 +17,7 @@ const VIEW: i64 = 200;
 
 fn catalog() -> Catalog {
     Catalog {
+        declarations: Default::default(),
         major: 17,
         session: Session {
             user: "dbo".into(),
@@ -294,6 +295,52 @@ fn every_refusal_names_its_reason() {
         condition(&nameless),
         "a reference names an object the capture cannot identify"
     );
+}
+
+#[test]
+fn only_declared_three_part_objects_leave_the_local_capture_boundary() {
+    use pbps_model::dependency::{Dependency as Shape, DependencyColumn, DependencyKind};
+    for kind in [DependencyKind::Table, DependencyKind::View] {
+        let mut source = catalog();
+        let mut row = reference(Some("dbo"), "t", None);
+        row.database = Some("otherdb".into());
+        source.dependencies.push(row);
+        let name = "otherdb.dbo.t".parse().unwrap();
+        source.declarations.insert(
+            name,
+            Shape {
+                kind,
+                columns: [(
+                    "id".into(),
+                    DependencyColumn {
+                        ty: "int".parse().unwrap(),
+                        nullable: false,
+                    },
+                )]
+                .into(),
+            },
+        );
+        let selected = select::select(&source, &scope()).unwrap();
+        let bindings = &selected.inputs[&object("app", "v")].bindings;
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.target.name == ["otherdb", "dbo", "t"])
+        );
+        assert!(!selected.inputs.contains_key(&object("dbo", "t")));
+        for variant in 0..5 {
+            let row = &mut source.dependencies[0];
+            row.server = (variant == 0).then(|| "linked".into());
+            row.schema = (variant != 1).then(|| "dbo".into());
+            row.class = if variant == 2 { 6 } else { 1 };
+            row.caller_dependent = variant == 3;
+            row.entity = if variant == 4 { "undeclared" } else { "t" }.into();
+            assert_eq!(
+                condition(&source),
+                "a reference names an object in another database or server"
+            );
+        }
+    }
 }
 
 #[test]

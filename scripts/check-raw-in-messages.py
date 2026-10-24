@@ -61,6 +61,8 @@ SQL_BUILDERS = {
 } | {
     "crates/pbps-mssql/src/resolver/externals.rs",
     "crates/pbps-mssql/src/resolver/externals/render.rs",
+    "crates/pbps-mssql/src/resolver/dependencies.rs",
+    "crates/pbps-mssql/src/resolver/dependencies/rebuild.rs",
     "crates/pbps-mssql/src/resolver/authorization/sandbox.rs",
     "crates/pbps-mssql/src/resolver/authorization/staged.rs",
     "crates/pbps-mssql/src/resolver/capture/object_properties.rs",
@@ -72,6 +74,14 @@ SQL_BUILDERS = {
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
+    "crates/pbps-mssql/src/resolver/dependencies.rs": (
+        None,
+        "builds companion declaration SQL; diagnostic sinks remain checked",
+    ),
+    "crates/pbps-mssql/src/resolver/dependencies/rebuild.rs": (
+        None,
+        "builds companion reconstruction SQL; diagnostic sinks remain checked",
+    ),
     "crates/pbps-model/src/types.rs": (
         4,
         "Three shown adapters escape canonical raw spellings; the canonical formatter preserves "

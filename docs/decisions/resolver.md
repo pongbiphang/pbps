@@ -4260,3 +4260,84 @@ defaults, keys, user types and unknown kinds are not skipped. Ownership and ACLs
 all retained subjects still compare, and file-supplied ownership is never
 repaired. Filtering only the renderer would leave the same false refusal in
 the other OwnerPartition callers.
+
+
+<a id="dec-2323-1"></a>
+
+**DEC-2323.1. Declared cross-database rehearsal retains per-dependency placement
+in SQL Server's preparation handoff.** Same-instance scratch binds the real
+other database without creating a companion, as measured on SQL Server
+17.0.4075.5 and approved on #2323. B1's comparison and its `declared, not
+compared` label remain unchanged. A run-owned scratch on another instance
+creates a same-named companion containing the declared objects. Readable
+objects use catalog rendering and staged comparison; unreadable objects use
+the declared shape. A declared view selects a private shape table, preserving
+kind V and exact nullability. A nullable literal view loses NOT NULL, while a
+shape-preserving literal view leaves write dependency metadata incomplete;
+neither replaces the private table. Creation and cleanup belong to the run,
+outside the irreversible compilation sandbox. Supplied scratch on another
+instance, name collisions and undeclared three-part references refuse by name.
+
+The typed preparation record distinguishes binding against the real database
+from a companion rendered from the catalog or the declaration. Tests assert
+that handoff directly. This changes no plan format or published schema;
+#2238 carries the record into sealed evidence when SQL Server reconstruction
+is delivered. The `runtime.same_instance` file-admission policy is not a
+placement observation and is never reused for this record. DEC-619.3's live
+marker and sandbox boundary are unchanged.
+
+The 2026-10-24 maintainer decision supersedes the private-table choice above
+for a readable declared view. Object-level VIEW DEFINITION is sufficient for
+its own catalog inputs; this path does not require database-wide capture
+privileges. Follow dm_sql_referenced_entities through every readable object.
+Rebuild tables from V4 facets, including computed expressions, identity,
+collation and rowversion; replay view definitions unchanged, recursively;
+reproduce INSTEAD OF verb presence. Compare output metadata and obtain any
+needed physical source grouping with describe_first_result_set in the
+companion, where the run owns the objects. An unreadable object is named in
+a partially-unverified limitation. Replay errors, metadata mismatches and
+unavailable physical lineage likewise retain their reason and fall back to a
+single source group. A fallback cannot leave a dependent declared root
+verified against the replaced shape. UNION lineage can stop at the view
+itself even with is_updateable=true; that is not a physical table group.
+
+Catalog reads on the target never include INSERT, UPDATE, DELETE or MERGE
+text, or NOEXEC, PARSEONLY or FMTONLY probes. DDL and trigger-presence templates
+run only in the owned companion sandboxes. Hidden base computation and
+hidden nested views made equal output metadata silently insufficient in
+measurement round 4; checking the whole closure makes those named
+limitations instead of claiming verification. Typed closed verification and
+limitation variants travel with the placement in Prepared. #2238 b4c carries
+them into ResolverRuntime::Scratch later; this slice adds no evidence field,
+plan format or Schema member. Apply's real-object transaction boundary and
+B1 comparison labels remain unchanged.
+
+V4's binding-relevant view index metadata is retained throughout the readable
+closure: index names, uniqueness, clustered/nonclustered kind, key order and
+direction, and included columns. Names are binding input to INDEX hints;
+schema binding alone cannot admit NOEXPAND without a unique clustered index.
+Read sys.indexes and sys.index_columns under object VIEW DEFINITION, create
+the unique clustered index first, and compare the complete readable view
+index set before recording verification. An unreadable name or key,
+unsupported reconstruction or differing set names the view and index in a
+typed limitation. A single-source fallback remains schema-bound and
+recreates readable indexes where possible. If that also fails, the index
+limitation retains its prior hidden-object or replay cause; a managed hint
+may fail rehearsal by name rather than acquire a false verified outcome.
+Apply's real-object binding remains DEC-2322.1. Class-7 INDEX references name
+their owning relation and follow that relation's visibility and rendering.
+
+An unchanged stored definition can still carry the old name after a rename.
+Replay each relation in a companion-only transaction and confirm that the
+expected relation exists before committing it. Otherwise roll back that DDL
+and retain the replay limitation before building the fallback. This keeps an
+unexpected CREATE name from leaving an untracked support view; the target
+still receives catalog reads only.
+
+Output-shape fallback materializes unsupported generated, hidden, sparse,
+column-set, graph and masked columns as ordinary columns, retaining their
+native output type, collation and nullability. Alias columns use their readable
+native base type, and incomplete identity metadata omits identity rather than
+guessing its specification. Strict replay still refuses unsupported facets;
+fallback retains that original replay limitation and never grants verification.
+Unreadable native types and unsafe collation names still refuse rendering.
