@@ -10608,6 +10608,33 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_bootstrap_shows_the_extracted_environment_label_once() {
+        let schema = Schema::default();
+        for (label, shown) in [
+            ("target\n\u{1b}[31m\u{202e}", r"target\n\u{1b}[31m\u{202e}"),
+            (
+                r"target\n\u{1b}[31m\u{202e}",
+                r"target\\n\\u{1b}[31m\\u{202e}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+            ("ordinary", "ordinary"),
+        ] {
+            let limitations = vec![r"type app.literal\n cannot be read".to_owned()];
+            let error =
+                refuse_nonempty_bootstrap(&schema, &limitations, &pbps_pg::Postgres::new(), label)
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(
+                error,
+                format!(
+                    "`{shown}` already has 1 of the declared object(s): type app.literal\\n cannot be read.\nBootstrap builds into an empty database; use `pbps plan --db` and `pbps apply` to migrate it instead."
+                )
+            );
+            refuse_nonempty_bootstrap(&schema, &[], &pbps_pg::Postgres::new(), label).unwrap();
+        }
+    }
+
+    #[test]
     fn bootstrap_admits_only_pg_cluster_roles_without_managed_grants() {
         let mut schema = Schema::default();
         let role: pbps_model::RoleName = "reader".into();

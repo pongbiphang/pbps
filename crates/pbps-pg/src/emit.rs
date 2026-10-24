@@ -3111,9 +3111,14 @@ name = pbps_model::escape::Escaped(&name),))
 
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
-        Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {
+        Change::RebuildPartitionedTable(_)
+        | Change::CopyTableRows(_)
+        | Change::AnalyzeTableTree(_) => {
             let (operation, table) = change.pending_rebuild().expect("explicit rebuild variant");
-            Err(DialectError::RebuildUnavailable { operation, table: table.clone() })
+            Err(DialectError::RebuildUnavailable {
+                operation,
+                table: table.clone(),
+            })
         }
 
         Change::DropPolicy { table, name, .. } => one(
@@ -3121,47 +3126,152 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             table,
             format!("DROP POLICY {} ON {};", quote(name)?, qualified(table)?),
         ),
-        Change::CreateType { uid, name, definition } => {
+        Change::CreateType {
+            uid,
+            name,
+            definition,
+        } => {
             let address = TableName::new(name.schema(), name.name());
             let sql = match definition.as_ref() {
-                pbps_model::ManagedType::Enum { values } => format!("CREATE TYPE {} AS ENUM ({});", qualified(&address)?, values.iter().map(|v| literal(v)).collect::<Vec<_>>().join(", ")),
-                pbps_model::ManagedType::Domain { base, not_null, default, checks, collation } => {
-                    let mut sql = format!("CREATE DOMAIN {} AS {}", qualified(&address)?, sql_type(base)?);
-                    if let Some(c) = collation { sql.push_str(&format!(" COLLATE {}.{}", quote(c.schema())?, quote(c.name())?)); }
-                    if let Some(text) = default { sql.push_str(&format!(" DEFAULT {}", verbatim(text))); }
-                    if *not_null { sql.push_str(" NOT NULL"); }
-                    for (constraint, text) in checks { sql.push_str(&format!(" CONSTRAINT {} CHECK ({})", quote(constraint.raw())?, verbatim(text))); }
-                    sql.push(';'); sql
+                pbps_model::ManagedType::Enum { values } => format!(
+                    "CREATE TYPE {} AS ENUM ({});",
+                    qualified(&address)?,
+                    values
+                        .iter()
+                        .map(|v| literal(v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                pbps_model::ManagedType::Domain {
+                    base,
+                    not_null,
+                    default,
+                    checks,
+                    collation,
+                } => {
+                    let mut sql = format!(
+                        "CREATE DOMAIN {} AS {}",
+                        qualified(&address)?,
+                        sql_type(base)?
+                    );
+                    if let Some(c) = collation {
+                        sql.push_str(&format!(
+                            " COLLATE {}.{}",
+                            quote(c.schema())?,
+                            quote(c.name())?
+                        ));
+                    }
+                    if let Some(text) = default {
+                        sql.push_str(&format!(" DEFAULT {}", verbatim(text)));
+                    }
+                    if *not_null {
+                        sql.push_str(" NOT NULL");
+                    }
+                    for (constraint, text) in checks {
+                        sql.push_str(&format!(
+                            " CONSTRAINT {} CHECK ({})",
+                            quote(constraint.raw())?,
+                            verbatim(text)
+                        ));
+                    }
+                    sql.push(';');
+                    sql
                 }
             };
             let mut statement = scoped(pg, name.schema(), &sql)?;
-            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: name.clone(), definition: Some((**definition).clone()) });
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: Some((**definition).clone()),
+            });
             Ok(vec![statement])
         }
-        Change::DropType { uid, name, definition } => {
-            let mut statement = scoped(pg, name.schema(), &format!("DROP {} {}.{};", if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) { "DOMAIN" } else { "TYPE" }, quote(name.schema())?, quote(name.name())?))?;
-            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: name.clone(), definition: None });
+        Change::DropType {
+            uid,
+            name,
+            definition,
+        } => {
+            let mut statement = scoped(
+                pg,
+                name.schema(),
+                &format!(
+                    "DROP {} {}.{};",
+                    if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) {
+                        "DOMAIN"
+                    } else {
+                        "TYPE"
+                    },
+                    quote(name.schema())?,
+                    quote(name.name())?
+                ),
+            )?;
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: name.clone(),
+                definition: None,
+            });
             Ok(vec![statement])
         }
 
-        Change::RenameType { uid, from, to, definition } => {
-            let kind = if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) { "DOMAIN" } else { "TYPE" };
+        Change::RenameType {
+            uid,
+            from,
+            to,
+            definition,
+        } => {
+            let kind = if matches!(definition.as_ref(), pbps_model::ManagedType::Domain { .. }) {
+                "DOMAIN"
+            } else {
+                "TYPE"
+            };
             let mut at = from.clone();
             let mut out = Vec::new();
             if from.schema() != to.schema() {
-                let mut statement = scoped(pg, at.schema(), &format!("ALTER {kind} {}.{} SET SCHEMA {};", quote(at.schema())?, quote(at.name())?, quote(to.schema())?))?;
-                at = pbps_model::TypeRef::new(to.schema(), from.name()).map_err(|e| invalid(e.to_string()))?;
-                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: at.clone(), definition: Some((**definition).clone()) });
+                let mut statement = scoped(
+                    pg,
+                    at.schema(),
+                    &format!(
+                        "ALTER {kind} {}.{} SET SCHEMA {};",
+                        quote(at.schema())?,
+                        quote(at.name())?,
+                        quote(to.schema())?
+                    ),
+                )?;
+                at = pbps_model::TypeRef::new(to.schema(), from.name())
+                    .map_err(|e| invalid(e.to_string()))?;
+                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                    uid: uid.clone(),
+                    name: at.clone(),
+                    definition: Some((**definition).clone()),
+                });
                 out.push(statement);
             }
             if at.name() != to.name() {
-                let mut statement = scoped(pg, at.schema(), &format!("ALTER {kind} {}.{} RENAME TO {};", quote(at.schema())?, quote(at.name())?, quote(to.name())?))?;
-                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement { uid: uid.clone(), name: to.clone(), definition: Some((**definition).clone()) });
+                let mut statement = scoped(
+                    pg,
+                    at.schema(),
+                    &format!(
+                        "ALTER {kind} {}.{} RENAME TO {};",
+                        quote(at.schema())?,
+                        quote(at.name())?,
+                        quote(to.name())?
+                    ),
+                )?;
+                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                    uid: uid.clone(),
+                    name: to.clone(),
+                    definition: Some((**definition).clone()),
+                });
                 out.push(statement);
             }
             Ok(out)
         }
-        Change::CreatePolicy { table, name, policy, .. } => {
+        Change::CreatePolicy {
+            table,
+            name,
+            policy,
+            ..
+        } => {
             let targets = match &policy.to {
                 pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
                 pbps_model::PolicyRoles::Roles(roles) => roles

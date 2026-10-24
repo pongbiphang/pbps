@@ -518,7 +518,9 @@ impl Unchecked {
         let description = match change {
             Change::RebuildPartitionedTable(_)
             | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => change.subject(),
+            | Change::AnalyzeTableTree(_) => {
+                pbps_model::escape::Escaped(&change.subject()).to_string()
+            }
             Change::AddCheck { table, name, .. } => {
                 format!(
                     "new check {name} on {table}",

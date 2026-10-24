@@ -1319,20 +1319,19 @@ pub fn describe(c: &Change) -> String {
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             let (operation, _) = c.pending_rebuild().expect("rebuild variant");
-            // Shared JSON description escapes as a whole until #2084 step 5.
             format!(
                 "pending blocking rewrite: {operation} for {} (unavailable)",
-                c.subject()
+                Escaped(&c.subject())
             )
         }
         Change::CreateType {
             name, definition, ..
-        } => format!("+ create {} {}", definition.kind(), name.raw()),
+        } => format!("+ create {} {}", definition.kind(), name.shown()),
         Change::DropType {
             name, definition, ..
-        } => format!("- drop {} {}", definition.kind(), name.raw()),
+        } => format!("- drop {} {}", definition.kind(), name.shown()),
         Change::RenameType { from, to, .. } => {
-            format!("~ rename type {} -> {}", from.raw(), to.raw())
+            format!("~ rename type {} -> {}", from.shown(), to.shown())
         }
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -2799,5 +2798,140 @@ mod tests {
             )
         );
         assert_ne!(describe(&change), Escaped(&describe(&change)).to_string());
+    }
+
+    #[test]
+    fn merged_type_lifecycle_descriptions_show_names_once_and_keep_raw_identities() {
+        use pbps_model::{Change, ManagedType, TypeRef};
+        for (name, shown) in [
+            (
+                "type\n\u{1b}[31m\u{202e}",
+                r#"app."type\n\u{1b}[31m\u{202e}""#,
+            ),
+            (
+                r"type\n\u{1b}[31m\u{202e}",
+                r#"app."type\\n\\u{1b}[31m\\u{202e}""#,
+            ),
+            ("名前_ünï", "app.\"名前_ünï\""),
+            ("ordinary", "app.ordinary"),
+        ] {
+            let from = TypeRef::new("app", name).unwrap();
+            for definition in [
+                ManagedType::Enum {
+                    values: vec!["ok".into()],
+                },
+                ManagedType::Domain {
+                    base: "integer".parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                },
+            ] {
+                let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
+                let to = TypeRef::new("other", name).unwrap();
+                let target_shown = shown.replacen("app.", "other.", 1);
+                for (change, expected, key) in [
+                    (
+                        Change::CreateType {
+                            uid: uid.clone(),
+                            name: from.clone(),
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("+ create {} {shown}", definition.kind()),
+                        "name",
+                    ),
+                    (
+                        Change::DropType {
+                            uid: uid.clone(),
+                            name: from.clone(),
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("- drop {} {shown}", definition.kind()),
+                        "name",
+                    ),
+                    (
+                        Change::RenameType {
+                            uid,
+                            from: from.clone(),
+                            to,
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("~ rename type {shown} -> {target_shown}"),
+                        "from",
+                    ),
+                ] {
+                    assert_eq!(super::describe(&change), expected);
+                    assert_eq!(
+                        serde_json::to_value(&change).unwrap()[key],
+                        serde_json::to_value(&from).unwrap()
+                    );
+                    assert_eq!(from.name(), name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_rebuild_descriptions_show_subjects_once_and_keep_raw_identities() {
+        use pbps_model::*;
+        for (name, shown) in [
+            ("table\n\u{1b}[31m\u{202e}", r"table\n\u{1b}[31m\u{202e}"),
+            (
+                r"table\n\u{1b}[31m\u{202e}",
+                r"table\\n\\u{1b}[31m\\u{202e}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+            ("ordinary", "ordinary"),
+        ] {
+            let table = TableName::new("app", name);
+            let relation = RebuildRelation {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: table.clone(),
+            };
+            let identities = RebuildIdentities {
+                tables: Default::default(),
+                columns: Default::default(),
+            };
+            for change in [
+                Change::RebuildPartitionedTable(Box::new(RebuildPartitionedTable {
+                    table: table.clone(),
+                    before: Default::default(),
+                    after: Default::default(),
+                    intent: Rebuild {
+                        source: identities.clone(),
+                        replacement: identities,
+                        target_checksum: "not an execution fixture".into(),
+                        max_rows: 0,
+                        allowed_at: "2026-10-24T00:00:00Z".into(),
+                        reason: "planned rewrite".parse().unwrap(),
+                        operator: "operator".into(),
+                    },
+                })),
+                Change::CopyTableRows(Box::new(CopyTableRows {
+                    source: relation.clone(),
+                    target: relation.clone(),
+                    columns: Vec::new(),
+                    source_partitions: Vec::new(),
+                    target_partitions: Vec::new(),
+                    max_rows: 0,
+                })),
+                Change::AnalyzeTableTree(Box::new(AnalyzeTableTree {
+                    parent: relation,
+                    partitions: Vec::new(),
+                })),
+            ] {
+                let (operation, _) = change.pending_rebuild().unwrap();
+                assert_eq!(
+                    super::describe(&change),
+                    format!("pending blocking rewrite: {operation} for app.{shown} (unavailable)")
+                );
+                let unchecked = pbps_dialect::Unchecked::for_change(&change, r"tool text \x");
+                assert_eq!(unchecked.description, format!("app.{shown}"));
+                assert_eq!(unchecked.reason, r"tool text \x");
+                assert_eq!(change.subject(), format!("app.{name}"));
+                assert_eq!(change.table(), Some(&table));
+            }
+        }
     }
 }
