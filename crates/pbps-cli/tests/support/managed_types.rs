@@ -2436,6 +2436,86 @@ fn enum_label_additions_preserve_all_positions_through_apply_pull_and_repull() {
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_applied_label_chains_keep_annotations_when_adding_labels_and_converge() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "label_chain_round1");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a','b')");
+        let d = Demo::new("label-chain-round1");
+        succeeds(d.run(&["pull", "--db", db, "--force"]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "adopt enum before label chain",
+        ]));
+        let file = d.dir.join("schema/app.e.type.yml");
+        std::fs::write(
+            &file,
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, {name: c, renamed_from: b}]\n",
+        )
+        .unwrap();
+        d.commit();
+        let path = d.dir.join("label-chain.plan.json");
+        let chain = label_plan(&d, db, &path);
+        assert_eq!(chain.changes.changes.len(), 2);
+        assert!(
+            chain
+                .changes
+                .changes
+                .iter()
+                .all(|step| matches!(step.change, pbps_model::Change::RenameEnumValue { .. }))
+        );
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "rename",
+        ]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+
+        // Keep both annotations: b now names the first label's final value,
+        // not a source that should be renamed to c again.
+        std::fs::write(
+            &file,
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, {name: c, renamed_from: b}, d]\n",
+        )
+        .unwrap();
+        d.commit();
+        let added = label_plan(&d, db, &path);
+        assert_eq!(added.changes.changes.len(), 1);
+        assert!(
+            matches!(&added.changes.changes[0].change, pbps_model::Change::AddEnumValue { value, .. } if value == "d")
+        );
+        succeeds(apply_plan(&d, db, &path, false));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["pull", "--db", db, "--force"]));
+        let pulled = pbps_load::load_schema_dir(&d.dir.join("schema"))
+            .unwrap()
+            .schema;
+        assert_eq!(
+            pulled.types[&"app.e".parse().unwrap()],
+            ManagedType::Enum {
+                values: vec!["b".into(), "c".into(), "d".into()]
+            }
+        );
+        d.commit();
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn enum_label_renames_keep_rows_checks_defaults_and_authored_provenance_without_rebuilds() {
     for server in [
         server(),
