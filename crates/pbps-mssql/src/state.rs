@@ -474,6 +474,29 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
     rows.first().map(entry_from_row).transpose()
 }
 
+/// A selected historical entry, or the newest when no id is supplied.
+/// This is a read: it never creates or migrates the ledger.
+pub async fn entry(
+    conn: &mut Conn,
+    id: Option<i64>,
+) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = match id {
+        Some(id) => {
+            conn.query_with(
+                "SELECT id, CONVERT(varchar(23), applied_at, 126) AS applied_at, state_json
+               FROM dbo.__pbps_state WHERE id = @P1;",
+                &[id.into()],
+            )
+            .await?
+        }
+        None => conn.query(SELECT_LATEST).await?,
+    };
+    rows.first().map(stored_entry_from_row).transpose()
+}
+
 /// The most recent `limit` entries, newest first.
 ///
 /// Every one of them has to be readable: a caller asking for entries wants the
@@ -843,22 +866,21 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 }
 
 fn entry_from_row(row: &pbps_db::Row) -> Result<LedgerEntry, LedgerError> {
-    let id: i64 = get(row, "id")?;
-    let state_json: &str = get(row, "state_json")?;
-    // `from_json`, not `from_str` then `check_version`: an entry written by an
-    // older pbps is refused by its version and the remedy that goes with it,
-    // rather than by whichever field of its older shape serde reached first.
-    let snapshot = StateSnapshot::from_json(state_json)
-        .map_err(|message| LedgerError::BadEntry { id, message })?;
-    Ok(LedgerEntry {
+    let stored = stored_entry_from_row(row)?;
+    let id = stored.id;
+    stored.read().map_err(|error| LedgerError::BadEntry {
         id,
-        // NULL is impossible: the column is NOT NULL with a default. Treating a
-        // surprise as an empty string would put a blank date on a status screen,
-        // so it is reported instead.
+        message: error.to_string(),
+    })
+}
+
+fn stored_entry_from_row(row: &pbps_db::Row) -> Result<pbps_db::ledger::StoredEntry, LedgerError> {
+    Ok(pbps_db::ledger::StoredEntry {
+        id: get(row, "id")?,
         applied_at: opt::<&str>(row, "applied_at")?
             .ok_or_else(|| DbError::BadRow("`applied_at` is unexpectedly NULL".into()))?
             .to_owned(),
-        snapshot,
+        state_json: get::<&str>(row, "state_json")?.to_owned(),
     })
 }
 

@@ -380,6 +380,12 @@ pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
 /// column holding real data. Rename intent is human input everywhere else in
 /// pbps (constraint 6), and drift is no exception.
 pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
+    observed_ids_reserving(live, recorded, &IdsFile::default())
+}
+
+/// Complete observed identities while reserving another historical record's
+/// UIDs too. Derivation must never manufacture a match to its recorded intent.
+pub fn observed_ids_reserving(live: &Schema, recorded: &IdsFile, reserved: &IdsFile) -> IdsFile {
     let tables_by_name: BTreeMap<&TableName, &Uid> =
         recorded.tables.iter().map(|(u, n)| (n, u)).collect();
     let columns_by_ref: BTreeMap<&ColumnRef, &Uid> =
@@ -397,6 +403,20 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
         .chain(recorded.roles.keys())
         .chain(recorded.types.keys())
         .chain(recorded.tombstones.keys())
+        .chain(reserved.tables.keys())
+        .chain(reserved.columns.keys())
+        .chain(reserved.roles.keys())
+        .chain(reserved.types.keys())
+        .chain(reserved.tombstones.keys())
+        .chain([recorded, reserved].into_iter().flat_map(|ids| {
+            ids.rebuilds.values().flat_map(|rebuild| {
+                rebuild
+                    .replacement
+                    .tables
+                    .keys()
+                    .chain(rebuild.replacement.columns.keys())
+            })
+        }))
         .cloned()
         .collect();
 

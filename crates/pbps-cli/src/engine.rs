@@ -261,6 +261,16 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
     }
 }
 
+pub async fn entry(
+    conn: &mut Conn,
+    id: Option<i64>,
+) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
+    match conn.driver() {
+        Driver::Mssql => pbps_mssql::state::entry(conn, id).await,
+        Driver::Postgres => pbps_pg::state::entry(conn, id).await,
+    }
+}
+
 pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>, LedgerError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::state::timeline(conn, limit).await,

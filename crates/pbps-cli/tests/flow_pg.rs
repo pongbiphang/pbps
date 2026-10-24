@@ -34357,3 +34357,213 @@ fn bootstrap_scripts_keep_the_guard_and_session_pin_bytes_from_before_certificat
         assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
     }
 }
+
+#[path = "support/state_history.rs"]
+mod state_history;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_round_trips_and_recovers_through_a_new_forward_plan() {
+    for server in [server(), old_server()] {
+        state_history::recovery(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_refusals_preserve_the_project_and_distinguish_ledger_states() {
+    for server in [server(), old_server()] {
+        state_history::refusals(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_requires_readable_snapshots_but_no_database_write_privileges() {
+    for server in [server(), old_server()] {
+        state_history::permissions(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {
+    for server in [server(), old_server()] {
+        state_history::hostile_names(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
+    for server in [server(), old_server()] {
+        state_history::identities(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids() {
+    for server in [server(), old_server()] {
+        state_history::retained_column_ids(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids() {
+    for server in [server(), old_server()] {
+        state_history::unrecorded_column_ids(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_unchanged_snapshots_and_baselines_do_not_restate_authored_sql() {
+    for server in [server(), old_server()] {
+        state_history::unchanged_sql(&server, true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
+    for server in [server(), old_server()] {
+        state_history::non_utf8_paths(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_matches_an_unrecorded_column_to_its_later_recorded_uid() {
+    for server in [server(), old_server()] {
+        state_history::acquired_column_ids(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit() {
+    for server in [server(), old_server()] {
+        state_history::public_execution_is_unknown(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn state_history_preserves_recorded_partition_move_limits_in_json_and_human_output() {
+    for server in [server(), old_server()] {
+        let own = OwnDatabase::new(&server, "history-moves2289");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("history-moves2289");
+        let path = d.dir.join("schema/app.events.yml");
+        let declaration = concat!(
+            "table: app.events\ncolumns:\n  id: {type: integer, nullable: false}\n",
+            "partition_by: [id]\npartitions:\n  ev_rest: default\n"
+        );
+        std::fs::write(&path, declaration).unwrap();
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        let first = scalar(connection, "SELECT max(id) FROM public.__pbps_state").to_string();
+        on_server(connection, "INSERT INTO app.events VALUES (5), (15)");
+        std::fs::write(
+            &path,
+            format!("{declaration}  ev_0_10: {{from: ['0'], to: ['10']}}\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan", "--no-dev"]));
+        succeeds(d.run(&[
+            "move-rows",
+            "app.ev_0_10",
+            "--max-rows",
+            "7",
+            "--reason",
+            "maintenance window",
+        ]));
+        d.commit();
+        let plan = d.dir.join("moves.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let second = scalar(connection, "SELECT max(id) FROM public.__pbps_state").to_string();
+        let snapshot = latest_snapshot(connection);
+        let partition: pbps_model::TableName = "app.ev_0_10".parse().unwrap();
+        let uid = snapshot.ids.table_uid(&partition).unwrap();
+        assert_eq!(
+            snapshot.ids.moves[uid].max_rows, 7,
+            "fixture did not record permission"
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM ONLY app.ev_0_10"),
+            1
+        );
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM ONLY app.ev_rest"),
+            1
+        );
+        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        let compare = |expected: Option<u64>| {
+            let ledger = text_of(
+                connection,
+                "SELECT string_agg(state_json::text, E'\\n' ORDER BY id) FROM public.__pbps_state",
+            );
+            let compared = json_output(succeeds(d.run(&[
+                "state", "diff", &first, &second, "--db", connection, "--format", "json",
+            ])));
+            let changes: pbps_model::ChangeSet =
+                serde_json::from_value(compared["data"]["changes"].clone()).unwrap();
+            let limit = changes.changes.iter().find_map(|p| {
+                if let pbps_model::Change::CreateTable {
+                    name,
+                    moves_at_most,
+                    ..
+                } = &p.change
+                    && name == &partition
+                {
+                    Some(*moves_at_most)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(limit, Some(expected), "{changes:?}");
+            let human = succeeds(d.run(&["state", "diff", &first, &second, "--db", connection]));
+            let human = stdout(&human);
+            assert_eq!(
+                human.contains("at most 7 as allowed"),
+                expected.is_some(),
+                "{human}"
+            );
+            assert_eq!(
+                human.contains("none allowed: the apply refuses any it holds"),
+                expected.is_none(),
+                "{human}"
+            );
+            assert_eq!(
+                text_of(
+                    connection,
+                    "SELECT string_agg(state_json::text, E'\\n' ORDER BY id) FROM public.__pbps_state"
+                ),
+                ledger
+            );
+            assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        };
+        compare(Some(7));
+        // Older records may lack move intent. Current project permission is
+        // never a substitute for what the selected historical record holds.
+        on_server(
+            connection,
+            &format!(
+                concat!(
+                    "UPDATE public.__pbps_state SET state_json = ",
+                    "(state_json::jsonb #- '{{ids,moves}}')::text WHERE id = {second}"
+                ),
+                second = second
+            ),
+        );
+        assert!(latest_snapshot(connection).ids.moves.is_empty());
+        compare(None);
+    }
+}

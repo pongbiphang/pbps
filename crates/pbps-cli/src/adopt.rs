@@ -506,6 +506,17 @@ pub(crate) fn write_declarations(
     schema: &Schema,
     public_execute: &pbps_model::PublicExecute,
 ) -> anyhow::Result<BTreeSet<PathBuf>> {
+    write_declarations_with_deps(dir, schema, public_execute, &Default::default())
+}
+
+/// Historical exports also retain the ordering annotations recorded beside
+/// the schema. Pull has no such annotations and continues to pass an empty map.
+pub(crate) fn write_declarations_with_deps(
+    dir: &Path,
+    schema: &Schema,
+    public_execute: &pbps_model::PublicExecute,
+    module_deps: &pbps_model::ModuleDeps,
+) -> anyhow::Result<BTreeSet<PathBuf>> {
     // Before the first file: two declarations whose names differ only in case
     // encode to filenames that differ only in case, and a filesystem that
     // ignores case would keep one of each — the second silently written over
@@ -543,7 +554,12 @@ pub(crate) fn write_declarations(
         let path = declaration_file::module_path(dir, id, module.kind)?;
         std::fs::write(
             &path,
-            pbps_load::render_module(id, module, &Default::default(), public_execute.contains(id)),
+            pbps_load::render_module(
+                id,
+                module,
+                module_deps.get(id).unwrap_or(&Default::default()),
+                public_execute.contains(id),
+            ),
         )
         .with_context(|| format!("cannot write `{}`", path.display()))?;
         written.insert(path);

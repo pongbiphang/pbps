@@ -34,6 +34,7 @@ mod report;
 mod resolution;
 mod row_security;
 mod saved_plan;
+mod state_history;
 mod state_list;
 mod status;
 #[cfg(test)]
@@ -565,7 +566,18 @@ impl Command {
             Command::State {
                 command: StateCommand::List { format, .. },
             } => ("state list", *format),
-            Command::State { .. } => return None,
+            Command::State {
+                command: StateCommand::Show { format, .. },
+            } => ("state show", *format),
+            Command::State {
+                command: StateCommand::Diff { format, .. },
+            } => ("state diff", *format),
+            Command::State {
+                command: StateCommand::Export { format, .. },
+            } => ("state export", *format),
+            Command::State {
+                command: StateCommand::Prune { .. },
+            } => return None,
         };
         (format == OutputFormat::Json).then_some(name)
     }
@@ -677,6 +689,39 @@ enum StateCommand {
         limit: u32,
 
         /// text (default) or json
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+
+    /// Show the full snapshot and metadata recorded by one ledger entry
+    Show {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        id: i64,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Compare two recorded states; the destination defaults to the newest entry
+    Diff {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        from: i64,
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        to: Option<i64>,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[arg(long, default_value = "human")]
+        format: OutputFormat,
+    },
+    /// Write historical declarations for review and a new forward plan
+    Export {
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
+        id: i64,
+        #[command(flatten)]
+        target: TargetArgs,
+        /// Replace existing declarations, including removing stale declaration files
+        #[arg(long)]
+        force: bool,
         #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
@@ -1311,6 +1356,46 @@ fn run() -> anyhow::Result<()> {
                     target.resolve(&project),
                 )?;
                 state_list::cmd_state_list(&target, limit, json)
+            }
+            StateCommand::Show { id, target, format } => {
+                let json = format == OutputFormat::Json;
+                let target = output::or_unanswerable(
+                    "state show",
+                    json,
+                    "environment.unresolved",
+                    target.resolve(&project),
+                )?;
+                state_history::cmd_show(&target, id, json)
+            }
+            StateCommand::Diff {
+                from,
+                to,
+                target,
+                format,
+            } => {
+                let json = format == OutputFormat::Json;
+                let target = output::or_unanswerable(
+                    "state diff",
+                    json,
+                    "environment.unresolved",
+                    target.resolve(&project),
+                )?;
+                state_history::cmd_diff(&project, &target, from, to, json)
+            }
+            StateCommand::Export {
+                id,
+                target,
+                force,
+                format,
+            } => {
+                let json = format == OutputFormat::Json;
+                let target = output::or_unanswerable(
+                    "state export",
+                    json,
+                    "environment.unresolved",
+                    target.resolve(&project),
+                )?;
+                state_history::cmd_export(&project, &target, id, force, json)
             }
             StateCommand::Prune { target, keep } => {
                 let target = target.resolve(&project)?;

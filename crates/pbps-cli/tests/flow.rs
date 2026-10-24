@@ -23117,3 +23117,87 @@ fn a_sql_server_project_refuses_a_declared_type_by_name() {
     let output = d.run(&["validate"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
 }
+
+#[path = "support/state_history.rs"]
+mod state_history;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_round_trips_and_recovers_through_a_new_forward_plan() {
+    state_history::recovery(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_refusals_preserve_the_project_and_distinguish_ledger_states() {
+    state_history::refusals(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_requires_readable_snapshots_but_no_database_write_privileges() {
+    state_history::permissions(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_keeps_raw_names_in_declarations_and_json_and_shows_them_once() {
+    state_history::hostile_names(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+fn state_history_setup_failures_keep_the_single_json_envelope() {
+    let d = Demo::new("history-setup2289");
+    std::fs::remove_file(d.dir.join("pbps.yml")).unwrap();
+    for command in ["show", "diff", "export"] {
+        let out = d.run(&["state", command, "1", "--format", "json"]);
+        assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["command"], format!("state {command}"));
+        assert_eq!(report["result"], "unanswerable");
+        assert!(report.get("data").is_none());
+    }
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_uses_recorded_uids_and_preserves_later_rename_intent() {
+    state_history::identities(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_reads_baseline_and_forced_snapshots_with_retained_dropped_column_ids() {
+    state_history::retained_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_diffs_baseline_and_forced_snapshot_columns_without_recorded_uids() {
+    state_history::unrecorded_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_unchanged_snapshots_and_baselines_do_not_restate_authored_sql() {
+    state_history::unchanged_sql(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_export_json_reports_non_utf8_project_and_stale_paths() {
+    state_history::non_utf8_paths(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_matches_an_unrecorded_column_to_its_later_recorded_uid() {
+    state_history::acquired_column_ids(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit() {
+    state_history::public_execution_is_unknown(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

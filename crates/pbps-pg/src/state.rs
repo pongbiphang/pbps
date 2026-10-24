@@ -1346,6 +1346,31 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
     rows.first().map(entry_from_row).transpose()
 }
 
+/// A selected historical entry, or the newest when no id is supplied.
+/// This is a read: it never creates or migrates the ledger.
+pub async fn entry(
+    conn: &mut Conn,
+    id: Option<i64>,
+) -> Result<Option<pbps_db::ledger::StoredEntry>, LedgerError> {
+    if !is_initialized(conn).await? {
+        return Err(LedgerError::NotInitialized);
+    }
+    let rows = match id {
+        Some(id) => {
+            conn.query_with(
+                &format!(
+                    "SELECT id, {}, state_json FROM ONLY {STATE_TABLE} WHERE id = $1",
+                    rendered("applied_at")
+                ),
+                &[id.into()],
+            )
+            .await?
+        }
+        None => conn.query(&select_latest()).await?,
+    };
+    rows.first().map(stored_entry_from_row).transpose()
+}
+
 /// The most recent `limit` entries, newest first.
 ///
 /// Every one of them has to be readable: a caller asking for entries wants the
@@ -1769,18 +1794,19 @@ pub async fn lock_holder(conn: &mut Conn) -> Result<Option<LockInfo>, DbError> {
 }
 
 fn entry_from_row(row: &Row) -> Result<LedgerEntry, LedgerError> {
-    let id: i64 = number(row, "id")?;
-    let state_json = text(row, "state_json")?;
-    // `from_json`, not `from_str` then `check_version`: an entry written by an
-    // older pbps is refused by its version and the remedy that goes with it,
-    // rather than by whichever field of its older shape serde reached first.
-    // This is the reader #74 added, and there is no second path to it.
-    let snapshot = StateSnapshot::from_json(&state_json)
-        .map_err(|message| LedgerError::BadEntry { id, message })?;
-    Ok(LedgerEntry {
+    let stored = stored_entry_from_row(row)?;
+    let id = stored.id;
+    stored.read().map_err(|error| LedgerError::BadEntry {
         id,
+        message: error.to_string(),
+    })
+}
+
+fn stored_entry_from_row(row: &Row) -> Result<pbps_db::ledger::StoredEntry, LedgerError> {
+    Ok(pbps_db::ledger::StoredEntry {
+        id: number(row, "id")?,
         applied_at: text(row, "applied_at")?,
-        snapshot,
+        state_json: text(row, "state_json")?,
     })
 }
 

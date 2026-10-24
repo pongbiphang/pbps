@@ -61,6 +61,27 @@ pub struct LedgerEntry {
     pub snapshot: StateSnapshot,
 }
 
+/// One selected ledger row before its versioned snapshot has been decoded.
+///
+/// Historical readers must distinguish an unsupported version from damaged
+/// JSON. `latest` keeps its existing flattened error, while `state show`,
+/// `diff` and `export` retain the typed reason from `StateSnapshot::read_json`.
+pub struct StoredEntry {
+    pub id: i64,
+    pub applied_at: String,
+    pub state_json: String,
+}
+
+impl StoredEntry {
+    pub fn read(self) -> Result<LedgerEntry, pbps_model::Unreadable> {
+        Ok(LedgerEntry {
+            id: self.id,
+            applied_at: self.applied_at,
+            snapshot: StateSnapshot::read_json(&self.state_json)?,
+        })
+    }
+}
+
 /// One ledger row as a *timeline* reads it: the projected columns always, and
 /// the recorded state only if this build can read it.
 ///
