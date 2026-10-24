@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::ModuleDeps;
 use pbps_model::operation::{
-    Effects, Incarnation, ObjectKey, Operation, OperationId, Requirement, Resource,
+    Effects, Incarnation, ObjectKey, Operation, OperationId, Recorded, Requirement, Resource,
 };
 
 use super::edges::{Baseline, Checks, Edge, Source, graph};
@@ -40,10 +40,12 @@ pub enum Violation {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct Standing {
     base: bool,
     plan: bool,
+    base_target: Option<Recorded>,
+    plan_target: Option<Recorded>,
 }
 
 /// Replays `operations` in the order given and refuses it where a
@@ -104,45 +106,62 @@ pub(crate) fn verify_with(
         Standing {
             base: base == Some(true),
             plan,
+            base_target: baseline.bound_target(key).cloned(),
+            plan_target: plan.then(|| baseline.bound_target(key).cloned()).flatten(),
         }
     };
     for (operation, fx) in operations.iter().zip(effects) {
         for requirement in &fx.requires {
             let key = requirement.key();
-            let now = *replay.entry(key.clone()).or_insert_with(|| start(key));
+            let now = replay
+                .entry(key.clone())
+                .or_insert_with(|| start(key))
+                .clone();
             let unknown = held(key).is_none();
-            let present = |s: Standing| s.base || s.plan;
+            let present = |s: &Standing| s.base || s.plan;
             let ok = match requirement {
-                Requirement::Exists(_) => present(now) || unknown,
+                Requirement::Exists(_) => present(&now) || unknown,
                 Requirement::Is(_, Incarnation::Base) => {
                     if checks.incarnations {
                         now.base || unknown
                     } else {
-                        present(now) || unknown
+                        present(&now) || unknown
                     }
                 }
                 Requirement::Is(_, Incarnation::Final) => {
                     if checks.incarnations {
                         now.plan || unknown
                     } else {
-                        present(now) || unknown
+                        present(&now) || unknown
                     }
                 }
                 Requirement::Bound(_, bound) => {
                     let input = replay
                         .entry(bound.input.clone())
                         .or_insert_with(|| start(&bound.input));
-                    let input = *input;
+                    let input = input.clone();
                     match bound.incarnation {
                         Incarnation::Base if checks.incarnations => input.base,
                         Incarnation::Final if checks.incarnations => input.plan,
-                        Incarnation::Base | Incarnation::Final => present(input),
+                        Incarnation::Base | Incarnation::Final => present(&input),
                     }
                 }
                 // Ordering requirements are checked below against the whole graph.
                 Requirement::Reads(_) | Requirement::BeforeRewrite(_) => true,
+                Requirement::NotBoundTo { target, .. } => {
+                    let still_bound = unknown
+                        || (now.base && now.base_target.as_ref().is_none_or(|t| t == target))
+                        || (now.plan && now.plan_target.as_ref().is_none_or(|t| t == target));
+                    if still_bound {
+                        out.push(Violation::StillPresent {
+                            operation: operation.id(),
+                            key: key.clone(),
+                        });
+                    }
+                    true
+                }
                 Requirement::Absent(_) => {
-                    if present(now) {
+                    if present(&now) {
                         out.push(Violation::StillPresent {
                             operation: operation.id(),
                             key: key.clone(),
@@ -181,6 +200,7 @@ pub(crate) fn verify_with(
             if let Resource::Object(key, _) = resource {
                 let s = replay.entry(key.clone()).or_insert_with(|| start(key));
                 s.plan = true;
+                s.plan_target = fx.bound_target(key, Incarnation::Final).cloned();
             }
         }
     }

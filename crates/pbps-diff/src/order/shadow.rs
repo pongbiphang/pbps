@@ -268,7 +268,9 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
     let unprovided = |operation: OperationId, requirement: &Requirement| {
         report.graph.unmet.iter().any(|u| {
             ops.get(u.operation).is_some_and(|o| o.id() == operation)
-                && &u.requirement == requirement
+                && (&u.requirement == requirement
+                    || matches!((&u.requirement, requirement),
+                        (Requirement::NotBoundTo { surface, .. }, Requirement::Absent(key)) if surface == key))
         })
     };
     // A function a computed column calls is moved by the connected pass

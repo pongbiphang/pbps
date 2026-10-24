@@ -4976,3 +4976,6 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
     assert!(graph.unmet.is_empty());
     assert_eq!(verify(ops.as_slice(), &fx, &base, &declared), []);
 }
+
+#[path = "retirement_tests.rs"]
+mod retirement;
