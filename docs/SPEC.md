@@ -1565,6 +1565,17 @@ CREATE TABLE dbo.__pbps_lock (
 );
 ```
 
+**Operator provenance (DEC-2330.1):** CLI commands that create ledger entries
+or identity intent take the operator from `PBPS_OPERATOR` when set. It must
+contain a non-whitespace character, and meaningful text is preserved verbatim
+before the ledger's existing storage bounds. A set but blank or whitespace-only
+value is a usage error (exit 2), refused by variable name before project, file
+or connection I/O; it never falls back to the runner's identity. When unset,
+the existing order remains git `user.name` (trimmed and nonempty), then `$USER`,
+then `unknown`. This is audit attribution, not deployment approval or permission
+to supply rename/drop intent. CI examples set it from the deploying actor
+([CI guide](CI.md)). Historical operator text remains readable unchanged.
+
 **Resolver evidence in the ledger (§9.3.2):** a resolver plan's fingerprints are
 HMAC-SHA256 under the target environment's fingerprint key (DEC-952.1). Without
 the key they test no guess of the literals they cover, and neither do the
@@ -1698,7 +1709,7 @@ or authorizing their modification.
 |---|---|---|
 | Accept reality: fold the manual change back into the declarations | `pbps pull --table X`, then merge by hand | The manual change was right and should be kept |
 | Restore the declarations: change the database back | Fix, then run `plan` / `apply` normally | The manual change was a mistake |
-| Rebaseline: do not pursue the difference, take the current state as the new starting point | `pbps baseline --reason ... --operator ...` | A DBA has already dealt with it under a specific approval |
+| Rebaseline: do not pursue the difference, take the current state as the new starting point | `PBPS_OPERATOR=... pbps baseline --reason ...` | A DBA has already dealt with it under a specific approval |
 
 `baseline` queries the database, writes a new `state_json`, and records the
 reason, operator and timestamp in the ledger. Its human `--reason` uses the
@@ -1795,7 +1806,7 @@ full state.
 | `pbps verify` | The drift check: the live database against `__pbps_state`. `--format json` emits the typed drift diff, and found drift fires the `on_drift` hook (see 9.4) |
 | `pbps apply --plan plan.json --checksum ... --allow ...` | Apply exactly the plan checksum approved at the deployment gate. `--staged` runs a staged plan statement by statement outside a transaction, recording each completion; `--staged --resume` continues one that stopped |
 | `pbps snapshot` | Query the database and write a new `__pbps_state` |
-| `pbps baseline --reason --operator` | Reset the state baseline |
+| `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state list` | This environment's history, newest first |
 | `pbps state show <id>` | Read an entry's full schema snapshot and metadata; `--format json` uses the findings envelope |

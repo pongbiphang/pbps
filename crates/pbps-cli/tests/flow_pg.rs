@@ -828,6 +828,32 @@ fn identity_batches_keep_annotation_provenance_and_single_edit_workflows() {
     batch_intent::annotations_and_single_edits("postgres");
 }
 
+#[path = "support/audit_operators.rs"]
+mod audit_operators;
+
+#[test]
+fn explicit_operators_are_recorded_verbatim_in_new_audit_intent() {
+    audit_operators::explicit("postgres");
+}
+
+#[test]
+fn unset_operators_keep_git_then_user_attribution() {
+    audit_operators::unset("postgres");
+}
+
+#[test]
+fn blank_operators_refuse_before_project_or_connection_io() {
+    audit_operators::before_io("postgres");
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn ci_operators_are_recorded_and_blank_overrides_leave_the_ledger_unchanged() {
+    let own = OwnDatabase::new(&server(), "operator2330");
+    on_server(own.connection(), "CREATE SCHEMA app");
+    audit_operators::connected("postgres", own.connection());
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 
