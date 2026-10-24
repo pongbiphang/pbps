@@ -949,3 +949,82 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
 
 #[path = "rebuild_live.rs"]
 mod execution;
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn references_sort_what_a_stored_default_binds_and_what_the_facts_cannot_hold() {
+    use pbps_model::operation::Snapshot;
+    use pbps_pg::modules::dependencies::references;
+    let mut db = TestDb::create("references2296").await;
+    db.conn
+        .execute(
+            "CREATE SCHEMA app;
+        CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+        CREATE TABLE app.other(id integer);
+        CREATE SEQUENCE app.free;
+        CREATE TABLE app.parent(k integer NOT NULL, a integer DEFAULT 7, b integer DEFAULT app.f(1),
+          c serial, e regclass DEFAULT 'app.other'::regclass, f integer DEFAULT nextval('app.free'),
+          g integer GENERATED ALWAYS AS (a * 2) STORED)",
+        )
+        .await
+        .unwrap();
+    let version = db
+        .conn
+        .query("SELECT current_setting('server_version_num')::int AS version")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("version")
+        .unwrap()
+        .unwrap();
+    let schema = Schema::default();
+    let ids = ids();
+    let before = Snapshot {
+        schema: &schema,
+        ids: &ids,
+    };
+    let tables = [ids.tables.keys().next().unwrap().clone()].into();
+    // The read is the caller's transaction's, or it is refused.
+    assert!(references(&mut db.conn, before, &tables).await.is_err());
+    db.conn.execute("BEGIN").await.unwrap();
+    let found = references(&mut db.conn, before, &tables).await;
+    let missing = references(&mut db.conn, before, &["t_bbbbbb".parse().unwrap()].into()).await;
+    db.conn.execute("ROLLBACK").await.unwrap();
+    db.drop().await;
+    assert!(
+        missing.is_err(),
+        "a table the baseline does not name is not empty"
+    );
+    let found = found.unwrap();
+    let at = |name: &str| {
+        &found.columns[&"app.parent"
+            .parse::<pbps_model::TableName>()
+            .unwrap()
+            .column(name)]
+    };
+    let routine = ModuleId::Routine(pbps_model::RoutineId::new(
+        pbps_model::ObjectName::new("app", "f"),
+        vec!["integer".parse().unwrap()],
+    ));
+    assert_eq!(at("a").default.as_deref(), Some("7"));
+    assert!(at("a").routines.is_empty() && !at("a").unrepresented);
+    assert_eq!(at("b").routines, [routine].into());
+    assert!(!at("b").unrepresented);
+    assert_eq!(
+        at("c").sequences,
+        ["app.parent.c".parse().unwrap()].into(),
+        "a serial's sequence is owned by its column"
+    );
+    assert!(!at("c").unrepresented);
+    assert!(
+        at("e").unrepresented,
+        "a relation is not a representable binding"
+    );
+    assert!(
+        at("f").unrepresented,
+        "a sequence nobody owns is not representable"
+    );
+    assert!(!at("g").unrepresented && at("g").default.is_some());
+    assert_eq!(at("k").default, None);
+    assert_eq!(at("k").local_not_null, version >= 180000);
+    assert!(!at("a").local_not_null);
+}
