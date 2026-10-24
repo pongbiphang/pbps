@@ -14,6 +14,23 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_NAMES = {
+    "PBPS_TEST_MSSQL_NAME": "pbps-test-mssql",
+    "PBPS_TEST_MSSQL_EXPRESS_NAME": "pbps-test-mssql-express",
+    "PBPS_TEST_MSSQL_SCRATCH_NAME": "pbps-test-mssql-scratch",
+    "PBPS_TEST_PG_NAME": "pbps-test-pg",
+    "PBPS_TEST_PG_OLD_NAME": "pbps-test-pg16",
+    "PBPS_TEST_PG_SCRATCH_NAME": "pbps-test-pg-scratch",
+}
+
+
+def fixture_environment(**overrides):
+    # Host-local lane settings must not turn default-name regressions into
+    # custom-name runs or silently change the endpoints asserted below.
+    env = {key: value for key, value in os.environ.items()
+           if key != "NAME" and not key.startswith("PBPS_TEST_")}
+    env.update(overrides)
+    return env
 
 
 def job_commands(workflow, job):
@@ -30,6 +47,164 @@ def job_commands(workflow, job):
 
 
 class LiveExecution(unittest.TestCase):
+    def test_fixture_names_default_when_unset_or_empty(self):
+        for runner in ("mssql", "pg", "resolver"):
+            for empty in (False, True):
+                with self.subTest(runner=runner, empty=empty):
+                    overrides = dict.fromkeys(FIXTURE_NAMES, "") if empty else {}
+                    result, calls, _ = self.named_fixture_script(runner, overrides)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.started_names(calls), self.fixture_names(runner))
+
+    def test_custom_names_reach_every_fixture_consumer_without_changing_test_commands(self):
+        overrides = {key: "lane." + value + ".fixture" for key, value in FIXTURE_NAMES.items()}
+        ports = {"PBPS_TEST_PORT": "25330", "PBPS_TEST_EXPRESS_PORT": "25331",
+                 "PBPS_TEST_MSSQL_SCRATCH_PORT": "25332", "PBPS_TEST_PG_PORT": "55320",
+                 "PBPS_TEST_PG_OLD_PORT": "55321", "PBPS_TEST_PG_SCRATCH_PORT": "55322"}
+        for runner in ("mssql", "pg", "resolver"):
+            with self.subTest(runner=runner):
+                result, calls, environments = self.named_fixture_script(runner, overrides | ports)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = self.fixture_names(runner, "lane.", ".fixture")
+                self.assertEqual(self.started_names(calls), expected)
+                self.assertEqual({c[2] for c in calls if c[:2] == ["docker", "exec"]},
+                                 set(expected))
+                validators = [c for c in calls if c[:2] == ["python3", "scripts/check-live-fixture.py"]]
+                checked = [c[c.index("--container") + 1] for c in validators]
+                self.assertEqual(checked, expected if runner != "mssql" else
+                                 [expected[0], expected[1], expected[0], expected[2]])
+                for call in validators:
+                    name = call[call.index("--container") + 1]
+                    key = next(key for key, value in overrides.items() if value == name)
+                    port_key = {"PBPS_TEST_MSSQL_NAME": "PBPS_TEST_PORT",
+                                "PBPS_TEST_MSSQL_EXPRESS_NAME": "PBPS_TEST_EXPRESS_PORT"}.get(
+                                    key, key.removesuffix("_NAME") + "_PORT")
+                    self.assertEqual(call[call.index("--port") + 1], ports[port_key])
+                if runner == "pg":
+                    installs = [c[2] for c in calls if c[:2] == ["docker", "exec"]
+                                and "partman" in " ".join(c)]
+                    self.assertCountEqual(installs, expected[:2])
+                    self.assertTrue(environments)
+                    for env in environments:
+                        self.assertEqual(env["PBPS_TEST_PG_CONTAINER"], expected[0])
+                        self.assertEqual(env["PBPS_TEST_PG_OLD_CONTAINER"], expected[1])
+                baseline, default_calls, _ = self.named_fixture_script(runner)
+                self.assertEqual(baseline.returncode, 0, baseline.stderr)
+                clients = lambda commands: [c for c in commands if c[0] == "cargo"
+                                           or c[:2] == ["python3", "scripts/live-transport.py"]]
+                self.assertEqual(clients(calls), clients(default_calls))
+                self.assertTrue(all(c[-2:] == ["--exact", "fixture case"]
+                                    for c in calls if c[0] == "cargo"))
+
+    def test_dotted_names_reuse_only_exact_existing_containers(self):
+        overrides = {key: "lane." + value + ".fixture" for key, value in FIXTURE_NAMES.items()}
+        for runner in ("mssql", "pg", "resolver"):
+            expected = self.fixture_names(runner, "lane.", ".fixture")
+            for exact in (False, True):
+                with self.subTest(runner=runner, exact=exact):
+                    # The regex-like neighbour is a valid container name too.
+                    existing = expected if exact else [name.replace(".", "X") for name in expected]
+                    result, calls, _ = self.named_fixture_script(runner, overrides, existing)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.started_names(calls), [] if exact else expected)
+                    self.assertFalse(any(c[:2] == ["docker", "rm"] for c in calls))
+
+    def test_mssql_scratch_defaults_to_the_resolved_primary_name(self):
+        for runner in ("mssql", "resolver"):
+            with self.subTest(runner=runner):
+                result, calls, _ = self.named_fixture_script(
+                    runner, {"PBPS_TEST_MSSQL_NAME": "lane.primary"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = ["lane.primary", "lane.primary-scratch"]
+                if runner == "mssql":
+                    expected.insert(1, "pbps-test-mssql-express")
+                self.assertEqual(self.started_names(calls), expected)
+
+    def test_resolver_inherited_primary_precedes_the_name_override(self):
+        result, calls, _ = self.named_fixture_script(
+            "resolver", {"NAME": "caller.primary", "PBPS_TEST_MSSQL_NAME": "other.primary",
+                         "PBPS_TEST_MSSQL_SCRATCH_NAME": "explicit.scratch"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.started_names(calls), ["caller.primary", "explicit.scratch"])
+
+    def test_custom_fixture_failures_log_the_selected_name_and_preserve_it(self):
+        cases = [("mssql", "PBPS_TEST_MSSQL_EXPRESS_NAME"),
+                 ("pg", "PBPS_TEST_PG_NAME"), ("pg", "PBPS_TEST_PG_OLD_NAME"),
+                 ("pg", "PBPS_TEST_PG_SCRATCH_NAME"),
+                 ("resolver", "PBPS_TEST_MSSQL_NAME"),
+                 ("resolver", "PBPS_TEST_MSSQL_SCRATCH_NAME")]
+        for runner, key in cases:
+            with self.subTest(runner=runner, key=key):
+                result, calls, _ = self.named_fixture_script(
+                    runner, {key: "lane.failed"}, failing="lane.failed")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(["docker", "logs", "lane.failed"], calls)
+                self.assertFalse(any(c[0] == "cargo" or c[:2] == ["docker", "rm"] for c in calls))
+
+    @staticmethod
+    def fixture_names(runner, prefix="", suffix=""):
+        keys = list(FIXTURE_NAMES)
+        selected = keys[3:] if runner == "pg" else keys[:3]
+        if runner == "resolver":
+            selected = [keys[0], keys[2]]
+        return [prefix + FIXTURE_NAMES[key] + suffix for key in selected]
+
+    @staticmethod
+    def started_names(calls):
+        return [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
+
+    def named_fixture_script(self, runner, overrides=None, existing=(), failing=""):
+        # Exercise the real scripts, including the sourced helper. Every Docker,
+        # checker, transport and cargo invocation is intercepted before execution.
+        with tempfile.TemporaryDirectory(prefix="pbps-fixture-names-") as directory:
+            root = Path(directory)
+            fake = root / "client"
+            fake.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["PBPS_NAMES_CONTROL"])
+command = [Path(sys.argv[0]).name, *sys.argv[1:]]
+record = {"command": command}
+if command[0] == "cargo":
+    record["environment"] = {key: os.environ.get(key) for key in
+                             ("PBPS_TEST_PG_CONTAINER", "PBPS_TEST_PG_OLD_CONTAINER")}
+with (root / "calls").open("a") as log:
+    log.write(json.dumps(record) + "\n")
+if command[:2] == ["docker", "ps"]:
+    print(os.environ["PBPS_NAMES_EXISTING"])
+    if (root / "started").exists():
+        print((root / "started").read_text())
+elif command[:2] == ["docker", "run"]:
+    with (root / "started").open("a") as started:
+        started.write(command[command.index("--name") + 1] + "\n")
+elif command[:2] == ["docker", "exec"]:
+    if command[2] == os.environ["PBPS_NAMES_FAILING"]:
+        sys.exit(1)
+    if "SELECT CONVERT" in command[-1]:
+        print("SQL_Latin1_General_CP1_CI_AS")
+elif command[:2] == ["docker", "logs"]:
+    print("controlled fixture not ready", file=sys.stderr)
+elif command[0] not in ("cargo", "python3", "sleep"):
+    raise RuntimeError("Unexpected external command: " + repr(command))
+''')
+            fake.chmod(0o755)
+            for client in ("docker", "cargo", "python3", "sleep"):
+                (root / client).symlink_to(fake)
+            env = fixture_environment(
+                PATH=str(root) + os.pathsep + os.environ["PATH"],
+                PBPS_NAMES_CONTROL=str(root), PBPS_NAMES_EXISTING="\n".join(existing),
+                PBPS_NAMES_FAILING=failing)
+            env.update(overrides or {})
+            command = (["bash", "-c", "source scripts/resolver-mssql-fixtures.sh"]
+                       if runner == "resolver" else
+                       ["bash", "scripts/live-tests" + ("-pg" if runner == "pg" else "") + ".sh",
+                        "--exact", "fixture case"])
+            result = subprocess.run(command, cwd=ROOT, env=env, text=True,
+                                    capture_output=True, timeout=30)
+            records = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            return result, [r["command"] for r in records], [r["environment"] for r in records
+                                                            if "environment" in r]
+
     def test_resolver_fixtures_inherit_the_primary_name_and_reuse_exact_matches(self):
         for primary in (None, "pbps2236.fixture"):
             for reuse in (False, True):
@@ -59,7 +234,7 @@ elif command[:2] != ["docker", "run"] and command[0] != "python3":
                         fake.chmod(0o755)
                         for client in ("docker", "python3"):
                             (root / client).symlink_to(fake)
-                        env = dict(os.environ,
+                        env = fixture_environment(
                                    PATH=str(root) + os.pathsep + os.environ["PATH"],
                                    PBPS_FIXTURE_CONTROL=str(root),
                                    PBPS_FIXTURE_EXISTING=existing)
@@ -149,7 +324,7 @@ elif command[0] != 'sleep':
             fake.chmod(0o755)
             for name in ('docker', 'cargo', 'python3', 'sleep'):
                 (root / name).symlink_to(fake)
-            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+            env = fixture_environment(PATH=str(root) + os.pathsep + os.environ['PATH'],
                        PBPS_COLLATION_CONTROL=str(root), PBPS_COLLATION_MODE=mode,
                        IMAGE='owned-image')
             if runner == 'ci':
@@ -281,7 +456,7 @@ elif command[0] not in ("cargo", "python3", "sleep"):
             fake.chmod(0o755)
             for name in ("docker", "cargo", "python3", "sleep"):
                 (root / name).symlink_to(fake)
-            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+            env = fixture_environment(PATH=str(root) + os.pathsep + os.environ["PATH"],
                        PBPS_ADMISSION_CONTROL=str(root), PBPS_ADMISSION_MODE=mode)
             result = subprocess.run(["bash", "scripts/live-tests-pg.sh"], cwd=ROOT,
                                     env=env, text=True, capture_output=True, timeout=30)

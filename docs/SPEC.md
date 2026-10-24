@@ -3455,6 +3455,13 @@ dialect to test: on its first connection to a real server it found that the seam
 no process default to choose between them — which building, linting and
 `cargo deny` all reported as green (DECISIONS 228).
 
+Local fixture names are overridable with `PBPS_TEST_MSSQL_NAME`,
+`PBPS_TEST_MSSQL_EXPRESS_NAME`, `PBPS_TEST_MSSQL_SCRATCH_NAME`,
+`PBPS_TEST_PG_NAME`, `PBPS_TEST_PG_OLD_NAME` and `PBPS_TEST_PG_SCRATCH_NAME`.
+Unset or empty overrides retain the defaults; the SQL Server scratch name
+defaults to the resolved primary name plus `-scratch`. Supply distinct names
+and the existing port overrides for separate fixture sets on a shared host.
+
 The accepted resolver extension has additional, **not yet implemented**
 acceptance tests in [ADR-0016](ADR-0016-engine-assisted-planning.md#acceptance-tests).
 They must demonstrate correct binding decisions, refusal on missing evidence,

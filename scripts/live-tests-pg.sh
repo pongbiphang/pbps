@@ -6,10 +6,12 @@
 # dialect should not have to start the other engine to run its tests.
 #
 # The containers are left running afterwards so re-runs are instant; remove them
-# with: docker rm -f pbps-test-pg pbps-test-pg16 pbps-test-pg-scratch
+# with: docker rm -f "${PBPS_TEST_PG_NAME:-pbps-test-pg}" \
+#   "${PBPS_TEST_PG_OLD_NAME:-pbps-test-pg16}" \
+#   "${PBPS_TEST_PG_SCRATCH_NAME:-pbps-test-pg-scratch}"
 set -euo pipefail
 
-NAME=pbps-test-pg
+NAME=${PBPS_TEST_PG_NAME:-pbps-test-pg}
 # Overridable for the same reason as the SQL Server one: a developer machine
 # often already has PostgreSQL on 5432, and "the tests will not start" is a bad
 # way to find that out.
@@ -35,7 +37,7 @@ IMAGE=postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea
 #
 # Bump it only to another release **below 17**; a bump past that would make the
 # test that asserts the refusal pass for no reason.
-OLD_NAME=pbps-test-pg16
+OLD_NAME=${PBPS_TEST_PG_OLD_NAME:-pbps-test-pg16}
 OLD_PORT=${PBPS_TEST_PG_OLD_PORT:-54321}
 OLD_IMAGE=postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8
 
@@ -43,7 +45,7 @@ start() {
     local name=$1 port=$2 image=$3
     local containers
     containers=$(docker ps -a --format '{{.Names}}')
-    if ! grep -qx "$name" <<< "$containers"; then
+    if ! grep -Fxq -- "$name" <<< "$containers"; then
         docker run -d --name "$name" \
             -e "POSTGRES_PASSWORD=$PASSWORD" -e "POSTGRES_DB=$DB" \
             -p "$port:5432" "$image" >/dev/null
@@ -52,7 +54,7 @@ start() {
 
 # A second PostgreSQL 18 cluster, the resolver's scratch on another cluster
 # (DEC-1672.1): same digest, so the builds compare equal.
-SCRATCH_NAME=pbps-test-pg-scratch
+SCRATCH_NAME=${PBPS_TEST_PG_SCRATCH_NAME:-pbps-test-pg-scratch}
 SCRATCH_PORT=${PBPS_TEST_PG_SCRATCH_PORT:-54322}
 
 start "$NAME" "$PORT" "$IMAGE"

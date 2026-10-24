@@ -2,10 +2,12 @@
 # Runs the live SQL Server tests (SPEC §11.5) against a throwaway container.
 #
 # The containers are left running afterwards so re-runs are instant; remove
-# them with: docker rm -f pbps-test-mssql pbps-test-mssql-express pbps-test-mssql-scratch
+# them with: docker rm -f "${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}" \
+#   "${PBPS_TEST_MSSQL_EXPRESS_NAME:-pbps-test-mssql-express}" \
+#   "${PBPS_TEST_MSSQL_SCRATCH_NAME:-${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}-scratch}"
 set -euo pipefail
 
-NAME=pbps-test-mssql
+NAME=${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}
 # Overridable: a developer machine often already has a SQL Server container
 # holding the default port, and "the tests will not start" is a bad way to find
 # that out.
@@ -21,7 +23,7 @@ PASSWORD='Pbps!Test12345'
 IMAGE=mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
 
 containers=$(docker ps -a --format '{{.Names}}')
-if ! grep -qx "$NAME" <<< "$containers"; then
+if ! grep -Fxq -- "$NAME" <<< "$containers"; then
     docker run -d --name "$NAME" -e ACCEPT_EULA=Y \
         -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$PORT:1433" "$IMAGE" >/dev/null
 fi
@@ -41,10 +43,10 @@ export PBPS_TEST_DB="Server=localhost,$PORT;User Id=sa;Password=$PASSWORD;TrustS
 # server collation: what the resolver's analysis-scope rule is measured
 # against for the two facts no database on the first server can vary (#611).
 # Express, so it stays small beside the first one.
-EXPRESS_NAME=pbps-test-mssql-express
+EXPRESS_NAME=${PBPS_TEST_MSSQL_EXPRESS_NAME:-pbps-test-mssql-express}
 EXPRESS_PORT=${PBPS_TEST_EXPRESS_PORT:-14331}
 containers=$(docker ps -a --format '{{.Names}}')
-if ! grep -qx "$EXPRESS_NAME" <<< "$containers"; then
+if ! grep -Fxq -- "$EXPRESS_NAME" <<< "$containers"; then
     docker run -d --name "$EXPRESS_NAME" -e ACCEPT_EULA=Y -e MSSQL_PID=Express \
         -e MSSQL_COLLATION=Latin1_General_100_CS_AS \
         -e "MSSQL_SA_PASSWORD=$PASSWORD" -p "$EXPRESS_PORT:1433" "$IMAGE" >/dev/null
