@@ -1,6 +1,3 @@
-// Diagnosis reasons are prose in every format until #2084 step 5
-// (DEC-2084.1): shown names sit beside already escaped database errors.
-
 //! Is a partitioned table's series running out, and are its rows landing in
 //! the DEFAULT partition (#1789, DEC-1789.2)?
 //!

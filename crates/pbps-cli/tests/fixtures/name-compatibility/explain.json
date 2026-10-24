@@ -31,20 +31,20 @@
         "class": "destructive",
         "why": "data can be lost or a uniqueness guarantee removed",
         "changes": [
-          "app.name\nline\r\u001b[31m\\‮名前  - drop column name\nline\r\u001b[31m\\‮名前2"
+          "app.name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  - drop column name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前2"
         ]
       },
       {
         "class": "not-null",
         "why": "existing NULLs, or rows with no value for a newly required column, make the statement fail",
         "changes": [
-          "app.name\nline\r\u001b[31m\\‮名前  ~ name\nline\r\u001b[31m\\‮名前1 becomes NOT NULL"
+          "app.name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  ~ name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前1 becomes NOT NULL"
         ]
       }
     ],
     "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 5ca64ba7f57b1c4af157f3fc362764453f47d632b4c4c9a96b3cc024ad32bcd9 --allow destructive,not-null",
     "probes": [
-      "existing NULLs in app.name\nline\r\u001b[31m\\‮名前.name\nline\r\u001b[31m\\‮名前1, which NOT NULL would reject"
+      "existing NULLs in app.name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前.name\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前1, which NOT NULL would reject"
     ],
     "unchecked": [],
     "statement_count": 3

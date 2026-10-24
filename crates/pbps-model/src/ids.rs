@@ -161,8 +161,6 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
-    // Error payloads keep raw name text for the error's existing value escape.
-    // #2084 step 5 (DEC-2084.1) must preserve that single pass when changing message producers.
     pub fn validated(self) -> Result<ValidIds, IdsError> {
         self.validate()?;
         Ok(ValidIds(self))
@@ -206,7 +204,6 @@ impl IdsFile {
             if !schema.roles.contains_key(name) {
                 return Err(IdsError::NotHeld {
                     uid: uid.clone(),
-                    // Raw error payload; IdsError escapes it whole until #2084 step 5.
                     name: name.raw().to_owned(),
                 });
             }
@@ -408,7 +405,6 @@ impl IdsFile {
 
         check_unique(self.tables.iter().map(|(u, n)| (u, n.raw().to_string())))?;
         check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
-        // Duplicate keys also feed IdsError, escaped whole until #2084 step 5.
         check_unique(self.roles.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
         check_unique(self.types.iter().map(|(u, n)| (u, n.raw().to_string())))?;
 

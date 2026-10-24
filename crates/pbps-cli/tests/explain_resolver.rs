@@ -977,10 +977,10 @@ fn assert_only_the_reports_own_lines(text: &str, plain: &str, what: &str) {
 
 /// A reviewer approves from the text report, and a hand-made plan holds valid
 /// names and free text with control characters in them: the report shows each
-/// of them escaped, in the lines it already had, and `--format json`, which
-/// escapes them as JSON, is what it was.
+/// of them escaped, in the lines it already had. Structured JSON values stay
+/// raw while human-facing prose is shown once in every format.
 #[test]
-fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
+fn the_report_keeps_structured_plan_values_raw_and_shows_prose_once() {
     let shown = HOSTILE_SHOWN;
     let explained = |plan: SavedPlan| {
         let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
@@ -1017,8 +1017,7 @@ fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
     let checks = &text[text.find("Checks that run before").expect(&text)..];
     assert!(checks.contains(shown), "a probe: {checks}");
 
-    // JSON is what it was: each value as JSON spells it, and not escaped a
-    // second time.
+    // Structured values retain their bytes; generated prose is shown once.
     let raw = String::from_utf8(json.stdout.clone()).unwrap();
     let value = report(&json);
     for (what, got) in [
@@ -1032,12 +1031,19 @@ fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
         raw.contains(&serde_json::to_string(HOSTILE).unwrap()),
         "{raw}"
     );
-    assert!(!raw.contains(shown) && !raw.contains("\\u{1b}"), "{raw}");
     let approval = value["data"]["risks"][0]["changes"][0].as_str().unwrap();
     assert!(
-        approval.contains(HOSTILE) && !approval.contains(shown),
+        approval.contains(shown) && !approval.contains(HOSTILE),
         "{approval:?}"
     );
+
+    let finding = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == HOSTILE)
+        .unwrap();
+    assert_eq!(finding["message"], shown);
 
     // A resolved plan, with the resolver's entry, image and limitation.
     let (text, json) = explained(resolved_plan_holding(HOSTILE));
@@ -1346,6 +1352,167 @@ fn same_instance_is_explained_and_tampering_fails_the_approved_checksum() {
         assert!(
             String::from_utf8_lossy(&out.stderr).contains("checksum"),
             "{out:?}"
+        );
+    }
+}
+
+#[test]
+fn saved_finding_prose_preserves_tool_backslashes_and_the_sealed_plan() {
+    let rendered = format!(r"tool bytea `\x` names {HOSTILE_SHOWN}");
+    for (message, expected) in [
+        (
+            format!(r"tool bytea `\x` names {HOSTILE}"),
+            rendered.clone(),
+        ),
+        (rendered.clone(), rendered),
+        (
+            r"tool bytea `\x` names literal\\n".into(),
+            r"tool bytea `\x` names literal\\n".into(),
+        ),
+        (
+            "tool bytea `\\x` names 名前_ünï❤️".into(),
+            "tool bytea `\\x` names 名前_ünï❤️".into(),
+        ),
+    ] {
+        let mut plan = plan_holding("ordinary");
+        plan.changes.changes[0].findings[0].message = message;
+        let checksum = plan.wire_fingerprint();
+        let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+        let text = artifact.explain("text");
+        assert!(text.status.success(), "{text:?}");
+        let text = String::from_utf8(text.stdout).unwrap();
+        assert!(
+            text.contains(&format!("      warning: ordinary — {expected}\n")),
+            "{text:?}"
+        );
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        let json = artifact.explain("json");
+        assert!(json.status.success(), "{json:?}");
+        let value = report(&json);
+        let finding = value["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["id"] == "ordinary")
+            .unwrap();
+        assert_eq!(finding["message"], expected);
+        assert_eq!(value["data"]["checksum"], checksum);
+        assert_eq!(plan.wire_fingerprint(), checksum);
+    }
+}
+
+fn plan_holding_bytea_row(value: &str, key_column: &str, identity_key: bool) -> SavedPlan {
+    let table = TableName::new("app", "bytes");
+    let ids = IdsFile {
+        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+        columns: [
+            ("c_aaaaaa".parse().unwrap(), table.column(key_column)),
+            ("c_bbbbbb".parse().unwrap(), table.column("payload")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let change = PlannedChange::new(Change::InsertRow {
+        table,
+        key_column: key_column.into(),
+        identity_key,
+        key: "1".into(),
+        row: [("payload".into(), pbps_model::Value::Text(value.into()))]
+            .into_iter()
+            .collect(),
+        defaults: Default::default(),
+        types: [("payload".into(), "bytea".parse().unwrap())].into(),
+    });
+    SavedPlan::new(
+        PlanOrigin::Database,
+        "postgres",
+        "fixture",
+        PlanBaseline {
+            time_zone: None,
+            description: "target database".into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        ChangeSet {
+            changes: vec![change],
+        },
+        ids,
+    )
+}
+
+#[test]
+fn malformed_bytea_saved_plans_show_each_error_operand_once() {
+    for (value, expected) in [
+        (
+            "\\x00\n\u{1b}[31m\u{202e}名前",
+            r#"postgres: the value "\\x00\n\u{1b}[31m\u{202e}名前" is declared for a `bytea` column and `00\n\u{1b}[31m\u{202e}名前` is not hex digits"#,
+        ),
+        (
+            r"\x00\n\u{1b}[31m\u{202e}名前",
+            r#"postgres: the value "\\x00\\n\\u{1b}[31m\\u{202e}名前" is declared for a `bytea` column and `00\\n\\u{1b}[31m\\u{202e}名前` is not hex digits"#,
+        ),
+        (
+            "\\x名前_ünï",
+            r#"postgres: the value "\\x名前_ünï" is declared for a `bytea` column and `名前_ünï` is not hex digits"#,
+        ),
+    ] {
+        let expected = format!("cannot render a change as SQL: {expected}");
+        let plan = plan_holding_bytea_row(value, "id", false);
+        let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+        let before = std::fs::read(artifact.0.join("plan.json")).unwrap();
+        let text = artifact.explain("text");
+        assert_eq!(text.status.code(), Some(1), "{text:?}");
+        assert_eq!(
+            String::from_utf8(text.stderr).unwrap(),
+            format!("error: {expected}\n")
+        );
+        let json = artifact.explain("json");
+        assert_eq!(json.status.code(), Some(1), "{json:?}");
+        assert_eq!(report(&json)["findings"][0]["message"], expected);
+        assert_eq!(std::fs::read(artifact.0.join("plan.json")).unwrap(), before);
+    }
+    let plan = plan_holding_bytea_row(r"\x00", "id", false);
+    let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+    assert!(artifact.explain("text").status.success());
+}
+
+#[test]
+fn pinned_identity_refusals_show_saved_column_names_once() {
+    for (name, shown) in [
+        (
+            "key\n\u{1b}[31m\u{202e}名前",
+            r"key\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"key\n\u{1b}[31m\u{202e}名前",
+            r"key\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("名前_ünï", "名前_ünï"),
+    ] {
+        let plan = plan_holding_bytea_row(r"\x00", name, true);
+        let expected = format!(
+            "cannot render a change as SQL: postgres: `app.bytes` keys its declared rows by `{shown}`, an identity column. This engine writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind: the apply succeeds, the plan verifies clean, and the next insert from anywhere else fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place them outside pbps and adopt them with `pbps baseline`."
+        );
+        let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+        let before = std::fs::read(artifact.0.join("plan.json")).unwrap();
+        let text = artifact.explain("text");
+        assert_eq!(text.status.code(), Some(1), "{text:?}");
+        assert_eq!(
+            String::from_utf8(text.stderr).unwrap(),
+            format!("error: {expected}\n")
+        );
+        let json = artifact.explain("json");
+        assert_eq!(report(&json)["findings"][0]["message"], expected);
+        assert_eq!(std::fs::read(artifact.0.join("plan.json")).unwrap(), before);
+        let ordinary = plan_holding_bytea_row(r"\x00", name, false);
+        assert!(
+            Artifact::new(&serde_json::to_value(ordinary).unwrap())
+                .explain("text")
+                .status
+                .success()
         );
     }
 }

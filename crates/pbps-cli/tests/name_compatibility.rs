@@ -217,8 +217,8 @@ fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
 }
 
 #[test]
-fn a_policy_finding_keeps_raw_json_and_is_shown_exactly_once() {
-    let (schema, _, mut plan, _) = artifacts(NAME);
+fn declaration_policy_keys_stay_raw_and_cli_prose_is_shown_once() {
+    let (schema, _, _, _) = artifacts(NAME);
     let policies = serde_json::from_str(
         r#"{"rules":{"naming.table":{"severity":"warning","pattern":"never"}}}"#,
     )
@@ -240,28 +240,58 @@ fn a_policy_finding_keeps_raw_json_and_is_shown_exactly_once() {
         findings[0].message,
         format!("app.{NAME}: table `{NAME}` does not match `never`")
     );
-    plan.changes.changes[0].findings = findings;
     let dir = std::env::temp_dir().join(format!("pbps-name-policy-{}", rand::random::<u64>()));
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::write(dir.join("plan.json"), serde_json::to_vec(&plan).unwrap()).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
-        .current_dir(&dir)
-        .args(["explain", "--plan", "plan.json", "--format", "text"])
-        .output()
+    std::fs::create_dir_all(dir.join("schema")).unwrap();
+    std::fs::write(dir.join("pbps.yml"), "dialect: postgres\npolicies:\n  rules:\n    naming.table: {severity: warning, pattern: never}\n").unwrap();
+    std::fs::write(
+        dir.join("schema/t.yml"),
+        serde_json::to_string(&serde_json::json!({
+            "table": format!("app.{NAME}"), "columns": {"c": {"type": "int"}}
+        }))
+        .unwrap()
+        .replace('\u{9b}', r"\u009b"),
+    )
+    .unwrap();
+    let expected = format!("app.{SHOWN}: table `{SHOWN}` does not match `never`");
+    for format in ["text", "json"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_pbps"))
+            .current_dir(&dir)
+            .args(["validate", "--format", format])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(if format == "json" {
+            output.stdout
+        } else {
+            output.stderr
+        })
         .unwrap();
+        if format == "json" {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let finding = json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["id"] == "naming.table")
+                .unwrap();
+            assert_eq!(finding["message"], expected);
+        } else {
+            assert_eq!(text, format!("  warning: {expected}\n"));
+            assert!(
+                !text.contains(&pbps_model::escape::Escaped(&expected).to_string()),
+                "{text:?}"
+            );
+            assert!(
+                !text.chars().any(|c| c.is_control() && c != '\n'),
+                "{text:?}"
+            );
+        }
+    }
     std::fs::remove_dir_all(dir).unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        text.contains(&format!(
-            "      warning: naming.table — app.{SHOWN}: table `{SHOWN}` does not match `never`\n"
-        )),
-        "{text:?}"
-    );
 }
 
 #[test]
-fn table_change_descriptions_keep_raw_json_and_are_shown_once_under_approval() {
+fn table_change_descriptions_are_shown_once_in_json_and_under_approval() {
     let (_, _, mut plan, _) = artifacts(NAME);
     plan.changes.changes = vec![PlannedChange::new(Change::DropTable {
         uid: "t_aaaaaa".parse().unwrap(),
@@ -299,7 +329,7 @@ fn table_change_descriptions_keep_raw_json_and_are_shown_once_under_approval() {
     let json: serde_json::Value = serde_json::from_str(&outputs[1]).unwrap();
     assert_eq!(
         json["data"]["risks"][0]["changes"][0],
-        format!("app.{NAME}  - drop table app.{NAME}")
+        format!("app.{SHOWN}  - drop table app.{SHOWN}")
     );
 }
 

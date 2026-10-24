@@ -54,14 +54,10 @@ use pbps_model::{
 
 /// What a dialect refuses, in a sentence that names the object it refused.
 ///
-/// The names in it are the declarations' or a saved plan's, and either may hold
-/// any character, a line break or a terminal sequence included (SPEC §4.3). A
-/// refusal is a line of the tool's own, so every free-text field is shown
-/// escaped by this type's `Display` (DEC-2032.1, #2035): hundreds of messages
-/// build a `String` out of names with `format!`, and escaping the field here
-/// covers all of them where editing each would miss the next one written. The
-/// one message that is not a single line, a statement to run by hand, has a
-/// variant of its own so that its line breaks stay the tool's.
+/// Message fields contain prose whose artifact-controlled operands have already
+/// been rendered with `.shown()` or `Escaped` (DEC-2084.1). `Display` preserves
+/// the tool's text; canonical type spellings and failed identifiers are single
+/// values and retain their own escaping here.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
     #[error("{operation} for `{}` cannot be emitted before blocking rewrites are enabled", table.shown())]
@@ -75,7 +71,7 @@ pub enum DialectError {
     #[error(
         "wrong number of arguments for `{}` in {dialect}: {}",
         pbps_model::escape::Escaped(.ty),
-        pbps_model::escape::Escaped(.detail)
+        .detail
     )]
     BadTypeArity {
         dialect: &'static str,
@@ -85,7 +81,7 @@ pub enum DialectError {
 
     #[error(
         "{dialect} does not support {}",
-        pbps_model::escape::Escaped(.feature)
+        .feature
     )]
     Unsupported {
         dialect: &'static str,
@@ -109,7 +105,7 @@ pub enum DialectError {
     /// and changes nothing is the silent wrong answer.
     #[error(
         "the {dialect} dialect does not implement {} yet",
-        pbps_model::escape::Escaped(.part)
+        .part
     )]
     NotBuilt { dialect: &'static str, part: String },
 
@@ -118,21 +114,14 @@ pub enum DialectError {
     /// cannot carry one. Distinct from [`DialectError::Unsupported`], which says
     /// "this database has no such feature"; this one says "this database has the
     /// feature, and you used it wrongly".
-    #[error("{dialect}: {}", pbps_model::escape::Escaped(.message))]
+    #[error("{dialect}: {message}")]
     Invalid {
         dialect: &'static str,
         message: String,
     },
 
-    /// [`DialectError::Invalid`] for a message that writes text of its own that
-    /// `Invalid` would change when it escapes the whole message, such as the
-    /// backslash of PostgreSQL's `\x` spelling of a `bytea` (#2081).
-    ///
-    /// The caller passes every plan-carried value through `Escaped` as it
-    /// builds the message, and `Display` does not escape it again, so the
-    /// text the tool wrote is shown as written and the values stay inert. A
-    /// value left unescaped here is shown raw: use `Invalid` unless the message
-    /// needs this.
+    /// A refusal whose producers already render every value individually.
+    /// Kept for the bytea diagnostics that introduced this contract (#2081).
     #[error("{dialect}: {message}")]
     InvalidVerbatim {
         dialect: &'static str,
@@ -142,21 +131,32 @@ pub enum DialectError {
     /// A change this dialect will not perform, with the statement a human runs
     /// instead.
     ///
-    /// Its own variant, not an [`DialectError::Invalid`] with a line break in
-    /// its message, because `Invalid` escapes every line break it holds: a
-    /// break the tool wrote and one a name carried cannot be told apart in a
-    /// finished string. Here the two parts are kept apart, each is escaped, and
-    /// the layout around them is the tool's own.
-    #[error(
-        "{dialect}: {}. Run it by hand, then plan again:\n\n    {}",
-        pbps_model::escape::Escaped(.why),
-        pbps_model::escape::Escaped(.statement)
-    )]
+    /// SQL keeps its original backslashes so the suggested statement names
+    /// the same object. Controls and invisible characters make it a labelled
+    /// preview instead: an inert spelling is not executable SQL (#2078).
+    #[error("{dialect}: {why}. {}", by_hand(.statement))]
     ByHand {
         dialect: &'static str,
         why: String,
         statement: String,
     },
+}
+
+// SQL quoting has already happened at the producer. Escape controls without
+// doubling SQL's literal backslashes; never offer a changed identity to paste.
+fn by_hand(statement: &str) -> String {
+    let preview = statement
+        .split('\\')
+        .map(|part| pbps_model::escape::Escaped(part).to_string())
+        .collect::<Vec<_>>()
+        .join("\\");
+    if preview == statement {
+        format!("Run it by hand, then plan again:\n\n    {statement}")
+    } else {
+        format!(
+            "Statement preview only (not pasteable: the identifier contains controls or invisible characters):\n\n    {preview}\n\nRecreate the original identifier with your SQL client, then plan again."
+        )
+    }
 }
 
 /// How safe a type change is.
@@ -514,110 +514,111 @@ pub struct Unchecked {
 }
 
 impl Unchecked {
-    // These labels are also JSON. Keep name operands raw until #2084 step 5 (DEC-2084.1);
-    // the explain renderer escapes each complete check/reason once.
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
             Change::RebuildPartitionedTable(_)
             | Change::CopyTableRows(_)
-            | Change::AnalyzeTableTree(_) => change.subject(),
+            | Change::AnalyzeTableTree(_) => {
+                pbps_model::escape::Escaped(&change.subject()).to_string()
+            }
             Change::AddCheck { table, name, .. } => {
                 format!(
                     "new check {name} on {table}",
-                    table = table.raw(),
-                    // Shared JSON/explain description is escaped once until #2084 step 5.
-                    name = name.raw(),
+                    table = table.shown(),
+                    name = name.shown(),
                 )
             }
             Change::AddUnique { table, name, .. } => {
                 format!(
                     "new unique constraint {name} on {table}",
-                    table = table.raw(),
-                    // Shared JSON/explain description is escaped once until #2084 step 5.
-                    name = name.raw(),
+                    table = table.shown(),
+                    name = name.shown(),
                 )
             }
             Change::AddForeignKey { table, name, .. } => {
                 format!(
                     "new foreign key {name} on {table}",
-                    table = table.raw(),
-                    // Shared JSON/explain description is escaped once until #2084 step 5.
-                    name = name.raw(),
+                    table = table.shown(),
+                    name = name.shown(),
                 )
             }
             Change::AddIndex { table, name, .. } => {
                 format!(
                     "new unique index {name} on {table}",
-                    table = table.raw(),
-                    // Shared JSON/explain description is escaped once until #2084 step 5.
-                    name = name.raw(),
+                    table = table.shown(),
+                    name = name.shown(),
                 )
             }
             Change::SetPrimaryKey { table, to, .. } => format!(
                 "new primary key {} on {table}",
                 to.as_ref()
-                    // Shared JSON/explain description is escaped once until #2084 step 5.
-                    .and_then(|key| key.name.as_ref().map(pbps_model::ObjectLocalName::raw))
-                    .unwrap_or("(unnamed)"),
-                table = table.raw()
+                    .and_then(|key| key.name.as_ref().map(|n| n.shown().to_string()))
+                    .unwrap_or_else(|| "(unnamed)".to_owned()),
+                table = table.shown()
             ),
             Change::AddColumn { table, name, .. } => {
-                format!("new NOT NULL column {}", table.column(name).raw())
+                format!("new NOT NULL column {}", table.column(name).shown())
             }
             Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
-            | Change::SetRowSecurity { .. } => change.subject(),
+            | Change::SetRowSecurity { .. } => {
+                pbps_model::escape::Escaped(&change.subject()).to_string()
+            }
             Change::SetReplicaIdentity { table, .. } => {
-                format!("replica identity of {table}", table = table.raw())
+                format!("replica identity of {table}", table = table.shown())
             }
             Change::SetStorageParameters { table, .. } => {
-                format!("storage parameters of {table}", table = table.raw())
+                format!("storage parameters of {table}", table = table.shown())
             }
             Change::SetTablePersistence { table, .. } => {
-                format!("persistence of {table}", table = table.raw())
+                format!("persistence of {table}", table = table.shown())
             }
             Change::SetIndexStorageParameters { table, .. } => {
-                format!("index storage parameters on {table}", table = table.raw())
+                format!("index storage parameters on {table}", table = table.shown())
             }
             Change::AlterColumnNullability { column, .. } => {
-                format!("NOT NULL column {column}", column = column.raw())
+                format!("NOT NULL column {column}", column = column.shown())
             }
             Change::SetPartitionNotNull { table, column, .. } => {
                 format!(
                     "NOT NULL column {} on the partition",
-                    table.column(column).raw()
+                    table.column(column).shown()
                 )
             }
             Change::AddComputedColumn { table, name, .. } => {
-                format!("new computed column {}", table.column(name).raw())
+                format!("new computed column {}", table.column(name).shown())
             }
             Change::AlterColumnType { column, .. } => {
-                format!("type conversion of {column}", column = column.raw())
+                format!("type conversion of {column}", column = column.shown())
             }
             Change::AlterColumnExpression { column, .. } => {
                 format!(
                     "recomputed generated column {column}",
-                    column = column.raw()
+                    column = column.shown()
                 )
             }
             Change::AlterColumnNumbering { column, .. } => {
-                format!("numbering source of {column}", column = column.raw())
+                format!("numbering source of {column}", column = column.shown())
             }
             Change::DeleteRow { table, key, .. } => {
-                format!("references to row {key} in {table}", table = table.raw())
+                format!(
+                    "references to row {key} in {table}",
+                    table = table.shown(),
+                    key = pbps_model::escape::Escaped(&key.to_string())
+                )
             }
             Change::DetachPartition { table, parent, .. } => {
                 format!(
                     "references to the partition {table}, detached from {parent}",
-                    table = table.raw(),
-                    parent = parent.raw()
+                    table = table.shown(),
+                    parent = parent.shown()
                 )
             }
             Change::AttachPartition { table, parent, .. } => {
                 format!(
                     "rows of {table} outside the range it takes under {parent}",
-                    table = table.raw(),
-                    parent = parent.raw()
+                    table = table.shown(),
+                    parent = parent.shown()
                 )
             }
             Change::CreateTable { .. }
@@ -648,7 +649,9 @@ impl Unchecked {
             | Change::RenameRole { .. }
             | Change::Grant { .. }
             | Change::Revoke { .. }
-            | Change::PublicExecution { .. } => change.subject(),
+            | Change::PublicExecution { .. } => {
+                pbps_model::escape::Escaped(&change.subject()).to_string()
+            }
         };
         Self::new(description, reason)
     }
@@ -2954,8 +2957,7 @@ pub trait Dialect {
                 dialect: self.name(),
                 feature: format!(
                     "`{spelled}` as a routine argument type",
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    spelled = spelled.raw(),
+                    spelled = spelled.shown(),
                 ),
             })
     }
@@ -3104,8 +3106,7 @@ pub trait Dialect {
                 dialect: self.name(),
                 message: format!(
                     "column `{column}` can have only one of default, identity, a `serial` type or generated",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 ),
             });
         }
@@ -4609,16 +4610,13 @@ mod tests {
 
     use super::*;
 
-    /// A refusal names an object out of a declaration or a saved plan, and the
-    /// name may hold a line break or a terminal sequence. Every free-text
-    /// field of the error is shown escaped by the error's own `Display`, so no
-    /// message built with `format!` can start a line of its own
-    /// (DEC-2032.1, #2035).
+    /// Producers render each value once; error display preserves the prose.
     #[test]
     fn a_refusal_shows_the_names_it_carries_escaped() {
         const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
         const SHOWN: &str = "x\\n\\u{1b}[31mred\\r\\u{202e}";
         let hostile = || HOSTILE.to_owned();
+        let shown = || SHOWN.to_owned();
         for refusal in [
             DialectError::UnknownType {
                 dialect: "pg",
@@ -4627,29 +4625,29 @@ mod tests {
             DialectError::BadTypeArity {
                 dialect: "pg",
                 ty: hostile(),
-                detail: hostile(),
+                detail: shown(),
             },
             DialectError::Unsupported {
                 dialect: "pg",
-                feature: hostile(),
+                feature: shown(),
             },
             DialectError::UnquotableIdent(hostile()),
             DialectError::NotBuilt {
                 dialect: "pg",
-                part: hostile(),
+                part: shown(),
             },
             DialectError::Invalid {
                 dialect: "pg",
-                message: format!("table `app.{HOSTILE}` has no primary key"),
+                message: format!("table `app.{SHOWN}` has no primary key"),
             },
             DialectError::ByHand {
                 dialect: "pg",
-                why: format!("role `{HOSTILE}` is not here"),
+                why: format!("role `{SHOWN}` is not here"),
                 statement: format!("CREATE ROLE \"{HOSTILE}\";"),
             },
         ] {
             let text = refusal.to_string();
-            let body = text.replace("\n\n    ", " ");
+            let body = text.replace('\n', " ");
             assert!(!body.chars().any(char::is_control), "{text:?}");
             assert!(text.contains(SHOWN), "{text}");
         }
@@ -4683,6 +4681,60 @@ mod tests {
             ordinary.to_string(),
             "pg: table `app.名前_ünï` has no primary key"
         );
+    }
+
+    #[test]
+    fn prose_fields_preserve_tool_backslashes_and_individually_shown_names() {
+        let role = pbps_model::RoleName::from("a\n\u{1b}[31m\u{9b}\\\u{202e}名前❤️");
+        let prose = format!("role `{}` reads a bytea as `\\x`", role.shown());
+        let expected =
+            "pg: role `a\\n\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前❤️` reads a bytea as `\\x`";
+        for error in [
+            DialectError::Invalid {
+                dialect: "pg",
+                message: prose.clone(),
+            },
+            DialectError::InvalidVerbatim {
+                dialect: "pg",
+                message: prose,
+            },
+        ] {
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.to_string().chars().any(char::is_control));
+        }
+        let literal = pbps_model::RoleName::from(r"a\n");
+        assert_ne!(role.shown().to_string(), literal.shown().to_string());
+    }
+
+    #[test]
+    fn unchecked_labels_show_each_operand_once_and_preserve_tool_text() {
+        for (name, shown) in [
+            ("part\n\u{1b}[31m\\\u{202e}", r"part\n\u{1b}[31m\\\u{202e}"),
+            ("名前_ünï❤️", "名前_ünï❤️"),
+        ] {
+            let change = Change::AddCheck {
+                table: TableName::new("app", name),
+                name: name.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "true".into(),
+                },
+            };
+            let unchecked = Unchecked::for_change(&change, r"tool text \x");
+            assert_eq!(
+                unchecked.description,
+                format!("new check {shown} on app.{shown}")
+            );
+            assert_eq!(unchecked.reason, r"tool text \x");
+            assert!(!unchecked.description.chars().any(char::is_control));
+            let fallback = Unchecked::for_change(
+                &Change::DropIndex {
+                    table: TableName::new("app", name),
+                    name: name.into(),
+                },
+                "not checked",
+            );
+            assert_eq!(fallback.description, format!("app.{shown}"));
+        }
     }
 
     /// The scan finds a name in code whatever its case or brackets, and not

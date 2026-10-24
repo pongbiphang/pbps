@@ -36,29 +36,29 @@
         "class": "rename",
         "why": "the old name disappears: views, procedures and any application still using it break",
         "changes": [
-          "role role\nline\r\u001b[31m\\‮名前old  ~ rename role role\nline\r\u001b[31m\\‮名前old -> role\nline\r\u001b[31m\\‮名前new"
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前old  ~ rename role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前old -> role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前new"
         ]
       },
       {
         "class": "revoke",
         "why": "access is taken away: an application still relying on it fails from the moment the plan commits",
         "changes": [
-          "role role\nline\r\u001b[31m\\‮名前new  - drop role role\nline\r\u001b[31m\\‮名前new, removing 1 member(s) first: role\nline\r\u001b[31m\\‮名前member",
-          "role role\nline\r\u001b[31m\\‮名前  - revoke update on app.role\nline\r\u001b[31m\\‮名前"
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前new  - drop role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前new, removing 1 member(s) first: role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前member",
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  - revoke update on app.role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前"
         ]
       },
       {
         "class": "grant-widen",
         "why": "access widens: a role can do more than before, which the merge request should have reviewed",
         "changes": [
-          "role role\nline\r\u001b[31m\\‮名前  + grant select on app.role\nline\r\u001b[31m\\‮名前",
-          "role role\nline\r\u001b[31m\\‮名前  + grant execute on schema::role\nline\r\u001b[31m\\‮名前"
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  + grant select on app.role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前",
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  + grant execute on schema::role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前"
         ]
       }
     ],
     "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 026aba2031ee2a0fbeb647d8d62df3b39521eea0f2f2f2d964be6c2b7960c1c9 --allow rename,revoke",
     "probes": [
-      "`role\nline\r\u001b[31m\\‮名前`, the schema this plan grants `role\nline\r\u001b[31m\\‮名前` permissions on, is not a schema this database has by that spelling — create it, or write the target the way the database spells it"
+      "`role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前`, the schema this plan grants `role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` permissions on, is not a schema this database has by that spelling — create it, or write the target the way the database spells it"
     ],
     "unchecked": [],
     "statement_count": 7

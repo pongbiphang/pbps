@@ -442,7 +442,9 @@
         "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
         "verify_distinguishes_permission_denials_from_failed_connections",
         "doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap",
-        "raised_guard_messages_are_shown_once_on_every_apply_path"
+        "raised_guard_messages_are_shown_once_on_every_apply_path",
+        "step5_connected_history_refusals_show_each_name_once",
+        "step5_connected_drift_and_ledger_refusals_show_each_name_once"
       ]
     },
     {
@@ -890,7 +892,7 @@
         "an_untrusted_domain_check_leaves_the_partition_default_probe_unrun",
         "an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal",
         "an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails",
-        "partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans",
+        "partition_default_warnings_show_names_once_in_json_and_human_output",
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused",
         "an_ambiguous_date_or_time_literal_is_refused_with_both_readings",
         "an_offset_less_value_is_read_in_the_target_databases_own_zone",
@@ -927,7 +929,12 @@
         "state_history_matches_an_unrecorded_column_to_its_later_recorded_uid",
         "state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit",
         "state_history_preserves_recorded_partition_move_limits_in_json_and_human_output",
-        "a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull"
+        "a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull",
+        "step5_connected_drift_and_ledger_refusals_show_each_name_once",
+        "step5_connected_role_refusals_and_by_hand_sql_preserve_identity",
+        "step5_connected_module_rebuild_refusals_show_each_name_once",
+        "step5_connected_ordering_refusals_show_subjects_and_descriptions_once",
+        "step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json"
       ]
     },
     {

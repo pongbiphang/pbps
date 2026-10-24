@@ -264,7 +264,6 @@ fn canonical_base(base: &str) -> &str {
 fn unknown(ty: &ColumnType) -> DialectError {
     DialectError::UnknownType {
         dialect: DIALECT,
-        // Raw data, escaped by the diagnostic writer until #2084 step 5.
         ty: ty.raw().to_string(),
     }
 }
@@ -272,7 +271,6 @@ fn unknown(ty: &ColumnType) -> DialectError {
 fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     DialectError::BadTypeArity {
         dialect: DIALECT,
-        // Raw data, escaped by the diagnostic writer until #2084 step 5.
         ty: ty.raw().to_string(),
         detail: detail.into(),
     }
@@ -305,7 +303,12 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
         // closed list and normalizes nothing.
         _ => return None,
     };
-    let at = column.map_or_else(String::new, |name| format!("column `{name}`: "));
+    let at = column.map_or_else(String::new, |name| {
+        format!(
+            "column `{name}`: ",
+            name = pbps_model::escape::Escaped(name),
+        )
+    });
     Some(DialectError::Invalid {
         dialect: DIALECT,
         message: format!(
@@ -314,8 +317,7 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
              {declared}`). Here it is `{ty}`, which the engine has no column for. Declare \
              `type: {declared}`, or `{reads_back}` with an `identity:`.",
             declared = ty.base,
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            ty = ty.raw(),
+            ty = ty.shown(),
         ),
     })
 }
@@ -343,8 +345,7 @@ fn refuse_overlong_reference(ty: &ColumnType, user: &TypeRef) -> Result<(), Dial
                      the reference would name a different type from the one written",
                     part.len(),
                     crate::MAX_IDENT_BYTES,
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    ty = ty.raw(),
+                    ty = ty.shown(),
                 ),
             });
         }

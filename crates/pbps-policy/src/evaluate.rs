@@ -1,6 +1,3 @@
-// Findings are shared JSON and report prose. Name operands stay raw until
-// #2084 step 5 (DEC-2084.1) removes the report's whole-message escape; subjects stay raw keys.
-
 //! Running the catalogue: the declaration rules over a [`Schema`], the plan
 //! rules over a [`ChangeSet`] (ADR-0008 decisions 1 and 6).
 //!
@@ -86,6 +83,8 @@ impl Live<'_> {
 
 /// The declaration rules over the whole schema (the `validate` point).
 pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<Finding> {
+    // These messages are raw comparison keys for partitions extend. The CLI
+    // projects them to prose only after comparing the original (id, message).
     let mut out = Vec::new();
 
     for (id, what) in [
@@ -127,34 +126,29 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 Naming::Index => table
                     .indexes
                     .keys()
-                    // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
                     .map(|i| ("index", i.raw().to_owned()))
                     .collect(),
                 Naming::Constraint => table
                     .primary_key
                     .iter()
-                    // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
                     .filter_map(|pk| pk.name.as_ref().map(|n| n.raw().to_owned()))
                     .map(|n| ("primary key", n))
                     .chain(
                         table
                             .unique
                             .keys()
-                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
                             .map(|n| ("unique constraint", n.raw().to_owned())),
                     )
                     .chain(
                         table
                             .foreign_keys
                             .keys()
-                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
                             .map(|n| ("foreign key", n.raw().to_owned())),
                     )
                     .chain(
                         table
                             .checks
                             .keys()
-                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
                             .map(|n| ("check constraint", n.raw().to_owned())),
                     )
                     .collect(),
@@ -212,10 +206,8 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                         Some(&subject),
                         format!(
                             "{name}.{column}: `{}` {advice}",
-                            // Raw data, escaped by the diagnostic writer until #2084 step 5.
                             spec.ty.raw(),
                             name = name.raw(),
-                            // raw: whole-message escaped until #2084 step 5.
                             column = column.raw(),
                         ),
                     ));
@@ -423,7 +415,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                             "{table}: this revision both adds and drops or narrows a column; \
                              that usually wants expand/contract staging (SPEC §13.3) — add \
                              first, backfill, then contract in a later revision",
-                            table = table.raw()
+                            table = table.shown()
                         ),
                     )
                     .map(|f| (at, f)),
@@ -448,22 +440,18 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                         "{column}: {from} -> {to} narrows or converts an array's elements, \
                          which pbps does not do: the plan is refused when it is computed \
                          against a database",
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        from = from.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        from = from.shown(),
+                        to = to.shown(),
                     )
                 } else {
                     format!(
                         "{column}: {from} -> {to} depends on what is already stored; the \
                          pre-flight probe counts the rows that would not fit before the \
                          first statement runs",
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        from = from.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        from = from.shown(),
+                        to = to.shown(),
                     )
                 };
                 out.extend(live.finding(Some(&subject), message).map(|f| (i, f)));
@@ -479,7 +467,6 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 permissions,
             } = &p.change
             {
-                // Raw subject key; reports escape it until #2084 step 5.
                 let subject = format!("role {}", role.raw());
                 out.extend(
                     live.finding(
@@ -491,10 +478,8 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                                 .map(|p| p.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", "),
-                            // Shared finding sentence, escaped whole until #2084 step 5.
-                            role = role.raw(),
-                            // Shared finding sentence, escaped whole until #2084 step 5.
-                            target = target.raw(),
+                            role = role.shown(),
+                            target = target.shown(),
                         ),
                     )
                     .map(|f| (i, f)),
@@ -603,7 +588,7 @@ pub fn parse_window(s: &str) -> Result<Window, String> {
 mod tests {
 
     #[test]
-    fn grant_policy_keys_and_shared_sentences_keep_raw_role_and_target_names() {
+    fn grant_policy_keys_stay_raw_while_shared_sentences_show_names_once() {
         let name = "role\nline\\path\u{202e}名前";
         let change = PlannedChange::new(Change::Grant {
             role: name.into(),
@@ -620,7 +605,10 @@ mod tests {
         );
         assert_eq!(
             findings[0].1.message,
-            format!("role {name} gains usage on schema::{name}")
+            format!(
+                "role {shown} gains usage on schema::{shown}",
+                shown = pbps_model::escape::Escaped(name)
+            )
         );
         let suppressed = |on: &str| {
             serde_json::from_value::<Policies>(serde_json::json!({"suppress": [
@@ -1262,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_type_messages_keep_raw_saved_plan_data() {
+    fn policy_type_messages_show_names_without_changing_saved_plan_data() {
         let raw = "type\n\\\u{1b}\"名前";
         let canonical = "app.\"type\n\\\u{1b}\"\"名前\"";
         for array in [false, true] {
@@ -1298,15 +1286,107 @@ mod tests {
             };
             assert_eq!(
                 finding.message,
-                format!("dbo.customer.n: integer{suffix} -> {canonical}{suffix} {reason}")
+                format!(
+                    "dbo.customer.n: integer{suffix} -> {canonical}{suffix} {reason}",
+                    canonical = pbps_model::escape::Escaped(canonical)
+                )
             );
-            assert!(finding.message.contains('\n'));
+            assert!(!finding.message.chars().any(char::is_control));
             change.risks.remove(&RiskClass::Narrowing);
             assert!(
                 !plan(&cs(vec![change]), &Policies::default(), &ctx())
                     .iter()
                     .any(|(_, f)| f.id == "change.narrowing-on-data")
             );
+        }
+    }
+
+    #[test]
+    fn naming_regexes_match_the_original_program_and_reject_literal_lookalikes() {
+        for (pattern, matching, other) in [
+            (r"item\d+", "item12", r"item\d"),
+            (r"item\\tail", r"item\tail", "itemtail"),
+        ] {
+            let policies: Policies = serde_json::from_value(serde_json::json!({
+                "rules": {"naming.table": {"severity": "error", "pattern": pattern}}
+            }))
+            .unwrap();
+            assert!(policies.check().is_empty());
+            let evaluate = |name: &str| {
+                let mut schema = Schema::default();
+                schema.tables.insert(
+                    pbps_model::TableName::new("app", name),
+                    pbps_model::Table::default(),
+                );
+                declarations(&schema, &policies, &ctx())
+                    .into_iter()
+                    .filter(|finding| finding.id == "naming.table")
+                    .collect::<Vec<_>>()
+            };
+            assert!(evaluate(matching).is_empty(), "{pattern}: {matching}");
+            let rejected = evaluate(other);
+            assert_eq!(rejected.len(), 1, "{pattern}: {other}");
+            assert_eq!(
+                rejected[0].message,
+                format!("app.{other}: table `{other}` does not match `{pattern}`")
+            );
+        }
+    }
+
+    #[test]
+    fn declaration_comparison_keys_retain_the_original_name_bytes() {
+        let policies: Policies = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "naming.table": {"severity": "error", "pattern": "ordinary"},
+                "data.max-rows": {"rows": 0}
+            }
+        }))
+        .unwrap();
+        for name in [
+            "Bad\n\u{1b}[31m\u{9b}\\\u{202e}名前",
+            r"Bad\n",
+            "名前_ünï❤️",
+        ] {
+            let mut table = pbps_model::Table::default();
+            table.columns.insert(
+                name.into(),
+                pbps_model::Column::new(pbps_model::ColumnType::simple("image")),
+            );
+            table.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: [(pbps_model::RowKey::from("1"), Default::default())].into(),
+            });
+            let mut schema = Schema::default();
+            schema
+                .tables
+                .insert(pbps_model::TableName::new("app", name), table);
+            let mut context = ctx();
+            context.deprecated_types = &[("image", "advice")];
+            let findings = declarations(&schema, &policies, &context);
+            assert_eq!(findings.len(), 3);
+            for (rule, expected) in [
+                (
+                    "naming.table",
+                    format!("app.{name}: table `{name}` does not match `ordinary`"),
+                ),
+                (
+                    "data.max-rows",
+                    format!(
+                        "app.{name}: 1 declared rows is above 0 — this does not look like reference data, and every plan compares it row by row"
+                    ),
+                ),
+                (
+                    "column.no-deprecated-type",
+                    format!("app.{name}.{name}: `image` advice"),
+                ),
+            ] {
+                let finding = findings.iter().find(|finding| finding.id == rule).unwrap();
+                assert_eq!(
+                    finding.subject.as_deref(),
+                    Some(format!("app.{name}").as_str())
+                );
+                assert_eq!(finding.message, expected);
+            }
         }
     }
 }

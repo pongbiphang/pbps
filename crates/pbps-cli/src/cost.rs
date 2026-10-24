@@ -119,13 +119,11 @@ pub fn render(report: &CostReport) -> String {
                         also_locks,
                         rows,
                     } => {
-                        // These fields are raw cost JSON. Keep the single text
-                        // boundary until #2084 step 5 (DEC-2084.1) types the sentence.
                         let _ = writeln!(
                             out,
                             "  Change {}: {} ({})",
                             change_index + 1,
-                            Escaped(about),
+                            about,
                             Escaped(table)
                         );
                         let rewrite = match rewrite {
@@ -149,7 +147,11 @@ pub fn render(report: &CostReport) -> String {
                             let _ = writeln!(
                                 out,
                                 "    Also locks: {}",
-                                Escaped(&also_locks.join(", "))
+                                also_locks
+                                    .iter()
+                                    .map(|name| Escaped(name).to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             );
                         }
                         let _ = writeln!(out, "    Rows: {rows}");
@@ -167,7 +169,7 @@ mod tests {
     use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
 
     #[test]
-    fn offline_estimates_keep_raw_cost_json_and_are_shown_once() {
+    fn offline_estimates_keep_raw_identity_fields_and_shown_prose() {
         for (part, shown) in [
             (
                 "a\nb\r\u{1b}[31m\u{9b}\\c\u{200b}",
@@ -213,7 +215,7 @@ mod tests {
                 let json = serde_json::to_value(&report).unwrap();
                 assert_eq!(
                     json["changes"][0]["about"],
-                    format!("changing app.{part}.{part} to bigint{suffix}")
+                    format!("changing app.{shown}.{shown} to bigint{suffix}")
                 );
                 assert_eq!(json["changes"][0]["table"], format!("app.{part}"));
                 assert_eq!(json["changes"][0]["also_locks"][0], format!("app.{part}"));

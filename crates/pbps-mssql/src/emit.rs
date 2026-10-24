@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! The T-SQL emitter: the one place in the codebase where SQL is written.
 //!
 //! # Two rules that shape almost every statement here
@@ -336,10 +333,8 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{table} is a partition of {parent}, which SQL Server's model does not hold",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw(),
-                // raw: whole-message escaped until #2084 step 5
-                parent = parent.raw()
+                table = table.shown(),
+                parent = parent.shown()
             ),
         }),
 
@@ -508,16 +503,14 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "a replica identity on `{table}`, which is PostgreSQL's",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown()
             ),
         }),
         Change::SetStorageParameters { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(
                 "storage parameters on `{table}`, which are PostgreSQL's",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown()
             ),
         }),
         // A partition is PostgreSQL's in this model (#1581).
@@ -526,8 +519,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                 dialect: crate::types::DIALECT,
                 message: format!(
                     "{table} is a partition, which SQL Server's model does not hold",
-                    // raw: whole-message escaped until #2084 step 5
-                    table = table.raw()
+                    table = table.shown()
                 ),
             })
         }
@@ -535,16 +527,14 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "an unlogged `{table}`, which is PostgreSQL's",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown()
             ),
         }),
         Change::SetIndexStorageParameters { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
             feature: format!(
                 "index storage parameters on `{table}`, which are PostgreSQL's",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown()
             ),
         }),
         Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {
@@ -558,8 +548,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             feature: format!(
                 "settling PUBLIC execution on `{routine}`: this engine grants none to revoke or \
                  keep, and `public` here is an ordinary database role",
-                // raw: whole-message escaped until #2084 step 5.
-                routine = routine.raw()
+                routine = routine.shown()
             ),
         }),
 
@@ -677,10 +666,8 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
                     message: format!(
                         "column `{column}` has type `{ty}`, which SQL Server refuses to name in \
                          ALTER COLUMN; its nullability cannot be changed",
-                        // raw: whole-message escaped until #2084 step 5
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        ty = ty.raw(),
+                        column = column.shown(),
+                        ty = ty.shown(),
                     ),
                 });
             }
@@ -725,8 +712,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             message: format!(
                 "{column} is a generated column, which this model holds for PostgreSQL only",
-                // raw: whole-message escaped until #2084 step 5
-                column = column.raw()
+                column = column.shown()
             ),
         }),
 
@@ -737,8 +723,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             message: format!(
                 "{column}: a change to its identity has no ALTER on SQL Server, and this model \
                  changes one on PostgreSQL only",
-                // raw: whole-message escaped until #2084 step 5
-                column = column.raw()
+                column = column.shown()
             ),
         }),
 
@@ -923,11 +908,7 @@ pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, Diale
     if body.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            message: format!(
-                "module `{id}` has an empty definition",
-                // raw: whole-message escaped until #2084 step 5.
-                id = id.raw()
-            ),
+            message: format!("module `{id}` has an empty definition", id = id.shown()),
         });
     }
     let head = format!(
@@ -946,8 +927,7 @@ pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, Diale
                 dialect: DIALECT,
                 message: format!(
                     "trigger `{id}` does not say which table it is on",
-                    // raw: whole-message escaped until #2084 step 5.
-                    id = id.raw()
+                    id = id.shown()
                 ),
             })?;
             format!("{head}\nON {}\n{body}", qualified(on)?)
@@ -1159,8 +1139,7 @@ fn update_row(
             dialect: DIALECT,
             message: format!(
                 "{table}: a row update with no changed column",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown()
             ),
         });
     }
@@ -1392,7 +1371,8 @@ fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String,
         literal(&format!(
             "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
              or another writer inside it. Nothing was applied.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     ))
 }
@@ -1541,7 +1521,8 @@ fn wrote_the_row(
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
              says which.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     ))
 }
@@ -1552,7 +1533,8 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         literal(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
              plan was made. Plan again.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     )
 }
@@ -1578,8 +1560,7 @@ fn securable(target: &GrantTarget) -> Result<String, DialectError> {
                 dialect: DIALECT,
                 message: format!(
                     "`{r}` names an argument list; SQL Server identifies a routine by name alone",
-                    // raw: whole-message escaped until #2084 step 5.
-                    r = r.raw()
+                    r = r.shown()
                 ),
             });
         }
@@ -1710,7 +1691,8 @@ fn generated_column_definition(
             return Err(DialectError::Invalid {
                 dialect: "mssql",
                 message: format!(
-                    "column `{name}` is a generated column, which this model holds for PostgreSQL only"
+                    "column `{name}` is a generated column, which this model holds for PostgreSQL only",
+                    name = pbps_model::escape::Escaped(name),
                 ),
             });
         }
@@ -1718,7 +1700,8 @@ fn generated_column_definition(
             return Err(DialectError::Invalid {
                 dialect: "mssql",
                 message: format!(
-                    "column `{name}` is a `serial`, which this model holds for PostgreSQL only"
+                    "column `{name}` is a `serial`, which this model holds for PostgreSQL only",
+                    name = pbps_model::escape::Escaped(name),
                 ),
             });
         }
@@ -1769,7 +1752,8 @@ pub(crate) fn collate_clause(collation: Option<&Collation>) -> Result<String, Di
             dialect: DIALECT,
             message: format!(
                 "collation `{name}` is not a SQL Server collation name: those are letters, \
-                 digits and `_`"
+                 digits and `_`",
+                name = pbps_model::escape::Escaped(name),
             ),
         });
     }
@@ -1864,8 +1848,8 @@ fn create_index(
             message: format!(
                 "index `{name}` on `{table}` is the clustered index, which can have neither \
                  INCLUDE columns nor a WHERE filter",
-                // raw: whole-message escaped until #2084 step 5
-                table = table.raw()
+                table = table.shown(),
+                name = pbps_model::escape::Escaped(name),
             ),
         });
     }
@@ -1984,8 +1968,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            // raw: whole-message escaped until #2084 step 5
-            message: format!("table `{name}` has no columns", name = name.raw()),
+            message: format!("table `{name}` has no columns", name = name.shown()),
         });
     }
     let qualified_name = qualified(name)?;

@@ -160,7 +160,6 @@ fn canonical_base(base: &str) -> &str {
 fn unknown(ty: &ColumnType) -> DialectError {
     DialectError::UnknownType {
         dialect: DIALECT,
-        // Raw data, escaped by the diagnostic writer until #2084 step 5.
         ty: ty.raw().to_string(),
     }
 }
@@ -168,7 +167,6 @@ fn unknown(ty: &ColumnType) -> DialectError {
 fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
     DialectError::BadTypeArity {
         dialect: DIALECT,
-        // Raw data, escaped by the diagnostic writer until #2084 step 5.
         ty: ty.raw().to_string(),
         detail: detail.into(),
     }
@@ -187,8 +185,7 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             message: format!(
                 "`{ty}` names a user-defined type, and references to user-defined types are \
                  not supported; declare a built-in type",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                ty = ty.raw(),
+                ty = ty.shown(),
             ),
         });
     }
@@ -200,8 +197,7 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
             message: format!(
                 "`{ty}` is an array type, which SQL Server does not have; declare the element \
                  type, or a separate table for the elements",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                ty = ty.raw(),
+                ty = ty.shown(),
             ),
         });
     }

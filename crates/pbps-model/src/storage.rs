@@ -72,8 +72,12 @@ pub fn table_kind(name: &str) -> Option<Kind> {
 /// `value` of table parameter `name` in its one canonical spelling, or why
 /// it is not one.
 pub fn canonical(name: &str, value: &str) -> Result<String, String> {
-    let kind = table_kind(name)
-        .ok_or_else(|| format!("`{name}` is not a table storage parameter this model declares"))?;
+    let kind = table_kind(name).ok_or_else(|| {
+        format!(
+            "`{name}` is not a table storage parameter this model declares",
+            name = crate::escape::Escaped(name),
+        )
+    })?;
     spelled(kind, name, value)
 }
 
@@ -101,7 +105,8 @@ pub fn canonical_index(method: IndexMethod, name: &str, value: &str) -> Result<S
         .ok_or_else(|| {
             format!(
                 "`{name}` is not a storage parameter of a {} index this model declares",
-                method.as_str()
+                method.as_str(),
+                name = crate::escape::Escaped(name),
             )
         })?;
     spelled(kind, name, value)
@@ -123,7 +128,13 @@ fn spelled(kind: Kind, name: &str, value: &str) -> Result<String, String> {
             }
         }
     };
-    read.ok_or_else(|| format!("`{value}` is not a value of storage parameter `{name}`"))
+    read.ok_or_else(|| {
+        format!(
+            "`{value}` is not a value of storage parameter `{name}`",
+            name = crate::escape::Escaped(name),
+            value = crate::escape::Escaped(value),
+        )
+    })
 }
 
 /// PostgreSQL's `parse_bool`: case-insensitive, surrounding whitespace

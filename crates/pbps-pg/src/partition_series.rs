@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! A series of RANGE partitions, generated from the declarations
 //! (#1789, DEC-1789.1).
 //!
@@ -367,16 +364,21 @@ pub(crate) fn parse_step_as(what: &str, every: &str) -> Result<Step, String> {
         _ if count.is_empty() || count.bytes().all(|b| b == b'0') => {
             return Err(format!(
                 "{what} `{every}` starts with no positive whole number: write a step such as \
-                 `1month`, `7day`, `1week` or `1year`"
+                 `1month`, `7day`, `1week` or `1year`",
+                every = pbps_model::escape::Escaped(every),
             ));
         }
         _ => {
-            return Err(format!("{what} `{every}` is too large a step"));
+            return Err(format!(
+                "{what} `{every}` is too large a step",
+                every = pbps_model::escape::Escaped(every),
+            ));
         }
     };
     if n > MAX_STEP {
         return Err(format!(
-            "{what} `{every}` is too large a step (at most {MAX_STEP})"
+            "{what} `{every}` is too large a step (at most {MAX_STEP})",
+            every = pbps_model::escape::Escaped(every),
         ));
     }
     let unit = match unit.trim().to_ascii_lowercase().as_str() {
@@ -387,13 +389,16 @@ pub(crate) fn parse_step_as(what: &str, every: &str) -> Result<Step, String> {
         "" => {
             return Err(format!(
                 "{what} `{every}` has no unit: a date or time key steps in `day`, `week`, \
-                 `month` or `year`, as `1month`"
+                 `month` or `year`, as `1month`",
+                every = pbps_model::escape::Escaped(every),
             ));
         }
         other => {
             return Err(format!(
                 "{what} `{every}`: `{other}` is not a unit; use `day`, `week`, `month` or \
-                 `year`"
+                 `year`",
+                every = pbps_model::escape::Escaped(every),
+                other = pbps_model::escape::Escaped(other),
             ));
         }
     };
@@ -517,36 +522,37 @@ struct Declared {
 
 fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
     let parent = req.parent;
-    let table = req
-        .schema
-        .tables
-        .get(parent)
-        .ok_or_else(|| invalid(format!("`{parent}` is not declared", parent = parent.raw())))?;
+    let table = req.schema.tables.get(parent).ok_or_else(|| {
+        invalid(format!(
+            "`{parent}` is not declared",
+            parent = parent.shown()
+        ))
+    })?;
     if let Some(of) = &table.partition_of {
         return Err(invalid(format!(
             "`{parent}` is a partition of `{}`, and a partition is not extended; name its parent",
-            of.parent.raw(),
-            parent = parent.raw()
+            of.parent.shown(),
+            parent = parent.shown()
         )));
     }
     let by = table.partition_by.as_ref().ok_or_else(|| {
         invalid(format!(
             "`{parent}` declares no `partition_by:`; a series extends a RANGE-partitioned table",
-            parent = parent.raw()
+            parent = parent.shown()
         ))
     })?;
     if !by.strategy.is_range() {
         return Err(invalid(format!(
             "`{parent}` is partitioned by {}: a series extends a RANGE-partitioned table",
             by.strategy.keyword(),
-            parent = parent.raw()
+            parent = parent.shown()
         )));
     }
     if by.external {
         return Err(invalid(format!(
             "`{parent}` declares `partitions: external`: its partitions are another tool's, and \
              pbps declares none of them. Extend them with that tool",
-            parent = parent.raw()
+            parent = parent.shown()
         )));
     }
     let [column] = by.columns.as_slice() else {
@@ -554,26 +560,23 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
             "`{parent}` is partitioned by {} columns, and a series has one frontier: only a \
              single-column key is generated",
             by.columns.len(),
-            parent = parent.raw()
+            parent = parent.shown()
         )));
     };
     let ty = table.columns.get(column).map(|c| &c.ty).ok_or_else(|| {
         invalid(format!(
             "`{parent}` is partitioned by `{column}`, which it does not declare",
-            parent = parent.raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            column = column.raw(),
+            parent = parent.shown(),
+            column = column.shown(),
         ))
     })?;
     let key = Key::of(ty).ok_or_else(|| {
         invalid(format!(
             "`{parent}` is partitioned by `{column}`, a {ty}: a series is generated for a \
              `date`, `timestamp`, `timestamptz`, `smallint`, `integer` or `bigint` key",
-            parent = parent.raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            column = column.raw(),
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            ty = ty.raw(),
+            parent = parent.shown(),
+            column = column.shown(),
+            ty = ty.shown(),
         ))
     })?;
 
@@ -593,7 +596,7 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
             PartitionBound::List { .. } | PartitionBound::Hash { .. } => {
                 return Err(invalid(format!(
                     "partition {name} is not a range: only a RANGE parent's partitions extend",
-                    name = name.raw()
+                    name = name.shown()
                 )));
             }
             PartitionBound::Range { from, to } => {
@@ -603,7 +606,7 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
                          is one column",
                         from.len(),
                         to.len(),
-                        name = name.raw()
+                        name = name.shown()
                     )));
                 };
                 match end {
@@ -611,13 +614,13 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
                         return Err(invalid(format!(
                             "partition {name} reaches MAXVALUE, so no range can follow it; \
                              there is nothing to extend",
-                            name = name.raw()
+                            name = name.shown()
                         )));
                     }
                     BoundDatum::MinValue => {
                         return Err(invalid(format!(
                             "partition {name} ends at MINVALUE, which no range can",
-                            name = name.raw()
+                            name = name.shown()
                         )));
                     }
                     BoundDatum::Value(text) => ends.push((name.clone(), text.clone())),
@@ -649,7 +652,7 @@ fn named(req: &RangeSeriesRequest<'_>, suffix: &str) -> Result<TableName, Dialec
             "the partition name `{}` is {} bytes, and the engine keeps {MAX_IDENT_BYTES}: it \
              would truncate the name, and two such names can collide. Declare these partitions \
              by hand under shorter names",
-            name.name,
+            pbps_model::escape::Escaped(&name.name),
             name.name.len()
         )));
     }
@@ -657,7 +660,7 @@ fn named(req: &RangeSeriesRequest<'_>, suffix: &str) -> Result<TableName, Dialec
         return Err(invalid(format!(
             "`{name}` is already declared, and the series would name a partition so; declare \
              these partitions by hand, or rename that table",
-            name = name.raw()
+            name = name.shown()
         )));
     }
     Ok(name)
@@ -685,38 +688,58 @@ fn temporal(
             invalid(format!(
                 "partition {name} ends at `{text}`, {}",
                 why(key, &r),
-                name = name.raw()
+                name = name.shown(),
+                text = pbps_model::escape::Escaped(text),
             ))
         })?;
         if frontier.as_ref().is_none_or(|(best, ..)| c > *best) {
             frontier = Some((
                 c,
                 text,
-                format!("partition {name} ends at `{text}`", name = name.raw()),
+                format!(
+                    "partition {name} ends at `{text}`",
+                    name = name.shown(),
+                    text = pbps_model::escape::Escaped(text),
+                ),
             ));
         }
     }
-    let until = parse_civil(key, req.until)
-        .map_err(|r| invalid(format!("--until `{}`, {}", req.until, why(key, &r))))?;
+    let until = parse_civil(key, req.until).map_err(|r| {
+        invalid(format!(
+            "--until `{}`, {}",
+            pbps_model::escape::Escaped(req.until),
+            why(key, &r),
+        ))
+    })?;
     let (start, start_text, origin) = match (frontier, req.from) {
         (Some((_, end, _)), Some(from)) => {
             return Err(invalid(format!(
                 "--from `{from}` is accepted only for a parent that declares no range yet; \
                  `{}` already ends at `{end}`, where the series continues",
-                req.parent.raw()
+                req.parent.shown(),
+                from = pbps_model::escape::Escaped(from),
             )));
         }
         (Some((c, text, origin)), None) => (c, text.to_owned(), origin),
         (None, Some(from)) => {
-            let c = parse_civil(key, from)
-                .map_err(|r| invalid(format!("--from `{from}`, {}", why(key, &r))))?;
-            (c, from.to_owned(), format!("--from `{from}`"))
+            let c = parse_civil(key, from).map_err(|r| {
+                invalid(format!(
+                    "--from `{from}`, {}",
+                    why(key, &r),
+                    from = pbps_model::escape::Escaped(from),
+                ))
+            })?;
+            (
+                c,
+                from.to_owned(),
+                format!("--from `{from}`", from = pbps_model::escape::Escaped(from),),
+            )
         }
         (None, None) => {
             return Err(invalid(format!(
                 "`{}` declares no range to continue from: say where the series starts with \
                  --from, as `--from {}`",
-                req.parent.raw(),
+                req.parent.shown(),
                 key.example()
             )));
         }
@@ -725,7 +748,8 @@ fn temporal(
     if until <= start && declared.ends.is_empty() {
         return Err(invalid(format!(
             "--until `{}` is not after --from `{start_text}`",
-            req.until
+            pbps_model::escape::Escaped(req.until),
+            start_text = pbps_model::escape::Escaped(&start_text),
         )));
     }
 
@@ -773,8 +797,9 @@ fn temporal(
         return Err(invalid(format!(
             "--until `{}` is not a whole number of `{}` steps after `{start_text}`, so the last \
              partition would end short of it or past it. {nearest}",
-            req.until,
-            req.every.trim()
+            pbps_model::escape::Escaped(req.until),
+            pbps_model::escape::Escaped(req.every.trim()),
+            start_text = pbps_model::escape::Escaped(&start_text),
         )));
     }
     let count = i128::from(diff / len);
@@ -835,7 +860,8 @@ fn integers(
             invalid(format!(
                 "--every `{every}`: a {} key steps by a plain positive whole number, as \
                  `--every 1000`",
-                int.name
+                int.name,
+                every = pbps_model::escape::Escaped(every),
             ))
         })?;
 
@@ -844,37 +870,54 @@ fn integers(
         let v = parse_integer(int, text).map_err(|why| {
             invalid(format!(
                 "partition {name} ends at `{text}`, {why}",
-                name = name.raw()
+                name = name.shown(),
+                text = pbps_model::escape::Escaped(text),
             ))
         })?;
         if frontier.as_ref().is_none_or(|(best, _)| v > *best) {
             frontier = Some((
                 v,
-                format!("partition {name} ends at `{text}`", name = name.raw()),
+                format!(
+                    "partition {name} ends at `{text}`",
+                    name = name.shown(),
+                    text = pbps_model::escape::Escaped(text),
+                ),
             ));
         }
     }
-    let until = parse_integer(int, req.until)
-        .map_err(|why| invalid(format!("--until `{}`, {why}", req.until)))?;
+    let until = parse_integer(int, req.until).map_err(|why| {
+        invalid(format!(
+            "--until `{}`, {why}",
+            pbps_model::escape::Escaped(req.until),
+        ))
+    })?;
     let (start, _origin) = match (frontier, req.from) {
         (Some((v, _)), Some(from)) => {
             return Err(invalid(format!(
                 "--from `{from}` is accepted only for a parent that declares no range yet; \
                  `{}` already ends at `{v}`, where the series continues",
-                req.parent.raw()
+                req.parent.shown(),
+                from = pbps_model::escape::Escaped(from),
             )));
         }
         (Some(found), None) => found,
         (None, Some(from)) => {
-            let v = parse_integer(int, from)
-                .map_err(|why| invalid(format!("--from `{from}`, {why}")))?;
-            (v, format!("--from `{from}`"))
+            let v = parse_integer(int, from).map_err(|why| {
+                invalid(format!(
+                    "--from `{from}`, {why}",
+                    from = pbps_model::escape::Escaped(from),
+                ))
+            })?;
+            (
+                v,
+                format!("--from `{from}`", from = pbps_model::escape::Escaped(from),),
+            )
         }
         (None, None) => {
             return Err(invalid(format!(
                 "`{}` declares no range to continue from: say where the series starts with \
                  --from, as `--from 0`",
-                req.parent.raw()
+                req.parent.shown()
             )));
         }
     };
@@ -883,7 +926,7 @@ fn integers(
         if declared.ends.is_empty() {
             return Err(invalid(format!(
                 "--until `{}` is not after --from `{start}`",
-                req.until
+                pbps_model::escape::Escaped(req.until)
             )));
         }
         return Ok(RangeSeries {
@@ -927,7 +970,7 @@ fn integers(
                 "the partition from `{lo}` would be named `{}_{lo}`, which is not an \
                  identifier; declare a series that starts at 0 or above, or declare these \
                  partitions by hand",
-                req.parent.name
+                pbps_model::escape::Escaped(&req.parent.name)
             )));
         }
         partitions.push(SeriesPartition {

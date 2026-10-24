@@ -822,7 +822,7 @@ fn removal_of(
             Part::Policy(_) => {
                 return Err(format!(
                     "{}: explicitly remove or replace the dependent policy in the declarations",
-                    d.described
+                    pbps_model::escape::Escaped(&d.described)
                 ));
             }
             Part::Generated(_) => {
@@ -1349,18 +1349,20 @@ impl Expansion for Weave<'_> {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
                     tail: Vec::new(),
-                    // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
-                    reason: format!("{} depends on `{root}`", d.described, root = root.raw()),
+                    reason: format!(
+                        "{} depends on `{root}`",
+                        pbps_model::escape::Escaped(&d.described),
+                        root = root.shown()
+                    ),
                 })
             }
             Need::Removed { root, k } => {
                 let d = self.dependent(root, *k)?;
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
-                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                 let reason = format!(
                     "{} depends on `{root}`, which this plan drops",
-                    d.described,
-                    root = root.raw()
+                    pbps_model::escape::Escaped(&d.described),
+                    root = root.shown()
                 );
                 match find(&view, &parts, &d.holds, partitions, removes) {
                     // Moved to the module's drop, ahead of everything from
@@ -1455,11 +1457,10 @@ impl Expansion for Weave<'_> {
                                 of: after,
                                 change: added,
                                 anchor: Anchor::After(after),
-                                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
-                                    d.described,
-                                    root = root.raw()
+                                    pbps_model::escape::Escaped(&d.described),
+                                    root = root.shown()
                                 ),
                             })],
                             respelled: Vec::new(),
@@ -1911,7 +1912,10 @@ pub fn before_its_partitions_indexes(
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
                     (name.shown().to_string(), table.shown().to_string())
                 } else {
-                    (cs.changes[i].change.subject(), String::new())
+                    (
+                        pbps_model::escape::Escaped(&cs.changes[i].change.subject()).to_string(),
+                        String::new(),
+                    )
                 }
             };
             let refused = |k: usize, why: String| {
@@ -1931,7 +1935,7 @@ pub fn before_its_partitions_indexes(
                     k,
                     format!(
                         "it would pass a change to {}",
-                        cs.changes[c].change.subject()
+                        pbps_model::escape::Escaped(&cs.changes[c].change.subject())
                     ),
                 ));
             }
@@ -1951,7 +1955,7 @@ pub fn before_its_partitions_indexes(
                             k,
                             format!(
                                 "it rests on {}, which it could take",
-                                cs.changes[j].change.subject()
+                                pbps_model::escape::Escaped(&cs.changes[j].change.subject())
                             ),
                         )
                     },
@@ -3364,3 +3368,56 @@ fn truncated(mut part: String) -> String {
 #[cfg(test)]
 #[path = "deployment_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod policy_message_tests {
+    use super::*;
+
+    #[test]
+    fn policy_rebuild_refusals_show_descriptions_once_and_keep_raw_keys() {
+        for (raw, shown) in [
+            (
+                "policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\n\u{1b}[31m\u{202e}名前",
+            ),
+            (
+                r"policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\\n\\u{1b}[31m\\u{202e}名前",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let table = TableName::new("app", "t");
+            let dependent = Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: table.clone(),
+                    part: Part::Policy(raw.into()),
+                },
+            };
+            assert_eq!(
+                removal_of(&dependent, &Schema::default(), None).unwrap_err(),
+                format!(
+                    "{shown}: explicitly remove or replace the dependent policy in the declarations"
+                )
+            );
+            assert_eq!(dependent.described, raw);
+            assert!(
+                matches!(&dependent.holds, Holds::TablePart { part: Part::Policy(name), .. } if name == raw)
+            );
+            let check = Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: table.clone(),
+                    part: Part::Check(raw.into()),
+                },
+            };
+            assert_eq!(
+                removal_of(&check, &Schema::default(), None).unwrap(),
+                Change::DropCheck {
+                    table,
+                    name: raw.into()
+                }
+            );
+        }
+    }
+}

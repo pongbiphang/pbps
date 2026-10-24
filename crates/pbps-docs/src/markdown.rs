@@ -160,7 +160,6 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             s,
             "- **Unique** `{n}`: {}",
             columns(&u.columns),
-            // Document data uses its medium escaping; retained after #2084 step 5.
             n = n.raw(),
         );
     }
@@ -171,18 +170,11 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             columns(&fk.columns),
             fk.references_table.raw(),
             columns(&fk.references_columns),
-            // Document data uses its medium escaping; retained after #2084 step 5.
             n = n.raw(),
         );
     }
     for (n, c) in &table.checks {
-        let _ = writeln!(
-            s,
-            "- **Check** `{n}`: `{}`",
-            c.expression,
-            // Document data uses its medium escaping; retained after #2084 step 5.
-            n = n.raw(),
-        );
+        let _ = writeln!(s, "- **Check** `{n}`: `{}`", c.expression, n = n.raw(),);
     }
     for (n, ix) in &table.indexes {
         let cols: Vec<String> = ix
@@ -201,7 +193,6 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             "- **Index** `{n}`{}: {}",
             if ix.unique { " (unique)" } else { "" },
             cols.join(", "),
-            // Document data uses its medium escaping; retained after #2084 step 5.
             n = n.raw(),
         );
         if !ix.include.is_empty() {

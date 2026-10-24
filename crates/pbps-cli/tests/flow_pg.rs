@@ -11226,22 +11226,16 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             .iter()
             .find(|check| check["name"] == "numbered_column_fills")
             .unwrap();
-        let raw_message = check["message"].as_str().unwrap();
+        let message = check["message"].as_str().unwrap();
         assert!(
-            raw_message.contains(&format!("app.t.{RAW}")),
+            message.contains(&format!("app.t.{SHOWN}")),
             "{server}: {report}"
         );
         assert!(
-            !raw_message.contains(&format!("app.t.{SHOWN}")),
+            !message.contains(&format!("app.t.{RAW}")),
             "{server}: {report}"
         );
-        assert_eq!(
-            line,
-            format!(
-                "numbered_column_fills: {}",
-                pbps_model::escape::Escaped(raw_message)
-            )
-        );
+        assert_eq!(line, format!("numbered_column_fills: {}", message));
         on_server(
             connection,
             "SET client_min_messages = error;
@@ -31242,7 +31236,7 @@ fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() 
 /// human writers. A default the engine can ask about emits no warning.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans() {
+fn partition_default_warnings_show_names_once_in_json_and_human_output() {
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (version, server) in [("18", server()), ("16", old)] {
         let partition = "ev\nline\\tail";
@@ -31316,7 +31310,8 @@ partitions:
         let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
         let warnings = unasked(&report);
         assert_eq!(warnings.len(), 1, "{version}: {report}");
-        assert_eq!(warnings[0]["message"], raw, "{version}: {report}");
+        assert_eq!(warnings[0]["message"], shown, "{version}: {report}");
+        assert_ne!(warnings[0]["message"], raw, "{version}: {report}");
         let check_human = |output: Output| {
             let error = stderr(&succeeds(output));
             let lines: Vec<_> = error
@@ -34772,4 +34767,331 @@ fn state_history_preserves_recorded_partition_move_limits_in_json_and_human_outp
         assert!(latest_snapshot(connection).ids.moves.is_empty());
         compare(None);
     }
+}
+
+#[path = "support/message_boundaries.rs"]
+mod message_boundaries;
+
+#[test]
+#[ignore = "needs a live PostgreSQL; run through the lane wrapper"]
+fn step5_connected_drift_and_ledger_refusals_show_each_name_once() {
+    message_boundaries::drift_and_ledger(&server(), true);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; run through the lane wrapper"]
+fn step5_connected_role_refusals_and_by_hand_sql_preserve_identity() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for name in &self.1 {
+                let _ = try_on_server(
+                    &self.0,
+                    &format!(
+                        "DROP ROLE IF EXISTS {}",
+                        message_boundaries::quote(name, true)
+                    ),
+                );
+            }
+        }
+    }
+    let server = server();
+    for (i, suffix) in message_boundaries::CASES
+        .iter()
+        .chain([&r"one\backslash"])
+        .enumerate()
+    {
+        let old = format!("pbps_s5_{}_{}_{}", std::process::id(), i, suffix);
+        let new = format!("{old}next");
+        let _roles = Roles(server.clone(), vec![old.clone(), new.clone()]);
+        let own = OwnDatabase::new(&server, &format!("step5_roles_{i}"));
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&format!("step5-roles-{i}"));
+        d.table(ONE_COLUMN);
+        let file = d.dir.join("schema/reader.yml");
+        let declaration = |name: &str| {
+            format!(
+                "role: {}\ngrants:\n  app.t: [select]\n  schema::app: [usage]\n",
+                message_boundaries::yaml_scalar(name)
+            )
+        };
+        std::fs::write(&file, declaration(&old)).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        message_boundaries::refused(
+            d.run(&["bootstrap", "--db", connection]),
+            &old,
+            "cluster does not have it",
+        );
+        let refusal =
+            pbps_pg::roles::refuse_missing(&pbps_model::RoleName::from(old.as_str())).to_string();
+        let quoted_old = message_boundaries::quote(&old, true);
+        let quoted_new = message_boundaries::quote(&new, true);
+        if refusal.contains("not pasteable") {
+            // The preview is inert. A SQL client must recreate the actual identity.
+            on_server(&server, &format!("CREATE ROLE {quoted_old}"));
+        } else {
+            let (_, statement) = refusal.split_once("\n\n    ").unwrap();
+            assert_eq!(statement, format!("CREATE ROLE {quoted_old};"));
+            on_server(&server, statement);
+        }
+        assert_eq!(
+            scalar(
+                &server,
+                &format!(
+                    "SELECT count(*) FROM pg_roles WHERE rolname = '{}'",
+                    old.replace('\'', "''")
+                )
+            ),
+            1
+        );
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        std::fs::write(&file, declaration(&new)).unwrap();
+        succeeds(d.run(&["rename-role", &old, &new]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        on_server(
+            &server,
+            &format!("ALTER ROLE {quoted_old} RENAME TO {quoted_new}"),
+        );
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        on_server(&server, &format!("CREATE ROLE {quoted_old}"));
+        message_boundaries::refused(
+            apply_plan(&d, connection, &plan, false),
+            &old,
+            "Resolve the name collision",
+        );
+        on_server(&server, &format!("DROP ROLE {quoted_old}"));
+        succeeds(apply_plan(&d, connection, &plan, false));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; run through the lane wrapper"]
+fn step5_connected_module_rebuild_refusals_show_each_name_once() {
+    let server = server();
+    for (i, name) in message_boundaries::CASES.iter().enumerate() {
+        let own = OwnDatabase::new(&server, &format!("step5_modules_{i}"));
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&format!("step5-modules-{i}"));
+        d.table(ONE_COLUMN);
+        let file = d.dir.join("schema/view.yml");
+        let address = message_boundaries::yaml_scalar(&format!("app.{name}"));
+        std::fs::write(
+            &file,
+            format!("view: {address}\ndefinition: SELECT id FROM app.t\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        std::fs::write(
+            &file,
+            format!("view: {address}\ndefinition: SELECT id FROM app.t WHERE id > 0\n"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let qualified = format!("app.{}", message_boundaries::quote(name, true));
+        on_server(
+            connection,
+            &format!("COMMENT ON VIEW {qualified} IS 'keep this operator note'"),
+        );
+        message_boundaries::refused(
+            apply_plan(&d, connection, &plan, false),
+            name,
+            "before_a_rebuild",
+        );
+        on_server(connection, &format!("COMMENT ON VIEW {qualified} IS NULL"));
+        succeeds(apply_plan(&d, connection, &plan, false));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+    for (i, (name, shown)) in [
+        (
+            "child\n\u{1b}[31m\u{202e}名前",
+            r"child\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"child\n\u{1b}[31m\u{202e}名前",
+            r"child\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("child_名前_ünï", "child_名前_ünï"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let own = OwnDatabase::new(&server, &format!("step5_provenance_{i}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app; CREATE VIEW app.root AS SELECT 1 AS id; CREATE VIEW app.{} AS SELECT id FROM app.root",
+                message_boundaries::quote(name, true),
+            ),
+        );
+        let d = Demo::new(&format!("step5-provenance-{i}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let root = d.dir.join("schema/app.root.view.yml");
+        let original = std::fs::read_to_string(&root).unwrap();
+        assert!(original.contains("1 AS id"), "{original}");
+        std::fs::write(&root, original.replace("1 AS id", "2 AS id")).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&succeeds(
+            d.run(&["plan", "--db", connection, "--format", "json"]),
+        )))
+        .unwrap();
+        let origins = report["data"]["origins"].as_array().unwrap();
+        assert_eq!(origins.len(), 2, "{report}");
+        for origin in origins {
+            assert_eq!(origin["role"], "split part");
+            let expected = format!("rule _RETURN on view app.\"{shown}\" depends on `app.root`");
+            assert_eq!(origin["reason"], expected);
+            assert_eq!(origin["source"], format!("app.{name}"));
+            assert!(human.contains(&format!("{expected}\n")), "{human:?}");
+        }
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        let checksum = plan_checksum(&plan);
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "destructive",
+        ]));
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; run through the lane wrapper"]
+fn step5_connected_ordering_refusals_show_subjects_and_descriptions_once() {
+    let server = server();
+    for (i, name) in message_boundaries::CASES.iter().enumerate() {
+        let own = OwnDatabase::new(&server, &format!("step5_order_{i}"));
+        let connection = own.connection();
+        let q = message_boundaries::quote(name, true);
+        let a = message_boundaries::quote("a", true);
+        let b = message_boundaries::quote("b", true);
+        on_server(
+            connection,
+            &format!(
+                "CREATE SCHEMA app; CREATE TABLE app.{q} ({a} integer, {b} integer, g integer GENERATED ALWAYS AS ({a} * 2) STORED, h integer GENERATED ALWAYS AS ({b} * 2) STORED)"
+            ),
+        );
+        let d = Demo::new(&format!("step5-order-{i}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        let (table, spec) = loaded.schema.tables.iter().next().unwrap();
+        let mut spec = spec.clone();
+        for column in ["a", "b"] {
+            spec.columns.get_mut(column).unwrap().ty = "bigint".parse().unwrap();
+        }
+        for (column, input) in [("g", &b), ("h", &a)] {
+            spec.columns.get_mut(column).unwrap().value_source =
+                pbps_model::ValueSource::Generated(pbps_model::Generated {
+                    expression: format!("{input} * 2"),
+                    stored: true,
+                });
+        }
+        let files = pbps_load::schema_files(&d.dir.join("schema")).unwrap();
+        assert_eq!(files.len(), 1);
+        std::fs::write(&files[0], pbps_load::fmt::render(table, &spec, &[], None)).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        message_boundaries::refused(
+            d.run(&["plan", "--db", connection]),
+            name,
+            "wait on one another",
+        );
+    }
+}
+
+/// Opaque ledger reasons retain the pre-step-5 status contract in both formats.
+#[test]
+#[ignore = "needs live pg"]
+fn step5_failed_status_preserves_opaque_ledger_reason_in_text_and_json() {
+    let own = OwnDatabase::new(&server(), "step5_status_reason");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "step5-status-reason", ONE_COLUMN);
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nenvironments:\n  dev:\n    url_env: PBPS_STEP5_STATUS_DB\n",
+    )
+    .unwrap();
+    let reason = "ledger\n\u{1b}[31m\u{202e}opaque\\literal";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+            .await
+            .unwrap();
+        let mut snapshot = pbps_pg::state::latest(&mut conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        snapshot.kind = pbps_model::StateKind::Failed;
+        snapshot.reason = Some(reason.into());
+        snapshot.git_sha = None;
+        snapshot.operator = "status-fixture".into();
+        pbps_pg::state::record(&mut conn, &snapshot).await.unwrap();
+        conn.execute("UPDATE public.__pbps_state SET applied_at = TIMESTAMP '2026-10-23 00:00:00'")
+            .await
+            .unwrap();
+    });
+    let detail = "the last deployment attempt failed: ledger\n\u{1b}[31m\u{202e}opaque\\literal";
+    // The baseline contract deliberately keeps opaque ledger text as recorded.
+    // Escaping it would also double failure prose that was rendered before recording.
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .current_dir(&d.dir)
+            .env("PBPS_STEP5_STATUS_DB", connection)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let text = run(&["status"]);
+    assert_eq!(code(&text), 0, "{}{}", stdout(&text), stderr(&text));
+    assert_eq!(
+        stdout(&text),
+        format!(
+            "ENVIRONMENT  STATE   LAST RECORDED            GIT        BY\ndev          failed  2026-10-23T00:00:00.000  -          status-fixture\n\n  dev: {detail}\n"
+        )
+    );
+    let json = run(&["status", "--format", "json"]);
+    assert_eq!(code(&json), 0, "{}{}", stdout(&json), stderr(&json));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(report["data"][0]["state"], "failed");
+    assert_eq!(report["data"][0]["detail"], detail);
+    assert_eq!(
+        report["findings"][0]["message"],
+        format!("dev: failed — {detail}")
+    );
+    assert_eq!(
+        serde_json::to_string(&report["data"][0]["detail"]).unwrap(),
+        "\"the last deployment attempt failed: ledger\\n\\u001b[31m\u{202e}opaque\\\\literal\""
+    );
+    assert_ne!(
+        report["data"][0]["detail"],
+        pbps_model::escape::Escaped(detail).to_string()
+    );
 }

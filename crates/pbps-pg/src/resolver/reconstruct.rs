@@ -296,7 +296,7 @@ impl Reconstruction {
                     steps.push(step(
                         dialect,
                         Phase::Modules,
-                        &change.subject(),
+                        &pbps_model::escape::Escaped(&change.subject()).to_string(),
                         change,
                         Vec::new(),
                         None,

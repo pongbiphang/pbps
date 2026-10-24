@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! PostgreSQL: the dialect, as far as it is built.
 //!
 //! The counterpart of `pbps-mssql`, and the crate SPEC §11.1's map has been
@@ -160,12 +157,14 @@ fn generation_problems(column: &str, generated: &pbps_model::Generated) -> Vec<D
     if !generated.stored {
         found.push(invalid(format!(
             "column `{column}` is a virtual generated column (`stored: false`), which this model \
-             does not hold; declare `stored: true`"
+             does not hold; declare `stored: true`",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     if crate::LEXICON.expression_in(&generated.expression) == pbps_dialect::Expression::Absent {
         found.push(invalid(format!(
-            "column `{column}` has an empty generation expression"
+            "column `{column}` has an empty generation expression",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     found
@@ -216,8 +215,7 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
                     "`partition_by` names `{column}`, which is not a declared column",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
         }
@@ -227,11 +225,7 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             .map(|k| ("the primary key".to_owned(), &k.columns))
             .chain(table.unique.iter().map(|(n, u)| {
                 (
-                    format!(
-                        "unique constraint `{n}`",
-                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                        n = n.raw(),
-                    ),
+                    format!("unique constraint `{n}`", n = n.shown(),),
                     &u.columns,
                 )
             }));
@@ -241,8 +235,7 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
                     found.push(invalid(format!(
                         "{what} does not include the partition key column `{key}`, which \
                          PostgreSQL requires of every key on a partitioned table",
-                        // raw: whole-message escaped until #2084 step 5.
-                        key = key.raw(),
+                        key = key.shown(),
                     )));
                 }
             }
@@ -300,8 +293,8 @@ fn identity_problems(
             "column `{column}` has an `identity:` on `{}`. This engine says it in so many words: \
              identity column type must be smallint, integer, or bigint. A `numeric` is refused \
              here even with a scale of zero, where SQL Server admits one.",
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            declared.ty.raw()
+            declared.ty.shown(),
+            column = pbps_model::escape::Escaped(column),
         ))),
         // The seed is checked against the sequence's bounds, not the column's:
         // see [`types::identity_seed_range`] for why those are not the same
@@ -311,12 +304,12 @@ fn identity_problems(
              counting by {} starts somewhere in {}..={}: the engine refuses the table with START \
              value ({}) out of the sequence's own bounds.",
             identity.seed,
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            declared.ty.raw(),
+            declared.ty.shown(),
             identity.increment,
             accepted.start(),
             accepted.end(),
-            identity.seed
+            identity.seed,
+            column = pbps_model::escape::Escaped(column),
         ))),
         Some(accepted) => {
             // An exact span can reach both endpoints. PostgreSQL accepts a
@@ -330,10 +323,10 @@ fn identity_problems(
                      but no valid seed can produce a second value; use an increment magnitude \
                      at most {span}.",
                     identity.increment,
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    declared.ty.raw(),
+                    declared.ty.shown(),
                     accepted.start(),
-                    accepted.end()
+                    accepted.end(),
+                    column = pbps_model::escape::Escaped(column),
                 )));
             }
         }
@@ -343,7 +336,8 @@ fn identity_problems(
     if declared.nullable {
         found.push(invalid(format!(
             "column `{column}` has an `identity:`, so it cannot be nullable: the engine refuses \
-             the pair as conflicting NULL/NOT NULL declarations."
+             the pair as conflicting NULL/NOT NULL declarations.",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     // `INCREMENT must not be zero`, and it is worth saying why rather than
@@ -351,7 +345,8 @@ fn identity_problems(
     if identity.increment == 0 {
         found.push(invalid(format!(
             "column `{column}` has an `identity:` with an increment of 0, which never advances: \
-             the engine refuses it as INCREMENT must not be zero."
+             the engine refuses it as INCREMENT must not be zero.",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     found
@@ -385,20 +380,20 @@ fn sequence_problems(
         None => found.push(invalid(format!(
             "column `{column}` has an owned sequence on `{}`; a `serial` column is a smallint, \
              an integer or a bigint",
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            declared.ty.raw()
+            declared.ty.shown(),
+            column = pbps_model::escape::Escaped(column),
         ))),
         Some(accepted) if !accepted.contains(&sequence.start) => found.push(invalid(format!(
             "column `{column}`'s sequence starts at {}, and a sequence on `{}` counting by {} \
              starts somewhere in {}..={}: the engine refuses START value ({}) out of the \
              sequence's own bounds.",
             sequence.start,
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            declared.ty.raw(),
+            declared.ty.shown(),
             sequence.increment,
             accepted.start(),
             accepted.end(),
-            sequence.start
+            sequence.start,
+            column = pbps_model::escape::Escaped(column),
         ))),
         Some(accepted) => {
             let span = i128::from(*accepted.end()) - i128::from(*accepted.start());
@@ -407,8 +402,8 @@ fn sequence_problems(
                     "column `{column}`'s sequence has an increment of {} whose magnitude \
                      exceeds its span {span} for `{}`, so no start can produce a second value",
                     sequence.increment,
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    declared.ty.raw()
+                    declared.ty.shown(),
+                    column = pbps_model::escape::Escaped(column),
                 )));
             }
         }
@@ -416,21 +411,24 @@ fn sequence_problems(
     if sequence.increment == 0 {
         found.push(invalid(format!(
             "column `{column}`'s sequence has an increment of 0, which never advances: the \
-             engine refuses it as INCREMENT must not be zero."
+             engine refuses it as INCREMENT must not be zero.",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     // `serial` makes the column NOT NULL; a NULL in it is a row the sequence
     // was never asked for.
     if declared.nullable {
         found.push(invalid(format!(
-            "column `{column}` is a `serial`, which is NOT NULL; leave out `nullable: true`"
+            "column `{column}` is a `serial`, which is NOT NULL; leave out `nullable: true`",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     // Only the parent owns the sequence; a partition declares no serial of
     // its own, even though the engine copies the parent's default (#2217).
     if table.partition_of.is_some() {
         found.push(invalid(format!(
-            "column `{column}` is a `serial` on a partition; declare it on the partitioned parent"
+            "column `{column}` is a `serial` on a partition; declare it on the partitioned parent",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     if let Some(named) = &sequence.name {
@@ -443,7 +441,9 @@ fn sequence_problems(
         if *named == generated_name(&table_name.name, Some(column), "seq") {
             found.push(invalid(format!(
                 "column `{column}`'s sequence is named `{named}`, the name the engine generates; \
-                 leave out `name:`"
+                 leave out `name:`",
+                column = pbps_model::escape::Escaped(column),
+                named = pbps_model::escape::Escaped(named),
             )));
         }
         // The engine truncates a longer name to 63 bytes with a notice, and
@@ -451,7 +451,9 @@ fn sequence_problems(
         if named.len() > 63 {
             found.push(invalid(format!(
                 "column `{column}`'s sequence name `{named}` is longer than 63 bytes, which the \
-                 engine truncates"
+                 engine truncates",
+                column = pbps_model::escape::Escaped(column),
+                named = pbps_model::escape::Escaped(named),
             )));
         }
     }
@@ -492,15 +494,15 @@ fn options_problems(
                  {}..={}: the engine refuses it",
                 held.start(),
                 held.end(),
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                ty = ty.raw(),
+                ty = ty.shown(),
+                column = pbps_model::escape::Escaped(column),
             )));
         } else if value == own {
             found.push(invalid(format!(
                 "column `{column}`: {what} has `{name}: {value}`, which is already the \
                  engine's {name} for `{ty}` counting by {increment}; leave out `{name}:`",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                ty = ty.raw(),
+                ty = ty.shown(),
+                column = pbps_model::escape::Escaped(column),
             )));
         }
     }
@@ -509,19 +511,22 @@ fn options_problems(
     if low >= high {
         found.push(invalid(format!(
             "column `{column}`: {what} runs {low}..={high}, and its minimum must be below its \
-             maximum: the engine refuses MINVALUE ({low}) must be less than MAXVALUE ({high})"
+             maximum: the engine refuses MINVALUE ({low}) must be less than MAXVALUE ({high})",
+            column = pbps_model::escape::Escaped(column),
         )));
     }
     if let Some(cache) = options.cache {
         if cache < 1 {
             found.push(invalid(format!(
                 "column `{column}`: {what} has `cache: {cache}`, and a cache holds at least \
-                 one number: the engine refuses CACHE ({cache}) must be greater than zero"
+                 one number: the engine refuses CACHE ({cache}) must be greater than zero",
+                column = pbps_model::escape::Escaped(column),
             )));
         } else if cache == 1 {
             found.push(invalid(format!(
                 "column `{column}`: {what} has `cache: 1`, which is already the engine's; \
-                 leave out `cache:`"
+                 leave out `cache:`",
+                column = pbps_model::escape::Escaped(column),
             )));
         }
     }
@@ -538,21 +543,13 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
         && pk.columns.iter().any(|c| c.raw() == column)
     {
         keys.push(match &pk.name {
-            Some(name) => format!(
-                "primary key `{name}`",
-                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                name = name.raw(),
-            ),
+            Some(name) => format!("primary key `{name}`", name = name.shown(),),
             None => "the primary key".to_owned(),
         });
     }
     for (name, unique) in &table.unique {
         if unique.columns.iter().any(|c| c.raw() == column) {
-            keys.push(format!(
-                "unique constraint `{name}`",
-                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                name = name.raw(),
-            ));
+            keys.push(format!("unique constraint `{name}`", name = name.shown(),));
         }
     }
     for (name, index) in &table.indexes {
@@ -562,11 +559,7 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
                 .iter()
                 .any(|c| c.key.column().is_some_and(|c| c.raw() == column))
         {
-            keys.push(format!(
-                "unique index `{name}`",
-                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                name = name.raw(),
-            ));
+            keys.push(format!("unique index `{name}`", name = name.shown(),));
         }
     }
     keys.into_iter()
@@ -575,7 +568,8 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
             message: format!(
                 "column `{column}` has `cycle: true` and is under {key}: once its sequence \
                  wraps it hands out a number a row already holds, and the insert fails on that \
-                 key. Leave out `cycle:`, or take the column out of the key"
+                 key. Leave out `cycle:`, or take the column out of the key",
+                column = pbps_model::escape::Escaped(column),
             ),
         })
         .collect()
@@ -617,12 +611,9 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
                          expression over it: whether a number the sequence hands out again \
                          collides there depends on what the expression gives back, which is \
                          not checked",
-                        // raw: declaration notes are escaped whole until #2084 step 5.
-                        table_name.raw(),
-                        // raw: declaration notes are escaped whole until #2084 step 5.
-                        column = column.raw(),
-                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                        name = name.raw(),
+                        table_name.shown(),
+                        column = column.shown(),
+                        name = name.shown(),
                     ));
                 }
             }
@@ -859,7 +850,9 @@ fn default_problems(
                  column reads back with none. Every plan would set it again and the \
                  check of what the apply left behind would refuse the column. A \
                  column with no default already defaults to NULL here: declare no \
-                 default."
+                 default.",
+                column_name = pbps_model::escape::Escaped(column_name),
+                expr = pbps_model::escape::Escaped(expr),
             ),
         });
     }
@@ -1478,8 +1471,7 @@ impl Dialect for Postgres {
                 message: format!(
                     "{own} `{name}` is named as its parent's {kind}, which the partition already \
                      has under that name; name it otherwise",
-                    // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                    name = name.raw(),
+                    name = name.shown(),
                 ),
             });
         }
@@ -1497,10 +1489,8 @@ impl Dialect for Postgres {
                         "foreign key `{name}` is its parent's `{parents}` again, which the \
                          partition already has as a clone, and which the engine may take it \
                          for; declare it on the parent only",
-                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                        name = name.raw(),
-                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
-                        parents = parents.raw(),
+                        name = name.shown(),
+                        parents = parents.shown(),
                     ),
                 });
             }
@@ -1528,8 +1518,7 @@ impl Dialect for Postgres {
                 found.push(invalid(format!(
                     "column `{column}` is not a column of its parent, whose columns are the \
                      partition's",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
                 continue;
             };
@@ -1537,8 +1526,7 @@ impl Dialect for Postgres {
                 found.push(invalid(format!(
                     "column `{column}` is NOT NULL on its parent already, which the partition \
                      takes; leave out its `nullable: false`",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
             let Some(default) = &own.default else {
@@ -1551,8 +1539,7 @@ impl Dialect for Postgres {
                         if parent_default == default {
                             found.push(invalid(format!(
                                 "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column = column.raw(),
+                                column = column.shown(),
                             )));
                         }
                     }
@@ -1571,21 +1558,18 @@ impl Dialect for Postgres {
                 };
                 found.push(invalid(format!(
                     "column `{column}` is {kind} on its parent, and takes no default of the partition's own",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
             if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
                 found.push(invalid(format!(
                     "column `{column}` has an empty default expression",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
             // As a column's default is held, against the parent's column,
             // whose type the partition's is.
             if let Ok(normalized) = types::normalize(&theirs.ty) {
-                // Raw validation sentence, escaped whole until #2084 step 5.
                 found.extend(default_problems(column.raw(), theirs, &normalized, default));
             }
         }
@@ -1635,12 +1619,12 @@ impl Dialect for Postgres {
                 ));
             }
             for (policy_name, policy) in &table.row_policies {
-                found.extend(
-                    policy
-                        .problems()
-                        .into_iter()
-                        .map(|problem| invalid(format!("row policy `{policy_name}`: {problem}"))),
-                );
+                found.extend(policy.problems().into_iter().map(|problem| {
+                    invalid(format!(
+                        "row policy `{policy_name}`: {problem}",
+                        policy_name = pbps_model::escape::Escaped(policy_name),
+                    ))
+                }));
                 if let Err(error) = self.quote_ident(policy_name) {
                     found.push(error);
                 }
@@ -1661,8 +1645,7 @@ impl Dialect for Postgres {
                 message: format!(
                     "`{computed}` is a computed column, which this model holds for SQL Server; \
                      declare it as a column with `generated:` on PostgreSQL",
-                    // raw: whole-message escaped until #2084 step 5.
-                    computed = computed.raw(),
+                    computed = computed.shown(),
                 ),
             });
         }
@@ -1690,10 +1673,8 @@ impl Dialect for Postgres {
                             "`data:` cannot be declared on a table with an array column, and \
                              `{column}` is `{}`; declare the rows elsewhere, or leave the block \
                              out",
-                            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                            spec.ty.raw(),
-                            // raw: whole-message escaped until #2084 step 5.
-                            column = column.raw(),
+                            spec.ty.shown(),
+                            column = column.shown(),
                         ),
                     });
                 }
@@ -1751,7 +1732,8 @@ impl Dialect for Postgres {
                      every unqualified name in its checks, filters and defaults would resolve \
                      through whatever schema the deploying role owns. Declare it under a name \
                      the path can carry.",
-                    name = name.raw()
+                    name = name.shown(),
+                    schema = pbps_model::escape::Escaped(schema),
                 ),
             });
         }
@@ -1767,7 +1749,8 @@ impl Dialect for Postgres {
                      the session's temporary schema: measured, `CREATE TABLE \"pg_temp\".\"t\"` \
                      leaves a `pg_temp_58.t` that disappears with the connection. Declare the \
                      table in a schema of the project's own.",
-                    name = name.raw()
+                    name = name.shown(),
+                    schema = pbps_model::escape::Escaped(schema),
                 ),
             });
         }
@@ -1781,7 +1764,7 @@ impl Dialect for Postgres {
                      Only those names in schema `{}` are reserved; the same table name in \
                      another project schema is read back normally.",
                     crate::state::LEDGER_SCHEMA,
-                    name = name.raw()
+                    name = name.shown()
                 ),
             });
         }
@@ -1827,8 +1810,7 @@ impl Dialect for Postgres {
                              be NOT NULL. This engine does not refuse the table -- it sets \
                              `NOT NULL` for you -- and then no plan can ever make the column match \
                              the declaration again.",
-                            // raw: whole-message escaped until #2084 step 5.
-                            column = column.raw(),
+                            column = column.shown(),
                         ),
                     });
                 }
@@ -1839,7 +1821,6 @@ impl Dialect for Postgres {
             if let Err(e) = self.quote_ident(column_name.raw()) {
                 found.push(e);
             }
-            // Raw validation sentence, escaped whole until #2084 step 5.
             if let Some(named) = types::refuse_serial(&column.ty, Some(column_name.raw())) {
                 found.push(named);
                 // Everything below asks a question about the type, and asking
@@ -1877,7 +1858,6 @@ impl Dialect for Postgres {
                     pbps_model::ValueSource::None => {}
                     pbps_model::ValueSource::Default(expr) => {
                         found.extend(default_problems(
-                            // Raw validation sentence, escaped whole until #2084 step 5.
                             column_name.raw(),
                             column,
                             &normalized,
@@ -1885,17 +1865,14 @@ impl Dialect for Postgres {
                         ));
                     }
                     pbps_model::ValueSource::Identity(identity) => {
-                        // Raw validation sentence, escaped whole until #2084 step 5.
                         found.extend(identity_problems(column_name.raw(), column, identity));
                         if identity.options.cycle {
-                            // Raw validation sentence, escaped whole until #2084 step 5.
                             found.extend(cycle_problems(table, column_name.raw()));
                         }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
                     }
@@ -1905,27 +1882,23 @@ impl Dialect for Postgres {
                         found.extend(sequence_problems(
                             name,
                             table,
-                            // Raw validation sentence, escaped whole until #2084 step 5.
                             column_name.raw(),
                             column,
                             sequence,
                         ));
                         if sequence.options.cycle {
-                            // Raw validation sentence, escaped whole until #2084 step 5.
                             found.extend(cycle_problems(table, column_name.raw()));
                         }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` is a `serial` and has a `default:`; its default is its sequence's `nextval`",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
                         if has_identity {
                             found.push(invalid(format!(
                                 "column `{column_name}` is both a `serial` and an identity; the engine refuses an identity on a column that has a default",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
                     }
@@ -1933,25 +1906,21 @@ impl Dialect for Postgres {
                         if has_sequence {
                             found.push(invalid(format!(
                                 "column `{column_name}` is both a `serial` and a generated column",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
                         if has_default {
                             found.push(invalid(format!(
                                 "column `{column_name}` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
                         if has_identity {
                             found.push(invalid(format!(
                                 "column `{column_name}` is both an identity and a generated column",
-                                // raw: whole-message escaped until #2084 step 5.
-                                column_name = column_name.raw(),
+                                column_name = column_name.shown(),
                             )));
                         }
-                        // Raw validation sentence, escaped whole until #2084 step 5.
                         found.extend(generation_problems(column_name.raw(), generated));
                     }
                 }

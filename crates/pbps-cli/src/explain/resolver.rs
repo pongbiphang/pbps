@@ -57,7 +57,7 @@ pub struct Limitation {
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct SurfaceVerdict {
     /// Its kind and name, such as `default app.t.c`.
-    pub surface: Text,
+    pub surface: String,
     /// `unaffected`, `rebuilt`, `created` or `removed`.
     pub verdict: &'static str,
 }
@@ -210,32 +210,28 @@ fn surface_verdict(resolution: &SurfaceResolution) -> SurfaceVerdict {
         (None, None) => "absent",
     };
     SurfaceVerdict {
-        surface: Text::new(surface(&resolution.surface)),
+        surface: surface(&resolution.surface),
         verdict,
     }
 }
 
 fn surface(surface: &Surface) -> String {
-    // This becomes Text and JSON; rendering escapes it once. Keep the input
-    // raw until #2084 step 5 (DEC-2084.1) removes the shared-sentence boundary.
     match surface {
-        Surface::Namespace(name) => format!("schema {name}"),
-        Surface::Table(table) => format!("table {table}", table = table.raw()),
-        Surface::Column(column) => format!("column {column}", column = column.raw()),
-        Surface::Default(column) => format!("default {column}", column = column.raw()),
+        Surface::Namespace(name) => format!("schema {}", Escaped(name)),
+        Surface::Table(table) => format!("table {table}", table = table.shown()),
+        Surface::Column(column) => format!("column {column}", column = column.shown()),
+        Surface::Default(column) => format!("default {column}", column = column.shown()),
         Surface::Check { table, name } => format!(
             "check {table}.{name}",
-            table = table.raw(),
-            // Shared JSON/Text surface; rendering escapes once until #2084 step 5.
-            name = name.raw(),
+            table = table.shown(),
+            name = name.shown(),
         ),
         Surface::Index { table, name } => format!(
             "index {table}.{name}",
-            table = table.raw(),
-            // Shared JSON/Text surface; rendering escapes once until #2084 step 5.
-            name = name.raw(),
+            table = table.shown(),
+            name = name.shown(),
         ),
-        Surface::Module(module) => format!("module {module}", module = module.raw()),
+        Surface::Module(module) => format!("module {module}", module = module.shown()),
     }
 }
 
@@ -255,8 +251,8 @@ fn reason(reason: OrderReason) -> &'static str {
 /// write said after it.
 ///
 /// The entry and the image are the plan's text, a [`Text`] shown escaped
-/// (DEC-2032.1, #2035); the rest of this module's text is escaped for the same
-/// reason, and [`ResolverDetail`] itself stays raw because it is also the JSON.
+/// (DEC-2032.1, #2035). Structured resolver identities retain their original
+/// bytes; surface descriptions are rendered prose in every format (DEC-2084.1).
 pub fn line(detail: &ResolverDetail) -> String {
     let mut out = format!(
         "{} ({} scratch, {})",
@@ -306,8 +302,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
     for surface in &detail.surfaces {
         out.push_str(&format!(
             "    {:<11} {}\n",
-            surface.verdict,
-            surface.surface.shown()
+            surface.verdict, surface.surface
         ));
     }
     if !detail.order.is_empty() {
@@ -371,7 +366,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
 #[cfg(test)]
 mod tests {
     #[test]
-    fn surface_descriptions_keep_raw_json_and_are_shown_once() {
+    fn surface_descriptions_are_shown_prose_in_every_format() {
         let part = "a\nb\\c\u{200b}";
         let shown = r"a\nb\\c\u{200b}";
         let table = pbps_model::TableName::new("app", part);
@@ -408,9 +403,10 @@ mod tests {
                 format!("index app.{shown}.{shown}"),
             ),
         ] {
-            let raw = Text::new(surface(&subject));
-            assert_eq!(raw.raw(), expected);
-            assert_eq!(raw.shown().to_string(), escaped);
+            let prose = surface(&subject);
+            assert_eq!(prose, escaped);
+            assert_ne!(prose, expected);
+            assert_eq!(serde_json::to_value(&prose).unwrap(), escaped);
         }
         let ordinary = Surface::Table(pbps_model::TableName::new("app", "名前"));
         assert_eq!(
@@ -586,7 +582,7 @@ mod tests {
                 description: text.into(),
             }];
             d.surfaces = vec![SurfaceVerdict {
-                surface: format!("table app.{text}").into(),
+                surface: surface(&Surface::Table(pbps_model::TableName::new("app", text))),
                 verdict: "created",
             }];
             d.prerequisites = vec![PrerequisiteDetail {

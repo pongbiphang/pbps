@@ -204,7 +204,7 @@ where
 }
 
 #[test]
-fn role_refusals_escape_roles_and_grant_targets_once_at_the_whole_message_boundary() {
+fn role_refusals_show_roles_and_grant_targets_once() {
     let name = RoleName::from(NAME);
     let role = Role {
         grants: [(
@@ -223,10 +223,15 @@ fn role_refusals_escape_roles_and_grant_targets_once_at_the_whole_message_bounda
         )
     );
     assert!(pbps_pg::roles::unsupported_permissions(180006, &name, &role).is_empty());
+    let preview = NAME
+        .split('\\')
+        .map(|part| pbps_model::escape::Escaped(part).to_string())
+        .collect::<Vec<_>>()
+        .join("\\");
     assert_eq!(
         pbps_pg::roles::refuse_missing(&name).to_string(),
         format!(
-            "postgres: role `{SHOWN}` is declared here and the cluster does not have it. A PostgreSQL role is a cluster object, so pbps manages what a role is granted in this database and not whether the role exists (ADR-0010 section 3). Run it by hand, then plan again:\n\n    CREATE ROLE \"{SHOWN}\";"
+            "postgres: role `{SHOWN}` is declared here and the cluster does not have it. A PostgreSQL role is a cluster object, so pbps manages what a role is granted in this database and not whether the role exists (ADR-0010 section 3). Statement preview only (not pasteable: the identifier contains controls or invisible characters):\n\n    CREATE ROLE \"{preview}\";\n\nRecreate the original identifier with your SQL client, then plan again."
         )
     );
 }

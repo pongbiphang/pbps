@@ -1,6 +1,3 @@
-// Catalog refusal/detail sentences are prose beside rendered type errors.
-// Show names once until #2084 step 5 (DEC-2084.1); typed targets stay raw.
-
 //! Reading a live PostgreSQL back into the model: the pure half.
 //!
 //! The split is [`crate::catalog`]'s doc comment's, and it is the one the SQL

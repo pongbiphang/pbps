@@ -134,7 +134,7 @@ pub fn unmanaged_refusal(
                 ..
             } => format!(
                 "- {} -- explicitly remove or replace this policy in the declarations",
-                d.described
+                pbps_model::escape::Escaped(&d.described)
             ),
             Holds::TablePart {
                 part: Part::Generated(_),
@@ -181,5 +181,50 @@ impl PolicyDependent {
             .tables
             .get(&self.table)
             .is_some_and(|table| table.row_policies.contains_key(&self.name))
+    }
+}
+
+#[cfg(test)]
+mod policy_message_tests {
+    use super::*;
+
+    #[test]
+    fn unmanaged_policy_refusals_show_descriptions_once_and_keep_raw_keys() {
+        let id: ModuleId = "app.gate()".parse().unwrap();
+        for (raw, shown) in [
+            (
+                "policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\n\u{1b}[31m\u{202e}名前",
+            ),
+            (
+                r"policy\n\u{1b}[31m\u{202e}名前",
+                r"policy\\n\\u{1b}[31m\\u{202e}名前",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let dependent = Dependent {
+                described: raw.into(),
+                holds: Holds::TablePart {
+                    table: pbps_model::TableName::new("app", "t"),
+                    part: Part::Policy(raw.into()),
+                },
+            };
+            assert_eq!(
+                unmanaged_refusal(&id, std::slice::from_ref(&dependent), &Schema::default())
+                    .unwrap(),
+                format!(
+                    "`app.gate()` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so the change is a drop \
+                     and a create (ADR-0009 section 3), and these objects depend on it and this project could not \
+                     put them back:\n- {shown} -- explicitly remove or replace this policy in the declarations\nThe plan names every object it drops, or it does not drop \
+                     (SPEC 14.3), so `DROP ... CASCADE` is not offered. Declare them, or remove the \
+                     dependency, and plan again."
+                )
+            );
+            assert_eq!(dependent.described, raw);
+            assert!(
+                matches!(&dependent.holds, Holds::TablePart { part: Part::Policy(name), .. } if name == raw)
+            );
+        }
+        assert!(unmanaged_refusal(&id, &[], &Schema::default()).is_none());
     }
 }

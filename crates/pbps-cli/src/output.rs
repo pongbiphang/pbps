@@ -73,8 +73,6 @@ pub struct Finding {
     pub severity: Severity,
 
     /// What is wrong, in the user's vocabulary.
-    // Prose in every format until #2084 step 5 (DEC-2084.1): producers show
-    // names once beside error displays; renderers print this sentence as is.
     pub message: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,8 +388,6 @@ pub fn human(findings: &[Finding]) -> String {
             Severity::Warning => "warning",
             Severity::Note => "note",
         };
-        // Prose already contains shown names and escaped error displays.
-        // A whole-message pass would double them (#2084 step 5, DEC-2084.1).
         out.push_str(&format!("  {where_}{label}: {}\n", f.message));
         if let Some(r) = &f.remedy {
             out.push_str(&format!("    {r}\n"));
@@ -414,7 +410,10 @@ mod tests {
             let table = pbps_model::TableName::new("app", part);
             let error = pbps_dialect::DialectError::Invalid {
                 dialect: "test",
-                message: format!("column `{part}` is invalid"),
+                message: format!(
+                    "column `{}` is invalid",
+                    pbps_model::ColumnName::from(part).shown()
+                ),
             };
             let finding = super::Finding::error(
                 "dialect.rejected",

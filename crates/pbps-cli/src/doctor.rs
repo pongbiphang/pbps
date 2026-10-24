@@ -1467,8 +1467,6 @@ const NAMED: usize = 3;
 /// The partitioned parents' findings (#1789, DEC-1789.2), all warnings: a
 /// series about to run out, or rows in the DEFAULT, stops no deployment, and a
 /// question that could not be asked is not a clean bill either.
-// Names in diagnosis prose are shown once in every format until #2084 step 5
-// (DEC-2084.1); pasteable arguments below keep their raw spelling.
 fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
     use pbps_db::doctor::{DefaultRows, Reach, Runway};
     let recheck = || format!("pbps doctor {}", target_arg(d));

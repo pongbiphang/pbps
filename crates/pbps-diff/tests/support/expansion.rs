@@ -151,7 +151,7 @@ impl State {
                     {
                         return Err(format!(
                             "{rule}: respelling `{}` changed what kind of step it is",
-                            old.change.subject()
+                            pbps_model::escape::Escaped(&old.change.subject())
                         ));
                     }
                     *old = change;

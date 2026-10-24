@@ -1,6 +1,3 @@
-// Default-check warnings can include escaped database errors: their names are
-// shown once in prose until #2084 step 5 (DEC-2084.1).
-
 //! The catalog queries behind [`crate::introspect`].
 //!
 //! Only this file runs SQL against a live server; it converts `pg_catalog` rows
@@ -3167,10 +3164,8 @@ async fn ask_about_partition_defaults(
                 out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its declared text may name a \
                      temporary schema, whose objects another session can change",
-                    // raw: shared warning is escaped by its human writers until #2084 step 5.
-                    partition = partition.raw(),
-                    // raw: shared warning is escaped by its human writers until #2084 step 5.
-                    column = column.raw(),
+                    partition = partition.shown(),
+                    column = column.shown(),
                 ));
                 continue;
             }
@@ -3186,12 +3181,9 @@ async fn ask_about_partition_defaults(
                 Err(_) => out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its type `{}` is not one this \
                      check can create a column of",
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    theirs.ty.raw(),
-                    // raw: shared warning is escaped by its human writers until #2084 step 5.
-                    partition = partition.raw(),
-                    // raw: shared warning is escaped by its human writers until #2084 step 5.
-                    column = column.raw(),
+                    theirs.ty.shown(),
+                    partition = partition.shown(),
+                    column = column.shown(),
                 )),
             }
         }
@@ -3269,10 +3261,8 @@ async fn ask_about_partition_defaults(
         out.defaults_unasked.extend(asked.iter().map(|d| {
             format!(
                 "partition {} column `{}`: {why}",
-                // raw: shared warning is escaped by its human writers until #2084 step 5.
-                d.partition.raw(),
-                // raw: shared warning is escaped by its human writers until #2084 step 5.
-                d.column.raw()
+                d.partition.shown(),
+                d.column.shown()
             )
         }));
         return;
@@ -3296,10 +3286,8 @@ async fn ask_about_partition_defaults(
                     Ok(_) => {}
                     Err(why) => out.defaults_unasked.push(format!(
                         "partition {} column `{}`: {why}",
-                        // raw: shared warning is escaped by its human writers until #2084 step 5.
-                        d.partition.raw(),
-                        // raw: shared warning is escaped by its human writers until #2084 step 5.
-                        d.column.raw()
+                        d.partition.shown(),
+                        d.column.shown()
                     )),
                 }
             }
@@ -3307,10 +3295,8 @@ async fn ask_about_partition_defaults(
         Err(why) => out.defaults_unasked.extend(asked.iter().map(|d| {
             format!(
                 "partition {} column `{}`: {why}",
-                // raw: shared warning is escaped by its human writers until #2084 step 5.
-                d.partition.raw(),
-                // raw: shared warning is escaped by its human writers until #2084 step 5.
-                d.column.raw()
+                d.partition.shown(),
+                d.column.shown()
             )
         })),
     }

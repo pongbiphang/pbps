@@ -3116,6 +3116,20 @@ fn a_system_versioned_table_round_trips_through_the_cli() {
 #[test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
 fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
+    late_history_name("t_history");
+}
+
+#[test]
+#[ignore = "needs a live SQL Server; run through the lane wrapper"]
+fn step5_connected_history_refusals_show_each_name_once() {
+    for name in message_boundaries::CASES {
+        late_history_name(name);
+    }
+}
+
+fn late_history_name(name: &str) {
+    let quoted = message_boundaries::quote(name, false);
+    let shown = pbps_model::escape::Escaped(name).to_string();
     let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
     let own = OwnDatabase::new(&server, "temporal1176_late");
     on_server(
@@ -3129,7 +3143,7 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
     ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
     std::fs::write(
         d.dir.join("schema/dbo.t.yml"),
-        "table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\n  vf: {type: datetime2(7), nullable: false}\n  vt: {type: datetime2(7), nullable: false}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: dbo.t_history\n",
+        format!("table: dbo.t\ncolumns:\n  id: {{type: int, nullable: false}}\n  vf: {{type: datetime2(7), nullable: false}}\n  vt: {{type: datetime2(7), nullable: false}}\n\nprimary_key: [id]\n\nsystem_time:\n  period: [vf, vt]\n  versioning:\n    history: {}\n", message_boundaries::yaml_scalar(&format!("dbo.{name}"))),
     )
     .unwrap();
     ok(&d.run(&["plan"]));
@@ -3154,9 +3168,9 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
     // Now, and adoptable: matching columns, and a clustered index.
     on_server(
         own.connection(),
-        "CREATE TABLE dbo.t_history (id int NOT NULL, vf datetime2 NOT NULL, vt datetime2 NOT NULL);
-         CREATE CLUSTERED INDEX ix_t_history ON dbo.t_history (vt, vf);
-         INSERT dbo.t_history VALUES (7, '2000-01-01', '2001-01-01');",
+        &format!("CREATE TABLE dbo.{quoted} (id int NOT NULL, vf datetime2 NOT NULL, vt datetime2 NOT NULL);
+         CREATE CLUSTERED INDEX ix_t_history ON dbo.{quoted} (vt, vf);
+         INSERT dbo.{quoted} VALUES (7, '2000-01-01', '2001-01-01');"),
     );
     for (path, extra) in [(&transactional, None), (&staged, Some("--staged"))] {
         let checksum = plan_checksum(path);
@@ -3173,15 +3187,19 @@ fn a_history_name_taken_after_the_plan_is_refused_at_apply() {
         let refused = d.run(&args);
         assert_ne!(code(&refused), 0, "{extra:?}: {}", stdout(&refused));
         assert!(
-            stderr(&refused).contains("dbo.t names dbo.t_history as its history table"),
+            stderr(&refused).contains(&format!("dbo.t names dbo.{shown} as its history table")),
             "{extra:?}: {}",
             stderr(&refused)
         );
+        message_boundaries::refused(refused, name, "as its history table");
         on_server(
             own.connection(),
-            "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'the table was created', 1;
-             IF (SELECT temporal_type FROM sys.tables WHERE name = 't_history') <> 0
+            &format!(
+                "IF OBJECT_ID('dbo.t') IS NOT NULL THROW 50000, 'the table was created', 1;
+             IF (SELECT temporal_type FROM sys.tables WHERE name = N'{}') <> 0
                  THROW 50000, 'the table was adopted', 1;",
+                name.replace('\'', "''")
+            ),
         );
     }
 }
@@ -23225,4 +23243,13 @@ fn state_history_matches_an_unrecorded_column_to_its_later_recorded_uid() {
 #[ignore = "needs live mssql"]
 fn state_history_diffs_omit_unrecorded_public_execution_policy_and_report_the_limit() {
     state_history::public_execution_is_unknown(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[path = "support/message_boundaries.rs"]
+mod message_boundaries;
+
+#[test]
+#[ignore = "needs a live SQL Server; run through the lane wrapper"]
+fn step5_connected_drift_and_ledger_refusals_show_each_name_once() {
+    message_boundaries::drift_and_ledger(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }

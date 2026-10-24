@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! What SQL Server will refuse, checked before anything is generated.
 //!
 //! These are the errors worth catching in `pbps validate`, where the user sees
@@ -86,8 +83,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
         };
         errs.push(invalid(format!(
             "role `{name}` cannot contain {reason}",
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         )));
     }
     if FIXED_ROLES
@@ -97,8 +93,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
         errs.push(invalid(format!(
             "`{name}` is a built-in database role, which cannot be created, dropped or renamed; \
              declare a role of your own and grant to that",
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         )));
     }
     for (target, permissions) in &role.grants {
@@ -114,10 +109,9 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                 errs.push(invalid(format!(
                     "role `{name}`: `{r}` names an argument list; SQL Server identifies a routine \
                      by name alone, so grant on `{}` instead",
-                    r.name.raw(),
-                    r = r.raw(),
-                    // Whole-message escaping remains until #2084 step 5.
-                    name = name.raw(),
+                    r.name.shown(),
+                    r = r.shown(),
+                    name = name.shown(),
                 )));
                 vec![&r.name.schema, &r.name.name]
             }
@@ -141,10 +135,8 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                 "role `{name}`: `{}` on `{target}` is not a permission SQL Server has; it is                  PostgreSQL's (ADR-0010 §6), and this engine takes {}",
                 p.as_str(),
                 permission_words(),
-                // Whole-message escaping remains until #2084 step 5.
-                target = target.raw(),
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
+                target = target.shown(),
+                name = name.shown(),
             )));
         }
         // `GRANT EXECUTE` on a table, `GRANT SELECT` on a procedure: the
@@ -163,7 +155,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
             errs.push(invalid(format!(
                 "grants on `{object}`, a trigger, which takes no permission at all: the engine \
                  has none on triggers — grant on the table it fires on instead",
-                object = object.raw()
+                object = object.shown()
             )));
             continue;
         };
@@ -180,7 +172,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    object = object.raw()
+                    object = object.shown()
                 )));
             }
         }
@@ -417,14 +409,14 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
     // thing for the whole-schema check; this one catches a module that
     // reached the emitter another way — a saved plan, a state snapshot.
     if let Some(args) = id.args() {
-        let spelled: Vec<String> = args.iter().map(|arg| arg.raw().to_owned()).collect();
+        let spelled: Vec<String> = args.iter().map(|arg| arg.shown().to_string()).collect();
         errs.push(invalid(format!(
             "{} `{name}` is declared with the argument list `({})`; SQL Server identifies a {} by \
              name alone",
             module.kind,
             spelled.join(","),
             module.kind,
-            name = name.raw()
+            name = name.shown()
         )));
     }
 
@@ -433,7 +425,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
         errs.push(invalid(format!(
             "{} `{name}` has an empty definition",
             module.kind,
-            name = name.raw()
+            name = name.shown()
         )));
     }
 
@@ -453,7 +445,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
             "{} `{name}` contains a `GO` batch separator; a module is one batch, and `GO` is a \
              client instruction rather than something the server understands",
             module.kind,
-            name = name.raw()
+            name = name.shown()
         )));
     }
 
@@ -473,7 +465,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
             "{} `{name}` is declared WITH ENCRYPTION, whose definition cannot be read back; \
              pbps cannot manage it (ADR-0002)",
             module.kind,
-            name = name.raw()
+            name = name.shown()
         )));
     }
 
@@ -487,12 +479,12 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
         }
         (ModuleKind::Trigger, _) => errs.push(invalid(format!(
             "trigger `{name}` does not say which table it is on (`on:`)",
-            name = name.raw()
+            name = name.shown()
         ))),
         (kind, ModuleId::Trigger { on, .. }) => errs.push(invalid(format!(
             "`{name}` is a {kind} and cannot be `on: {on}`; only a trigger names a table",
-            name = name.raw(),
-            on = on.raw()
+            name = name.shown(),
+            on = on.shown()
         ))),
         (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
     }
@@ -529,13 +521,9 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
                          `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
                          one (1764). If it does read it, declare `{column}` with \
                          `persisted: true`; `plan --dev` asks the engine before anything runs",
-                        // Raw: `validate` escapes the whole note once, as it
-                        // does every declaration note.
-                        name = name.raw(),
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
-                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                        check = check.raw(),
+                        name = name.shown(),
+                        column = column.shown(),
+                        check = check.shown(),
                     ));
                 }
             }
@@ -672,21 +660,13 @@ pub(crate) fn table_sources(
         .map(|pk| ("the primary key".to_owned(), &pk.storage_parameters))
         .chain(table.unique.iter().map(|(n, u)| {
             (
-                format!(
-                    "unique constraint `{n}`",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
-                ),
+                format!("unique constraint `{n}`", n = n.shown(),),
                 &u.storage_parameters,
             )
         }))
         .chain(table.indexes.iter().map(|(n, ix)| {
             (
-                format!(
-                    "index `{n}`",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
-                ),
+                format!("index `{n}`", n = n.shown(),),
                 &ix.storage_parameters,
             )
         }));
@@ -726,15 +706,13 @@ pub(crate) fn table_sources(
             match source {
                 pbps_model::ValueSource::Generated(_) => errs.push(invalid(format!(
                     "column `{col_name}` is a generated column, which this model holds for PostgreSQL only",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 ))),
                 // PostgreSQL's `serial` (#1631): SQL Server numbers a column
                 // with an `identity:`.
                 pbps_model::ValueSource::Sequence(_) => errs.push(invalid(format!(
                     "column `{col_name}` is a `serial`, which this model holds for PostgreSQL only; declare an `identity:`",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 ))),
                 pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) | pbps_model::ValueSource::Identity(_) => {}
             }
@@ -759,10 +737,8 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "column `{col_name}` is `{}`, which takes no collation; only character \
                      types do",
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    col.ty.raw(),
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col.ty.shown(),
+                    col_name = col_name.shown(),
                 )));
             }
             if let Err(e) = crate::emit::collate_clause(Some(collation)) {
@@ -781,24 +757,20 @@ pub(crate) fn table_sources(
             if !types::can_be_identity(&col.ty) {
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, which needs an integer type or a decimal with scale 0, not `{}`",
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    col.ty.raw(),
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col.ty.shown(),
+                    col_name = col_name.shown(),
                 )));
             }
             if col.nullable {
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, so it cannot be nullable",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 )));
             }
             if identity.increment == 0 {
                 errs.push(invalid(format!(
                     "column `{col_name}` has an IDENTITY increment of 0, which never advances",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 )));
             }
             // An IDENTITY here has a seed and an increment and nothing else:
@@ -808,8 +780,7 @@ pub(crate) fn table_sources(
                     "column `{col_name}` has an `identity:` with min, max, cycle or cache, \
                      which a SQL Server IDENTITY does not have; it takes only a seed and an \
                      increment",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 )));
             }
             if supplied.iter().any(|source| match source {
@@ -821,8 +792,7 @@ pub(crate) fn table_sources(
             }) {
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, so it cannot also have a default",
-                    // raw: whole-message escaped until #2084 step 5.
-                    col_name = col_name.raw(),
+                    col_name = col_name.shown(),
                 )));
             }
         }
@@ -830,10 +800,9 @@ pub(crate) fn table_sources(
     if identity_columns.len() > 1 {
         errs.push(invalid(format!(
             "a table may have only one IDENTITY column, but `{}` are all marked",
-            // Shared invalid() sentence, escaped whole until #2084 step 5.
             identity_columns
                 .iter()
-                .map(|c| c.raw())
+                .map(|c| c.shown().to_string())
                 .collect::<Vec<_>>()
                 .join("`, `")
         )));
@@ -885,8 +854,7 @@ pub(crate) fn table_sources(
         {
             errs.push(invalid(format!(
                 "a `data:` block cannot key its rows by `{key}`, {what}: {why}",
-                // raw: whole-message escaped until #2084 step 5.
-                key = key.raw(),
+                key = key.shown(),
             )));
         }
         // The key travels as a string literal too, and the engine converts
@@ -941,8 +909,8 @@ pub(crate) fn table_sources(
                             ValueKind::Bool => "a `bit` key is `0`, `1`, `true` or `false`",
                             ValueKind::Text => key_shape(&base, text).unwrap_or_default(),
                         },
-                        // raw: whole-message escaped until #2084 step 5.
-                        key_column = key_column.raw(),
+                        key_column = key_column.shown(),
+                        key = pbps_model::escape::Escaped(&key.to_string()),
                     )));
                 }
             }
@@ -956,8 +924,8 @@ pub(crate) fn table_sources(
                     errs.push(invalid(format!(
                         "row `{key}` sets `{column}`, {what}, which a `data:` block cannot \
                          hold: {why} — leave the column out of the row",
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
+                        key = pbps_model::escape::Escaped(&key.to_string()),
                     )));
                     continue;
                 }
@@ -981,8 +949,8 @@ pub(crate) fn table_sources(
                          plan — write it as {spelling}",
                         value.kind(),
                         kind.name(),
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
+                        key = pbps_model::escape::Escaped(&key.to_string()),
                     )));
                 }
                 // The right kind, but not a value the type holds: the kind
@@ -995,8 +963,8 @@ pub(crate) fn table_sources(
                     errs.push(invalid(format!(
                         "row `{key}` sets `{column}` to {n}, but `{base}` holds {lo} to {hi}: the \
                          engine would refuse the insert",
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
+                        key = pbps_model::escape::Escaped(&key.to_string()),
                     )));
                 }
             }
@@ -1010,15 +978,13 @@ pub(crate) fn table_sources(
         if table.columns.contains_key(name) {
             errs.push(invalid(format!(
                 "`{name}` is both a column and a computed column",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
         if computed.expression.trim().is_empty() {
             errs.push(invalid(format!(
                 "computed column `{name}` has an empty expression",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
         // Measured on 17.0: 8183, "Only UNIQUE or PRIMARY KEY constraints can
@@ -1028,8 +994,7 @@ pub(crate) fn table_sources(
             errs.push(invalid(format!(
                 "computed column `{name}` is `not_null` but not `persisted`, and SQL Server holds \
                  NOT NULL on persisted computed columns only",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
     }
@@ -1050,8 +1015,7 @@ pub(crate) fn table_sources(
             if table.columns.get(c).is_some_and(|c| c.nullable) {
                 errs.push(invalid(format!(
                     "primary key column `{c}` is nullable; a primary key column must be NOT NULL",
-                    // raw: whole-message escaped until #2084 step 5.
-                    c = c.raw(),
+                    c = c.shown(),
                 )));
             }
         }
@@ -1062,11 +1026,7 @@ pub(crate) fn table_sources(
             errs.push(e);
         }
         errs.extend(key_columns(
-            &format!(
-                "unique constraint `{n}`",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
-            ),
+            &format!("unique constraint `{n}`", n = n.shown(),),
             &u.columns,
             table,
             Computed::Allowed,
@@ -1078,11 +1038,7 @@ pub(crate) fn table_sources(
             errs.push(e);
         }
         errs.extend(key_columns(
-            &format!(
-                "foreign key `{n}`",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
-            ),
+            &format!("foreign key `{n}`", n = n.shown(),),
             &fk.columns,
             table,
             Computed::Refused,
@@ -1092,15 +1048,13 @@ pub(crate) fn table_sources(
                 "foreign key `{n}` has {} column(s) but references {}; the two sides must line up",
                 fk.columns.len(),
                 fk.references_columns.len(),
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
         if fk.references_columns.is_empty() {
             errs.push(invalid(format!(
                 "foreign key `{n}` names no columns on the referenced table",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
         // PostgreSQL's action: SQL Server has no `RESTRICT`, and `no_action`
@@ -1111,8 +1065,7 @@ pub(crate) fn table_sources(
                     "foreign key `{n}` is `{side}: restrict`, a PostgreSQL action; SQL Server \
                      has no RESTRICT, so declare `no_action`, which it checks at the end of the \
                      statement instead",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )));
             }
         }
@@ -1125,8 +1078,7 @@ pub(crate) fn table_sources(
         if c.expression.trim().is_empty() {
             errs.push(invalid(format!(
                 "check constraint `{n}` has an empty expression",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
     }
@@ -1142,8 +1094,8 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "index `{n}` has the expression key `{expression}`, and SQL Server indexes \
                      only columns",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
+                    expression = pbps_model::escape::Escaped(expression),
                 )));
             }
         }
@@ -1153,11 +1105,7 @@ pub(crate) fn table_sources(
             .filter_map(|c| c.key.column().cloned())
             .collect();
         errs.extend(key_columns(
-            &format!(
-                "index `{n}`",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
-            ),
+            &format!("index `{n}`", n = n.shown(),),
             &keys,
             table,
             Computed::Allowed,
@@ -1166,35 +1114,29 @@ pub(crate) fn table_sources(
             errs.push(invalid(format!(
                 "index `{n}` has {} key columns; SQL Server allows at most {MAX_INDEX_KEY_COLUMNS}",
                 keys.len(),
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
         for inc in &idx.include {
             if !table.columns.contains_key(inc) && !table.computed.contains_key(inc) {
                 errs.push(invalid(format!(
                     "index `{n}` includes `{inc}`, which is not a column of this table",
-                    // raw: whole-message escaped until #2084 step 5.
-                    inc = inc.raw(),
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    inc = inc.shown(),
+                    n = n.shown(),
                 )));
             }
             if keys.contains(inc) {
                 errs.push(invalid(format!(
                     "index `{n}` has `{inc}` both as a key column and as an included column",
-                    // raw: whole-message escaped until #2084 step 5.
-                    inc = inc.raw(),
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    inc = inc.shown(),
+                    n = n.shown(),
                 )));
             }
         }
         if idx.filter.as_ref().is_some_and(|f| f.trim().is_empty()) {
             errs.push(invalid(format!(
                 "index `{n}` has an empty filter expression",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
         // PostgreSQL's words (DEC-1169.1): SQL Server builds every index this model
@@ -1203,8 +1145,7 @@ pub(crate) fn table_sources(
             errs.push(invalid(format!(
                 "index `{n}` uses the `{}` method, which SQL Server does not have",
                 idx.method.as_str(),
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )));
         }
         for key in &idx.columns {
@@ -1212,9 +1153,9 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
                      classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                    key.key.text(),
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    pbps_model::escape::Escaped(key.key.text()),
+                    n = n.shown(),
+                    class = pbps_model::escape::Escaped(class),
                 )));
             }
         }
@@ -1227,16 +1168,14 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "index `{n}` is the clustered index, which cannot have INCLUDE columns: it \
                      holds every column already",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )));
             }
             if idx.filter.is_some() {
                 errs.push(invalid(format!(
                     "index `{n}` is the clustered index, which cannot be filtered: it holds \
                      every row",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )));
             }
         }
@@ -1273,8 +1212,7 @@ fn system_time(
         errs.push(invalid(format!(
             "`system_time` names `{}` as both the start and the end of its period; name two \
              columns",
-            // raw: whole-message escaped until #2084 step 5.
-            st.start.raw()
+            st.start.shown()
         )));
     }
     for (role, column) in [("start", &st.start), ("end", &st.end)] {
@@ -1282,8 +1220,7 @@ fn system_time(
             errs.push(invalid(format!(
                 "`system_time` names `{column}` as its period's {role}, but no column of that \
                  name is declared; declare it under `columns:` as `datetime2`, not nullable",
-                // raw: whole-message escaped until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
             )));
             continue;
         };
@@ -1292,18 +1229,15 @@ fn system_time(
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which SQL Server requires to be \
                  `datetime2`, not `{}`",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                col.ty.raw(),
-                // raw: whole-message escaped until #2084 step 5.
-                column = column.raw(),
+                col.ty.shown(),
+                column = column.shown(),
             )));
         }
         if col.nullable {
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which is never NULL; declare it \
                  `nullable: false`",
-                // raw: whole-message escaped until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
             )));
         }
         if sources
@@ -1321,8 +1255,7 @@ fn system_time(
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which the engine writes, so it \
                  cannot also be an identity",
-                // raw: whole-message escaped until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
             )));
         }
     }
@@ -1340,10 +1273,8 @@ fn system_time(
         errs.push(invalid(format!(
             "the period's columns `{}` and `{}` are `datetime2({start})` and `datetime2({end})`, \
              and SQL Server requires one precision for both",
-            // raw: whole-message escaped until #2084 step 5.
-            st.start.raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            st.end.raw()
+            st.start.shown(),
+            st.end.shown()
         )));
     }
     // Every write to a row writes history, and the period's columns are the
@@ -1370,7 +1301,7 @@ fn system_time(
         if &v.history == name {
             errs.push(invalid(format!(
                 "`system_time` names `{name}` itself as its history table; name another table",
-                name = name.raw()
+                name = name.shown()
             )));
         }
         // Its index is `ix_` and the name, which the engine cuts at 127
@@ -1382,7 +1313,7 @@ fn system_time(
                 "history table `{}` has a name longer than 124 characters (UTF-16 units, as \
                  SQL Server counts them), which leaves its index, `ix_` and the name, no room in \
                  SQL Server's 128; name it shorter",
-                v.history.raw()
+                v.history.shown()
             )));
         }
         // The engine keeps history for at most 1000 years, in any unit
@@ -1424,29 +1355,21 @@ fn key_columns(
             None if table.computed.contains_key(c) => errs.push(invalid(format!(
                 "{what} uses the computed column `{c}`, and a key over a computed column is not \
                  held yet",
-                // raw: whole-message escaped until #2084 step 5.
-                c = c.raw(),
+                c = c.shown(),
             ))),
             None => errs.push(invalid(format!(
                 "{what} references `{c}`, which is not a column of this table",
-                // raw: whole-message escaped until #2084 step 5.
-                c = c.raw(),
+                c = c.shown(),
             ))),
             Some(col) if !types::is_indexable(&col.ty) => errs.push(invalid(format!(
                 "{what} uses `{c}`, whose type `{}` cannot be part of a key",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                col.ty.raw(),
-                // raw: whole-message escaped until #2084 step 5.
-                c = c.raw(),
+                col.ty.shown(),
+                c = c.shown(),
             ))),
             Some(_) => {}
         }
         if seen.contains(&c) {
-            errs.push(invalid(format!(
-                "{what} names `{c}` twice",
-                // raw: whole-message escaped until #2084 step 5.
-                c = c.raw(),
-            )));
+            errs.push(invalid(format!("{what} names `{c}` twice", c = c.shown(),)));
         }
         seen.push(c);
     }
@@ -1581,8 +1504,7 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("may read the computed column `len`"))
         );
-        // The table's name is left raw, for `validate`'s one escaping pass: a
-        // backslash in it is one backslash in the note, not an escaped one.
+        // Shared notes are already prose; every writer preserves this spelling.
         let mut odd = pbps_model::Schema::default();
         odd.tables.insert(
             TableName::new("dbo", "a\\b"),
@@ -1591,7 +1513,7 @@ mod tests {
         assert!(
             checks_over_computed_columns(&odd)
                 .iter()
-                .any(|n| n.starts_with("dbo.a\\b: check constraint `ck`")),
+                .any(|n| n.starts_with("dbo.a\\\\b: check constraint `ck`")),
             "{:?}",
             checks_over_computed_columns(&odd)
         );

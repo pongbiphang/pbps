@@ -120,7 +120,7 @@ impl Schema {
                         let say = |c: &Option<Collation>| {
                             c.as_ref().map_or_else(
                                 || "the database default".to_owned(),
-                                |c| format!("`{c}`"),
+                                |c| format!("`{}`", crate::escape::Escaped(c.as_str())),
                             )
                         };
                         problems.push(format!(
@@ -195,8 +195,7 @@ impl Table {
                 std::collections::btree_map::Entry::Occupied(entry) => problems.push(format!(
                     "{} and {kind} are both named `{name}`; constraint names must be distinct within a table",
                     entry.get(),
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    name = name.raw(),
+                    name = name.shown(),
                 )),
             }
         }
@@ -232,7 +231,10 @@ impl Table {
                 .filter_map(|(name, value)| match canonical(name, value) {
                     Ok(spelled) if spelled == *value => None,
                     Ok(spelled) => Some(format!(
-                        "{what}storage parameter `{name}` is `{value}`, which is spelled `{spelled}`"
+                        "{what}storage parameter `{name}` is `{value}`, which is spelled `{spelled}`",
+                        name = crate::escape::Escaped(name),
+                        value = crate::escape::Escaped(value),
+                        spelled = crate::escape::Escaped(&spelled),
                     )),
                     Err(why) => Some(format!("{what}{why}")),
                 })
@@ -249,11 +251,7 @@ impl Table {
         }
         for (name, unique) in &self.unique {
             found.extend(check(
-                &format!(
-                    "unique constraint `{name}`: ",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    name = name.raw(),
-                ),
+                &format!("unique constraint `{name}`: ", name = name.shown(),),
                 &unique.storage_parameters,
                 &btree,
             ));
@@ -261,11 +259,7 @@ impl Table {
         for (name, index) in &self.indexes {
             let method = index.method;
             found.extend(check(
-                &format!(
-                    "index `{name}`: ",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    name = name.raw(),
-                ),
+                &format!("index `{name}`: ", name = name.shown(),),
                 &index.storage_parameters,
                 &|n, v| crate::storage::canonical_index(method, n, v),
             ));
@@ -294,8 +288,7 @@ impl Table {
                     "`replica_identity` names {what}, over nullable column(s) `{}`, which \
                      PostgreSQL does not take as a replica identity; declare them NOT NULL",
                     open.iter()
-                        // raw: whole-message escaped by dialect validation until #2084 step 5.
-                        .map(ColumnName::raw)
+                        .map(|n| n.shown().to_string())
                         .collect::<Vec<_>>()
                         .join("`, `")
                 )]
@@ -312,45 +305,30 @@ impl Table {
                 None => vec![format!(
                     "`replica_identity` names unique constraint `{n}`, which this table does not \
                      declare",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )],
                 Some(u) => over(
-                    format!(
-                        "unique constraint `{n}`",
-                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                        n = n.raw(),
-                    ),
+                    format!("unique constraint `{n}`", n = n.shown(),),
                     &u.columns,
                 ),
             },
             Some(ReplicaIdentity::Index(n)) => match self.indexes.get(n) {
                 None => vec![format!(
                     "`replica_identity` names index `{n}`, which this table does not declare",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )],
                 Some(ix) if !ix.unique || ix.filter.is_some() => vec![format!(
                     "`replica_identity` names index `{n}`, which is not unique or is partial; \
                      PostgreSQL takes only a unique, non-partial index",
-                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                    n = n.raw(),
+                    n = n.shown(),
                 )],
                 Some(ix) => match ix.column_keys() {
                     None => vec![format!(
                         "`replica_identity` names index `{n}`, which holds an expression; \
                          PostgreSQL takes only an index over plain columns",
-                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                        n = n.raw(),
+                        n = n.shown(),
                     )],
-                    Some(columns) => over(
-                        format!(
-                            "index `{n}`",
-                            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                            n = n.raw(),
-                        ),
-                        &columns,
-                    ),
+                    Some(columns) => over(format!("index `{n}`", n = n.shown(),), &columns),
                 },
             },
         }
@@ -372,13 +350,11 @@ impl Table {
             Some(Clustered::Heap) => Vec::new(),
             Some(Clustered::Unique(n)) if !self.unique.contains_key(n) => vec![format!(
                 "`clustered` names unique constraint `{n}`, which this table does not declare",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )],
             Some(Clustered::Index(n)) if !self.indexes.contains_key(n) => vec![format!(
                 "`clustered` names index `{n}`, which this table does not declare",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                n = n.raw(),
+                n = n.shown(),
             )],
             Some(Clustered::Unique(_) | Clustered::Index(_)) => Vec::new(),
         }
@@ -1051,7 +1027,6 @@ impl std::fmt::Display for RawReplicaIdentity<'_> {
                 } else {
                     "{index: "
                 })?;
-                // Canonical data spelling; retained after #2084 step 5.
                 f.write_str(n.raw())?;
                 f.write_str("}")
             }

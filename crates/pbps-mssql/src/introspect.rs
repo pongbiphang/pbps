@@ -1,6 +1,3 @@
-// Catalog refusal/detail sentences are prose beside rendered type errors.
-// Show names once until #2084 step 5 (DEC-2084.1); typed targets stay raw.
-
 //! Reading a live database back into the model — the heart of `pbps pull`.
 //!
 //! # Shape
@@ -1226,8 +1223,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         "{name}: SQL Server named its history table {}; the declaration names \
                          it explicitly, so a table created from it keeps this name instead of \
                          another the engine would choose",
-                        v.history.raw(),
-                        name = name.raw()
+                        v.history.shown(),
+                        name = name.shown()
                     ));
                 }
                 table.system_time = Some(st.clone());

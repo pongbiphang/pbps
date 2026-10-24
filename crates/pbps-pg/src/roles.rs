@@ -96,10 +96,8 @@ pub fn unsupported_permissions(
                  \"maintain\"` -- measured on 16.15 -- which is a statement that would fail after \
                  everything ordered before it had run. Remove it, or upgrade the server",
                 rendered(server_version_num),
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
-                // Whole-message escaping remains until #2084 step 5.
-                target = target.raw(),
+                name = name.shown(),
+                target = target.shown(),
             )));
         }
     }
@@ -149,7 +147,6 @@ pub async fn missing_roles(
 /// holding the plan to the manual, and the `CREATE ROLE` they can paste is the
 /// difference between a refusal that blocks and one that unblocks.
 pub fn refuse_missing(name: &pbps_model::RoleName) -> DialectError {
-    // ByHand escapes the quoted SQL statement whole until #2084 step 5.
     match crate::quote(name.raw()) {
         Ok(quoted) => DialectError::ByHand {
             dialect: DIALECT,
@@ -157,8 +154,7 @@ pub fn refuse_missing(name: &pbps_model::RoleName) -> DialectError {
                 "role `{name}` is declared here and the cluster does not have it. A PostgreSQL \
                  role is a cluster object, so pbps manages what a role is granted in this \
                  database and not whether the role exists (ADR-0010 section 3)",
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             ),
             statement: format!("CREATE ROLE {quoted};"),
         },
@@ -219,7 +215,6 @@ pub fn refuse_rename(
     to: &pbps_model::RoleName,
     evidence: RenameEvidence,
 ) -> Option<DialectError> {
-    // ByHand escapes the quoted SQL statement whole until #2084 step 5.
     let (quoted_from, quoted_to) = match (crate::quote(from.raw()), crate::quote(to.raw())) {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return Some(e),
@@ -236,19 +231,15 @@ pub fn refuse_rename(
              move the grants, while granting to `{to}` would leave `{from}` holding everything \
              it holds now. Resolve the name collision by hand, preserving the intended \
              principal and its grants, then plan again.",
-            // Whole-message escaping remains until #2084 step 5.
-            from = from.raw(),
-            // Whole-message escaping remains until #2084 step 5.
-            to = to.raw(),
+            from = from.shown(),
+            to = to.shown(),
         ),
         RenameEvidence::NeitherPresent => format!(
             "neither `{from}` nor `{to}` is in the cluster, so there is no principal to rename \
              and none to grant on (ADR-0010 section 3). Restore the intended principal or correct \
              the declarations, then plan again.",
-            // Whole-message escaping remains until #2084 step 5.
-            from = from.raw(),
-            // Whole-message escaping remains until #2084 step 5.
-            to = to.raw(),
+            from = from.shown(),
+            to = to.shown(),
         ),
         RenameEvidence::NotRunYet => {
             return Some(DialectError::ByHand {
@@ -258,10 +249,8 @@ pub fn refuse_rename(
                      revision declares has not been run. A PostgreSQL role is a cluster object \
                      and pbps does not own it (ADR-0010 section 3); the grants follow the \
                      role's oid, so nothing has to be re-granted afterwards",
-                    // Whole-message escaping remains until #2084 step 5.
-                    from = from.raw(),
-                    // Whole-message escaping remains until #2084 step 5.
-                    to = to.raw(),
+                    from = from.shown(),
+                    to = to.shown(),
                 ),
                 statement: format!("ALTER ROLE {quoted_from} RENAME TO {quoted_to};"),
             });

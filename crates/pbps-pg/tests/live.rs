@@ -30737,6 +30737,40 @@ async fn a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing()
         .expect_err("a schema that is not there cannot be reported on");
     assert!(matches!(e, ImpactError::Name(_)), "{e:?}");
 
+    // Compare after cleanup so the deliberately failing mutation leaves no database behind.
+    let mut diagnostics = Vec::new();
+    for (name, shown) in [
+        (
+            "missing\n\u{1b}[31m\u{202e}名前",
+            r"missing\n\u{1b}[31m\u{202e}名前",
+        ),
+        (
+            r"missing\n\u{1b}[31m\u{202e}名前",
+            r"missing\\n\\u{1b}[31m\\u{202e}名前",
+        ),
+        ("名前_ünï", "名前_ünï"),
+    ] {
+        let table = TableName::new(&s, name);
+        for (target, description) in [
+            (
+                RenameTarget::Table(table.clone()),
+                format!("table {s}.{shown}"),
+            ),
+            (
+                RenameTarget::Column(table.column("id")),
+                format!("column {s}.{shown}.id"),
+            ),
+        ] {
+            let error = rename_impact(&mut conn, &target)
+                .await
+                .expect_err("the name is absent");
+            diagnostics.push((
+                error.to_string(),
+                format!("postgres: {s}.{shown} is not a table this database has, so what a rename of {description} would affect cannot be read"),
+            ));
+        }
+    }
+
     // The negative case: present, and genuinely without dependants.
     let present = RenameTarget::Table(TableName::new(&s, "t"));
     let report = rename_impact(&mut conn, &present)
@@ -30751,6 +30785,9 @@ async fn a_table_the_catalog_does_not_have_is_not_a_rename_that_breaks_nothing()
         .await
         .expect("drop");
     conn.drop().await;
+    for (actual, expected) in diagnostics {
+        assert_eq!(actual, expected);
+    }
 }
 
 /// ADR-0012 §3's dataset, re-measured in full: for every ordered pair of the

@@ -1,5 +1,3 @@
-// Shared Pulled warnings remain raw until #2084 step 5 (DEC-2084.1); terminal warning boundaries escape them.
-
 //! `pbps` — declarative database schema version control.
 
 use crate::emission::Engine as _;
@@ -1697,7 +1695,7 @@ fn cmd_pull(
     })?;
 
     for notice in &pulled.onboarding_notices {
-        eprintln!("warning: {}", pbps_model::escape::Escaped(notice));
+        eprintln!("warning: {}", notice);
     }
     for warning in &pulled.warnings {
         eprintln!("warning: {warning}");
@@ -1950,10 +1948,19 @@ pub fn attach_policy_findings<S: Clone>(
 
 /// A rule's finding as the envelope carries it: the rule id is the finding id.
 pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
+    // A saved plan can supply this prose without going through its producers.
+    // Keep already shown names and tool backslashes (DEC-2084.1), but make raw
+    // controls in hand-made findings inert without changing the sealed plan.
+    let message = f
+        .message
+        .split('\\')
+        .map(|part| pbps_model::escape::Escaped(part).to_string())
+        .collect::<Vec<_>>()
+        .join("\\");
     match f.severity {
-        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), f.message.clone()),
-        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), f.message.clone()),
-        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), f.message.clone()),
+        pbps_model::Severity::Error => output::Finding::error(f.id.clone(), message),
+        pbps_model::Severity::Warning => output::Finding::warning(f.id.clone(), message),
+        pbps_model::Severity::Note => output::Finding::note(f.id.clone(), message),
     }
 }
 
@@ -2183,8 +2190,6 @@ pub(crate) fn declaration_problems(
     declaration_problems_with_sources(loaded, dialect, &Default::default())
 }
 
-// Diagnostic prose combines shown names with escaped DialectError displays;
-// never escape these sentences whole until #2084 step 5 (DEC-2084.1).
 fn declaration_problems_with_sources(
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
@@ -2531,14 +2536,7 @@ fn validate_inspected(
             dialect
                 .declaration_notes(&l.schema)
                 .into_iter()
-                .map(|note| {
-                    // Raw probe data becomes finding prose here until #2084 step 5
-                    // (DEC-2084.1); it contains no rendered error.
-                    output::Finding::note(
-                        "dialect.not-checked",
-                        pbps_model::escape::Escaped(&note).to_string(),
-                    )
-                }),
+                .map(|note| output::Finding::note("dialect.not-checked", note)),
         );
 
         // The project's own rules (ADR-0008): the declaration point. The block
@@ -2637,6 +2635,21 @@ pub(crate) fn declaration_policy_findings(
     only: Option<std::collections::BTreeSet<String>>,
     now: i64,
 ) -> Vec<output::Finding> {
+    raw_declaration_policy_findings(project, dialect, schema, only, now)
+        .into_iter()
+        .map(declaration_finding)
+        .collect()
+}
+
+/// Declaration messages are comparison data for the partition generator.
+/// Keep their original bytes until its (id, message) comparison is complete.
+pub(crate) fn raw_declaration_policy_findings(
+    project: &Project,
+    dialect: &dyn Dialect,
+    schema: &Schema,
+    only: Option<std::collections::BTreeSet<String>>,
+    now: i64,
+) -> Vec<pbps_model::Finding> {
     let policies = project.config.policies();
     let mut ctx = policy_context_at(project, dialect, false, now);
     ctx.only = only;
@@ -2648,9 +2661,13 @@ pub(crate) fn declaration_policy_findings(
     // type is, the policy says what to think of it (DECISIONS 187).
     let spelled = types_as_the_dialect_spells_them(schema, dialect);
     pbps_policy::declarations(&spelled, &policies, &ctx)
-        .iter()
-        .map(policy_finding)
-        .collect()
+}
+
+/// Show one opaque declaration key, after any comparison of that key.
+/// Plan findings already contain prose; declaration findings retain raw data.
+pub(crate) fn declaration_finding(mut finding: pbps_model::Finding) -> output::Finding {
+    finding.message = pbps_model::escape::Escaped(&finding.message).to_string();
+    policy_finding(&finding)
 }
 
 /// Refuses a command that writes declarations while the `policies:` block is

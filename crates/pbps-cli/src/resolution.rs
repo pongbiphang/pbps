@@ -128,8 +128,6 @@ pub enum Refused {
 }
 
 /// The surfaces only the engine can answer, as a report names them.
-// These descriptions become prose beside escaped resolver errors. Keep their
-// names shown once until #2084 step 5 (DEC-2084.1), including in finding JSON.
 pub fn named(assessment: &Assessment) -> String {
     let names: Vec<String> = assessment.unresolved().map(describe).collect();
     names.join(", ")

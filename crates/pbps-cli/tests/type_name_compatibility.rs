@@ -367,7 +367,7 @@ fn type_refusals_escape_once_at_whole_and_individual_boundaries() {
 }
 
 #[test]
-fn estimate_type_text_remains_raw_data_beside_shown_diagnostics() {
+fn estimate_type_descriptions_are_shown_prose() {
     let table = TableName::new("app", "t");
     let uid: Uid = "c_aaaaaa".parse().unwrap();
     let ty = ColumnType::reference(TypeRef::new("app", NAME).unwrap());
@@ -392,14 +392,12 @@ fn estimate_type_text_remains_raw_data_beside_shown_diagnostics() {
     let canonical = "app.\"type\nline\r\"\"'\u{1b}[31m\u{9b}\\\u{202e}名前\"";
     let pg = pbps_pg::estimate::planned_estimates(&names);
     let ms = pbps_mssql::estimate::planned_estimates(&names);
-    assert_eq!(pg[0].1.about, format!("changing app.t.v to {canonical}"));
-    assert_eq!(
-        ms[0].1.about,
-        format!("changing app.t.v to {canonical} NULL")
-    );
+    let shown = pbps_model::escape::Escaped(canonical).to_string();
+    assert_eq!(pg[0].1.about, format!("changing app.t.v to {shown}"));
+    assert_eq!(ms[0].1.about, format!("changing app.t.v to {shown} NULL"));
     for about in [&pg[0].1.about, &ms[0].1.about] {
-        assert!(about.contains("type\nline\r"));
-        assert!(!about.contains(SHOWN));
+        assert!(!about.chars().any(char::is_control));
+        assert!(about.contains(&shown));
         let json = serde_json::to_string(about).unwrap();
         assert_eq!(serde_json::from_str::<String>(&json).unwrap(), **about);
     }

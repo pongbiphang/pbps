@@ -289,7 +289,7 @@ pub async fn rename_impact(
             message: format!(
                 "module {module} is not a rename target on this engine: what depends on a \
                  module about to be dropped is `modules::dependents`'s question",
-                module = module.raw()
+                module = module.shown()
             ),
         }));
     }
@@ -312,19 +312,18 @@ pub async fn rename_impact(
     {
         Some(oid) => oid,
         None => {
-            // DialectError escapes this complete message until #2084 step 5 (DEC-2084.1).
-            let raw_table = target.table().raw().to_string();
+            let table = target.table();
             let target = match target {
-                RenameTarget::Table(t) => format!("table {}", t.raw()),
-                RenameTarget::Column(c) => format!("column {}", c.raw()),
-                RenameTarget::Module(m) => format!("module {}", m.raw()),
+                RenameTarget::Table(t) => format!("table {}", t.shown()),
+                RenameTarget::Column(c) => format!("column {}", c.shown()),
+                RenameTarget::Module(m) => format!("module {}", m.shown()),
             };
             return Err(ImpactError::Name(DialectError::Invalid {
                 dialect: crate::types::DIALECT,
                 message: format!(
                     "{} is not a table this database has, so what a rename of {target} \
                      would affect cannot be read",
-                    raw_table
+                    table.shown()
                 ),
             }));
         }

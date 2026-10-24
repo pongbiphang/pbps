@@ -618,7 +618,10 @@ fn release<S: Clone>(
              another. Drop them in plans of their own.",
             members
                 .first()
-                .map_or_else(String::new, |&m| cs.changes[m].change.subject())
+                .map_or_else(String::new, |&m| pbps_model::escape::Escaped(
+                    &cs.changes[m].change.subject()
+                )
+                .to_string())
         )),
         Err(
             refusal @ (Refusal::Outside { .. }

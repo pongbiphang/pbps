@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! PostgreSQL declaration structure and roles, checked before anything connects.
 //!
 //! The counterpart of `pbps-mssql/src/validate.rs`'s role half, and the place
@@ -61,8 +58,8 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
             found.push(invalid(format!(
                 "column `{name}` names collation `{collation}`; column collations are modelled \
                  for SQL Server only, so remove the line",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
+                collation = pbps_model::escape::Escaped(collation.as_str()),
             )));
         }
     }
@@ -78,19 +75,11 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         found.extend(key_columns("primary key", &pk.columns, table, true));
     }
     for (name, unique) in &table.unique {
-        let what = format!(
-            "unique constraint `{name}`",
-            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-            name = name.raw(),
-        );
+        let what = format!("unique constraint `{name}`", name = name.shown(),);
         found.extend(key_columns(&what, &unique.columns, table, true));
     }
     for (name, fk) in &table.foreign_keys {
-        let what = format!(
-            "foreign key `{name}`",
-            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-            name = name.raw(),
-        );
+        let what = format!("foreign key `{name}`", name = name.shown(),);
         found.extend(key_columns(&what, &fk.columns, table, false));
         if fk.columns.len() != fk.references_columns.len() {
             found.push(invalid(format!(
@@ -128,8 +117,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
             if !seen.insert(column) && said.insert(column) {
                 found.push(invalid(format!(
                     "{what} names `{column}` twice on the referenced table;                      the referenced columns must be distinct",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
         }
@@ -143,8 +131,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         if crate::LEXICON.expression_in(&check.expression) == Expression::Absent {
             found.push(invalid(format!(
                 "check constraint `{name}` has an empty expression",
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
     }
@@ -166,17 +153,12 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 "{kind} `{name}` starts with `{}`, which pbps keeps for the temporary \
                  CHECK of a staged attach; rename it",
                 crate::emit::SCAN_CHECK_PREFIX,
-                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
     }
     for (name, index) in &table.indexes {
-        let what = format!(
-            "index `{name}`",
-            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
-            name = name.raw(),
-        );
+        let what = format!("index `{name}`", name = name.shown(),);
         // Column keys are held to the table; an expression key to being an
         // expression at all, as a filter is (DEC-1169.2). An index of
         // expression keys alone names no column and is not empty.
@@ -199,8 +181,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
                     "{what} includes `{column}`, which is not a column of this table",
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
                 )));
             }
         }
@@ -234,7 +215,8 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                         "{what} indexes `{}` with operator class `{class}`; a B-tree index here \
                          takes only its type's default class, so leave the class out \
                          (or, if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                        key.key.text()
+                        pbps_model::escape::Escaped(key.key.text()),
+                        class = pbps_model::escape::Escaped(class),
                     )));
                 }
             }
@@ -257,14 +239,14 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                 if key.descending {
                     found.push(invalid(format!(
                         "{what} orders `{}` descending, and a GIN index has no order",
-                        key.key.text()
+                        pbps_model::escape::Escaped(key.key.text())
                     )));
                 }
                 let Some(column) = key.key.column() else {
                     found.push(invalid(format!(
                         "{what} is a GIN index over the expression `{}`, and this model holds \
                          GIN only over `jsonb` columns",
-                        key.key.text()
+                        pbps_model::escape::Escaped(key.key.text())
                     )));
                     continue;
                 };
@@ -277,8 +259,7 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     found.push(invalid(format!(
                         "{what} is a GIN index over `{column}`, and this model holds GIN only over \
                          `jsonb` columns",
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
                     )));
                 }
                 match key.opclass.as_deref() {
@@ -286,15 +267,14 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     Some("jsonb_ops") => found.push(invalid(format!(
                         "{what} names `jsonb_ops` for `{column}`, which is GIN's default for \
                          `jsonb`; leave the class out",
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
                     ))),
                     Some(class) => found.push(invalid(format!(
                         "{what} indexes `{column}` with operator class `{class}`; a GIN index \
                          over `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the \
                          default `jsonb_ops`",
-                        // raw: whole-message escaped until #2084 step 5.
-                        column = column.raw(),
+                        column = column.shown(),
+                        class = pbps_model::escape::Escaped(class),
                     ))),
                 }
             }
@@ -318,15 +298,13 @@ fn key_columns(
         if !table.columns.contains_key(name) {
             found.push(invalid(format!(
                 "{what} references `{name}`, which is not a column of this table",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
         if distinct && !seen.insert(name) {
             found.push(invalid(format!(
                 "{what} names `{name}` twice",
-                // raw: whole-message escaped until #2084 step 5.
-                name = name.raw(),
+                name = name.shown(),
             )));
         }
     }
@@ -533,6 +511,10 @@ fn target_kind(
             .into_iter()
             .collect();
         signatures.sort();
+        let signatures: Vec<_> = signatures
+            .iter()
+            .map(|signature| pbps_model::escape::Escaped(signature).to_string())
+            .collect();
         return Err(invalid(if signatures.len() == 1 {
             format!(
                 "`{object}` is a routine, which this engine identifies by its signature and not \
@@ -541,7 +523,7 @@ fn target_kind(
                  plan would revoke and re-grant it. Write `{}` instead",
                 signatures[0],
                 signatures[0],
-                object = object.raw()
+                object = object.shown()
             )
         } else {
             format!(
@@ -550,7 +532,7 @@ fn target_kind(
                  one of {}",
                 answering.len(),
                 signatures.join(", "),
-                object = object.raw()
+                object = object.shown()
             )
         }));
     }
@@ -608,8 +590,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
              predefined roles; the engine refuses `CREATE ROLE` on such a name, and what those \
              roles are granted is the cluster's business rather than this database's \
              (ADR-0010 section 3)",
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         )));
     }
 
@@ -663,10 +644,8 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                  it -- quoting does not make it literal. Every grant this dialect emits sets \
                  the path first, so no plan can carry this one. Grant in a schema the path \
                  can name",
-                // Whole-message escaping remains until #2084 step 5.
-                target = target.raw(),
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
+                target = target.shown(),
+                name = name.shown(),
             )));
             continue;
         }
@@ -677,10 +656,9 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                  schema are left out of the pull, so a grant there reads back as absent and \
                  every plan would propose it again (DECISIONS 385). Grant in a schema this \
                  project declares",
-                // Whole-message escaping remains until #2084 step 5.
-                target = target.raw(),
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
+                target = target.shown(),
+                name = name.shown(),
+                schema_of = pbps_model::escape::Escaped(schema_of),
             )));
             continue;
         }
@@ -697,10 +675,8 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                  Server's (ADR-0010 section 6), and this engine takes {}",
                 p.as_str(),
                 permission_words(),
-                // Whole-message escaping remains until #2084 step 5.
-                target = target.raw(),
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
+                target = target.shown(),
+                name = name.shown(),
             )));
         }
         let engine_words = || permissions.iter().copied().filter(|p| has_permission(*p));
@@ -733,10 +709,9 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                             .join(" and "),
                         p.as_str(),
 
-                        // Whole-message escaping remains until #2084 step 5.
-                        target = target.raw(),
-                        // Whole-message escaping remains until #2084 step 5.
-                        name = name.raw(),
+                        target = target.shown(),
+                        name = name.shown(),
+                        s = pbps_model::escape::Escaped(s),
                     )));
                 }
             }
@@ -752,10 +727,9 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                          so every permission here reaches nothing and the role's own query is \
                          `permission denied for schema {schema_of}` (ADR-0010 section 1, measured). Add \
                          `schema::{schema_of}: [usage]` to this role",
-                        // Whole-message escaping remains until #2084 step 5.
-                        target = target.raw(),
-                        // Whole-message escaping remains until #2084 step 5.
-                        name = name.raw(),
+                        target = target.shown(),
+                        name = name.shown(),
+                        schema_of = pbps_model::escape::Escaped(schema_of),
                     )));
                 }
                 let kind = match target {
@@ -790,10 +764,8 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                             .map(|p| p.as_str())
                             .collect::<Vec<_>>()
                             .join(", "),
-                        // Whole-message escaping remains until #2084 step 5.
-                        target = target.raw(),
-                        // Whole-message escaping remains until #2084 step 5.
-                        name = name.raw(),
+                        target = target.shown(),
+                        name = name.shown(),
                     )));
                 }
             }

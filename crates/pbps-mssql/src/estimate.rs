@@ -1,6 +1,3 @@
-// Estimate descriptions are shared cost JSON; keep operands raw until #2084 step 5 (DEC-2084.1).
-// The cost text renderer escapes the complete description once.
-
 //! Measured offline ALTER COLUMN costs, never correctness risk or approval.
 //!
 //! SQL Server updates rows in place: unchanged allocation IDs do not prove a
@@ -188,8 +185,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     Work::ClusteredBuild,
                     format!(
                         "building `{name}` as the clustered index",
-                        // Shared estimate description is escaped by the report until #2084 step 5.
-                        name = name.raw(),
+                        name = name.shown(),
                     ),
                 ),
                 Change::SetPrimaryKey {
@@ -205,11 +201,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 Change::DropUnique { table, name } | Change::DropIndex { table, name } => (
                     table,
                     Work::MaybeClusteredDrop(Some(name.clone())),
-                    format!(
-                        "dropping `{name}`",
-                        // Shared estimate description is escaped by the report until #2084 step 5.
-                        name = name.raw(),
-                    ),
+                    format!("dropping `{name}`", name = name.shown(),),
                 ),
                 Change::CreateTable { .. }
                 | Change::DropTable { .. }
@@ -386,9 +378,8 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                     about: format!(
                         "changing {column} to {to} {}",
                         if to_nullable { "NULL" } else { "NOT NULL" },
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        to = to.shown(),
                     ),
                     table: column.table.clone(),
                     rewrite,

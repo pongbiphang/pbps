@@ -16,8 +16,6 @@ use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 ///
 /// An intent retains its meaning, not where it was supplied (SPEC §6). Describe
 /// the operation without inventing an annotation for a command or prompt answer.
-// Intent and blocker sentences are prose in every format until #2084 step 5
-// (DEC-2084.1); only their embedded command arguments stay raw.
 pub fn intent(i: &Intent) -> String {
     match i {
         Intent::RenameType { from, to } => {
@@ -1150,7 +1148,7 @@ pub fn changes(cs: &ChangeSet) -> String {
                     .join(", ")
             )
         };
-        out.push_str(&format!("    {}{}\n", Escaped(&describe(&p.change)), risks));
+        out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
         // A step a planning rule added says which, and for what (#1776,
         // DEC-1958.3). A plan read back from its file has none to say.
         if let Some(o) = &p.provenance {
@@ -1159,17 +1157,18 @@ pub fn changes(cs: &ChangeSet) -> String {
                 o.rule,
                 o.role.as_str(),
                 Escaped(&o.source),
-                Escaped(&o.reason)
+                o.reason
             ));
         }
         // The analyzers' findings, under the change they are about, at the
         // severity the project chose (ADR-0008).
         for f in &p.findings {
+            let finding = crate::policy_finding(f);
             out.push_str(&format!(
                 "      {}: {} — {}\n",
-                f.severity,
-                Escaped(&f.id),
-                Escaped(&f.message)
+                finding.severity_word(),
+                Escaped(&finding.id),
+                finding.message
             ));
         }
     }
@@ -1315,27 +1314,24 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
 }
 
 pub fn describe(c: &Change) -> String {
-    // Shared JSON prose stays raw until #2084 step 5 (DEC-2084.1): changes() and the
-    // approval renderer escape the complete description once.
     match c {
         Change::RebuildPartitionedTable(_)
         | Change::CopyTableRows(_)
         | Change::AnalyzeTableTree(_) => {
             let (operation, _) = c.pending_rebuild().expect("rebuild variant");
-            // Shared JSON description escapes as a whole until #2084 step 5.
             format!(
                 "pending blocking rewrite: {operation} for {} (unavailable)",
-                c.subject()
+                Escaped(&c.subject())
             )
         }
         Change::CreateType {
             name, definition, ..
-        } => format!("+ create {} {}", definition.kind(), name.raw()),
+        } => format!("+ create {} {}", definition.kind(), name.shown()),
         Change::DropType {
             name, definition, ..
-        } => format!("- drop {} {}", definition.kind(), name.raw()),
+        } => format!("- drop {} {}", definition.kind(), name.shown()),
         Change::RenameType { from, to, .. } => {
-            format!("~ rename type {} -> {}", from.raw(), to.raw())
+            format!("~ rename type {} -> {}", from.shown(), to.shown())
         }
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -1350,8 +1346,8 @@ pub fn describe(c: &Change) -> String {
                 pbps_model::PartitionBound::Default => {
                     format!(
                         "+ create table {name}, the default partition of {}",
-                        of.parent.raw(),
-                        name = name.raw()
+                        of.parent.shown(),
+                        name = name.shown()
                     )
                 }
                 bound @ (pbps_model::PartitionBound::Range { .. }
@@ -1390,8 +1386,8 @@ pub fn describe(c: &Change) -> String {
                     };
                     let made = format!(
                         "+ create table {name}, a partition of {} for rows {rows}",
-                        of.parent.raw(),
-                        name = name.raw()
+                        of.parent.shown(),
+                        name = name.shown()
                     );
                     // The rows it takes from the DEFAULT are the change's to
                     // say, since they leave that partition (#1547), and so
@@ -1400,12 +1396,12 @@ pub fn describe(c: &Change) -> String {
                         (Some(default), Some(most)) => format!(
                             "{made}, moving those rows out of the default partition {default}, \
                              at most {most} as allowed",
-                            default = default.raw()
+                            default = default.shown()
                         ),
                         (Some(default), None) => format!(
                             "{made}, moving those rows out of the default partition {default}, \
                              none allowed: the apply refuses any it holds",
-                            default = default.raw()
+                            default = default.shown()
                         ),
                         (None, _) => made,
                     }
@@ -1414,14 +1410,14 @@ pub fn describe(c: &Change) -> String {
             None => format!(
                 "+ create table {name} ({} columns)",
                 table.columns.len(),
-                name = name.raw()
+                name = name.shown()
             ),
         },
         Change::DropTable {
             name,
             detach_from: None,
             ..
-        } => format!("- drop table {name}", name = name.raw()),
+        } => format!("- drop table {name}", name = name.shown()),
         Change::DetachPartition {
             table,
             parent,
@@ -1433,8 +1429,8 @@ pub fn describe(c: &Change) -> String {
                 .iter()
                 .filter(|n| n.name.as_ref() != Some(&n.parent))
                 .count(),
-            table = table.raw(),
-            parent = parent.raw()
+            table = table.shown(),
+            parent = parent.shown()
         ),
         Change::AttachPartition {
             table,
@@ -1449,8 +1445,8 @@ pub fn describe(c: &Change) -> String {
             };
             format!(
                 "~ attach table {table} to {parent} as {partition}, keeping its rows",
-                table = table.raw(),
-                parent = parent.raw()
+                table = table.shown(),
+                parent = parent.shown()
             )
         }
         // Said, because the detach is a statement of its own and locks the
@@ -1461,46 +1457,35 @@ pub fn describe(c: &Change) -> String {
             ..
         } => format!(
             "- drop table {name}, a partition of {parent}, detached from it first",
-            name = name.raw(),
-            parent = parent.raw()
+            name = name.shown(),
+            parent = parent.shown()
         ),
         Change::RenameTable { from, to, .. } => format!(
             "~ rename table {from} -> {to}",
-            from = from.raw(),
-            to = to.raw()
+            from = from.shown(),
+            to = to.shown()
         ),
         Change::AddColumn { name, column, .. } => {
             format!(
                 "+ add column {name} {}",
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                column.ty.raw(),
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                name = name.raw(),
+                column.ty.shown(),
+                name = name.shown(),
             )
         }
-        Change::DropColumn { column, .. } => format!(
-            "- drop column {}",
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            column.name.raw()
-        ),
+        Change::DropColumn { column, .. } => format!("- drop column {}", column.name.shown()),
         Change::RenameColumn { from, to, .. } => format!(
             "~ rename column {from} -> {to}",
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            from = from.raw(),
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            to = to.raw(),
+            from = from.shown(),
+            to = to.shown(),
         ),
         Change::AlterColumnType {
             column, from, to, ..
         } => {
             format!(
                 "~ {} type {from} -> {to}",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw(),
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                from = from.raw(),
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                to = to.raw(),
+                column.name.shown(),
+                from = from.shown(),
+                to = to.shown(),
             )
         }
         Change::AlterColumnNullability {
@@ -1509,76 +1494,52 @@ pub fn describe(c: &Change) -> String {
             ..
         } => format!(
             "~ {} becomes {}",
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            column.name.raw(),
+            column.name.shown(),
             if *to_nullable { "nullable" } else { "NOT NULL" }
         ),
         Change::AlterColumnDefault { column, to, .. } => match to {
             Some(v) => format!(
                 "~ {} default -> {v}",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw()
+                column.name.shown(),
+                v = pbps_model::escape::Escaped(v),
             ),
-            None => format!(
-                "~ {} default removed",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw()
-            ),
+            None => format!("~ {} default removed", column.name.shown()),
         },
         Change::AlterColumnExpression { column, to, .. } => {
             format!(
                 "~ {} generated as {to}",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw()
+                column.name.shown(),
+                to = pbps_model::escape::Escaped(&to.to_string()),
             )
         }
         Change::AlterColumnNumbering {
             column, from, to, ..
         } => format!(
             "~ {} numbered by {} -> {}",
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            column.name.raw(),
+            column.name.shown(),
             numbering_source(from),
             numbering_source(to)
         ),
         Change::AddComputedColumn { name, computed, .. } => format!(
             "+ add computed column {name} as ({}){}{}",
-            computed.expression,
+            Escaped(&computed.expression),
             if computed.persisted { " persisted" } else { "" },
             if computed.not_null { " not null" } else { "" },
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         ),
-        Change::DropComputedColumn { name, .. } => format!(
-            "- drop computed column {name}",
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            name = name.raw(),
-        ),
+        Change::DropComputedColumn { name, .. } => {
+            format!("- drop computed column {name}", name = name.shown(),)
+        }
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
-            // `.raw()`: this line is the JSON `risks[].changes` text as well as
-            // the report's, and the report escapes each line whole when it
-            // prints it (`Escaped(&describe(..))`, #2035). Showing the reason
-            // here too would escape it twice and change the JSON. The interim
-            // cover goes with #2084 step 5 (DEC-2084.1).
-            Some(r) => format!(
-                "~ {} marked deprecated: {}",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw(),
-                r.raw()
-            ),
-            None => format!(
-                "~ {} no longer deprecated",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw()
-            ),
+            Some(r) => format!("~ {} marked deprecated: {}", column.name.shown(), r.shown()),
+            None => format!("~ {} no longer deprecated", column.name.shown()),
         },
         Change::SetPrimaryKey { to, .. } => match to {
             Some(pk) => format!(
                 "~ primary key -> ({})",
-                /* Shared JSON/prose, escaped whole until #2084 step 5. */
                 pk.columns
                     .iter()
-                    .map(pbps_model::ColumnName::raw)
+                    .map(|n| n.shown().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1597,56 +1558,63 @@ pub fn describe(c: &Change) -> String {
         } => match (to, fallback) {
             (Some(v), _) => format!(
                 "~ {column} default -> {v}",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
+                v = pbps_model::escape::Escaped(v),
             ),
             (None, Some(_)) => format!(
                 "~ {column} default -> its parent's",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
             ),
-            (None, None) => format!(
-                "~ {column} default removed",
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                column = column.raw(),
-            ),
+            (None, None) => format!("~ {column} default removed", column = column.shown(),),
         },
         Change::SetPartitionNotNull {
             column, not_null, ..
         } => format!(
             "~ {column} becomes {}",
             if *not_null { "NOT NULL" } else { "nullable" },
-            // Shared JSON/prose, escaped whole until #2084 step 5.
-            column = column.raw(),
+            column = column.shown(),
         ),
         Change::SetIndexStorageParameters {
             target, set, reset, ..
         } => {
-            let mut parts: Vec<String> = set.iter().map(|(k, v)| format!("{k} = {v}")).collect();
-            parts.extend(reset.iter().map(|k| format!("{k} reset")));
+            let mut parts: Vec<String> = set
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{k} = {v}",
+                        k = Escaped(k),
+                        v = pbps_model::escape::Escaped(v),
+                    )
+                })
+                .collect();
+            parts.extend(reset.iter().map(|k| format!("{} reset", Escaped(k))));
             let of = match target {
                 pbps_model::IndexPart::PrimaryKey => "primary key".to_owned(),
-                pbps_model::IndexPart::Unique(n) => format!(
-                    "unique constraint {n}",
-                    // Shared JSON/report description is escaped once until #2084 step 5.
-                    n = n.raw(),
-                ),
-                pbps_model::IndexPart::Index(n) => format!(
-                    "index {n}",
-                    // Shared JSON/report description is escaped once until #2084 step 5.
-                    n = n.raw(),
-                ),
+                pbps_model::IndexPart::Unique(n) => {
+                    format!("unique constraint {n}", n = n.shown(),)
+                }
+                pbps_model::IndexPart::Index(n) => format!("index {n}", n = n.shown(),),
             };
             format!("~ storage parameters of {of}: {}", parts.join(", "))
         }
         Change::SetStorageParameters { set, reset, .. } => {
-            let mut parts: Vec<String> = set.iter().map(|(k, v)| format!("{k} = {v}")).collect();
-            parts.extend(reset.iter().map(|k| format!("{k} reset")));
+            let mut parts: Vec<String> = set
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{k} = {v}",
+                        k = Escaped(k),
+                        v = pbps_model::escape::Escaped(v),
+                    )
+                })
+                .collect();
+            parts.extend(reset.iter().map(|k| format!("{} reset", Escaped(k))));
             format!("~ storage parameters: {}", parts.join(", "))
         }
-        Change::DropPolicy { name, .. } => format!("- drop row policy {name}"),
+        Change::DropPolicy { name, .. } => format!("- drop row policy {}", Escaped(name)),
         Change::CreatePolicy { name, policy, .. } => format!(
-            "+ create row policy {name} FOR {} AS {}",
+            "+ create row policy {} FOR {} AS {}",
+            Escaped(name),
             policy.command.as_str().to_ascii_uppercase(),
             if policy.restrictive {
                 "RESTRICTIVE"
@@ -1661,51 +1629,26 @@ pub fn describe(c: &Change) -> String {
         Change::SetReplicaIdentity { to, .. } => match to {
             Some(identity) => format!(
                 "~ replica identity -> {identity}",
-                // Shared JSON/report description is escaped once until #2084 step 5.
-                identity = identity.raw(),
+                identity = identity.shown(),
             ),
             None => "~ replica identity -> default".to_owned(),
         },
-        Change::AddUnique { name, .. } => format!(
-            "+ unique constraint {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::DropUnique { name, .. } => format!(
-            "- unique constraint {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::AddForeignKey { name, .. } => format!(
-            "+ foreign key {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::DropForeignKey { name, .. } => format!(
-            "- foreign key {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::AddCheck { name, .. } => format!(
-            "+ check constraint {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::DropCheck { name, .. } => format!(
-            "- check constraint {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::AddIndex { name, .. } => format!(
-            "+ index {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
-        Change::DropIndex { name, .. } => format!(
-            "- index {name}",
-            // Shared JSON/report description is escaped once until #2084 step 5.
-            name = name.raw(),
-        ),
+        Change::AddUnique { name, .. } => {
+            format!("+ unique constraint {name}", name = name.shown(),)
+        }
+        Change::DropUnique { name, .. } => {
+            format!("- unique constraint {name}", name = name.shown(),)
+        }
+        Change::AddForeignKey { name, .. } => format!("+ foreign key {name}", name = name.shown(),),
+        Change::DropForeignKey { name, .. } => {
+            format!("- foreign key {name}", name = name.shown(),)
+        }
+        Change::AddCheck { name, .. } => format!("+ check constraint {name}", name = name.shown(),),
+        Change::DropCheck { name, .. } => {
+            format!("- check constraint {name}", name = name.shown(),)
+        }
+        Change::AddIndex { name, .. } => format!("+ index {name}", name = name.shown(),),
+        Change::DropIndex { name, .. } => format!("- index {name}", name = name.shown(),),
         Change::CreateModule { module, .. } => format!("+ create {}", module.kind),
         // "restate", not "alter": the whole definition is sent, which is what
         // `CREATE OR ALTER` does and what the reviewer is approving.
@@ -1714,7 +1657,11 @@ pub fn describe(c: &Change) -> String {
         // Reference data (ADR-0004). The key identifies the row to a reviewer
         // who has no connection, so it leads every line.
         Change::InsertRow { key, row, .. } => {
-            format!("+ row {key} ({} values)", row.0.len() + 1)
+            format!(
+                "+ row {key} ({} values)",
+                row.0.len() + 1,
+                key = pbps_model::escape::Escaped(&key.to_string()),
+            )
         }
         Change::UpdateRow { key, columns, .. } => {
             // Both ends, because the reviewer at the gate cannot look the old
@@ -1724,16 +1671,27 @@ pub fn describe(c: &Change) -> String {
                 .map(|(c, (from, to))| {
                     format!(
                         "{c} {from} -> {to}",
-                        // Shared JSON/prose, escaped whole until #2084 step 5.
-                        c = c.raw(),
+                        c = c.shown(),
+                        to = pbps_model::escape::Escaped(&to.to_string()),
+                        from = pbps_model::escape::Escaped(&from.to_string()),
                     )
                 })
                 .collect();
-            format!("~ row {key}: {}", cells.join(", "))
+            format!(
+                "~ row {key}: {}",
+                cells.join(", "),
+                key = pbps_model::escape::Escaped(&key.to_string()),
+            )
         }
         Change::DeleteRow { key, cause, .. } => match cause {
-            DeleteCause::Undeclared => format!("- row {key} (not declared)"),
-            DeleteCause::KeyChanged => format!("- row {key} (key changed)"),
+            DeleteCause::Undeclared => format!(
+                "- row {key} (not declared)",
+                key = pbps_model::escape::Escaped(&key.to_string()),
+            ),
+            DeleteCause::KeyChanged => format!(
+                "- row {key} (key changed)",
+                key = pbps_model::escape::Escaped(&key.to_string()),
+            ),
         },
         Change::SetDataMode { to, .. } => match to {
             Some(m) => format!("~ reference data is now `{m}`"),
@@ -1742,47 +1700,35 @@ pub fn describe(c: &Change) -> String {
         Change::SetEnsureKeys { from, to, .. } => format!(
             "~ ensure keys: manage [{}]; stop managing [{}]",
             to.difference(from)
-                .map(ToString::to_string)
+                .map(|key| Escaped(&key.to_string()).to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
             from.difference(to)
-                .map(ToString::to_string)
+                .map(|key| Escaped(&key.to_string()).to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
         // Roles (ADR-0005). The permissions are spelled out: "grant on
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
-        Change::CreateRole { name, .. } => format!(
-            "+ create role {name}",
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
-        ),
+        Change::CreateRole { name, .. } => format!("+ create role {name}", name = name.shown(),),
         Change::DropRole { name, members, .. } if members.is_empty() => {
-            format!(
-                "- drop role {name}",
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
-            )
+            format!("- drop role {name}", name = name.shown(),)
         }
         Change::DropRole { name, members, .. } => format!(
             "- drop role {name}, removing {} member(s) first: {}",
             members.len(),
             members
                 .iter()
-                // Shared JSON/prose, escaped whole until #2084 step 5.
-                .map(pbps_model::RoleName::raw)
+                .map(|n| n.shown().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            // Whole-message escaping remains until #2084 step 5.
-            name = name.raw(),
+            name = name.shown(),
         ),
         Change::RenameRole { from, to, .. } => format!(
             "~ rename role {from} -> {to}",
-            // Whole-message escaping remains until #2084 step 5.
-            from = from.raw(),
-            // Whole-message escaping remains until #2084 step 5.
-            to = to.raw(),
+            from = from.shown(),
+            to = to.shown(),
         ),
         Change::Grant {
             target,
@@ -1791,8 +1737,7 @@ pub fn describe(c: &Change) -> String {
         } => format!(
             "+ grant {} on {target}",
             permissions_list(permissions),
-            // Whole-message escaping remains until #2084 step 5.
-            target = target.raw(),
+            target = target.shown(),
         ),
         Change::Revoke {
             target,
@@ -1801,8 +1746,7 @@ pub fn describe(c: &Change) -> String {
         } => format!(
             "- revoke {} on {target}",
             permissions_list(permissions),
-            // Whole-message escaping remains until #2084 step 5.
-            target = target.raw(),
+            target = target.shown(),
         ),
         Change::PublicExecution {
             routine,
@@ -1810,7 +1754,7 @@ pub fn describe(c: &Change) -> String {
             ..
         } => format!(
             "- revoke execute on {routine} from PUBLIC",
-            routine = routine.raw()
+            routine = routine.shown()
         ),
         // A statement of its own, because the engine's default is not
         // something to take on trust (DECISIONS 517) — and worth a reader's
@@ -1822,7 +1766,7 @@ pub fn describe(c: &Change) -> String {
             ..
         } => format!(
             "+ grant execute on {routine} to PUBLIC (declared)",
-            routine = routine.raw()
+            routine = routine.shown()
         ),
     }
 }
@@ -1976,7 +1920,10 @@ fn numbering_source(source: &pbps_model::ValueSource) -> String {
     use pbps_model::ValueSource;
     match source {
         ValueSource::None => "nothing".to_owned(),
-        ValueSource::Default(text) => format!("the default {text}"),
+        ValueSource::Default(text) => format!(
+            "the default {text}",
+            text = pbps_model::escape::Escaped(text),
+        ),
         ValueSource::Identity(id) => format!(
             "an identity (start {}, increment {}{})",
             id.seed,
@@ -1987,13 +1934,15 @@ fn numbering_source(source: &pbps_model::ValueSource) -> String {
             "{} (start {}, increment {}{})",
             sequence.name.as_ref().map_or_else(
                 || "its own sequence".to_owned(),
-                |n| format!("its sequence {n}")
+                |n| format!("its sequence {n}", n = pbps_model::escape::Escaped(n),)
             ),
             sequence.start,
             sequence.increment,
             sequence_options(&sequence.options)
         ),
-        ValueSource::Generated(generated) => format!("the expression {}", generated.expression),
+        ValueSource::Generated(generated) => {
+            format!("the expression {}", Escaped(&generated.expression))
+        }
     }
 }
 
@@ -2089,7 +2038,7 @@ mod tests {
             rule: "weave",
             role: AddedRole::Teardown,
             source: "app.f(integer)".into(),
-            reason: "ck depends on it\n    + forged line".into(),
+            reason: format!("ck depends on {}", Escaped("it\n    + forged line")),
         });
         let cs = ChangeSet {
             changes: vec![drop(), added],
@@ -2823,7 +2772,7 @@ mod tests {
     }
 
     #[test]
-    fn type_descriptions_keep_raw_explain_data_until_the_human_boundary() {
+    fn type_descriptions_show_each_type_once_in_every_format() {
         use pbps_model::{ColumnType, TypeRef};
         let raw = ColumnType::reference(TypeRef::new("app", "type\n\\\u{1b}\"名前").unwrap());
         let visible = ColumnType::reference(TypeRef::new("app", r#"type\n\\\u{1b}"名前"#).unwrap());
@@ -2842,8 +2791,147 @@ mod tests {
         };
         assert_eq!(
             describe(&change),
-            format!("~ v type {raw_text} -> {visible_text}")
+            format!(
+                "~ v type {} -> {}",
+                Escaped(raw_text),
+                Escaped(visible_text)
+            )
         );
         assert_ne!(describe(&change), Escaped(&describe(&change)).to_string());
+    }
+
+    #[test]
+    fn merged_type_lifecycle_descriptions_show_names_once_and_keep_raw_identities() {
+        use pbps_model::{Change, ManagedType, TypeRef};
+        for (name, shown) in [
+            (
+                "type\n\u{1b}[31m\u{202e}",
+                r#"app."type\n\u{1b}[31m\u{202e}""#,
+            ),
+            (
+                r"type\n\u{1b}[31m\u{202e}",
+                r#"app."type\\n\\u{1b}[31m\\u{202e}""#,
+            ),
+            ("名前_ünï", "app.\"名前_ünï\""),
+            ("ordinary", "app.ordinary"),
+        ] {
+            let from = TypeRef::new("app", name).unwrap();
+            for definition in [
+                ManagedType::Enum {
+                    values: vec!["ok".into()],
+                },
+                ManagedType::Domain {
+                    base: "integer".parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                },
+            ] {
+                let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
+                let to = TypeRef::new("other", name).unwrap();
+                let target_shown = shown.replacen("app.", "other.", 1);
+                for (change, expected, key) in [
+                    (
+                        Change::CreateType {
+                            uid: uid.clone(),
+                            name: from.clone(),
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("+ create {} {shown}", definition.kind()),
+                        "name",
+                    ),
+                    (
+                        Change::DropType {
+                            uid: uid.clone(),
+                            name: from.clone(),
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("- drop {} {shown}", definition.kind()),
+                        "name",
+                    ),
+                    (
+                        Change::RenameType {
+                            uid,
+                            from: from.clone(),
+                            to,
+                            definition: Box::new(definition.clone()),
+                        },
+                        format!("~ rename type {shown} -> {target_shown}"),
+                        "from",
+                    ),
+                ] {
+                    assert_eq!(super::describe(&change), expected);
+                    assert_eq!(
+                        serde_json::to_value(&change).unwrap()[key],
+                        serde_json::to_value(&from).unwrap()
+                    );
+                    assert_eq!(from.name(), name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_rebuild_descriptions_show_subjects_once_and_keep_raw_identities() {
+        use pbps_model::*;
+        for (name, shown) in [
+            ("table\n\u{1b}[31m\u{202e}", r"table\n\u{1b}[31m\u{202e}"),
+            (
+                r"table\n\u{1b}[31m\u{202e}",
+                r"table\\n\\u{1b}[31m\\u{202e}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+            ("ordinary", "ordinary"),
+        ] {
+            let table = TableName::new("app", name);
+            let relation = RebuildRelation {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: table.clone(),
+            };
+            let identities = RebuildIdentities {
+                tables: Default::default(),
+                columns: Default::default(),
+            };
+            for change in [
+                Change::RebuildPartitionedTable(Box::new(RebuildPartitionedTable {
+                    table: table.clone(),
+                    before: Default::default(),
+                    after: Default::default(),
+                    intent: Rebuild {
+                        source: identities.clone(),
+                        replacement: identities,
+                        target_checksum: "not an execution fixture".into(),
+                        max_rows: 0,
+                        allowed_at: "2026-10-24T00:00:00Z".into(),
+                        reason: "planned rewrite".parse().unwrap(),
+                        operator: "operator".into(),
+                    },
+                })),
+                Change::CopyTableRows(Box::new(CopyTableRows {
+                    source: relation.clone(),
+                    target: relation.clone(),
+                    columns: Vec::new(),
+                    source_partitions: Vec::new(),
+                    target_partitions: Vec::new(),
+                    max_rows: 0,
+                })),
+                Change::AnalyzeTableTree(Box::new(AnalyzeTableTree {
+                    parent: relation,
+                    partitions: Vec::new(),
+                })),
+            ] {
+                let (operation, _) = change.pending_rebuild().unwrap();
+                assert_eq!(
+                    super::describe(&change),
+                    format!("pending blocking rewrite: {operation} for app.{shown} (unavailable)")
+                );
+                let unchecked = pbps_dialect::Unchecked::for_change(&change, r"tool text \x");
+                assert_eq!(unchecked.description, format!("app.{shown}"));
+                assert_eq!(unchecked.reason, r"tool text \x");
+                assert_eq!(change.subject(), format!("app.{name}"));
+                assert_eq!(change.table(), Some(&table));
+            }
+        }
     }
 }

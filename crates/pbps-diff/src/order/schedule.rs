@@ -97,10 +97,10 @@ impl Refusal {
     /// order the schedule was built over.
     pub fn describe(&self, changes: &ChangeSet) -> String {
         let name = |i: usize| {
-            changes
-                .changes
-                .get(i)
-                .map_or_else(|| format!("#{i}"), |p| format!("`{}`", p.change.subject()))
+            changes.changes.get(i).map_or_else(
+                || format!("#{i}"),
+                |p| format!("`{}`", pbps_model::escape::Escaped(&p.change.subject())),
+            )
         };
         match self {
             Refusal::Outside {

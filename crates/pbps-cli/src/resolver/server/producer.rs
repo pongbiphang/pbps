@@ -451,7 +451,7 @@ fn describe(change: &pbps_model::Change) -> String {
         .ok()
         .and_then(|v| v.get("op").and_then(|op| op.as_str()).map(str::to_owned))
         .unwrap_or_default();
-    format!("{op} {}", change.subject())
+    format!("{op} {}", pbps_model::escape::Escaped(&change.subject()))
 }
 
 /// What stopped a production run before it returned evidence (#1514).
