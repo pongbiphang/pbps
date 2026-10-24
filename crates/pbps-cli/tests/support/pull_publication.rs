@@ -260,3 +260,54 @@ pub fn output_directories(server: &str, pg: bool) {
         );
     }
 }
+
+#[cfg(unix)]
+pub fn restrictive_permissions(server: &str, pg: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    for (mode, linked) in [(0o600, false), (0o640, true), (0o644, false)] {
+        let name = format!("pull2311_permissions_{mode}_{linked}");
+        let own = OwnDatabase::new(server, &name);
+        if pg {
+            on_server(own.connection(), "CREATE SCHEMA app");
+        }
+        on_server(
+            own.connection(),
+            &format!(
+                "CREATE TABLE {schema}.country (code varchar(20) PRIMARY KEY, label varchar(80) NOT NULL); \
+                 INSERT INTO {schema}.country VALUES ('private', 'secret-before')",
+                schema = schema(pg),
+            ),
+        );
+        let d = Demo::new(&name);
+        let table = format!("{}.country", schema(pg));
+        ok(d.run(&["pull", "--db", own.connection(), "--data", &table]));
+        let dir = d.dir.join("schema");
+        let output = dir.join(format!("{table}.yml"));
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(mode)).unwrap();
+        if linked {
+            std::fs::rename(&output, dir.join("legacy.yml")).unwrap();
+            std::os::unix::fs::symlink("legacy.yml", &output).unwrap();
+        }
+        on_server(
+            own.connection(),
+            &format!("UPDATE {table} SET label = 'secret-after' WHERE code = 'private'"),
+        );
+        let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+        ok(d.run(&[
+            "pull",
+            "--force",
+            "--db",
+            own.connection(),
+            "--data",
+            &table,
+        ]));
+        let actual = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+        assert_eq!(actual, mode, "forced pull broadened declaration access");
+        assert!(!std::fs::symlink_metadata(&output).unwrap().is_symlink());
+        let text = std::fs::read_to_string(&output).unwrap();
+        assert!(text.contains("secret-after"), "{text}");
+        assert!(!text.contains("secret-before"), "{text}");
+        assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+        ok(d.run(&["validate"]));
+    }
+}

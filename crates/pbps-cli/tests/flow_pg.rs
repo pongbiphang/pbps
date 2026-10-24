@@ -34814,6 +34814,15 @@ fn forced_pull2311_directory_outputs_refuse_before_changing_the_project() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn forced_pull2311_preserves_restrictive_permissions_when_replacing_data() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::restrictive_permissions(&server, true);
+    }
+}
+
 #[path = "support/message_boundaries.rs"]
 mod message_boundaries;
 

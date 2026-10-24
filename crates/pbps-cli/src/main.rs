@@ -1849,13 +1849,17 @@ fn cmd_pull(
     }
     // A directory at an output filename makes copying fail predictably. Refuse
     // it before deleting any declarations, including through a directory link.
+    let mut output_permissions = std::collections::BTreeMap::new();
     for path in &written {
         match std::fs::metadata(path) {
-            Ok(metadata) => anyhow::ensure!(
-                !metadata.is_dir(),
-                "`{}` is a directory; move it before retrying pull",
-                pbps_model::Text::new(path.display().to_string()).shown()
-            ),
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.is_dir(),
+                    "`{}` is a directory; move it before retrying pull",
+                    pbps_model::Text::new(path.display().to_string()).shown()
+                );
+                output_permissions.insert(path.clone(), metadata.permissions());
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -1898,7 +1902,19 @@ fn cmd_pull(
             std::fs::create_dir_all(parent)?;
         }
         let source = stage.path().join(path.strip_prefix(&dir)?);
-        std::fs::copy(&source, path).with_context(|| {
+        let publish = || -> std::io::Result<u64> {
+            let Some(permissions) = output_permissions.get(path) else {
+                return std::fs::copy(&source, path);
+            };
+            // Replacing an entry must not broaden its access, especially with
+            // `--data`. Set the old permissions while the replacement is empty,
+            // before copying any validated bytes; chmod after copying is too late.
+            let mut input = std::fs::File::open(&source)?;
+            let mut output = std::fs::File::create_new(path)?;
+            output.set_permissions(permissions.clone())?;
+            std::io::copy(&mut input, &mut output)
+        };
+        publish().with_context(|| {
             format!(
                 "cannot publish `{}`",
                 pbps_model::Text::new(path.display().to_string()).shown()

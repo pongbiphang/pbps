@@ -178,7 +178,8 @@
       "ignored_on": ["linux", "darwin"],
       "cases": [
         "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
-        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases"
+        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
+        "forced_pull2311_preserves_restrictive_permissions_when_replacing_data"
       ]
     },
     {
@@ -188,7 +189,8 @@
       "ignored_on": ["linux", "darwin"],
       "cases": [
         "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
-        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases"
+        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
+        "forced_pull2311_preserves_restrictive_permissions_when_replacing_data"
       ]
     },
     {
