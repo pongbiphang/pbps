@@ -737,24 +737,7 @@ pub(crate) fn diff_partial_rebuilding(
 
     let (label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
-    let label_changes = ChangeSet {
-        changes: label_changes.into_iter().map(PlannedChange::new).collect(),
-    };
-    // Compare retained authored expressions in the spelling PostgreSQL will
-    // deparse after the approved rename. No CHECK/default is rebuilt for this.
-    let mut forwarded_base = base.schema.clone();
-    crate::enum_labels::forward_schema(
-        &mut forwarded_base,
-        base.ids,
-        &label_changes,
-        dialect,
-        false,
-    );
-    let base = Side {
-        schema: &forwarded_base,
-        ids: base.ids,
-    };
-    changes.extend(label_changes.changes.into_iter().map(|p| p.change));
+    changes.extend(label_changes);
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.

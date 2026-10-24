@@ -2945,19 +2945,23 @@ or SQL-bodied routines containing the quoted label. The named remedy is
 partition keys, before this use check can arise. DEC-1523.1 is unchanged;
 admitting those surfaces belongs to #2346, not slice 3a.
 
-PostgreSQL stores enum constants by oid: renaming sad to blue changes a
-retained `m <> 'sad'` CHECK and a default's catalog text without rebuilding
-either. Comparison forwards only approved labels in typed expected SQL
-constants, including enum-array constants, retaining dimensions, NULL,
-escaping, comments and unrelated text constants. Authored defaults use the
-column's type; uncast authored checks require their referenced columns to
-belong to the enum; catalog comparisons require a bound enum/domain cast.
-The same expression adapter covers already-declarable generated/index/policy/
-module expressions and partition-own defaults on non-reference partition keys,
-so the closing guard does not mistake their OID-driven deparse for drift.
-Expected row values and partition bounds are not forwarded. The declaration
-record advances existing expression provenance without inventing it for adopted
-expressions; raw catalog checksums remain unmodified evidence.
+PostgreSQL stores enum constants by oid, but pbps does not rewrite SQL text
+through a label rename. An updated CHECK or default differs from its recorded
+declaration and the ordinary diff lists its rebuild or alteration. DropCheck
+(class 2) precedes the label rename (class 7); defaults follow in class 9 and
+AddCheck in class 13. These statements succeed in one transaction on PG 16.15
+and 18.6: renamed labels, unlike newly added values, are usable immediately.
+The cost is explicit: AddCheck scans its table under ACCESS EXCLUSIVE until
+commit. An engine-typed, scan-free alternative is tracked in #2354.
+
+Connected spelling probes defer defaults and CHECKs by the resolved identity
+of an enum whose label this plan renames, including arrays and domains over
+it, without reading or reversing their SQL text. The probe view never changes
+the declaration used for diffing or recording. The engine enforces statements
+at apply; existing post-statement declared-type vetting and closing readback
+checks remain in force. No expression provenance is forwarded or invented.
+A retained expression that still uses the old label must surface a named
+error rather than silently recording a guessed new spelling.
 
 Unannotated label removal and retained-label reordering stay named refusals
 with the #1635 slice 3b remedy. Domain alterations stay slice 4. Saved plan 52

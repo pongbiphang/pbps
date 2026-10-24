@@ -1157,29 +1157,6 @@ impl Lexicon {
     /// (DEC-1364.1). An unterminated literal ends the scan.
     #[must_use]
     pub fn string_literals(&self, text: &str) -> Vec<String> {
-        self.string_literal_ranges(text)
-            .into_iter()
-            .map(|(_, _, value)| value)
-            .collect()
-    }
-
-    /// Rewrite decoded SQL literals while preserving comments, identifiers and
-    /// every unchanged byte. The suffix permits a caller to require a typed cast.
-    pub fn rewrite_string_literals(
-        &self,
-        text: &str,
-        mut replacement: impl FnMut(&str, &str) -> Option<String>,
-    ) -> String {
-        let mut out = text.to_owned();
-        for (start, end, value) in self.string_literal_ranges(text).into_iter().rev() {
-            if let Some(value) = replacement(&value, &text[end..]) {
-                out.replace_range(start..end, &format!("'{}'", value.replace('\'', "''")));
-            }
-        }
-        out
-    }
-
-    fn string_literal_ranges(&self, text: &str) -> Vec<(usize, usize, String)> {
         let bytes = text.as_bytes();
         let mut out = Vec::new();
         let mut i = 0;
@@ -1241,7 +1218,7 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, i) else {
                     break;
                 };
-                out.push((i, literal.end, literal.contents));
+                out.push(literal.contents);
                 i = literal.end;
             } else if let Some(start) = literal_start(rest)
                 && (start == '\'' || !after_name)
@@ -1258,7 +1235,7 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, at) else {
                     break;
                 };
-                out.push((i, literal.end, literal.contents));
+                out.push(literal.contents);
                 i = literal.end;
             } else {
                 i += ch.len_utf8();
@@ -6649,27 +6626,6 @@ mod code_only_tests {
             PG.routine_language("() RETURNS text /* LANGUAGE plpgsql */ AS 'x'"),
             None
         );
-    }
-
-    #[test]
-    fn literal_rewrites_preserve_comments_identifiers_and_unselected_types() {
-        let sql =
-            "m <> E'sad'::app.e AND text <> 'sad'::text /* 'sad' */ AND \"sad\" IS NULL -- 'sad'\n";
-        let actual = PG.rewrite_string_literals(sql, |value, suffix| {
-            (value == "sad" && suffix.starts_with("::app.e")).then(|| "can't".to_owned())
-        });
-        assert_eq!(
-            actual,
-            "m <> 'can''t'::app.e AND text <> 'sad'::text /* 'sad' */ AND \"sad\" IS NULL -- 'sad'\n"
-        );
-        assert_eq!(PG.rewrite_string_literals(sql, |_, _| None), sql);
-        for spelling in ["'sad'", "E'sad'", "U&'sad'", "$tag$sad$tag$"] {
-            assert_eq!(
-                PG.rewrite_string_literals(spelling, |value, _| (value == "sad")
-                    .then(|| "blue".to_owned())),
-                "'blue'"
-            );
-        }
     }
 
     const MSSQL: Lexicon = Lexicon {

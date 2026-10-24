@@ -832,6 +832,7 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 | RenameType chains | free destination first | existing slot edges; cycles/swaps refuse by name in the differ |
 | RenameType → AddEnumValue/RenameEnumValue | final type spelling first | class 1 before class 7; same uid resource |
 | AddEnumValue/RenameEnumValue → typed tables, columns, defaults, checks, modules and dependent domains | labels/spellings first | class 7 type subrank before tables; existing final-type effects and two-write base order; later classes 8/9/13/14 |
+| DropCheck → RenameEnumValue → updated defaults/AddCheck | ordinary expression rebuild, never lexical forwarding | classes 2 → 7 → 9/13; renamed labels are usable in this transaction; AddCheck scans under ACCESS EXCLUSIVE until commit (DEC-1635.6, #2354) |
 | Label changes on one uid | approved intermediate order | rank by operation ordinal inside the existing type subrank; the existing resource-write edge preserves it |
 | AddEnumValue → any same-plan evaluation of its new label | transactional use refused by name | plan-time refusal (DEC-1635.6), including enum arrays and domains; apply the label first, then the rest |
 | Label changes → reference-data rows or enum-rooted partition bounds | not declarable today | DEC-1523.1 refuses the surface before a use check or ordering obligation; #2346 tracks admission |
