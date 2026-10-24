@@ -13,56 +13,70 @@ use pbps_model::{
 
 use crate::pins::Within;
 use crate::user_types::{self, TypeRead, UserType};
+use pbps_diff::{
+    Side,
+    identity::type_refs::{TypeIdentity, TypeResolver, TypeSide},
+};
 
 fn failed(why: impl Into<String>) -> DbError {
     DbError::BadRow(why.into())
 }
 
-pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef> {
-    let mut types: Vec<&ColumnType> = schemas
-        .iter()
-        .flat_map(|s| s.tables.values())
-        .flat_map(|t| t.columns.values().map(|c| &c.ty))
-        .chain(
-            schemas
-                .iter()
-                .flat_map(|s| s.types.values())
-                .filter_map(|t| match t {
-                    pbps_model::ManagedType::Domain { base, .. }
-                        if base.type_ref().is_some_and(|r| r.schema() != "pg_catalog") =>
-                    {
-                        Some(base)
-                    }
-                    pbps_model::ManagedType::Enum { .. }
-                    | pbps_model::ManagedType::Domain { .. } => None,
-                }),
-        )
-        .collect();
+fn reference_uses<'a>(
+    schemas: &[(TypeSide, &'a Schema)],
+    changes: &'a ChangeSet,
+) -> Vec<(TypeSide, &'a ColumnType)> {
+    let mut types = Vec::new();
+    for (side, schema) in schemas {
+        types.extend(
+            schema
+                .tables
+                .values()
+                .flat_map(|t| t.columns.values().map(|c| (*side, &c.ty))),
+        );
+        types.extend(schema.types.values().filter_map(|t| match t {
+            pbps_model::ManagedType::Domain { base, .. }
+                if base.type_ref().is_some_and(|r| r.schema() != "pg_catalog") =>
+            {
+                Some((*side, base))
+            }
+            pbps_model::ManagedType::Enum { .. } | pbps_model::ManagedType::Domain { .. } => None,
+        }));
+    }
     for planned in &changes.changes {
         match &planned.change {
-            Change::RebuildPartitionedTable(r) => types.extend(
-                r.before
-                    .values()
-                    .chain(r.after.values())
-                    .flat_map(|t| t.columns.values().map(|c| &c.ty)),
-            ),
-            Change::CopyTableRows(c) => types.extend(
-                c.columns
-                    .iter()
-                    .flat_map(|c| std::iter::once(&c.cast).chain(c.source.iter().map(|s| &s.ty))),
-            ),
+            Change::RebuildPartitionedTable(r) => {
+                types.extend(
+                    r.before
+                        .values()
+                        .flat_map(|t| t.columns.values().map(|c| (TypeSide::Base, &c.ty))),
+                );
+                types.extend(
+                    r.after
+                        .values()
+                        .flat_map(|t| t.columns.values().map(|c| (TypeSide::Desired, &c.ty))),
+                );
+            }
+            Change::CopyTableRows(c) => types.extend(c.columns.iter().flat_map(|c| {
+                std::iter::once((TypeSide::Desired, &c.cast))
+                    .chain(c.source.iter().map(|s| (TypeSide::Base, &s.ty)))
+            })),
             Change::AnalyzeTableTree(_) => {}
             Change::CreateTable { table, .. }
             | Change::AttachPartition { shape: table, .. }
             | Change::DetachPartition { shape: table, .. } => {
-                types.extend(table.columns.values().map(|c| &c.ty));
+                types.extend(table.columns.values().map(|c| (TypeSide::Desired, &c.ty)));
             }
-            Change::AddColumn { column, .. } => types.push(&column.ty),
-            Change::AlterColumnType { from, to, .. } => types.extend([from, to]),
+            Change::AddColumn { column, .. } => types.push((TypeSide::Desired, &column.ty)),
+            Change::AlterColumnType { from, to, .. } => {
+                types.extend([(TypeSide::Base, from), (TypeSide::Desired, to)])
+            }
             Change::AlterColumnNullability { ty, .. } | Change::AlterColumnNumbering { ty, .. } => {
-                types.push(ty)
+                types.push((TypeSide::Desired, ty))
             }
-            Change::InsertRow { types: carried, .. } => types.extend(carried.values()),
+            Change::InsertRow { types: carried, .. } => {
+                types.extend(carried.values().map(|ty| (TypeSide::Desired, ty)))
+            }
             Change::UpdateRow {
                 types: before,
                 after_types,
@@ -75,15 +89,17 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
                 key_type,
                 ..
             } => {
-                types.extend(before.values());
-                types.extend(after_types.values());
-                types.extend(key_type);
+                types.extend(before.values().map(|ty| (TypeSide::Base, ty)));
+                types.extend(after_types.values().map(|ty| (TypeSide::Desired, ty)));
+                // The row key is compared after structural changes; unlike
+                // recorded cells, its carried type is the declared one.
+                types.extend(key_type.iter().map(|ty| (TypeSide::Desired, ty)));
             }
             Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
                 if let pbps_model::ManagedType::Domain { base, .. } = definition.as_ref()
                     && base.type_ref().is_some_and(|r| r.schema() != "pg_catalog")
                 {
-                    types.push(base);
+                    types.push((TypeSide::Desired, base));
                 }
             }
             Change::DropTable { .. }
@@ -128,9 +144,40 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         }
     }
     types
+}
+
+pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef> {
+    let schemas: Vec<_> = schemas.iter().map(|s| (TypeSide::Desired, *s)).collect();
+    reference_uses(&schemas, changes)
         .into_iter()
-        .filter_map(|ty| ty.type_ref().cloned())
+        .filter_map(|(_, ty)| ty.type_ref().cloned())
         .collect()
+}
+
+/// A managed name on the other side cannot erase an external prerequisite.
+pub fn external_references(
+    base: Side<'_>,
+    desired: Side<'_>,
+    changes: &ChangeSet,
+) -> BTreeSet<TypeRef> {
+    let resolver = TypeResolver::new(base.ids, desired.ids);
+    reference_uses(
+        &[
+            (TypeSide::Base, base.schema),
+            (TypeSide::Desired, desired.schema),
+        ],
+        changes,
+    )
+    .into_iter()
+    .filter_map(|(side, ty)| {
+        let reference = ty.type_ref()?;
+        matches!(
+            resolver.resolve(side, reference),
+            TypeIdentity::ExternalOrUnrecorded(_)
+        )
+        .then(|| reference.clone())
+    })
+    .collect()
 }
 
 /// Managed definitions are certified by their checksum-pinned declarations.
@@ -269,6 +316,29 @@ pub async fn seal(
         .into_iter()
         .filter(|r| !managed.contains(r))
         .collect();
+    seal_references(conn, schemas, references).await
+}
+
+/// Planning supplies both uid maps; bootstrap's single-side inventory stays separate.
+pub async fn seal_sides(
+    conn: &mut Conn,
+    base: Side<'_>,
+    desired: Side<'_>,
+    changes: &ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+) -> Result<Vec<TypePin>, DbError> {
+    trusted_roles(conn, trusted).await?;
+    let references = external_references(base, desired, changes)
+        .into_iter()
+        .collect();
+    seal_references(conn, &[base.schema, desired.schema], references).await
+}
+
+async fn seal_references(
+    conn: &mut Conn,
+    schemas: &[&Schema],
+    references: Vec<TypeRef>,
+) -> Result<Vec<TypePin>, DbError> {
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
         check_defaults(schema, &types).map_err(failed)?;
@@ -313,6 +383,35 @@ pub async fn seal(
     Ok(types.iter().map(pin).collect())
 }
 
+fn require_references(
+    references: &[TypeRef],
+    declared: &[pbps_model::DeclaredTypePin],
+    changes: &ChangeSet,
+) -> Result<(), DbError> {
+    let (base_ids, desired_ids) = self::declared::identities(declared, changes);
+    let schema = Schema::default();
+    let required = external_references(
+        Side {
+            schema: &schema,
+            ids: &base_ids,
+        },
+        Side {
+            schema: &schema,
+            ids: &desired_ids,
+        },
+        changes,
+    );
+    for reference in &required {
+        if !references.contains(reference) {
+            return Err(failed(format!(
+                "plan has no type pin for `{reference}`; plan again against the database",
+                reference = reference.shown(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn check(
     conn: &mut Conn,
     within: Within,
@@ -324,18 +423,7 @@ pub async fn check(
         .iter()
         .map(|p| TypeRef::new(&p.schema, &p.name).map_err(|e| failed(e.to_string())))
         .collect::<Result<_, _>>()?;
-    let managed = managed_names(&[], changes)
-        .union(&self::declared::names(declared))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    for reference in self::references(&[], changes).difference(&managed) {
-        if !references.contains(reference) {
-            return Err(failed(format!(
-                "plan has no type pin for `{reference}`; plan again against the database",
-                reference = reference.shown(),
-            )));
-        }
-    }
+    require_references(&references, declared, changes)?;
     let actual: Vec<_> = read(conn, within, &references)
         .await?
         .iter()
@@ -502,6 +590,210 @@ mod tests {
             )]
             .into(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn newly_created_types_need_no_external_pin_for_tables_and_domain_bases() {
+        for array in ["", "[]"] {
+            for domain in [false, true] {
+                let enumeration = pbps_model::ManagedType::Enum {
+                    values: vec!["ok".into()],
+                };
+                let mut changes = ChangeSet {
+                    changes: vec![pbps_model::PlannedChange::new(Change::CreateType {
+                        uid: "y_000001".parse().unwrap(),
+                        name: "app.mood".parse().unwrap(),
+                        definition: Box::new(enumeration),
+                    })],
+                };
+                if domain {
+                    changes
+                        .changes
+                        .push(pbps_model::PlannedChange::new(Change::CreateType {
+                            uid: "y_000002".parse().unwrap(),
+                            name: "app.choice".parse().unwrap(),
+                            definition: Box::new(pbps_model::ManagedType::Domain {
+                                base: format!("app.mood{array}").parse().unwrap(),
+                                not_null: false,
+                                default: None,
+                                checks: Default::default(),
+                                collation: None,
+                            }),
+                        }));
+                }
+                let ty = if domain {
+                    "app.choice".to_owned()
+                } else {
+                    format!("app.mood{array}")
+                };
+                changes
+                    .changes
+                    .push(pbps_model::PlannedChange::new(Change::CreateTable {
+                        uid: "t_000001".parse().unwrap(),
+                        name: "app.t".parse().unwrap(),
+                        table: Box::new(pbps_model::Table {
+                            columns: [("v".into(), Column::new(ty.parse().unwrap()))].into(),
+                            ..Default::default()
+                        }),
+                        beside_default: None,
+                        moves_at_most: None,
+                    }));
+                require_references(&[], &[], &changes).unwrap();
+                let (base, desired) = declared::identities(&[], &changes);
+                assert!(base.types.is_empty());
+                assert_eq!(
+                    desired.type_uid(&"app.mood".parse().unwrap()),
+                    Some(&"y_000001".parse().unwrap())
+                );
+                // A matching name without its explicit CREATE remains external.
+                changes.changes.remove(0);
+                let refusal = require_references(&[], &[], &changes)
+                    .unwrap_err()
+                    .to_string();
+                assert!(refusal.contains("app.mood"), "{refusal}");
+            }
+        }
+    }
+
+    #[test]
+    fn row_keys_resolve_the_desired_uid_after_a_type_creation_or_rename() {
+        for rename in [false, true] {
+            let definition = Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["ok".into()],
+            });
+            let lifecycle = if rename {
+                Change::RenameType {
+                    uid: "y_000001".parse().unwrap(),
+                    from: "app.old".parse().unwrap(),
+                    to: "app.mood".parse().unwrap(),
+                    definition,
+                }
+            } else {
+                Change::CreateType {
+                    uid: "y_000001".parse().unwrap(),
+                    name: "app.mood".parse().unwrap(),
+                    definition,
+                }
+            };
+            for delete in [false, true] {
+                let key_type = Some("app.mood".parse().unwrap());
+                let row = if delete {
+                    Change::DeleteRow {
+                        table: "app.t".parse().unwrap(),
+                        key_column: "v".into(),
+                        key: "ok".into(),
+                        cause: pbps_model::change::DeleteCause::Undeclared,
+                        row: Default::default(),
+                        dropped: Default::default(),
+                        types: Default::default(),
+                        after_types: Default::default(),
+                        key_type,
+                    }
+                } else {
+                    Change::UpdateRow {
+                        table: "app.t".parse().unwrap(),
+                        key_column: "v".into(),
+                        key: "ok".into(),
+                        columns: Default::default(),
+                        unchanged: Default::default(),
+                        types: Default::default(),
+                        after_types: Default::default(),
+                        key_type,
+                    }
+                };
+                let changes = ChangeSet {
+                    changes: vec![
+                        pbps_model::PlannedChange::new(lifecycle.clone()),
+                        pbps_model::PlannedChange::new(row.clone()),
+                    ],
+                };
+                require_references(&[], &[], &changes).unwrap();
+                assert!(
+                    require_references(
+                        &[],
+                        &[],
+                        &ChangeSet {
+                            changes: vec![pbps_model::PlannedChange::new(row)]
+                        }
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_external_reference_on_one_side_is_not_hidden_by_a_managed_name_on_the_other() {
+        let name: TypeRef = "app.mood".parse().unwrap();
+        let definition = pbps_model::ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let base_ids = pbps_model::IdsFile {
+            types: [("y_000001".parse().unwrap(), name.clone())].into(),
+            ..Default::default()
+        };
+        let base = Schema {
+            types: [(name.clone(), definition.clone())].into(),
+            ..Default::default()
+        };
+        for array in ["", "[]"] {
+            let column = Column::new(format!("app.mood{array}").parse().unwrap());
+            let table = pbps_model::Table {
+                columns: [("v".into(), column)].into(),
+                ..Default::default()
+            };
+            let desired = Schema {
+                tables: [("app.t".parse().unwrap(), table.clone())].into(),
+                ..Default::default()
+            };
+            let empty = pbps_model::IdsFile::default();
+            let changes = ChangeSet {
+                changes: vec![
+                    pbps_model::PlannedChange::new(Change::DropType {
+                        uid: "y_000001".parse().unwrap(),
+                        name: name.clone(),
+                        definition: Box::new(definition.clone()),
+                    }),
+                    pbps_model::PlannedChange::new(Change::CreateTable {
+                        uid: "t_000001".parse().unwrap(),
+                        name: "app.t".parse().unwrap(),
+                        table: Box::new(table),
+                        beside_default: None,
+                        moves_at_most: None,
+                    }),
+                ],
+            };
+            let old = Side {
+                schema: &base,
+                ids: &base_ids,
+            };
+            let new = Side {
+                schema: &desired,
+                ids: &empty,
+            };
+            assert_eq!(
+                external_references(old, new, &changes),
+                [name.clone()].into()
+            );
+            assert!(require_references(&[], &[], &changes).is_err());
+            require_references(std::slice::from_ref(&name), &[], &changes).unwrap();
+
+            let managed = pbps_model::IdsFile {
+                types: [("y_000002".parse().unwrap(), name.clone())].into(),
+                ..Default::default()
+            };
+            assert!(
+                external_references(
+                    old,
+                    Side {
+                        schema: &desired,
+                        ids: &managed
+                    },
+                    &changes
+                )
+                .is_empty()
+            );
         }
     }
 

@@ -3587,6 +3587,12 @@ fn cmd_plan(
         )?;
         let skipped = scheduled.skipped;
         let mut cs = scheduled.changes;
+        findings.extend(deploy::type_replacement_warnings(
+            &base.ids,
+            &res.ids,
+            cs.changes(),
+            json,
+        ));
 
         // The plan rules (ADR-0008): attached to the changes they are about, so
         // the plan file carries them to `explain`, and reported here at the

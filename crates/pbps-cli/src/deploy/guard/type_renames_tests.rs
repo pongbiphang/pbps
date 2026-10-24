@@ -185,3 +185,120 @@ fn approved_type_moves_preserve_every_catalog_expression_and_refuse_real_edits()
         }
     }
 }
+
+#[test]
+fn type_replacement_guards_follow_final_uids_and_refuse_the_old_definition() {
+    let old = ManagedType::Enum {
+        values: vec!["old".into()],
+    };
+    let new = ManagedType::Enum {
+        values: vec!["new".into()],
+    };
+    let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+    let before = Schema {
+        types: [(name.clone(), old.clone())].into(),
+        ..Default::default()
+    };
+    let after = Schema {
+        types: [(name.clone(), new.clone())].into(),
+        ..Default::default()
+    };
+    let create = Change::CreateType {
+        uid: "y_000002".parse().unwrap(),
+        name: name.clone(),
+        definition: Box::new(new),
+    };
+    let drop = Change::DropType {
+        uid: "y_000001".parse().unwrap(),
+        name: name.clone(),
+        definition: Box::new(old),
+    };
+    for parts in [
+        vec![drop.clone(), create.clone()],
+        vec![create.clone(), drop.clone()],
+    ] {
+        let changes = ChangeSet {
+            changes: parts.into_iter().map(PlannedChange::new).collect(),
+        };
+        let check = |read| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                &changes,
+                &before,
+                read,
+                "test",
+                Settled::Closing,
+            )
+        };
+        check(&after).unwrap();
+        assert!(check(&before).is_err());
+    }
+}
+
+#[test]
+fn replacement_warnings_name_both_uids_and_preserve_identity_advice() {
+    use super::super::type_replacement_warnings;
+    let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+    let old: pbps_model::Uid = "y_000001".parse().unwrap();
+    let new: pbps_model::Uid = "y_000002".parse().unwrap();
+    let base = pbps_model::IdsFile {
+        types: [(old.clone(), name.clone())].into(),
+        ..Default::default()
+    };
+    let desired = pbps_model::IdsFile {
+        types: [(new.clone(), name.clone())].into(),
+        ..Default::default()
+    };
+    let definition = Box::new(ManagedType::Enum {
+        values: vec!["ok".into()],
+    });
+    let drop = PlannedChange::new(Change::DropType {
+        uid: old.clone(),
+        name: name.clone(),
+        definition: definition.clone(),
+    });
+    let create = PlannedChange::new(Change::CreateType {
+        uid: new,
+        name: name.clone(),
+        definition: definition.clone(),
+    });
+    let warnings = type_replacement_warnings(
+        &base,
+        &desired,
+        &ChangeSet {
+            changes: vec![drop.clone(), create.clone()],
+        },
+        true,
+    );
+    assert_eq!(warnings.len(), 1);
+    let message = &warnings[0].message;
+    for text in [
+        "app.mood",
+        "y_000001",
+        "y_000002",
+        "different types",
+        "history does not carry over",
+        "original declaration file",
+        "renamed_from",
+        "not supported yet",
+        "currently refused",
+        "#1635 slices 3 and 4",
+    ] {
+        assert!(message.contains(text), "{text}: {message}");
+    }
+    for changes in [
+        vec![drop],
+        vec![create],
+        vec![],
+        vec![PlannedChange::new(Change::RenameType {
+            uid: old,
+            from: name,
+            to: "app.renamed".parse().unwrap(),
+            definition,
+        })],
+    ] {
+        assert!(
+            type_replacement_warnings(&base, &desired, &ChangeSet { changes }, true).is_empty()
+        );
+    }
+}

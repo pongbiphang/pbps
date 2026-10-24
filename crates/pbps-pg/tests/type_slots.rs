@@ -279,3 +279,182 @@ fn a_table_to_type_handoff_is_an_existing_slot_edge_and_the_reverse_is_rejected(
             .any(|edge| edge.before == 0 && edge.after == 1)
     );
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn replacement_type_slots_apply_new_dependents_and_refuse_retained_bindings() {
+    use pbps_diff::order::deployment::{
+        Sources,
+        schedule::{Declarations, Facts, schedule},
+    };
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let mut conn =
+            pbps_db::Conn::connect(pbps_db::Driver::Postgres, &std::env::var(variable).unwrap())
+                .await
+                .unwrap();
+        for array in [false, true] {
+            for domain in [false, true] {
+                conn.execute("BEGIN; CREATE SCHEMA resolver2321; CREATE TYPE resolver2321.mood AS ENUM ('old')").await.unwrap();
+                let name: pbps_model::TypeRef = "resolver2321.mood".parse().unwrap();
+                let old = uid(UidKind::Type, "old2321");
+                let new = uid(UidKind::Type, "new2321");
+                let base = Schema {
+                    types: [(
+                        name.clone(),
+                        ManagedType::Enum {
+                            values: vec!["old".into()],
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let mut desired = Schema {
+                    types: [(
+                        name.clone(),
+                        ManagedType::Enum {
+                            values: vec!["new".into()],
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let base_ids = IdsFile {
+                    types: [(old, name.clone())].into(),
+                    ..Default::default()
+                };
+                let mut ids = IdsFile {
+                    types: [(new, name)].into(),
+                    ..Default::default()
+                };
+                let ty = if array {
+                    "resolver2321.mood[]"
+                } else {
+                    "resolver2321.mood"
+                };
+                if domain {
+                    desired.types.insert(
+                        "resolver2321.choice".parse().unwrap(),
+                        ManagedType::Domain {
+                            base: ty.parse().unwrap(),
+                            not_null: false,
+                            default: None,
+                            checks: Default::default(),
+                            collation: None,
+                        },
+                    );
+                    ids.types.insert(
+                        uid(UidKind::Type, "domain2321"),
+                        "resolver2321.choice".parse().unwrap(),
+                    );
+                } else {
+                    let table = Table {
+                        columns: [("v".into(), pbps_model::Column::new(ty.parse().unwrap()))]
+                            .into(),
+                        ..Default::default()
+                    };
+                    desired
+                        .tables
+                        .insert("resolver2321.t".parse().unwrap(), table);
+                    ids.tables.insert(
+                        uid(UidKind::Table, "table2321"),
+                        "resolver2321.t".parse().unwrap(),
+                    );
+                    ids.columns.insert(
+                        uid(UidKind::Column, "column2321"),
+                        pbps_model::ColumnRef {
+                            table: "resolver2321.t".parse().unwrap(),
+                            name: "v".into(),
+                        },
+                    );
+                }
+                let dialect = pbps_pg::Postgres::new();
+                let hints = pbps_model::Hints::default();
+                let before = pbps_diff::Side {
+                    schema: &base,
+                    ids: &base_ids,
+                };
+                let after = pbps_diff::Side {
+                    schema: &desired,
+                    ids: &ids,
+                };
+                let logical = pbps_diff::diff(before, after, &dialect, &hints).unwrap();
+                let ordered = schedule(
+                    logical,
+                    &Declarations {
+                        schema: &desired,
+                        sources: Sources {
+                            before,
+                            after: &ids,
+                        },
+                        module_deps: &hints.module_deps,
+                    },
+                    &Facts::default(),
+                    &dialect,
+                )
+                .unwrap()
+                .changes;
+                let ordered = ordered.ordered(pbps_model::PlanMode::Transactional, &dialect);
+                let lowered = pbps_dialect::lower::lower_all(
+                    &ordered as &dyn pbps_diff::order::PlanView<pbps_pg::Postgres>,
+                    &dialect,
+                )
+                .unwrap();
+                for statement in lowered.statements() {
+                    conn.execute(&statement.sql).await.unwrap();
+                }
+                let live = pbps_pg::catalog::introspect_within_transaction(&mut conn)
+                    .await
+                    .unwrap()
+                    .schema;
+                assert_eq!(
+                    live.types[&"resolver2321.mood".parse().unwrap()],
+                    desired.types[&"resolver2321.mood".parse().unwrap()]
+                );
+                assert!(
+                    pbps_diff::diff(
+                        pbps_diff::Side {
+                            schema: &live,
+                            ids: &ids
+                        },
+                        after,
+                        &dialect,
+                        &hints
+                    )
+                    .unwrap()
+                    .changes()
+                    .is_empty()
+                );
+                // The identical desired spelling still binds the retained base uid.
+                let mut retained = base.clone();
+                let mut retained_ids = base_ids.clone();
+                if domain {
+                    retained.types.insert(
+                        "resolver2321.choice".parse().unwrap(),
+                        desired.types[&"resolver2321.choice".parse().unwrap()].clone(),
+                    );
+                    retained_ids.types.insert(
+                        uid(UidKind::Type, "domain2321"),
+                        "resolver2321.choice".parse().unwrap(),
+                    );
+                } else {
+                    retained.tables = desired.tables.clone();
+                    retained_ids.tables = ids.tables.clone();
+                    retained_ids.columns = ids.columns.clone();
+                }
+                assert!(
+                    pbps_diff::diff(
+                        pbps_diff::Side {
+                            schema: &retained,
+                            ids: &retained_ids
+                        },
+                        after,
+                        &dialect,
+                        &hints
+                    )
+                    .is_err()
+                );
+                conn.execute("ROLLBACK").await.unwrap();
+            }
+        }
+    }
+}

@@ -6027,6 +6027,71 @@ pub async fn seal_type_pins(
     }
 }
 
+/// Lifecycle pin collection must retain each reference's side-specific identity.
+pub async fn seal_plan_type_pins(
+    conn: &mut Conn,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    changes: &ChangeSet,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    pin_routines: bool,
+) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let pins =
+                pbps_pg::type_refs::seal_sides(conn, base, desired, changes, trusted).await?;
+            type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
+            Ok(pins)
+        }
+        Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
+        Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+    }
+}
+
+/// Requirements already classified as external cannot borrow a lifecycle name.
+fn require_type_pins(
+    pins: &[pbps_model::TypePin],
+    required: &BTreeSet<pbps_model::TypeRef>,
+) -> anyhow::Result<()> {
+    for reference in required {
+        if !pins
+            .iter()
+            .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
+        {
+            anyhow::bail!(
+                "plan has no type pin for `{reference}`; plan again against the database",
+                reference = reference.shown(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod type_pin_identity_tests {
+    use super::*;
+
+    #[test]
+    fn every_external_identity_requires_its_own_pin() {
+        let required = ["app.mood".parse().unwrap()].into();
+        assert!(require_type_pins(&[], &required).is_err());
+        let pin = pbps_model::TypePin {
+            schema: "app".into(),
+            name: "mood".into(),
+            oid: 1,
+            kind: "enum".into(),
+            digest: "ab".repeat(32),
+        };
+        require_type_pins(std::slice::from_ref(&pin), &required).unwrap();
+        let other = pbps_model::TypePin {
+            name: "other".into(),
+            ..pin
+        };
+        assert!(require_type_pins(&[other], &required).is_err());
+        require_type_pins(&[], &BTreeSet::new()).unwrap();
+    }
+}
+
 /// Refuse changed type prerequisites and owner trust before replay proceeds.
 pub async fn check_type_pins(
     conn: &mut Conn,
@@ -6038,20 +6103,7 @@ pub async fn check_type_pins(
     if &plan.trusted_roles != trusted {
         anyhow::bail!("trusted_roles changed since planning; plan again against the database");
     }
-    for reference in required {
-        if !plan
-            .type_pins
-            .iter()
-            .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
-            && !pbps_pg::type_refs::declared::names(&plan.declared_type_pins).contains(reference)
-            && !pbps_pg::type_refs::managed_names(&[], &plan.changes).contains(reference)
-        {
-            anyhow::bail!(
-                "plan has no type pin for `{reference}`; plan again against the database",
-                reference = reference.shown(),
-            );
-        }
-    }
+    require_type_pins(&plan.type_pins, required)?;
     match conn.driver() {
         Driver::Postgres => {
             let within = if within_transaction {

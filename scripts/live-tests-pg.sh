@@ -109,6 +109,7 @@ export PBPS_TEST_PG_OLD_CONTAINER="$OLD_NAME"
 # seconds is what proves the wait is bounded. It is why this suite takes half a
 # minute for six tests.
 cargo test -p pbps-pg --test live -- --ignored "$@"
+cargo test -p pbps-pg --test type_slots -- --ignored "$@"
 # Capture internals are private engine components. Their two-session live
 # regressions live in the library test target and must run here and in CI.
 cargo test --profile live-test -p pbps-pg --lib -- --ignored --test-threads=1 "$@"
