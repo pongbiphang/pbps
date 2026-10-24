@@ -172,6 +172,30 @@
   },
   "groups": [
     {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "darwin"],
+      "cases": [
+        "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
+        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
+        "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
+        "forced_pull2311_dangling_output_parent_refuses_before_changing_the_project"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "darwin"],
+      "cases": [
+        "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
+        "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
+        "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
+        "forced_pull2311_dangling_output_parent_refuses_before_changing_the_project"
+      ]
+    },
+    {
       "target": [
         "pbps-cli",
         "bin",
@@ -386,6 +410,9 @@
         "nonstandard_foreign_key_state_refuses_key_replacement_before_writing",
         "pull_leaves_out_a_trigger_whose_table_it_does_not_write",
         "pull_preserves_trigger_definitions_with_yaml_controls",
+        "forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration",
+        "forced_pull2311_invalid_staging_leaves_the_project_byte_identical",
+        "forced_pull2311_directory_outputs_refuse_before_changing_the_project",
         "forced_pull_preserves_applied_column_rename_and_drop_history",
         "unchanged_forced_pull_preserves_identities_rows_and_history",
         "forced_pull_mints_only_added_objects",
@@ -738,6 +765,9 @@
         "resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_externals_file",
         "doctor_tells_a_role_that_cannot_read_the_lock_what_to_grant_in_postgres_terms",
         "drift_and_pull_are_read_from_the_postgres_catalog",
+        "forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration",
+        "forced_pull2311_invalid_staging_leaves_the_project_byte_identical",
+        "forced_pull2311_directory_outputs_refuse_before_changing_the_project",
         "forced_pull_preserves_applied_column_rename_and_drop_history",
         "unchanged_forced_pull_preserves_identities_rows_and_history",
         "forced_pull_mints_only_added_objects",

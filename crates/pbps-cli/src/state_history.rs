@@ -505,7 +505,7 @@ fn export(
         ));
     }
     let schema = entry.snapshot.declared.overlay(&entry.snapshot.schema);
-    let (stage, files, removed, mut findings) = (|| -> anyhow::Result<_> {
+    let (stage, copies, files, removed, mut findings) = (|| -> anyhow::Result<_> {
         let stage = adopt::Stage::new("state-export")?;
         let staged = adopt::write_declarations_with_deps(
             stage.path(),
@@ -515,10 +515,15 @@ fn export(
         )?;
         let loaded = adopt::check_staged(stage.path(), dialect)?;
         let findings = adopt::refuse_policy_errors(project, &loaded, dialect)?;
-        let files: BTreeSet<_> = staged
+        let copies: Vec<_> = staged
             .iter()
-            .map(|path| path.strip_prefix(stage.path()).map(|p| dir.join(p)))
+            .map(|source| {
+                source
+                    .strip_prefix(stage.path())
+                    .map(|relative| (source.clone(), dir.join(relative)))
+            })
             .collect::<Result<_, _>>()?;
+        let files: BTreeSet<_> = copies.iter().map(|(_, path)| path.clone()).collect();
         let removed: Vec<_> = present
             .iter()
             .filter(|path| !files.contains(*path))
@@ -542,13 +547,23 @@ fn export(
                 );
             }
         }
-        Ok((stage, files, removed, findings))
+        for path in &files {
+            crate::paths::require_removable_output(path, &present)?;
+        }
+        Ok((stage, copies, files, removed, findings))
     })()
     .map_err(invalid)?;
     // No project write precedes the staged load and validation above. Publish
     // those exact validated bytes; never rerender a different representation.
     (|| -> anyhow::Result<()> {
         std::fs::create_dir_all(&dir)?;
+        // Match pull's publication order: a parent-directory failure must
+        // happen before any old declaration is removed (#2311).
+        for path in &files {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         // Remove old directory entries before publishing: a stale spelling can
         // alias an output on a case-insensitive filesystem. Replacing every
         // declaration entry also breaks old symlinks instead of following them.
@@ -556,12 +571,8 @@ fn export(
             std::fs::remove_file(path)
                 .with_context(|| format!("cannot remove old declaration `{}`", path.display()))?;
         }
-        for path in &files {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let source = stage.path().join(path.strip_prefix(&dir)?);
-            std::fs::copy(&source, path)
+        for (source, path) in &copies {
+            std::fs::copy(source, path)
                 .with_context(|| format!("cannot publish `{}`", path.display()))?;
         }
         Ok(())
@@ -574,6 +585,7 @@ fn export(
         );
         Refusal::new("state.export-invalid", message)
     })?;
+    drop(stage);
     if dialect.creates_public_executable_routines()
         && schema
             .modules
@@ -822,6 +834,127 @@ mod tests {
             serde_json::to_value(pbps_load::schema_files(&project.schema_dir()).unwrap()).unwrap(),
             serde_json::to_value(&data.files).unwrap()
         );
+    }
+
+    #[test]
+    fn state_history_unlisted_output_directories_refuse_before_removing_declarations() {
+        for linked in [false, true] {
+            if linked && !cfg!(unix) {
+                continue;
+            }
+            let (_stage, project, entry) = fixture("history-output-directory");
+            std::fs::create_dir(project.schema_dir()).unwrap();
+            let old = project.schema_dir().join("custom.yml");
+            let output = project.schema_dir().join("dbo.product.yml");
+            let directory = if linked {
+                project.schema_dir().join("directory")
+            } else {
+                output.clone()
+            };
+            std::fs::write(&old, "keep old declaration\n").unwrap();
+            std::fs::write(project.ids_file(), "keep identity bytes\n").unwrap();
+            std::fs::create_dir(&directory).unwrap();
+            let notes = directory.join("notes.txt");
+            std::fs::write(&notes, "keep non-declaration\n").unwrap();
+            #[cfg(unix)]
+            if linked {
+                std::os::unix::fs::symlink("directory", &output).unwrap();
+            }
+            let before = (
+                std::fs::read(&old).unwrap(),
+                std::fs::read(&notes).unwrap(),
+                std::fs::read(project.ids_file()).unwrap(),
+                std::fs::read(project.config_file()).unwrap(),
+            );
+            let result = export(
+                &project,
+                &entry,
+                true,
+                crate::dialect(&project).unwrap().as_ref(),
+            );
+            assert!(
+                old.is_file(),
+                "unlisted output failure deleted a declaration"
+            );
+            assert_eq!(
+                (
+                    std::fs::read(&old).unwrap(),
+                    std::fs::read(&notes).unwrap(),
+                    std::fs::read(project.ids_file()).unwrap(),
+                    std::fs::read(project.config_file()).unwrap(),
+                ),
+                before
+            );
+            assert!(directory.is_dir());
+            assert_eq!(std::fs::read_dir(project.root()).unwrap().count(), 3);
+            assert_eq!(
+                std::fs::read_dir(project.schema_dir()).unwrap().count(),
+                if linked { 3 } else { 2 }
+            );
+            let error = result.err().unwrap();
+            assert_eq!(error.id, "state.export-invalid");
+            assert!(error.message.contains("move it"), "{}", error.message);
+            assert!(error.message.contains("Nothing was written"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_history_dangling_output_parent_refuses_before_removing_declarations() {
+        let (_stage, project, mut entry) = fixture("history-output-parent");
+        let table = entry
+            .snapshot
+            .schema
+            .tables
+            .remove(&"dbo.product".parse().unwrap())
+            .unwrap();
+        entry
+            .snapshot
+            .schema
+            .tables
+            .insert("sales.country".parse().unwrap(), table);
+        entry
+            .snapshot
+            .schema
+            .roles
+            .insert("reader".into(), Default::default());
+        std::fs::create_dir(project.schema_dir()).unwrap();
+        let old = project.schema_dir().join("sales.country.yml");
+        std::fs::write(&old, "old declaration bytes\n").unwrap();
+        std::fs::write(project.ids_file(), "original identity bytes\n").unwrap();
+        let roles = project.schema_dir().join("roles");
+        std::os::unix::fs::symlink("missing-roles", &roles).unwrap();
+        let before = (
+            std::fs::read(&old).unwrap(),
+            std::fs::read(project.ids_file()).unwrap(),
+            std::fs::read(project.config_file()).unwrap(),
+            std::fs::read_link(&roles).unwrap(),
+        );
+        let dialect = crate::dialect(&project).unwrap();
+        let error = export(&project, &entry, true, dialect.as_ref())
+            .err()
+            .unwrap();
+        assert_eq!(error.id, "state.export-invalid");
+        assert!(
+            old.is_file(),
+            "output-parent failure deleted the old declaration"
+        );
+        assert_eq!(
+            (
+                std::fs::read(&old).unwrap(),
+                std::fs::read(project.ids_file()).unwrap(),
+                std::fs::read(project.config_file()).unwrap(),
+                std::fs::read_link(&roles).unwrap(),
+            ),
+            before
+        );
+        assert_eq!(std::fs::read_dir(project.root()).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(project.schema_dir()).unwrap().count(), 2);
+
+        std::fs::remove_file(roles).unwrap();
+        assert!(export(&project, &entry, true, dialect.as_ref()).is_ok());
+        let loaded = pbps_load::load_schema_dir(&project.schema_dir()).unwrap();
+        assert_eq!(loaded.schema, entry.snapshot.schema);
     }
 
     #[test]

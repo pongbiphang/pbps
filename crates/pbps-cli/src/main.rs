@@ -1787,7 +1787,7 @@ fn cmd_pull(
     // and the only way to know that before touching the project is to have
     // asked about the files themselves (#902).
     let stage = adopt::Stage::new("pull")?;
-    adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
+    let staged = adopt::write_declarations(stage.path(), &pulled.schema, &pulled.public_execute)?;
     let loaded =
         adopt::check_staged(stage.path(), dialect.as_ref()).context("pull wrote nothing")?;
     // And the project's own rules, as `validate` evaluates them: a pull into a
@@ -1796,11 +1796,119 @@ fn cmd_pull(
     for f in adopt::refuse_policy_errors(project, &loaded, dialect.as_ref())? {
         eprintln!("{}: {}", f.severity_word(), f.message);
     }
-    drop(stage);
-
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
-    let written = adopt::write_declarations(&dir, &pulled.schema, &pulled.public_execute)?;
-
+    let copies: Vec<_> = staged
+        .iter()
+        .map(|source| {
+            source
+                .strip_prefix(stage.path())
+                .map(|relative| (source.clone(), dir.join(relative)))
+        })
+        .collect::<Result<_, _>>()?;
+    let written: std::collections::BTreeSet<_> =
+        copies.iter().map(|(_, path)| path.clone()).collect();
+    // Same reading as the guard above, for the same reason in the other
+    // direction: a failed listing that came back empty would silently skip the
+    // cleanup and leave two files declaring one name. List before publishing
+    // so a read failure also leaves the project untouched.
+    let present = match std::fs::metadata(&dir) {
+        Ok(_) => pbps_load::schema_files(&dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling directory link is present, not an empty destination.
+            match std::fs::symlink_metadata(&dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Ok(_) => bail!(
+                    "`{}` is a dangling link",
+                    pbps_model::Text::new(dir.display().to_string()).shown()
+                ),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+    .with_context(|| {
+        format!(
+            "cannot list `{}`",
+            pbps_model::Text::new(dir.display().to_string()).shown()
+        )
+    })?;
+    let removed: Vec<_> = present
+        .iter()
+        .filter(|path| !written.contains(*path))
+        .cloned()
+        .collect();
+    let root = paths::absolute(&dir)?;
+    // Force replaces declarations, never config or identity inputs reached
+    // through an output name or one of the entries about to be removed.
+    for path in written.iter().chain(&present) {
+        for protected in [project.ids_file(), project.config_file()] {
+            anyhow::ensure!(
+                !paths::same_file(path, &protected)?,
+                "`{}` aliases protected project input `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown(),
+                pbps_model::Text::new(protected.display().to_string()).shown()
+            );
+        }
+        anyhow::ensure!(
+            paths::absolute(path)?.starts_with(&root),
+            "`{}` resolves outside the declaration directory",
+            pbps_model::Text::new(path.display().to_string()).shown()
+        );
+    }
+    // A directory at an output filename makes copying fail predictably. Refuse
+    // it before deleting any declarations, including through a directory link.
+    let mut output_permissions = std::collections::BTreeMap::new();
+    for path in &written {
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.is_dir(),
+                    "`{}` is a directory; move it before retrying pull",
+                    pbps_model::Text::new(path.display().to_string()).shown()
+                );
+                output_permissions.insert(path.clone(), metadata.permissions());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot inspect `{}`",
+                        pbps_model::Text::new(path.display().to_string()).shown()
+                    )
+                });
+            }
+        }
+    }
+    // Check every destination, including entries the lowercase extension listing
+    // missed. Listed aliases are admitted by file identity, not by spelling.
+    for path in &written {
+        paths::require_removable_output(path, &present)?;
+    }
+    // Identity validation/serialization must not discover a refusal after
+    // declarations have already been removed. Keep unchanged JSON byte-exact.
+    let ids_json = match &resolution {
+        Ok(res) if existing_ids.is_none() || res.ids != ids => {
+            Some(serialize_ids(project, &res.ids)?)
+        }
+        _ => None,
+    };
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "cannot create `{}`",
+            pbps_model::Text::new(dir.display().to_string()).shown()
+        )
+    })?;
+    // Create every output parent before removing declarations: a dangling
+    // directory link must fail while the old files are still intact (#2311).
+    for path in &written {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if ids_json.is_some()
+        && let Some(parent) = project.ids_file().parent()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
     // recreation, and a view that became a procedure would leave
@@ -1808,20 +1916,38 @@ fn cmd_pull(
     // name, which `validate` refuses and every later load fails on. `--force`
     // already means "replace my declarations with this database"; this is the
     // rest of that sentence.
-    let mut removed = Vec::new();
-    // Same reading as the guard above, for the same reason in the other
-    // direction: a failed listing that came back empty would silently skip the
-    // cleanup and leave exactly the two-files-one-name state this block exists
-    // to prevent.
-    let present = pbps_load::schema_files(&dir)
-        .with_context(|| format!("cannot list `{}`", dir.display()))?;
-    for path in present {
-        if written.contains(&path) {
-            continue;
-        }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("cannot remove the stale `{}`", path.display()))?;
-        removed.push(path);
+    //
+    // Remove all old entries first: a stale spelling can alias an output on a
+    // case-insensitive filesystem. This also unlinks output symlinks instead
+    // of writing through them and then deleting their stale targets (#2311).
+    for path in &present {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "cannot remove old declaration `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown()
+            )
+        })?;
+    }
+    // Publish the exact bytes that passed validation, without rendering again.
+    for (source, path) in &copies {
+        let publish = || -> std::io::Result<u64> {
+            let Some(permissions) = output_permissions.get(path) else {
+                return std::fs::copy(source, path);
+            };
+            // Replacing an entry must not broaden its access, especially with
+            // `--data`. Set the old permissions while the replacement is empty,
+            // before copying any validated bytes; chmod after copying is too late.
+            let mut input = std::fs::File::open(source)?;
+            let mut output = std::fs::File::create_new(path)?;
+            output.set_permissions(permissions.clone())?;
+            std::io::copy(&mut input, &mut output)
+        };
+        publish().with_context(|| {
+            format!(
+                "cannot publish `{}`",
+                pbps_model::Text::new(path.display().to_string()).shown()
+            )
+        })?;
     }
     if !removed.is_empty() {
         eprintln!(
@@ -1861,8 +1987,13 @@ fn cmd_pull(
         }
     };
     // Leave even the original JSON formatting intact for an unchanged pull.
-    if existing_ids.is_none() || res.ids != ids {
-        write_ids(project, &res.ids)?;
+    if let Some(json) = ids_json {
+        std::fs::write(project.ids_file(), json).with_context(|| {
+            format!(
+                "cannot write identity file `{}`",
+                pbps_model::Text::new(project.ids_file().display().to_string()).shown()
+            )
+        })?;
     }
     let minted = res.created_tables.len()
         + res.added_columns.len()
@@ -2397,20 +2528,24 @@ fn read_ids(project: &Project) -> anyhow::Result<IdsFile> {
     Ok(read_ids_opt(project)?.unwrap_or_default())
 }
 
-fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
-    let path = project.ids_file();
+fn serialize_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<String> {
     ids.validate().with_context(|| {
         format!(
             "refusing to write inconsistent identity file `{}`",
-            path.display()
+            pbps_model::Text::new(project.ids_file().display().to_string()).shown()
         )
     })?;
+    // A trailing newline, so the file never shows "\ No newline at end of file" in
+    // a diff.
+    Ok(format!("{}\n", serde_json::to_string_pretty(ids)?))
+}
+
+fn write_ids(project: &Project, ids: &IdsFile) -> anyhow::Result<()> {
+    let json = serialize_ids(project, ids)?;
+    let path = project.ids_file();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    // A trailing newline, so the file never shows "\ No newline at end of file" in
-    // a diff.
-    let json = format!("{}\n", serde_json::to_string_pretty(ids)?);
     std::fs::write(&path, json)
         .with_context(|| format!("cannot write identity file `{}`", path.display()))?;
     Ok(())
