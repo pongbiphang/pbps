@@ -17,6 +17,7 @@
 
 use crate::emission::Engine as _;
 use anyhow::{Context as _, bail};
+use pbps_diff::identity::type_refs::{TypeIdentity, TypeResolver, TypeSide};
 use pbps_diff::order::PlanningPlan;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -4550,27 +4551,14 @@ fn refuse_pinned_movement(
     let (plan, settled) = read.parts();
     let changes = plan.changes;
     let mut named_before = sequences_named(dialect, before);
-    let mut renamed_types = BTreeMap::new();
-    for step in &changes.changes {
-        if let pbps_model::Change::RenameType { from, to, .. } = &step.change {
-            renamed_types.insert(from.clone(), to.clone());
-        }
-    }
-    for step in &changes.changes {
-        if let pbps_model::Change::RenameType { from, to, .. } = &step.change
-            && let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name())
-        {
-            renamed_types
-                .entry(intermediate)
-                .or_insert_with(|| to.clone());
-        }
-    }
-    // This read follows the admitted changes (or one emitted staged step).
-    // Map each original reference once: a chain's final names can still be
-    // another uid's original names, and cannot certify execution progress.
+    use pbps_diff::identity::type_refs::{TypeResolver, TypeSide, after_changes, before_changes};
+    let base_ids = before_changes(plan.ids, changes);
+    let desired_ids = after_changes(&base_ids, changes);
+    let resolver = TypeResolver::new(&base_ids, &desired_ids);
+    let renames = pbps_pg::type_refs::renames::TypeRenames::resolved(&base_ids, &desired_ids);
     let mut named_after = sequences_named(dialect, after);
-    if !renamed_types.is_empty() {
-        pbps_pg::type_refs::renames::TypeRenames(renamed_types).schema(named_before.to_mut());
+    if !renames.0.is_empty() {
+        renames.schema(named_before.to_mut());
         pbps_pg::type_refs::renames::TypeRenames::default().schema(named_after.to_mut());
     }
     let after = named_after.as_ref();
@@ -4579,26 +4567,33 @@ fn refuse_pinned_movement(
     for step in &changes.changes {
         match &step.change {
             pbps_model::Change::CreateType {
-                name, definition, ..
-            } => {
-                expected_types.insert(name.clone(), Some(definition.as_ref()));
+                uid, definition, ..
             }
-            pbps_model::Change::DropType { name, .. } => {
-                expected_types.insert(name.clone(), None);
-            }
-            pbps_model::Change::RenameType {
-                from,
-                to,
-                definition,
-                ..
+            | pbps_model::Change::RenameType {
+                uid, definition, ..
             } => {
-                expected_types.insert(from.clone(), None);
-                expected_types.insert(to.clone(), Some(definition.as_ref()));
-                if let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name()) {
-                    expected_types.entry(intermediate).or_insert(None);
+                if let Some(name) = resolver.name(TypeSide::Desired, uid) {
+                    expected_types.insert(name.clone(), Some(definition.as_ref()));
                 }
             }
             _ => {}
+        }
+    }
+    // Retired names and intermediate addresses may be reused by another uid.
+    // Only the final identity map decides which names must be absent.
+    for step in &changes.changes {
+        let old = match &step.change {
+            pbps_model::Change::DropType { name, .. } => Some(name.clone()),
+            pbps_model::Change::RenameType { from, to, .. } => {
+                if let Ok(intermediate) = pbps_model::TypeRef::new(to.schema(), from.name()) {
+                    expected_types.entry(intermediate).or_insert(None);
+                }
+                Some(from.clone())
+            }
+            _ => None,
+        };
+        if let Some(name) = old {
+            expected_types.entry(name).or_insert(None);
         }
     }
     let types: BTreeSet<_> = before.types.keys().chain(after.types.keys()).collect();
@@ -6222,7 +6217,12 @@ fn refuse_unidentified_bootstrap_objects(schema: &Schema, ids: &IdsFile) -> anyh
         .chain(
             types
                 .keys()
-                .filter(|name| ids.type_uid(name).is_none())
+                .filter(|name| {
+                    matches!(
+                        TypeResolver::new(ids, ids).resolve(TypeSide::Desired, name),
+                        TypeIdentity::ExternalOrUnrecorded(_)
+                    )
+                })
                 .map(|name| format!("type {}", name.shown())),
         )
         .collect();
@@ -6808,6 +6808,29 @@ pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
     })
 }
 
+/// Advisory only: a reused name supplies no identity intent (SPEC 14.3).
+pub(crate) fn type_replacement_warnings(
+    base: &IdsFile,
+    desired: &IdsFile,
+    changes: &pbps_model::ChangeSet,
+    json: bool,
+) -> Vec<crate::output::Finding> {
+    let resolver = TypeResolver::new(base, desired);
+    changes.changes.iter().filter_map(|step| {
+        let pbps_model::Change::DropType { uid: old, name, .. } = &step.change else { return None };
+        let TypeIdentity::Declared(new) = resolver.resolve(TypeSide::Desired, name) else { return None };
+        if old == new || !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::CreateType { uid, .. } if uid == new)) {
+            return None;
+        }
+        let message = format!(
+            "Type `{}` is replaced: old uid `{old}` and new uid `{new}` are different types to pbps, so the old uid's history does not carry over to the new one. To change the type while keeping its uid, keep the original declaration file and its uid and edit the definition there; rename with `renamed_from`. In-place definition changes are not supported yet (#1635 slices 3 and 4), so changing the definition under the same uid is currently refused. This is a suggestion only; pbps never infers identity from the name.",
+            name.shown(),
+        );
+        if !json { eprintln!("warning: {message}"); }
+        Some(crate::output::Finding::warning("plan.type-replacement", message))
+    }).collect()
+}
+
 /// `pbps plan --db` — the applyable plan, computed against the target
 /// environment as queried (SPEC §7.3).
 ///
@@ -7087,7 +7110,7 @@ pub fn cmd_plan_db(
         // First declarations adopt the live definition, as newly managed
         // cluster roles do. Already recorded types still participate in drift.
         for (name, definition) in &as_recorded.types {
-            if entry.snapshot.ids.type_uid(name).is_none() {
+            if matches!(TypeResolver::new(&entry.snapshot.ids, &resolved.ids).resolve(TypeSide::Base, name), TypeIdentity::ExternalOrUnrecorded(_)) {
                 expected.types.insert(name.clone(), definition.clone());
             }
         }
@@ -7243,9 +7266,12 @@ pub fn cmd_plan_db(
             })
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
+        findings.extend(type_replacement_warnings(&recorded_ids, &resolved.ids, cs.changes(), json));
 
-        let prerequisite_types = crate::engine::seal_type_pins(
-            &mut conn, &[&base, &declared], &cs,
+        let prerequisite_types = crate::engine::seal_plan_type_pins(
+            &mut conn,
+            pbps_diff::Side { schema: &base, ids: &recorded_ids },
+            pbps_diff::Side { schema: &declared, ids: &resolved.ids }, &cs,
             &project.config.trusted_roles, project.config.pin_type_routines,
         ).await?;
         let needs_review = !crate::engine::type_input_routines(
@@ -7726,9 +7752,10 @@ pub fn cmd_plan_db(
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
-        let type_pins = crate::engine::seal_type_pins(
+        let type_pins = crate::engine::seal_plan_type_pins(
             &mut conn,
-            &[&entry.snapshot.schema, &loaded.schema],
+            pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
+            pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
             &cs,
             &project.config.trusted_roles,
             project.config.pin_type_routines,
@@ -8482,14 +8509,18 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
         .renames;
-    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
+    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes, &plan.ids);
     if plan.changes.is_empty()
         && original_ids.roles == plan.ids.roles
         && original_ids.types == plan.ids.types
     {
         // No statements still means replay of the approved type prerequisites
         // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
-        if !pinned_managed.references.is_empty() || !plan.type_pins.is_empty() {
+        if !pinned_managed.references.is_empty()
+            || !pinned_managed.declared_types.is_empty()
+            || !plan.type_pins.is_empty()
+            || !plan.declared_type_pins.is_empty()
+        {
             crate::pins::check(
                 conn,
                 project,
@@ -8813,14 +8844,18 @@ async fn apply_under_lock<D: crate::emission::Engine>(
 fn pinned_managed(
     recorded: &StateSnapshot,
     changes: &pbps_model::ChangeSet,
+    desired: &IdsFile,
 ) -> crate::pins::Managed {
+    let approved_base = pbps_diff::identity::type_refs::before_changes(desired, changes);
+    let base_ids = type_scope(&recorded.ids, &approved_base);
     let mut set = managed_modules(Some(recorded), None);
     set.extend(modules_after(recorded, changes, Settled::SoFar));
     // Existing-column operations carry no type. A missing saved pin must
     // still refuse, rather than erase a baseline reference from admission.
     crate::pins::Managed {
         modules: set,
-        references: crate::engine::type_references(&recorded.schema),
+        references: crate::pins::external_references(&recorded.schema, &base_ids),
+        declared_types: crate::pins::declared_requirements(&recorded.schema, &base_ids),
     }
 }
 
@@ -8838,16 +8873,26 @@ fn rename_snapshot_roles(
     }
 }
 
-/// Incoming cluster roles belong in the queried and pinned baseline even
+/// Incoming type declarations belong in the queried and pinned baseline even
 /// before their UIDs have reached the ledger. Existing names keep their
 /// baseline UID; only their post-apply identity changes when a UID is replaced.
-fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
+fn type_scope(recorded: &IdsFile, declared: &IdsFile) -> IdsFile {
     let mut scoped = recorded.clone();
     for (uid, name) in &declared.types {
-        if !scoped.types.contains_key(uid) && scoped.type_uid(name).is_none() {
+        if !scoped.types.contains_key(uid)
+            && matches!(
+                TypeResolver::new(&scoped, declared).resolve(TypeSide::Base, name),
+                TypeIdentity::ExternalOrUnrecorded(_)
+            )
+        {
             scoped.types.insert(uid.clone(), name.clone());
         }
     }
+    scoped
+}
+
+fn role_scope(recorded: &IdsFile, declared: &IdsFile, dialect: &dyn Dialect) -> IdsFile {
+    let mut scoped = type_scope(recorded, declared);
     if !dialect.manages_roles() {
         for (uid, name) in &declared.roles {
             if !scoped.roles.values().any(|old| old == name) {
@@ -9110,7 +9155,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             project,
             target,
             plan,
-            &pinned_managed(&entry.snapshot, &plan.changes),
+            &pinned_managed(&entry.snapshot, &plan.changes, &plan.ids),
             crate::pins::Check::BeforeProbes,
         )
         .await?;
@@ -9129,7 +9174,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 project,
                 target,
                 plan,
-                managed: &pinned_managed(&entry.snapshot, &plan.changes),
+                managed: &pinned_managed(&entry.snapshot, &plan.changes, &plan.ids),
             },
         )
         .await?;
@@ -9189,7 +9234,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     );
     // A resume starts from a checkpoint, whose modules include what earlier
     // steps created; the union keeps those managed too.
-    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
+    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes, &plan.ids);
     let written_routines = crate::engine::written_routines(&plan.changes);
     // Whether this run has a checkpoint to resume from: a resumed run starts
     // on one.
@@ -9470,7 +9515,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         // true — refusing before writing it would lose the record of a
         // statement that has already committed, which is what checkpoints are
         // for. Stopping is the whole remedy a staged run has.
-        let statement_plan = staged.statement(stmt);
+        let statement_plan = staged.statement(stmt, statements.get(i.wrapping_sub(1)));
         staged_pinned_movement(
             dialect,
             statement_plan.staged(),

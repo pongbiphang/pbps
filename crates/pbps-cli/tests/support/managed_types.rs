@@ -2175,3 +2175,206 @@ fn type_renames_refuse_default_and_check_edits_inside_the_plan_window() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn same_name_type_replacements_warn_and_distinguish_new_and_retained_dependents() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for array in [false, true] {
+            for domain in [false, true] {
+                for retained in [false, true] {
+                    let own = OwnDatabase::new(&server, "replacement2321");
+                    let db = own.connection();
+                    let ty = if array { "app.mood[]" } else { "app.mood" };
+                    on_server(
+                        db,
+                        "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('old')",
+                    );
+                    if retained {
+                        let sql = if domain {
+                            format!("CREATE DOMAIN app.choice AS {ty}")
+                        } else {
+                            format!("CREATE TABLE app.t (v {ty})")
+                        };
+                        on_server(db, &sql);
+                    }
+                    let old_oid = scalar(db, "SELECT 'app.mood'::regtype::oid::bigint");
+                    let d = Demo::new("replacement2321");
+                    succeeds(d.run(&["pull", "--db", db]));
+                    d.commit();
+                    succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt old type"]));
+                    std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+                    succeeds(d.run(&[
+                        "intent",
+                        "--drop-type",
+                        "app.mood",
+                        "replace the type explicitly",
+                    ]));
+                    std::fs::write(
+                        d.dir.join("schema/app.mood.type.yml"),
+                        "enum: app.mood\nvalues: [new]\n",
+                    )
+                    .unwrap();
+                    if domain {
+                        std::fs::write(
+                            d.dir.join("schema/app.choice.type.yml"),
+                            format!("domain: app.choice\ntype: '{ty}'\n"),
+                        )
+                        .unwrap();
+                    } else {
+                        d.table(&format!("table: app.t\ncolumns:\n  v: {{type: '{ty}'}}\n"));
+                    }
+                    // Mint the new declaration's uid without asking a refused
+                    // retained-dependent plan to publish identity as a side effect.
+                    let ids_path = d.dir.join("schema.ids.json");
+                    let ids: pbps_model::IdsFile =
+                        serde_json::from_slice(&std::fs::read(&ids_path).unwrap()).unwrap();
+                    let desired = pbps_load::load_schema_dir(&d.dir.join("schema"))
+                        .unwrap()
+                        .schema;
+                    let resolved = pbps_diff::resolve(
+                        &desired,
+                        &ids,
+                        &[],
+                        &pbps_diff::Context {
+                            operator: "test".into(),
+                            today: "2026-10-24".into(),
+                        },
+                    )
+                    .unwrap();
+                    std::fs::write(&ids_path, serde_json::to_vec_pretty(&resolved.ids).unwrap())
+                        .unwrap();
+                    if !retained {
+                        let offline = d.run(&["plan", "--no-dev"]);
+                        succeeds(offline.clone());
+                        assert!(
+                            stderr(&offline).contains("different types to pbps"),
+                            "{}",
+                            stderr(&offline)
+                        );
+                    }
+                    d.commit();
+                    let path = d.dir.join("replacement.plan.json");
+                    let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                    if retained {
+                        assert_ne!(code(&out), 0);
+                        assert!(
+                            stderr(&out).contains("app.mood")
+                                && stderr(&out).contains("retained declaration"),
+                            "{}",
+                            stderr(&out)
+                        );
+                        assert!(!path.exists());
+                        assert_eq!(
+                            scalar(db, "SELECT 'app.mood'::regtype::oid::bigint"),
+                            old_oid
+                        );
+                        continue;
+                    }
+                    succeeds(out.clone());
+                    assert!(
+                        stderr(&out).contains("different types to pbps")
+                            && stderr(&out).contains("history does not carry over"),
+                        "{}",
+                        stderr(&out)
+                    );
+                    let json = d.run(&[
+                        "plan",
+                        "--db",
+                        db,
+                        "--out",
+                        path.to_str().unwrap(),
+                        "--format",
+                        "json",
+                    ]);
+                    succeeds(json.clone());
+                    let report: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+                    assert!(
+                        report["findings"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|f| f["id"] == "plan.type-replacement"),
+                        "{report}"
+                    );
+                    assert!(
+                        !stderr(&json).contains("different types to pbps"),
+                        "{}",
+                        stderr(&json)
+                    );
+                    succeeds(d.run(&[
+                        "apply",
+                        "--db",
+                        db,
+                        "--plan",
+                        path.to_str().unwrap(),
+                        "--checksum",
+                        &plan_checksum(&path),
+                        "--allow",
+                        "destructive",
+                    ]));
+                    assert_ne!(
+                        scalar(db, "SELECT 'app.mood'::regtype::oid::bigint"),
+                        old_oid
+                    );
+                    let clean = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                    succeeds(clean.clone());
+                    assert!(!stderr(&clean).contains("different types to pbps"));
+                    let next: pbps_model::SavedPlan =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    assert!(next.changes.is_empty());
+                    succeeds(d.run(&["verify", "--db", db]));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn external_references_do_not_borrow_a_dropped_types_declared_identity() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for array in ["", "[]"] {
+            let own = OwnDatabase::new(&server, "external2321");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('old')",
+            );
+            let oid = scalar(db, "SELECT 'app.mood'::regtype::oid::bigint");
+            let d = Demo::new("external2321");
+            succeeds(d.run(&["pull", "--db", db]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt old type"]));
+            std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+            succeeds(d.run(&[
+                "intent",
+                "--drop-type",
+                "app.mood",
+                "retire the declared identity",
+            ]));
+            d.table(&format!(
+                "table: app.t\ncolumns:\n  v: {{type: 'app.mood{array}'}}\n"
+            ));
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let path = d.dir.join("external.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            succeeds(out.clone());
+            assert!(!stderr(&out).contains("different types to pbps"));
+            let plan: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(plan.declared_type_pins.is_empty());
+            assert_eq!(plan.type_pins.len(), 1);
+            assert_eq!(plan.type_pins[0].name, "mood");
+            assert_eq!(plan.type_pins[0].oid, oid);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app' AND c.relname='t'"
+                ),
+                0
+            );
+        }
+    }
+}

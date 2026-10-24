@@ -7,6 +7,7 @@ use pbps_model::{DeclaredTypeBefore, DeclaredTypePin, IdsFile, ManagedType, Sche
 
 use super::{failed, input_routines};
 use crate::pins::Within;
+use pbps_diff::identity::type_refs::{TypeResolver, TypeSide, after_changes, before_changes};
 
 pub fn seal(
     base: &Schema,
@@ -14,11 +15,12 @@ pub fn seal(
     desired: &Schema,
     ids: &IdsFile,
 ) -> Vec<DeclaredTypePin> {
+    let resolver = TypeResolver::new(base_ids, ids);
     ids.types
         .iter()
         .filter_map(|(uid, name)| {
             let definition = desired.types.get(name)?.clone();
-            let before = base_ids.types.get(uid).and_then(|before_name| {
+            let before = resolver.name(TypeSide::Base, uid).and_then(|before_name| {
                 base.types
                     .get(before_name)
                     .map(|definition| DeclaredTypeBefore {
@@ -81,6 +83,7 @@ async fn definitions(conn: &mut Conn, within: Within) -> Result<Schema, DbError>
 
 /// Follow the emitter's uid annotation through the executed prefix, including
 /// SET SCHEMA's intermediate name. A final name can still hold another uid.
+#[cfg(test)]
 fn current<'a>(
     pin: &'a DeclaredTypePin,
     executed: &'a [pbps_dialect::Statement],
@@ -145,6 +148,32 @@ fn pending_predecessor(
     })
 }
 
+pub(super) fn identities(
+    pins: &[DeclaredTypePin],
+    changes: &pbps_model::ChangeSet,
+) -> (IdsFile, IdsFile) {
+    let declared = IdsFile {
+        types: pins
+            .iter()
+            .map(|p| (p.uid.clone(), p.name.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    // Bootstrap and per-statement rechecks carry external pins alone. Their
+    // approved type operations still establish the desired uid map; requiring
+    // a catalog pin to discover a CREATE would demand evidence of an absent type.
+    let desired = after_changes(&declared, changes);
+    let mut base = before_changes(&desired, changes);
+    for pin in pins {
+        if let Some(before) = &pin.before {
+            base.types.insert(pin.uid.clone(), before.name.clone());
+        } else {
+            base.types.remove(&pin.uid);
+        }
+    }
+    (base, desired)
+}
+
 fn check_definitions(
     live: &Schema,
     pins: &[DeclaredTypePin],
@@ -152,19 +181,26 @@ fn check_definitions(
     changes: &pbps_model::ChangeSet,
     executed: &[pbps_dialect::Statement],
 ) -> Result<(Vec<TypeRef>, Vec<TypeRef>), DbError> {
-    let renames = super::renames::TypeRenames(
-        pins.iter()
-            .filter_map(|p| {
-                let before = p.before.as_ref()?;
-                let (name, _, _) = current(p, executed)?;
-                (name != &before.name).then(|| (before.name.clone(), name.clone()))
-            })
-            .collect(),
-    );
+    let (base, desired) = identities(pins, changes);
+    let mut positioned = base.clone();
+    for step in executed.iter().filter_map(|s| s.declared_type.as_ref()) {
+        if step.definition.is_some() {
+            positioned.types.insert(step.uid.clone(), step.name.clone());
+        } else {
+            positioned.types.remove(&step.uid);
+        }
+    }
+    let resolver = TypeResolver::new(&base, &positioned);
+    let desired_resolver = TypeResolver::new(&desired, &positioned);
+    let renames = super::renames::TypeRenames::resolved(&base, &positioned);
     let mut present = Vec::new();
     let mut absent = Vec::new();
     for pin in pins {
-        if let Some((name, definition, before)) = current(pin, executed) {
+        if let Some(name) = resolver.name(TypeSide::Desired, &pin.uid) {
+            let (definition, before) = match &pin.before {
+                Some(before) => (&before.definition, true),
+                None => (&pin.definition, false),
+            };
             let actual = live.types.get(name).ok_or_else(|| {
                 failed(format!(
                     "declared type `{}` is absent; plan again",
@@ -176,13 +212,8 @@ fn check_definitions(
                 // Pins hold only the saved catalog text. Follow exactly the
                 // approved moves already executed, including expression casts.
                 renames.definition(&mut expected);
-            } else if let ManagedType::Domain { base, .. } = &mut expected
-                && let Some(reference) = base.type_ref()
-                && let Some(base_pin) = pins.iter().find(|p| &p.name == reference)
-                && let Some((current, _, _)) = current(base_pin, executed)
-            {
-                let ty = pbps_model::ColumnType::reference(current.clone());
-                *base = if base.is_array() { ty.into_array() } else { ty };
+            } else if let ManagedType::Domain { base, .. } = &mut expected {
+                desired_resolver.remap(base, TypeSide::Base, TypeSide::Desired);
             }
             let mut comparable = actual.clone();
             super::renames::TypeRenames::default().definition(&mut comparable);
@@ -340,6 +371,58 @@ mod tests {
             definition: Some(pin.definition.clone()),
         });
         statement
+    }
+
+    #[test]
+    fn a_new_domain_pin_resolves_its_base_on_the_desired_side_at_each_position() {
+        for array in ["", "[]"] {
+            let mut domain = renamed_pin(
+                "domain2321",
+                "app.d",
+                "app.d",
+                ManagedType::Domain {
+                    base: format!("app.b{array}").parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                },
+            );
+            domain.before = None;
+            let pins = [
+                renamed_pin("a2321", "app.a", "app.b", enumeration("a")),
+                renamed_pin("b2321", "app.b", "app.c", enumeration("b")),
+                domain,
+            ];
+            let statement = wrote(&pins[2], "app.d");
+            let mut actual = pins[2].definition.clone();
+            let ManagedType::Domain { base, .. } = &mut actual else {
+                unreachable!()
+            };
+            *base = format!("app.a{array}").parse().unwrap();
+            let mut live = Schema {
+                types: [
+                    ("app.a".parse().unwrap(), enumeration("a")),
+                    ("app.b".parse().unwrap(), enumeration("b")),
+                    ("app.d".parse().unwrap(), actual),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            check_definitions(
+                &live,
+                &pins,
+                false,
+                &Default::default(),
+                std::slice::from_ref(&statement),
+            )
+            .unwrap();
+            live.types
+                .insert("app.d".parse().unwrap(), pins[2].definition.clone());
+            assert!(
+                check_definitions(&live, &pins, false, &Default::default(), &[statement]).is_err()
+            );
+        }
     }
 
     #[test]

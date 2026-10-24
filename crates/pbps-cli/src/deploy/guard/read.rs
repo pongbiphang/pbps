@@ -67,6 +67,7 @@ impl<'a> Staged<'a> {
     pub(in crate::deploy) fn statement(
         &self,
         statement: &pbps_dialect::Statement,
+        previous: Option<&pbps_dialect::Statement>,
     ) -> StatementPlan {
         let mut changes = self.0.changes.clone();
         let mut ids = self.0.ids.clone();
@@ -84,9 +85,14 @@ impl<'a> Staged<'a> {
             *to = statement_to.clone();
         }
         if let [change] = changes.changes.as_mut_slice()
-            && let Change::RenameType { uid, to, .. } = &mut change.change
+            && let Change::RenameType { uid, from, to, .. } = &mut change.change
             && let Some(emitted) = &statement.declared_type
         {
+            if let Some(before) = previous.and_then(|s| s.declared_type.as_ref())
+                && before.uid == *uid
+            {
+                *from = before.name.clone();
+            }
             ids.types.insert(uid.clone(), emitted.name.clone());
             *to = emitted.name.clone();
         }
@@ -352,7 +358,7 @@ mod tests {
         let mut before = baseline;
         for (i, statement) in statements.iter().enumerate() {
             let emitted = statement.declared_type.as_ref().unwrap();
-            let at_statement = staged.statement(statement);
+            let at_statement = staged.statement(statement, statements.get(i.wrapping_sub(1)));
             assert_eq!(at_statement.ids.types[&uid], emitted.name);
             let mut after = before.clone();
             after.types.clear();
@@ -414,7 +420,7 @@ mod tests {
             assert_eq!(statements.len(), 2, "a transfer and a rename");
             let mut before = baseline.clone();
             for (i, statement) in statements.iter().enumerate() {
-                let at_statement = staged.statement(statement);
+                let at_statement = staged.statement(statement, statements.get(i.wrapping_sub(1)));
                 let [(.., address)] = statement.renames.as_slice() else {
                     panic!("emitted rename metadata")
                 };

@@ -21,6 +21,7 @@
 //! preview) or from querying the database itself (Phase 3's authoritative plan).
 //! This layer does not care which; it does the comparison and nothing else.
 
+use crate::identity::type_refs::{TypeIdentity, TypeResolver, TypeSide};
 use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -726,13 +727,20 @@ pub(crate) fn diff_partial_rebuilding(
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
+    let types = TypeResolver::new(base.ids, declared.ids);
     let unrecorded_base = Schema {
         types: base
             .schema
             .types
             .iter()
             .filter(|(name, _)| {
-                base.ids.type_uid(name).is_none() && declared.ids.type_uid(name).is_none()
+                matches!(
+                    types.resolve(TypeSide::Base, name),
+                    TypeIdentity::ExternalOrUnrecorded(_)
+                ) && matches!(
+                    types.resolve(TypeSide::Desired, name),
+                    TypeIdentity::ExternalOrUnrecorded(_)
+                )
             })
             .map(|(n, d)| (n.clone(), d.clone()))
             .collect(),
@@ -751,8 +759,7 @@ pub(crate) fn diff_partial_rebuilding(
             .and_then(|name| declared.schema.types.get(name).map(|ty| (name, ty)))
         {
             None => {
-                let used = declared.schema.tables.values().any(|t| t.columns.values().any(|c| c.ty.type_ref() == Some(old_name)))
-                    || declared.schema.types.values().any(|t| matches!(t, pbps_model::ManagedType::Domain { base, .. } if base.type_ref() == Some(old_name)));
+                let used = types.has_retained_dependent(base.schema, declared.schema, uid);
                 if used {
                     errs.push(DiffError::TypeLifecycleUnsupported { name: old_name.clone(), reason: "a retained declaration still uses this type; drop or change its dependents first".into() });
                 }
@@ -764,16 +771,8 @@ pub(crate) fn diff_partial_rebuilding(
             }
             Some((name, new)) => {
                 let mut comparable = old.clone();
-                if let pbps_model::ManagedType::Domain { base: ty, .. } = &mut comparable
-                    && let Some(reference) = ty.type_ref()
-                    && let Some(type_uid) = base.ids.type_uid(reference)
-                    && let Some(renamed) = declared.ids.types.get(type_uid)
-                {
-                    *ty = if ty.is_array() {
-                        pbps_model::ColumnType::reference(renamed.clone()).into_array()
-                    } else {
-                        pbps_model::ColumnType::reference(renamed.clone())
-                    };
+                if let pbps_model::ManagedType::Domain { base: ty, .. } = &mut comparable {
+                    types.remap(ty, TypeSide::Base, TypeSide::Desired);
                 }
                 let old_schema = Schema {
                     types: [(name.clone(), comparable)].into(),
@@ -829,8 +828,13 @@ pub(crate) fn diff_partial_rebuilding(
 
     // A retained uid is still a managed claim after a manual drop and a
     // baseline. It cannot become an unheld identity in an empty apply.
-    for name in declared.ids.types.values() {
-        if !declared.schema.types.contains_key(name) && !base.schema.types.contains_key(name) {
+    for (uid, name) in &declared.ids.types {
+        if !declared.schema.types.contains_key(name)
+            && types
+                .name(TypeSide::Base, uid)
+                .and_then(|old| base.schema.types.get(old))
+                .is_none()
+        {
             errs.push(DiffError::TypeLifecycleUnsupported {
                 name: name.clone(),
                 reason: "its identity remains recorded but its declaration is absent".into(),
@@ -1249,6 +1253,7 @@ pub(crate) fn diff_partial_rebuilding(
 
         diff_columns(
             &index,
+            &types,
             base_name,
             declared_name,
             base_table,
@@ -2380,6 +2385,7 @@ pub struct Diffed {
 #[allow(clippy::too_many_arguments)]
 fn diff_columns(
     index: &Indexes<'_>,
+    types: &TypeResolver<'_>,
     base_table_name: &TableName,
     declared_table_name: &TableName,
     base_table: &Table,
@@ -2435,8 +2441,7 @@ fn diff_columns(
         let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
         let (mut from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
         if let (Some(old), Some(new)) = (from_ty.type_ref(), to_ty.type_ref())
-            && index.base.type_uid(old).is_some()
-            && index.base.type_uid(old) == index.declared.type_uid(new)
+            && types.same_declared(old, new)
             && from_ty.is_array() == to_ty.is_array()
         {
             from_ty = to_ty.clone();
@@ -24937,5 +24942,325 @@ mod managed_type_tests {
         assert_eq!(scoped.schema.types, schema.types);
         assert!(scoped.unmanaged_types.is_empty());
         assert_eq!(crate::observed_ids(&schema, &ids).types, ids.types);
+    }
+}
+
+#[cfg(test)]
+mod type_replacement_tests {
+    use super::*;
+    use pbps_dialect::MinimalDialect;
+    use pbps_model::ManagedType;
+
+    #[test]
+    fn a_same_named_other_uid_cannot_supply_a_missing_declaration() {
+        let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+        let base = Schema {
+            types: [(
+                name.clone(),
+                ManagedType::Enum {
+                    values: vec!["old".into()],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let old = IdsFile {
+            types: [("y_000001".parse().unwrap(), name.clone())].into(),
+            ..Default::default()
+        };
+        let new = IdsFile {
+            types: [("y_000002".parse().unwrap(), name)].into(),
+            ..Default::default()
+        };
+        let errors = diff(
+            Side {
+                schema: &base,
+                ids: &old,
+            },
+            Side {
+                schema: &Schema::default(),
+                ids: &new,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("its identity remains recorded")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn replacement_dependents_follow_their_own_identity_on_each_side() {
+        for array in [false, true] {
+            for domain in [false, true] {
+                let mood: pbps_model::TypeRef = "app.mood".parse().unwrap();
+                let old: Uid = "y_000001".parse().unwrap();
+                let new: Uid = "y_000002".parse().unwrap();
+                let own: Uid = if domain { "y_000003" } else { "t_000001" }
+                    .parse()
+                    .unwrap();
+                let definition = ManagedType::Enum {
+                    values: vec!["ok".into()],
+                };
+                let mut base = Schema {
+                    types: [(mood.clone(), definition.clone())].into(),
+                    ..Default::default()
+                };
+                let mut desired = base.clone();
+                let mut base_ids = IdsFile {
+                    types: [(old.clone(), mood.clone())].into(),
+                    ..Default::default()
+                };
+                let mut ids = IdsFile {
+                    types: [(new, mood)].into(),
+                    ..Default::default()
+                };
+                let ty: ColumnType = if array { "app.mood[]" } else { "app.mood" }
+                    .parse()
+                    .unwrap();
+                if domain {
+                    desired.types.insert(
+                        "app.choice".parse().unwrap(),
+                        ManagedType::Domain {
+                            base: ty,
+                            not_null: false,
+                            default: None,
+                            checks: Default::default(),
+                            collation: None,
+                        },
+                    );
+                    ids.types.insert(own.clone(), "app.choice".parse().unwrap());
+                } else {
+                    desired.tables.insert(
+                        "app.t".parse().unwrap(),
+                        Table {
+                            columns: [("v".into(), pbps_model::Column::new(ty))].into(),
+                            ..Default::default()
+                        },
+                    );
+                    ids.tables.insert(own.clone(), "app.t".parse().unwrap());
+                    ids.columns.insert(
+                        "c_000001".parse().unwrap(),
+                        ColumnRef {
+                            table: "app.t".parse().unwrap(),
+                            name: "v".into(),
+                        },
+                    );
+                }
+                let run = |base: &Schema, before: &IdsFile| {
+                    diff(
+                        Side {
+                            schema: base,
+                            ids: before,
+                        },
+                        Side {
+                            schema: &desired,
+                            ids: &ids,
+                        },
+                        &MinimalDialect,
+                        &Hints::default(),
+                    )
+                };
+                let plan = run(&base, &base_ids).unwrap();
+                assert!(
+                    plan.changes
+                        .iter()
+                        .any(|s| matches!(&s.change, Change::DropType { uid, .. } if uid == &old))
+                );
+                if domain {
+                    base.types.insert(
+                        "app.choice".parse().unwrap(),
+                        desired.types[&"app.choice".parse().unwrap()].clone(),
+                    );
+                    base_ids.types.insert(own, "app.choice".parse().unwrap());
+                } else {
+                    base.tables = desired.tables.clone();
+                    base_ids.tables = ids.tables.clone();
+                    base_ids.columns = ids.columns.clone();
+                }
+                let errors = run(&base, &base_ids).unwrap_err();
+                assert!(
+                    errors.iter().any(|e| e.to_string().contains("app.mood")
+                        && e.to_string().contains("retained declaration")),
+                    "{errors:?}"
+                );
+                // Reusing the dependent's name with a new own uid is a new declaration.
+                if domain {
+                    base_ids.types.remove(&"y_000003".parse().unwrap());
+                } else {
+                    base_ids.tables.clear();
+                    base_ids.columns.clear();
+                }
+                run(&base, &base_ids).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn retained_columns_follow_type_uids_instead_of_a_rename_chains_names() {
+        let enumeration = ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let mut base = Schema {
+            types: [
+                ("app.a".parse().unwrap(), enumeration.clone()),
+                ("app.b".parse().unwrap(), enumeration.clone()),
+            ]
+            .into(),
+            tables: [(
+                "app.t".parse().unwrap(),
+                Table {
+                    columns: [(
+                        "v".into(),
+                        pbps_model::Column::new("app.b[]".parse().unwrap()),
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let mut desired = base.clone();
+        desired.types.remove(&"app.a".parse().unwrap());
+        desired.types.insert("app.c".parse().unwrap(), enumeration);
+        desired
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns["v"]
+            .ty = "app.c[]".parse().unwrap();
+        let ids = |a: &str, b: &str| IdsFile {
+            types: [
+                ("y_000001".parse().unwrap(), a.parse().unwrap()),
+                ("y_000002".parse().unwrap(), b.parse().unwrap()),
+            ]
+            .into(),
+            tables: [("t_000001".parse().unwrap(), "app.t".parse().unwrap())].into(),
+            columns: [(
+                "c_000001".parse().unwrap(),
+                ColumnRef {
+                    table: "app.t".parse().unwrap(),
+                    name: "v".into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let before = ids("app.a", "app.b");
+        let after = ids("app.b", "app.c");
+        let run = |base: &Schema, desired: &Schema| {
+            diff(
+                Side {
+                    schema: base,
+                    ids: &before,
+                },
+                Side {
+                    schema: desired,
+                    ids: &after,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap()
+        };
+        let plan = run(&base, &desired);
+        assert!(
+            !plan
+                .changes
+                .iter()
+                .any(|s| matches!(s.change, Change::AlterColumnType { .. }))
+        );
+        // Changing the binding to the other uid must still emit a retype.
+        base.tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns["v"]
+            .ty = "app.a[]".parse().unwrap();
+        assert!(
+            run(&base, &desired)
+                .changes
+                .iter()
+                .any(|s| matches!(s.change, Change::AlterColumnType { .. }))
+        );
+    }
+
+    #[test]
+    fn a_domain_base_follows_its_uid_once_through_a_rename_chain() {
+        let e = ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let domain = |name: &str| ManagedType::Domain {
+            base: name.parse().unwrap(),
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        for array in ["", "[]"] {
+            let base = Schema {
+                types: [
+                    ("app.a".parse().unwrap(), e.clone()),
+                    ("app.b".parse().unwrap(), e.clone()),
+                    ("app.d".parse().unwrap(), domain(&format!("app.b{array}"))),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let desired = Schema {
+                types: [
+                    ("app.b".parse().unwrap(), e.clone()),
+                    ("app.c".parse().unwrap(), e.clone()),
+                    ("app.d".parse().unwrap(), domain(&format!("app.c{array}"))),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let ids = |a: &str, b: &str| IdsFile {
+                types: [
+                    ("y_000001".parse().unwrap(), a.parse().unwrap()),
+                    ("y_000002".parse().unwrap(), b.parse().unwrap()),
+                    ("y_000003".parse().unwrap(), "app.d".parse().unwrap()),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            diff(
+                Side {
+                    schema: &base,
+                    ids: &ids("app.a", "app.b"),
+                },
+                Side {
+                    schema: &desired,
+                    ids: &ids("app.b", "app.c"),
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            let mut wrong = desired.clone();
+            wrong
+                .types
+                .insert("app.d".parse().unwrap(), domain(&format!("app.b{array}")));
+            assert!(
+                diff(
+                    Side {
+                        schema: &base,
+                        ids: &ids("app.a", "app.b")
+                    },
+                    Side {
+                        schema: &wrong,
+                        ids: &ids("app.b", "app.c")
+                    },
+                    &MinimalDialect,
+                    &Hints::default()
+                )
+                .is_err()
+            );
+        }
     }
 }

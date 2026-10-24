@@ -503,6 +503,8 @@
         "baseline_catalog_evidence_keeps_the_parent_refusal_after_database_restore",
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
+        "managed_types::external_references_do_not_borrow_a_dropped_types_declared_identity",
+        "managed_types::same_name_type_replacements_warn_and_distinguish_new_and_retained_dependents",
         "managed_types::declared_type_lifecycles_converge_and_vetting_is_atomic",
         "managed_types::bootstrap_refuses_existing_declared_types_without_recording_a_failed_state",
         "managed_types::bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of_them",
@@ -2130,6 +2132,13 @@
         "resolver::server::scratch::mssql_live_tests::same_instance2270::another_instance_does_not_require_file_consent",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_automatic_externals_use_catalog_rendering_only"
       ]
+    },
+    {
+      "target": ["pbps-pg", "test", "type_slots"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["replacement_type_slots_apply_new_dependents_and_refuse_retained_bindings"]
     }
   ]
 }

@@ -2851,3 +2851,51 @@ PostgreSQL 16 and 18, handwritten `VALUE > 0`, `VALUE IN ('a','b')`, and default
 `'a'` converge after apply, layout changes remain differences, rename preserves
 the authored spelling, and hand-altered CHECKs refuse as drift. Disabling the
 domain overlay makes the convergence test fail before the next plan can seal.
+
+
+<a id="dec-2321-1"></a>
+
+**DEC-2321.1. Type references resolve through the identity map of their own side.**
+`pbps-diff::identity::type_refs::TypeResolver` resolves a base reference through
+base ids and a desired reference through declared ids. Its explicit
+ExternalOrUnrecorded result carries no managed identity and never means absent.
+Both execution engines and the CLI may use diff under the existing crate
+boundaries; no model or saved-plan field is added. Domain-base remapping,
+retained column comparison, executed pin positions and movement guards share
+this resolver. Remapping resolves each source once, so rename-chain output
+cannot be mistaken for another original name.
+
+A retained dependent must exist on both sides by its own table or type uid,
+and its base reference must resolve to the retiring uid. New tables/domains
+resolve on the desired side. Retained columns keep their original binding when
+a different uid takes the same spelling; an explicit retype to a different
+reference can release it. Column identity follows a recorded column rename.
+External pin requirements retain their side-specific classification even if a
+lifecycle operation on the other side uses the same name. Connected planning
+supplies both uid maps to pin collection; carried before/after operation types
+retain their source side, and replay reconstructs those maps from approved pins
+and uid-bearing operations. CREATE establishes desired identity even when a
+bootstrap or per-statement check has no declared pin bundle; an absent type
+cannot supply a catalog pin. Row keys resolve in the desired map because their
+comparisons run after structural changes. Kept and renamed identities still
+require their declared evidence, and a drop carries its checksum-pinned
+before-definition under the retiring uid. A missing declaration cannot borrow another uid's
+same-named baseline definition. Required declared pins match the uid or an
+explicit drop of that uid, including on no-op and resumed paths. The Types name-slot layer and every
+scheduling/handover rule remain unchanged (DEC-1964.2, DEC-1635.3).
+
+A DropType and CreateType of different uids at one name produce the advisory
+`plan.type-replacement` finding, warning severity, in connected and offline
+plan output. Human output uses stderr; JSON carries it in the findings envelope.
+It names the type and both uids, explains that identity history does not carry
+over, and suggests keeping the original declaration file and uid, editing its
+definition there, and using renamed_from for a rename. It also explains that
+in-place definition changes remain refused until #1635 slices 3 and 4.
+Rename alone, drop alone and create alone produce no replacement warning.
+This never supplies identity intent (SPEC 14.3).
+
+Unit and PostgreSQL 16/18 tests distinguish new and retained table/domain
+references, including arrays, preserve rename chains and intermediate-holder
+handoffs, and refuse changed live definitions. Warning tests cover both
+report channels and all three warning negatives. Each repaired site is checked
+by temporarily reverting its behavior with a copy of the file retained aside.

@@ -36,6 +36,8 @@ use pbps_model::{
     ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
 };
 
+pub mod type_refs;
+
 /// A situation that cannot be decided automatically and needs a human.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {

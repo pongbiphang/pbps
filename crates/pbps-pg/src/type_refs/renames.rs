@@ -11,6 +11,21 @@ use pbps_model::{ColumnType, ManagedType, Schema, TypeRef, ValueSource};
 pub struct TypeRenames(pub BTreeMap<TypeRef, TypeRef>);
 
 impl TypeRenames {
+    /// Construct the text adapter from identity evidence on the two sides.
+    pub fn resolved(base: &pbps_model::IdsFile, desired: &pbps_model::IdsFile) -> Self {
+        use pbps_diff::identity::type_refs::{TypeResolver, TypeSide};
+        let resolver = TypeResolver::new(base, desired);
+        Self(
+            base.types
+                .iter()
+                .filter_map(|(uid, from)| {
+                    let to = resolver.name(TypeSide::Desired, uid)?;
+                    (from != to).then(|| (from.clone(), to.clone()))
+                })
+                .collect(),
+        )
+    }
+
     pub fn column_type(&self, ty: &mut ColumnType) {
         if let Some(to) = ty.type_ref().and_then(|r| self.0.get(r)) {
             let reference = ColumnType::reference(to.clone());
@@ -238,6 +253,36 @@ fn identifier(text: &str, at: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_remapping_uses_each_source_uid_and_leaves_unrecorded_names_alone() {
+        use pbps_model::IdsFile;
+        let ids = |a: &str, b: &str| IdsFile {
+            types: [
+                ("y_000001".parse().unwrap(), a.parse().unwrap()),
+                ("y_000002".parse().unwrap(), b.parse().unwrap()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let base = ids("app.a", "app.b");
+        let desired = ids("app.b", "app.c");
+        let renames = TypeRenames::resolved(&base, &desired);
+        for (from, to) in [
+            ("app.a", "app.b"),
+            ("app.b[]", "app.c[]"),
+            ("app.external", "app.external"),
+        ] {
+            let mut ty = from.parse().unwrap();
+            renames.column_type(&mut ty);
+            assert_eq!(ty, to.parse::<ColumnType>().unwrap());
+        }
+        assert!(
+            TypeRenames::resolved(&IdsFile::default(), &desired)
+                .0
+                .is_empty()
+        );
+    }
 
     #[test]
     fn casts_follow_each_original_name_once_and_leave_data_and_other_names_alone() {

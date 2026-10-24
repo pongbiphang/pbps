@@ -575,6 +575,8 @@ jobs:
       # own, and what proves the wait is bounded is waiting it out.
       - run: cargo test -p pbps-pg --test live -- --ignored --skip commutation::pairs
         if: matrix.suite == 'dialect'
+      - run: cargo test -p pbps-pg --test type_slots -- --ignored
+        if: matrix.suite == 'dialect'
       # The commutation sample (#1965) rides with the capture half: `dialect`
       # is the longest PostgreSQL shard, and the sample must not lengthen it.
       - run: cargo test -p pbps-pg --test live -- --ignored commutation::pairs

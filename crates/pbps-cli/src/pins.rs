@@ -114,6 +114,56 @@ impl<'a> Check<'a> {
 pub struct Managed {
     pub modules: BTreeSet<ModuleId>,
     pub references: BTreeSet<pbps_model::TypeRef>,
+    pub declared_types: BTreeSet<pbps_model::Uid>,
+}
+
+/// Preserve external requirements independently of same-named lifecycle steps.
+pub(crate) fn external_references(
+    schema: &pbps_model::Schema,
+    ids: &pbps_model::IdsFile,
+) -> BTreeSet<pbps_model::TypeRef> {
+    use pbps_diff::identity::type_refs::{TypeIdentity, TypeResolver, TypeSide};
+    let resolver = TypeResolver::new(ids, ids);
+    crate::engine::type_references(schema)
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                resolver.resolve(TypeSide::Base, r),
+                TypeIdentity::ExternalOrUnrecorded(_)
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn declared_requirements(
+    schema: &pbps_model::Schema,
+    ids: &pbps_model::IdsFile,
+) -> BTreeSet<pbps_model::Uid> {
+    use pbps_diff::identity::type_refs::{TypeIdentity, TypeResolver, TypeSide};
+    let resolver = TypeResolver::new(ids, ids);
+    crate::engine::type_references(schema)
+        .iter()
+        .chain(schema.types.keys())
+        .filter_map(|r| match resolver.resolve(TypeSide::Base, r) {
+            TypeIdentity::Declared(uid) => Some(uid.clone()),
+            TypeIdentity::ExternalOrUnrecorded(_) => None,
+        })
+        .collect()
+}
+
+fn require_declared_types(
+    required: &BTreeSet<pbps_model::Uid>,
+    pins: &[pbps_model::DeclaredTypePin],
+    changes: &pbps_model::ChangeSet,
+) -> anyhow::Result<()> {
+    for uid in required {
+        if !pins.iter().any(|p| &p.uid == uid)
+            && !changes.changes.iter().any(|s| matches!(&s.change, pbps_model::Change::DropType { uid: dropped, .. } if dropped == uid))
+        {
+            bail!("plan has no declared type pin for uid `{uid}`; plan again against the database");
+        }
+    }
+    Ok(())
 }
 
 /// The approved artifact and its environment, borrowed at execution boundaries.
@@ -184,6 +234,11 @@ pub async fn check(
     at: Check<'_>,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
+        require_declared_types(
+            &managed.declared_types,
+            &plan.declared_type_pins,
+            &plan.changes,
+        )?;
         pbps_pg::type_refs::declared::check(
             conn,
             &plan.declared_type_pins,
@@ -640,5 +695,126 @@ mod tests {
             pins(&key(8), routines())[0].digest
         );
         assert_eq!(pins(&key(7), routines()), pins(&key(7), routines()));
+    }
+}
+
+#[cfg(test)]
+mod type_identity_tests {
+    use super::*;
+
+    #[test]
+    fn creating_a_type_does_not_waive_an_existing_uids_reviewed_evidence() {
+        let old: pbps_model::Uid = "y_000001".parse().unwrap();
+        let new: pbps_model::Uid = "y_000002".parse().unwrap();
+        let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+        let definition = pbps_model::ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let created = pbps_model::PlannedChange::new(pbps_model::Change::CreateType {
+            uid: new,
+            name: name.clone(),
+            definition: Box::new(definition.clone()),
+        });
+        let pin = pbps_model::DeclaredTypePin {
+            uid: old.clone(),
+            name: name.clone(),
+            definition: definition.clone(),
+            before: Some(pbps_model::DeclaredTypeBefore {
+                name: name.clone(),
+                definition: definition.clone(),
+            }),
+        };
+        for rename in [false, true] {
+            let mut changes = pbps_model::ChangeSet {
+                changes: vec![created.clone()],
+            };
+            if rename {
+                changes.changes.push(pbps_model::PlannedChange::new(
+                    pbps_model::Change::RenameType {
+                        uid: old.clone(),
+                        from: name.clone(),
+                        to: "app.kept".parse().unwrap(),
+                        definition: Box::new(definition.clone()),
+                    },
+                ));
+            }
+            assert!(require_declared_types(&[old.clone()].into(), &[], &changes).is_err());
+            require_declared_types(&[old.clone()].into(), std::slice::from_ref(&pin), &changes)
+                .unwrap();
+        }
+        // A drop carries its reviewed before-definition in the UID-bearing step.
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                created,
+                pbps_model::PlannedChange::new(pbps_model::Change::DropType {
+                    uid: old.clone(),
+                    name,
+                    definition: Box::new(definition),
+                }),
+            ],
+        };
+        require_declared_types(&[old].into(), &[], &changes).unwrap();
+    }
+
+    #[test]
+    fn a_declared_requirement_needs_its_own_uid_even_when_a_pin_reuses_its_name() {
+        let old: pbps_model::Uid = "y_000001".parse().unwrap();
+        let new: pbps_model::Uid = "y_000002".parse().unwrap();
+        let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+        let definition = pbps_model::ManagedType::Enum {
+            values: vec!["ok".into()],
+        };
+        let pin = pbps_model::DeclaredTypePin {
+            uid: new,
+            name: name.clone(),
+            definition: definition.clone(),
+            before: None,
+        };
+        assert!(
+            require_declared_types(
+                &[old.clone()].into(),
+                std::slice::from_ref(&pin),
+                &Default::default()
+            )
+            .is_err()
+        );
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropType {
+                    uid: old.clone(),
+                    name,
+                    definition: Box::new(definition),
+                },
+            )],
+        };
+        require_declared_types(&[old.clone()].into(), &[pin], &changes).unwrap();
+        assert!(require_declared_types(&[old].into(), &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn an_external_reference_cannot_borrow_a_same_named_declared_identity() {
+        let name: pbps_model::TypeRef = "app.mood".parse().unwrap();
+        let schema = pbps_model::Schema {
+            tables: [(
+                "app.t".parse().unwrap(),
+                pbps_model::Table {
+                    columns: [(
+                        "v".into(),
+                        pbps_model::Column::new("app.mood[]".parse().unwrap()),
+                    )]
+                    .into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let external = pbps_model::IdsFile::default();
+        let declared = pbps_model::IdsFile {
+            types: [("y_000001".parse().unwrap(), name.clone())].into(),
+            ..Default::default()
+        };
+        assert_eq!(external_references(&schema, &external), [name].into());
+        assert!(external_references(&schema, &declared).is_empty());
     }
 }

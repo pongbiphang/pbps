@@ -230,6 +230,7 @@ elif command[0] != 'sleep':
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg16", "--container", "pbps-test-pg16", "--port", "54321"],
             ["python3", "scripts/check-live-fixture.py", "--cell", "pg18", "--container", "pbps-test-pg-scratch", "--port", "54322"],
             ["cargo", "test", "-p", "pbps-pg", "--test", "live", "--", "--ignored"],
+            ["cargo", "test", "-p", "pbps-pg", "--test", "type_slots", "--", "--ignored"],
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-pg", "--lib", "--", "--ignored", "--test-threads=1"],
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
             ["python3", "scripts/live-transport.py", "pg"],
