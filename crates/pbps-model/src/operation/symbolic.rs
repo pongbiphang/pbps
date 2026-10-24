@@ -299,6 +299,16 @@ pub struct State {
     pub members: BTreeMap<Recorded, Membership>,
 }
 
+/// Engine-normalized endpoint descriptions, read once for an analysis.
+/// Membership in each snapshot is exact; the column universe may include
+/// known absence. Neither the snapshots nor these facts choose an order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub base: State,
+    pub goal: State,
+    pub parents: BTreeSet<Recorded>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

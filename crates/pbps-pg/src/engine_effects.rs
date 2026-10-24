@@ -1,5 +1,8 @@
 //! PostgreSQL's measured membership policy, as portable planning data.
 //! No catalog I/O or tentative ordering belongs in these rules (DEC-2296.2).
+pub(crate) mod facts;
+#[cfg(test)]
+mod scenes_test;
 use pbps_model::operation::symbolic::{
     Datum, Fact, Merge, MergeCase, Ownership, TransferPolicy, Value,
 };
@@ -127,5 +130,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `meeting_plans.golden` characterizes, per scene (13 kinds of parent
+    /// change x 3 motions x 2 cuts), the plan the first implementation
+    /// (`c97cd4ad`) settles on PostgreSQL 16 and 18 when the parent also has
+    /// dependent defaults, a rebuilt routine and an unrelated renamed table:
+    /// `<scene>\t<OK|ERR> <sha256 of the changes and spellings>` for each
+    /// version. The three `ERR` plans are the conservative refusals of a
+    /// retained non-convex cut. Later slices assert against it; this one keeps
+    /// it whole.
+    #[test]
+    fn the_meeting_plan_golden_names_every_scene_once() {
+        let golden = include_str!("engine_effects/meeting_plans.golden");
+        let rows: Vec<Vec<&str>> = golden.lines().map(|l| l.split('\t').collect()).collect();
+        assert_eq!(rows.len(), 78);
+        assert_eq!(rows.iter().map(|r| r[0]).collect::<BTreeSet<_>>().len(), 78);
+        for motion in ["Attach", "Detach", "Drop"] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| r[0].split('/').nth(1) == Some(motion))
+                    .count(),
+                26
+            );
+        }
+        let plans: Vec<_> = rows.iter().flat_map(|r| &r[1..]).collect();
+        assert_eq!(plans.len(), 156);
+        assert!(plans.iter().all(|p| {
+            let (status, hash) = p.split_once(' ').unwrap();
+            matches!(status, "OK" | "ERR") && hash.len() == 64
+        }));
+        assert_eq!(plans.iter().filter(|p| p.starts_with("ERR")).count(), 3);
     }
 }

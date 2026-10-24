@@ -3098,6 +3098,19 @@ pub trait Dialect {
         Ok(pbps_model::operation::Effects::default())
     }
 
+    /// Pure, normalized property facts for the partition families a plan
+    /// moves, from the two snapshots and what the connected seam read of the
+    /// baseline's stored columns. Known absence and unread facts stay
+    /// distinct. The default knows no family.
+    fn symbolic_facts(
+        &self,
+        _before: pbps_model::operation::Snapshot<'_>,
+        _after: pbps_model::operation::Snapshot<'_>,
+        _stored: &pbps_model::operation::MembershipCatalog,
+    ) -> pbps_model::operation::symbolic::Facts {
+        Default::default()
+    }
+
     /// Whether a routine this engine creates arrives executable by every
     /// principal in it (ADR-0010 §5, DECISIONS 371).
     ///
