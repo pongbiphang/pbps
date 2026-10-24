@@ -37871,3 +37871,6 @@ mod certified_fixture {
         "/../pbps-diff/tests/support/emission.rs"
     ));
 }
+
+#[path = "support/rebuild_read_boundary.rs"]
+mod rebuild_read_boundary;
