@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Context as _;
 use pbps_config::Project;
 use pbps_db::{LedgerEntry, LedgerError};
 use pbps_model::{StateSnapshot, Text, Unreadable};
@@ -532,7 +531,7 @@ fn export(
         let root = crate::paths::absolute(&dir)?;
         // Force authorizes declaration replacement, never identity/config writes
         // through an alias or a generated filename that names a protected input.
-        for path in files.iter().chain(&removed) {
+        for path in files.iter().chain(&present) {
             anyhow::ensure!(
                 crate::paths::absolute(path)?.starts_with(&root),
                 "`{}` resolves outside the declaration directory",
@@ -547,44 +546,17 @@ fn export(
                 );
             }
         }
-        for path in &files {
-            crate::paths::require_removable_output(path, &present)?;
-        }
         Ok((stage, copies, files, removed, findings))
     })()
     .map_err(invalid)?;
-    // No project write precedes the staged load and validation above. Publish
-    // those exact validated bytes; never rerender a different representation.
-    (|| -> anyhow::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        // Match pull's publication order: a parent-directory failure must
-        // happen before any old declaration is removed (#2311).
-        for path in &files {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        // Remove old directory entries before publishing: a stale spelling can
-        // alias an output on a case-insensitive filesystem. Replacing every
-        // declaration entry also breaks old symlinks instead of following them.
-        for path in &present {
-            std::fs::remove_file(path)
-                .with_context(|| format!("cannot remove old declaration `{}`", path.display()))?;
-        }
-        for (source, path) in &copies {
-            std::fs::copy(source, path)
-                .with_context(|| format!("cannot publish `{}`", path.display()))?;
-        }
-        Ok(())
-    })()
-    .map_err(|error| {
-        let message = format!(
-            "Entry #{} could not be fully published: {error:#}. \
-             Inspect the declaration files before retrying.",
-            entry.id
-        );
+    // Publish the validated bytes through the same restore boundary as pull.
+    let cleanup = crate::publication::publish(&dir, &present, &copies).map_err(|error| {
+        let message = format!("Entry #{} could not be published: {error:#}", entry.id);
         Refusal::new("state.export-invalid", message)
     })?;
+    if let Some(note) = cleanup {
+        findings.push(output::Finding::warning("state.export-backup", note));
+    }
     drop(stage);
     if dialect.creates_public_executable_routines()
         && schema
@@ -663,6 +635,85 @@ mod tests {
             ),
         };
         (stage, project, entry)
+    }
+
+    #[test]
+    fn state_history_publication_errors_restore_files_and_cleanup_notes_remain_success() {
+        let (_stage, project, entry) = fixture("history-publication2351");
+        std::fs::create_dir(project.schema_dir()).unwrap();
+        let old = project.schema_dir().join("custom.yml");
+        std::fs::write(&old, "keep these bytes").unwrap();
+        std::fs::write(project.ids_file(), "keep identity bytes").unwrap();
+        let dialect = crate::dialect(&project).unwrap();
+        let error = crate::publication::tests::with_fault(&[("write", 0)], || {
+            export(&project, &entry, true, dialect.as_ref())
+        })
+        .err()
+        .unwrap();
+        assert!(error.message.contains("the project is unchanged"));
+        assert_eq!(std::fs::read(&old).unwrap(), b"keep these bytes");
+        assert_eq!(
+            std::fs::read(project.ids_file()).unwrap(),
+            b"keep identity bytes"
+        );
+        let (data, findings) = crate::publication::tests::with_fault(&[("cleanup", 0)], || {
+            export(&project, &entry, true, dialect.as_ref())
+        })
+        .map_err(|e| e.message)
+        .unwrap();
+        assert_eq!(data.files.len(), 1);
+        let note = findings
+            .iter()
+            .find(|f| f.id == "state.export-backup")
+            .unwrap();
+        assert!(note.message.contains("were published"));
+        assert!(note.message.contains(".pbps-publication-backup"));
+        let report = output::Report::new("state export", findings, Some(&data));
+        assert!(report.outcome().is_ok());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("state.export-backup") && json.contains("were published"));
+        assert_eq!(
+            std::fs::read(project.ids_file()).unwrap(),
+            b"keep identity bytes"
+        );
+    }
+
+    #[test]
+    fn state_history_replacement_identity_checks_grow_linearly_with_file_count() {
+        for count in [32, 64] {
+            let (_stage, project, mut entry) = fixture("history-scaling2352");
+            let table = entry
+                .snapshot
+                .schema
+                .tables
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            entry.snapshot.schema.tables.clear();
+            for i in 0..count {
+                entry
+                    .snapshot
+                    .schema
+                    .tables
+                    .insert(format!("dbo.t{i:03}").parse().unwrap(), table.clone());
+            }
+            let dialect = crate::dialect(&project).unwrap();
+            export(&project, &entry, true, dialect.as_ref())
+                .map_err(|e| e.message)
+                .unwrap();
+            crate::paths::inspections::CALLS.with(|n| n.set(0));
+            export(&project, &entry, true, dialect.as_ref())
+                .map_err(|e| e.message)
+                .unwrap();
+            let calls = crate::paths::inspections::CALLS.with(|n| n.get());
+            // Two protected inputs, for each old entry and each output. A scan
+            // of all removal candidates for every output exceeds this bound.
+            assert!(
+                calls <= 4 * count,
+                "{count} files made {calls} identity inspections"
+            );
+        }
     }
 
     #[test]
@@ -893,14 +944,18 @@ mod tests {
             );
             let error = result.err().unwrap();
             assert_eq!(error.id, "state.export-invalid");
-            assert!(error.message.contains("move it"), "{}", error.message);
-            assert!(error.message.contains("Nothing was written"));
+            assert!(
+                error.message.contains("move any existing"),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains("the project is unchanged"));
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn state_history_dangling_output_parent_refuses_before_removing_declarations() {
+    fn state_history_dangling_output_parent_failure_restores_declarations() {
         let (_stage, project, mut entry) = fixture("history-output-parent");
         let table = entry
             .snapshot

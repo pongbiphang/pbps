@@ -35171,7 +35171,7 @@ fn forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases(
 
 #[test]
 #[ignore = "needs live PostgreSQL"]
-fn forced_pull2311_directory_outputs_refuse_before_changing_the_project() {
+fn forced_pull2311_directory_output_failures_restore_the_project() {
     for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
         pull_publication::output_directories(&server, true);
     }
@@ -35189,9 +35189,18 @@ fn forced_pull2311_preserves_restrictive_permissions_when_replacing_data() {
 #[cfg(unix)]
 #[test]
 #[ignore = "needs live PostgreSQL"]
-fn forced_pull2311_dangling_output_parent_refuses_before_changing_the_project() {
+fn forced_pull2311_dangling_output_parent_failure_restores_the_project() {
     for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
         pull_publication::dangling_output_parent(&server, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs live PostgreSQL"]
+fn publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        pull_publication::restorable_commands(&server, true);
     }
 }
 
