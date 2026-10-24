@@ -212,8 +212,9 @@ enum Command {
         #[arg(long)]
         no_dev: bool,
 
-        /// Select a named resolver profile for target planning. Selection only:
-        /// resolver acquisition and binding qualification are not implemented yet
+        /// Select a named resolver for PostgreSQL target planning. When needed, it
+        /// resolves bindings and publishes a plan for transactional apply, which
+        /// rechecks the saved evidence. SQL Server resolution is refused by name
         #[arg(long, value_name = "PROFILE")]
         resolve_with: Option<String>,
 

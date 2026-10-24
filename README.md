@@ -6,7 +6,7 @@ out the rest.
 
 - Design specification: [docs/SPEC.md](docs/SPEC.md)
 - Decision records: [docs/ADR-0001-yaml-crate.md](docs/ADR-0001-yaml-crate.md)
-  through [docs/ADR-0015-local-ui-implementation.md](docs/ADR-0015-local-ui-implementation.md);
+  through [docs/ADR-0018-catalog-identity-evidence.md](docs/ADR-0018-catalog-identity-evidence.md);
   ADR-0009 to ADR-0014 record the PostgreSQL design, measured before the
   dialect was built and revisited against its implementation; ADR-0015 records
   how the local UI of ADR-0006 is built
@@ -17,6 +17,9 @@ out the rest.
 - Tested engine versions, editions and qualification scope:
   [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - Current phase, command surface, open items: [docs/STATUS.md](docs/STATUS.md)
+
+Before the first release, the plan, state and schema-set formats carry no
+compatibility promise.
 
 **Phases 0 through 5 are complete as scoped**, with SQL Server and PostgreSQL
 supported through the CLI: tables, columns, keys, constraints and indexes;

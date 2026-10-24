@@ -133,6 +133,12 @@ how to add an entry here.
      staged apply are deferred. Existing rebind protections remain until tested
      replacements land. No runtime format changes are made by this decision.
 
+*Superseded in part by [DEC-952.1](ledger.md#dec-952-1),
+[DEC-1515.1](#dec-1515-1), [DEC-1528.1](#dec-1528-1) and
+[DEC-1636.1](#dec-1636-1): fingerprints are keyed, planning without a resolver
+remains the default, and measured containment, executable identity and verified
+channels have been removed. PostgreSQL resolver planning and apply have shipped.*
+
 <a id="decision-492"></a>
 
 492. **Ship advisory resolver discovery before qualification, without a
@@ -229,6 +235,9 @@ how to add an entry here.
     for supported premises and the distinction between component fixtures and
     complete admission on a disposable native Linux runner.
 
+*Superseded by [DEC-1636.1](#dec-1636-1): measured Docker admission,
+native runtime capabilities and private channels have been removed.*
+
 <a id="decision-498"></a>
 
 498. **Authenticate socket-activated Docker through its accepted Unix peer,
@@ -246,6 +255,9 @@ how to add an entry here.
     supplies safe Linux socket calls without project-local unsafe code.
     An inherited-listener fixture measures the creator/acceptor distinction
     and rejects unrelated owners, cookie substitution and lost continuity.
+
+*Superseded by [DEC-1636.1](#dec-1636-1): Docker peer and socket observation
+have been removed with the measured profiles.*
 
 <a id="decision-514"></a>
 
@@ -288,6 +300,9 @@ how to add an entry here.
     on, and cleanup opens a fresh one. The operator gives up nothing that a
     scratch server needs: storage is a tmpfs bounded by the container's memory,
     and the container stays warm across runs.
+
+*Superseded by [DEC-1636.1](#dec-1636-1): measured supplied-server admission
+and its private forwarder have been removed.*
 
 <a id="decision-520"></a>
 
@@ -352,6 +367,11 @@ how to add an entry here.
      whenever the set of facts it compares does, and a reader accepts only
      the identifiers it lists. Its PostgreSQL identifier is now
      `pg-reported-scope-v2`.*
+
+*Superseded in part by [DEC-1528.1](#dec-1528-1) and
+[DEC-1636.1](#dec-1636-1): compatibility still compares reported catalog
+facts and the deployment context, but executable and library identity and
+process-bound qualification have been removed.*
 
 <a id="decision-521"></a>
 
@@ -421,6 +441,10 @@ how to add an entry here.
      read is bracketed — read twice, and the two must agree — where 520 uses one
      transaction. Qualification is not a binding adapter; SQL Server's stays
      unimplemented (#619, #620).
+
+*Superseded in part by [DEC-1636.1](#dec-1636-1): SQL Server's executable
+step and process-bound lifecycle have been removed; the catalog comparison
+remains as `mssql-reported-scope-v1`.*
 
 <a id="decision-522"></a>
 
@@ -517,6 +541,9 @@ how to add an entry here.
      refusal that names the wrong end sends the next investigation to the
      wrong process — worse than naming none.
 
+*Superseded by [DEC-1636.1](#dec-1636-1): process and socket observation
+have been removed with the measured profiles.*
+
 <a id="decision-528"></a>
 
 528. **Observe a pinned PID-namespace procfs view without claiming a complete
@@ -543,6 +570,9 @@ how to add an entry here.
      certify those later contracts or replace the existing production callers
      in this stage. See [the contract, pre-implementation measurements and
      repeatable fixture](../RESOLVER-NAMESPACE.md).
+
+*Superseded by [DEC-1636.1](#dec-1636-1): namespace-scoped process
+observation has been removed with the measured profiles.*
 
 <a id="decision-529"></a>
 
@@ -577,6 +607,9 @@ how to add an entry here.
      observations do not establish an atomic inventory, engine provenance or
      protection against the provisioning administrator. The measured Docker
      recipes and namespace fixtures qualify these distinct questions separately.
+
+*Superseded by [DEC-1636.1](#dec-1636-1): measured container admission and
+task observation have been removed.*
 
 <a id="decision-531"></a>
 
@@ -617,6 +650,9 @@ how to add an entry here.
      remain independent gates. No model, driver boundary, public schema or
      deployment authorization changes here.
 
+*Superseded by [DEC-1636.1](#dec-1636-1): the measured launch boundary,
+workload identities and root deadline have been removed.*
+
 <a id="decision-533"></a>
 
 533. **A socket holder is observed; target identity is positively bound under
@@ -656,6 +692,9 @@ how to add an entry here.
      appearing behind the scan have real-kernel regressions. No saved-plan,
      dialect, driver or deployment authorization boundary changes here.
 
+*Superseded by [DEC-1636.1](#dec-1636-1): native target binding and process
+and socket observation have been removed.*
+
 <a id="decision-542"></a>
 
 542. **The resolver qualifies inherited seccomp behavior before releasing its
@@ -690,6 +729,9 @@ how to add an entry here.
      probe-specific behavior. Real-engine compilation, additional loopback
      connections, valid-socket Fast Open attempts, wrong-policy bootstrap
      refusal and actual removed-probe controls pin the supported contract.
+
+*Superseded by [DEC-1636.1](#dec-1636-1): measured containment and its
+seccomp bootstrap probes have been removed.*
 
 <a id="dec-804-1"></a>
 

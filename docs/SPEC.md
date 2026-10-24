@@ -58,9 +58,10 @@ rules out even when they would be convenient — are listed in 14.3.
 
 **In**: tables (create / drop / rename), columns, primary keys, unique
 constraints, foreign keys, check constraints, indexes — and, since Phase 3.5,
-**modules**: views, stored procedures, functions and triggers.
+**modules**: views, stored procedures, functions and triggers; and, since
+Phase 4, database roles and their grants (ADR-0005).
 
-**Deferred**: permissions (GRANT), data transformation (backfill).
+**Deferred**: data transformation (backfill).
 
 Objects like views and stored procedures, where the definition simply *is* the
 latest version, behave much like repeatable migrations. That is a different
@@ -3793,7 +3794,7 @@ arrives again as a reasonable-sounding request.
   the next plan will try to remove. Everything before a plan or after an apply
   is already supported.
 - **Progressive disclosure.** The default output is a short result plus the next
-  command; `--verbose`, JSON and `explain` reveal the identities, probes,
+  command; JSON and `explain` reveal the identities, probes,
   normalization and checksums underneath when they are wanted.
 
 This ordering is deliberate. Broadening the object model improves coverage, and
