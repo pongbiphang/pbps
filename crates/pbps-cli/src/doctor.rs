@@ -1619,7 +1619,7 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                             .first()
                             .map_or_else(|| crate::report::placeholder("partition"), parent_arg),
                         crate::report::placeholder("max-rows"),
-                        crate::report::placeholder("why")
+                        "\"\""
                     )),
                 );
             }
@@ -3209,7 +3209,7 @@ mod tests {
         let remedy = finding.remedy.as_deref().unwrap();
         assert_eq!(
             remedy,
-            "pbps move-rows app.ev_2027_03 --max-rows \"<max-rows>\" --reason \"<why>\""
+            "pbps move-rows app.ev_2027_03 --max-rows \"<max-rows>\" --reason \"\""
         );
         assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
         // When it could not, the declared partitions it might be are named,
@@ -3227,7 +3227,7 @@ mod tests {
         let remedy = finding.remedy.as_deref().unwrap();
         assert_eq!(
             remedy,
-            "pbps move-rows \"<partition>\" --max-rows \"<max-rows>\" --reason \"<why>\""
+            "pbps move-rows \"<partition>\" --max-rows \"<max-rows>\" --reason \"\""
         );
         assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
         // No candidate is recorded as the target, whichever it is.
@@ -3244,7 +3244,7 @@ mod tests {
             &parent_findings(&held(vec![name("app.ev_2027_04"), name("app.ev_2027_02")]))[0];
         assert_eq!(
             finding.remedy.as_deref(),
-            Some("pbps move-rows app.ev_2027_04 --max-rows \"<max-rows>\" --reason \"<why>\"")
+            Some("pbps move-rows app.ev_2027_04 --max-rows \"<max-rows>\" --reason \"\"")
         );
     }
 

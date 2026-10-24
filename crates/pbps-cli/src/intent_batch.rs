@@ -4,6 +4,8 @@ use anyhow::{Context as _, ensure};
 use clap::{ArgAction, Args};
 use pbps_model::{ColumnRef, Intent};
 
+pub const SINGLE_REASON_HELP: &str = "pbps intent refuses hyphen-leading values, including '-'; use the single commands pbps drop, drop-table, drop-role, move-rows or rebuild-table with --reason - for stdin reasons.";
+
 #[derive(Args)]
 #[group(required = true, multiple = true)]
 pub struct BatchArgs {
@@ -63,6 +65,10 @@ impl BatchArgs {
             ("--drop-table", &self.drop_table),
             ("--drop-role", &self.drop_role),
         ] {
+            ensure!(
+                !values.iter().any(|value| value.starts_with('-')),
+                "{flag}: {SINGLE_REASON_HELP}"
+            );
             let (pairs, remainder) = values.as_chunks::<2>();
             ensure!(remainder.is_empty(), "{flag} requires two values");
             for [first, second] in pairs {

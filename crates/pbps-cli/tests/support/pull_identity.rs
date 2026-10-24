@@ -357,7 +357,7 @@ pub fn batch_after_forced_pull(server: &str, pg: bool) {
     let phone = format!("{table}.legacy_phone");
     assert!(
         stderr(&out).contains(&format!(
-            "pbps intent --drop {email} \"<why>\" --drop {phone} \"<why>\""
+            "pbps intent --drop {email} \"\" --drop {phone} \"\""
         )),
         "{}",
         stderr(&out)

@@ -29,6 +29,7 @@ mod partitions;
 mod paths;
 mod pins;
 mod prompt;
+mod reason_input;
 mod report;
 mod resolution;
 mod row_security;
@@ -355,7 +356,7 @@ enum Command {
         max_rows: u64,
         /// Why moving the rows is acceptable here; required for audit
         #[arg(long)]
-        reason: String,
+        reason: pbps_model::Reason,
     },
 
     /// Record intent for a blocking partitioned-table rewrite (execution is not available yet)
@@ -798,7 +799,31 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::try_parse().unwrap_or_else(|mut error| {
+        if error.context().any(|(kind, value)| {
+            kind == clap::error::ContextKind::Usage && value.to_string().contains("pbps intent")
+        }) {
+            error.insert(
+                clap::error::ContextKind::Suggested,
+                clap::error::ContextValue::StyledStrs(vec![
+                    intent_batch::SINGLE_REASON_HELP.into(),
+                ]),
+            );
+        }
+        error.exit()
+    });
+    if let Command::Drop { reason, .. }
+    | Command::DropTable { reason, .. }
+    | Command::DropRole { reason, .. }
+    | Command::MoveRows { reason, .. }
+    | Command::RebuildTable { reason, .. } = &mut cli.command
+    {
+        reason_input::resolve(reason).unwrap_or_else(|error| {
+            Cli::command()
+                .error(clap::error::ErrorKind::ValueValidation, error)
+                .exit()
+        });
+    }
     // Commands that create audit metadata reject a misconfigured CI identity
     // before discovery, file writes or connections (DEC-2330.1). Read-only
     // commands can still inspect history while that configuration is repaired.
@@ -1310,7 +1335,7 @@ fn run() -> anyhow::Result<()> {
             Intent::MoveRows {
                 table: table.parse::<TableName>()?,
                 max_rows,
-                reason,
+                reason: reason.to_string(),
             }
             .into(),
         ),

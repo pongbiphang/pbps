@@ -4301,7 +4301,7 @@ pub(crate) fn moving_beyond_its_intent(
             "rows of {default} are {inside} {partition}, its parent {parent}'s new \
              partition beside it, and no move of them was allowed, which may be seen by \
              whatever reads the database's changes; nothing was moved. Allow it with \
-             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again, or \
+             `pbps move-rows {partition} --max-rows <N> --reason \"\"` and plan again, or \
              move them by hand, in one transaction: {by_hand}",
             default = default.shown(),
             partition = partition.shown(),
@@ -4312,7 +4312,7 @@ pub(crate) fn moving_beyond_its_intent(
              allowed move may take; nothing was moved. Move them by hand: create the table and \
              move the rows a batch at a time, then run the last batch and the attach in one \
              transaction with the DEFAULT locked, as in: {by_hand} Or allow more with \
-             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again.",
+             `pbps move-rows {partition} --max-rows <N> --reason \"\"` and plan again.",
             default = default.shown(),
             partition = partition.shown()
         ),
@@ -6311,7 +6311,7 @@ mod tests {
         }
         for said in [
             "no move of them was allowed",
-            "pbps move-rows app.ev_2025 --max-rows <N> --reason <why>",
+            "pbps move-rows app.ev_2025 --max-rows <N> --reason \"\"",
             "LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE; CREATE TABLE \"app\".\"ev_2025\"",
             "ATTACH PARTITION \"app\".\"ev_2025\" FOR VALUES FROM (E''2025-01-01'') TO \
              (E''2026-01-01'');",

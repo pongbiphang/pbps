@@ -2,6 +2,7 @@
 """Turn `pbps <command> --format json` into GitHub Actions annotations.
 
     pbps validate --format json | scripts/findings-to-github.py
+    pbps plan --check --format json | scripts/findings-to-github.py --pr-comment
 
 # Why this is a script and not a flag
 
@@ -25,7 +26,9 @@ two places. Deriving it here once turned `doctor`'s exit 1 into a 2, which sends
 an unreachable database to whoever wrote the schema change.
 """
 
+import argparse
 import json
+import re
 import sys
 
 # Annotation levels GitHub understands. `note` exists but is rendered so quietly
@@ -56,7 +59,25 @@ def escape_property(value: str) -> str:
     )
 
 
+def markdown(report, findings, code):
+    """Keep the blockers above their remedies, with the complete batch last."""
+    print(f"## pbps {report.get('command', '')}: {report.get('result', 'findings')}")
+    for finding in findings:
+        print(f"\n- **{finding.get('id', '')}**: {finding.get('message', '')}")
+    for finding in sorted(findings, key=lambda f: f.get("id") == "identity.batch-required"):
+        remedy = finding.get("remedy")
+        if remedy:
+            # A quoted identifier or audit reason can itself contain a fence.
+            fence = "`" * max(3, 1 + max(map(len, re.findall(r"`+", remedy)), default=0))
+            print(f"\n{fence}\n{remedy}\n{fence}")
+    if code == 1:
+        print("\nCould not complete; see the findings above.")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pr-comment", action="store_true", help="write Markdown to stdout")
+    args = parser.parse_args()
     raw = sys.stdin.read()
     if not raw.strip():
         print("::error::pbps produced no output to annotate", file=sys.stderr)
@@ -88,6 +109,10 @@ def main() -> int:
     EXIT = {"ok": 0, "findings": 2, "unanswerable": 1}
 
     findings = report.get("findings", [])
+    code = EXIT.get(report.get("result", "findings"), 2)
+    if args.pr_comment:
+        markdown(report, findings, code)
+        return code
     for f in findings:
         level = LEVEL.get(f.get("severity", "error"), "error")
         props = [f"title=pbps {escape_property(f.get('id', ''))}"]

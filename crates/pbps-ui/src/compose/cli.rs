@@ -93,6 +93,15 @@ pub(super) struct Cli {
 
 impl Cli {
     fn run<S: AsRef<std::ffi::OsStr>>(&self, project: &Path, arguments: &[S]) -> Result<Vec<u8>> {
+        self.run_input(project, arguments, &[])
+    }
+
+    fn run_input<S: AsRef<std::ffi::OsStr>>(
+        &self,
+        project: &Path,
+        arguments: &[S],
+        input: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut command = Command::new(&self.executable);
         // All commands here are offline. An empty environment also prevents
         // repository/config overrides or an environment URL from escaping the
@@ -106,7 +115,7 @@ impl Cli {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["--project", ".", "--no-input"])
             .args(arguments);
-        let result = process::run(command, &[], self.deadline)?;
+        let result = process::run(command, input, self.deadline)?;
         if !result.status.success() {
             // A signal, timeout or failed pipe exchange does not prove that
             // private work completed. A normal refusal still needs the
@@ -136,7 +145,21 @@ impl Cli {
     }
 
     pub fn record(&self, project: &Path, intent: &Intent, base: &str) -> Result<()> {
-        self.run(project, &intent.arguments(base))?;
+        // CLI '-' now selects stdin. Preserve Compose's already supplied
+        // literal reason instead of letting an empty pipe erase that choice.
+        let input: &[u8] = if let Intent::Drop { reason, .. }
+        | Intent::DropTable { reason, .. }
+        | Intent::DropRole { reason, .. } = intent
+        {
+            if reason == "-" {
+                reason.as_bytes()
+            } else {
+                &[]
+            }
+        } else {
+            &[]
+        };
+        self.run_input(project, &intent.arguments(base), input)?;
         Ok(())
     }
 

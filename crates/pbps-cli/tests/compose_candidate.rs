@@ -1157,7 +1157,7 @@ fn changed_configuration_and_secret_bearing_destinations_do_not_seal() {
 }
 
 #[test]
-fn blank_drop_reasons_never_produce_a_compose_candidate() {
+fn compose_refuses_blank_drop_reasons_and_preserves_literal_dash_reasons() {
     let repo = Repository::new("blank-reasons1796", "");
     repo.table(&format!("{ORIGINAL}  old: {{type: int}}\n"));
     checked(repo.cli(&["plan"]));
@@ -1175,14 +1175,20 @@ fn blank_drop_reasons_never_produce_a_compose_candidate() {
         assert!(error.to_string().contains("The CLI refused"), "{error}");
         assert_eq!(repo.preserved(), before);
     }
-    let mut action = request();
-    action.intent = Intent::Drop {
-        column: "dbo.t.old".into(),
-        reason: "Approved retirement".into(),
-    };
-    let preview = store.preview(action, SystemTime::now()).unwrap();
-    assert!(preview.diff.contains("Approved retirement"));
-    assert_eq!(repo.preserved(), before);
+    for reason in ["Approved retirement", "-"] {
+        let mut action = request();
+        action.intent = Intent::Drop {
+            column: "dbo.t.old".into(),
+            reason: reason.into(),
+        };
+        let preview = store.preview(action, SystemTime::now()).unwrap();
+        assert!(
+            preview.diff.contains(&format!("\"reason\": \"{reason}\"")),
+            "{}",
+            preview.diff
+        );
+        assert_eq!(repo.preserved(), before);
+    }
 }
 
 #[test]
