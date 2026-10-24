@@ -28,6 +28,9 @@ use pbps_dialect::{Dialect, TypeChangeRisk};
 use pbps_model::ColumnType;
 use pbps_pg::Postgres;
 
+#[path = "support/dependencies.rs"]
+mod dependencies_tests;
+
 #[path = "support/alias_batches.rs"]
 mod alias_batches;
 

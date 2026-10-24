@@ -11,8 +11,9 @@ pub enum Root {
 }
 
 /// A successful empty read is Present(empty), never Absent or Unreadable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Fact<T> {
+    #[default]
     Absent,
     Present(T),
     Unreadable(String),
@@ -49,6 +50,7 @@ pub enum Ownership {
     PartitionClone,
     ConstraintTrigger,
     Attribute,
+    Storage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,3 +242,54 @@ impl<'a> ModuleAdapter<'a> {
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+/// Physical evidence for restoring keys and composite bindings, not plan authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relation {
+    pub name: pbps_model::TableName,
+    pub row_type: Object,
+    pub array_type: Object,
+    pub attributes: BTreeMap<i32, (pbps_model::ColumnName, Object)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Key {
+    pub index: Object,
+    pub columns: Vec<Object>,
+    pub referenced_columns: Vec<Object>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Catalog {
+    pub graph: Graph,
+    pub relations: BTreeMap<Object, Relation>,
+    pub keys: BTreeMap<Object, Key>,
+    /// Catalog type OIDs in declaration order, including OUT arguments.
+    pub routines: BTreeMap<Object, (Vec<Object>, Object)>,
+    pub publications: Fact<BTreeSet<(String, pbps_model::TableName)>>,
+}
+
+impl Catalog {
+    /// A complete read is still not permission to destroy an unmanaged object.
+    pub fn checked(&self, root: &Root, declared: &pbps_model::Schema) -> Result<Closure, String> {
+        if let Some((publication, table)) =
+            self.publications.require("publication membership")?.first()
+        {
+            return Err(format!(
+                "{} is in publication {}; rebuild is refused",
+                table.shown(),
+                Escaped(publication)
+            ));
+        }
+        let closure = self.graph.closure(root)?;
+        for dependent in closure.surfaces.values() {
+            if !dependent.managed(declared) {
+                return Err(format!(
+                    "{}: unmanaged dependent; declare or remove it before rebuilding",
+                    Escaped(&dependent.described)
+                ));
+            }
+        }
+        Ok(closure)
+    }
+}
