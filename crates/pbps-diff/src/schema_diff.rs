@@ -223,7 +223,11 @@ pub enum DiffError {
     )]
     PartitionedTableChange { table: TableName, what: Vec<String> },
 
-    #[error("cannot plan the blocking rewrite of {table}: {why}", table = .table.shown())]
+    #[error(
+        "cannot plan the blocking rewrite of {table}: {why}. Table rebuild support is tracked \
+         in issue #2298",
+        table = .table.shown(),
+    )]
     RebuildTable { table: TableName, why: String },
 
     #[error("the rebuild intent for {uid} has no source parent identity")]
@@ -4590,12 +4594,17 @@ fn refuse_partition_changes(
                     strategy: by.strategy,
                 }
             };
-            if (b.partition_by.as_ref().map(renamed) != d.partition_by
-                || where_(b, true) != where_(d, false))
-                && !detached
-                && !attached
-            {
-                refuse(declared_name, "change its partitioning".to_owned());
+            let changes_key = b.partition_by.as_ref().map(renamed) != d.partition_by;
+            if (changes_key || where_(b, true) != where_(d, false)) && !detached && !attached {
+                refuse(
+                    declared_name,
+                    if changes_key {
+                        "change its partitioning (partition-key rebuild support: issue #2298)"
+                    } else {
+                        "change its partitioning"
+                    }
+                    .to_owned(),
+                );
             }
         }
     }
@@ -4770,7 +4779,7 @@ fn refuse_partition_changes(
                     table,
                     format!(
                         "{} while this plan attaches, detaches or drops {}; change the parent and \
-                         the partitions in separate plans",
+                         the partitions in separate plans (support in one plan: issue #2296)",
                         change_in_words(change),
                         tables.join(", ")
                     ),
@@ -4807,7 +4816,10 @@ fn refuse_partition_changes(
             {
                 refuse(
                     table,
-                    format!("{}, which is in its partition key", change_in_words(change)),
+                    format!(
+                        "{}, which is in its partition key (table rebuild support: issue #2298)",
+                        change_in_words(change)
+                    ),
                 );
             } else if let Change::AddColumn { column: c, .. } = change
                 && (match &c.value_source {
@@ -4841,7 +4853,7 @@ fn refuse_partition_changes(
                     table,
                     format!(
                         "{} while this plan attaches, detaches or drops {}; change the columns and the \
-                         partitions in separate plans",
+                         partitions in separate plans (support in one plan: issue #2296)",
                         change_in_words(change),
                         tables.join(", ")
                     ),
@@ -4867,7 +4879,7 @@ fn refuse_partition_changes(
                     to,
                     format!(
                         "{} while this plan attaches, detaches or drops {}; rename it and change \
-                         the partitions in separate plans",
+                         the partitions in separate plans (support in one plan: issue #2296)",
                         change_in_words(change),
                         tables.join(", ")
                     ),

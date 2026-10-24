@@ -2785,8 +2785,10 @@ fn moved_time_zone(
         (Some(planned), Some(now)) if planned == now => None,
         (Some(planned), Some(now)) => Some(format!(
             "`{label}` reads offset-less date/time values in `{now}` now, and this plan \
-             was computed in `{planned}`.\nEvery `timestamptz` and `timetz` it writes \
-             without an offset would be stored at another instant than the one approved. \
+             was computed in `{planned}`.\nDifferent spellings are treated as different zones; \
+             their texts must match exactly (DEC-1916.1). A different zone could store any \
+             `timestamptz` or `timetz` written without an offset at another instant than \
+             the one approved. \
              {remedy}",
             label = pbps_model::escape::Escaped(label),
         )),
@@ -5672,16 +5674,19 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                     report.changes.changes.len() + report.unexpressible.len()
                 ),
             )
-            .remedy("pbps pull | pbps plan --db … && pbps apply | pbps baseline --reason \"…\""),
+            .remedy(crate::report::DRIFT_REMEDY),
         );
     }
     // One finding per difference, because the differ returns one per
     // unexpressible change and the column name in it is the remedy.
     for e in &report.unexpressible {
-        findings.push(crate::output::Finding::error(
-            "state.drift-unexpressible",
-            format!("{}: {e}", pbps_model::escape::Escaped(&target.label)),
-        ));
+        findings.push(
+            crate::output::Finding::error(
+                "state.drift-unexpressible",
+                format!("{}: {e}", pbps_model::escape::Escaped(&target.label)),
+            )
+            .remedy(crate::report::DRIFT_REMEDY),
+        );
     }
     // The typed report predates managed modules and carries tables only. JSON
     // findings use the complete policy inventory so readable and unreadable
@@ -11078,8 +11083,21 @@ mod tests {
 
     #[test]
     fn two_spellings_of_one_zone_are_refused_like_two_zones() {
-        assert!(
-            super::moved_time_zone(Some(&zone("UTC")), Some(&zone("Etc/UTC")), "prod").is_some()
+        let message = super::moved_time_zone(Some(&zone("UTC")), Some(&zone("Etc/UTC")), "prod")
+            .expect("spellings still refuse");
+        for text in [
+            "`Etc/UTC` now",
+            "computed in `UTC`",
+            "Different spellings are treated as different zones",
+            "texts must match exactly",
+            "pbps plan --db",
+        ] {
+            assert!(message.contains(text), "{message}");
+        }
+        assert_eq!(
+            super::moved_time_zone(Some(&zone("UTC")), Some(&zone("UTC")), "prod"),
+            None,
+            "matching spellings carry no refusal or guidance"
         );
     }
 

@@ -30,6 +30,9 @@ mod rebuild_members;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/refusal_next_steps_pg.rs"]
+mod refusal_next_steps;
+
 const REBUILD_ALIAS_SOURCE: &str = "table: app.p\ncolumns:\n  k: {type: int}\n  bucket: {type: int4}\n  label: {type: varchar(20)}\n  spelled: {type: character varying(30)}\n  stamp: {type: timestamptz}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
 
 /// The same assertions run without a database and inside the owned live test.
@@ -17022,6 +17025,16 @@ fn omission_report(d: &Demo, connection: &str, command: &str) -> serde_json::Val
             .filter(|f| f["id"] == "state.drift-unexpressible")
             .collect::<Vec<_>>();
         assert_eq!(facts.len(), 1, "{report}");
+        let remedy = facts[0]["remedy"]
+            .as_str()
+            .expect("existing optional remedy");
+        for command in [
+            "`pbps pull`",
+            "`pbps plan --db`",
+            "`pbps baseline --reason …`",
+        ] {
+            assert!(remedy.contains(command), "{report}");
+        }
         assert!(
             facts[0]["message"]
                 .as_str()
