@@ -1427,3 +1427,47 @@ tokens. Unreadable quoted tokens and node properties or aliases outside this
 bounded grammar are refused as unsupported flow mappings. Reading a text `#`
 as a comment could hide a later scheduling key, so uncertainty must refuse,
 never accept while hiding that key.
+
+<a id="dec-2357-1"></a>
+
+**DEC-2357.1. The local sharded live driver qualifies as the full gate when
+each invocation's union is exact and fixture-sensitive tests remain isolated.**
+The maintainer accepts `scripts/live-shards.py` as the live portion of the
+AGENTS.md full gate on two conditions: each cargo invocation's shard union
+equals its authoritative `--list` set exactly, and tests that count containers
+or select fixture names are isolated by owned identities or pinned to one
+shard. The driver runs the same repository runners and immutable images;
+unset shard mode retains their existing commands. It replaces each invocation's
+filters with assigned exact names, runs one test thread per shard, and requires
+each assigned name to report `ok` or `FAILED` exactly once with a matching
+libtest summary and exit status. An empty invocation assignment is skipped,
+never passed as an empty filter; a shard empty for its entire suite fails.
+Missing, duplicate or extra tests and unreadable evidence fail the union audit.
+
+Resolver container-count assertions already filter by their process's unique
+label (#2095), SQL Server removal assertions inspect run-owned IDs, and psql
+and pg_dump cases consume the runner's exported container names. Keep those
+contracts. TLS transport runs once on shard 0, with its repeated trust variants
+retained as distinct invocation obligations. The merge group still executes
+the canonical CI layout. The equivalent gate preserves test membership and
+fixture admission, not the order of test neighbours, which was never a
+guarantee. Weight-based balancing may change neighbours without changing that
+membership or the serial execution within each shard.
+
+With both suites selected, one pool launches every shard concurrently and
+audits both suites even when one fails. Choose counts from one startup memory
+snapshot: reserve roughly 1 GiB for each PostgreSQL set (up to four by default),
+then allocate 9 GiB for SQL Server shard 0 and 5 GiB for each additional set
+without Express (up to three SQL Server shards). Explicit counts
+must also fit the joint budget. Missing weights use the observed median so an
+unmeasured test does not look artificially cheap.
+Use the measured working budget rather than the containers' worst-case caps;
+record the lowest available memory at startup and 15-second intervals, along
+with per-shard wall times, so the budget remains accountable to live evidence.
+
+Only shard 0 starts Express. Classify its consumers by exact names in the
+driver's fixture inventory, enumerate their binaries and verify the pin before
+launching any runner, then check it again at execution and audit. Seed weighted
+balancing with that pinned load; an Express reader may never fall through to a
+hash-selected nonzero shard. This preserves every test while removing unused
+Express servers from the other shards.

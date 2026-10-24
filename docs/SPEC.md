@@ -3455,6 +3455,69 @@ dialect to test: on its first connection to a real server it found that the seam
 no process default to choose between them — which building, linting and
 `cargo deny` all reported as green (DECISIONS 228).
 
+Local fixture names are overridable with `PBPS_TEST_MSSQL_NAME`,
+`PBPS_TEST_MSSQL_EXPRESS_NAME`, `PBPS_TEST_MSSQL_SCRATCH_NAME`,
+`PBPS_TEST_PG_NAME`, `PBPS_TEST_PG_OLD_NAME` and `PBPS_TEST_PG_SCRATCH_NAME`.
+Unset or empty overrides retain the defaults; the SQL Server scratch name
+defaults to the resolved primary name plus `-scratch`. Supply distinct names
+and the existing port overrides for separate fixture sets on a shared host.
+
+`PBPS_LIVE_SHARD=i/N` selects zero-based shard `i` of a local live suite.
+Unset shard mode retains the ordinary runner commands. In shard mode the
+same scripts enumerate each cargo invocation with its original filters,
+partition the names deterministically, and execute assigned exact names with
+one test thread. Empty invocation assignments are skipped; a shard empty for
+the entire suite fails. Every assigned test must report `ok` or `FAILED`, and
+the named reports must agree with libtest's summary and process exit.
+Direct stderr diagnostics remain in the shard logs, separate from the
+libtest stdout parser.
+
+`python3 scripts/live-shards.py --suite all` runs both suites concurrently in
+one pool. It chooses counts jointly from available memory at startup: reserve
+approximately 1 GiB per PostgreSQL set (up to four by default), then allocate
+9 GiB for SQL Server shard 0, which includes Express, and 5 GiB for each
+additional SQL Server shard without Express (at least one, capped at three).
+`--mssql-shards` and `--pg-shards` override counts within the joint memory budget.
+The chosen counts and available memory are printed before launching runners.
+`--suite mssql|pg` selects one engine. `--output` names a fresh directory for
+per-shard logs, invocation receipts and `summary.json`, with total and per-suite
+wall times. Both suites are audited and reported even if one fails; either
+failure fails the driver. The driver independently
+requires each invocation's union to equal its `--list` set exactly, including
+duplicate detection, and refuses a missing invocation or unreported test.
+The summary includes each shard's wall time and the lowest available memory
+sampled at startup and every 15 seconds; an unreadable sample fails the run.
+
+Shard fixture names default to `<prefix>s<i>-<kind>` (`--prefix`, default
+`pbps-live`); explicit name overrides instead gain `-s<i>`. SQL Server scratch
+still derives from the resolved primary name unless explicitly overridden.
+Shard ports add `10*i` to the existing port overrides, with shard-mode defaults
+26330–26332 and 56320–56322. Name and port collisions refuse before provisioning.
+`--weights file.json` uses positive per-test seconds for deterministic
+longest-first balancing when the file exists; missing entries use its median
+(one second for an empty file). Keys combine the binary selector's hash and
+qualified test name. Without a weights file, assignment hashes that identity.
+Keep host-specific measurements outside the repository. Unreadable or malformed
+weights refuse. `--measure
+file.json` records sequential result intervals (including process startup for
+the first test) for a subsequent weighted run. Each run snapshots input weights
+before starting shards.
+
+Only SQL Server shard 0 provisions Express. `EXPRESS_INVENTORY` in the driver
+classifies every Express reader by exact libtest name; a preflight enumerates
+their binaries and rejects missing names or a nonzero-shard assignment before
+any runner starts. Both the cargo proxy and the final audit enforce that pin.
+Weighted balancing seeds shard 0 with the pinned tests' load before assigning
+the remainder. Nonzero shards leave `PBPS_TEST_EXPRESS_DB` unset.
+
+The isolation audit retains the existing process-label filter on resolver
+container counts (`scratch::live_tests::scratch_containers`, #2095), run-owned
+container IDs in SQL Server cleanup tests, and the exported PostgreSQL container
+variables used by psql and pg_dump tests. No default container or port is assumed
+by these paths. The separate TLS transport script runs once on shard 0; its
+individual cargo obligations remain enumerated and checked, including repeated
+trust variants. Canonical CI scheduling is unchanged (DEC-2357.1).
+
 The accepted resolver extension has additional, **not yet implemented**
 acceptance tests in [ADR-0016](ADR-0016-engine-assisted-planning.md#acceptance-tests).
 They must demonstrate correct binding decisions, refusal on missing evidence,

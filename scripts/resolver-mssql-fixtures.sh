@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Source this file: both connection variables belong to the calling runner.
 # These fixtures share one immutable image and the primary's server collation.
-# Remove them with: docker rm -f "$PBPS_RM_NAME" "$PBPS_RM_NAME-scratch"
+# Remove them with: docker rm -f "$PBPS_RM_NAME" "$PBPS_RM_SCRATCH_NAME"
 set -euo pipefail
 
-PBPS_RM_NAME=${NAME:-pbps-test-mssql}
-PBPS_RM_SCRATCH_NAME="$PBPS_RM_NAME-scratch"
+PBPS_RM_NAME=${NAME:-${PBPS_TEST_MSSQL_NAME:-pbps-test-mssql}}
+PBPS_RM_SCRATCH_NAME=${PBPS_TEST_MSSQL_SCRATCH_NAME:-$PBPS_RM_NAME-scratch}
 PBPS_RM_IMAGE=mcr.microsoft.com/mssql/server@sha256:4bab24f36c1ecd48e85f7d37df26e6bf301641d84c3fe652f9a0dcc947d512e1
 PBPS_RM_PASSWORD='Pbps!Test12345'
 PBPS_RM_PORT=${PBPS_TEST_PORT:-14330}

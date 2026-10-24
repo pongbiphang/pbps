@@ -87,7 +87,8 @@ Read before changing things:
     the Python checks, `cargo fmt --all --check`, warning-free
     `cargo clippy --workspace --all-targets`, and
     `cargo test --workspace --all-targets --no-fail-fast`;
-  - then `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`.
+  - then `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`, run directly
+    or through the sharded driver (DEC-2357.1).
 - Run the full gate on every head that can be queued (DEC-1838.1). All green,
   then push:
   - before the first push of the branch;
