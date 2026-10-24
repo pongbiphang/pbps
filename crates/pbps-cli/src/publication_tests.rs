@@ -374,9 +374,9 @@ fn failed_restoration_names_each_unsaved_path_and_retains_remaining_backups() {
     assert!(
         message.contains("injected write failure") && message.contains("injected restore failure")
     );
-    assert!(message.contains("old-2.yml") && message.contains("old-2.yml.bak"));
+    assert!(message.contains("old-2.yml") && message.contains("2.bak"));
     assert_eq!(
-        fs::read(f.dir.join(BACKUP).join("old-2.yml.bak")).unwrap(),
+        fs::read(f.dir.join(BACKUP).join("2.bak")).unwrap(),
         b"old 2\n"
     );
     assert_eq!(fs::read(&f.old[0]).unwrap(), b"old 0\n");
@@ -400,7 +400,7 @@ fn backup_cleanup_failure_is_success_with_an_actionable_leftover_note() {
             .len(),
         1
     );
-    assert!(f.dir.join(BACKUP).join("old-0.yml.bak").exists());
+    assert!(f.dir.join(BACKUP).join("0.bak").exists());
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn restoration_does_not_overwrite_an_occupied_original_path() {
     let f = Fixture::new(1);
     let backup = f.dir.join(BACKUP);
     fs::create_dir(&backup).unwrap();
-    let saved = backup.join("old-0.yml.bak");
+    let saved = backup.join("0.bak");
     fs::rename(&f.old[0], &saved).unwrap();
     fs::write(&f.old[0], "editor replacement").unwrap();
     let failed = restore(
@@ -420,7 +420,7 @@ fn restoration_does_not_overwrite_an_occupied_original_path() {
     );
     assert_eq!(failed.len(), 1);
     assert!(failed[0].contains("destination is occupied"));
-    assert!(failed[0].contains("old-0.yml.bak"));
+    assert!(failed[0].contains("0.bak"));
     assert_eq!(fs::read(&f.old[0]).unwrap(), b"editor replacement");
     assert_eq!(fs::read(saved).unwrap(), b"old 0\n");
 }
@@ -451,4 +451,65 @@ fn replacement_keeps_special_mode_bits_that_writing_clears() {
         assert!(f.publish().unwrap().is_none());
         assert_eq!(fs::metadata(&output).unwrap().mode() & 0o7777, mode);
     }
+}
+
+#[test]
+fn backup_names_do_not_collide_with_valid_declaration_parent_directories() {
+    let mut f = Fixture::new(2);
+    let first = f.dir.join("tables.yml");
+    let nested = f.dir.join("tables.yml.bak/other.yml");
+    fs::create_dir(nested.parent().unwrap()).unwrap();
+    for (i, path) in [first, nested].into_iter().enumerate() {
+        fs::rename(&f.old[i], &path).unwrap();
+        fs::copy(&f.copies[i].0, &path).unwrap();
+        f.old[i] = path;
+    }
+    assert_eq!(
+        pbps_load::load_schema_dir(&f.dir)
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        2
+    );
+    assert!(f.publish().unwrap().is_none());
+    assert_eq!(
+        pbps_load::load_schema_dir(&f.dir)
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        2
+    );
+    assert!(f.old.iter().all(|path| !path.exists()));
+    assert!(!f.dir.join(BACKUP).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_names_fit_when_declaration_filenames_are_at_the_filesystem_limit() {
+    let mut f = Fixture::new(1);
+    let path = f.dir.join(format!("{}.yml", "x".repeat(251)));
+    fs::rename(&f.old[0], &path).unwrap();
+    fs::copy(&f.copies[0].0, &path).unwrap();
+    f.old[0] = path;
+    assert_eq!(
+        pbps_load::load_schema_dir(&f.dir)
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        1
+    );
+    assert!(f.publish().unwrap().is_none());
+    assert_eq!(
+        pbps_load::load_schema_dir(&f.dir)
+            .unwrap()
+            .schema
+            .tables
+            .len(),
+        1
+    );
+    assert!(!f.old[0].exists());
+    assert!(!f.dir.join(BACKUP).exists());
 }

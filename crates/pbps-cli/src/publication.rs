@@ -77,18 +77,11 @@ pub(crate) fn publish(
             )
         })?;
         owns_backup = true;
-        for path in present {
-            let mut saved = backup.join(path.strip_prefix(dir)?);
-            // A crashed run must not leave backup YAML for the loader to read.
-            saved.as_mut_os_string().push(".bak");
-            if let Some(parent) = saved.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "cannot prepare backup `{}`",
-                        Text::new(saved.display().to_string()).shown()
-                    )
-                })?;
-            }
+        for (index, path) in present.iter().enumerate() {
+            // Flat bounded names avoid collisions with user directories and do
+            // not expand a declaration filename already at the filesystem limit.
+            // The completed-move list retains each original path for restoration.
+            let saved = backup.join(format!("{index}.bak"));
             #[cfg(test)]
             tests::fault("rename", path)?;
             fs::rename(path, &saved).with_context(|| {

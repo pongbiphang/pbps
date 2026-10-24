@@ -1602,8 +1602,9 @@ regressions, and `scripts/findings_to_github_test.py`.
 **DEC-2351.1. Pull and state export rename old declarations aside and restore
 on publication failure.** Repeated preflights cannot exclude a later I/O
 failure. One CLI publisher keeps a private, same-filesystem
-`.pbps-publication-backup` directory, with relative names suffixed `.bak` so
-leftovers are not declarations. It tracks completed moves and created entries;
+`.pbps-publication-backup` directory, with short unique `.bak` names so
+backups cannot collide with declaration paths or expand a maximal filename.
+It tracks original paths, completed moves and created entries in memory;
 a failed publication removes its outputs and restores the old entries. Only a
 complete restoration reports "the project is unchanged". An incomplete one
 names every failed restoration and retains the remaining backups. A crashed
