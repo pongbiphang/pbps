@@ -87,6 +87,16 @@ class TestLines(unittest.TestCase):
         text = "/*\n#[cfg(test)]\nmod tests {\n*/\npub fn real() {}\n}\n"
         self.assertEqual(ps.test_lines(text), set())
 
+    def test_a_string_continuation_keeps_later_lines_aligned(self):
+        text = SOURCE.replace(
+            "        assert_eq!(shown(), 1);\n",
+            '        let s = "one \\\n            two \\\n            three";\n'
+            "        assert_eq!(shown(), 1);\n",
+        )
+        # Each continuation, if dropped, cuts one line off the end of the
+        # file; two reach the module's closing brace.
+        self.assertEqual(ps.test_lines(text), set(range(5, 17)))
+
     def test_a_quote_char_literal_does_not_open_a_string(self):
         text = "fn q() -> char {\n    '\"'\n}\n\n" + SOURCE
         self.assertEqual(ps.test_lines(text), set(range(9, 18)))

@@ -85,6 +85,9 @@ def code_starts(text):
             i += 1
         elif state == '"':
             if c == "\\":
+                # A line continuation still ends a line, inside the string.
+                if text.startswith("\n", i + 1):
+                    starts.append(False)
                 i += 2
                 continue
             if c == '"':
