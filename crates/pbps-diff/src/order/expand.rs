@@ -209,35 +209,75 @@ pub fn expand<E: Expansion>(
             list(&left)
         ));
     }
-    Ok(Expanded {
-        changes: super::PlanningPlan::new(
-            ChangeSet {
-                changes: state.changes,
-            },
-            state
-                .origins
-                .into_iter()
-                .map(|origin| match origin {
-                    Origin::Whole(at) => input.origins[at].clone(),
-                    Origin::SplitPart(at) => match input.origins[at].source() {
-                        LogicalSource::Change(at) => Origin::SplitPart(at),
-                        LogicalSource::Rebinding(_) => input.origins[at].clone(),
-                    },
-                    Origin::Teardown(LogicalSource::Change(at)) => {
-                        Origin::Teardown(input.origins[at].source())
-                    }
-                    Origin::Restoration(LogicalSource::Change(at)) => {
-                        Origin::Restoration(input.origins[at].source())
-                    }
-                    origin @ (Origin::Teardown(LogicalSource::Rebinding(_))
-                    | Origin::Restoration(LogicalSource::Rebinding(_))) => origin,
-                })
-                .collect(),
-            input.logical,
-            state.proof,
-        ),
-        rewrites,
-    })
+    let retained: Vec<_> = if input.boundaries.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .origins
+            .iter()
+            .map(|origin| {
+                if let Origin::Whole(at) = origin {
+                    Some(*at)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut changes = super::PlanningPlan::new(
+        ChangeSet {
+            changes: state.changes,
+        },
+        state
+            .origins
+            .into_iter()
+            .map(|origin| match origin {
+                Origin::Whole(at) => input.origins[at].clone(),
+                Origin::SplitPart(at) => match input.origins[at].source() {
+                    LogicalSource::Change(at) => Origin::SplitPart(at),
+                    LogicalSource::Rebinding(_) => input.origins[at].clone(),
+                },
+                Origin::Teardown(LogicalSource::Change(at)) => {
+                    Origin::Teardown(input.origins[at].source())
+                }
+                Origin::Restoration(LogicalSource::Change(at)) => {
+                    Origin::Restoration(input.origins[at].source())
+                }
+                origin @ (Origin::Teardown(LogicalSource::Rebinding(_))
+                | Origin::Restoration(LogicalSource::Rebinding(_))) => origin,
+            })
+            .collect(),
+        input.logical,
+        state.proof,
+    );
+    if !input.boundaries.is_empty()
+        && let Some(identities) = &input.identities
+    {
+        let added = identities.additional(
+            retained
+                .iter()
+                .enumerate()
+                .filter(|(_, prior)| prior.is_none())
+                .map(|(at, _)| {
+                    (
+                        changes.origins[at].clone(),
+                        changes.payload.changes[at].clone(),
+                    )
+                }),
+            input.boundaries.module_edits(),
+        );
+        let mut added = added.iter().cloned();
+        let operations =
+            pbps_model::operation::Operations::from_operations(retained.iter().map(|prior| {
+                prior.map_or_else(
+                    || added.next().expect("every new step has a fresh identity"),
+                    |at| identities.as_slice()[at].clone(),
+                )
+            }));
+        changes.identities = Some(operations.with_steps(&changes.payload.changes));
+    }
+    changes.boundaries = input.boundaries;
+    Ok(Expanded { changes, rewrites })
 }
 
 fn list<T: fmt::Display>(items: &[T]) -> String {

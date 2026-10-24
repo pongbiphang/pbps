@@ -88,6 +88,7 @@ pub(crate) fn differ(plan: PlanningPlan) -> DiffPlan {
 pub(super) fn state<S, T>(plan: PlanningPlan<S>) -> PlanningPlan<T> {
     let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
     done.identities = plan.identities;
+    done.boundaries = plan.boundaries;
     done
 }
 
@@ -126,6 +127,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     _dialect: &D,
 ) -> Result<CanonicalPlan<D>, String> {
     reject_pending_rebuild(&plan.payload)?;
+    plan.boundaries.ensure(&plan)?;
     let identities = plan.identities.or_else(|| {
         Some(pbps_model::operation::Operations::expanded(
             plan.logical,
@@ -138,6 +140,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     });
     let mut done = PlanningPlan::new(plan.payload, plan.origins, plan.logical, plan.proof);
     done.identities = identities;
+    done.boundaries = plan.boundaries;
     Ok(done)
 }
 impl<D: pbps_dialect::Dialect + ?Sized> CanonicalPlan<D> {
@@ -162,6 +165,7 @@ pub struct PlanningPlan<S = Draft> {
     pub(super) logical: usize,
     pub(super) proof: OrderingProof,
     pub(super) identities: Option<pbps_model::operation::Operations>,
+    pub(super) boundaries: super::boundaries::Obligations,
 }
 
 impl<S> PlanningPlan<S> {
@@ -179,6 +183,24 @@ impl<S> PlanningPlan<S> {
             logical,
             proof,
             identities: None,
+            boundaries: Default::default(),
+        }
+    }
+    pub(crate) fn pending_boundaries(
+        &mut self,
+        pending: impl IntoIterator<Item = super::boundaries::Boundary>,
+        modules: pbps_model::operation::ModuleEdits,
+    ) {
+        self.boundaries.require(pending, modules);
+        if !self.boundaries.is_empty() && self.identities.is_none() {
+            self.identities = Some(pbps_model::operation::Operations::expanded(
+                self.logical,
+                self.origins
+                    .iter()
+                    .cloned()
+                    .zip(self.payload.changes.iter().cloned()),
+                modules,
+            ));
         }
     }
     pub fn changes(&self) -> &ChangeSet {
@@ -359,6 +381,9 @@ impl<D: ?Sized> OrderedPlan<D> {
     where
         D: pbps_dialect::Dialect,
     {
+        plan.boundaries
+            .ensure(&plan)
+            .expect("pending boundaries cannot enter a certified emitter");
         Self {
             identities: plan.identities.unwrap_or_else(|| {
                 pbps_model::operation::Operations::expanded(
@@ -383,6 +408,9 @@ impl<D: ?Sized> OrderedPlan<D> {
     where
         D: pbps_dialect::Dialect,
     {
+        plan.boundaries
+            .ensure(&plan)
+            .expect("pending boundaries cannot enter a certified emitter");
         Self {
             identities: plan.identities.unwrap_or_else(|| {
                 pbps_model::operation::Operations::expanded(

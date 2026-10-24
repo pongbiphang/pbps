@@ -42,6 +42,7 @@ let _ = pbps_diff::order::singleton(
 "#
 )]
 
+pub(crate) mod boundaries;
 pub mod catalog;
 pub mod commute;
 mod companions;

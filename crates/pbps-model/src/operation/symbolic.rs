@@ -159,27 +159,65 @@ impl ShapeCheck {
         }
     }
 }
+/// An engine supplies a finite merge over normalized, identity-bearing facts.
+/// This is planning data, never executable callbacks or a serialized program.
+/// Missing/overlapping rows cannot establish an admissible boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merge {
+    pub cases: Vec<MergeCase>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCase {
+    pub parent: Value,
+    pub candidate: Value,
+    pub result: Fact<Value>,
+}
+impl Merge {
+    pub fn apply(&self, parent: &Value, candidate: &Value) -> Result<Value, String> {
+        let mut matches = self
+            .cases
+            .iter()
+            .filter(|case| case.parent == *parent && case.candidate == *candidate);
+        let case = matches
+            .next()
+            .ok_or("the boundary merge has no rule for the read parent/candidate facts")?;
+        if matches.next().is_some() {
+            return Err(
+                "the boundary merge has overlapping rules for the read parent/candidate facts"
+                    .into(),
+            );
+        }
+        case.result.known().cloned()
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferPolicy {
+    Merge(Merge),
     Preserve,
     Inherit,
     Adopt(PartKey),
 }
 impl TransferPolicy {
-    pub fn attach(&self, parent: &Recorded, inherited: &Value, previous: &Value) -> Value {
+    pub fn attach(
+        &self,
+        parent: &Recorded,
+        inherited: &Value,
+        previous: &Value,
+    ) -> Result<Value, String> {
         match self {
-            Self::Preserve => previous.clone(),
-            Self::Inherit => Value {
+            Self::Merge(merge) => merge.apply(inherited, previous),
+            Self::Preserve => Ok(previous.clone()),
+            Self::Inherit => Ok(Value {
                 ownership: Ownership::Inherited,
                 ..inherited.clone()
-            },
-            Self::Adopt(part) => Value {
+            }),
+            Self::Adopt(part) => Ok(Value {
                 ownership: Ownership::Clone {
                     parent: parent.clone(),
                     part: part.clone(),
                 },
                 ..inherited.clone()
-            },
+            }),
         }
     }
 }
@@ -317,6 +355,75 @@ mod policy_tests {
         assert_eq!(
             WritePolicy::StrengthenNotNull.apply(&relaxed, &tightened),
             tightened
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    fn v(text: &str) -> Value {
+        Value {
+            datum: Datum::Definition(text.into()),
+            bindings: BTreeSet::new(),
+            ownership: Ownership::Own,
+        }
+    }
+    #[test]
+    fn a_merge_reads_both_complete_values_and_preserves_its_declared_result() {
+        let parent = v("parent");
+        let candidate = v("candidate");
+        let result = Value {
+            ownership: Ownership::Inherited,
+            ..v("merged")
+        };
+        let merge = Merge {
+            cases: vec![MergeCase {
+                parent: parent.clone(),
+                candidate: candidate.clone(),
+                result: Fact::Known(result.clone()),
+            }],
+        };
+        assert_eq!(merge.apply(&parent, &candidate), Ok(result));
+        assert!(merge.apply(&v("other"), &candidate).is_err());
+        assert!(merge.apply(&parent, &v("other")).is_err());
+        let mut rebound = parent.clone();
+        rebound.bindings.insert(super::super::BoundInput {
+            input: ObjectKey::Module(crate::ModuleId::Named("app.f".parse().unwrap())),
+            incarnation: super::super::Incarnation::Final,
+        });
+        assert!(merge.apply(&rebound, &candidate).is_err());
+    }
+    #[test]
+    fn missing_overlapping_and_unread_merge_rules_are_distinct_failures() {
+        let p = v("p");
+        let c = v("c");
+        let row = MergeCase {
+            parent: p.clone(),
+            candidate: c.clone(),
+            result: Fact::Unread,
+        };
+        assert!(
+            Merge { cases: vec![] }
+                .apply(&p, &c)
+                .unwrap_err()
+                .contains("no rule")
+        );
+        assert!(
+            Merge {
+                cases: vec![row.clone()]
+            }
+            .apply(&p, &c)
+            .unwrap_err()
+            .contains("not read")
+        );
+        assert!(
+            Merge {
+                cases: vec![row.clone(), row]
+            }
+            .apply(&p, &c)
+            .unwrap_err()
+            .contains("overlapping")
         );
     }
 }

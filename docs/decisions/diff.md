@@ -8455,3 +8455,59 @@ ACCESS EXCLUSIVE lock until commit and the attach scan runs inside that
 window; splitting manually remains the user's choice. Remaining refusals,
 including conflicting cuts and capabilities, must name the separate-plans
 remedy. A generic cycle message alone does not discharge that requirement.
+
+<a id="dec-2296-2"></a>
+
+**DEC-2296.2. Column meetings read a parent's property at the transfer
+boundary; engine merges are portable data.** The column slice may extend the
+contract before activating any producer or removing a guard. `Merge` contains
+engine-supplied rows over complete normalized parent and candidate values,
+including bindings and ownership. Its result is a value/ownership fact, not
+SQL, a callback or executable authority. Missing, overlapping or unread rules
+are named obligations rather than an identity transfer or a guessed order.
+A transfer reads its parent's property version at ATTACH. The existing cut
+compiler evaluates the merge at every declared version cut against the child
+goal: a unique admitted side creates its boundary edge, both sides create no
+preference edge, and neither creates the named separate-plans obligation.
+Independent replay applies the same merge at the actual ATTACH position.
+A standalone source's explicit parent-only, retained-lifetime property chain
+ends where ATTACH consumes its managed owner. Its terminal event precedes
+ATTACH and supplies the candidate read; the transfer's surviving endpoint
+then replaces the consumed source's pre-boundary goal. This joins declared
+versions, never equal text or a guessed parent cut.
+
+Pending boundary comparisons travel with immutable PlanningPlan values
+through settlement, expansion, state conversion and planning append. Concrete
+replay discharges them against the current changes and retained event/origin
+identities. Reordering, rewriting or respelling makes that receipt stale;
+canonical completion refuses it in every build. Findings/risks alone do not
+change the contract. No receipt or pending comparison is serialized.
+
+PostgreSQL supplies the mapping in `engine_effects`. Native measurements on
+PG18 show that a stronger local NOT NULL survives attachment to a nullable
+parent, while attachment to a NOT NULL parent merges it into inherited
+ownership. SET NOT NULL after attachment retains the existing local flag;
+SET before attachment clears it at attachment. An explicit own SET after
+both makes the flag local again. PG16 uses its measured effective/stronger
+column policy separately; no PG18 constraint-locality fact is inferred from
+PG16's absence of NOT NULL rows in `pg_constraint`. The model knows no engine
+version or PostgreSQL recursion policy. General merges can also represent
+other measured parent-dependent property/binding transfers; each production
+mapping must name its evidence. The contract extension alone activates none.
+
+The maintainer approved the column/part evidence boundary on 2026-10-24:
+the checked manifest accounts for all 72 measured D pair profiles (144
+executions). Enabled column profiles receive product plan/apply/readback,
+verify and empty replan on applicable PG16/PG18 endpoints. Capability-refused
+profiles and all 32 part profiles receive native two-order readback plus named
+product-refusal/no-mutation checks now; their product acceptance remains owed
+by the PART PR. Tests may not silently omit or relabel a measured profile.
+Explicit own-value restorations may be redundant metadata-only ALTERs.
+
+A combined plan reports that the first parent ALTER holds the parent tree's
+ACCESS EXCLUSIVE lock until commit and that the attach validation scan runs
+inside this longer window. Splitting the column and partition changes into
+separate plans remains the user's choice. Remaining capability, ambiguous-cut
+and conflicting-boundary refusals retain that remedy. This adds no ordering
+pass, rank, tie-break, settlement, proof union, saved field or wire version;
+ordinary unprovided requirements remain observational (DEC-1954.6).

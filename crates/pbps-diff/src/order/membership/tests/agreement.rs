@@ -326,6 +326,7 @@ fn generated_contracts(mut visit: impl FnMut(String, &Fixture)) {
         }
     }
     aliased_contracts(&mut visit);
+    merge::generated_contracts(&mut visit);
     // Fixed-seed contracts combine baseline membership, up to three moves,
     // recursive writes, restorations and multiple clauses per operation.
     // Vary known cells, aliases, lifetime, scope, ownership and endpoint goals.
@@ -779,3 +780,5 @@ mod necessity;
 mod determinism;
 pub(super) use determinism::declared_goals;
 use determinism::{Determinism, aliased_contracts};
+
+mod merge;

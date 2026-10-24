@@ -17,14 +17,20 @@ pub fn before_rewrites(
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
         .map_err(|error| error.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);
-    let operations = Operations::of_plan(
-        &changes.changes,
-        if dialect.rebuilds_modules() {
-            ModuleEdits::Rebuilt
-        } else {
-            ModuleEdits::InPlace
-        },
-    );
+    let operations = (!changes.boundaries.is_empty())
+        .then_some(&changes.identities)
+        .and_then(|identities| identities.as_ref())
+        .map(|ops| ops.with_steps(&changes.changes))
+        .unwrap_or_else(|| {
+            Operations::of_plan(
+                &changes.changes,
+                if dialect.rebuilds_modules() {
+                    ModuleEdits::Rebuilt
+                } else {
+                    ModuleEdits::InPlace
+                },
+            )
+        });
     let base = Snapshot {
         schema: before.schema,
         ids: before.ids,
@@ -38,7 +44,8 @@ pub fn before_rewrites(
         fx.requires
             .iter()
             .any(|r| matches!(r, Requirement::BeforeRewrite(_)))
-    }) {
+    }) && changes.boundaries.is_empty()
+    {
         return Ok(changes);
     }
     if let Some((_, error)) = effects.unowned.first() {
@@ -58,7 +65,12 @@ pub fn before_rewrites(
             moving[edge.after] = true;
         }
     }
-    if !moving.iter().any(|m| *m) {
+    if !changes.boundaries.is_empty() {
+        for (at, fx) in effects.effects.iter().enumerate() {
+            moving[at] |= !fx.symbolic.is_empty();
+        }
+    }
+    if !moving.iter().any(|m| *m) && changes.boundaries.is_empty() {
         return Ok(changes);
     }
     // Only the release and its delayed rewrites may disturb this order.
@@ -103,8 +115,22 @@ pub fn before_rewrites(
             previous = Some(at);
         }
     }
-    schedule
+    let mut settled = schedule
         .settle(changes.clone())
-        .map(|settled| settled.changes)
-        .map_err(|refusal| refusal.describe(&changes))
+        .map_err(|refusal| refusal.describe(&changes))?;
+    if !settled.changes.boundaries.is_empty() {
+        let operations = super::reordered_operations(&operations, &settled.sequence);
+        let effects: Vec<_> = settled
+            .sequence
+            .iter()
+            .map(|&at| effects.effects[at].clone())
+            .collect();
+        settled.changes.boundaries.discharge(
+            operations.as_slice(),
+            &effects,
+            &Default::default(),
+        )?;
+        settled.changes.identities = Some(operations);
+    }
+    Ok(settled.changes)
 }

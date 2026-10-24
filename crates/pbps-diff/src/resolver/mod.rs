@@ -183,7 +183,7 @@ pub fn plan_operations<D: Dialect + ?Sized>(
     let (ordered, operations) = crate::order::resolver_finish::finish(
         ordered,
         &sequence,
-        logical.changes.len(),
+        &logical,
         prepared.origins,
         desired.ids,
         dialect,

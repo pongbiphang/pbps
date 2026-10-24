@@ -543,7 +543,17 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        Ok(crate::order::differ(crate::order::propose(d.changes)))
+        let pending = crate::order::boundaries::meetings(base, declared, &d.changes);
+        let mut plan = crate::order::propose(d.changes);
+        plan.pending_boundaries(
+            pending,
+            if dialect.rebuilds_modules() {
+                pbps_model::operation::ModuleEdits::Rebuilt
+            } else {
+                pbps_model::operation::ModuleEdits::InPlace
+            },
+        );
+        Ok(crate::order::differ(plan))
     } else {
         Err(d.errors)
     }
