@@ -1,5 +1,7 @@
 //! Name allocation only; explicit rebuild recipes still refuse SQL lowering.
 use pbps_diff::order::catalog::graph::Fact;
+mod naming;
+pub use naming::{Allocation, collect_names};
 use pbps_model::{ColumnName, IndexPart, ObjectLocalName, TableName};
 use std::collections::BTreeSet;
 

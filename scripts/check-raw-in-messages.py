@@ -59,6 +59,8 @@ SQL_BUILDERS = {
     for engine in ("pg", "mssql")
     for module in ("emit", "preflight", "rows", "catalog")
 } | {
+    # Derives PostgreSQL index names for rebuilt partition trees.
+    "crates/pbps-pg/src/partition_index/naming.rs",
     "crates/pbps-mssql/src/resolver/externals.rs",
     "crates/pbps-mssql/src/resolver/externals/render.rs",
     "crates/pbps-mssql/src/resolver/dependencies.rs",
@@ -127,6 +129,10 @@ ALLOWED = {
     "crates/pbps-pg/src/emit.rs": (
         None,
         "builds PostgreSQL statements from raw names",
+    ),
+    "crates/pbps-pg/src/partition_index/naming.rs": (
+        None,
+        "derives PostgreSQL index names for rebuilt partition trees",
     ),
     "crates/pbps-pg/src/preflight.rs": (
         None,

@@ -3754,6 +3754,20 @@ pub async fn catalog_dependents(
     Ok(pbps_pg::modules::dependencies::collect(conn, root, source).await?)
 }
 
+/// Complete naming domains for a rebuild, never a permissive offline default.
+#[allow(dead_code)] // PR2c.2b.2 connects this seam; admission stays refused.
+pub async fn rebuild_names(
+    conn: &mut Conn,
+    schemas: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<pbps_diff::order::catalog::graph::Naming> {
+    match conn.driver() {
+        Driver::Postgres => Ok(pbps_pg::partition_index::collect_names(conn, schemas).await?),
+        Driver::Mssql => anyhow::bail!(
+            "rebuild namespace occupancy requires PostgreSQL; SQL Server rebuild is refused"
+        ),
+    }
+}
+
 /// Every dependent of every module this plan drops, read inside the caller's
 /// transaction (`modules::dependents` refuses outside one). Empty on SQL
 /// Server, whose `CREATE OR ALTER` rebuilds nothing.

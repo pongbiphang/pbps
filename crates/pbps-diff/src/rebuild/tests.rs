@@ -30,6 +30,14 @@ fn qualify(
     super::qualify(base, desired, table, &pbps_dialect::MinimalDialect)
 }
 
+fn transition(
+    base: Side<'_>,
+    desired: Side<'_>,
+    root: &RebuildPartitionedTable,
+) -> Result<pbps_model::ValidIds, RebuildError> {
+    super::target_identities(base, desired, root, &pbps_dialect::MinimalDialect)
+}
+
 fn side<'a>(schema: &'a Schema, ids: &'a IdsFile) -> Side<'a> {
     Side { schema, ids }
 }
@@ -259,6 +267,31 @@ fn every_approved_member_change_resolves_without_other_identity_intent() {
             .expect(&case.name);
             assert_eq!(payload.before, base.tables, "{}", case.name);
             assert_eq!(payload.after, case.desired.tables, "{}", case.name);
+            let target =
+                transition(side(&base, &ids), side(&case.desired, &approval), &payload).unwrap();
+            assert_eq!(
+                target.tables, payload.intent.replacement.tables,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                target.columns, payload.intent.replacement.columns,
+                "{}",
+                case.name
+            );
+            assert!(target.rebuilds.is_empty());
+            target.check_held_by(&case.desired).unwrap();
+            assert!(
+                payload
+                    .intent
+                    .source
+                    .tables
+                    .keys()
+                    .chain(payload.intent.source.columns.keys())
+                    .all(|u| target.tombstones.contains_key(u))
+            );
+            assert_eq!(resolution.ids, approval);
+
             assert_eq!(
                 crate::resolve(&case.desired, &resolution.ids, &[], &ctx()).unwrap(),
                 resolution,
@@ -827,4 +860,41 @@ fn recorded_format_is_strict_and_old_identity_bytes_stay_unchanged() {
         }
         assert!(bad.validate().is_err(), "{defect}");
     }
+}
+
+#[test]
+fn proposed_rebuild_identities_require_the_exact_approval_and_preserve_audit() {
+    let (mut base, _, mut desired) = fixture();
+    let other = TableName::new("app", "other");
+    base.tables.insert(other.clone(), Table::default());
+    desired.tables.insert(other.clone(), Table::default());
+    let ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let approval = recorded(&base, &ids, &desired);
+    let root = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+    let target = transition(side(&base, &ids), side(&desired, &approval), &root).unwrap();
+    assert_eq!(target.table_uid(&other), ids.table_uid(&other));
+    for stone in target.tombstones.values() {
+        assert_eq!(stone.reason, "maintenance");
+        assert_eq!(stone.operator, ctx().operator);
+        assert_eq!(stone.dropped_at, ctx().today);
+    }
+    let mut forged = root.clone();
+    forged.intent.max_rows += 1;
+    assert!(
+        transition(side(&base, &ids), side(&desired, &approval), &forged)
+            .unwrap_err()
+            .why
+            .contains("payload")
+    );
+    let mut withdrawn = approval.clone();
+    withdrawn.rebuilds.clear();
+    assert!(
+        transition(side(&base, &ids), side(&desired, &withdrawn), &root)
+            .unwrap_err()
+            .why
+            .contains("intent")
+    );
+    assert_eq!(approval.rebuilds.values().next(), Some(&root.intent));
 }

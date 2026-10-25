@@ -389,6 +389,58 @@ pub fn qualify(
     })
 }
 
+/// Proposed ledger state only: the recorded file is consumed by PR4 after
+/// successful execution, never by planning this transition (DEC-2298.2).
+pub fn target_identities(
+    base: Side<'_>,
+    desired: Side<'_>,
+    root: &RebuildPartitionedTable,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> Result<pbps_model::ValidIds, RebuildError> {
+    if qualify(base, desired, &root.table, dialect)? != *root {
+        return Err(refused(
+            &root.table,
+            "rebuild payload differs from the approved tree",
+        ));
+    }
+    let mut ids = desired.ids.clone();
+    ids.rebuilds
+        .remove(desired.ids.table_uid(&root.table).unwrap());
+    for (uid, was) in root
+        .intent
+        .source
+        .tables
+        .iter()
+        .map(|(u, n)| (u, n.raw().to_string()))
+        .chain(
+            root.intent
+                .source
+                .columns
+                .iter()
+                .map(|(u, n)| (u, n.raw().to_string())),
+        )
+    {
+        ids.tables.remove(uid);
+        ids.columns.remove(uid);
+        ids.moves.remove(uid);
+        ids.tombstones.insert(
+            uid.clone(),
+            pbps_model::Tombstone {
+                was,
+                dropped_at: root.intent.allowed_at.clone(),
+                reason: root.intent.reason.as_ref().into(),
+                operator: root.intent.operator.clone(),
+            },
+        );
+    }
+    ids.tables.extend(root.intent.replacement.tables.clone());
+    ids.columns.extend(root.intent.replacement.columns.clone());
+    ids.check_held_by(desired.schema)
+        .map_err(|e| refused(&root.table, e.to_string()))?;
+    ids.validated()
+        .map_err(|e| refused(&root.table, e.to_string()))
+}
+
 #[cfg(test)]
 mod tests;
 
