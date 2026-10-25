@@ -93,6 +93,32 @@ pub enum DiffError {
     )]
     ConversionWithRename { column: ColumnRef },
 
+    /// A type change that leaves a foreign key between two types the engine
+    /// cannot join (#2359, DEC-2359.1): one end retyped and the other left
+    /// as it was, or both retyped to types that do not meet. The apply would
+    /// take the key down for the change and be refused when it put it back.
+    #[error(
+        "foreign key {constraint} of {table} would join {referencing} (`{referencing_type}`) to \
+         {referenced} (`{referenced_type}`) once this plan has run, and the engine cannot join \
+         those two types, so it would refuse the key at the apply. {next}",
+        constraint = .constraint.shown(),
+        table = .table.shown(),
+        referencing = .referencing.shown(),
+        referenced = .referenced.shown(),
+        referencing_type = pbps_model::escape::Escaped(.referencing_type),
+        referenced_type = pbps_model::escape::Escaped(.referenced_type),
+    )]
+    ForeignKeyTypesDiffer {
+        table: TableName,
+        constraint: pbps_model::ObjectLocalName,
+        referencing: ColumnRef,
+        referenced: ColumnRef,
+        referencing_type: String,
+        referenced_type: String,
+        /// What to do about it, which depends on which end this plan retypes.
+        next: String,
+    },
+
     /// The identity file records conversions for an engine that converts
     /// implicitly and has no `USING` (#2331, ADR-0012 section 5).
     #[error(
@@ -1415,6 +1441,7 @@ pub(crate) fn diff_partial_rebuilding(
         &mut errs,
     );
     refuse_temporal_changes(base, declared, &changes, &mut errs);
+    refuse_unjoinable_foreign_keys(declared.schema, dialect, &changes, &mut errs);
     refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
     refuse_partition_changes(base, declared, &index, hints, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
@@ -3431,6 +3458,59 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
         }
     }
     changes.extend(split);
+}
+
+/// A foreign key a type change would leave between two types the engine cannot
+/// join is named here, at plan time, where the apply would otherwise take the key
+/// down for the change and be refused when it put it back (#2359, DEC-2359.1).
+fn refuse_unjoinable_foreign_keys(
+    declared: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    for key in crate::foreign_keys::unjoinable(changes, declared, dialect) {
+        let (referencing, referencing_type) = &key.referencing;
+        let (referenced, referenced_type) = &key.referenced;
+        let next = match (key.referencing_retyped, key.referenced_retyped) {
+            (true, true) => format!(
+                "Declare types for {} and {} that a key can join, or remove the foreign key.",
+                referencing.shown(),
+                referenced.shown()
+            ),
+            (changed_is_referencing, _) => {
+                let (changed, other) = if changed_is_referencing {
+                    (referencing, referenced)
+                } else {
+                    (referenced, referencing)
+                };
+                let record = if dialect.records_conversions() {
+                    format!(
+                        " (when the engine cannot make that change by itself, record its \
+                         conversion with `pbps convert {} --using -`)",
+                        other.shown()
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Change {other} to a type a key can join with it in the same plan{record}, \
+                     or declare {changed} with the type it has today, or remove the foreign key.",
+                    other = other.shown(),
+                    changed = changed.shown(),
+                )
+            }
+        };
+        errs.push(DiffError::ForeignKeyTypesDiffer {
+            table: key.table.clone(),
+            constraint: key.constraint.clone(),
+            referencing: referencing.clone(),
+            referenced: referenced.clone(),
+            referencing_type: referencing_type.raw().to_string(),
+            referenced_type: referenced_type.raw().to_string(),
+            next,
+        });
+    }
 }
 
 /// Dependency maintenance is visible in the saved plan, including its ordinary

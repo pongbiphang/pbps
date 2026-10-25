@@ -9,6 +9,7 @@
 
 pub mod conversion;
 pub mod enum_labels;
+pub mod foreign_keys;
 pub mod identity;
 pub mod managed;
 pub mod order;

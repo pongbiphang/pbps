@@ -1350,6 +1350,22 @@ impl Dialect for Postgres {
         true
     }
 
+    fn retype_dependents(
+        &self,
+        from: &ColumnType,
+        to: &ColumnType,
+    ) -> pbps_dialect::RetypeDependents {
+        types::retype_dependents(from, to)
+    }
+
+    fn foreign_key_types_compatible(
+        &self,
+        referencing: &ColumnType,
+        referenced: &ColumnType,
+    ) -> Option<bool> {
+        types::foreign_key_types_compatible(referencing, referenced)
+    }
+
     fn type_change_needs_using(&self, from: &ColumnType, to: &ColumnType) -> bool {
         // The three refusals `emit` makes for a change with no recorded
         // conversion, in one place so the prompt asks for exactly the changes

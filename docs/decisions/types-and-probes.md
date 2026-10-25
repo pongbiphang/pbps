@@ -3062,8 +3062,8 @@ the YAML it would have to be deleted by hand once every environment moved.
   Partition-key columns keep their existing refusal; #2298's rebuild takes the
   expression as its copy projection.
 
-Not decided here and not done: the foreign keys on either side of a converted
-column; the same conversion for a domain's base type.
+Not decided here and not done: the same conversion for a domain's base type.
+The foreign keys on either side of a converted column are DEC-2359.1.
 
 <a id="dec-1635-7"></a>
 
@@ -3268,3 +3268,65 @@ partitions; the per-column row counts; each refused dependent; views, bodies and
 triggers; a rename in the same plan; and staged apply with resume across the
 steps. Each repaired site was checked by temporarily reverting its behavior
 with a copy of the file retained aside.
+
+<a id="dec-2359-1"></a>
+
+**DEC-2359.1. A type change that leaves the types a key can join takes the
+foreign key down around it, a recorded conversion and an ordinary retype alike;
+a key the plan would leave between types the engine cannot join is refused at
+plan time (#2359).** DEC-2331.1 left the keys on either side of a converted
+column undecided, and the maintainer decided (2026-10-26) to apply, not refuse:
+a recorded conversion takes the path an ordinary retype takes.
+
+- **Measured, PostgreSQL 16 and 18.** The dialect answered nothing for
+  `retype_dependents`, so the differ's drop-and-add of a key around a retype
+  (`recreate_retyped_dependents`, written for SQL Server) never ran here. A
+  `text` column converted to `integer` with `USING`, as the referencing column,
+  as the referenced one or both, planned and then failed on the first `ALTER`:
+  `foreign key constraint "fk_c_p" cannot be implemented`, the apply rolled
+  back whole. An ordinary `integer` to `text` on both ends of a key fails the
+  same way, so it is not a property of conversions. Inside one group of types
+  (`integer` to `bigint`, `varchar(5)` to `varchar(9)`, on either or both ends)
+  the engine rebuilds the key itself and checks it against the rows, and
+  nothing is needed.
+- **One answer for both.** `types::retype_dependents` names the foreign keys
+  when the change leaves the group of types a key can join, in either
+  direction. The differ then does what it does for any dialect that names them:
+  the key is dropped before the first of the retypes, added after the last, and
+  the engine's effects order the rest (DEC-1998.1). There is no path of its own
+  for a conversion. A pair the table cannot place (an array, a user-defined
+  type, `json`, `tsvector`, `xml`) keeps the engine's handling, as before. The
+  re-added key is a `constraint` change, gated like any added key; the drop
+  carries no class.
+- **The table is measured, and directional.** A key was created between every
+  pair of 22 types on both versions (484 pairs, the same answer on both,
+  SQLSTATE 42804 for each refusal): whole numbers reference whole numbers,
+  `numeric` and floats, never the other way round; `text`, `varchar` and `char`
+  join one another; `date`, `timestamp` and `timestamptz` join one another;
+  `time` also references `timetz` and `interval`; `inet` and `cidr` join; the
+  rest join only themselves. `foreign_key_type_compatibility_matches_the_engine`
+  re-measures it. `Some(false)` is the engine's refusal, and `None` is "not in
+  the table", which refuses nothing.
+- **The one-sided case is refused by name where the plan is built.** A key
+  whose columns the plan retypes and whose declared types the dialect knows it
+  cannot join is `DiffError::ForeignKeyTypesDiffer`, raised by `diff` itself, so
+  `plan`, `plan --db` and every planner that diffs refuse it before any
+  statement. The message names the constraint and its table, both columns with
+  their declared types, and the next step: change the other end in the same
+  plan (recording its conversion where the dialect records them), declare the
+  column with the type it has today, or remove the key; with both ends retyped
+  it asks the declarations to agree. A dialect with no table says nothing.
+- **The pre-flight is unchanged.** The NULL probe, the key probes and the vet
+  read the column and never a key, so a dropped and re-added key changes none of
+  them. The key's own probe counts orphans through the cast on both sides for an
+  ordinary retype, as it did. For a recorded conversion it stays "unchecked",
+  named in the report, because the converted value is the expression's over the
+  table's own row and the probe's alias cannot carry it (DEC-2331.1); the engine
+  validates the key when it is added, and a converted value that has no parent
+  rolls the whole apply back (pinned by
+  `a_converted_value_that_breaks_the_reference_rolls_the_whole_plan_back`).
+  `--staged` takes one logical change and is not offered this plan.
+- **Not done.** A key declared between types the engine cannot join, with no type
+  change in the plan (a new key or table), still reaches the apply; an
+  expression-aware orphan probe for a recorded column would turn the rolled-back
+  apply into a refusal by name.
