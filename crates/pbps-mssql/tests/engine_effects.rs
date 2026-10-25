@@ -1590,3 +1590,125 @@ fn a_trigger_edited_dropped_or_added_beside_a_rebuilt_view_is_planned_once() {
         assert_eq!(plan.verify(&own), []);
     }
 }
+
+#[test]
+fn connected_callee_answers_override_folding_only_for_compared_names() {
+    use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
+    use pbps_model::operation::{Incarnation, Requirement};
+
+    let (before, after, callee, caller) = module_pair(
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.F(@a) END",
+        false,
+    );
+    let changes = vec![PlannedChange::new(Change::CreateModule {
+        id: caller.clone(),
+        module: Box::new(after.modules[&caller].clone()),
+    })];
+    let ids = IdsFile::default();
+    let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &ids, &ids);
+    let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+    let key = |name: &str| SlotKey {
+        namespace: Namespace::Relations("app".into()),
+        name: name.into(),
+    };
+    let lower = key("f");
+    let upper = key("F");
+    let negative = CatalogFacts {
+        compared: [lower.clone(), upper.clone()].into(),
+        ..Default::default()
+    };
+    let partial = CatalogFacts {
+        compared: [lower.clone()].into(),
+        ..Default::default()
+    };
+    let positive = CatalogFacts {
+        alike: [(lower, upper)].into(),
+        ..negative.clone()
+    };
+    // None, an empty fact set, and one unqueried name carry no connected
+    // answer. Both queried with no equal pair is an authoritative negative.
+    for (facts, needs) in [
+        (None, true),
+        (Some(CatalogFacts::default()), true),
+        (Some(partial), true),
+        (Some(negative), false),
+        (Some(positive), true),
+    ] {
+        let effects = pbps_diff::order::analyse_with_catalog(
+            &ops,
+            &owners,
+            Snapshot {
+                schema: &before,
+                ids: &ids,
+            },
+            Snapshot {
+                schema: &after,
+                ids: &ids,
+            },
+            &Mssql,
+            facts.as_ref(),
+        );
+        assert!(effects.unowned.is_empty());
+        assert_eq!(
+            effects.effects[0].requires.contains(&Requirement::Is(
+                ObjectKey::Module(callee.clone()),
+                Incarnation::Final,
+            )),
+            needs,
+            "{facts:?}"
+        );
+    }
+}
+
+#[test]
+fn connected_call_candidates_include_payloads_and_old_bindings_without_computed_columns() {
+    use pbps_model::ChangeSet;
+    let (mut before, mut after, callee, caller) = module_pair(
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN APP.F(@a) /* bogus.call() */ END",
+        false,
+    );
+    let payload = after.modules[&caller].clone();
+    let mut old = payload.clone();
+    old.definition = "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN old.g(@a) END".into();
+    before.modules.insert(caller.clone(), old);
+    // The endpoint differs from this operation's payload, as with split
+    // rewrites. Comparing endpoint text alone would miss APP.F.
+    after.modules.get_mut(&caller).unwrap().definition =
+        "(@a int) RETURNS int AS BEGIN RETURN @a END".into();
+    let changes = ChangeSet {
+        changes: vec![PlannedChange::new(Change::AlterModule {
+            id: caller,
+            module: Box::new(payload),
+        })],
+    };
+    let names = pbps_mssql::schema_bound_call_names(&changes, &before, &after);
+    assert!(before.tables.is_empty() && after.tables.is_empty());
+    assert!(names.contains(&TableName::new("APP", "F")));
+    assert!(names.contains(&TableName::new("old", "g")));
+    assert!(names.contains(&callee.referenced_name().unwrap()));
+    assert!(!names.contains(&TableName::new("bogus", "call")));
+    assert!(pbps_mssql::schema_bound_call_names(&ChangeSet::default(), &before, &after).is_empty());
+    let plain = ChangeSet {
+        changes: vec![PlannedChange::new(Change::CreateModule {
+            id: ModuleId::Named(TableName::new("app", "plain")),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                definition: "(@a int) RETURNS int AS BEGIN RETURN app.F(@a) END".into(),
+                description: None,
+                options: Default::default(),
+            }),
+        })],
+    };
+    assert!(pbps_mssql::schema_bound_call_names(&plain, &before, &after).is_empty());
+    // Views now carry binding in their options (DEC-2329.1); their function
+    // calls need the same connected candidates as a bound function's calls.
+    let view = |bound| ChangeSet {
+        changes: vec![PlannedChange::new(Change::CreateModule {
+            id: vid("caller"),
+            module: Box::new(view_of("SELECT APP.F(1) AS n", bound)),
+        })],
+    };
+    assert!(pbps_mssql::schema_bound_call_names(&view(true), &before, &after)
+        .contains(&TableName::new("APP", "F")));
+    assert!(pbps_mssql::schema_bound_call_names(&view(false), &before, &after).is_empty());
+}

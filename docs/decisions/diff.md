@@ -8615,3 +8615,25 @@ and only for a plan that moves a partition while changing its parent's
 columns. It is not a field of the dialect or the engine. A default whose
 references the facts cannot represent is unrepresented, never an empty
 binding set. No guard, plan byte, saved field or wire version changes.
+
+<a id="dec-2221-1"></a>
+
+**DEC-2221.1. Connected schema-bound function calls use catalog name equality;
+offline calls keep lexical matching.** (#2221.) Extend the existing final
+object-name comparison with the actual operation payload's two-part calls,
+baseline calls it releases, and managed function names from both snapshots.
+This runs on module-only plans too, independently of computed-column reads.
+It reuses the existing `COLLATE CATALOG_DEFAULT` comparison (DEC-1459.1)
+and passes its `CatalogFacts` to engine effects. The query now runs where
+fewer than two candidates previously skipped it; no new metadata read or
+privilege is needed. These remain text-derived requirements, not catalog
+dependency edges.
+
+A compared pair's equality or inequality overrides folding. Only an absent
+comparison (offline, or a name outside `compared`) falls back to the existing
+exact-first, unambiguous case fold. Query failures propagate, never an empty
+answer; an empty `alike` with both names compared is a successful negative.
+The shared callee matcher refines both `Final` and baseline `BeforeRewrite`
+requirements; view matching remains lexical (#2143). No rank, wire format or
+release verifier is added. The module-only SQL Server regression measures
+accent, width and case sensitivity, the reversed verifier order and 3729.

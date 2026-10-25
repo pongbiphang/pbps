@@ -76,13 +76,14 @@ pub mod validate;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mssql;
 
-/// Match managed names within one snapshot: case-only neighbours disable
-/// folding, and function calls must not be confused with alias columns.
+/// Match managed names within one snapshot. Without a connected comparison,
+/// case-only neighbours disable folding; calls never mean alias columns.
 fn schema_bound_callees(
     dialect: &Mssql,
     caller: &ModuleId,
     module: &Module,
     schema: &Schema,
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
 ) -> std::collections::BTreeSet<ModuleId> {
     let calls = dialect.qualified_calls(&module.definition);
     let managed: Vec<_> = schema
@@ -105,10 +106,28 @@ fn schema_bound_callees(
             let unambiguous = !managed.iter().any(|other| other != &name && folded(other));
             let bound = if definition.kind == pbps_model::ModuleKind::Function {
                 calls.iter().any(|(schema, leaf)| {
-                    (schema == &name.schema && leaf == &name.name)
-                        || (unambiguous
-                            && schema.to_lowercase() == name.schema.to_lowercase()
-                            && leaf.to_lowercase() == name.name.to_lowercase())
+                    use pbps_dialect::slots::{Namespace, Same, SlotKey, same};
+                    let key = |schema: &str, leaf: &str| SlotKey {
+                        namespace: Namespace::Relations(schema.into()),
+                        name: leaf.into(),
+                    };
+                    match same(
+                        dialect,
+                        catalog,
+                        &key(schema, leaf),
+                        &key(&name.schema, &name.name),
+                    ) {
+                        Same::Yes => true,
+                        Same::No => false,
+                        // Only an unqueried pair (including offline analysis)
+                        // falls back. A successful negative overrides folding.
+                        Same::Unknown => {
+                            (schema == &name.schema && leaf == &name.name)
+                                || (unambiguous
+                                    && schema.to_lowercase() == name.schema.to_lowercase()
+                                    && leaf.to_lowercase() == name.name.to_lowercase())
+                        }
+                    }
                 })
             } else {
                 dialect.may_name_qualified_exact(&module.definition, &name.schema, &name.name)
@@ -118,6 +137,49 @@ fn schema_bound_callees(
             bound.then(|| callee.clone())
         })
         .collect()
+}
+
+/// Spellings the connected comparison must cover, even on module-only plans.
+/// Only comparison candidates: authored calls must not become occupancy reads
+/// or acquire metadata-visibility requirements (DEC-2221.1).
+pub fn schema_bound_call_names(
+    changes: &pbps_model::ChangeSet,
+    before: &Schema,
+    after: &Schema,
+) -> std::collections::BTreeSet<TableName> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut calls = |module: &Module| {
+        if binding::is_schema_bound(module) {
+            names.extend(
+                Mssql
+                    .qualified_calls(&module.definition)
+                    .into_iter()
+                    .map(|(schema, name)| TableName::new(schema, name)),
+            );
+        }
+    };
+    for planned in &changes.changes {
+        if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
+            &planned.change
+        {
+            calls(module);
+        }
+        if let Change::AlterModule { id, .. } | Change::DropModule { id, .. } = &planned.change
+            && let Some(old) = before.modules.get(id)
+        {
+            calls(old);
+        }
+    }
+    if !names.is_empty() {
+        names.extend([before, after].into_iter().flat_map(|schema| {
+            schema
+                .modules
+                .iter()
+                .filter(|(_, module)| module.kind == pbps_model::ModuleKind::Function)
+                .filter_map(|(id, _)| id.referenced_name())
+        }));
+    }
+    names
 }
 
 impl pbps_dialect::PlanDialect for Mssql {
@@ -204,6 +266,7 @@ impl Dialect for Mssql {
         owners: &dyn pbps_model::operation::Owners,
         before: pbps_model::operation::Snapshot<'_>,
         after: pbps_model::operation::Snapshot<'_>,
+        catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{
@@ -228,7 +291,7 @@ impl Dialect for Mssql {
             // endpoint.
             && binding::is_schema_bound(module)
         {
-            for callee in schema_bound_callees(self, id, module, after.schema) {
+            for callee in schema_bound_callees(self, id, module, after.schema, catalog) {
                 fx.requires.push(Requirement::Is(
                     ObjectKey::Module(callee),
                     Incarnation::Final,
@@ -250,9 +313,9 @@ impl Dialect for Mssql {
         {
             let kept = replacement
                 .filter(|module| binding::is_schema_bound(module))
-                .map(|module| schema_bound_callees(self, id, module, after.schema))
+                .map(|module| schema_bound_callees(self, id, module, after.schema, catalog))
                 .unwrap_or_default();
-            for callee in schema_bound_callees(self, id, old, before.schema) {
+            for callee in schema_bound_callees(self, id, old, before.schema, catalog) {
                 if !kept.contains(&callee) {
                     fx.requires
                         .push(Requirement::BeforeRewrite(ObjectKey::Module(callee)));

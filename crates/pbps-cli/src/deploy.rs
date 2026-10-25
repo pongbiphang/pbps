@@ -7669,6 +7669,8 @@ pub fn cmd_plan_db(
                 &resolved.ids,
                 &target.label,
                 &precedence,
+                &recorded_snapshot.schema,
+                &loaded.schema,
             )
             .await?;
             // The module passes may plan the revision again in the differ's

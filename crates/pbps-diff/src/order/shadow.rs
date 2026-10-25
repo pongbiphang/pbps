@@ -40,12 +40,25 @@ pub fn analyse(
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Shadowed {
+    analyse_with_catalog(operations, owners, before, after, dialect, None)
+}
+
+/// The same effects, with connected identifier comparisons. Missing comparisons
+/// remain unknown; a failed read must never be supplied as an empty answer.
+pub fn analyse_with_catalog(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+) -> Shadowed {
     let mut unowned = Vec::new();
     let effects = operations
         .iter()
         .map(|op: &Operation| {
             let portable = effects(op, owners, before, after);
-            let engine = dialect.engine_effects(op, owners, before, after);
+            let engine = dialect.engine_effects(op, owners, before, after, catalog);
             match (portable, engine) {
                 (Ok(p), Ok(e)) => p.merged(e),
                 (Err(error), _) | (_, Err(error)) => {
@@ -197,7 +210,7 @@ pub(crate) fn observe(
         },
     );
     let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse(&operations, &owners, before, after, dialect);
+    let shadowed = analyse_with_catalog(&operations, &owners, before, after, dialect, facts);
     let report = shadowed.report(&operations, &baseline, declared);
     let mut lines: Vec<String> = report
         .unowned

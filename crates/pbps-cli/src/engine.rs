@@ -1417,6 +1417,8 @@ pub async fn order_created_object_names<S: Clone>(
     ids: &pbps_model::IdsFile,
     label: &str,
     precedence: &[(pbps_model::Change, pbps_model::Change)],
+    before: &Schema,
+    after: &Schema,
 ) -> anyhow::Result<Option<pbps_dialect::slots::CatalogFacts>> {
     if conn.driver() != Driver::Mssql {
         return Ok(None);
@@ -1477,7 +1479,12 @@ pub async fn order_created_object_names<S: Clone>(
         })?;
     // Which of the plan's own names are one under the database's
     // collation (#1215).
-    let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
+    let mut candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
+    // Computed-column reads may be skipped on a module-only plan. Extend this
+    // existing comparison, whose answers the final observer already carries.
+    candidates.extend(pbps_mssql::schema_bound_call_names(cs, before, after));
+    candidates.sort();
+    candidates.dedup();
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
     crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)?;
     Ok(Some(object_slots(&occupants, &candidates, &alike)))
@@ -4270,6 +4277,10 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "engine/mssql_live_tests.rs"]
+mod mssql_live_tests;
 
 #[cfg(test)]
 mod tests {
