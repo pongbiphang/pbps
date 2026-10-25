@@ -4622,6 +4622,12 @@ connection string can name the instance but never its endpoint.
   Express database matched the existing prediction. Idle, an AUTO_CLOSE
   database reports `is_cleanly_shutdown` 1, but acquisition reads the
   options from inside the database, where it is 0.
+- **The run-owned reference is read from inside it too.** A closed Express
+  database also reports NULL for most option columns. The reference was
+  created and then read from master, and Express closed it in between: the
+  Windows job refused its own fresh scratch on nine of those columns. Both
+  sides of the comparison now read from inside, so the result no longer
+  depends on how soon the engine closes an idle database.
 - **A missing instance is told from a stopped one (measured on the Windows
   job).** The 17.x helper answers `info <name>` for an instance that does not
   exist with a success status and no pipe, the same answer as for a stopped

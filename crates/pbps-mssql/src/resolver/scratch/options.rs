@@ -4,7 +4,7 @@
 
 use super::{one, text};
 use pbps_db::DbError;
-use pbps_db::transport::QueryConnection;
+use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_model::escape::Escaped;
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
@@ -195,6 +195,22 @@ pub async fn supplied_reference(
 
 /// `SERVERPROPERTY('EngineEdition')` of Express and LocalDB.
 const EXPRESS_EDITION: &str = "4";
+
+/// [`read`] with the session inside `database`, then back where it started,
+/// so a later DROP DATABASE is not blocked by it. Express, LocalDB included,
+/// creates every database with AUTO_CLOSE on, and closes it once no session
+/// is inside. A closed database's row shows NULLs and is_cleanly_shutdown 1
+/// (measured on 17.0 Express), which describe that moment, not the database.
+pub async fn read_inside(
+    conn: &mut impl ExecuteConnection,
+    database: &str,
+) -> Result<DatabaseOptions, DbError> {
+    let home = super::database(conn).await?.name;
+    super::use_database(conn, database).await?;
+    let options = read(conn, database).await;
+    super::use_database(conn, &home).await?;
+    options
+}
 
 pub fn differences(actual: &DatabaseOptions, reference: &DatabaseOptions) -> Vec<String> {
     actual

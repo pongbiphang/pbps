@@ -221,7 +221,9 @@ pub async fn fresh_reference(
     let result = async {
         conn.execute(&format!("CREATE DATABASE [{}];", names.database()))
             .await?;
-        scratch::options::read(conn, names.database()).await
+        // Read from inside, as the scratch is: Express may already have
+        // closed the new database (see `read_inside`).
+        scratch::options::read_inside(conn, names.database()).await
     }
     .await;
     drop_reference(conn, names).await.map_err(|error| {

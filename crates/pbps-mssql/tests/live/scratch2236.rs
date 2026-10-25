@@ -162,6 +162,66 @@ async fn an_express_supplied_reference_predicts_a_fresh_database_exactly() {
     assert_eq!(model_row(&mut conn).await["is_auto_close_on"], false);
 }
 
+/// The run-owned reference is created and read on one connection. Express
+/// can close it in between (CI run 40219619692 refused its own fresh scratch
+/// this way), so the read must not depend on how fast that happens: this
+/// waits until the database is closed and still expects the open values.
+#[tokio::test]
+#[ignore = "needs a second live SQL Server; set PBPS_TEST_EXPRESS_DB (see scripts/live-tests.sh)"]
+async fn an_express_database_closed_before_its_read_still_reads_as_open() {
+    let express = std::env::var("PBPS_TEST_EXPRESS_DB").expect(
+        "PBPS_TEST_EXPRESS_DB is not set; this test needs the Express server scripts/live-tests.sh starts",
+    );
+    let mut conn = connect_live(&express).await.unwrap();
+    let closed = format!("pbps2377_closed_{}", std::process::id());
+    let open = format!("pbps2377_open_{}", std::process::id());
+    conn.execute(&format!(
+        "CREATE DATABASE [{closed}]; CREATE DATABASE [{open}];"
+    ))
+    .await
+    .unwrap();
+    let inside = connect_live(&format!("{express};Database={open}")).await;
+    let shut = format!(
+        "SELECT CONVERT(int, is_cleanly_shutdown) AS shut FROM sys.databases WHERE name = N'{closed}';"
+    );
+    let mut waited = 0;
+    while waited < 120
+        && conn.query(&shut).await.unwrap()[0]
+            .try_get::<i32>("shut")
+            .unwrap()
+            != Some(1)
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        waited += 1;
+    }
+    let outside = options::read(&mut conn, &closed).await;
+    let read = options::read_inside(&mut conn, &closed).await;
+    let expected = options::read(&mut conn, &open).await;
+    let home = conn.query("SELECT DB_NAME() AS name;").await.unwrap()[0]
+        .try_get::<&str>("name")
+        .unwrap()
+        .map(str::to_owned);
+    drop(inside);
+    for name in [&closed, &open] {
+        conn.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .unwrap();
+    }
+    assert!(waited < 120, "the idle database never closed");
+    let (outside, read, expected) = (outside.unwrap(), read.unwrap(), expected.unwrap());
+    // Negative: from outside, the closed row is what refused the scratch.
+    assert!(
+        options::differences(&outside, &expected).contains(&"is_cleanly_shutdown".to_owned()),
+        "{:?}",
+        options::differences(&outside, &expected)
+    );
+    assert_eq!(options::differences(&read, &expected), Vec::<String>::new());
+    // The session is back where it started, so the drop above could run.
+    assert_eq!(home.as_deref(), Some("master"));
+}
+
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn scratch_inventory_reads_every_catalog_and_cleans_contained_dependencies() {
@@ -621,19 +681,26 @@ async fn failed_database_creation_and_failed_reference_reads_release_every_recor
         ))
         .await
         .unwrap();
+    // The options are read inside the new reference, where its creator is
+    // dbo and no database deny applies. A server-scoped view's deny is kept
+    // in master (4629 elsewhere, measured) and fails the read after CREATE
+    // DATABASE, the moment this case is about.
+    admin
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             DENY SELECT ON sys.database_recovery_status TO [{login}];"
+        ))
+        .await
+        .unwrap();
     db.conn
         .execute(&format!(
             "CREATE USER [{login}] FOR LOGIN [{login}]; ALTER ROLE db_owner ADD MEMBER \
-             [{login}]; DENY SELECT ON sys.all_columns TO public; EXECUTE AS \
-             LOGIN=N'{login}';"
+             [{login}]; EXECUTE AS LOGIN=N'{login}';"
         ))
         .await
         .unwrap();
     let reference = pbps_mssql::resolver::fresh_reference(&mut db.conn, &names).await;
-    db.conn
-        .execute("REVERT; REVOKE SELECT ON sys.all_columns FROM public;")
-        .await
-        .unwrap();
+    db.conn.execute("REVERT;").await.unwrap();
     let remaining = admin
         .query(&format!(
             "SELECT DB_ID(N'{}') AS database_id;",
@@ -643,10 +710,15 @@ async fn failed_database_creation_and_failed_reference_reads_release_every_recor
         .unwrap();
     db.drop().await;
     admin
-        .execute(&format!("DROP LOGIN [{login}];"))
+        .execute(&format!("DROP USER [{login}]; DROP LOGIN [{login}];"))
         .await
         .unwrap();
-    assert!(reference.unwrap_err().to_string().contains("all_columns"));
+    assert!(
+        reference
+            .unwrap_err()
+            .to_string()
+            .contains("database_recovery_status")
+    );
     assert_eq!(remaining[0].try_get::<i32>("database_id").unwrap(), None);
 }
 
