@@ -19,20 +19,7 @@ fn ids() -> IdsFile {
         .insert("t_aaaaaa".parse().unwrap(), "app.parent".parse().unwrap());
     ids
 }
-const TREE: &str = "CREATE SCHEMA app;
-CREATE TABLE app.lookup(id integer PRIMARY KEY);
-CREATE TABLE app.unrelated(id integer REFERENCES app.lookup(id));
-CREATE TABLE app.parent(id integer NOT NULL, code integer NOT NULL, memo text, CONSTRAINT positive CHECK(id>=0), PRIMARY KEY(id), UNIQUE(id,code), FOREIGN KEY(code) REFERENCES app.lookup(id)) PARTITION BY RANGE(id);
-CREATE TABLE app.child PARTITION OF app.parent FOR VALUES FROM(0) TO(100);
-CREATE TABLE app.incoming(id integer NOT NULL, parent_id integer REFERENCES app.parent(id)) PARTITION BY RANGE(id);
-CREATE TABLE app.incoming_child PARTITION OF app.incoming FOR VALUES FROM(0) TO(100);
-CREATE VIEW app.left_view AS SELECT id,code FROM app.parent;
-CREATE VIEW app.right_view AS SELECT id FROM app.parent;
-CREATE VIEW app.diamond AS SELECT l.id FROM app.left_view l JOIN app.right_view r USING(id);
-CREATE FUNCTION app.composite(app.parent) RETURNS app.parent LANGUAGE sql AS 'SELECT $1';
-CREATE FUNCTION app.composite_array(app.parent[]) RETURNS app.parent[] LANGUAGE sql AS 'SELECT $1';
-CREATE FUNCTION app.on_row() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
-CREATE TRIGGER parent_trigger BEFORE INSERT ON app.parent FOR EACH ROW EXECUTE FUNCTION app.on_row();";
+const TREE: &str = include_str!("rebuild_tree.sql");
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]

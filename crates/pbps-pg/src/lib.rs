@@ -1048,8 +1048,7 @@ impl pbps_dialect::PlanDialect for Postgres {
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::staged_attach(&planned.change)
-            .unwrap_or_else(|| emit::emit(self, &planned.change, planned.strategy))
+        emit::emit_staged(self, &planned.change, planned.strategy)
     }
 }
 
@@ -1062,9 +1061,7 @@ impl Dialect for Postgres {
     ) -> Result<usize, DialectError> {
         match mode {
             pbps_model::PlanMode::Transactional => emit::emit(self, change, strategy),
-            pbps_model::PlanMode::Staged => {
-                emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
-            }
+            pbps_model::PlanMode::Staged => emit::emit_staged(self, change, strategy),
         }
         .map(|statements| statements.len())
     }

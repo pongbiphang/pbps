@@ -8572,3 +8572,11 @@ Storage confers no early allocator release and needs no explicit restoration.
 Classification uses only the validated typed chain. Incomplete, unreadable
 or unproved chains and non-storage owners that are not TableParts retain
 their named refusals. This grants no rebuild execution authority.
+
+<a id="dec-2298-11"></a>
+
+**DEC-2298.11. A rebuild copy enforces its approved cap atomically.** The private
+PostgreSQL copy uses explicit typed projections and checks ROW_COUNT in the
+same DO statement. Exceeding max_rows raises P0001 and rolls back, rather than
+silently copying a prefix with LIMIT. This guard does not replace the later
+pre-write count, locks and recertification; admission remains closed.
