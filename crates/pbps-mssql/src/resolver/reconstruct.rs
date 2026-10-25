@@ -16,10 +16,22 @@
 //! even where `f` is schema-bound and reads the table.
 //!
 //! A module that reads a computed column must follow it, and the column
-//! must follow the functions it calls. That is PostgreSQL's "late table"
-//! question over a smaller unit: the held part is only the computed column
-//! and what is built over it, never the table, which SQL Server may create
-//! before the function that reads it.
+//! must follow the functions it calls: PostgreSQL's "late table" question
+//! over a smaller unit, the one computed column, never the table (SQL Server
+//! may create it before the function that reads it) and not a table's
+//! columns as a group. A key, index or primary key is held with the last
+//! computed column it names and follows the others; a foreign key with
+//! either end on a computed column waits for every module.
+//!
+//! Per column is sound because columns have no order among themselves (a
+//! computed column may not use another, 1759, measured on 17.0): a column's
+//! only constraints are the functions it calls before it and the modules that
+//! read it after. A group adds every column's constraints to each: with
+//! `d AS (id + 1)` and `c AS (f(id))` where `f` reads `d`, it calls `f` a
+//! reader of what must follow `f`, though bare table, `d`, `f`, `c` compiles.
+//! A cycle that remains is real: an existing table's column is bound when a
+//! module is created (measured for scalar functions, schema-bound ones and
+//! views), so `f` reading `c` while `c` calls `f` has no order.
 //!
 //! Roles, grants and rows are not reproduced. None changes what a name
 //! binds to, and the plan's schema grants, the only kind it carries, are
@@ -48,8 +60,7 @@ pub enum ReconstructError {
     #[error("scratch compilation of {declaration} was interrupted: {reason}")]
     Interrupted { declaration: String, reason: String },
     #[error(
-        "{0} has a computed column calling a declared function that itself needs the column; \
-         no order compiles both"
+        "scratch cannot order {0}: a computed column and a declared function each need the other"
     )]
     Cycle(String),
 }
@@ -62,6 +73,9 @@ pub struct Metadata {
     /// The roots this step creates: a table, a module or a type. A child
     /// arrives with its parent and is not listed.
     created: Vec<ObjectIdentity>,
+    /// The computed columns a key or index over them waits for, by the id
+    /// each column's step makes resolvable.
+    follows: Vec<String>,
 }
 
 /// SQL-free lowering input. The lexical observations are finite answers from
@@ -100,11 +114,19 @@ pub struct Reconstruction {
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
 }
 
-/// A table whose computed columns, and what stands over them, are held
-/// until the functions they call exist.
+/// One computed column, and what stands over it, held until the functions it
+/// calls exist. `id` stands for the column wherever the scratch route knows a
+/// table: the column's own name made resolvable by its step and read by the
+/// parts that name it.
 struct Late {
+    id: TableName,
     table: TableName,
-    computed: BTreeSet<String>,
+    column: String,
+    expression: String,
+}
+
+fn column_id(table: &TableName, column: &str) -> TableName {
+    TableName::new(table.schema.clone(), format!("{}.{column}", table.name))
 }
 
 type Draft = Part<Metadata>;
@@ -166,6 +188,7 @@ fn part(
             phase,
             declaration: declaration.to_owned(),
             created,
+            follows: Vec::new(),
         },
     })
 }
@@ -279,18 +302,8 @@ impl Reconstruction {
         let held = late
             .into_iter()
             .map(|(late, range)| HeldTable {
-                table: late.table,
-                generated: range
-                    .clone()
-                    .filter_map(|at| {
-                        if let Change::AddComputedColumn { computed, .. } = &steps[at].change.change
-                        {
-                            Some(computed.expression.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
+                table: late.id,
+                generated: vec![late.expression],
                 steps: range,
             })
             .collect::<Vec<_>>();
@@ -396,46 +409,86 @@ fn table_steps(
     let computed = std::mem::take(&mut bare.computed);
     let checks = std::mem::take(&mut bare.checks);
     let keys = std::mem::take(&mut bare.foreign_keys);
-    let over_computed = |columns: Vec<&str>| {
-        columns
-            .iter()
-            .any(|column| computed.keys().any(|c| c.raw() == *column))
+    // The computed columns, by position, that `columns` name.
+    let naming = |columns: Vec<&str>| -> Vec<usize> {
+        computed
+            .keys()
+            .enumerate()
+            .filter(|(_, c)| columns.contains(&c.raw()))
+            .map(|(at, _)| at)
+            .collect()
     };
-    let mut unique = Vec::new();
-    for (n, u) in std::mem::take(&mut bare.unique) {
-        if over_computed(u.columns.iter().map(|c| c.raw()).collect()) {
-            let clustered = table.unique_is_clustered(n.raw());
-            unique.push((n, u, clustered));
-        } else {
-            bare.unique.insert(n, u);
-        }
-    }
-    // The key that cannot be in the first `CREATE`: it names a column that
-    // does not exist yet. Added after the column under the name and layout it
-    // is declared with (the same clause the `CREATE` would have written).
-    let primary_key = bare
-        .primary_key
-        .take_if(|pk| over_computed(pk.columns.iter().map(|c| c.raw()).collect()));
+    // What cannot be in the first `CREATE` because it names a computed
+    // column that does not exist yet (the primary key: 1911, measured), each
+    // with the columns it names, to be added under the name and layout it is
+    // declared with.
+    let mut over: Vec<(Vec<usize>, Draft)> = Vec::new();
+    let mut keep = |named: Vec<usize>, subject: String, change: Change| {
+        part(Phase::Keys, &subject, change, Vec::new(), Vec::new())
+            .map(|draft| over.push((named, draft)))
+    };
     let nonclustered = !table.primary_key_is_clustered();
-    let mut indexes = Vec::new();
-    for (n, i) in std::mem::take(&mut bare.indexes) {
-        let keyed = i.column_keys();
-        // An expression key or a filter can name a computed column too.
-        let over = i.holds_expression()
-            || over_computed(
-                keyed
+    if let Some(pk) = bare
+        .primary_key
+        .take_if(|pk| !naming(pk.columns.iter().map(|c| c.raw()).collect()).is_empty())
+    {
+        keep(
+            naming(pk.columns.iter().map(|c| c.raw()).collect()),
+            format!("primary key of {}", name.shown()),
+            Change::SetPrimaryKey {
+                table: name.clone(),
+                from: None,
+                to: Some(pk),
+                nonclustered,
+            },
+        )?;
+    }
+    for (n, constraint) in std::mem::take(&mut bare.unique) {
+        let named = naming(constraint.columns.iter().map(|c| c.raw()).collect());
+        if named.is_empty() {
+            bare.unique.insert(n, constraint);
+            continue;
+        }
+        keep(
+            named,
+            format!("unique {} on {}", n.shown(), name.shown()),
+            Change::AddUnique {
+                table: name.clone(),
+                clustered: table.unique_is_clustered(n.raw()),
+                name: n,
+                constraint,
+            },
+        )?;
+    }
+    for (n, index) in std::mem::take(&mut bare.indexes) {
+        // An expression key or a filter can name any computed column.
+        let named = if index.holds_expression() {
+            (0..computed.len()).collect()
+        } else {
+            naming(
+                index
+                    .column_keys()
                     .iter()
                     .flatten()
-                    .chain(&i.include)
+                    .chain(&index.include)
                     .map(|c| c.raw())
                     .collect(),
-            );
-        if over && !computed.is_empty() {
-            let clustered = table.index_is_clustered(n.raw());
-            indexes.push((n, i, clustered));
-        } else {
-            bare.indexes.insert(n, i);
+            )
+        };
+        if named.is_empty() {
+            bare.indexes.insert(n, index);
+            continue;
         }
+        keep(
+            named,
+            format!("index {} on {}", n.shown(), name.shown()),
+            Change::AddIndex {
+                table: name.clone(),
+                clustered: table.index_is_clustered(n.raw()),
+                name: n,
+                index: Box::new(index),
+            },
+        )?;
     }
     let mut defaults = Vec::new();
     for (column, spec) in &mut bare.columns {
@@ -470,11 +523,12 @@ fn table_steps(
             Vec::new(),
         )?);
     }
-    // The held part: each computed column, then what stands over it. Phase
-    // Tables, so that without a declared callee the column is added right
-    // after its table, before any module can read it.
-    let held_from = steps.len();
-    for (column, expression) in &computed {
+    // Each computed column is its own held unit, then the keys that end at it.
+    // Phase Tables, so that without a declared callee the column is added
+    // right after its table, before any module can read it.
+    let ids: Vec<TableName> = computed.keys().map(|c| column_id(name, c.raw())).collect();
+    for (at, (column, expression)) in computed.iter().enumerate() {
+        let from = steps.len();
         steps.push(part(
             Phase::Tables,
             &format!("computed column {}", name.column(column.clone()).shown()),
@@ -483,59 +537,25 @@ fn table_steps(
                 name: column.clone(),
                 computed: expression.clone(),
             },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    if let Some(pk) = primary_key {
-        steps.push(part(
-            Phase::Keys,
-            &format!("primary key of {}", name.shown()),
-            Change::SetPrimaryKey {
-                table: name.clone(),
-                from: None,
-                to: Some(pk),
-                nonclustered,
-            },
-            Vec::new(),
+            vec![ids[at].name.clone()],
             Vec::new(),
         )?);
-    }
-    for (n, constraint, clustered) in unique {
-        steps.push(part(
-            Phase::Keys,
-            &format!("unique {} on {}", n.shown(), name.shown()),
-            Change::AddUnique {
-                table: name.clone(),
-                name: n,
-                constraint,
-                clustered,
-            },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    for (n, index, clustered) in indexes {
-        steps.push(part(
-            Phase::Keys,
-            &format!("index {} on {}", n.shown(), name.shown()),
-            Change::AddIndex {
-                table: name.clone(),
-                name: n,
-                index: Box::new(index),
-                clustered,
-            },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    if !computed.is_empty() {
+        let (mine, rest) = std::mem::take(&mut over)
+            .into_iter()
+            .partition(|(named, _)| named.last() == Some(&at));
+        over = rest;
+        for (named, mut dependent) in mine {
+            dependent.metadata.follows = named.iter().map(|&n| ids[n].name.clone()).collect();
+            steps.push(dependent);
+        }
         late.push((
             Late {
+                id: ids[at].clone(),
                 table: name.clone(),
-                computed: computed.keys().map(|c| c.raw().to_owned()).collect(),
+                column: column.raw().to_owned(),
+                expression: expression.expression.clone(),
             },
-            held_from..steps.len(),
+            from..steps.len(),
         ));
     }
     for (column, default) in defaults {
@@ -569,45 +589,24 @@ fn table_steps(
 }
 
 /// What each part may name, by the same lexical test the ordinary planner
-/// uses: a declared name it may call, and a table whose computed column it
-/// may read. A held table is read by a part naming it and either one of the
-/// held columns or every column at once (`*`, `alias.*`) in a module whose
-/// creation binds its column list: a view or an inline table-valued function
-/// (measured on 17.0: a view `SELECT * FROM t` created before `ALTER TABLE ..
-/// ADD c` never exposes `c`, and a view over it naming `c` fails 207, though
-/// the same two views compile with the column first). A schema-bound
-/// function that reads the table's other columns is no reader (measured: it
-/// compiles before the column is added), and neither is a procedure, a
-/// trigger or a scalar function, whose body binds when it runs.
-///
-/// The wildcard rule cannot make a cycle that refuses a valid order. A cycle
-/// needs a reader that is also a callee of the held column, and a column
-/// calls scalar functions only, which cannot list columns; so a function
-/// the held expressions call is never taken for a wildcard reader (measured:
-/// a scalar function with `EXISTS (SELECT * FROM t)` compiles before the
-/// column). What remains is the refusal every reader already carries: a
-/// callee that names a reader module is refused by name as a cycle, which
-/// is never a wrong order.
+/// uses: a declared name it may call, and the computed columns it may read.
+/// A part reads a column by naming its table and the column (any kind of
+/// module: the column is bound when it is created), or its table and every
+/// column at once (`*`, `alias.*`) in a view or an inline table-valued
+/// function, whose creation binds the column list (measured on 17.0: a view
+/// `SELECT * FROM t` created before `ADD c` never exposes `c`, and a view
+/// over it naming `c` fails 207). A procedure or a trigger expands its `*`
+/// when it runs, and a scalar function's `EXISTS (SELECT * ..)` projects no
+/// list, so a function any column of the table calls (necessarily scalar) is
+/// never a wildcard reader: that rule cannot refuse a valid order.
 fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<usize>)]) {
+    let ids: BTreeSet<&String> = late.iter().map(|(l, _)| &l.id.name).collect();
     let names: BTreeSet<String> = steps
         .iter()
-        .flat_map(|s| s.names.iter().cloned())
+        .flat_map(|s| s.names.iter())
+        .filter(|name| !ids.contains(name))
+        .cloned()
         .chain(late.iter().map(|(l, _)| l.table.name.clone()))
-        .collect();
-    let held: Vec<Vec<String>> = late
-        .iter()
-        .map(|(_, range)| {
-            range
-                .clone()
-                .filter_map(|at| {
-                    if let Change::AddComputedColumn { computed, .. } = &steps[at].change.change {
-                        Some(computed.expression.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
         .collect();
     for part in steps {
         let statements = crate::emit::emit(&part.change.change, part.change.strategy)
@@ -634,20 +633,24 @@ fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<
             && statements
                 .iter()
                 .any(|s| selects_all(&dialect.code_only(&s.sql)));
-        part.calls = names.iter().filter(|n| names_text(n)).cloned().collect();
+        part.calls = names
+            .iter()
+            .filter(|n| names_text(n))
+            .cloned()
+            .chain(part.metadata.follows.iter().cloned())
+            .collect();
         part.tables = late
             .iter()
-            .zip(&held)
-            .filter(|((l, _), expressions)| {
+            .filter(|(l, _)| {
                 let called = callee_name.is_some_and(|name| {
-                    expressions
-                        .iter()
-                        .any(|expression| dialect.generation_may_call(expression, name))
+                    late.iter().any(|(other, _)| {
+                        other.table == l.table
+                            && dialect.generation_may_call(&other.expression, name)
+                    })
                 });
-                names_text(&l.table.name)
-                    && (l.computed.iter().any(|c| names_text(c)) || (wildcard && !called))
+                names_text(&l.table.name) && (names_text(&l.column) || (wildcard && !called))
             })
-            .map(|((l, _), _)| l.table.clone())
+            .map(|(l, _)| l.id.clone())
             .collect();
     }
 }

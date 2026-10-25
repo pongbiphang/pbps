@@ -611,3 +611,107 @@ fn a_foreign_key_between_plain_columns_stays_with_the_tables() {
         "{statements:#?}"
     );
 }
+
+fn reads(function: &str, column: &str) -> Change {
+    function_named(
+        function,
+        &format!(
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT({column}) FROM app.t WHERE id = @x); END"
+        ),
+    )
+}
+
+fn function_named(function_name: &str, definition: &str) -> Change {
+    function(function_name, definition)
+}
+
+#[test]
+fn a_function_reading_one_computed_column_does_not_wait_for_a_column_that_calls_it() {
+    // `d AS (id + 1)` and `c AS (f(id))`, with `f` reading `d`: bare table,
+    // `d`, `f`, `c` compiles (measured on 17.0), though `f` reads a column of
+    // the table whose other column must follow it. Held as one group that is
+    // a cycle; held per column `d` calls nothing and is never held.
+    for functions_first in [false, true] {
+        let table = table("t", &[("c", "app.f(id)"), ("d", "id + 1")]);
+        let changes = if functions_first {
+            vec![reads("f", "d"), table]
+        } else {
+            vec![table, reads("f", "d")]
+        };
+        let statements = sql(&build(changes).unwrap());
+        let create = at(&statements, "CREATE TABLE [app].[t]");
+        let d = at(&statements, "ADD [d] AS");
+        let routine = at(&statements, "FUNCTION [app].[f]");
+        let c = at(&statements, "ADD [c] AS");
+        assert!(
+            create < d && d < routine && routine < c,
+            "functions_first={functions_first}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_function_reading_the_column_that_calls_it_is_still_a_cycle_per_column() {
+    // Measured on 17.0: the column cannot be added before the function, nor
+    // the function created before the column it reads (207). Another column
+    // of the table makes no difference to that. (A cycle across two columns,
+    // each function reading the other's column, is left to the engine: the
+    // scratch route finds only a reader that its own column calls, and the
+    // order it gives then fails to compile, naming the function: see the live
+    // test.)
+    let own = build(vec![
+        table("t", &[("c", "app.f(id)"), ("d", "id + 1")]),
+        reads("f", "c"),
+    ])
+    .expect_err("f reads the column that calls it");
+    assert!(
+        matches!(&own, ReconstructError::Cycle(subject) if subject.contains("app.t.c")),
+        "{own:?}"
+    );
+}
+
+#[test]
+fn two_computed_columns_calling_two_functions_follow_their_own_function_in_any_order() {
+    for functions in [["f1", "f2"], ["f2", "f1"]] {
+        let mut changes = vec![table("t", &[("c1", "app.f2(id)"), ("c2", "app.f1(id)")])];
+        changes.extend(functions.map(|name| function(name, FUNCTION)));
+        let statements = sql(&build(changes).unwrap());
+        assert!(
+            at(&statements, "FUNCTION [app].[f2]") < at(&statements, "ADD [c1] AS"),
+            "{statements:#?}"
+        );
+        assert!(
+            at(&statements, "FUNCTION [app].[f1]") < at(&statements, "ADD [c2] AS"),
+            "{statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_key_over_two_computed_columns_follows_both() {
+    for functions in [["f1", "f2"], ["f2", "f1"]] {
+        let mut changes = vec![table_with("t", |t| {
+            t.computed.insert("c1".into(), persisted("app.f1(v)"));
+            t.computed.insert("c2".into(), persisted("app.f2(v)"));
+            t.unique.insert(
+                "uq_two".into(),
+                pbps_model::UniqueConstraint {
+                    columns: vec!["c1".into(), "c2".into()],
+                    storage_parameters: Default::default(),
+                },
+            );
+        })];
+        changes.extend(functions.map(|name| function(name, FUNCTION)));
+        let statements = sql(&build(changes).unwrap());
+        let key = at(&statements, "[uq_two]");
+        assert!(
+            at(&statements, "ADD [c1] AS") < key && at(&statements, "ADD [c2] AS") < key,
+            "{functions:?}: {statements:#?}"
+        );
+        assert!(
+            at(&statements, "FUNCTION [app].[f1]") < at(&statements, "ADD [c1] AS")
+                && at(&statements, "FUNCTION [app].[f2]") < at(&statements, "ADD [c2] AS"),
+            "{functions:?}: {statements:#?}"
+        );
+    }
+}

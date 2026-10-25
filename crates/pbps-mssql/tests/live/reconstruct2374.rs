@@ -447,3 +447,111 @@ async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_t
         .await;
     }
 }
+
+fn reading(function: &str, column: &str) -> Change {
+    module(
+        ModuleKind::Function,
+        function,
+        &format!(
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT({column}) FROM app.t WHERE id = @x); END"
+        ),
+    )
+}
+
+/// Each computed column is held on its own: `d AS (id + 1)` calls nothing, so
+/// the function that reads it need not wait for `c`, which calls that
+/// function. Bare table, `d`, `f`, `c` compiles; one group for both columns
+/// asked `f` to follow a column that must follow `f`.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_function_reading_one_computed_column_compiles_before_a_column_that_calls_it() {
+    for (tag, functions_first) in [("per_a", false), ("per_b", true)] {
+        case(tag, move |mut conn| async move {
+            let table = table("t", |t| {
+                t.computed.insert("c".into(), computed("app.f(id)"));
+                t.computed.insert("d".into(), computed("id + 1"));
+            });
+            let changes = if functions_first {
+                vec![reading("f", "d"), table]
+            } else {
+                vec![table, reading("f", "d")]
+            };
+            compile(&mut conn, changes).await.unwrap();
+            assert_eq!(
+                count(
+                    &mut conn,
+                    "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t')"
+                )
+                .await,
+                2,
+                "{tag}"
+            );
+        })
+        .await;
+    }
+}
+
+/// A key over two computed columns follows both, whichever order the two
+/// functions their columns call are declared in.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_key_over_two_computed_columns_follows_both_and_their_functions() {
+    for (tag, functions) in [("two_a", ["f1", "f2"]), ("two_b", ["f2", "f1"])] {
+        case(tag, move |mut conn| async move {
+            let mut changes = vec![table("t", |t| {
+                t.columns.get_mut("id").unwrap().nullable = false;
+                t.computed.insert("c1".into(), persisted("app.f1(v)"));
+                t.computed.insert("c2".into(), persisted("app.f2(v)"));
+                t.unique.insert(
+                    "uq_two".into(),
+                    pbps_model::UniqueConstraint {
+                        columns: vec!["c1".into(), "c2".into()],
+                        storage_parameters: Default::default(),
+                    },
+                );
+            })];
+            changes.extend(functions.map(|name| module(ModuleKind::Function, name, FUNCTION)));
+            compile(&mut conn, changes).await.unwrap();
+            assert_eq!(
+                count(
+                    &mut conn,
+                    "SELECT COUNT(*) FROM sys.key_constraints WHERE name = N'uq_two' AND type = 'UQ'"
+                )
+                .await,
+                1,
+                "{tag}"
+            );
+        })
+        .await;
+    }
+}
+
+/// A real cycle across two columns (each function reads the other's column)
+/// has no order. The scratch route finds only a reader its own column
+/// calls, so this one reaches the engine, which refuses it by naming the
+/// function and its error: a refusal either way, never an accepted order.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_cycle_across_two_computed_columns_is_refused_naming_the_declaration() {
+    case("cycle", |mut conn| async move {
+        let refused = compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c1".into(), computed("app.g1(id)"));
+                    t.computed.insert("c2".into(), computed("app.g2(id)"));
+                }),
+                reading("g1", "c2"),
+                reading("g2", "c1"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&refused, ReconstructError::Cycle(_))
+                || matches!(&refused, ReconstructError::Compile { reason, .. } if reason.contains("207")),
+            "no order compiles it, so something names it: {refused}"
+        );
+    })
+    .await;
+}
