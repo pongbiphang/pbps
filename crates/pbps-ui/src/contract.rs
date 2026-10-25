@@ -127,6 +127,25 @@ pub struct Explanation {
     /// A resolved plan's sealed evidence (#1517); absent for any other plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolver: Option<Resolver>,
+    /// A plan's sealed rehearsal record (#2379); absent when never asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rehearsal: Option<Rehearsal>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rehearsal {
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spelling: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

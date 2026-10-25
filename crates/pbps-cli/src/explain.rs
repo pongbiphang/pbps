@@ -27,6 +27,7 @@ use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
 use crate::report::{placeholder, shell_arg};
 
+mod rehearsal;
 mod resolver;
 use crate::{db, output, report};
 
@@ -93,6 +94,11 @@ pub struct Explanation {
     /// resolved (#1517). An ordinary plan carries no resolver provenance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolver: Option<resolver::ResolverDetail>,
+    /// The sealed rehearsal record (#2379): present when the plan was
+    /// rehearsed or the rehearsal was turned off, absent when it was never
+    /// asked for. Absence is not "rehearsed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rehearsal: Option<rehearsal::RehearsalDetail>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -474,6 +480,7 @@ fn explain(
             }
             pbps_model::resolver::PlanAnalysis::Ordinary => None,
         },
+        rehearsal: plan.rehearsal.as_ref().map(rehearsal::detail),
     })
 }
 
@@ -643,6 +650,9 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     if let Some(detail) = &e.resolver {
         out.push_str(&format!("  resolver    {}\n", resolver::line(detail)));
     }
+    if let Some(detail) = &e.rehearsal {
+        out.push_str(&format!("  rehearsal   {}\n", rehearsal::line(detail)));
+    }
     out.push_str(&format!("  dialect     {}\n", Escaped(&e.dialect)));
     out.push_str(&format!("  created     {}\n", e.created_at.shown()));
     if let Some(sha) = &e.git_sha {
@@ -733,6 +743,9 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
 
     if let Some(detail) = &e.resolver {
         out.push_str(&resolver::render(detail, &plan.changes));
+    }
+    if let Some(detail) = &e.rehearsal {
+        out.push_str(&rehearsal::render(detail));
     }
 
     out.push_str("\nThe environment\n");

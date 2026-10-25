@@ -47,6 +47,7 @@ pub mod plan_names;
 pub mod reason;
 pub mod rebuild;
 pub mod rebuild_ops;
+pub mod rehearsal;
 pub mod rename;
 pub mod resolver;
 pub mod role;
@@ -94,6 +95,7 @@ pub use rebuild_ops::{
     IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition, RebuildPartitionedTable,
     RebuildRelation,
 };
+pub use rehearsal::Rehearsal;
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{

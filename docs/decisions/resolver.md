@@ -4367,3 +4367,29 @@ before cooperative cancellation can release them. Abrupt process death still
 cannot run supplied-database cleanup. Docker readiness diagnostics are shared
 with the resolver so consolidating acquisition retains preview's measured
 startup refusals and password redaction.
+
+<a id="dec-2379-1"></a>
+
+**DEC-2379.1. The rehearsal record is a plan-level optional field, externally
+tagged, and sealed by the plan fingerprint without a version bump (#2379).**
+The rehearsal also runs for a plan that needs no resolver, which carries no
+resolver evidence, so the record is `SavedPlan::rehearsal`, not part of the
+evidence. It is `Converged { entry, scratch, layout, spelling }` or `Off`, and
+the field is omitted when absent, as `same_instance` is (DEC-2270.1): the
+wire fingerprint hashes the whole file, an older reader refuses the unknown
+field through `deny_unknown_fields`, and the plan version stands. The scratch
+reuses `ScratchSource` and `ScratchLayout`, so a docker image is sealed as
+configured and unverified, as in the evidence; the field is named `scratch`
+because the shared type already carries a `kind` tag.
+
+The enum is externally tagged because serde's internally tagged unit variant
+drops fields it does not know, where `Off` must refuse them (#1843). A record
+naming no entry, or a docker scratch naming no image, is incomplete and is
+refused by `validate_analysis` like an empty evidence runtime. Absent, `Off`
+and `Converged` are three different statements; nothing reads absence as
+either. A failed rehearsal refuses the plan, so there is no failed outcome.
+`explain` shows the record in the human summary and as `rehearsal` in the JSON
+envelope (published schema set 61), and `apply` only displays it. The core
+moved out of `dev` into an engine-neutral `rehearsal` module that takes the
+base state as an input; the git baseline is its only base until the connected
+rehearsal lands, and `--dev` output is unchanged.

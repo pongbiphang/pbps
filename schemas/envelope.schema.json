@@ -1310,6 +1310,17 @@
               "type": "null"
             }
           ]
+        },
+        "rehearsal": {
+          "description": "The sealed rehearsal record (#2379): present when the plan was\nrehearsed or the rehearsal was turned off, absent when it was never\nasked for. Absence is not \"rehearsed\".",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RehearsalDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1583,6 +1594,54 @@
         "class",
         "name",
         "signature"
+      ]
+    },
+    "RehearsalDetail": {
+      "description": "The sealed rehearsal record, flattened for `--format json`.",
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "description": "`converged`: the plan's statements ran on a scratch engine and it\nmatched the declarations. `off`: the operator turned the rehearsal off,\nso the plan was not rehearsed.",
+          "type": "string"
+        },
+        "entry": {
+          "description": "The `pbps.yml` resolver entry that supplied the scratch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scratch": {
+          "description": "`server` or `docker`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image": {
+          "description": "A docker scratch's image reference as configured: unverified, since\nthe content behind a tag can change.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layout": {
+          "description": "`run-owned` or `supplied`, as for the resolver evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spelling": {
+          "description": "Differences that are only the engine's own spelling, as it stored them.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "outcome"
       ]
     },
     "envelope.explain": {
@@ -2705,6 +2764,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 60,
+  "x-pbps-schema-version": 61,
   "x-pbps-tool-version": "0.0.0"
 }

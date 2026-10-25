@@ -31,6 +31,7 @@ mod pins;
 mod prompt;
 mod publication;
 mod reason_input;
+mod rehearsal;
 mod report;
 mod resolution;
 mod row_security;
