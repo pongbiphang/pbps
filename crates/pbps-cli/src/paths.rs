@@ -46,6 +46,8 @@ pub(crate) fn absolute(path: &Path) -> anyhow::Result<PathBuf> {
 /// Existing aliases are compared by filesystem identity; missing destinations
 /// still need a spelling comparison because planning can create the ids file.
 pub(crate) fn same_file(a: &Path, b: &Path) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    inspections::CALLS.with(|n| n.set(n.get() + 1));
     if absolute(a)? == absolute(b)? {
         return Ok(true);
     }
@@ -73,33 +75,6 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Every existing destination must be one of the entries removed before copying.
-/// A lowercase-extension listing can miss an uppercase alias on a case-insensitive
-/// filesystem; spelling membership would also reject aliases it did list (#2311).
-pub(crate) fn require_removable_output(output: &Path, removal: &[PathBuf]) -> anyhow::Result<()> {
-    match std::fs::symlink_metadata(output) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot inspect `{}`",
-                    pbps_model::Text::new(output.display().to_string()).shown()
-                )
-            });
-        }
-    }
-    for old in removal {
-        if same_file(output, old)? {
-            return Ok(());
-        }
-    }
-    anyhow::bail!(
-        "`{}` already exists outside the declaration replacement set; move it before retrying",
-        pbps_model::Text::new(output.display().to_string()).shown()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,83 +94,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_preflight_refuses_an_uppercase_extension_alias_omitted_from_removal() {
-        let dir = Directory::new();
-        let old = dir.0.join("custom.yml");
-        let uppercase = dir.0.join("country.YML");
-        let output = dir.0.join("country.yml");
-        std::fs::write(&old, "keep old declaration").unwrap();
-        std::fs::write(&uppercase, "keep uppercase entry").unwrap();
-        // Simulate case-insensitive lookup with a symlink. Exclude that simulator
-        // entry from the removal list: the real filesystem has only country.YML,
-        // which schema_files omits. The lane's filesystem is case-sensitive.
-        if !output.exists() {
-            std::os::unix::fs::symlink("country.YML", &output).unwrap();
-        }
-        let present: Vec<_> = pbps_load::schema_files(&dir.0)
-            .unwrap()
-            .into_iter()
-            .filter(|path| path != &output)
-            .collect();
-        assert_eq!(present.as_slice(), std::slice::from_ref(&old));
-        let publish = || -> anyhow::Result<()> {
-            require_removable_output(&output, &present)?;
-            for path in &present {
-                std::fs::remove_file(path)?;
-            }
-            std::fs::File::create_new(&output)?;
-            Ok(())
-        };
-        let result = publish();
-        assert!(
-            old.is_file(),
-            "unlisted output failure deleted a declaration"
-        );
-        assert_eq!(std::fs::read(&old).unwrap(), b"keep old declaration");
-        assert_eq!(std::fs::read(&uppercase).unwrap(), b"keep uppercase entry");
-        assert!(result.unwrap_err().to_string().contains("move it"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_preflight_admits_listed_file_identities_without_spelling_membership() {
-        let dir = Directory::new();
-        let old = dir.0.join("Country.yml");
-        let output = dir.0.join("country.yml");
-        std::fs::write(&old, "old declaration").unwrap();
-        if !output.exists() {
-            std::os::unix::fs::symlink("Country.yml", &output).unwrap();
-        }
-        require_removable_output(&output, std::slice::from_ref(&old)).unwrap();
-        let hardlink = dir.0.join("hard.yml");
-        std::fs::hard_link(&old, &hardlink).unwrap();
-        require_removable_output(&hardlink, &[old]).unwrap();
-        require_removable_output(&dir.0.join("absent.yml"), &[]).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replacement_preflight_distinguishes_unlisted_dangling_and_unreadable_entries() {
-        let dir = Directory::new();
-        let regular = dir.0.join("country.yml");
-        let dangling = dir.0.join("dangling.yml");
-        let unreadable = dir.0.join("loop.yml");
-        std::fs::write(&regular, "not scheduled for removal").unwrap();
-        std::os::unix::fs::symlink("missing", &dangling).unwrap();
-        std::os::unix::fs::symlink("loop.yml", &unreadable).unwrap();
-        for path in [&regular, &dangling] {
-            let error = require_removable_output(path, &[]).unwrap_err();
-            assert!(error.to_string().contains("move it"));
-            // A listed dangling entry is removable even though metadata follows
-            // its missing target; symlink_metadata establishes its presence.
-            require_removable_output(path, std::slice::from_ref(path)).unwrap();
-        }
-        let error = require_removable_output(&unreadable, &[regular]).unwrap_err();
-        assert!(error.to_string().contains("cannot inspect"));
     }
 
     #[test]
@@ -250,5 +148,12 @@ mod tests {
         let dir = Directory::new();
         std::os::unix::fs::symlink("loop", dir.0.join("loop")).unwrap();
         assert!(same_file(&dir.0.join("loop"), &dir.0.join("missing")).is_err());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod inspections {
+    thread_local! {
+        pub(crate) static CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 }

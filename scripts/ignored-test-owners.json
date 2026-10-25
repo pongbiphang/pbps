@@ -180,7 +180,8 @@
         "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
         "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
         "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
-        "forced_pull2311_dangling_output_parent_refuses_before_changing_the_project"
+        "forced_pull2311_dangling_output_parent_failure_restores_the_project",
+        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements"
       ]
     },
     {
@@ -192,7 +193,8 @@
         "forced_pull2311_replaces_output_symlinks_before_removing_stale_targets",
         "forced_pull2311_protects_config_and_identities_from_output_and_stale_aliases",
         "forced_pull2311_preserves_restrictive_permissions_when_replacing_data",
-        "forced_pull2311_dangling_output_parent_refuses_before_changing_the_project"
+        "forced_pull2311_dangling_output_parent_failure_restores_the_project",
+        "publication2351_pull_and_export_restore_failures_and_keep_restricted_hardlink_replacements"
       ]
     },
     {
@@ -412,7 +414,7 @@
         "pull_preserves_trigger_definitions_with_yaml_controls",
         "forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration",
         "forced_pull2311_invalid_staging_leaves_the_project_byte_identical",
-        "forced_pull2311_directory_outputs_refuse_before_changing_the_project",
+        "forced_pull2311_directory_output_failures_restore_the_project",
         "forced_pull_preserves_applied_column_rename_and_drop_history",
         "unchanged_forced_pull_preserves_identities_rows_and_history",
         "forced_pull_mints_only_added_objects",
@@ -768,7 +770,7 @@
         "drift_and_pull_are_read_from_the_postgres_catalog",
         "forced_pull2311_replaces_differently_cased_aliases_with_one_loadable_declaration",
         "forced_pull2311_invalid_staging_leaves_the_project_byte_identical",
-        "forced_pull2311_directory_outputs_refuse_before_changing_the_project",
+        "forced_pull2311_directory_output_failures_restore_the_project",
         "forced_pull_preserves_applied_column_rename_and_drop_history",
         "unchanged_forced_pull_preserves_identities_rows_and_history",
         "forced_pull_mints_only_added_objects",

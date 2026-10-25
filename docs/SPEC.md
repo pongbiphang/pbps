@@ -3895,7 +3895,11 @@ Acceptance criteria for that slice:
 1. A user with a supported existing database can reach a reviewable plan without
    opening this specification.
 2. No successful onboarding command partially rewrites the working tree: output
-   is staged, validated, then renamed into place atomically.
+   is staged and validated first. Forced pull and state export rename old
+   declarations aside and restore them on publication failure (DEC-2351.1).
+   Failed restoration names the remaining backups; failed backup cleanup after
+   successful publication is a warning. A leftover backup requires inspection
+   before retrying.
 3. Every diagnostic names the failing environment or file, says what to do next,
    and redacts connection strings.
 4. The human, JSON and CI-annotation views describe the same typed findings; a

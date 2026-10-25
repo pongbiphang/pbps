@@ -1596,3 +1596,25 @@ Pinned by `stdin_reasons_and_unedited_remedies_preserve_human_intent`,
 `stdin_refusal_precedes_discovery_and_plan_apply_cannot_record_intent`,
 `stdin_preserves_the_reason_except_one_final_line_ending`, the batch/report
 regressions, and `scripts/findings_to_github_test.py`.
+
+<a id="dec-2351-1"></a>
+
+**DEC-2351.1. Pull and state export rename old declarations aside and restore
+on publication failure.** Repeated preflights cannot exclude a later I/O
+failure. One CLI publisher keeps a private, same-filesystem
+`.pbps-publication-backup` directory, with short unique `.bak` names so
+backups cannot collide with declaration paths or expand a maximal filename.
+It tracks original paths, completed moves and created entries in memory;
+a failed publication removes its outputs and restores the old entries. Only a
+complete restoration reports "the project is unchanged". An incomplete one
+names every failed restoration and retains the remaining backups. A crashed
+run's backup requires manual inspection before another publication. Successful
+publication followed by failed backup deletion is success with a warning
+naming the leftover. Replacements keep file permissions and, on Unix, the
+existing destination's group before receiving content, or refuse with
+restoration and a remedy.
+A measured write cleared modes `02750` to `0750` and `04640` to `0640`, so
+mode is reapplied after copying. Identity writes and the exit 2 result for
+unresolved identity intent remain outside this helper (DEC-1790.1). The
+per-output removal-membership scan is unnecessary and removed (#2352);
+protected-input and containment checks remain.

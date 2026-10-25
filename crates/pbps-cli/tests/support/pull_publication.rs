@@ -255,7 +255,9 @@ pub fn output_directories(server: &str, pg: bool) {
         );
         let said = stderr(&refused);
         assert!(
-            said.contains("is a directory") && said.contains("move it"),
+            said.contains("cannot create declaration")
+                && said.contains("move any existing")
+                && said.contains("the project is unchanged"),
             "{said}"
         );
     }
@@ -365,4 +367,124 @@ pub fn dangling_output_parent(server: &str, pg: bool) {
     assert!(roles.join(format!("{name}.yml")).is_file());
     assert!(d.dir.join("schema/sales.country.yml").is_file());
     ok(d.run(&["validate"]));
+}
+
+#[cfg(unix)]
+pub fn restorable_commands(server: &str, pg: bool) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let (own, d) = prepared(server, pg, "publication2351_commands");
+    d.commit();
+    ok(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "publication fixture",
+    ]));
+    let dir = d.dir.join("schema");
+    let output = dir.join(format!("{}.country.yml", schema(pg)));
+    let expected = pbps_load::load_schema_dir(&dir).unwrap().schema;
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o640)).unwrap();
+    if let Some(group) = rustix::process::getgroups()
+        .unwrap()
+        .into_iter()
+        .find(|g| *g != rustix::process::getegid())
+    {
+        rustix::fs::chown(&output, None, Some(group)).unwrap();
+    }
+    let before = std::fs::metadata(&output).unwrap();
+    std::fs::hard_link(&output, dir.join("legacy.yml")).unwrap();
+    ok(d.run(&["pull", "--force", "--db", own.connection()]));
+    let after = std::fs::metadata(&output).unwrap();
+    assert_eq!(
+        (after.mode() & 0o7777, after.gid()),
+        (before.mode() & 0o7777, before.gid())
+    );
+    assert_eq!(
+        pbps_load::schema_files(&dir).unwrap().as_slice(),
+        std::slice::from_ref(&output)
+    );
+    let list = d.run(&[
+        "state",
+        "list",
+        "--db",
+        own.connection(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&list), 0, "{}{}", stdout(&list), stderr(&list));
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let id = list["data"]["entries"][0]["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    std::fs::rename(&output, dir.join("custom.yml")).unwrap();
+    std::fs::create_dir(&output).unwrap();
+    std::fs::write(output.join("notes.txt"), "keep the directory too").unwrap();
+    let before = project_bytes(&d.dir);
+    for args in [
+        vec!["pull", "--force", "--db", own.connection()],
+        vec![
+            "state",
+            "export",
+            &id,
+            "--force",
+            "--db",
+            own.connection(),
+            "--format",
+            "json",
+        ],
+    ] {
+        let refused = d.run(&args);
+        assert_eq!(
+            code(&refused),
+            1,
+            "{}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        let said = format!("{}{}", stdout(&refused), stderr(&refused));
+        assert!(said.contains("the project is unchanged"), "{said}");
+        assert_eq!(
+            project_bytes(&d.dir),
+            before,
+            "{args:?} damaged the project"
+        );
+    }
+    std::fs::remove_dir_all(&output).unwrap();
+    let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
+    ok(d.run(&["state", "export", &id, "--force", "--db", own.connection()]));
+    assert_eq!(pbps_load::load_schema_dir(&dir).unwrap().schema, expected);
+    assert_eq!(std::fs::read(d.dir.join("schema.ids.json")).unwrap(), ids);
+    ok(d.run(&["validate"]));
+
+    // IDs are written after declaration publication. Preparing their parent
+    // must not leave a new schema subdirectory behind when publication fails.
+    let fresh = Demo::new("publication2351_ids_parent");
+    let config = fresh.dir.join("pbps.yml");
+    let mut yaml = std::fs::read_to_string(&config).unwrap();
+    yaml.push_str("\nids_file: schema/new-identities/ids.json\n");
+    std::fs::write(&config, yaml).unwrap();
+    let fresh_dir = fresh.dir.join("schema");
+    std::fs::write(
+        fresh_dir.join("custom.yml"),
+        std::fs::read(&output).unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir(fresh_dir.join(format!("{}.country.yml", schema(pg)))).unwrap();
+    let before = project_bytes(&fresh.dir);
+    let refused = fresh.run(&["pull", "--force", "--db", own.connection()]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(stderr(&refused).contains("the project is unchanged"));
+    assert_eq!(
+        project_bytes(&fresh.dir),
+        before,
+        "IDs-parent preparation escaped restoration"
+    );
 }

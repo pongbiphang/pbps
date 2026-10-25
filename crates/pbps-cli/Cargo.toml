@@ -38,6 +38,9 @@ schemars.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 hyper.workspace = true
 hyper-util.workspace = true
@@ -68,3 +71,6 @@ pbps-db = { workspace = true, features = ["test-request-count"] }
 pbps-mssql.workspace = true
 tokio = { workspace = true, features = ["macros", "io-util"] }
 jsonschema.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }

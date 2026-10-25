@@ -29,6 +29,7 @@ mod partitions;
 mod paths;
 mod pins;
 mod prompt;
+mod publication;
 mod reason_input;
 mod report;
 mod resolution;
@@ -1885,61 +1886,14 @@ fn cmd_pull(
             pbps_model::Text::new(path.display().to_string()).shown()
         );
     }
-    // A directory at an output filename makes copying fail predictably. Refuse
-    // it before deleting any declarations, including through a directory link.
-    let mut output_permissions = std::collections::BTreeMap::new();
-    for path in &written {
-        match std::fs::metadata(path) {
-            Ok(metadata) => {
-                anyhow::ensure!(
-                    !metadata.is_dir(),
-                    "`{}` is a directory; move it before retrying pull",
-                    pbps_model::Text::new(path.display().to_string()).shown()
-                );
-                output_permissions.insert(path.clone(), metadata.permissions());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "cannot inspect `{}`",
-                        pbps_model::Text::new(path.display().to_string()).shown()
-                    )
-                });
-            }
-        }
-    }
-    // Check every destination, including entries the lowercase extension listing
-    // missed. Listed aliases are admitted by file identity, not by spelling.
-    for path in &written {
-        paths::require_removable_output(path, &present)?;
-    }
-    // Identity validation/serialization must not discover a refusal after
-    // declarations have already been removed. Keep unchanged JSON byte-exact.
+    // Identity validation/serialization remains a semantic prerequisite for
+    // declaration publication. Keep unchanged JSON byte-exact.
     let ids_json = match &resolution {
         Ok(res) if existing_ids.is_none() || res.ids != ids => {
             Some(serialize_ids(project, &res.ids)?)
         }
         _ => None,
     };
-    std::fs::create_dir_all(&dir).with_context(|| {
-        format!(
-            "cannot create `{}`",
-            pbps_model::Text::new(dir.display().to_string()).shown()
-        )
-    })?;
-    // Create every output parent before removing declarations: a dangling
-    // directory link must fail while the old files are still intact (#2311).
-    for path in &written {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    if ids_json.is_some()
-        && let Some(parent) = project.ids_file().parent()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
     // What a forced pull did not write, it removes. Leaving it would be worse
     // than deleting it: a declaration for an object that is gone plans its
     // recreation, and a view that became a procedure would leave
@@ -1948,37 +1902,10 @@ fn cmd_pull(
     // already means "replace my declarations with this database"; this is the
     // rest of that sentence.
     //
-    // Remove all old entries first: a stale spelling can alias an output on a
-    // case-insensitive filesystem. This also unlinks output symlinks instead
-    // of writing through them and then deleting their stale targets (#2311).
-    for path in &present {
-        std::fs::remove_file(path).with_context(|| {
-            format!(
-                "cannot remove old declaration `{}`",
-                pbps_model::Text::new(path.display().to_string()).shown()
-            )
-        })?;
-    }
-    // Publish the exact bytes that passed validation, without rendering again.
-    for (source, path) in &copies {
-        let publish = || -> std::io::Result<u64> {
-            let Some(permissions) = output_permissions.get(path) else {
-                return std::fs::copy(source, path);
-            };
-            // Replacing an entry must not broaden its access, especially with
-            // `--data`. Set the old permissions while the replacement is empty,
-            // before copying any validated bytes; chmod after copying is too late.
-            let mut input = std::fs::File::open(source)?;
-            let mut output = std::fs::File::create_new(path)?;
-            output.set_permissions(permissions.clone())?;
-            std::io::copy(&mut input, &mut output)
-        };
-        publish().with_context(|| {
-            format!(
-                "cannot publish `{}`",
-                pbps_model::Text::new(path.display().to_string()).shown()
-            )
-        })?;
+    // Rename old entries aside before copying: aliases must not survive cleanup,
+    // and a failed copy must leave the old declarations recoverable (DEC-2351.1).
+    if let Some(note) = publication::publish(&dir, &present, &copies)? {
+        eprintln!("warning: {note}");
     }
     if !removed.is_empty() {
         eprintln!(
@@ -2019,6 +1946,14 @@ fn cmd_pull(
     };
     // Leave even the original JSON formatting intact for an unchanged pull.
     if let Some(json) = ids_json {
+        if let Some(parent) = project.ids_file().parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "cannot create identity directory `{}`",
+                    pbps_model::Text::new(parent.display().to_string()).shown()
+                )
+            })?;
+        }
         std::fs::write(project.ids_file(), json).with_context(|| {
             format!(
                 "cannot write identity file `{}`",
