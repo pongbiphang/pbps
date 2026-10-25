@@ -420,6 +420,67 @@ async fn a_check_naming_a_column_by_a_letter_the_fold_leaves_alone_compiles() {
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn a_view_reading_a_column_by_a_mapped_letter_compiles_after_the_column() {
+    // `lodz` binds `[łódź]` on a CI_AI catalog, and a view binds its columns
+    // when it is created, so it must follow the column.
+    case_collated(
+        "mapped_read",
+        Some("Latin1_General_100_CI_AI"),
+        |mut conn| async move {
+            compile(
+                &mut conn,
+                vec![
+                    module(ModuleKind::View, "v", "SELECT lodz FROM app.t"),
+                    table("t", |t| {
+                        t.computed.insert("łódź".into(), computed("app.f(v)"));
+                    }),
+                    module(ModuleKind::Function, "f", FUNCTION),
+                ],
+            )
+            .await
+            .unwrap();
+            let sql = "SELECT COUNT(*) FROM sys.views WHERE object_id = OBJECT_ID(N'app.v')";
+            assert_eq!(count(&mut conn, sql).await, 1);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_call_by_a_mapped_letter_compiles_after_the_function() {
+    // `app.lodz` binds the function `app.[łódź]` on a CI_AI catalog, so the
+    // computed column calling it must follow the function.
+    case_collated(
+        "mapped_call",
+        Some("Latin1_General_100_CI_AI"),
+        |mut conn| async move {
+            compile(
+                &mut conn,
+                vec![
+                    table("t", |t| {
+                        t.computed.insert("c".into(), computed("app.lodz(v)"));
+                    }),
+                    module(ModuleKind::Function, "łódź", FUNCTION),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t')"
+            )
+            .await,
+            1
+        );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn a_scalar_function_with_an_exists_over_a_top_wildcard_compiles_before_the_column_it_serves()
 {
     case("exists_top", |mut conn| async move {

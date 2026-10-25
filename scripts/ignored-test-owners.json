@@ -1129,6 +1129,8 @@
         "reconstruct2374::a_mid_table_computed_column_keeps_the_target_s_column_positions",
         "reconstruct2374::a_check_naming_a_column_by_an_accent_insensitive_equal_compiles_and_keeps_positions",
         "reconstruct2374::a_check_naming_a_column_by_a_letter_the_fold_leaves_alone_compiles",
+        "reconstruct2374::a_view_reading_a_column_by_a_mapped_letter_compiles_after_the_column",
+        "reconstruct2374::a_call_by_a_mapped_letter_compiles_after_the_function",
         "reconstruct2374::a_scalar_function_with_an_exists_over_a_top_wildcard_compiles_before_the_column_it_serves",
         "reconstruct2374::a_check_over_a_hash_named_computed_column_compiles_after_the_column",
         "reconstruct2374::a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles",

@@ -1,5 +1,6 @@
 use super::*;
 use crate::generated::{column_names, selects_all, without_variables};
+use crate::validate::computed_note_fold;
 use indexmap::IndexMap;
 use pbps_model::{
     ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleDeps, ModuleId, Uid, UidKind,
@@ -1328,16 +1329,16 @@ fn a_module_reading_a_column_by_an_equal_name_waits_for_it() {
 
 #[test]
 fn a_letter_the_fold_leaves_alone_may_still_bind() {
-    // NFKD leaves ł, æ and ß as they are, yet an accent-insensitive catalog
-    // binds them to l, ae and ss (measured). A name holding such a letter, on
-    // either side, may be the column: the check follows it (#2408).
+    // A letter that is not in the fold's table of measured bindings may still
+    // bind under some catalog collation (ȼ binds c on one of two measured).
+    // A name holding one, on either side, may be the column: the check
+    // follows it (#2408).
     for (pending, read) in [
-        ("łódź", "lodz"),
-        ("lodz", "łódź"),
-        ("łódź", "LODZ"),
-        ("æther", "aether"),
-        ("straße", "strasse"),
-        ("cafe", "ł"),
+        ("ŋarn", "narn"),
+        ("narn", "ŋarn"),
+        ("ŧest", "TEST"),
+        ("ȼafe", "cafe"),
+        ("cafe", "ŋ"),
     ] {
         let statements = sql(&build(vec![
             table_with("t", |t| {
@@ -1423,6 +1424,106 @@ fn a_function_in_another_script_than_latin_makes_no_cycle_with_the_column_that_c
     .unwrap());
     assert!(
         at(&statements, "FUNCTION [app].[g]") < at(&statements, "ADD [c] AS"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_letter_the_catalog_binds_to_ascii_is_resolved_by_the_fold() {
+    // Measured on Latin1_General_100_CI_AI and SQL_Latin1_General_CP1_CI_AI:
+    // each of these binds to its mapping, upper case too.
+    for (letter, mapped) in [
+        ("ł", "l"),
+        ("Ł", "l"),
+        ("æ", "ae"),
+        ("Æ", "ae"),
+        ("ß", "ss"),
+        ("ø", "o"),
+        ("Ø", "o"),
+        ("đ", "d"),
+        ("Đ", "d"),
+        ("ð", "d"),
+        ("Ð", "d"),
+        ("þ", "th"),
+        ("Þ", "th"),
+        ("œ", "oe"),
+        ("Œ", "oe"),
+        ("ħ", "h"),
+        ("Ħ", "h"),
+        ("ŀ", "l"),
+        ("Ŀ", "l"),
+        ("ı", "i"),
+        ("ĸ", "k"),
+        ("ƒ", "f"),
+        ("Ƒ", "f"),
+        ("ǥ", "g"),
+        ("Ǥ", "g"),
+        ("ɨ", "i"),
+        ("Ɨ", "i"),
+    ] {
+        assert_eq!(computed_note_fold(letter), mapped, "{letter}");
+    }
+    // Negative: the engine binds none of these to ASCII (measured), so the
+    // fold leaves them, and they stay "unresolved" for the parts.
+    for letter in ["ŋ", "Ŋ", "ŧ", "Ŧ", "ꞁ", "ȼ", "Ƀ"] {
+        assert_eq!(
+            computed_note_fold(letter),
+            letter.to_lowercase(),
+            "{letter}"
+        );
+    }
+    assert_eq!(computed_note_fold("ŁÓDŹ"), "lodz");
+}
+
+#[test]
+fn a_module_reading_a_column_by_a_mapped_letter_waits_for_it() {
+    // `lodz` binds `[łódź]` on an accent-insensitive catalog, and a view binds
+    // its columns when it is created (207 otherwise, measured).
+    for (pending, read) in [("łódź", "lodz"), ("lodz", "łódź"), ("straße", "strasse")] {
+        let statements = sql(&build(vec![
+            view("v", &format!("SELECT [{read}] FROM app.t")),
+            table("t", &[(pending, "app.g(v)")]),
+            function("g", FUNCTION),
+        ])
+        .unwrap());
+        assert!(
+            at(&statements, &format!("ADD [{pending}] AS")) < at(&statements, "VIEW [app].[v]"),
+            "{pending}/{read}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_call_by_a_mapped_letter_finds_the_function() {
+    for (declared, called) in [("łódź", "lodz"), ("lodz", "łódź"), ("straße", "strasse")] {
+        let statements = sql(&build(vec![
+            table("t", &[("c", &format!("app.[{called}](id)"))]),
+            function(declared, FUNCTION),
+        ])
+        .unwrap());
+        assert!(
+            at(&statements, &format!("FUNCTION [app].[{declared}]"))
+                < at(&statements, "ADD [c] AS"),
+            "{declared}/{called}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_unrelated_name_is_no_read_by_a_module_beside_a_mapped_letter() {
+    // The view names `other`, not the pending `łódź`: no edge, so it is
+    // created with the bare table, before the column.
+    let statements = sql(&build(vec![
+        view("v", "SELECT other FROM app.t"),
+        table_with("t", |t| {
+            t.columns.insert("other".into(), int());
+            t.computed.insert("łódź".into(), persisted("app.g(v)"));
+        }),
+        function("g", FUNCTION),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "VIEW [app].[v]") < at(&statements, "ADD [łódź] AS"),
         "{statements:#?}"
     );
 }
