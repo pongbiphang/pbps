@@ -4600,10 +4600,12 @@ connection string can name the instance but never its endpoint.
   cases it listed), a timeout and a skip all fail it.
 - **TLS (measured, maintainer decision 2026-10-25).** LocalDB 17.0.4025.3
   offers no encryption on its pipe: a string that requires it fails with
-  "Server does not allow the requested encryption level". pbps keeps its rule
-  that an omitted `Encrypt` means required and that nothing is ever downgraded,
-  so a LocalDB selector names `Encrypt=false` explicitly. The traffic stays on
-  a local pipe and the login is SSPI, with no password on the wire. pbps never
+  "Server does not allow the requested encryption level", and `Encrypt=false`
+  still asks for an encrypted login, so the server drops the pipe (os error
+  233). pbps keeps its rule that an omitted `Encrypt` means required and that
+  nothing is ever downgraded, so a LocalDB selector names the driver's no-TLS
+  spelling, `Encrypt=DANGER_PLAINTEXT`, explicitly. The traffic stays on a
+  local pipe and the login is SSPI, with no password on the wire. pbps never
   writes that setting for the operator.
 - **Not widened.** The platform comparison is unchanged: a Linux target with a
   Windows LocalDB scratch stays a named platform mismatch, and major 16 is not

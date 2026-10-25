@@ -330,10 +330,11 @@ async fn localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifi
 async fn localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe() {
     let found = resolved(&server("PBPS_TEST_LOCALDB_SCRATCH")).await;
     let plain = found.connection().to_owned();
-    // LocalDB offers no encryption on its pipe, so the job's strings say
-    // `Encrypt=false` (DEC-2271.2). A string that asks for encryption, by
-    // saying so or by omitting `Encrypt` (which means required), must not
-    // connect: the pipe never downgrades what the string requested.
+    // LocalDB has no TLS on its pipe, so the job's strings say
+    // `Encrypt=DANGER_PLAINTEXT` (DEC-2271.2). A string that asks for
+    // encryption, by saying so, by omitting `Encrypt` (which means required)
+    // or with `Encrypt=false` (an encrypted login), must not connect: the pipe
+    // never downgrades what the string requested.
     let asking = |encrypt: &str| {
         let selector = LocalDbSelector::read(&format!(
             "Server=(localdb)\\{};Integrated Security=SSPI{encrypt}",
@@ -347,7 +348,11 @@ async fn localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe() {
         Conn::connect(Driver::Mssql, &plain).await.is_ok(),
         "the string that declines encryption connects"
     );
-    for encrypt in [";Encrypt=true;TrustServerCertificate=true", ""] {
+    for encrypt in [
+        ";Encrypt=true;TrustServerCertificate=true",
+        "",
+        ";Encrypt=false",
+    ] {
         let refused = Conn::connect(Driver::Mssql, &asking(encrypt)).await;
         assert!(
             refused.is_err(),

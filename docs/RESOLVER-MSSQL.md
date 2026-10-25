@@ -437,11 +437,11 @@ for a moment keeps that type.
       own `tempdb`. It is Express, so an edition difference is a recorded
       limitation (§9).
       - The operator provides and starts the instance and names it in the
-        scratch variable, `Server=(localdb)\<name>;Integrated Security=SSPI;Encrypt=false`.
+        scratch variable, `Server=(localdb)\<name>;Integrated Security=SSPI;Encrypt=DANGER_PLAINTEXT`.
         A named instance only: the default, shared and versioned forms are
-        refused. LocalDB offers no encryption on its pipe, and an omitted
-        `Encrypt` means required, so the operator declines it explicitly
-        (DEC-2271.2).
+        refused. LocalDB has no TLS on its pipe; an omitted `Encrypt` means
+        required and `Encrypt=false` still encrypts the login, so the operator
+        writes the driver's no-TLS spelling explicitly (DEC-2271.2).
       - The engine finds its pipe once per run by asking `SqlLocalDB.exe`
         (a fixed path, no shell, bounded output and time) and opens that
         endpoint for every connection of the run. No pipe, two pipes or a

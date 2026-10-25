@@ -50,11 +50,13 @@ HELPER = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft 
 USER = "pbpslocaldb"
 ROOT = Path(r"C:\pbps-localdb")
 TARGET, SCRATCH, DISPOSABLE = "pbps_target", "pbps_scratch", "pbps_disposable"
-# LocalDB refuses encryption on its pipe (measured on 17.0.4025.3: "Server
-# does not allow the requested encryption level"), and pbps never downgrades a
-# string that asks for it, so the operator writes `Encrypt=false` (DEC-2271.2).
-# The case that checks the policy asks for encryption itself.
-TRUST = "Encrypt=false"
+# LocalDB has no TLS on its pipe (measured on 17.0.4025.3): a string requiring
+# encryption fails with "Server does not allow the requested encryption
+# level", and `Encrypt=false` still asks for an encrypted login, so the server
+# drops the pipe (os error 233). pbps never downgrades a string, so the
+# operator writes the driver's no-TLS spelling, `Encrypt=DANGER_PLAINTEXT`
+# (DEC-2271.2). The case that checks the policy asks for encryption itself.
+TRUST = "Encrypt=DANGER_PLAINTEXT"
 
 # A plain pattern: the inventory's fixture grammar refuses `re.compile`.
 SUMMARY = (r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "

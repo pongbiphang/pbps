@@ -76,7 +76,7 @@ class Handoff(unittest.TestCase):
 
     def test_the_selector_is_the_integrated_pipe_form_the_driver_admits(self):
         text = lq.selector("pbps_scratch")
-        self.assertEqual(text, r"Server=(localdb)\pbps_scratch;Integrated Security=SSPI;Encrypt=false")
+        self.assertEqual(text, r"Server=(localdb)\pbps_scratch;Integrated Security=SSPI;Encrypt=DANGER_PLAINTEXT")
         lq.wrapper({"S": text}, ["x"], "o")  # survives the wrapper unchanged
         for name in (lq.TARGET, lq.SCRATCH, lq.DISPOSABLE):
             self.assertRegex(name, r"[A-Za-z0-9_]{1,128}")
