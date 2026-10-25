@@ -12,7 +12,7 @@ pub(super) mod fixture;
 fn rebuild_copy_precedes_analyze_by_effects_in_adversarial_input_order() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let schema = Schema::default();
     let before = Snapshot {
@@ -121,7 +121,7 @@ fn rebuild_roots_and_partial_parts_cannot_gain_canonical_authority() {
 fn rebuild_swap_uses_shared_slots_with_distinct_reserved_holders() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let old = base.index().table_uid(&root.table).unwrap().clone();
     let new = desired.index().table_uid(&root.table).unwrap().clone();

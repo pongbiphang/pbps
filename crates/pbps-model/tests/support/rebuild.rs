@@ -14,11 +14,37 @@ pub fn approval() -> (
     let Change::RebuildPartitionedTable(root) = changes().remove(0) else {
         panic!("root fixture")
     };
-    let mut base = root.intent.source.as_ids();
+    // The environment holds the sources; the files, as approval left them,
+    // hold the replacements, the retired sources and the lineage record.
+    let base = root.intent.source.as_ids();
     let parent = base.index().table_uid(&root.table).unwrap().clone();
-    base.rebuilds.insert(parent, root.intent.clone());
-    base.validate().unwrap();
-    let desired = root.intent.replacement.as_ids();
+    let mut desired = root.intent.replacement.as_ids();
+    for (uid, was) in root
+        .intent
+        .source
+        .tables
+        .iter()
+        .map(|(u, n)| (u, n.raw().to_string()))
+        .chain(
+            root.intent
+                .source
+                .columns
+                .iter()
+                .map(|(u, c)| (u, c.raw().to_string())),
+        )
+    {
+        desired.tombstones.insert(
+            uid.clone(),
+            Tombstone {
+                was,
+                dropped_at: root.intent.allowed_at.clone(),
+                reason: root.intent.reason.as_ref().into(),
+                operator: root.intent.operator.clone(),
+            },
+        );
+    }
+    desired.rebuilds.insert(parent, root.intent.clone());
+    desired.validate().unwrap();
     let addresses = root
         .intent
         .replacement

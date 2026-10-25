@@ -41,7 +41,7 @@ fn prepared_inventory_executes_through_the_existing_driver_with_stable_ids() {
         }
     ));
     assert_eq!(result.rewrites, 1);
-    assert!(result.target.rebuilds.is_empty());
+    assert_eq!(result.target.rebuilds, f.recorded.rebuilds);
     assert_eq!(f.recorded.rebuilds.len(), 1);
 }
 
@@ -149,7 +149,7 @@ fn a_prepared_rebuild_refuses_changed_mode_or_stale_approval() {
     assert!(
         expand(&f.input(), prepared, &pbps_pg::Postgres::new())
             .unwrap_err()
-            .contains("fingerprint")
+            .contains("re-approve it with")
     );
 }
 

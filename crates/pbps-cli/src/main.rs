@@ -375,13 +375,27 @@ enum Command {
         from: Option<String>,
     },
 
-    /// Record intent for a blocking partitioned-table rewrite (execution is not available yet)
+    /// Approve a blocking partitioned-table rewrite, or withdraw an approval
+    /// (execution is not available yet)
+    ///
+    /// Approving switches the table's identities in the identity file at once;
+    /// commit it with the declarations. `--withdraw` is the offline inverse.
     RebuildTable {
         table: String,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        max_rows: u64,
+        /// The most rows the rewrite may copy
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..),
+              required_unless_present = "withdraw", conflicts_with = "withdraw")]
+        max_rows: Option<u64>,
+        /// Why a blocking rewrite is acceptable here; required for audit
+        #[arg(
+            long,
+            required_unless_present = "withdraw",
+            conflicts_with = "withdraw"
+        )]
+        reason: Option<pbps_model::Reason>,
+        /// Restore the source identities and drop the approval, in the file only
         #[arg(long)]
-        reason: pbps_model::Reason,
+        withdraw: bool,
     },
 
     /// Generate the declarations of a partitioned table's next partitions
@@ -839,7 +853,10 @@ fn run() -> anyhow::Result<()> {
     | Command::DropTable { reason, .. }
     | Command::DropRole { reason, .. }
     | Command::MoveRows { reason, .. }
-    | Command::RebuildTable { reason, .. } = &mut cli.command
+    | Command::RebuildTable {
+        reason: Some(reason),
+        ..
+    } = &mut cli.command
     {
         reason_input::resolve(reason).unwrap_or_else(|error| {
             Cli::command()
@@ -1388,7 +1405,14 @@ fn run() -> anyhow::Result<()> {
             table,
             max_rows,
             reason,
-        } => cmd_rebuild_table(&project, &table.parse()?, max_rows, &reason),
+            withdraw,
+        } => match (max_rows, reason) {
+            (Some(max_rows), Some(reason)) => {
+                cmd_rebuild_table(&project, &table.parse()?, max_rows, &reason)
+            }
+            _ if withdraw => cmd_withdraw_rebuild(&project, &table.parse()?),
+            _ => unreachable!("clap requires the cap and the reason unless withdrawing"),
+        },
         Command::Partitions {
             command:
                 PartitionsCommand::Extend {
@@ -3332,7 +3356,25 @@ fn cmd_rebuild_table(
         write_ids(project, &updated)?;
         println!("updated {}", project.ids_file().display());
     }
-    println!("Recorded a blocking rewrite; table rebuild execution is not available yet.");
+    println!(
+        "Approved a blocking rewrite and switched its identities; table rebuild execution is not available yet."
+    );
+    Ok(())
+}
+
+/// The offline inverse of [`cmd_rebuild_table`]: nothing is read from a
+/// database, and an environment that already applied the rewrite refuses by
+/// name at its next plan (DEC-2298.12).
+fn cmd_withdraw_rebuild(project: &Project, table: &TableName) -> anyhow::Result<()> {
+    let ids = read_ids(project)?;
+    let updated = pbps_diff::rebuild::withdraw(&ids, table)?;
+    write_ids(project, &updated)?;
+    println!("updated {}", project.ids_file().display());
+    println!(
+        "Restored the source identities of {}. Revert its declarations to the source shape as well; \
+         `git revert` of the approval commit does both.",
+        table.shown()
+    );
     Ok(())
 }
 

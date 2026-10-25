@@ -387,9 +387,9 @@ pub fn validate_saved_plan(
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         refuse!("unsupported saved-plan version {}", plan.version);
     }
-    if !plan.ids.rebuilds.is_empty() {
-        refuse!("recorded blocking rewrite intent cannot be executed yet");
-    }
+    // A lineage record stays in the identity file after its rewrite, so one is
+    // not a reason to refuse. A broken one fails the identity validation below
+    // (DEC-2298.12); a rewrite still to run is refused change by change.
     for planned in &plan.changes.changes {
         if let Some((operation, table)) = planned.change.pending_rebuild() {
             refuse!(

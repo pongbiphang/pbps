@@ -625,7 +625,7 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         Box::new(root.clone()),
     ))];
     let owners = PlanOwners::new(PlanNames::of(&logical, &desired).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let before = Snapshot {
         schema: &schema,

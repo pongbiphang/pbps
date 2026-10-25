@@ -409,9 +409,10 @@ pub fn prepare(
             );
         }
     }
+    let view_ids = crate::rebuild::logical_view(input.desired.ids, r);
     let sources = super::deployment::Sources {
         before: input.before,
-        after: input.desired.ids,
+        after: &view_ids,
     };
     let logical = rule.out.logical.clone();
     let view = sources.project(&logical)?;

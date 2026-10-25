@@ -210,7 +210,8 @@ fn part(p: &Prepared, purpose: Purpose) -> &Change {
 fn preparation_keeps_typed_parts_reserved_uids_and_readonly_target_state() {
     let f = Fixture::new();
     let p = f.prepare().unwrap();
-    assert!(p.target().rebuilds.is_empty());
+    // Approval already installed the replacements, so the target is the files.
+    assert_eq!(p.target().rebuilds, f.recorded.rebuilds);
     assert_eq!(f.recorded.rebuilds.len(), 1);
     assert_eq!(p.target().tables, f.root.intent.replacement.tables);
     assert!(

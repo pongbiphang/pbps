@@ -8,7 +8,7 @@ mod fixture;
 fn rebuild_addresses_keep_source_and_reserved_owners_distinct() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     for (identities, spelling, prefix) in [
         (&root.intent.source, Spelling::Base, "old_"),
@@ -66,7 +66,7 @@ fn rebuild_addresses_refuse_stale_foreign_duplicate_and_occupied_bindings() {
     let (root, base, desired, addresses) = fixture::approval();
     let attempt = |root: &RebuildPartitionedTable, a: &[IntermediateAddress]| {
         PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-            .with_rebuild_addresses(root, &base, a)
+            .with_rebuild_addresses(root, &desired, a)
             .err()
             .unwrap()
             .to_string()
@@ -89,7 +89,7 @@ fn rebuild_addresses_refuse_stale_foreign_duplicate_and_occupied_bindings() {
 fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let schema = Schema::default();
     let before = Snapshot {
@@ -168,7 +168,7 @@ fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
 fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let before_schema = Schema {
         tables: root.before,

@@ -212,8 +212,97 @@ fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), Rebui
     Ok(())
 }
 
-/// Records intent like move-rows: convergent for the same fingerprint, reason
-/// and cap; another approval updates audit fields but preserves reserved uids.
+/// What `ids` holds beyond one side of a record: the rest of the environment,
+/// which a rewrite of this tree must leave exactly as the files have it.
+fn outside(
+    ids: &IdsFile,
+    mine: &RebuildIdentities,
+) -> (
+    BTreeMap<Uid, TableName>,
+    BTreeMap<Uid, pbps_model::ColumnRef>,
+) {
+    (
+        ids.tables
+            .iter()
+            .filter(|(u, _)| !mine.tables.contains_key(*u))
+            .map(|(u, n)| (u.clone(), n.clone()))
+            .collect(),
+        ids.columns
+            .iter()
+            .filter(|(u, _)| !mine.columns.contains_key(*u))
+            .map(|(u, c)| (u.clone(), c.clone()))
+            .collect(),
+    )
+}
+
+fn reapprove(
+    ids: &IdsFile,
+    schema: &Schema,
+    key: &Uid,
+    table: &TableName,
+    approval: (u64, &Reason, &str, &Context),
+) -> Result<IdsFile, RebuildError> {
+    let (max_rows, reason, checksum, ctx) = approval;
+    let old = &ids.rebuilds[key];
+    // The tree must already be resolved: this rewrites the record against the
+    // declarations, it does not decide identity for what changed since.
+    let replacement = source_identities(
+        Side {
+            schema,
+            ids,
+        },
+        table,
+    )
+    .map_err(|_| refused(table, "resolve identity for the changed members first: every member and column must have an identity"))?;
+    if let Some(stale) = old
+        .replacement
+        .tables
+        .keys()
+        .find(|u| ids.tables.contains_key(*u) && !replacement.tables.contains_key(*u))
+        .and_then(|u| ids.tables.get(u))
+        .or_else(|| {
+            old.replacement
+                .columns
+                .keys()
+                .find(|u| ids.columns.contains_key(*u) && !replacement.columns.contains_key(*u))
+                .and_then(|u| ids.columns.get(u).map(|c| &c.table))
+        })
+    {
+        return Err(refused(
+            table,
+            format!(
+                "{} is still recorded but no longer declared; record its drop or rename first",
+                stale.shown()
+            ),
+        ));
+    }
+    let mut out = ids.clone();
+    let approval = out.rebuilds.get_mut(key).unwrap();
+    if approval.target_checksum == checksum
+        && approval.replacement == replacement
+        && approval.max_rows == max_rows
+        && &approval.reason == reason
+    {
+        return Ok(out);
+    }
+    approval.target_checksum = checksum.to_owned();
+    approval.replacement = replacement;
+    approval.max_rows = max_rows;
+    approval.reason = reason.clone();
+    approval.allowed_at = ctx.today.clone();
+    approval.operator = ctx.operator.clone();
+    out.validate()
+        .map_err(|_| refused(table, "the refreshed approval is inconsistent"))?;
+    Ok(out)
+}
+
+/// Approves a rewrite the way `move-rows` records a move, and switches the
+/// identities in the same write (DEC-2298.12): the tree's replacement
+/// identities become live, the source ones tombstones, and a lineage record
+/// keeps `source -> replacement` for the environments that still hold the
+/// source. Repeating an approval keeps the record's source and only refreshes
+/// it against the current declarations; a table that was rebuilt and whose key
+/// then changes against the committed baseline starts the next link instead.
 #[allow(clippy::too_many_arguments)]
 pub fn record(
     base: Side<'_>,
@@ -240,28 +329,22 @@ pub fn record(
         ids: base.ids,
     };
     let desired = &after.0;
-    // Re-recording after committing the desired key is convergent, but an
-    // old approval must still pass the column-override guard on both ends.
+    // An old approval must still pass the column-override guard on both ends.
     refuse_partition_column_overrides(&tree(base.schema, table), table)?;
     refuse_partition_column_overrides(&tree(desired, table), table)?;
     let checksum = after.fingerprint();
-    let mut out = ids.clone();
-    if let Some(old) = ids.rebuilds.get(uid) {
-        if old.target_checksum != checksum {
-            return Err(refused(
+    if let Some((key, old)) = ids.rebuild_into(uid) {
+        let next_link =
+            base.ids.rebuilds.get(key) == Some(old) && shape(base.schema, desired, table).is_ok();
+        if !next_link {
+            return reapprove(
+                ids,
+                desired,
+                &key.clone(),
                 table,
-                "the desired schema changed after approval; the recorded rebuild is stale",
-            ));
+                (max_rows, reason, &checksum, ctx),
+            );
         }
-        if old.max_rows == max_rows && &old.reason == reason {
-            return Ok(out);
-        }
-        let approval = out.rebuilds.get_mut(uid).unwrap();
-        approval.max_rows = max_rows;
-        approval.reason = reason.clone();
-        approval.allowed_at = ctx.today.clone();
-        approval.operator = ctx.operator.clone();
-        return Ok(out);
     }
     shape(base.schema, desired, table)?;
     if base.ids.tables != ids.tables
@@ -274,13 +357,16 @@ pub fn record(
             "commit the source identities before recording a rebuild",
         ));
     }
-    if !ids.rebuilds.is_empty() {
+    let source = source_identities(base, table)?;
+    if let Some(moved) = source.tables.keys().find(|u| ids.moves.contains_key(*u)) {
         return Err(refused(
             table,
-            "only one blocking rewrite may be recorded at a time",
+            format!(
+                "a recorded move into {} would be lost; apply or remove it first",
+                ids.tables[moved].shown()
+            ),
         ));
     }
-    let source = source_identities(base, table)?;
     let mut reserved = BTreeSet::new();
     let mut fresh = |kind| loop {
         let uid = Uid::generate(kind);
@@ -306,6 +392,27 @@ pub fn record(
                 .insert(fresh(UidKind::Column), name.column(column));
         }
     }
+    let mut out = ids.clone();
+    for (uid, was) in source
+        .tables
+        .iter()
+        .map(|(u, n)| (u, n.raw().to_string()))
+        .chain(source.columns.iter().map(|(u, c)| (u, c.raw().to_string())))
+    {
+        out.tables.remove(uid);
+        out.columns.remove(uid);
+        out.tombstones.insert(
+            uid.clone(),
+            pbps_model::Tombstone {
+                was,
+                dropped_at: ctx.today.clone(),
+                reason: reason.as_ref().into(),
+                operator: ctx.operator.clone(),
+            },
+        );
+    }
+    out.tables.extend(replacement.tables.clone());
+    out.columns.extend(replacement.columns.clone());
     out.rebuilds.insert(
         uid.clone(),
         Rebuild {
@@ -321,15 +428,90 @@ pub fn record(
     out.validate().map_err(|_| {
         refused(
             table,
-            "the reserved replacement identities are inconsistent",
+            "the replacement identities are inconsistent with the file",
         )
     })?;
     Ok(out)
 }
 
-/// Match the approved lineage and target shape against the actual baseline.
-/// Catalog publication/dependent readability and row/size observations belong
-/// to connected qualification, never an empty default supplied here.
+/// `ids` with one record undone: the sources live again, the replacements and
+/// the record gone. Only the caller knows whether that is a withdrawal or a view.
+fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
+    let mut out = ids.clone();
+    out.rebuilds.remove(key);
+    for uid in record.replacement.tables.keys() {
+        out.tables.remove(uid);
+        out.moves.remove(uid);
+    }
+    for uid in record.replacement.columns.keys() {
+        out.columns.remove(uid);
+    }
+    for (uid, name) in &record.source.tables {
+        out.tombstones.remove(uid);
+        out.tables.insert(uid.clone(), name.clone());
+    }
+    for (uid, column) in &record.source.columns {
+        out.tombstones.remove(uid);
+        out.columns.insert(uid.clone(), column.clone());
+    }
+    out
+}
+
+/// The identities the unexpanded rewrite is projected over: the tree still
+/// under its source UIDs. The logical root carries no identity event of its
+/// own, so naming its plan over the switched file would start the tree under
+/// UIDs the environment does not hold (DEC-2298.12).
+pub fn logical_view(desired: &IdsFile, root: &RebuildPartitionedTable) -> IdsFile {
+    let key = root
+        .intent
+        .source
+        .tables
+        .iter()
+        .find_map(|(uid, name)| (name == &root.table).then_some(uid))
+        .expect("a qualified root names its source parent");
+    restored(desired, key, &root.intent)
+}
+
+/// The inverse of an approval, as an offline edit of the identity file
+/// (DEC-2298.12): the source identities come back, the replacement ones and
+/// the record go. An environment that already applied the rewrite holds the
+/// replacement; its plan refuses by name rather than dropping and creating.
+pub fn withdraw(ids: &IdsFile, table: &TableName) -> Result<IdsFile, RebuildError> {
+    ids.validate()
+        .map_err(|_| refused(table, "the identity file is inconsistent"))?;
+    let uid = ids
+        .table_uid(table)
+        .ok_or_else(|| refused(table, "the table has no identity"))?;
+    let (key, record) = ids
+        .rebuild_into(uid)
+        .ok_or_else(|| refused(table, "no rebuild is recorded for it"))?;
+    let retired = record
+        .replacement
+        .tables
+        .keys()
+        .chain(record.replacement.columns.keys())
+        .any(|u| ids.tombstones.contains_key(u));
+    if retired {
+        return Err(refused(
+            table,
+            "a replacement member was dropped after the approval; restoring the sources would bring it back. \
+             Use `git revert` on the approval commit instead",
+        ));
+    }
+    let out = restored(ids, key, record);
+    out.validate().map_err(|error| {
+        refused(
+            table,
+            format!("the sources cannot be restored beside the current identities: {error}"),
+        )
+    })?;
+    Ok(out)
+}
+
+/// Match the approved lineage and target shape against the environment's
+/// baseline, which holds the source identities. Catalog publication/dependent
+/// readability and row/size observations belong to connected qualification,
+/// never an empty default supplied here.
 pub fn qualify(
     base: Side<'_>,
     desired: Side<'_>,
@@ -343,7 +525,8 @@ pub fn qualify(
     let intent = desired
         .ids
         .table_uid(table)
-        .and_then(|uid| desired.ids.rebuilds.get(uid))
+        .and_then(|uid| desired.ids.rebuild_into(uid))
+        .map(|(_, intent)| intent)
         .ok_or_else(|| refused(table, "no explicit rebuild intent is recorded"))?;
     let before = canonical_schema(base.schema, dialect);
     let after = canonical_schema(desired.schema, dialect);
@@ -356,25 +539,22 @@ pub fn qualify(
         ids: desired.ids,
     };
     shape(base.schema, desired.schema, table)?;
-    if intent.target_checksum != after.fingerprint()
-        || base.ids.tables != desired.ids.tables
-        || base.ids.columns != desired.ids.columns
-        || base.ids.roles != desired.ids.roles
+    if intent.target_checksum != after.fingerprint() {
+        return Err(refused(
+            table,
+            format!(
+                "the declarations changed after the approval; re-approve it with \
+                 `pbps rebuild-table {} --max-rows {} --reason <why>`",
+                table.shown(),
+                intent.max_rows
+            ),
+        ));
+    }
+    if base.ids.roles != desired.ids.roles
         || base.ids.types != desired.ids.types
         || intent.source != source_identities(base, table)?
-        || intent.replacement.tables.values().collect::<BTreeSet<_>>()
-            != tree(desired.schema, table).keys().collect::<BTreeSet<_>>()
-        || intent
-            .replacement
-            .columns
-            .values()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            != tree(desired.schema, table)
-                .iter()
-                .filter(|(_, t)| t.partition_of.is_none())
-                .flat_map(|(n, t)| t.columns.keys().map(|c| n.column(c)))
-                .collect::<BTreeSet<_>>()
+        || intent.replacement != identities(desired.ids, &tree(desired.schema, table))
+        || outside(base.ids, &intent.source) != outside(desired.ids, &intent.replacement)
     {
         return Err(refused(
             table,
@@ -389,8 +569,8 @@ pub fn qualify(
     })
 }
 
-/// Proposed ledger state only: the recorded file is consumed by PR4 after
-/// successful execution, never by planning this transition (DEC-2298.2).
+/// The ledger state a rebuild leaves: the files' identities, which approval
+/// already switched. Proposed only; planning never consumes anything.
 pub fn target_identities(
     base: Side<'_>,
     desired: Side<'_>,
@@ -403,42 +583,137 @@ pub fn target_identities(
             "rebuild payload differs from the approved tree",
         ));
     }
-    let mut ids = desired.ids.clone();
-    ids.rebuilds
-        .remove(desired.ids.table_uid(&root.table).unwrap());
-    for (uid, was) in root
-        .intent
-        .source
-        .tables
-        .iter()
-        .map(|(u, n)| (u, n.raw().to_string()))
-        .chain(
-            root.intent
-                .source
-                .columns
-                .iter()
-                .map(|(u, n)| (u, n.raw().to_string())),
-        )
-    {
-        ids.tables.remove(uid);
-        ids.columns.remove(uid);
-        ids.moves.remove(uid);
-        ids.tombstones.insert(
-            uid.clone(),
-            pbps_model::Tombstone {
-                was,
-                dropped_at: root.intent.allowed_at.clone(),
-                reason: root.intent.reason.as_ref().into(),
-                operator: root.intent.operator.clone(),
-            },
-        );
-    }
-    ids.tables.extend(root.intent.replacement.tables.clone());
-    ids.columns.extend(root.intent.replacement.columns.clone());
-    ids.check_held_by(desired.schema)
+    desired
+        .ids
+        .check_held_by(desired.schema)
         .map_err(|e| refused(&root.table, e.to_string()))?;
-    ids.validated()
+    desired
+        .ids
+        .clone()
+        .validated()
         .map_err(|e| refused(&root.table, e.to_string()))
+}
+
+/// The tables a historical identity mapping holds in the form they had before
+/// a rewrite the `current` files approved since (DEC-2298.12). Restoring such a
+/// state is a reverse rebuild, which does not exist; a declaration export of it
+/// would only be refused later, at the first plan, with less to go on.
+pub fn rebuilt_since(historical: &IdsFile, current: &IdsFile) -> Vec<TableName> {
+    current
+        .rebuilds
+        .iter()
+        .filter(|(key, _)| historical.tables.contains_key(*key))
+        .filter_map(|(key, record)| record.source.tables.get(key).cloned())
+        .collect()
+}
+
+/// What an environment's baseline holds of one lineage record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holding {
+    /// The source parent: the record supplies the rebuild.
+    Source,
+    /// The replacement parent: nothing to rebuild.
+    Replacement,
+    /// Neither: the replacement is created directly.
+    Neither,
+    /// Parts of both, or of one without its parent. Never "nothing to rebuild".
+    Partial,
+}
+
+pub fn holding(base: &IdsFile, key: &Uid, record: &Rebuild) -> Holding {
+    let has = |ids: &RebuildIdentities| {
+        ids.tables
+            .keys()
+            .filter(|u| base.tables.contains_key(*u))
+            .count()
+            + ids
+                .columns
+                .keys()
+                .filter(|u| base.columns.contains_key(*u))
+                .count()
+    };
+    let size = |ids: &RebuildIdentities| ids.tables.len() + ids.columns.len();
+    let Some(root) = record.replacement_root(key) else {
+        return Holding::Partial;
+    };
+    match (
+        base.tables.contains_key(key),
+        base.tables.contains_key(root),
+    ) {
+        (true, false)
+            if has(&record.source) == size(&record.source) && has(&record.replacement) == 0 =>
+        {
+            Holding::Source
+        }
+        (false, true) if has(&record.source) == 0 => Holding::Replacement,
+        (false, false) if has(&record.source) + has(&record.replacement) == 0 => Holding::Neither,
+        _ => Holding::Partial,
+    }
+}
+
+/// The refusals the lineage records impose on a plan from `base` to `declared`.
+/// A record is read against what the environment's baseline holds of it.
+pub(crate) fn lineage_errors(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> Vec<crate::DiffError> {
+    let error = |table: TableName, why: String| crate::DiffError::RebuildTable { table, why };
+    let mut errors = Vec::new();
+    for (key, record) in &declared.ids.rebuilds {
+        let name = |ids: &IdsFile, uid: &Uid| ids.tables.get(uid).cloned();
+        let named = record.source.tables.get(key).cloned();
+        let table = name(declared.ids, record.replacement_root(key).unwrap_or(key))
+            .or(named)
+            .unwrap_or_else(|| TableName::new("?", "?"));
+        match holding(base.ids, key, record) {
+            Holding::Replacement | Holding::Neither => {}
+            Holding::Partial => errors.push(error(
+                table,
+                "the environment holds only part of the approved rewrite's source or replacement identities; \
+                 it cannot be read as rebuilt or as not yet rebuilt"
+                    .to_owned(),
+            )),
+            Holding::Source => {
+                let current = record
+                    .replacement_root(key)
+                    .is_some_and(|root| declared.ids.tables.contains_key(root));
+                let why = if !current {
+                    "this environment holds a source that was rebuilt again; deploy the revision that approved \
+                     each link in turn, as links are never merged"
+                        .to_owned()
+                } else {
+                    match qualify(base, declared, &table, dialect) {
+                        Ok(_) => "recorded intent is valid; table rebuild execution is not available yet"
+                            .to_owned(),
+                        Err(error) => error.why,
+                    }
+                };
+                errors.push(error(table, why));
+            }
+        }
+    }
+    // The files no longer record a rewrite this environment already applied
+    // (withdrawn after the fact, or an older revision): the replacement it
+    // holds would read as a table to drop and a source to create.
+    for (key, record) in &base.ids.rebuilds {
+        let Some(root) = record.replacement_root(key) else {
+            continue;
+        };
+        if base.ids.tables.contains_key(root)
+            && !declared.ids.tables.contains_key(root)
+            && !declared.ids.tombstones.contains_key(root)
+        {
+            errors.push(error(
+                base.ids.tables[root].clone(),
+                "this environment already applied an approved rewrite that the identity files no longer record \
+                 (withdrawn afterwards, or an older revision or state); neither a drop and create nor a \
+                 reverse rebuild is planned, so restore the approval to plan from here"
+                    .to_owned(),
+            ));
+        }
+    }
+    errors
 }
 
 #[cfg(test)]

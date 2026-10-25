@@ -226,7 +226,7 @@ async fn expansion_replays_own_parts_external_bindings_and_member_lifetimes() {
             assert!(position(name, true) < position("app.diamond", true));
         }
         done.target.validate().unwrap();
-        assert!(done.target.rebuilds.is_empty());
+        assert_eq!(done.target.rebuilds, recorded.rebuilds);
         assert_eq!(recorded.rebuilds.len(), 1);
         assert_eq!(
             done.target.tables.len() + root.intent.source.tables.len(),

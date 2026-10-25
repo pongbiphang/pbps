@@ -55,7 +55,9 @@ impl PlanOwners<'_> {
             .table_uid(&root.table)
             .cloned()
             .ok_or_else(|| bad("source parent is not recorded"))?;
-        if recorded.rebuilds.get(&uid) != Some(&root.intent) || self.rebuild.is_some() {
+        if recorded.rebuild_into(&uid).map(|(_, r)| r) != Some(&root.intent)
+            || self.rebuild.is_some()
+        {
             return Err(bad("missing, stale or duplicate approval"));
         }
         for (uid, name) in &root.intent.source.tables {

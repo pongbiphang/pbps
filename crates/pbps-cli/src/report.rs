@@ -118,7 +118,6 @@ fn decision_count(blocker: &Blocker) -> Option<usize> {
         | Blocker::RenameTargetExists { .. }
         | Blocker::UnrepresentableName { .. }
         | Blocker::MissingType { .. }
-        | Blocker::PendingRebuild { .. }
         | Blocker::MoveNotBesideDefault { .. } => None,
     }
 }
@@ -330,7 +329,6 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         | Blocker::RenameTargetExists { .. }
         | Blocker::UnrepresentableName { .. }
         | Blocker::MissingType { .. }
-        | Blocker::PendingRebuild { .. }
         | Blocker::MoveNotBesideDefault { .. } => {}
     }
 }
@@ -663,7 +661,6 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
             Blocker::UnrepresentableName { .. } => "identity.unrepresentable-name",
             Blocker::MoveNotBesideDefault { .. } => "identity.move-not-beside-default",
             Blocker::MissingType { .. } => "identity.missing-type",
-            Blocker::PendingRebuild { .. } => "identity.pending-rebuild",
         }
     }
     let text = one_blocker(b);
@@ -920,11 +917,6 @@ fn one_blocker(b: &Blocker) -> String {
                  the {what} so it no longer contains a `.`, then declare it (or pull) again\n"
             )
         }
-        Blocker::PendingRebuild { uid, table, object } => format!(
-            "  {object} is covered by the pending rebuild of {table}; its source identities cannot change\n\n    withdraw the rebuild by removing entry `{uid}` from `rebuilds` in the identity file, commit that withdrawal, then retry\n",
-            object = pbps_model::escape::Escaped(object),
-            table = table.shown(),
-        ),
         Blocker::MoveNotBesideDefault { table } => format!(
             "  {table} is not a range or list partition whose parent declares a DEFAULT \
              partition, so no rows can move into it\n\n    declare {table} as a range or list \

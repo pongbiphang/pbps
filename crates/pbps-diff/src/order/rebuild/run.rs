@@ -105,9 +105,10 @@ impl Rule<'_> {
         {
             return Ok(None);
         }
+        let view_ids = crate::rebuild::logical_view(self.input.desired.ids, self.input.root);
         let sources = order::deployment::Sources {
             before: self.input.before,
-            after: self.input.desired.ids,
+            after: &view_ids,
         };
         let view = sources.project(&self.prepared.logical)?;
         let change = order::deployment::removal_of(
