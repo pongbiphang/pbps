@@ -385,6 +385,41 @@ async fn a_check_naming_a_column_by_an_accent_insensitive_equal_compiles_and_kee
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn a_check_naming_a_column_by_a_letter_the_fold_leaves_alone_compiles() {
+    // On a CI_AI catalog `lodz` binds `[łódź]` though NFKD leaves ł alone
+    // (measured), so the check must follow the column.
+    case_collated("unresolved", Some("Latin1_General_100_CI_AI"), |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert(
+                        "łódź".into(),
+                        ComputedColumn {
+                            persisted: true,
+                            ..computed("app.f(v)")
+                        },
+                    );
+                    t.checks.insert(
+                        "ck".into(),
+                        pbps_model::CheckConstraint {
+                            expression: "lodz > 0".into(),
+                        },
+                    );
+                }),
+                module(ModuleKind::Function, "f", FUNCTION),
+            ],
+        )
+        .await
+        .unwrap();
+        let sql = "SELECT COUNT(*) FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID(N'app.t')";
+        assert_eq!(count(&mut conn, sql).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn a_scalar_function_with_an_exists_over_a_top_wildcard_compiles_before_the_column_it_serves()
 {
     case("exists_top", |mut conn| async move {

@@ -1325,3 +1325,104 @@ fn a_module_reading_a_column_by_an_equal_name_waits_for_it() {
         "{statements:#?}"
     );
 }
+
+#[test]
+fn a_letter_the_fold_leaves_alone_may_still_bind() {
+    // NFKD leaves ł, æ and ß as they are, yet an accent-insensitive catalog
+    // binds them to l, ae and ss (measured). A name holding such a letter, on
+    // either side, may be the column: the check follows it (#2408).
+    for (pending, read) in [
+        ("łódź", "lodz"),
+        ("lodz", "łódź"),
+        ("łódź", "LODZ"),
+        ("æther", "aether"),
+        ("straße", "strasse"),
+        ("cafe", "ł"),
+    ] {
+        let statements = sql(&build(vec![
+            table_with("t", |t| {
+                t.computed.insert(pending.into(), persisted("app.f(v)"));
+                t.checks.insert(
+                    "ck".into(),
+                    pbps_model::CheckConstraint {
+                        expression: format!("[{read}] > 0"),
+                    },
+                );
+            }),
+            function("f", FUNCTION),
+        ])
+        .unwrap());
+        assert!(
+            at(&statements, &format!("ADD [{pending}] AS")) < at(&statements, "[ck]"),
+            "{pending}/{read}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_unrelated_ascii_name_is_no_read_of_an_ascii_column() {
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.columns.insert("other".into(), int());
+            t.computed.insert("cafe".into(), persisted("app.f(v)"));
+            t.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "[other] > 0 AND N'ł' <> N'x'".into(),
+                },
+            );
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "[ck]") < at(&statements, "ADD [cafe] AS"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_callee_in_another_script_than_latin_makes_no_cycle_with_the_column_that_calls_it() {
+    // The column calls `app.[計算]`, which is planned; another function reads
+    // the column. A name with a letter the fold leaves alone must not make
+    // every function of the schema a callee, which would put `h` both before
+    // and after the column.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "app.[計算](id)")]),
+        function("計算", FUNCTION),
+        function(
+            "h",
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(c) FROM app.t WHERE id = @x); END",
+        ),
+    ])
+    .unwrap());
+    let column = at(&statements, "ADD [c] AS");
+    assert!(
+        at(&statements, "FUNCTION [app].[計算]") < column
+            && column < at(&statements, "FUNCTION [app].[h]"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_function_in_another_script_than_latin_makes_no_cycle_with_the_column_that_calls_it() {
+    // The function names the table and a column of it written in Chinese; the
+    // pending column calls it. A letter that no collation equates with `c`
+    // must not make the function a reader of `c`: that would put it both
+    // before and after the column.
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.columns.insert("名稱".into(), int());
+            t.computed.insert("c".into(), persisted("app.g(id)"));
+        }),
+        function(
+            "g",
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(名稱) FROM app.t WHERE id = @x); END",
+        ),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "FUNCTION [app].[g]") < at(&statements, "ADD [c] AS"),
+        "{statements:#?}"
+    );
+}

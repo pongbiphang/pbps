@@ -15,6 +15,7 @@
 //! declared order its position depends on.
 
 use crate::Mssql;
+use crate::validate::may_be_same_name;
 use pbps_dialect::{Dialect, DialectError};
 use pbps_model::{Change, IdsFile, ModuleId, ValueSource};
 use std::collections::BTreeSet;
@@ -65,9 +66,18 @@ pub(crate) fn parts(
         .skip(cut)
         .map(|c| name_key(c.raw()))
         .collect();
+    // A key's column list names model columns exactly. A part that reads a late
+    // column in its text waits for it, so a name that may be the
+    // column (`may_be_same_name`: a letter the fold leaves alone binds under
+    // some collation) only defers the part, an order that always compiles. A
+    // module reader or a callee is not so: over-reading orders it both before
+    // and after the column that calls it, a cycle (a function over a Chinese
+    // column name is "unresolved" to every column). Those compare by the fold.
     let reads_pending = |text: &str| {
-        column_names(dialect, text).is_none_or(|read| !read.is_disjoint(&pending))
-            && !pending.is_empty()
+        column_names(dialect, text).is_none_or(|read| {
+            read.iter()
+                .any(|name| pending.iter().any(|p| may_be_same_name(name, p)))
+        }) && !pending.is_empty()
     };
     let late_text = |text: &str| calling(text) || reads_pending(text);
     let late_column = |columns: &[pbps_model::ColumnName]| {

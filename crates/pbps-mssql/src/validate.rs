@@ -545,16 +545,8 @@ fn check_may_read_computed(expression: &str, column: &str) -> bool {
     if code.is_ascii() && column.is_ascii() {
         return false;
     }
-    let column = computed_note_fold(column);
-    // NFKD is not a catalog collation: measured, even ł/l, æ/ae and ß/ss
-    // bind on CI_AI. An unresolved letter on either side cannot prove no
-    // binding. Accept extra notes, but only for a possible code name.
-    let unresolved = |c: char| !c.is_ascii() && c.is_alphabetic();
-    let column_unresolved = column.chars().any(unresolved);
-    let may_bind = |name: &str| {
-        let name = computed_note_fold(name);
-        name == column || column_unresolved || name.chars().any(unresolved)
-    };
+    // Accept extra notes, but only for a possible code name.
+    let may_bind = |name: &str| may_be_same_name(name, column);
     // Decode the original delimiters before folding their contents. A
     // fullwidth closer is not doubled in SQL; folding it first would confuse
     // it with a real, escaped closer in the same identifier.
@@ -594,6 +586,17 @@ fn check_may_read_computed(expression: &str, column: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether the catalog may bind `a` and `b` to one name, whatever its
+/// collation: their folds are equal, or either still holds a letter the fold
+/// leaves alone. NFKD is not a catalog collation: measured, even ł/l, æ/ae and
+/// ß/ss bind on CI_AI, so an unresolved letter on either side cannot prove no
+/// binding.
+pub(crate) fn may_be_same_name(a: &str, b: &str) -> bool {
+    let unresolved = |c: char| !c.is_ascii() && c.is_alphabetic();
+    let (a, b) = (computed_note_fold(a), computed_note_fold(b));
+    a == b || a.chars().any(unresolved) || b.chars().any(unresolved)
 }
 
 pub(crate) fn computed_note_fold(text: &str) -> String {
