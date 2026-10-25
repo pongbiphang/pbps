@@ -515,8 +515,11 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
         out.tables.remove(uid);
         out.moves.remove(uid);
     }
+    // A conversion recorded for a replacement column went with the column, as
+    // a move went with its table; left behind it would orphan the file.
     for uid in record.replacement.columns.keys() {
         out.columns.remove(uid);
+        out.conversions.remove(uid);
     }
     for (uid, name) in &record.source.tables {
         out.tombstones.remove(uid);
@@ -838,6 +841,8 @@ pub(crate) fn lineage_errors(
             | pbps_model::ids::IdsError::KindMismatch { .. }
             | pbps_model::ids::IdsError::OrphanColumn { .. }
             | pbps_model::ids::IdsError::OrphanMove { .. }
+            | pbps_model::ids::IdsError::OrphanConversion { .. }
+            | pbps_model::ids::IdsError::InvalidConversion { .. }
             | pbps_model::ids::IdsError::NotHeld { .. } => None,
         };
         errors.push(error(

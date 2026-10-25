@@ -1218,3 +1218,12 @@ and is admitted only when it validates. The record's `types` and a root's
 state versions stay; a file written under the pending rules fails validation
 by name. Execution stays refused until the complete
 route ships (DEC-2298.1).
+
+A recorded conversion (#2331) is keyed by a column's UID, and approval retires
+the source columns' UIDs. So an approval is refused while a conversion is
+recorded for a column it retires (the file would be unreadable otherwise), the
+same file is unreadable by name if a merge brings the two together, and
+`--withdraw` takes the conversions of the replacement columns it removes, as it
+takes the replacements' moves. Whether the composed copy should honour a
+recorded conversion, by carrying it to the replacement column, is open and
+belongs to lowering the copy.

@@ -2078,3 +2078,167 @@ fn a_composed_rebuild_without_a_net_change_still_meets_every_other_rule() {
     let error = qualify(side(&start, &ids), side(&moved, &back), &table()).unwrap_err();
     assert!(error.why.contains("re-approve it with"), "{error}");
 }
+
+fn conversion() -> pbps_model::Conversion {
+    pbps_model::Conversion {
+        from: "text".into(),
+        to: "integer".into(),
+        using: "x::integer".into(),
+        allowed_at: "2026-10-24".into(),
+        operator: "tester".into(),
+    }
+}
+
+/// The fixture plus a table the rebuild does not touch, with a conversion
+/// recorded for one of its columns.
+fn with_unrelated_conversion() -> (Schema, IdsFile, Schema, Uid) {
+    let (mut base, _, mut desired) = fixture();
+    let other = TableName::new("app", "other");
+    let spec = Table {
+        columns: [("v".into(), Column::new("integer".parse().unwrap()))]
+            .into_iter()
+            .collect(),
+        ..Table::default()
+    };
+    base.tables.insert(other.clone(), spec.clone());
+    desired.tables.insert(other.clone(), spec);
+    let mut ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let uid = ids.column_uid(&other.column("v")).unwrap().clone();
+    ids.conversions.insert(uid.clone(), conversion());
+    ids.validate().unwrap();
+    (base, ids, desired, uid)
+}
+
+#[test]
+fn an_approval_keeps_the_conversion_of_a_column_it_does_not_replace() {
+    let (base, ids, desired, other) = with_unrelated_conversion();
+    let approval = recorded(&base, &ids, &desired);
+    assert_eq!(approval.conversions.keys().collect::<Vec<_>>(), [&other]);
+    approval.validate().unwrap();
+    // Re-approval and withdrawal leave it as they find it.
+    let refreshed = record(
+        side(&desired, &approval),
+        &desired,
+        &approval,
+        &table(),
+        30,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    assert_eq!(refreshed.conversions, approval.conversions);
+    assert_eq!(withdraw(&refreshed, &table()).unwrap(), ids);
+}
+
+#[test]
+fn an_approval_over_a_recorded_conversion_of_a_source_column_is_refused() {
+    let (base, mut ids, desired) = fixture();
+    let bucket = ids.column_uid(&table().column("bucket")).unwrap().clone();
+    ids.conversions.insert(bucket.clone(), conversion());
+    // The approval retires the column the conversion belongs to; it must not
+    // write a file that validation refuses, nor drop the intent unnamed.
+    let refused = record(
+        side(&base, &ids),
+        &desired,
+        &ids,
+        &table(),
+        20,
+        &reason(),
+        &ctx(),
+    );
+    assert!(refused.is_err());
+    // The same file without the conversion is approved.
+    ids.conversions.remove(&bucket);
+    assert!(
+        record(
+            side(&base, &ids),
+            &desired,
+            &ids,
+            &table(),
+            20,
+            &reason(),
+            &ctx()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn a_withdrawal_takes_the_conversion_of_a_replacement_column_with_it() {
+    let (base, ids, desired, other) = with_unrelated_conversion();
+    let approval = recorded(&base, &ids, &desired);
+    let replacement = approval
+        .column_uid(&table().column("bucket"))
+        .unwrap()
+        .clone();
+    let mut later = approval.clone();
+    later.conversions.insert(replacement.clone(), conversion());
+    later.validate().unwrap();
+    // The conversion described a column the withdrawal removes: the file comes
+    // back as it was before the approval, and the other column's survives.
+    let restored = withdraw(&later, &table()).unwrap();
+    assert_eq!(restored, ids);
+    assert!(restored.conversions.contains_key(&other));
+    assert!(!restored.conversions.contains_key(&replacement));
+    // A refreshed approval keeps the conversion of a column it still holds.
+    let refreshed = record(
+        side(&desired, &later),
+        &desired,
+        &later,
+        &table(),
+        30,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    assert!(refreshed.conversions.contains_key(&replacement));
+    refreshed.validate().unwrap();
+}
+
+#[test]
+fn a_chain_link_meets_the_conversion_rules_of_the_link_before_it() {
+    let (start, _, away, first, back) = there_and_back(false);
+    let middle = first.column_uid(&table().column("bucket")).unwrap().clone();
+    // The second approval retires the first link's replacement columns, so a
+    // conversion recorded for one is refused as for any source column.
+    let mut converted = first.clone();
+    converted.conversions.insert(middle.clone(), conversion());
+    assert!(
+        record(
+            side(&away, &converted),
+            &start,
+            &converted,
+            &table(),
+            30,
+            &reason(),
+            &ctx(),
+        )
+        .is_err()
+    );
+    // Withdrawing the second link brings the middle columns back, and a
+    // conversion recorded for the last link's columns goes with them.
+    let last = back.column_uid(&table().column("bucket")).unwrap().clone();
+    let mut later = back.clone();
+    later.conversions.insert(last.clone(), conversion());
+    let restored = withdraw(&later, &table()).unwrap();
+    assert_eq!(restored, first);
+    assert!(restored.conversions.is_empty());
+}
+
+#[test]
+fn a_conversion_left_on_a_retired_column_makes_the_lineage_unreadable_by_name() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    // A merge of a recorded conversion with an approval that retired its
+    // column: the plan must refuse, not read the rebuild as done or absent.
+    let retired = ids.column_uid(&table().column("bucket")).unwrap().clone();
+    let mut merged = approval.clone();
+    merged.conversions.insert(retired, conversion());
+    let why = first_rebuild_error(&diff(side(&base, &ids), side(&desired, &merged)));
+    assert!(why.contains("conversion"), "{why}");
+    // The same file without the conversion is not unreadable.
+    let clean = diff(side(&base, &ids), side(&desired, &approval));
+    assert!(first_rebuild_error(&clean).contains("recorded intent is valid"));
+}
