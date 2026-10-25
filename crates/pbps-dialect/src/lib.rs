@@ -642,6 +642,8 @@ impl Unchecked {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1242,7 +1244,55 @@ impl Lexicon {
         out
     }
 
+    /// The routine header's language, decoded independently of its body and
+    /// parameter defaults. Quoted names and SQL string spellings are supported.
+    pub fn routine_language(&self, definition: &str) -> Option<String> {
+        self.routine_language_in(definition, &self.header(definition))
+    }
+
+    /// The AS string body's original byte range, excluding parameter defaults
+    /// and clauses after the body. The blanked header supplies token boundaries;
+    /// the existing string reader supplies the complete literal's extent.
+    #[must_use]
+    pub fn routine_body(&self, definition: &str) -> Option<std::ops::Range<usize>> {
+        let cursor = self.routine_clause_end(&self.header(definition), "as")?;
+        let body = after_string_gap(&definition[cursor..]).0;
+        let start = definition.len() - body.len();
+        let literal = sql_string(body, 0)?;
+        Some(start..start + literal.end)
+    }
+
     fn has_native_language(&self, definition: &str, header: &str) -> bool {
+        matches!(
+            self.routine_language_in(definition, header).as_deref(),
+            Some("c" | "internal")
+        )
+    }
+
+    fn routine_language_in(&self, definition: &str, header: &str) -> Option<String> {
+        let cursor = self.routine_clause_end(header, "language")?;
+        let name = after_string_gap(&definition[cursor..]).0;
+        let name = if let Some(literal) = sql_string(name, 0) {
+            literal.contents
+        } else {
+            // The header already decodes Unicode identifiers and
+            // pads their span, so this offset also covers U&"…".
+            let name = &header[definition.len() - name.len()..];
+            if name.starts_with('"') {
+                quoted_identifier_len(name)
+                    .map(|end| name[1..end - 1].replace("\"\"", "\""))
+                    .unwrap_or_default()
+            } else {
+                let end = name
+                    .find(|c| !(self.identifier_continues)(c))
+                    .unwrap_or(name.len());
+                name[..end].to_ascii_lowercase()
+            }
+        };
+        Some(name)
+    }
+
+    fn routine_clause_end(&self, header: &str, word: &str) -> Option<usize> {
         let mut cursor = 0;
         let mut depth = 0usize;
         while cursor < header.len() {
@@ -1255,28 +1305,8 @@ impl Lexicon {
                     .find(|c| !(self.identifier_continues)(c))
                     .unwrap_or(rest.len());
                 cursor += len;
-                if depth == 0 && rest[..len].eq_ignore_ascii_case("language") {
-                    let name = after_string_gap(&definition[cursor..]).0;
-                    let name = if let Some(literal) = sql_string(name, 0) {
-                        literal.contents
-                    } else {
-                        // The header already decodes Unicode identifiers and
-                        // pads their span, so this offset also covers U&"…".
-                        let name = &header[definition.len() - name.len()..];
-                        if name.starts_with('"') {
-                            quoted_identifier_len(name)
-                                .map(|end| name[1..end - 1].replace("\"\"", "\""))
-                                .unwrap_or_default()
-                        } else {
-                            let end = name
-                                .find(|c| !(self.identifier_continues)(c))
-                                .unwrap_or(name.len());
-                            name[..end].to_ascii_lowercase()
-                        }
-                    };
-                    if matches!(name.as_str(), "c" | "internal") {
-                        return true;
-                    }
+                if depth == 0 && rest[..len].eq_ignore_ascii_case(word) {
+                    return Some(cursor);
                 }
             } else {
                 match ch {
@@ -1287,7 +1317,7 @@ impl Lexicon {
                 cursor += ch.len_utf8();
             }
         }
-        false
+        None
     }
 
     fn code_only_inner(&self, definition: &str, scan_bodies: bool) -> String {
@@ -6597,6 +6627,57 @@ mod code_only_tests {
         reserved: never_reserved,
         unicode_identifiers: true,
     };
+    #[test]
+    fn routine_language_comes_from_the_header_including_quoted_spellings() {
+        for language in ["plpgsql", "\"plpgsql\"", "'plpgsql'", "E'plpgsql'"] {
+            let definition =
+                format!("() RETURNS integer LANGUAGE {language} AS $$ BEGIN RETURN 1; END $$");
+            assert_eq!(PG.routine_language(&definition).as_deref(), Some("plpgsql"));
+        }
+        assert_eq!(PG.routine_language("(language integer DEFAULT 1) RETURNS integer LANGUAGE SQL AS $$ SELECT 1 /* LANGUAGE plpgsql */ $$").as_deref(), Some("sql"));
+        assert_eq!(
+            PG.routine_language("() RETURNS text AS $$ LANGUAGE plpgsql $$"),
+            None
+        );
+        assert_eq!(
+            PG.routine_language("() RETURNS text /* LANGUAGE plpgsql */ AS 'x'"),
+            None
+        );
+    }
+
+    #[test]
+    fn routine_body_range_excludes_defaults_and_clauses_after_the_body() {
+        for body in [
+            "$$ BEGIN RETURN 'new'; END $$",
+            "$body$ BEGIN RETURN 'new'; END $body$",
+            "'BEGIN RETURN ''new''; END'",
+            "E'BEGIN RETURN \\'new\\'; END'",
+            "U&'BEGIN RETURN ''new''; END'",
+        ] {
+            let definition = format!(
+                "(\"as\" text DEFAULT 'old', x text = $$AS 'fake'$$) RETURNS text \
+                 /* AS 'fake' */ AS /* body */ {body} LANGUAGE plpgsql \
+                 SET application_name TO 'after'"
+            );
+            let range = PG.routine_body(&definition).unwrap();
+            assert_eq!(&definition[range.clone()], body);
+            assert_eq!(
+                PG.string_literals(&definition[..range.start]),
+                ["old", "AS 'fake'"]
+            );
+            assert_eq!(PG.string_literals(&definition[range.end..]), ["after"]);
+            assert_eq!(PG.routine_language(&definition).as_deref(), Some("plpgsql"));
+        }
+        for definition in [
+            "(x text DEFAULT 'AS') RETURNS text LANGUAGE sql BEGIN ATOMIC SELECT x; END",
+            "() RETURNS text LANGUAGE plpgsql /* AS 'fake' */",
+            "() RETURNS text LANGUAGE plpgsql AS missing",
+            "() RETURNS text LANGUAGE plpgsql AS $$unterminated",
+        ] {
+            assert_eq!(PG.routine_body(definition), None, "{definition}");
+        }
+    }
+
     const MSSQL: Lexicon = Lexicon {
         whitespace_is_ascii: false,
         quoted_identifiers: &[('[', ']'), ('"', '"')],

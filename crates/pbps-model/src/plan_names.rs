@@ -332,7 +332,9 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(from.clone()),
             Some(to.clone()),
         )),
-        Change::CreateType { .. }
+        Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
+        | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
         | Change::AddComputedColumn { .. }

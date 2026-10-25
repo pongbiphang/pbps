@@ -197,9 +197,17 @@ fn check_definitions(
     let mut absent = Vec::new();
     for pin in pins {
         if let Some(name) = resolver.name(TypeSide::Desired, &pin.uid) {
-            let (definition, before) = match &pin.before {
-                Some(before) => (&before.definition, true),
-                None => (&pin.definition, false),
+            let latest = executed
+                .iter()
+                .filter_map(|s| s.declared_type.as_ref())
+                .rev()
+                .find(|s| s.uid == pin.uid);
+            let (definition, before) = match latest.and_then(|s| s.definition.as_ref()) {
+                Some(definition @ ManagedType::Enum { .. }) => (definition, true),
+                _ => match &pin.before {
+                    Some(before) => (&before.definition, true),
+                    None => (&pin.definition, false),
+                },
             };
             let actual = live.types.get(name).ok_or_else(|| {
                 failed(format!(
@@ -223,6 +231,15 @@ fn check_definitions(
                 return Err(failed(format!(
                     "declared type `{}` changed since planning; plan again",
                     name.shown()
+                )));
+            }
+            if complete
+                && matches!(pin.definition, ManagedType::Enum { .. })
+                && !matches_declaration(&pin.definition, actual)
+            {
+                return Err(failed(format!(
+                    "declared type `{}` does not match the completed plan",
+                    pin.name.shown()
                 )));
             }
             if complete && name != &pin.name {
@@ -886,5 +903,140 @@ mod tests {
                 values: vec!["changed".into()]
             }
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)] // Non-label fixtures are unreachable.
+mod label_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, EnumPlacement, PlannedChange};
+
+    fn enumeration(values: &[&str]) -> ManagedType {
+        ManagedType::Enum {
+            values: values.iter().map(|v| (*v).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn enum_pins_accept_every_executed_definition_and_refuse_skipped_steps_and_drift() {
+        let uid = "y_000001".parse().unwrap();
+        let name: TypeRef = "app.e".parse().unwrap();
+        let pin = DeclaredTypePin {
+            uid,
+            name: name.clone(),
+            definition: enumeration(&["blue", "x", "ok", "y"]),
+            before: Some(DeclaredTypeBefore {
+                name: name.clone(),
+                definition: enumeration(&["sad", "ok"]),
+            }),
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                Change::RenameEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    from: "sad".into(),
+                    to: "blue".into(),
+                    ordinal: 0,
+                    definition: Box::new(enumeration(&["blue", "ok"])),
+                },
+                Change::AddEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    value: "x".into(),
+                    placement: Some(EnumPlacement::After("blue".into())),
+                    ordinal: 1,
+                    definition: Box::new(enumeration(&["blue", "x", "ok"])),
+                },
+                Change::AddEnumValue {
+                    uid: pin.uid.clone(),
+                    name: name.clone(),
+                    value: "y".into(),
+                    placement: Some(EnumPlacement::After("ok".into())),
+                    ordinal: 2,
+                    definition: Box::new(pin.definition.clone()),
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        let mut live = Schema {
+            types: [(
+                name.clone(),
+                pin.before.as_ref().unwrap().definition.clone(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let mut executed = Vec::new();
+        check_definitions(
+            &live,
+            std::slice::from_ref(&pin),
+            false,
+            &changes,
+            &executed,
+        )
+        .unwrap();
+        assert!(
+            check_definitions(&live, std::slice::from_ref(&pin), true, &changes, &executed)
+                .is_err()
+        );
+        for (i, step) in changes.changes.iter().enumerate() {
+            let definition = match &step.change {
+                Change::AddEnumValue { definition, .. }
+                | Change::RenameEnumValue { definition, .. } => definition.as_ref(),
+                _ => unreachable!(),
+            };
+            live.types.insert(name.clone(), definition.clone());
+            assert!(
+                check_definitions(
+                    &live,
+                    std::slice::from_ref(&pin),
+                    false,
+                    &changes,
+                    &executed
+                )
+                .is_err(),
+                "unexecuted step {i}"
+            );
+            let mut statement = pbps_dialect::Statement::new("metadata only");
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: pin.uid.clone(),
+                name: name.clone(),
+                definition: Some(definition.clone()),
+            });
+            executed.push(statement);
+            check_definitions(
+                &live,
+                std::slice::from_ref(&pin),
+                i == 2,
+                &changes,
+                &executed,
+            )
+            .unwrap();
+            // A resumed check carries the same committed prefix and evidence.
+            check_definitions(
+                &live,
+                std::slice::from_ref(&pin),
+                i == 2,
+                &changes,
+                &executed.clone(),
+            )
+            .unwrap();
+            let mut drift = live.clone();
+            drift.types.insert(name.clone(), enumeration(&["rogue"]));
+            assert!(
+                check_definitions(
+                    &drift,
+                    std::slice::from_ref(&pin),
+                    false,
+                    &changes,
+                    &executed
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -37,6 +37,12 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
+    #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
+    EnumValueUse {
+        name: pbps_model::TypeRef,
+        label: String,
+        subject: String,
+    },
     #[error("type `{name}`: {reason}", name = .name.shown())]
     TypeLifecycleUnsupported {
         name: pbps_model::TypeRef,
@@ -628,7 +634,7 @@ pub fn type_differences(
                     definition
                 };
                 let fields = normalize(old).differences(&normalize(new));
-                (!fields.is_empty()).then(|| format!("{} changed; enum label changes require #1635 slice 3, domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
+                (!fields.is_empty()).then(|| format!("{} changed; enum removal/reordering requires #1635 slice 3b, domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
             }
             (None, None) => None,
         };
@@ -729,6 +735,10 @@ pub(crate) fn diff_partial_rebuilding(
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
 
+    let (label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
+    errs.extend(label_errors);
+    changes.extend(label_changes);
+
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
     let types = TypeResolver::new(base.ids, declared.ids);
@@ -786,14 +796,28 @@ pub(crate) fn diff_partial_rebuilding(
                     types: [(name.clone(), new.clone())].into(),
                     ..Default::default()
                 };
-                errs.extend(type_differences(&old_schema, &new_schema, dialect));
+                if !matches!(
+                    (&old_schema.types[name], new),
+                    (
+                        pbps_model::ManagedType::Enum { .. },
+                        pbps_model::ManagedType::Enum { .. }
+                    )
+                ) {
+                    errs.extend(type_differences(&old_schema, &new_schema, dialect));
+                }
                 if old_name != name {
                     type_renames.insert(old_name.clone(), name.clone());
                     changes.push(Change::RenameType {
                         uid: uid.clone(),
                         from: old_name.clone(),
                         to: name.clone(),
-                        definition: Box::new(new.clone()),
+                        definition: Box::new(
+                            if matches!(old, pbps_model::ManagedType::Enum { .. }) {
+                                old.clone()
+                            } else {
+                                new.clone()
+                            },
+                        ),
                     });
                 }
             }
@@ -1398,6 +1422,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetEnsureKeys { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1458,6 +1484,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1658,6 +1686,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1722,6 +1752,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2096,7 +2128,12 @@ pub(crate) fn diff_partial_rebuilding(
         }
     }
     let sort_class = |c: &Change| -> (u8, usize) {
-        if matches!(c, Change::CreateType { .. }) {
+        if matches!(
+            c,
+            Change::CreateType { .. }
+                | Change::AddEnumValue { .. }
+                | Change::RenameEnumValue { .. }
+        ) {
             return (7, 0);
         }
 
@@ -2371,6 +2408,7 @@ pub(crate) fn diff_partial_rebuilding(
     for (part, risks) in changes.changes.iter_mut().zip(risks) {
         part.risks = risks;
     }
+    errs.extend(crate::enum_labels::unsafe_uses(&changes, declared, dialect));
     Diffed {
         changes,
         errors: errs,
@@ -2838,6 +2876,8 @@ fn recreate_referenced_foreign_keys(
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -3399,6 +3439,8 @@ fn recreate_retyped_dependents(
         | Change::CreateModule { .. }
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
+        | Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
@@ -5450,6 +5492,8 @@ fn refuse_computed_dependencies(
                     | Change::CreateModule { .. }
                     | Change::AlterModule { .. }
                     | Change::DropModule { .. }
+                    | Change::AddEnumValue { .. }
+                    | Change::RenameEnumValue { .. }
                     | Change::CreateType { .. }
                     | Change::DropType { .. }
                     | Change::RenameType { .. }
@@ -6497,6 +6541,9 @@ fn dependency_rank(
         // Module ranks can be arbitrarily deep. A fixed -1 would leave a
         // policy behind a dropped routine it calls (DEC-1173.2).
         Change::DropPolicy { .. } => -(drop_rank.len() as isize) - 1,
+        Change::AddEnumValue { ordinal, .. } | Change::RenameEnumValue { ordinal, .. } => {
+            *ordinal as isize
+        }
         Change::CreateType { name, .. } | Change::RenameType { to: name, .. } => {
             *type_rank.get(name).unwrap_or(&0)
         }
@@ -7259,7 +7306,9 @@ fn order_key(c: &Change) -> u8 {
         | Change::AnalyzeTableTree(_) => {
             unreachable!("rebuild operations are expanded by order, never ranked by the differ")
         }
-        Change::CreateType { .. } => 7,
+        Change::AddEnumValue { .. }
+        | Change::RenameEnumValue { .. }
+        | Change::CreateType { .. } => 7,
         Change::DropType { .. } => 18,
         Change::RenameType { .. } => 1,
         // A policy releases its bindings before module and column teardown.
@@ -24765,7 +24814,9 @@ mod managed_type_tests {
         let created = run(&Schema::default(), &IdsFile::default(), &base, &base_ids).unwrap();
         assert!(matches!(
             created.changes[0].change,
-            Change::CreateType { .. }
+            Change::AddEnumValue { .. }
+                | Change::RenameEnumValue { .. }
+                | Change::CreateType { .. }
         ));
         let dropped = run(&base, &base_ids, &Schema::default(), &IdsFile::default()).unwrap();
         assert!(matches!(dropped.changes[0].change, Change::DropType { .. }));

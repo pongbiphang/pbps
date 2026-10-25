@@ -319,6 +319,8 @@ impl ResolverEvidence {
                     Change::Grant { .. }
                         | Change::Revoke { .. }
                         | Change::PublicExecution { .. }
+                        | Change::AddEnumValue { .. }
+                        | Change::RenameEnumValue { .. }
                         | Change::CreateType { .. }
                         | Change::DropType { .. }
                         | Change::RenameType { .. }

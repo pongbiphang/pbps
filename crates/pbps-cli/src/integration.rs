@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 58;
+pub const SCHEMA_VERSION: u32 = 59;
+// 59: explicit enum label rename annotations (#1635 slice 3a).
 // 58: declared SQL Server cross-database dependencies and comparison reports (#2322).
 // 57: historical state show, diff and export envelopes (issue #2289).
 // 56: declared type rename annotations and deferred domain vetting (#1635 slice two).

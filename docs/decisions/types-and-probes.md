@@ -2899,3 +2899,84 @@ references, including arrays, preserve rename chains and intermediate-holder
 handoffs, and refuse changed live definitions. Warning tests cover both
 report channels and all three warning negatives. Each repaired site is checked
 by temporarily reverting its behavior with a copy of the file retained aside.
+
+
+<a id="dec-1635-6"></a>
+
+**DEC-1635.6. Slice 3a adds and explicitly renames enum labels; reference-data and partition-key admission stays in #2346.**
+`AddEnumValue` emits ALTER TYPE ADD VALUE, and `RenameEnumValue` emits
+ALTER TYPE RENAME VALUE. A label accepts a string or `{name, renamed_from}`;
+one-shot intent stays beside Schema, never in its equality. Adding a label
+carries no intrinsic risk, as CreateType does. Renaming carries Rename, as
+RenameType does, because existing stored values return a different spelling.
+With no base definition for its uid, a type is created with its final labels
+and ignores label rename hints, like `identity::intent_is_absorbed`; loader
+validation still applies.
+Both operations use the existing class-7 type subrank and approved ordinal;
+whole-type rename stays class 1. Exists/final-type rewrite effects and the
+existing schedule place labels before their dependents; no pass is added.
+
+Renames execute while the target is free. PostgreSQL 16.15 and 18.6 accept a
+chain with the last destination freed first and reject a direct swap with
+"enum label already exists". As for type names, chains work and cycles or
+occupied targets refuse by name. After renames, retained labels keep their
+relative order. Additions walk the declared order from left to right: AFTER
+the previous desired label, BEFORE the first existing label at the start, or
+no neighbour for the first label of an empty enum. Each operation carries its
+exact intermediate after-definition for per-statement checks, staging and
+resume through the side-specific resolver (DEC-2321.1).
+
+The measured BEGIN/ADD VALUE/use results are the same on PG 16.15 and 18.6:
+
+| Use | enum | enum array | domain over enum | Declaration scope |
+|---|---|---|---|---|
+| Column default | unsafe use refused | unsafe use refused | unsafe use refused | declarable |
+| CHECK | unsafe use refused | unsafe use refused | unsafe use refused | declarable |
+| Row insert | unsafe use refused | unsafe use refused | unsafe use refused | not declarable today (DEC-1523.1, #2346) |
+| LIST partition bound | unsafe use refused | unsafe use refused | unsafe use refused | not declarable today (DEC-1523.1, #2346) |
+
+Creating a domain with its own default or CHECK over an enum or enum array
+also refuses, measured on both versions. Views, SQL string-body functions
+and SQL BEGIN ATOMIC functions also refuse
+same-transaction evaluation. Only the bodies of PL/pgSQL functions and
+procedures are deferred until invocation. Their parameter defaults bind at
+creation: both cast and uncast defaults using a newly added label refuse with
+unsafe use on PG 16.15 and 18.6, including procedure defaults. A PL/pgSQL body
+containing the new label with an existing-label parameter default is accepted.
+Planning therefore exempts only the AS string or dollar-quoted body, located
+with the existing lexicon; quoted labels elsewhere in the definition remain
+subject to the same conservative use check, including DEFAULT and = defaults.
+Planning refuses the still-declarable uses: column defaults/CHECKs over the
+enum, arrays or domains, a domain's own default/CHECK, and created/altered views
+or SQL-bodied routines containing the quoted label, plus function/procedure
+parameter defaults even when the language is PL/pgSQL. The named remedy is
+"apply the label first, then the rest". The ordinary table validation rejects
+`data:` on every user-defined reference or array, and rejects reference-valued
+partition keys, before this use check can arise. DEC-1523.1 is unchanged;
+admitting those surfaces belongs to #2346, not slice 3a.
+
+PostgreSQL stores enum constants by oid, but pbps does not rewrite SQL text
+through a label rename. An updated CHECK or default differs from its recorded
+declaration and the ordinary diff lists its rebuild or alteration. DropCheck
+(class 2) precedes the label rename (class 7); defaults follow in class 9 and
+AddCheck in class 13. These statements succeed in one transaction on PG 16.15
+and 18.6: renamed labels, unlike newly added values, are usable immediately.
+The cost is explicit: AddCheck scans its table under ACCESS EXCLUSIVE until
+commit. An engine-typed, scan-free alternative is tracked in #2354.
+
+Connected spelling probes defer defaults and CHECKs by the resolved identity
+of an enum whose label this plan renames, including arrays and domains over
+it, without reading or reversing their SQL text. The probe view never changes
+the declaration used for diffing or recording. The engine enforces statements
+at apply; existing post-statement declared-type vetting and closing readback
+checks remain in force. No expression provenance is forwarded or invented.
+A retained expression that still uses the old label must surface a named
+error rather than silently recording a guessed new spelling.
+
+Unannotated label removal and retained-label reordering stay named refusals
+with the #1635 slice 3b remedy. Domain alterations stay slice 4. Saved plan 52
+is retained because its checksum-pinned change payload now includes the two
+label operations and their intermediate definitions. Published schema set 59
+admits the YAML label intent. No row codec, contextual table-validation
+exception, speculative type inventory, absent-type value deferral, transient
+uid or connected value-probe reversal is introduced by this slice.

@@ -590,7 +590,9 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Type(Recorded(uid.clone())));
                 self.type_releases(name);
             }
-            Change::RenameType { uid, .. } => {
+            Change::AddEnumValue { uid, .. }
+            | Change::RenameEnumValue { uid, .. }
+            | Change::RenameType { uid, .. } => {
                 let key = ObjectKey::Type(Recorded(uid.clone()));
                 self.exists(key.clone());
                 self.rewrites(Resource::Object(key, Incarnation::Final));

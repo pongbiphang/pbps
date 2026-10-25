@@ -3231,7 +3231,18 @@ pub(crate) async fn refuse_misspelt(
     unasked: &mut Vec<String>,
     type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    let mut found = crate::engine::misspelt(conn, schema, at, type_routines_need_review)
+    refuse_misspelt_with_probe(conn, schema, schema, at, unasked, type_routines_need_review).await
+}
+
+async fn refuse_misspelt_with_probe(
+    conn: &mut Conn,
+    schema: &Schema,
+    probe_schema: &Schema,
+    at: &pbps_db::catalog::CatalogNames,
+    unasked: &mut Vec<String>,
+    type_routines_need_review: bool,
+) -> anyhow::Result<Schema> {
+    let mut found = crate::engine::misspelt(conn, probe_schema, at, type_routines_need_review)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     unasked.extend(found.defaults_unasked.iter().map(|why| {
@@ -4568,7 +4579,13 @@ fn refuse_pinned_movement(
     let mut expected_types = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
-            pbps_model::Change::CreateType {
+            pbps_model::Change::AddEnumValue {
+                uid, definition, ..
+            }
+            | pbps_model::Change::RenameEnumValue {
+                uid, definition, ..
+            }
+            | pbps_model::Change::CreateType {
                 uid, definition, ..
             }
             | pbps_model::Change::RenameType {
@@ -6385,6 +6402,7 @@ pub fn cmd_bootstrap(
             // bootstrap emit a dependent module first and fail on declarations that
             // plan perfectly well.
             &pbps_model::Hints {
+                enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
                 // Carried for the same reason, and one more: it is what decides
@@ -6973,9 +6991,15 @@ pub fn cmd_plan_db(
             ));
         }
         let mut unasked = Vec::new();
-        let refused = refuse_misspelt(
+        let probe_schema = pbps_diff::enum_labels::probe_schema(
+            pbps_diff::Side { schema: &entry.snapshot.schema, ids: &recorded_ids },
+            pbps_diff::Side { schema: &loaded.schema, ids: &resolved.ids },
+            &loaded.hints,
+        );
+        let refused = refuse_misspelt_with_probe(
             &mut conn,
             &loaded.schema,
+            &probe_schema,
             &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
             &mut unasked,
             type_routines_need_review,

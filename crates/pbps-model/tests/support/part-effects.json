@@ -1311,5 +1311,43 @@
         "with_check": "n > 0"
       }
     }
+  },
+  {
+    "name": "AddEnumValue",
+    "change": {
+      "op": "add_enum_value",
+      "uid": "y_aaaaaa",
+      "name": "app.e",
+      "value": "new",
+      "placement": {
+        "position": "after",
+        "value": "old"
+      },
+      "ordinal": 0,
+      "definition": {
+        "kind": "enum",
+        "values": [
+          "old",
+          "new"
+        ]
+      }
+    }
+  },
+  {
+    "name": "RenameEnumValue",
+    "change": {
+      "op": "rename_enum_value",
+      "uid": "y_aaaaaa",
+      "name": "app.e",
+      "from": "old",
+      "to": "new",
+      "ordinal": 0,
+      "definition": {
+        "kind": "enum",
+        "values": [
+          "new"
+        ]
+      }
+    }
   }
 ]

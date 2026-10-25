@@ -650,7 +650,9 @@ impl Operation {
                 ObjectKey::Table(checked_relation(owners, &a.parent, Spelling::Final)?)
             }
 
-            Change::CreateType { uid, .. }
+            Change::AddEnumValue { uid, .. }
+            | Change::RenameEnumValue { uid, .. }
+            | Change::CreateType { uid, .. }
             | Change::DropType { uid, .. }
             | Change::RenameType { uid, .. } => ObjectKey::Type(recorded(uid)),
             Change::CreateTable { uid, .. }
@@ -886,7 +888,9 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             },
             // Renames move an address, and the rest rewrite the instance that
             // stands: neither starts or ends one.
-            Change::RenameType { .. }
+            Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::RenameType { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
             | Change::RenameTable { .. }

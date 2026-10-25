@@ -74,11 +74,28 @@ pub struct EnumTypeDto {
     #[serde(default)]
     pub renamed_from: Option<String>,
     #[schemars(schema_with = "enum_values_schema")]
-    pub values: Vec<String>,
+    pub values: Vec<EnumValueDto>,
 }
 
-fn enum_values_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({"type": "array", "items": {"type": "string"}, "uniqueItems": true})
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum EnumValueDto {
+    Label(String),
+    Renamed(EnumValueIntentDto),
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EnumValueIntentDto {
+    pub name: String,
+    #[serde(default)]
+    pub renamed_from: Option<String>,
+}
+
+fn enum_values_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let mut schema = generator.subschema_for::<Vec<EnumValueDto>>();
+    schema.insert("uniqueItems".into(), true.into());
+    schema
 }
 
 /// A shared domain, with its column-style base type and named checks.

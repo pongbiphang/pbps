@@ -809,7 +809,9 @@ checks:
   phone_digits: "VALUE ~ '^[0-9+ -]+$'"
 ```
 
-An enum's `values` are ordered, unique strings; an empty enum is representable.
+An enum's `values` are ordered, unique labels; an empty enum is representable.
+A label is a string or `{name: blue, renamed_from: sad}`. The annotation is
+one-shot human intent outside `Schema`; plain strings remain valid.
 A domain declares its base with the column type grammar, optional `not_null`
 (default false), `default`, named `checks`, and a qualified `collation` when it
 differs from its base's. Expressions remain verbatim. Formatting follows §4.3,
@@ -828,7 +830,29 @@ Declared enums and domains are created, dropped and renamed as whole objects
 identity; names are never guessed. Cross-schema moves use SET SCHEMA followed
 by RENAME when needed. Swaps refuse by name. Drops require a recorded nonblank
 reason, a tombstone and destructive approval, like table drops, and follow the
-last dependent's removal or retype. Enum label changes require slice 3; domain
+last dependent's removal or retype. Enum labels can be added at their declared
+position or renamed with explicit label intent (DEC-1635.6). Removal without
+rename intent and reordering retained labels refuse by name until #1635 slice
+3b. Label rename chains execute in free-target order; swaps refuse by name.
+Adding a label has no intrinsic risk class, like type creation; renaming one
+requires `rename` approval because queries see different text.
+A plan cannot also evaluate its newly added label in a column default or
+CHECK over that enum, its array or a domain over it, in a domain's own default
+or CHECK, or in a created/altered view or SQL routine body. Apply the label
+first, then the rest. Only a PL/pgSQL routine's body is exempt because it binds
+at invocation. Function and procedure parameter defaults, in DEFAULT or =
+spelling, bind at creation and are checked even for PL/pgSQL. An updated
+CHECK/default is rebuilt or altered by the ordinary diff, and
+those changes appear in the plan. No SQL text is rewritten through label
+renames. DropCheck precedes the rename; defaults and AddCheck follow it in the
+same transaction. AddCheck scans its table under ACCESS EXCLUSIVE until
+commit; #2354 tracks an engine-typed, scan-free approach. Plan-time expression
+probes defer by the resolved enum type when its label is renamed, including
+arrays and domains. The engine enforces the declaration at apply, with the
+existing vet and readback checks.
+`data:` rows and partition bounds over user-defined references remain refused
+by DEC-1523.1 before the label-use check can arise; #2346 tracks admitting
+those surfaces. Arrays also remain refused under `data:`. Domain
 check/default/NOT NULL changes require slice 4. Base and collation changes
 remain unsupported and refuse by name.
 

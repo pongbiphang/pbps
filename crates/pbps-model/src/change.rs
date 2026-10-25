@@ -228,6 +228,24 @@ pub enum Change {
     CopyTableRows(Box<crate::CopyTableRows>),
     AnalyzeTableTree(Box<crate::AnalyzeTableTree>),
     BuildPartitionedIndex(Box<crate::BuildPartitionedIndex>),
+    /// One additive label, carrying the definition immediately after this step.
+    AddEnumValue {
+        uid: Uid,
+        name: crate::TypeRef,
+        value: String,
+        placement: Option<crate::EnumPlacement>,
+        ordinal: usize,
+        definition: Box<crate::ManagedType>,
+    },
+    /// Explicit label intent changes the text returned by existing rows.
+    RenameEnumValue {
+        uid: Uid,
+        name: crate::TypeRef,
+        from: String,
+        to: String,
+        ordinal: usize,
+        definition: Box<crate::ManagedType>,
+    },
     CreateType {
         uid: Uid,
         name: crate::TypeRef,
@@ -1360,9 +1378,10 @@ impl Change {
         // Canonical grouping and policy key. Human consumers escape this value;
         // rendering it here would change identity comparisons (DEC-2084.1).
         match self {
-            Change::CreateType { name, .. } | Change::DropType { name, .. } => {
-                name.raw().to_string()
-            }
+            Change::AddEnumValue { name, .. }
+            | Change::RenameEnumValue { name, .. }
+            | Change::CreateType { name, .. }
+            | Change::DropType { name, .. } => name.raw().to_string(),
             Change::RenameType { from, .. } => from.raw().to_string(),
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
@@ -1465,6 +1484,8 @@ impl Change {
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1567,6 +1588,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1690,6 +1713,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1792,6 +1817,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1918,6 +1945,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1993,6 +2022,8 @@ impl Change {
             | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2088,6 +2119,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2117,7 +2150,9 @@ impl Change {
             // `PUBLIC` is not a role name; it is every principal at once, and
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
             Change::PublicExecution { .. } => (None, None),
-            Change::CreateType { .. }
+            Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateTable { .. }
@@ -2228,6 +2263,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2340,6 +2377,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2418,6 +2457,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2568,6 +2609,8 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2602,7 +2645,9 @@ impl Change {
             Change::RenameRole { from, to, .. } => {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
-            Change::CreateType { .. }
+            Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
+            | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
             | Change::CreateTable { .. }
@@ -2714,6 +2759,8 @@ impl Change {
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2775,6 +2822,8 @@ impl Change {
             | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
+            | Change::AddEnumValue { .. }
+            | Change::RenameEnumValue { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2870,7 +2919,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // rename and not drop + add — but the old name is gone the same
             // way a table's is, and `IS_ROLEMEMBER('old')` in a module or an
             // application breaks on the spot. Same gate as the other renames.
-            Change::RenameType { .. } | Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
+            Change::RenameEnumValue { .. } | Change::RenameType { .. } | Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
                 r.insert(RiskClass::Rename);
             }
             Change::AlterColumnNullability {
@@ -3078,6 +3127,7 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             // Creating a role grants nothing by itself.
+            | Change::AddEnumValue { .. }
             | Change::CreateType { .. }
             | Change::CreateRole { .. }
             // A replica identity changes what logical replication carries to

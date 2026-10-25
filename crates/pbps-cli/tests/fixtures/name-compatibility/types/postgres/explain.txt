@@ -7,7 +7,7 @@ CREATE FUNCTION app.checked(integer) RETURNS boolean LANGUAGE sql RETURN $1 > 0;
   created     2026-10-22T00:00:00Z
   baseline    type-name master fixture
   execution   one transaction, all or nothing: a failure rolls the whole plan back
-  checksum    1a64aa30e909356a9b199310441bb54a33f60412584b864ce5070ac1262fe536
+  checksum    8e43da03156b189b1178501a38998c60b1bc00561df25bf3da5144e7caf0abf0
 
 What it changes
   3 change(s) across 1 table(s), 3 statement(s).
@@ -33,4 +33,4 @@ The environment
   the one question this file cannot answer; `pbps status` answers it.
 
 To approve and run it:
-  pbps apply --env "<environment>" --plan plan.json --checksum 1a64aa30e909356a9b199310441bb54a33f60412584b864ce5070ac1262fe536
+  pbps apply --env "<environment>" --plan plan.json --checksum 8e43da03156b189b1178501a38998c60b1bc00561df25bf3da5144e7caf0abf0

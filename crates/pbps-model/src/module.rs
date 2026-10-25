@@ -1016,6 +1016,10 @@ pub type PublicExecute = BTreeSet<ModuleId>;
 /// two states.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hints {
+    /// One-shot label intent, keyed by declared type and new label. It never
+    /// participates in Schema equality; live definitions establish absorption.
+    pub enum_value_renames: BTreeMap<crate::TypeRef, BTreeMap<String, String>>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).

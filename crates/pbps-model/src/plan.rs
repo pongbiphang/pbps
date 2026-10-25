@@ -265,7 +265,8 @@ use crate::zone::SessionZone;
 /// 50 pins declared cross-database shapes and their comparison (DEC-2322.1).
 /// 51 pins each routine under its own digest instead of one per schema, so a
 /// refusal can name the routine (DEC-2333.1).
-pub const CURRENT_VERSION: u32 = 51;
+/// 52 adds executable enum label changes and intermediate definitions (DEC-1635.6).
+pub const CURRENT_VERSION: u32 = 52;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -815,7 +816,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 51);
+        assert_eq!(CURRENT_VERSION, 52);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

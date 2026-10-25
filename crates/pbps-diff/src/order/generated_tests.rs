@@ -32,6 +32,32 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         values: vec!["ok".into()],
     });
     pin(
+        Change::AddEnumValue {
+            uid: type_uid.clone(),
+            name: type_name.clone(),
+            value: "new".into(),
+            placement: None,
+            ordinal: 0,
+            definition: definition.clone(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
+        Change::RenameEnumValue {
+            uid: type_uid.clone(),
+            name: type_name.clone(),
+            from: "old".into(),
+            to: "new".into(),
+            ordinal: 0,
+            definition: definition.clone(),
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
         Change::CreateType {
             uid: type_uid.clone(),
             name: type_name.clone(),

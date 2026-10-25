@@ -21,7 +21,10 @@ pub use convert::{LoadedModule, LoadedRole, LoadedTable};
 pub use dependencies::{LoadedDependency, load_dependency_str, render_dependency};
 pub use error::{LoadError, Semantic, SourceFile};
 pub use fmt::{render, render_module, render_partitioned, render_role};
-pub use managed_types::{LoadedType, load_type_str, render_type, render_type_with_intents};
+pub use managed_types::{
+    LoadedType, load_type_str, render_type, render_type_with_intents,
+    render_type_with_value_renames,
+};
 pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
@@ -287,6 +290,12 @@ fn collect_schema_dir(
                         from,
                         to: t.name.clone(),
                     });
+                }
+                if !t.value_renames.is_empty() {
+                    loaded
+                        .hints
+                        .enum_value_renames
+                        .insert(t.name.clone(), t.value_renames);
                 }
                 loaded.schema.types.insert(t.name, t.definition);
                 continue;
