@@ -951,6 +951,22 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
             .unwrap();
         // Restore the owned fixture before asserting either half of the contract.
         if !found || cleanup.is_err() || !fresh.is_empty() {
+            // What the engine recorded, so a miss on another installation
+            // says whether the change took effect where the inventory looks.
+            let recorded = db
+                .conn
+                .query(
+                    "SELECT (SELECT * FROM sys.database_filestream_options \
+                     WHERE database_id = DB_ID() FOR JSON PATH, INCLUDE_NULL_VALUES) AS row, \
+                     CONVERT(nvarchar(20), SERVERPROPERTY('FilestreamConfiguredLevel')) AS configured, \
+                     CONVERT(nvarchar(20), SERVERPROPERTY('FilestreamEffectiveLevel')) AS effective;",
+                )
+                .await
+                .map(|rows| {
+                    let text = |c: &str| rows[0].try_get::<&str>(c).ok().flatten().map(str::to_owned);
+                    (text("row"), text("configured"), text("effective"))
+                });
+            println!("{expected}: recorded={recorded:?}");
             db.conn.execute("REVERT;").await.unwrap();
             db.drop().await;
             panic!(
