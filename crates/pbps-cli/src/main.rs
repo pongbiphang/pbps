@@ -4075,6 +4075,13 @@ fn cmd_plan(
             // choice silently disable a validation the project had asked for — a
             // plan that does not converge would have come back `result: "ok"`.
             if json {
+                findings.push(output::Finding::note(
+                    "rehearsal.separation",
+                    "Separation from production is operator-vouched.",
+                ));
+                if rehearsal.externals_staged {
+                    findings.push(output::Finding::note("rehearsal.externals", "Externals were staged before the baseline and not compared with any target."));
+                }
                 for d in &rehearsal.structural {
                     findings.push(output::Finding::error(
                         "rehearsal.does-not-converge",

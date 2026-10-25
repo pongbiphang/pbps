@@ -26,7 +26,7 @@ pbps-ui.workspace = true
 indexmap.workspace = true
 rand.workspace = true
 base64.workspace = true
-tokio = { workspace = true, features = ["macros", "sync"] }
+tokio = { workspace = true, features = ["macros", "sync", "signal"] }
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true

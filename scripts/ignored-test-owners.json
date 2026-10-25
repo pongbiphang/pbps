@@ -2219,6 +2219,26 @@
         "refusal_next_steps::each_drifted_object_prints_three_remedies_without_changing_exit_two_or_json_ids",
         "refusal_next_steps::partial_index_estimates_explain_the_write_lock_and_unfiltered_neighbours_do_not"
       ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "dev587::shared_entry_stages_externals_before_baseline_and_empties_supplied_scratch",
+        "dev587::supplied_scratch_refuses_foreign_contents_without_creating_or_cleaning_them",
+        "dev587::supplied_scratch_refuses_nonfresh_options_before_setup",
+        "dev587::inherited_model_objects_refuse_run_owned_rehearsal_and_release_resources",
+        "dev587::rehearsal_signals_empty_supplied_scratch_and_remove_owned_databases_only"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "rehearsal",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes"]
     }
   ]
 }

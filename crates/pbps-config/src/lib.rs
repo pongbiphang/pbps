@@ -243,10 +243,8 @@ pub struct Hooks {
 /// # Why it is always optional
 ///
 /// The air-gap promise stands: with no dev database the preview degrades to
-/// lightweight normalization and says so. This differs from Atlas, where a dev
-/// database is required for many operations — and the difference is deliberate,
-/// because a tool that cannot answer without Docker cannot be used where this
-/// one has to be.
+/// lightweight normalization and says so. A preview remains available wherever
+/// Docker and a database connection are unavailable.
 ///
 /// A dev-verified plan is still a **preview**. Applyable plans come only from
 /// `plan --db` against the target, and this does not move that line.
@@ -254,35 +252,26 @@ pub struct Hooks {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(deny_unknown_fields)]
-// Both fields are individually optional in Rust because serde has to read the
-// file before it can say which one is present — but `dev::spec` requires
-// **exactly one**, and refuses `dev: {}` and a block naming both. A schema that
-// left the derive's shape alone blessed two pbps.yml files the CLI then cannot
-// run a plan with at all, which is the one thing generating the schema from
-// these types is supposed to prevent (the same reasoning as the module
-// declaration's `oneOf`).
-//
-// Each branch constrains the other key rather than merely requiring its own:
-// `required` alone would accept a file naming both.
-//
-// Pinned to null rather than to `false`, because that is `dev::spec`'s own
-// rule. It reads the two fields after serde, and YAML writes `url_env:` with
-// nothing after it — which serde reports as absent, so a block with a real
-// `docker:` beside an empty `url_env:` resolves perfectly well. `false` would
-// refuse that line: stricter than the tool rather than looser, but still a
-// disagreement, and the same one that had to be fixed in the module schema's
-// branches.
+// The three spellings are exclusive after deserialization; null means absent.
 #[schemars(extend("oneOf" = [
     serde_json::json!({
         "required": ["docker"],
-        "properties": {"docker": {"type": "string"}, "url_env": {"type": "null"}},
+        "properties": {"docker": {"type": "string"}, "url_env": {"type": "null"}, "resolver": {"type": "null"}},
     }),
     serde_json::json!({
         "required": ["url_env"],
-        "properties": {"url_env": {"type": "string"}, "docker": {"type": "null"}},
+        "properties": {"url_env": {"type": "string"}, "docker": {"type": "null"}, "resolver": {"type": "null"}},
+    }),
+    serde_json::json!({
+        "required": ["resolver"],
+        "properties": {"resolver": {"type": "string"}, "docker": {"type": "null"}, "url_env": {"type": "null"}},
     }),
 ]))]
 pub struct Dev {
+    /// A shared entry under `resolvers`, also selectable by connected planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolver: Option<String>,
+
     /// The name of an environment variable holding a connection string to a
     /// throwaway server — never the string itself, for the reason
     /// [`Environment`] gives.
@@ -989,6 +978,17 @@ mod tests {
             c.dev.unwrap().docker.as_deref(),
             Some("mcr.microsoft.com/mssql/server:2022-latest")
         );
+    }
+
+    #[test]
+    fn dev_and_resolver_select_one_configured_entry() {
+        let c = Config::parse("dialect: mssql\nresolvers:\n  scratch: {kind: server, url_env: SCRATCH, externals: externals.sql}\nresolve_with: scratch\ndev: {resolver: scratch}\n", Path::new("pbps.yml")).unwrap();
+        let dev = c.dev.as_ref().unwrap().resolver.as_deref().unwrap();
+        assert_eq!(
+            c.select_resolver(Some(dev), None).unwrap().unwrap().profile,
+            c.select_resolver(None, None).unwrap().unwrap().profile
+        );
+        assert!(c.select_resolver(Some("missing"), None).is_err());
     }
 
     /// A connection string in the file would be a credential in version

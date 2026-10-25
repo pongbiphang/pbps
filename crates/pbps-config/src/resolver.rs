@@ -454,8 +454,9 @@ pub struct ResolverSelection {
 }
 
 impl Config {
-    /// Pure precedence lookup. Call only for target planning; offline commands
-    /// do not need to resolve a default, much less read its credentials.
+    /// Pure precedence lookup. Connected planning uses target-aware precedence;
+    /// preview rehearsal passes its explicit shared-entry name with no environment.
+    /// Offline checks neither resolve defaults nor read credentials.
     pub fn select_resolver(
         &self,
         cli: Option<&str>,

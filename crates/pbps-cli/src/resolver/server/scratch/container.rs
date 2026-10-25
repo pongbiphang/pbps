@@ -10,6 +10,8 @@
 //! Podman through its compatible command or socket (`DOCKER_HOST`).
 
 use super::super::{Error, ProduceError, engine};
+
+mod startup;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};
 use std::time::Duration;
@@ -35,6 +37,16 @@ pub async fn with_container<T>(
     run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
 ) -> Result<T, ProduceError> {
     bind_target(driver, target_connection, planned_identity).await?;
+    with_started(driver, image, pull, run).await
+}
+
+/// The same acquisition without a target binding, for preview rehearsal.
+pub async fn with_started<T>(
+    driver: Driver,
+    image: &str,
+    pull: PullPolicy,
+    run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
+) -> Result<T, ProduceError> {
     acquire(image, pull).await?;
     let container = Container::start(driver, image).await?;
     let outcome = match container.ready(driver, READY).await {
@@ -111,6 +123,7 @@ struct Container {
     engine: engine::Docker,
     /// Set once `remove` confirmed it gone, so the drop guard stands down.
     removed: bool,
+    password: String,
 }
 
 impl Container {
@@ -125,6 +138,10 @@ impl Container {
             connection: String::new(),
             engine,
             removed: false,
+            password: match driver {
+                Driver::Mssql => pbps_mssql::resolver::scratch::password(&password),
+                Driver::Postgres => password.clone(),
+            },
         };
         let args = run_args(&container.id, &container.engine, image);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -168,6 +185,11 @@ impl Container {
     /// The deadline bounds each attempt too: a server that accepts TCP and
     /// then stalls in its handshake would otherwise hold the run past it.
     async fn ready(&self, driver: Driver, within: Duration) -> Result<(), ProduceError> {
+        if driver == Driver::Mssql {
+            return startup::ready(&self.connection, &self.id, &self.password)
+                .await
+                .map_err(|e| ProduceError::Acquire(e.to_string()));
+        }
         let deadline = tokio::time::Instant::now() + within;
         loop {
             let attempt = async {
@@ -574,6 +596,7 @@ mod tests {
             engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
             // Nothing was started: the drop guard has nothing to remove.
             removed: true,
+            password: String::new(),
         };
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -613,10 +636,23 @@ mod tests {
 
     #[test]
     fn only_one_loopback_mapping_is_a_published_port() {
-        assert_eq!(published_port("127.0.0.1:41417\n", 5432), Ok(41417));
+        for (text, port) in [
+            ("127.0.0.1:1", 1),
+            ("127.0.0.1:41417\n", 41417),
+            ("127.0.0.1:65535\r\n", 65535),
+        ] {
+            assert_eq!(published_port(text, 5432), Ok(port));
+        }
         // Negative: a public, IPv6, zero or second bind is not.
         for text in [
             "0.0.0.0:49154",
+            "invalid IP:45887",
+            "[::1]:49154",
+            "127.0.0.1:65536",
+            "127.0.0.1:+1",
+            "127.0.0.1:-1",
+            "garbage",
+            "127.0.0.1:41417\n127.0.0.1:41418\n",
             "[::]:49154",
             "127.0.0.1:0",
             "127.0.0.1:",
