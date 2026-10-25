@@ -119,6 +119,41 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
     assert!(options::supplied_reference(&mut conn).await.is_ok());
 }
 
+/// Express (and LocalDB, which is Express) creates every database with
+/// AUTO_CLOSE ON whatever model says, so a supplied scratch's reference must
+/// predict it; a prediction from model alone refuses every fresh database.
+#[tokio::test]
+#[ignore = "needs a second live SQL Server; set PBPS_TEST_EXPRESS_DB (see scripts/live-tests.sh)"]
+async fn an_express_supplied_reference_predicts_a_fresh_database_exactly() {
+    let express = std::env::var("PBPS_TEST_EXPRESS_DB").expect(
+        "PBPS_TEST_EXPRESS_DB is not set; this test needs the Express server scripts/live-tests.sh starts",
+    );
+    let mut conn = connect_live(&express).await.unwrap();
+    let name = format!("pbps2377_express_{}", std::process::id());
+    let reference = options::supplied_reference(&mut conn).await.unwrap();
+    conn.execute(&format!("CREATE DATABASE [{name}];"))
+        .await
+        .unwrap();
+    // Acquisition reads the options from inside the database. Idle, Express
+    // closes it and reports it cleanly shut down (measured), which describes
+    // that moment, not the database.
+    let inside = connect_live(&format!("{express};Database={name}")).await;
+    let actual = options::read(&mut conn, &name).await;
+    drop(inside);
+    conn.execute(&format!(
+        "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+    ))
+    .await
+    .unwrap();
+    let actual = actual.unwrap();
+    assert_eq!(
+        options::differences(&actual, &reference),
+        Vec::<String>::new()
+    );
+    // The edition rule is what made it match: model itself says OFF.
+    assert_eq!(model_row(&mut conn).await["is_auto_close_on"], false);
+}
+
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn scratch_inventory_reads_every_catalog_and_cleans_contained_dependencies() {

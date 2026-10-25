@@ -34,6 +34,7 @@ EPHEMERAL_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 EXPRESS_INVENTORY = {
     ("test", "-p", "pbps-mssql", "--test", "live", "--"): {
         "binding619::a_global_temporary_table_marks_one_instance_to_every_login_on_it",
+        "scratch2236::an_express_supplied_reference_predicts_a_fresh_database_exactly",
         "resolver_tests::editions611::a_real_express_target_is_an_edition_limitation_and_its_server_collation_a_mismatch",
     },
     ("test", "-p", "pbps-cli", "--test", "flow", "--"): {

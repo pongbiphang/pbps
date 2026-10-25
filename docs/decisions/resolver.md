@@ -4614,6 +4614,14 @@ connection string can name the instance but never its endpoint.
   `WINDOWS GROUP` entry exactly when it is DENY ONLY. A GRANT-capable group,
   another login and every other kind still refuse. The LocalDB job prints the
   whole token it measured.
+- **Express creates databases with AUTO_CLOSE ON (measured on 17.0.4075.5).**
+  Whatever model says, CREATE DATABASE on EngineEdition 4 sets AUTO_CLOSE
+  ON, and LocalDB is that edition. A supplied scratch's reference therefore
+  predicts `is_auto_close_on` true there. Predicting from model alone refused
+  every fresh LocalDB database. Every other `sys.databases` column of a fresh
+  Express database matched the existing prediction. Idle, an AUTO_CLOSE
+  database reports `is_cleanly_shutdown` 1, but acquisition reads the
+  options from inside the database, where it is 0.
 - **Not widened.** The platform comparison is unchanged: a Linux target with a
   Windows LocalDB scratch stays a named platform mismatch, and major 16 is not
   admitted. Edition differences remain recorded limitations (§9).

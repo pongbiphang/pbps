@@ -361,7 +361,9 @@ jobs:
       - name: the SQL Server resolver fixtures and live regressions
         run: |
           source scripts/resolver-mssql-fixtures.sh
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236
+          # The Express case needs the edition job's second server.
+          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 \
+            --skip an_express_supplied_reference_predicts_a_fresh_database_exactly
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 externals2269
@@ -476,15 +478,17 @@ jobs:
             -e "MSSQL_SA_PASSWORD=Pbps!Ci12345" -p 14331:1433 "$IMAGE" >/dev/null
           await pbps-ci-mssql-express Latin1_General_100_CS_AS
       # A name filter that matches nothing passes with zero tests, so the run
-      # is required to have run the two tests this job exists for: the edition
-      # comparison and the instance marker (#619).
+      # is required to have run the three tests this job exists for: the
+      # edition comparison, the instance marker (#619) and Express's fresh
+      # database options (#2377).
       - name: the edition tests
         run: |
           set -o pipefail
           cargo test -p pbps-mssql --test live -- --ignored \
             a_real_express_target_is_an_edition_limitation \
-            a_global_temporary_table_marks_one_instance_to_every_login_on_it | tee edition.log
-          grep -q "test result: ok. 2 passed" edition.log
+            a_global_temporary_table_marks_one_instance_to_every_login_on_it \
+            an_express_supplied_reference_predicts_a_fresh_database_exactly | tee edition.log
+          grep -q "test result: ok. 3 passed" edition.log
       # And the CLI's answer to an online strategy Express cannot run (#574).
       - name: the connected online-edition refusal
         run: |
