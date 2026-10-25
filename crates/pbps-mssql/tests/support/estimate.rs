@@ -22,6 +22,7 @@ fn retype(table: &str, column: &str, from: &str, to: &str) -> PlannedChange {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     })
 }
 

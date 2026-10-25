@@ -78,6 +78,7 @@ async fn check(connection: String, owner: String) {
         to_nullable: true,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     let changes = ChangeSet {
         changes: vec![

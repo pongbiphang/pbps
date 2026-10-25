@@ -2822,6 +2822,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: cs.clone(),
             to_collation: cs.clone(),
+            using: None,
         });
         assert!(
             retyped[0]
@@ -2936,6 +2937,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert_eq!(sql.len(), 1);
         assert!(sql[0].contains("ALTER TABLE [dbo].[t] ALTER COLUMN [amount] bigint NOT NULL;"));

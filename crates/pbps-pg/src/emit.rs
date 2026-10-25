@@ -3630,6 +3630,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             from_nullable,
             to_nullable,
             through_external_partitions,
+            using,
             ..
         } => {
             let normalized = types::normalize(to)?;
@@ -3653,6 +3654,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // a cast pbps chose, which is a data transformation nobody
             // declared, nobody reviewed and nobody can find in git.
             //
+            // The one exception is a conversion a human recorded for exactly
+            // this change (`pbps convert`, DEC-2331.1): it is the declared,
+            // reviewed transformation that section names, so the refusals
+            // below that ask for one do not apply, and its expression is the
+            // only text a `USING` is ever made from.
+            //
             // Both ends normalized first, and that is not a formality: the
             // catalogue's families are keyed on the spelling the engine gives
             // back, so `varchar(10)` unnormalized is a type it does not know
@@ -3662,7 +3669,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // is safe, and nowhere else yet (#1167, DEC-1167.1): narrowing one
             // needs element-wise probes over NULL arrays, NULL elements,
             // bounds and shape, which nothing counts today.
-            if (was.is_array() || normalized.is_array())
+            if using.is_none()
+                && (was.is_array() || normalized.is_array())
                 && was.is_array() == normalized.is_array()
                 && types::change_risk(&was, &normalized) != pbps_dialect::TypeChangeRisk::Safe
             {
@@ -3676,18 +3684,23 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     normalized = normalized.shown(),
                 )));
             }
-            if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
+            if using.is_none()
+                && types::change_risk(&was, &normalized)
+                    == pbps_dialect::TypeChangeRisk::Incompatible
+            {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{}` to `{normalized}`: this engine \
                      refuses the conversion outright -- `column \"{}\" cannot be cast \
                      automatically` -- and its remedy is a `USING` clause, which pbps does not \
                      emit. A `USING` expression says what the data becomes, and that is a \
                      transformation to declare and review, not one for a tool to choose \
-                     (ADR-0012 section 5). Add the new column, fill it in a declared step, and drop the \
-                     old one.",
+                     (ADR-0012 section 5). Record the conversion with `pbps convert {} --using -` \
+                     (the expression is read from standard input) and plan again, or add the new \
+                     column, fill it in a declared step, and drop the old one.",
                     column.name.shown(),
                     types::normalize(from)?.shown(),
                     column.name.shown(),
+                    column.shown(),
                     normalized = normalized.shown(),
                 )));
             }
@@ -3706,16 +3719,18 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // stored value in that zone is exactly the undeclared
             // transformation ADR-0012 §5 refuses. Whether the recorded zone
             // changes that answer is #1919.
-            if types::depends_on_the_session_time_zone(&was, &normalized) {
+            if using.is_none() && types::depends_on_the_session_time_zone(&was, &normalized) {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{was}` to `{normalized}`: the \
                      conversion gains or loses the time zone, and what each stored value \
                      becomes is then read from a session setting rather than from anything \
                      declared -- the same value converts to a different instant depending on \
                      the zone the applying session happens to hold. Say what the values mean \
-                     instead: add the new column, fill it in a declared step with the zone \
-                     written out (`AT TIME ZONE \'...\'`), and drop the old one.",
+                     instead: record the conversion with the zone written out in it \
+                     (`pbps convert {} --using -`, `AT TIME ZONE \'...\'`), or add the new column, \
+                     fill it in a declared step with the zone written out, and drop the old one.",
                     column.name.shown(),
+                    column.shown(),
                     was = was.shown(),
                     normalized = normalized.shown(),
                 )));
@@ -3726,8 +3741,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // so restating it always would put a line in plan.sql that changes
             // nothing.
             let mut parts = vec![format!(
-                "ALTER COLUMN {} TYPE {normalized}",
+                "ALTER COLUMN {} TYPE {normalized}{}",
                 quote(column.name.raw())?,
+                using
+                    .as_ref()
+                    .map(|expression| format!(" USING {expression}"))
+                    .unwrap_or_default(),
                 normalized = normalized.raw(),
             )];
             if from_nullable != to_nullable {
@@ -7148,6 +7167,7 @@ mod tests {
             through_external_partitions: through,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         for change in [nullability(true, true), retype(false, true)] {
             let sql = sql_of(&pg, &change);
@@ -7240,6 +7260,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         for (from, to) in [("int[]", "bigint[]"), ("varchar(10)[]", "varchar(20)[]")] {
             let sql = sql_of(&pg, &change(from, to)).join("\n");
@@ -7289,6 +7310,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: collation.clone(),
+                using: None,
             },
             Change::AlterColumnNullability {
                 uid: Uid::generate(UidKind::Column),
@@ -9144,6 +9166,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         }
     }
 

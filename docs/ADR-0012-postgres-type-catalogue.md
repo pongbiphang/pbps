@@ -279,6 +279,12 @@ is not obviously the better behaviour — it is the same decision taken by
 something that cannot be reviewed. Revisit if a real user is blocked; the
 replacement is a declared transformation with its own ADR, not a flag.
 
+*Amended by [DEC-2331.1](decisions/types-and-probes.md#dec-2331-1): that
+declared transformation exists. An expression a person recorded for one column
+and one `from` to `to` pair (`pbps convert`) is the only source of a `USING`
+clause. pbps still never chooses a cast, and every change without a record keeps
+this refusal.*
+
 ## 6. Two introspection traps, measured
 
 - **A dropped column does not leave.** After `DROP COLUMN gone`:

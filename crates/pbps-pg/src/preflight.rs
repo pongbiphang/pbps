@@ -426,6 +426,10 @@ struct AsStored<'v, 'p> {
     /// whole probe with it, and the runner reports the probe as unchecked
     /// rather than as a violation.
     retyped_from: BTreeMap<ColumnRef, pbps_model::ColumnType>,
+    /// The retyped columns whose new value is a recorded conversion's
+    /// expression (#2331), not the stored value cast to the new type. A probe
+    /// that reads such a column would read a value the plan never stores.
+    recorded: BTreeSet<ColumnRef>,
     /// The type of every column a row change of this plan carries a type
     /// for, as the plan leaves it: a literal the probe compares against
     /// another literal is compared through it (DECISIONS 341).
@@ -583,6 +587,7 @@ impl<'v, 'p> AsStored<'v, 'p> {
             columns_added: Default::default(),
             retyped: Default::default(),
             retyped_from: Default::default(),
+            recorded: Default::default(),
             column_types: Default::default(),
             recomputed: Default::default(),
             attached: Default::default(),
@@ -666,10 +671,17 @@ impl<'v, 'p> AsStored<'v, 'p> {
                         .insert(table.column(name), AddedColumn::of(column));
                 }
                 Event::AlterColumnType {
-                    column, from, to, ..
+                    column,
+                    from,
+                    to,
+                    using,
+                    ..
                 } => {
                     this.retyped.insert(column.clone(), to.clone());
                     this.retyped_from.insert(column.clone(), from.clone());
+                    if using.is_some() {
+                        this.recorded.insert(column.clone());
+                    }
                 }
                 Event::AlterColumnExpression { column, .. } => {
                     this.recomputed.insert(column.clone());
@@ -739,6 +751,20 @@ impl<'v, 'p> AsStored<'v, 'p> {
         reach(&mut self.retyped, partitions);
         reach(&mut self.retyped_from, partitions);
         reach(&mut self.column_types, partitions);
+        // The partitions' columns hold the parent's converted values, so a
+        // key probe over one must leave them unchecked as it does the parent's
+        // (#2331); `retyped` alone would send it a plain cast of the old text.
+        let recorded: Vec<ColumnRef> = self
+            .recorded
+            .iter()
+            .flat_map(|c| {
+                partitions
+                    .of_parent(&c.table)
+                    .iter()
+                    .map(|p| p.column(&c.name))
+            })
+            .collect();
+        self.recorded.extend(recorded);
         let recomputed: Vec<ColumnRef> = self
             .recomputed
             .iter()
@@ -2598,6 +2624,14 @@ fn rows_after(
     // plan gives the column where it gives it one.
     let projected = |i: usize, column: &str, sql: String| -> Option<String> {
         let reference = table.column(column);
+        // A recorded conversion's value is its expression's, which is written
+        // over the table's own row and cannot be re-spelled over this alias
+        // without rewriting its text (#2331). The key is left unchecked, and
+        // the engine enforces it during the apply, as for any key this module
+        // cannot spell.
+        if names.recorded.contains(&reference) {
+            return None;
+        }
         match (
             names.retyped_from.get(&reference),
             names.retyped.get(&reference),
@@ -3189,6 +3223,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             to,
             from_nullable,
             to_nullable,
+            using,
             ..
         } => {
             let Some(stored) = names.column(column) else {
@@ -3197,6 +3232,81 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             let table = qualified(&stored.table)?;
             let quoted = quote(stored.name.raw())?;
             let mut out = Vec::new();
+            // A recorded conversion is evaluated over every stored row, and
+            // the probe fails when the engine does: a value the expression
+            // cannot convert refuses the plan by name before the first
+            // statement runs (DEC-2331.1). Instead of the family's own probe
+            // below, which asks whether a value survives the engine's cast
+            // and is not the cast the expression performs. The count is
+            // always zero: the query is the evaluation, and `count` of the
+            // expression is what makes the engine compute it for each row
+            // rather than plan it away.
+            //
+            // **What the engine stores is the expression assigned to the new
+            // type**, so the query casts it to that exact type, typmod
+            // included: `amount::bigint` into a `smallint` raises on 40000
+            // and the bare expression does not (round 1 review). The cast is
+            // explicit and the `ALTER` is an assignment, and they part on a
+            // bounded string, where the cast truncates and the `ALTER`
+            // refuses (see `types::cannot_become`). That target gets the
+            // count of rows the assignment would refuse, beside the cast.
+            if let Some(expression) = using {
+                let Ok(target) = crate::types::normalize(to) else {
+                    unchecked.push(Unchecked::for_change(
+                        change,
+                        "the conversion's target type cannot be normalized",
+                    ));
+                    return Ok(out);
+                };
+                let value = format!("({expression})");
+                out.push(
+                    Probe::new(
+                        format!(
+                            "the conversion `USING {}` of {column}",
+                            pbps_model::escape::Escaped(expression),
+                            column = column.shown(),
+                        ),
+                        format!(
+                            "SELECT (0 * count(CAST({value} AS {target})))::int AS n FROM {table};",
+                            target = target.raw(),
+                        ),
+                    )
+                    .refusing_when_it_fails(),
+                );
+                if let Some(refused) = crate::types::assignment_refuses(&target, &value) {
+                    out.push(Probe::new(
+                        format!(
+                            "values the conversion `USING {}` of {column} makes that {to} would refuse",
+                            pbps_model::escape::Escaped(expression),
+                            column = column.shown(),
+                            to = target.shown(),
+                        ),
+                        format!(
+                            "SELECT {} AS n FROM {table}\n WHERE {value} IS NOT NULL AND ({refused});",
+                            saturated_count("count(*)")
+                        ),
+                    ));
+                }
+                // The converted value is what `NOT NULL` meets, so the NULLs
+                // counted are the expression's, not the stored column's: a
+                // `coalesce` that fills them is a valid plan (round 1
+                // review). Read through the same expression, so a row it
+                // cannot convert fails here by the same name.
+                //
+                // Whenever the target is `NOT NULL`, **not only when this
+                // plan tightens it** (round 4 review). A column that is
+                // already required holds no NULL, but `nullif(amount, '')::
+                // integer` makes one from a stored value, the engine refuses
+                // it, and the `count` above ignores a NULL result. "The stored
+                // column already satisfied it" is true of the old value and
+                // says nothing about the new one.
+                if !*to_nullable {
+                    out.push(
+                        null_probe(column, &table, &value).refusing_when_it_fails(),
+                    );
+                }
+                return Ok(out);
+            }
             // One `ALTER TABLE` takes both subcommands (ADR-0011 Amendment 1),
             // so a type change that also tightens the column carries the other
             // change's probe too.
@@ -5491,6 +5601,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let columns = vec![pbps_model::ColumnName::from("v")];
         let constraints = [
@@ -6306,6 +6417,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
                 pbps_model::PlannedChange::new(create.clone()),
             ],
@@ -6377,6 +6489,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
             ),
             (
@@ -6554,6 +6667,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
 
         let alone = probes(&set(vec![check(&table)]));
@@ -6620,6 +6734,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let plan = set(vec![retype.clone(), check.clone()]);
         let told = probes_with(&plan, &partitions);
@@ -7038,6 +7153,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let plan = |retype_change: Change| {
             set(vec![
@@ -7189,6 +7305,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AddForeignKey {
                 table: child.clone(),
@@ -7256,6 +7373,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AddForeignKey {
                 table: child.clone(),

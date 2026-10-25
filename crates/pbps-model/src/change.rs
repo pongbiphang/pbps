@@ -397,6 +397,15 @@ pub enum Change {
         /// bring it back (DEC-1533.1).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         through_external_partitions: bool,
+        /// The expression a human recorded for exactly this `from` to `to`
+        /// change (`pbps convert`, #2331), verbatim. The only source of a
+        /// `USING` clause (ADR-0012 section 5, DEC-2331.1): the differ copies
+        /// it from the identity file when the change is the one the record
+        /// names, and it is sealed by the plan's checksum like the rest of the
+        /// change. Absent for every other change, so a plan without a
+        /// conversion serializes as it did before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        using: Option<String>,
     },
     AlterColumnNullability {
         uid: Uid,
@@ -3149,6 +3158,13 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
                 not_null: false, ..
             } => {}
         }
+        // A recorded conversion rewrites every stored value by an expression
+        // nobody but its author has read, so the type pair's own class is not
+        // the whole of it: at least the class that asks for a human, whichever
+        // pair the expression bridges (DEC-2331.1).
+        if matches!(self, Change::AlterColumnType { using: Some(_), .. }) {
+            r.insert(RiskClass::Destructive);
+        }
         r
     }
 }
@@ -3632,6 +3648,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         assert!(
             c.intrinsic_risks().is_empty(),
@@ -3640,6 +3657,43 @@ mod tests {
 
         let planned = PlannedChange::new(c).with_risk(RiskClass::Narrowing);
         assert!(planned.risks.contains(&RiskClass::Narrowing));
+    }
+
+    /// #2331: a recorded conversion is sealed in the change itself, so the
+    /// plan's checksum covers the expression, and it asks for a human whatever
+    /// pair of types it bridges. A change without one serializes as it always
+    /// did, so no existing plan changes its checksum.
+    #[test]
+    fn a_recorded_conversion_is_sealed_in_the_change_and_asks_for_a_human() {
+        let make = |using: Option<&str>| Change::AlterColumnType {
+            uid: uid("c_k7x2mq"),
+            column: col("dbo.customer.balance"),
+            from: ty("varchar(10)"),
+            to: ty("varchar(20)"),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+            using: using.map(str::to_owned),
+        };
+        let widening = make(None);
+        assert!(widening.intrinsic_risks().is_empty());
+        assert!(!serde_json::to_string(&widening).unwrap().contains("using"));
+        let converting = make(Some("upper(balance)"));
+        assert_eq!(
+            converting.intrinsic_risks(),
+            BTreeSet::from([RiskClass::Destructive]),
+            "even a widening is value-changing under an expression"
+        );
+        let json = serde_json::to_string(&converting).unwrap();
+        assert!(json.contains(r#""using":"upper(balance)""#), "{json}");
+        assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), converting);
+        assert_ne!(
+            serde_json::to_string(&make(Some("lower(balance)"))).unwrap(),
+            json,
+            "editing the expression changes what the checksum covers"
+        );
     }
 
     /// A type change that also tightens nullability carries the not-null risk:
@@ -3657,6 +3711,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         assert!(
             make(true, false)
@@ -3947,6 +4002,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Change::AlterColumnNullability {
                 uid: uid("c_p3n8vd"),

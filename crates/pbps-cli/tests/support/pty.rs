@@ -124,6 +124,8 @@ mod tests {
                 "a_terminal_turns_the_prompt_on_and_the_answer_is_recorded",
                 "the_prompt_keeps_asking_until_every_ambiguity_is_answered",
                 "stopping_part_way_through_the_loop_still_records_nothing",
+                "a_terminal_asks_for_the_conversion_and_the_typed_expression_is_recorded",
+                "a_blank_answer_records_nothing_and_the_example_is_not_a_default",
             ] {
                 let out = Command::new(&timeout)
                     .args(["--kill-after=5s", "15s"])

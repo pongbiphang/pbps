@@ -187,6 +187,7 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         },
     ]
     .into_iter()

@@ -430,15 +430,34 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
     if let Some(live) = Live::of(policies, rules::CHANGE_NARROWING_ON_DATA, ctx) {
         for (i, p) in cs.changes.iter().enumerate() {
             if let Change::AlterColumnType {
-                column, from, to, ..
+                column,
+                from,
+                to,
+                using,
+                ..
             } = &p.change
                 && p.risks.contains(&RiskClass::Narrowing)
             {
                 let subject = column.table.raw().to_string();
-                // An array's element change has no probe: it is supported only
-                // where every element keeps its value, and refused when the
-                // plan is written against a database otherwise (#1167).
-                let message = if from.is_array() || to.is_array() {
+                // A recorded conversion (#2331) is read over every row by the
+                // pre-flight probe, an array's included, so the array
+                // sentence below, which says the plan is refused, would be
+                // false for it.
+                //
+                // An array's element change with no record has no probe: it
+                // is supported only where every element keeps its value, and
+                // refused when the plan is written against a database
+                // otherwise (#1167).
+                let message = if using.is_some() {
+                    format!(
+                        "{column}: {from} -> {to} is converted by the recorded expression; \
+                         the pre-flight probe evaluates it over every row before the first \
+                         statement runs",
+                        column = column.shown(),
+                        from = from.shown(),
+                        to = to.shown(),
+                    )
+                } else if from.is_array() || to.is_array() {
                     format!(
                         "{column}: {from} -> {to} narrows or converts an array's elements, \
                          which pbps does not do: the plan is refused when it is computed \
@@ -708,6 +727,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })
         .with_risk(RiskClass::Narrowing);
         let add = PlannedChange::new(Change::AddColumn {
@@ -1149,6 +1169,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         assert!(
             !widen_and_tighten.risks.contains(&RiskClass::Narrowing),
@@ -1212,6 +1233,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })
         .with_risk(RiskClass::Narrowing);
         let grant = PlannedChange::new(Change::Grant {
@@ -1286,6 +1308,38 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_conversion_is_not_described_as_refused() {
+        for (using, refused) in [(None, true), (Some("n::integer[]".to_owned()), false)] {
+            let mut change = PlannedChange::new(Change::AlterColumnType {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: table().column("n"),
+                from: ColumnType::simple("bigint").into_array(),
+                to: ColumnType::simple("integer").into_array(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+                using,
+            });
+            change.risks.insert(RiskClass::Narrowing);
+            let findings = plan(&cs(vec![change]), &Policies::default(), &ctx());
+            let message = &findings
+                .iter()
+                .find(|(_, f)| f.id == "change.narrowing-on-data")
+                .unwrap()
+                .1
+                .message;
+            assert_eq!(message.contains("is refused"), refused, "{message}");
+            assert_eq!(
+                message.contains("recorded expression"),
+                !refused,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn policy_type_messages_show_names_without_changing_saved_plan_data() {
         let raw = "type\n\\\u{1b}\"名前";
         let canonical = "app.\"type\n\\\u{1b}\"\"名前\"";
@@ -1307,6 +1361,7 @@ mod tests {
                 from_collation: None,
                 to_collation: None,
                 through_external_partitions: false,
+                using: None,
             });
             change.risks.insert(RiskClass::Narrowing);
             let findings = plan(&cs(vec![change.clone()]), &Policies::default(), &ctx());

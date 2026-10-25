@@ -95,6 +95,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         },
     ];
     let mut plan = SavedPlan::new(
@@ -393,6 +394,7 @@ fn estimate_type_descriptions_are_shown_prose() {
         from_collation: None,
         to_collation: None,
         through_external_partitions: false,
+        using: None,
     };
     let changes = vec![PlannedChange::new(change)];
     let ids = IdsFile {

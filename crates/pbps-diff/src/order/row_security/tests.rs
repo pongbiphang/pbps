@@ -115,6 +115,7 @@ fn policy_drop_only_plans_release_modules_and_columns_before_teardown() {
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         },
     );
 }

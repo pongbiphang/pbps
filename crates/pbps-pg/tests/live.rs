@@ -1112,6 +1112,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let changes = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(change)],
@@ -3449,6 +3450,7 @@ async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bit
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     let pg = Postgres::new();
     let risk = |from: &str, to: &str| {
@@ -9865,6 +9867,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Strategy::default(),
         )
@@ -9885,6 +9888,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Strategy::default(),
         )
@@ -11122,6 +11126,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Strategy::default(),
         )
@@ -11173,6 +11178,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
                 Strategy::default(),
             )
@@ -11195,6 +11201,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Strategy::default(),
         )
@@ -11375,6 +11382,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
 
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
@@ -23214,6 +23222,7 @@ fn narrowing_projection_change(column: &str, from: &str, to: &str) -> pbps_model
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     }
 }
 
@@ -27410,6 +27419,7 @@ async fn planned_key_collation_guards_use_renamed_added_created_and_retyped_colu
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
                 _ => unreachable!(),
             }
@@ -29656,6 +29666,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         },
     ];
     let cs = ChangeSet {
@@ -29969,6 +29980,7 @@ async fn integer_narrowing_conversion_probes_match_both_engine_boundaries() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })],
         };
         for (value, rejected) in [(min - 1, true), (min, false), (max, false), (max + 1, true)] {
@@ -30061,6 +30073,7 @@ async fn a_value_a_cast_would_truncate_is_one_the_alter_refuses() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     let cs = ChangeSet {
         changes: vec![PlannedChange::new(narrow("varchar(4)"))],
@@ -31682,6 +31695,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
@@ -31756,6 +31770,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     assert!(
         matches!(
@@ -31969,6 +31984,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let ours = one_estimate(&change, Strategy::default())
             .expect("every column change has an estimate")
@@ -32023,6 +32039,7 @@ async fn a_temporal_precision_change_is_estimated_as_the_engine_rebuilds_it() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         };
         let mut ours = one_estimate(&change, Strategy::default()).expect("an estimate");
         pbps_pg::estimate::against(&mut conn, &mut ours)
@@ -32091,6 +32108,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
 
     let folded = Change::AlterColumnType {
@@ -32103,6 +32121,7 @@ async fn a_change_that_rebuilds_nothing_may_still_read_every_row() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
 
     for (change, expected_reads, sql) in [
@@ -32307,6 +32326,7 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     let mut ours = one_estimate(&change, Strategy::default()).unwrap();
     against(&mut db, &mut ours).await.unwrap();
@@ -32555,6 +32575,7 @@ async fn the_lock_each_statement_takes_is_the_one_the_estimate_names() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE bigint"),
         ),
@@ -32693,6 +32714,7 @@ async fn a_shape_the_measurements_never_covered_is_not_answered_from_them() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
 
     // The static answer is the same for all of them, and the table decides
@@ -32791,6 +32813,7 @@ async fn index_expressions_and_predicates_keep_unmeasured_costs_unknown() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             };
             let mut estimate = one_estimate(&change, Strategy::default()).unwrap();
             assert_eq!(estimate.rewrite, Rewrite::Yes);
@@ -33028,6 +33051,7 @@ async fn a_length_probe_is_measured_in_the_session_the_statement_will_run_in() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })
     };
     let cs = ChangeSet {
@@ -33140,6 +33164,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             }),
             PlannedChange::new(Change::AlterColumnNullability {
                 uid: "c_bbbbbb".parse().unwrap(),
@@ -33159,6 +33184,7 @@ async fn estimate_provenance_follows_renamed_columns_for_indexes_and_checks() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             }),
         ],
     };
@@ -33354,6 +33380,7 @@ async fn an_estimate_for_a_renamed_table_is_measured_against_the_one_that_exists
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             }),
         ],
     };
@@ -33424,6 +33451,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
 
     // The probe this plan would have produced, had the skip not been there.
@@ -33530,6 +33558,7 @@ async fn a_date_the_engine_carries_across_is_not_counted_out_of_range() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })],
         };
         let measured = counts(&mut conn, &cs).await;
@@ -33624,6 +33653,7 @@ async fn a_float_on_the_boundary_is_judged_as_the_engine_judges_it() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })],
         };
         let measured = counts(&mut conn, &cs).await;
@@ -33910,6 +33940,7 @@ async fn a_length_probe_agrees_with_the_engine_for_every_rendering_the_pins_deci
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 })],
             };
             let measured = counts(&mut conn, &cs).await;

@@ -1596,6 +1596,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
                 PlannedChange::new(Change::RenameColumn {
                     uid: "c_aaaaaa".parse().expect("a uid"),
@@ -1616,6 +1617,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
             ],
         };
@@ -1719,6 +1721,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })
         };
         let mut cs = ChangeSet {
@@ -2007,6 +2010,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             },
             Strategy::default(),
         )
@@ -2032,6 +2036,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
                 Strategy::default(),
             )

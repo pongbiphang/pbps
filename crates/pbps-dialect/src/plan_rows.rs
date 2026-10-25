@@ -41,6 +41,9 @@ pub enum Event<'p> {
         to: &'p ColumnType,
         from_collation: &'p Option<Collation>,
         to_collation: &'p Option<Collation>,
+        /// The recorded conversion (#2331): the value the column holds
+        /// afterwards is this expression's, not the stored value's.
+        using: &'p Option<String>,
     },
     AlterColumnExpression {
         column: &'p ColumnRef,
@@ -130,6 +133,7 @@ impl<'p> PlanFacts<'p> {
                     to,
                     from_collation,
                     to_collation,
+                    using,
                     ..
                 } => Event::AlterColumnType {
                     column,
@@ -137,6 +141,7 @@ impl<'p> PlanFacts<'p> {
                     to,
                     from_collation,
                     to_collation,
+                    using,
                 },
                 Change::AlterColumnExpression { column, .. } => {
                     Event::AlterColumnExpression { column }

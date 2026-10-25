@@ -6883,7 +6883,7 @@ pub fn cmd_plan_db(
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
         let created_at = crate::now();
 
-        let resolved = match pbps_diff::resolve_with_annotations(
+        let mut resolved = match pbps_diff::resolve_with_annotations(
             &loaded.schema,
             &ids,
             &loaded.intents,
@@ -6903,6 +6903,10 @@ pub fn cmd_plan_db(
                 bail!("some changes could not be decided automatically");
             }
         };
+        // As `plan` prunes: a record whose type has moved on is stale
+        // identity, and this plan must be computed against what was reviewed
+        // (DEC-2331.1).
+        pbps_diff::conversion::prune(&mut resolved.ids, &loaded.schema, dialect.as_ref());
         if resolved.ids != ids {
             let message = format!(
                 "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
@@ -10184,6 +10188,9 @@ async fn run_probes(
     approved: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
     pin_session(conn, dialect).await?;
+    // A recorded conversion's expression is judged before any probe evaluates
+    // it: the probe would run non-built-in code as the deployer, unvetted.
+    crate::engine::vet_conversions(conn, names.changes()).await?;
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut unchecked = 0usize;
@@ -10214,6 +10221,17 @@ async fn run_probes(
         }
         let rows = match answer {
             Ok(rows) => rows,
+            // The server's text is left out: it quotes the value it could not
+            // convert, and this failure may be recorded (DECISIONS 455).
+            Err(e) if probe.refuses_when_it_fails => {
+                let code = e.server_error_code();
+                failures.push(format!(
+                    "{} fails on a stored row (SQLSTATE {})",
+                    probe.description,
+                    code.as_deref().unwrap_or("unknown")
+                ));
+                continue;
+            }
             Err(e) => {
                 unchecked += 1;
                 eprintln!(
@@ -16218,6 +16236,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         }]);
         refuse(&planned, &before, &retyped).expect("the plan's own change");
 
@@ -17354,6 +17373,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
             )],
         };
@@ -20440,6 +20460,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
             )],
         };
@@ -20496,6 +20517,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 },
             )],
         };
@@ -21429,6 +21451,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })
         };
         let cs = ChangeSet {
@@ -21519,6 +21542,7 @@ mod tests {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             })],
         };
         let found = key_type_changes_over_aliases(&cs, &declared, &rows, &final_ids, &live_ids);
@@ -22180,6 +22204,7 @@ mod tests {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         });
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
@@ -22384,6 +22409,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
             ],
         };

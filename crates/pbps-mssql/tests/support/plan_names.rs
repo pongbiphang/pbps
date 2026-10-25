@@ -27,6 +27,7 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
         from_collation: None,
         to_collation: None,
         through_external_partitions: false,
+        using: None,
     });
     let existing = [widen.clone()];
     let names = PlanNames::of(&existing, &after).unwrap();

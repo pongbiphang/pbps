@@ -271,6 +271,8 @@ fn historical_ids(
     // Complete live names without replacing this snapshot's version or intent.
     // Spell every field so new identity metadata requires a preservation choice.
     ids.moves.retain(|uid, _| observed.tables.contains_key(uid));
+    ids.conversions
+        .retain(|uid, _| observed.columns.contains_key(uid));
     pbps_model::IdsFile {
         version: ids.version,
         tables: observed.tables,
@@ -280,6 +282,7 @@ fn historical_ids(
         tombstones: ids.tombstones,
         moves: ids.moves,
         rebuilds: ids.rebuilds,
+        conversions: ids.conversions,
     }
 }
 
@@ -1153,6 +1156,13 @@ mod tests {
             reason: "selected snapshot permission".into(),
             operator: "selected".into(),
         };
+        let conversion = pbps_model::Conversion {
+            from: "int".into(),
+            to: "bigint".into(),
+            using: "code::bigint".into(),
+            allowed_at: "2026-10-24".into(),
+            operator: "selected".into(),
+        };
         let mut recorded = pbps_model::IdsFile {
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [
@@ -1209,6 +1219,9 @@ mod tests {
                 },
             )]
             .into(),
+            conversions: ["c_aaaaaa", "c_bbbbbb"]
+                .map(|uid| (uid.parse().unwrap(), conversion.clone()))
+                .into(),
         };
         recorded.clone().validated().unwrap();
         let mut other = recorded.clone();
@@ -1224,12 +1237,17 @@ mod tests {
             .rebuilds
             .values_mut()
             .for_each(|entry| entry.operator = "other".into());
+        other
+            .conversions
+            .values_mut()
+            .for_each(|entry| entry.using = "other".into());
         let selected = recorded.clone();
         recorded.tables.remove(&"t_bbbbbb".parse().unwrap());
         recorded.columns.remove(&"c_bbbbbb".parse().unwrap());
         recorded.roles.remove(&"r_bbbbbb".parse().unwrap());
         recorded.types.remove(&"y_bbbbbb".parse().unwrap());
         recorded.moves.remove(&"t_bbbbbb".parse().unwrap());
+        recorded.conversions.remove(&"c_bbbbbb".parse().unwrap());
         assert_eq!(historical_ids(&schema, &selected, &other), recorded);
         assert_eq!(
             historical_ids(&schema, &selected, &Default::default()),
@@ -1251,6 +1269,10 @@ mod tests {
         assert!(
             completed.rebuilds.is_empty(),
             "borrowed names do not grant rebuild permission"
+        );
+        assert!(
+            completed.conversions.is_empty(),
+            "borrowed names do not grant a conversion"
         );
         completed.validated().unwrap();
         selected.validated().unwrap();
@@ -1285,6 +1307,7 @@ mod tests {
             types: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             moves: BTreeMap::new(),
+            conversions: BTreeMap::new(),
             rebuilds: [(
                 "t_aaaaaa".parse().unwrap(),
                 pbps_model::Rebuild {

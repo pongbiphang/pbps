@@ -385,6 +385,10 @@ to add an entry here.
     first; a dialect that only works when it is called correctly is a trap, and
     normalizing twice is free (the same correction as DECISIONS 244).
 
+    *Amended by [DEC-2331.1](#dec-2331-1): the refusal stands for a change with
+    no recorded conversion, and its message now names `pbps convert`. A change
+    with one is made with the recorded `USING`.*
+
 <a id="decision-268"></a>
 
 268. **A type change the session's `TimeZone` would answer is refused, the way
@@ -438,6 +442,11 @@ to add an entry here.
     question, `types::depends_on_the_session_time_zone`, and refuses on it by
     name with the two-step remedy — add the column, fill it in a declared step
     with the zone written out, drop the old one.
+
+    *Amended by [DEC-2331.1](#dec-2331-1): a conversion recorded for the change
+    is the declared, reviewed statement of what the values mean, so the change is
+    made with it, and #1919's idea of pbps writing the recorded zone in itself
+    stays ruled out.*
 
 <a id="decision-283"></a>
 
@@ -2900,7 +2909,6 @@ handoffs, and refuse changed live definitions. Warning tests cover both
 report channels and all three warning negatives. Each repaired site is checked
 by temporarily reverting its behavior with a copy of the file retained aside.
 
-
 <a id="dec-1635-6"></a>
 
 **DEC-1635.6. Slice 3a adds and explicitly renames enum labels; reference-data and partition-key admission stays in #2346.**
@@ -2980,3 +2988,79 @@ label operations and their intermediate definitions. Published schema set 59
 admits the YAML label intent. No row codec, contextual table-validation
 exception, speculative type inventory, absent-type value deferral, transient
 uid or connected value-probe reversal is introduced by this slice.
+
+<a id="dec-2331-1"></a>
+
+**DEC-2331.1. A type change the engine cannot make by itself is made with a
+conversion a person recorded, kept in the identity file and pruned by the tool;
+pbps never chooses the cast (#2331).** ADR-0012 section 5 refuses `text` to
+`integer`, because a cast pbps chose is a transformation nobody declared, and
+left the user a two-step remedy that turns one routine change into several
+commits and applies. It said the replacement is a declared transformation, not
+a flag. This is it, and it is recorded the way a rename is rather than written
+in the declarations, because a conversion is one-time per environment: kept in
+the YAML it would have to be deleted by hand once every environment moved.
+
+- **The record** is `conversions` in `schema.ids.json`, keyed by the column's
+  uid: `from` and `to` as the dialect spells them, `using` verbatim, and the
+  `operator` and `allowed_at` of `move-rows`. It follows the column through a
+  rename, is reviewed in the merge request, and is in the plan's checksum twice:
+  as the identities the plan carries and as `using` on the change.
+- **Supplied** by `pbps convert <column> --using <expr>|- [--from <type>]`:
+  offline, `from` read from the declarations at `HEAD` unless named, `to` the
+  declared type. `-` reads standard input the way #2332 makes `drop --reason -` do:
+  UTF-8, one final line ending removed, blank refused before discovery. With a
+  terminal `plan` asks for the expression of each change that needs one; the
+  example on the prompt is a hint and a blank answer records nothing. Without
+  one, and under `plan --check`, it is the error finding
+  `plan.conversion-required` carrying the command. No flag of `plan` or `apply`
+  can supply it (SPEC 14.3).
+- **Consumed** by the differ, and only for a change of that column that is
+  exactly `from` to `to`. An environment already on `to` has no such change and
+  never reads the record, so each environment applies it once and nothing marks
+  it consumed. An environment on another type that needs an expression to get
+  there is refused by name with the command to record one for its start; one
+  whose engine converts the change itself ignores the record, so an expression
+  written for one source type is never applied to another. A column renamed in
+  the same plan is refused, because the expression names the column once. One
+  record per column: recording another replaces it.
+- **Pruned** when identities are written, by `plan` (and `plan --db`, which
+  insists the file already says so) and the intent commands: the column's
+  declared type is no longer `to`, or the column is gone. `integer` to `text` to
+  `integer` therefore never revives an old expression, and an environment still
+  on the old type needs a record for the new pair.
+- **Vetted, then evaluated, then applied.** The expression runs as the deploying
+  role, so it is judged before anything runs it, in the apply, ahead of the
+  pre-flight. It is bound against a temporary table holding only the old column,
+  wrapped as `CHECK (((<using>) IS NULL) OR true)`, in a transaction that is
+  rolled back. The engine keeps the whole tree unsimplified in `conbin` (the user
+  function's `funcid` stays, measured on 16 and 18 by the live test), and
+  refuses any name but the column's own as a binding error, so `using` may
+  reference only the column and the result cannot depend on another column's
+  retype. The tree then goes through DEC-2181.1's decoder: no function, operator
+  or cast that a role wrote, none on `RUNS_SQL`, no user-defined or domain type.
+  No text scanner (DEC-1635.4). A refusal names the code and the SQLSTATE and
+  never the server's text.
+- **Applied.** The change is classified `destructive` in addition to whatever
+  its pair of types says, through the ordinary `--allow`. The whole expression
+  is in the plan, `--sql` and `explain`. The pre-flight evaluates it over every
+  stored row, read-only, before the first statement, and a row it cannot convert
+  refuses the plan by name with the SQLSTATE and without the server's text,
+  which quotes the value; for this probe a failing query is the finding, where
+  for every other it is "unchecked". `ALTER COLUMN ... TYPE ... USING` is emitted
+  from the record and from nothing else, and the emitter's three refusals (no
+  automatic cast, the session zone, an array's elements) do not apply to a
+  change that has one. A user-defined type reference still cannot be retyped
+  (DEC-1523.1). A column default is taken down and put back around the
+  conversion even when its text is unchanged, because the engine cannot cast the
+  old default to the result (measured: see the live test).
+- **The session zone** (DEC-1916.1) is unchanged. `timestamp` to `timestamptz`
+  is allowed with a record; the expression can say `AT TIME ZONE '...'`, and
+  without a record the refusal stays, with #1919 open for that case.
+- **SQL Server** has no `USING` and converts implicitly, so it records nothing:
+  `convert` refuses and a file holding `conversions` is refused by the differ.
+  Partition-key columns keep their existing refusal; #2298's rebuild takes the
+  expression as its copy projection.
+
+Not decided here and not done: the foreign keys on either side of a converted
+column; the same conversion for a domain's base type.

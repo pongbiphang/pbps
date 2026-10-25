@@ -10058,6 +10058,66 @@ fn stopping_part_way_through_the_loop_still_records_nothing() {
     assert!(text.contains("pbps rename dbo.t.customer_zip"), "{text}");
 }
 
+/// #2331: the prompt for a conversion, through a real terminal. The example is
+/// a hint on the prompt line; the person types the expression, and it reaches
+/// the identity file as `pbps convert` would have put it, then the plan is made
+/// from it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_asks_for_the_conversion_and_the_typed_expression_is_recorded() {
+    let d = Demo::new("convert-prompt");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  amount: {type: text}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    d.table("table: dbo.t\ncolumns:\n  amount: {type: integer}\n");
+
+    let out = pty::run(
+        &format!("{BIN} --project {} plan", d.dir.display()),
+        b"nullif(amount, '')::integer\n",
+    );
+    let text = stdout(&out);
+    assert_eq!(code(&out), 0, "{text}");
+    assert!(
+        text.contains("Which expression makes the new value?"),
+        "{text}"
+    );
+    assert!(text.contains("for example `amount::integer`"), "{text}");
+    assert!(
+        text.contains("type text -> integer USING nullif(amount, '')::integer"),
+        "the plan is made from the answer: {text}"
+    );
+    let ids = std::fs::read_to_string(d.ids_path()).unwrap();
+    assert!(
+        ids.contains(r#""using": "nullif(amount, '')::integer""#),
+        "{ids}"
+    );
+}
+
+/// The example is never what a blank answer means: stopping records nothing,
+/// and the person is given the command for the same question without a terminal.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blank_answer_records_nothing_and_the_example_is_not_a_default() {
+    let d = Demo::new("convert-prompt-blank");
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    d.table("table: dbo.t\ncolumns:\n  amount: {type: text}\n");
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let before = std::fs::read_to_string(d.ids_path()).unwrap();
+    d.table("table: dbo.t\ncolumns:\n  amount: {type: integer}\n");
+
+    let out = pty::run(&format!("{BIN} --project {} plan", d.dir.display()), b"\n");
+    let text = stdout(&out);
+    assert_eq!(code(&out), FINDING, "{text}");
+    assert!(text.contains("Nothing was recorded."), "{text}");
+    assert!(
+        text.contains("pbps convert dbo.t.amount --using -"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read_to_string(d.ids_path()).unwrap(), before);
+}
+
 // ---- Third review round ----
 
 /// An offline plan cannot be applied at all — `apply` refuses a `Preview`

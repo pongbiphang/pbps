@@ -1310,6 +1310,33 @@ fn renders_alike_under_the_pins(t: &ColumnType) -> bool {
     !matches!(family(t), Family::Unknown)
 }
 
+/// The predicate, over `value`, naming what an **assignment** into `to` refuses
+/// and an explicit `CAST` to the same type lets through: the part of a recorded
+/// conversion's check the cast cannot see (#2331, round 1 review).
+///
+/// A bounded string is cut by the cast and refused by the `ALTER` (see
+/// [`cannot_become`], which has the measurement).
+///
+/// `None` for every other target: a numeric, a date and the rest raise in the
+/// cast exactly where the assignment does, so the cast is the whole check. A
+/// bit string would be a second case (the cast cuts and pads, the assignment
+/// wants the length), but the catalogue does not hold `bit`, so no declaration
+/// reaches it; whoever admits it adds its predicate here. `to` must be
+/// normalized.
+pub(crate) fn assignment_refuses(to: &ColumnType, value: &str) -> Option<String> {
+    if to.is_array() {
+        return None;
+    }
+    if let Family::Text {
+        len: Len::Bounded(n),
+        ..
+    } = family(to)
+    {
+        return Some(format!("length(rtrim(({value})::text, ' ')) > {n}"));
+    }
+    None
+}
+
 /// What a stored value must satisfy for `ALTER COLUMN … TYPE` to **fail** on
 /// it — the predicate a pre-flight probe counts (SPEC §7.5), over `value`.
 ///
@@ -3580,6 +3607,29 @@ mod tests {
 
     fn normalized(name: &str) -> ColumnType {
         normalize(&ty(name)).expect("normalizes")
+    }
+
+    /// Only the targets where the cast and the assignment part get a count of
+    /// their own (#2331): a bounded string. Every other target raises in the
+    /// cast exactly where the `ALTER` does.
+    #[test]
+    fn only_a_bounded_string_has_an_assignment_predicate() {
+        for (to, expected) in [
+            ("varchar(3)", Some("length(rtrim((v)::text, ' ')) > 3")),
+            ("char(3)", Some("length(rtrim((v)::text, ' ')) > 3")),
+            ("text", None),
+            ("varchar", None),
+            ("smallint", None),
+            ("numeric(5,2)", None),
+            ("timestamp(0)", None),
+            ("varchar(3)[]", None),
+        ] {
+            assert_eq!(
+                assignment_refuses(&normalized(to), "v").as_deref(),
+                expected,
+                "`{to}`"
+            );
+        }
     }
 
     /// The zone question is asked of the pair, not of the risk class: every row

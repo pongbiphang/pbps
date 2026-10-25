@@ -229,6 +229,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         },
         vec![&table],
         vec![],

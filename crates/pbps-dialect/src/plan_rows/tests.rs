@@ -321,6 +321,7 @@ fn a_backfill_and_a_later_retype_remain_distinct_prefix_facts() {
             from_collation: None,
             to_collation: None,
             through_external_partitions: false,
+            using: None,
         }),
     ];
     let ids = IdsFile {

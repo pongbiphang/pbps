@@ -6132,6 +6132,7 @@ async fn narrowing_to_sysname_probes_the_alias_real_capacity() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })],
     };
 
@@ -6250,6 +6251,7 @@ async fn narrowing_a_varbinary_source_to_sysname_is_not_falsely_blocked() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })],
     };
     for probe in Mssql.fixture_preflight(&cs).probes {
@@ -6306,6 +6308,7 @@ async fn unicode_capacity_verdict(
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })],
     };
     let preflight = Mssql.fixture_preflight(&changes);
@@ -6569,6 +6572,7 @@ async fn unicode_to_varchar_probes_character_loss() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         })],
     };
     async fn counts(conn: &mut Conn, plan: &ChangeSet) -> std::collections::BTreeMap<String, i32> {
@@ -7046,6 +7050,7 @@ async fn a_filtered_predicate_reads_a_retyped_column_through_the_type_it_has_now
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 }),
                 PlannedChange::new(Change::AddIndex {
                     table: TableName::new("dbo", "customer"),
@@ -14553,6 +14558,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 through_external_partitions: false,
                 from_collation: None,
                 to_collation: None,
+                using: None,
             }),
             PlannedChange::new(Change::UpdateRow {
                 table: TableName::new("dbo", "customer"),
@@ -16625,6 +16631,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
         through_external_partitions: false,
         from_collation: None,
         to_collation: None,
+        using: None,
     };
     for (family, spelling, wider) in [
         ("varchar", "varchar(10)", "varchar(20)"),
@@ -16754,6 +16761,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             through_external_partitions: false,
             from_collation: None,
             to_collation: None,
+            using: None,
         },
     ]);
     let reports = fixture_key_drop_blockers(&mut conn, &renamed)

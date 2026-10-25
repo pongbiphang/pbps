@@ -189,6 +189,7 @@ mod tests {
                     through_external_partitions: false,
                     from_collation: None,
                     to_collation: None,
+                    using: None,
                 })],
             };
             let ids = crate::plan_fixture::ids(&changes);

@@ -7,6 +7,7 @@
 //! This layer produces no SQL and touches no database (constraint 3 in
 //! CLAUDE.md).
 
+pub mod conversion;
 pub mod enum_labels;
 pub mod identity;
 pub mod managed;
