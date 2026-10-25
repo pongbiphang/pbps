@@ -465,6 +465,14 @@ pub struct SavedPlan {
     /// The project roles trusted when the input-path gate admitted this plan.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub trusted_roles: std::collections::BTreeSet<crate::RoleName>,
+
+    /// How the plan was rehearsed on a scratch engine, or that the operator
+    /// turned it off (#2379). Absent when no scratch entry was configured, so
+    /// plans written without one keep their bytes and the version stands: an
+    /// older reader refuses the field through `deny_unknown_fields`, the safe
+    /// direction (DEC-2379.1). `apply` displays it and never rehearses again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehearsal: Option<crate::Rehearsal>,
 }
 
 /// Complete catalog source of a reviewed input-path root (DEC-2181.2).
@@ -571,6 +579,7 @@ impl SavedPlan {
             type_routines: Vec::new(),
             type_routine_pins: None,
             trusted_roles: Default::default(),
+            rehearsal: None,
         }
     }
 
@@ -591,6 +600,9 @@ impl SavedPlan {
 
     pub fn validate_analysis(&self) -> Result<(), crate::resolver::EvidenceError> {
         use crate::resolver::{EvidenceError, PlanAnalysis};
+        if self.rehearsal.as_ref().is_some_and(|r| !r.is_complete()) {
+            return Err(EvidenceError::Incomplete);
+        }
         match (&self.analysis, self.origin, self.mode) {
             (PlanAnalysis::Ordinary, PlanOrigin::Database | PlanOrigin::Preview, _) => Ok(()),
             (

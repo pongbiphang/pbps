@@ -2034,6 +2034,16 @@ catalog stores `([amount]>(0))` — and it is reported *with the stored form*,
 which is the one thing no offline normalization can produce and exactly what is
 needed to silence it.
 
+The rehearsal core takes its base state as an input (#2379). The git baseline
+is the only base today, and it is never sealed. A plan file may carry an
+optional `rehearsal` record, covered by the plan checksum and omitted when
+absent: `converged` names the resolver entry, the scratch kind and layout, and
+the spelling differences the rehearsal accepted, and `off` says the operator
+turned the rehearsal off. `explain` prints it and `apply` only displays it.
+Absence means the rehearsal was never asked for; it is not read as `off`, and
+neither is read as rehearsed unless the record says `converged`. A failed
+rehearsal writes no plan, so no record names one (DEC-2379.1).
+
 Three stances govern this preview rehearsal:
 
 - **Always optional for previews.** The air-gap promise of 9.1 stands: with no

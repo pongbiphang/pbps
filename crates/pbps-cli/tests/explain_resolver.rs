@@ -1516,3 +1516,142 @@ fn pinned_identity_refusals_show_saved_column_names_once() {
         );
     }
 }
+
+/// A hand edit of a plan file, applied to its JSON.
+type Edit = fn(&mut serde_json::Value);
+
+fn rehearsed_plan(record: pbps_model::Rehearsal) -> SavedPlan {
+    let mut plan = plan_holding("t");
+    plan.rehearsal = Some(record);
+    plan
+}
+
+fn explained(plan: &SavedPlan) -> (String, serde_json::Value) {
+    let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
+    let text = artifact.explain("text");
+    assert!(text.status.success(), "{text:?}");
+    let value = report(&artifact.explain("json"));
+    (String::from_utf8_lossy(&text.stdout).into_owned(), value)
+}
+
+/// The record is sealed in the plan and shown by `explain` from the file
+/// alone, in human and JSON output (#2379).
+#[test]
+fn a_converged_rehearsal_is_explained_with_and_without_spelling_differences() {
+    let docker = |spelling: Vec<pbps_model::Text>| pbps_model::Rehearsal::Converged {
+        entry: "ci".into(),
+        scratch: ScratchSource::Docker {
+            image: "postgres:18".into(),
+        },
+        layout: ScratchLayout::RunOwned,
+        spelling,
+    };
+    let (text, value) = explained(&rehearsed_plan(docker(vec![])));
+    assert!(
+        text.contains(
+            "rehearsal   converged on ci (docker scratch, run-owned); \
+             image postgres:18, as configured, not verified\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("spelling difference"), "{text}");
+    assert!(!text.contains("\nRehearsal\n"), "{text}");
+    assert_eq!(
+        value["data"]["rehearsal"],
+        serde_json::json!({
+            "outcome": "converged", "entry": "ci", "scratch": "docker",
+            "image": "postgres:18", "layout": "run-owned",
+        })
+    );
+
+    let spelt = vec![
+        "check c on app.t: declared `a > 0`, the engine stores `(a > 0)`".into(),
+        "default on app.t.d: declared `1`, the engine stores `'1'::text`\u{1b}[31m".into(),
+    ];
+    let (text, value) = explained(&rehearsed_plan(docker(spelt)));
+    assert!(text.contains("; 2 spelling differences\n"), "{text}");
+    assert!(text.contains("\nRehearsal\n"), "{text}");
+    assert!(
+        text.contains("    check c on app.t: declared `a > 0`, the engine stores `(a > 0)`\n"),
+        "{text}"
+    );
+    // Engine text is escaped for the terminal, not echoed raw.
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert_eq!(
+        value["data"]["rehearsal"]["spelling"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let server = pbps_model::Rehearsal::Converged {
+        entry: "shared".into(),
+        scratch: ScratchSource::Server {},
+        layout: ScratchLayout::Supplied,
+        spelling: vec!["one".into()],
+    };
+    let (text, value) = explained(&rehearsed_plan(server));
+    assert!(
+        text.contains(
+            "rehearsal   converged on shared (server scratch, supplied); 1 spelling difference\n"
+        ),
+        "{text}"
+    );
+    assert!(value["data"]["rehearsal"].get("image").is_none(), "{value}");
+}
+
+/// `Off` is the operator's choice and is never read as a rehearsal; a plan
+/// with no record says nothing at all.
+#[test]
+fn an_off_rehearsal_is_never_read_as_rehearsed_and_absence_says_nothing() {
+    let (text, value) = explained(&rehearsed_plan(pbps_model::Rehearsal::Off));
+    assert!(
+        text.contains("rehearsal   off (this plan was not rehearsed)\n"),
+        "{text}"
+    );
+    assert!(!text.contains("converged"), "{text}");
+    assert_eq!(
+        value["data"]["rehearsal"],
+        serde_json::json!({"outcome": "off"})
+    );
+
+    let (text, value) = explained(&plan_holding("t"));
+    assert!(!text.contains("rehearsal"), "{text}");
+    assert!(value["data"].get("rehearsal").is_none(), "{value}");
+}
+
+/// Negative: a file whose record the reader cannot read, or whose record
+/// names nothing, is refused rather than explained.
+#[test]
+fn explain_refuses_a_rehearsal_record_it_cannot_read() {
+    let sealed = serde_json::to_value(rehearsed_plan(pbps_model::Rehearsal::Converged {
+        entry: "ci".into(),
+        scratch: ScratchSource::Server {},
+        layout: ScratchLayout::Supplied,
+        spelling: vec![],
+    }))
+    .unwrap();
+    let edits: [(&str, Edit); 4] = [
+        ("an unknown outcome", |v| v["rehearsal"] = "failed".into()),
+        ("no entry", |v| {
+            v["rehearsal"]["converged"]
+                .as_object_mut()
+                .unwrap()
+                .remove("entry");
+        }),
+        ("an unknown key", |v| {
+            v["rehearsal"]["converged"]["verified"] = true.into()
+        }),
+        ("an empty entry", |v| {
+            v["rehearsal"]["converged"]["entry"] = "".into()
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut plan = sealed.clone();
+        edit(&mut plan);
+        let out = Artifact::new(&plan).explain("text");
+        assert_eq!(out.status.code(), Some(1), "{what}: {out:?}");
+        assert!(out.stdout.is_empty(), "{what}: {out:?}");
+    }
+}
