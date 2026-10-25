@@ -254,7 +254,8 @@ async fn localdb2271_a_missing_or_stopped_instance_fails_by_name_within_the_boun
             .unwrap_err();
         assert!(started.elapsed() < pbps_db::CONNECT_TIMEOUT, "{failure}");
         match (&failure, expected) {
-            (Failure::Exit(_), _) | (Failure::NoUsablePipe, "no named pipe") => {}
+            (Failure::Missing(name), "pbps_never_created") if name == "pbps_never_created" => {}
+            (Failure::NoUsablePipe, "no named pipe") => {}
             _ => panic!("unexpected discovery failure for {selector}: {failure:?}"),
         }
         // Through the producer it is an acquire failure, the target is

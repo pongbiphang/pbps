@@ -4,7 +4,8 @@
 //! LocalDB accepts a connection only on a named pipe whose name changes every
 //! time the instance starts, so a connection string can name the instance but
 //! not the endpoint. This module finds the endpoint and does nothing else. It
-//! runs `SqlLocalDB.exe info <instance>` once, reads one pipe out of what it
+//! runs `SqlLocalDB.exe info <instance>` once (and `info` alone only to tell a
+//! missing instance from a stopped one), reads one pipe out of what it
 //! prints, and hands the rewritten connection string back to the ordinary
 //! driver, which admits it like any other and does all the SQL. It starts,
 //! stops and creates no instance: the operator provides a running one, as a
@@ -63,6 +64,11 @@ pub enum Failure {
          before the resolver needs it"
     )]
     NoUsablePipe,
+    #[error(
+        "no LocalDB instance named {0} exists for this Windows user; create and start it, as \
+         `SqlLocalDB.exe create {0} -s`"
+    )]
+    Missing(String),
     #[error("the instance reported {0} different named pipes; none was chosen")]
     AmbiguousPipe(usize),
     #[error("the instance's pipe is not a LocalDB pipe: {0}")]
@@ -148,11 +154,35 @@ fn selector_failure(error: DbError) -> Failure {
 }
 
 /// Runs `helper info <instance>` and reads its pipe.
+///
+/// The 17.x helper answers `info` for an instance that does not exist with a
+/// success status and no pipe, as it answers for a stopped one (measured on
+/// the Windows job). The two need different remedies, so only when no pipe is
+/// printed is the helper asked once more, for its list of instances: names
+/// are the one part of that output no display language translates.
 pub async fn discover(helper: &Path, instance: &str, budget: Duration) -> Result<String, Failure> {
     let deadline = Instant::now() + budget;
+    match pipe_in(&run(helper, &["info", instance], deadline, budget).await?) {
+        Err(Failure::NoUsablePipe) => {
+            if listed(&run(helper, &["info"], deadline, budget).await?, instance) {
+                Err(Failure::NoUsablePipe)
+            } else {
+                Err(Failure::Missing(instance.to_owned()))
+            }
+        }
+        found => found,
+    }
+}
+
+/// One bounded helper run: its output, or the failure that ended it.
+async fn run(
+    helper: &Path,
+    args: &[&str],
+    deadline: Instant,
+    budget: Duration,
+) -> Result<Vec<u8>, Failure> {
     let mut child = Command::new(helper)
-        .arg("info")
-        .arg(instance)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -205,7 +235,30 @@ pub async fn discover(helper: &Path, instance: &str, budget: Duration) -> Result
             |code| format!("exit code {code}"),
         )));
     }
-    pipe_in(&output)
+    Ok(output)
+}
+
+/// Whether the helper's instance list, one name per line, names `instance`.
+/// Instance names are case-insensitive, as LocalDB treats them.
+pub fn listed(output: &[u8], instance: &str) -> bool {
+    decode(output)
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(instance))
+}
+
+/// The helper's output as text: UTF-16, which has a NUL beside each ASCII
+/// byte, is decoded as such, and anything else as UTF-8.
+fn decode(output: &[u8]) -> String {
+    if output.starts_with(&[0xFF, 0xFE])
+        || output.iter().filter(|b| **b == 0).count() * 4 > output.len()
+    {
+        let units: Vec<u16> = (0..output.len() / 2)
+            .map(|at| u16::from_le_bytes([output[2 * at], output[2 * at + 1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(output).into_owned()
+    }
 }
 
 /// A timed-out or runaway helper is killed and reaped; the error that follows
@@ -227,16 +280,7 @@ const PIPE_PREFIX: &str = "np:\\\\.\\pipe\\";
 /// whitespace-delimited run. UTF-16 output, which has a NUL beside each ASCII
 /// byte, is decoded first so that a pipe in it is still seen.
 pub fn pipe_in(output: &[u8]) -> Result<String, Failure> {
-    let text = if output.starts_with(&[0xFF, 0xFE])
-        || output.iter().filter(|b| **b == 0).count() * 4 > output.len()
-    {
-        let units: Vec<u16> = (0..output.len() / 2)
-            .map(|at| u16::from_le_bytes([output[2 * at], output[2 * at + 1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
-    } else {
-        String::from_utf8_lossy(output).into_owned()
-    };
+    let text = decode(output);
     let mut found: Vec<&str> = Vec::new();
     let lower = text.to_ascii_lowercase();
     let mut from = 0;
@@ -318,6 +362,21 @@ mod tests {
         for nothing in ["", "\r\n", "Name: x\r\n"] {
             assert_eq!(pipe_in(nothing.as_bytes()), Err(Failure::NoUsablePipe));
         }
+    }
+
+    #[test]
+    fn the_instance_list_is_read_by_whole_name_in_any_case_and_encoding() {
+        let list = "MSSQLLocalDB\r\npbps_scratch\r\n";
+        assert!(super::listed(list.as_bytes(), "pbps_scratch"));
+        assert!(super::listed(list.as_bytes(), "PBPS_Scratch"));
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(list.encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(super::listed(&utf16, "pbps_scratch"));
+        // A prefix, a longer name or an empty list is not the instance.
+        for absent in ["pbps", "pbps_scratch2", "scratch"] {
+            assert!(!super::listed(list.as_bytes(), absent), "{absent}");
+        }
+        assert!(!super::listed(b"", "pbps_scratch"));
     }
 
     #[test]
@@ -454,6 +513,25 @@ mod tests {
             )
             .await;
             assert_eq!(outcome.unwrap(), PIPE);
+        }
+
+        #[tokio::test]
+        async fn no_pipe_for_an_unlisted_instance_is_missing_and_for_a_listed_one_stopped() {
+            // `info x` answers with no pipe; `info` lists the instances.
+            let (missing, _) = run(
+                "missing",
+                "[ \"$#\" = 2 ] && { echo 'Name: x'; exit 0; }\nprintf 'MSSQLLocalDB\\r\\nother\\r\\n'",
+                Duration::from_secs(10),
+            )
+            .await;
+            assert_eq!(missing, Err(Failure::Missing("x".into())));
+            let (stopped, _) = run(
+                "stopped",
+                "[ \"$#\" = 2 ] && { echo 'State: Stopped'; exit 0; }\nprintf 'MSSQLLocalDB\\r\\nx\\r\\n'",
+                Duration::from_secs(10),
+            )
+            .await;
+            assert_eq!(stopped, Err(Failure::NoUsablePipe));
         }
 
         #[tokio::test]

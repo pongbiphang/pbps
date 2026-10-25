@@ -278,6 +278,11 @@ def main():
         print(text)
         if code:
             raise RuntimeError(f"SqlLocalDB.exe could not create and start {name} (exit {code})")
+    # Printed for the record, never judged: what the helper says, as the
+    # dedicated user, for an instance that does not exist and for its list.
+    for argv in ([HELPER, "info", "pbps_never_created"], [HELPER, "info"]):
+        code, text = as_user(secret, argv)
+        print(f"{' '.join(str(a) for a in argv[1:])}: exit {code}\n{text}")
     resolved = {}
     for name in (TARGET, SCRATCH):
         code, text = as_user(secret, [example, selector(name)],

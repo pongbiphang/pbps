@@ -4560,7 +4560,7 @@ connection string can name the instance but never its endpoint.
   guessed. The target's connection never takes a selector: the driver still
   refuses `(localdb)` (DEC-2271.1).
 - **Discovery** (`pbps_mssql::resolver::localdb`). It runs
-  `SqlLocalDB.exe info <name>` once: a fixed path in the qualified major's
+  `SqlLocalDB.exe info <name>` once (and `info` alone only when no pipe is printed, below): a fixed path in the qualified major's
   directory (`170`), not a `PATH` search; no shell; the name as one argument;
   no SQL, credential or target string; output capped at 16 KiB; one deadline
   (`CONNECT_TIMEOUT`); a helper that overruns either is killed. Only a pipe is
@@ -4622,6 +4622,14 @@ connection string can name the instance but never its endpoint.
   Express database matched the existing prediction. Idle, an AUTO_CLOSE
   database reports `is_cleanly_shutdown` 1, but acquisition reads the
   options from inside the database, where it is 0.
+- **A missing instance is told from a stopped one (measured on the Windows
+  job).** The 17.x helper answers `info <name>` for an instance that does not
+  exist with a success status and no pipe, the same answer as for a stopped
+  one. Only when no pipe is printed, discovery runs `info` once more and reads
+  the instance list. Names are the one part of that output no display
+  language translates. An unlisted name fails as missing, with the create
+  remedy. A listed one fails as stopped, with the start remedy. Both runs
+  share the one deadline.
 - **Not widened.** The platform comparison is unchanged: a Linux target with a
   Windows LocalDB scratch stays a named platform mismatch, and major 16 is not
   admitted. Edition differences remain recorded limitations (§9).
