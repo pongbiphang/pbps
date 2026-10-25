@@ -60,7 +60,10 @@ pub enum ReconstructError {
     #[error("scratch compilation of {declaration} was interrupted: {reason}")]
     Interrupted { declaration: String, reason: String },
     #[error(
-        "scratch cannot order {0}: a computed column and a declared function each need the other"
+        "scratch cannot order {0}: a computed column and a declared function each need the other. \
+         A function needs a column wherever it names the table and the column, so one that only \
+         shares the column's name (an alias, another table's column, a table of the table's name \
+         in another schema) needs it too: rename the alias or the column"
     )]
     Cycle(String),
 }
@@ -123,6 +126,9 @@ struct Late {
     table: TableName,
     column: String,
     expression: String,
+    /// The declared functions its expression calls, as `schema.name`: found
+    /// once every function is known, and exact by schema (see `new`).
+    callees: Vec<String>,
 }
 
 fn column_id(table: &TableName, column: &str) -> TableName {
@@ -238,7 +244,7 @@ impl Reconstruction {
                 }
                 Change::CreateModule { id, module } => {
                     if module.kind == ModuleKind::Function {
-                        functions.push((steps.len(), id.name().to_owned()));
+                        functions.push((steps.len(), format!("{}.{}", id.schema(), id.name())));
                     }
                     steps.push(part(
                         Phase::Modules,
@@ -298,12 +304,29 @@ impl Reconstruction {
                 made.operation = operation;
             }
         }
+        // A column calls a declared function by a two-part name only, so the
+        // callee is found by schema and name, not by a name that merely
+        // appears in the expression (a column named like a function, or a
+        // function of the same name in another schema, is no callee).
+        for (late, _) in &mut late {
+            let called = dialect.qualified_calls(&late.expression);
+            late.callees = functions
+                .iter()
+                .map(|(_, token)| token)
+                .filter(|token| {
+                    called.iter().any(|(schema, name)| {
+                        format!("{schema}.{name}").to_lowercase() == token.to_lowercase()
+                    })
+                })
+                .cloned()
+                .collect();
+        }
         observe(dialect, &mut steps, &late);
         let held = late
             .into_iter()
             .map(|(late, range)| HeldTable {
                 table: late.id,
-                generated: vec![late.expression],
+                generated: late.callees,
                 steps: range,
             })
             .collect::<Vec<_>>();
@@ -554,6 +577,7 @@ fn table_steps(
                 table: name.clone(),
                 column: column.raw().to_owned(),
                 expression: expression.expression.clone(),
+                callees: Vec::new(),
             },
             from..steps.len(),
         ));
@@ -609,12 +633,27 @@ fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<
         .chain(late.iter().map(|(l, _)| l.table.name.clone()))
         .collect();
     for part in steps {
-        let statements = crate::emit::emit(&part.change.change, part.change.strategy)
-            .expect("this part's private validation probe already succeeded");
+        // The text this part could read or call through. A module's header is
+        // its own declaration, never a read of itself: a function `f` is no
+        // reader of a column `f` because its header says `f`.
+        let sources: Vec<String> = if let Change::CreateModule { module, .. } = &part.change.change
+        {
+            vec![module.definition.clone()]
+        } else {
+            crate::emit::emit(&part.change.change, part.change.strategy)
+                .expect("this part's private validation probe already succeeded")
+                .into_iter()
+                .map(|statement| statement.sql)
+                .collect()
+        };
+        let readable: Vec<String> = sources
+            .iter()
+            .map(|text| without_variables(&dialect.code_only(text)))
+            .collect();
         let names_text = |name: &str| {
-            statements
+            readable
                 .iter()
-                .any(|s| dialect.generation_may_call(&s.sql, name))
+                .any(|text| dialect.generation_may_call(text, name))
         };
         // Only a module whose creation binds a column list can see `*`.
         let lists_columns = matches!(
@@ -622,17 +661,14 @@ fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<
             Change::CreateModule { module, .. }
                 if matches!(module.kind, ModuleKind::View | ModuleKind::Function)
         );
-        let callee_name = if let Change::CreateModule { id, module } = &part.change.change
+        let callee = if let Change::CreateModule { id, module } = &part.change.change
             && module.kind == ModuleKind::Function
         {
-            Some(id.name())
+            Some(format!("{}.{}", id.schema(), id.name()))
         } else {
             None
         };
-        let wildcard = lists_columns
-            && statements
-                .iter()
-                .any(|s| selects_all(&dialect.code_only(&s.sql)));
+        let wildcard = lists_columns && readable.iter().any(|text| selects_all(text));
         part.calls = names
             .iter()
             .filter(|n| names_text(n))
@@ -642,17 +678,36 @@ fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<
         part.tables = late
             .iter()
             .filter(|(l, _)| {
-                let called = callee_name.is_some_and(|name| {
-                    late.iter().any(|(other, _)| {
-                        other.table == l.table
-                            && dialect.generation_may_call(&other.expression, name)
-                    })
+                let called = callee.as_ref().is_some_and(|callee| {
+                    late.iter()
+                        .any(|(other, _)| other.table == l.table && other.callees.contains(callee))
                 });
                 names_text(&l.table.name) && (names_text(&l.column) || (wildcard && !called))
             })
             .map(|(l, _)| l.id.clone())
             .collect();
     }
+}
+
+/// `code` without the names that are never a column: a variable or parameter
+/// (`@c`, `@@c`) and a temporary object (`#c`). The dialect's name test reads
+/// `c` out of all three (measured), so a function with a parameter `@c` would
+/// be taken for a reader of a column `c`.
+fn without_variables(code: &str) -> String {
+    let mut clean = String::with_capacity(code.len());
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '@' | '#') {
+            while chars
+                .next_if(|n| n.is_alphanumeric() || matches!(n, '_' | '@' | '#' | '$'))
+                .is_some()
+            {}
+            clean.push(' ');
+        } else {
+            clean.push(c);
+        }
+    }
+    clean
 }
 
 /// Whether `code`, a definition with strings and comments blanked

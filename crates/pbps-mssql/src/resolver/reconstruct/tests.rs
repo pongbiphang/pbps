@@ -715,3 +715,151 @@ fn a_key_over_two_computed_columns_follows_both() {
         );
     }
 }
+
+fn function_in(schema: &str, function_name: &str, definition: &str) -> Change {
+    Change::CreateModule {
+        id: ModuleId::Routine(pbps_model::RoutineId::new(
+            TableName::new(schema, function_name),
+            Vec::new(),
+        )),
+        module: Box::new(Module {
+            kind: ModuleKind::Function,
+            definition: definition.into(),
+            description: None,
+        }),
+    }
+}
+
+const READS_ID: &str =
+    "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(id) FROM app.t WHERE id = @x); END";
+
+// The lexical reader and call tests, audited together (round 5). For each
+// way a name can appear in a part's text without being a read or a call:
+
+#[test]
+fn a_function_is_no_reader_of_a_column_that_shares_its_name() {
+    // The header of `f` says `f`; a part never reads or calls itself through
+    // its declaration. Measured on 17.0: bare table, `f`, `ADD f AS (app.f(id))`.
+    let statements = sql(&build(vec![
+        table("t", &[("f", "app.f(id)")]),
+        function("f", READS_ID),
+    ])
+    .unwrap());
+    let create = at(&statements, "CREATE TABLE [app].[t]");
+    let routine = at(&statements, "FUNCTION [app].[f]");
+    let column = at(&statements, "ADD [f] AS");
+    assert!(create < routine && routine < column, "{statements:#?}");
+}
+
+#[test]
+fn a_parameter_a_local_a_string_and_a_comment_are_no_reads_of_a_column() {
+    // A string literal and a comment are no code to the dialect's lexer; a
+    // variable, a parameter and a temporary object are, and its name test
+    // reads `c` out of `@c`, `@@c` and `#c` (measured), so they are dropped.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "app.g(id)")]),
+        function(
+            "g",
+            "(@c int) RETURNS int AS BEGIN DECLARE @c2 int = @c; -- c\n /* c */ RETURN (SELECT COUNT(id) FROM app.t WHERE id = @c AND @@c = 1 AND 'c' = 'c' AND 1 = (SELECT 1 FROM #c)); END",
+        ),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "FUNCTION [app].[g]") < at(&statements, "ADD [c] AS"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_name_shared_with_the_column_by_an_alias_or_another_table_is_a_refusal_naming_the_remedy() {
+    // Content-dependent: whether `o.c` is `t.c` is for the engine to say, and
+    // a lexical test cannot. Reading it as `t.c` only ever adds a constraint,
+    // so what it can cost is a refusal, and the refusal says what to rename.
+    for text in [
+        "SELECT COUNT(o.c) FROM app.other AS o JOIN app.t ON 1 = 1",
+        "SELECT id AS c FROM app.t",
+        "SELECT COUNT(c) FROM other.t",
+    ] {
+        let refused = build(vec![
+            table("t", &[("c", "app.g(id)")]),
+            function(
+                "g",
+                &format!(
+                    "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM ({text}) AS q); END"
+                ),
+            ),
+        ])
+        .expect_err("g is read as reading the column that calls it");
+        let ReconstructError::Cycle(subject) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            subject.contains("app.t.c") && refused.to_string().contains("rename"),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_wildcard_from_another_table_over_holds_and_never_misorders() {
+    // `o.*` projects another table's columns, and the view also names `t`:
+    // it is read as projecting `t`'s too, so it follows the column. Later is
+    // always a valid place for a view, so this costs no refusal.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "app.f(id)")]),
+        view("s", "SELECT o.* FROM app.other AS o, app.t"),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "FUNCTION [app].[f]") < at(&statements, "ADD [c] AS")
+            && at(&statements, "ADD [c] AS") < at(&statements, "VIEW [app].[s]"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_column_named_like_a_function_calls_no_function() {
+    // `v + 1` uses the column `v`; the function `app.v` is called by name
+    // `app.v(`. Measured on 17.0: bare table, `ADD c AS (v + 1)`, then the
+    // function that reads `c`.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "v + 1")]),
+        function(
+            "v",
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(c) FROM app.t WHERE id = @x); END",
+        ),
+    ])
+    .unwrap());
+    let column = at(&statements, "ADD [c] AS");
+    assert!(
+        column < at(&statements, "FUNCTION [app].[v]"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_function_of_the_same_name_in_another_schema_is_no_callee() {
+    // `c` calls `other.f`; `app.f` shares its leaf name and reads `c`.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "other.f(id)")]),
+        function(
+            "f",
+            "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(c) FROM app.t WHERE id = @x); END",
+        ),
+        function_in("other", "f", FUNCTION),
+    ])
+    .unwrap());
+    let other = at(&statements, "FUNCTION [other].[f]");
+    let column = at(&statements, "ADD [c] AS");
+    let reader = at(&statements, "FUNCTION [app].[f]");
+    assert!(other < column && column < reader, "{statements:#?}");
+}
+
+#[test]
+fn a_variable_name_is_not_a_name_in_the_code() {
+    assert_eq!(
+        without_variables("SELECT @c, @@rowcount, #t.c, x@y FROM #t WHERE c = @c2"),
+        "SELECT  ,  ,  .c, x  FROM   WHERE c =  "
+    );
+}

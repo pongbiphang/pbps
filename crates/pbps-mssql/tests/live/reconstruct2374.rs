@@ -555,3 +555,87 @@ async fn a_cycle_across_two_computed_columns_is_refused_naming_the_declaration()
     })
     .await;
 }
+
+/// Names that look like reads or calls and are neither: the column and the
+/// function that share a name, a column named like a function, a parameter
+/// named like the column, and a function of the same leaf name in another
+/// schema. Each has a valid order (measured on 17.0), and the reader and
+/// call tests find it instead of reporting a cycle.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn names_that_only_look_like_a_read_or_a_call_make_no_cycle() {
+    case("alike_a", |mut conn| async move {
+        // The column `f` and the function `f`, which reads only `id`.
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("f".into(), computed("app.f(id)"));
+                }),
+                reading("f", "id"),
+            ],
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    case("alike_b", |mut conn| async move {
+        // `c AS (v + 1)` uses the column `v`; the function `app.v` is another thing.
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("v + 1"));
+                }),
+                reading("v", "c"),
+            ],
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    case("alike_c", |mut conn| async move {
+        // A parameter `@c` is no column `c`.
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("app.g(id)"));
+                }),
+                module(
+                    ModuleKind::Function,
+                    "g",
+                    "(@c int) RETURNS int AS BEGIN RETURN (SELECT COUNT(id) FROM app.t WHERE id = @c); END",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    case("alike_d", |mut conn| async move {
+        // `c` calls `other.f`; `app.f` shares the leaf name and reads `c`.
+        conn.execute("CREATE SCHEMA other;").await.unwrap();
+        let other = Change::CreateModule {
+            id: ModuleId::Routine(RoutineId::new(TableName::new("other", "f"), Vec::new())),
+            module: Box::new(Module {
+                kind: ModuleKind::Function,
+                definition: FUNCTION.into(),
+                description: None,
+            }),
+        };
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("other.f(id)"));
+                }),
+                reading("f", "c"),
+                other,
+            ],
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+}
