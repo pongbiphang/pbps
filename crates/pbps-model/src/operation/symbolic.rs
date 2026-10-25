@@ -57,7 +57,11 @@ impl<T> Fact<T> {
             Self::Known(value) => Ok(value),
             Self::Unread => Err("the required catalog fact was not read".into()),
             Self::Unsupported { sqlstate, reason } => {
-                Err(format!("unsupported capability ({sqlstate:?}): {reason}"))
+                // The error is prose; the fact retains its original reason bytes.
+                Err(format!(
+                    "unsupported capability ({sqlstate:?}): {}",
+                    crate::escape::Escaped(reason)
+                ))
             }
         }
     }
@@ -316,6 +320,33 @@ mod tests {
         assert_eq!(fx.clone().merged(fx).symbolic, [clause]);
         assert!(super::super::Effects::default().is_empty());
     }
+    #[test]
+    fn unsupported_fact_prose_is_rendered_once_while_fact_data_stays_raw() {
+        let raw = "part\n\u{1b}\u{202e}\\n\\u{1b}\\u{202e}\\雪é";
+        let shown = r"part\n\u{1b}\u{202e}\\n\\u{1b}\\u{202e}\\雪é";
+        for (sqlstate, rendered) in [
+            (None, "None".to_owned()),
+            (Some(raw.to_owned()), format!("Some(\"{shown}\")")),
+        ] {
+            let fact = Fact::<String>::Unsupported {
+                sqlstate,
+                reason: raw.to_owned(),
+            };
+            let before = fact.clone();
+            assert_eq!(
+                fact.known().unwrap_err(),
+                format!("unsupported capability ({rendered}): {shown}")
+            );
+            assert_eq!(fact, before);
+        }
+        let known = Fact::Known(raw.to_owned());
+        assert_eq!(known.known().unwrap(), raw);
+        assert_eq!(
+            Fact::<String>::Unread.known().unwrap_err(),
+            "the required catalog fact was not read"
+        );
+    }
+
     #[test]
     fn unknown_capability_and_known_empty_are_different_facts() {
         assert_eq!(Fact::Known(Vec::<Value>::new()).known().unwrap().len(), 0);

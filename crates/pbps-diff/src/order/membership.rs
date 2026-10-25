@@ -10,16 +10,12 @@ pub const REMEDY: &str = "change the columns and the partitions in separate plan
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Problem {
     pub operation: OperationId,
+    /// Completed prose: producers render opaque operands once (DEC-2084.1).
     pub detail: String,
 }
 impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {}; {REMEDY}",
-            self.operation,
-            pbps_model::Text::from(self.detail.clone()).shown()
-        )
+        write!(f, "{}: {}; {REMEDY}", self.operation, self.detail)
     }
 }
 impl std::error::Error for Problem {}

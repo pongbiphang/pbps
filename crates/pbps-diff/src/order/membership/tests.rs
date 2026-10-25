@@ -9,6 +9,8 @@ use pbps_model::operation::{
 use pbps_model::plan_names::At;
 use pbps_model::{Change, ChangeSet, ModuleDeps, PlannedChange};
 
+mod diagnostics;
+
 struct NoLookup;
 impl Owners for NoLookup {
     fn table(
