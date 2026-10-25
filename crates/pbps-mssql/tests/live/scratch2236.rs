@@ -918,8 +918,8 @@ async fn system_database_permissions_follow_fixed_rules_and_restore_each_change(
 /// Refusals of a catalog case's statement by an installation that lacks the
 /// feature, measured on LocalDB and on the Express container: 39020, Advanced
 /// Analytics Extensions not installed; 15707, automatic tuning needs
-/// Enterprise.
-const UNAVAILABLE: &[&str] = &["39020", "15707"];
+/// Enterprise; 9982, no full-text search in a LocalDB user instance.
+const UNAVAILABLE: &[&str] = &["39020", "15707", "9982"];
 
 /// Whether the engine reports the default FILESTREAM row for the current
 /// database on an instance whose FILESTREAM level is 0.
@@ -951,16 +951,19 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         )
         .await
         .unwrap();
+    let mut refused = Vec::new();
     for (expected, create) in cases.restore {
         if let Err(error) = db.conn.execute(&create).await {
             // An installation that cannot create the object cannot leave its
             // catalog dirty; only these measured refusals are accepted.
+            // Any other refusal is collected, so one run reports them all.
             let code = error.server_error_code();
-            assert!(
-                code.as_deref()
-                    .is_some_and(|code| UNAVAILABLE.contains(&code)),
-                "{expected}: {error}"
-            );
+            if !code
+                .as_deref()
+                .is_some_and(|code| UNAVAILABLE.contains(&code))
+            {
+                refused.push(format!("{expected}: {error}"));
+            }
             continue;
         }
         let names = inventory::read(&mut db.conn, Some("catalog_owner"))
@@ -991,6 +994,11 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
                 fresh.names()
             );
         }
+    }
+    if !refused.is_empty() {
+        db.conn.execute("REVERT;").await.unwrap();
+        db.drop().await;
+        panic!("refused outside UNAVAILABLE:\n{}", refused.join("\n"));
     }
     let mut denied_reads = Vec::new();
     for catalog in [
