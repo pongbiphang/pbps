@@ -1174,12 +1174,24 @@ declarations, otherwise the plan is refused with the re-approval command
 (re-approval keeps the source and rewrites the rest against the declarations,
 and needs identity resolved first); neither means a new environment, which
 creates the replacement directly. Parts of both, or a parent without its
-members, are refused. A chain `B -> N -> M` is a record per link. An
-environment holding `B` is refused by name rather than rebuilt straight to
-`M`: the checksum of the first link describes declarations that no longer
-exist, so each link is applied from the revision that approved it, and links
-are never merged. A second key change against a committed approval starts the
-next link; a repeated call is a re-approval.
+members, are refused. A chain `B -> N -> M` is a record per link, and an
+environment holding an older link is qualified for **one composed rebuild** to
+the latest link against today's declarations, not for each link in turn: the
+earlier links' declarations no longer exist to be applied, and walking an
+environment through them would copy every row several times. Only the latest
+link's checksum must match the declarations. Every link's `max_rows` applies,
+so the strictest is the cap of the one copy. Columns compose along the lineage
+UIDs (inside a link a column keeps its name, between links its UID, so a
+rename in between is followed), and their conversions compose as nested casts
+through the types each approval kept in the record's `types`; ordinary edits
+between two approvals fold into the next cast. A column born along the chain
+has nothing to read in the environment. The plan presents the composed rebuild
+for review, the qualified root carries the earlier links, and preparing it for
+execution is refused until the composed copy is lowered. Stopping at an
+intermediate link means deploying the revision that approved it. An
+environment holding parts of two links, or a chain whose records the
+identities around them contradict, is refused. A second key change against a
+committed approval starts the next link; a repeated call is a re-approval.
 
 `--withdraw` is the offline inverse: it restores the source UIDs and drops the
 tombstones, the replacements and the record. It undoes the newest link of a
@@ -1190,7 +1202,8 @@ including a `revert` target) is refused by name: the baseline's own record
 proves the rewrite was applied, and neither a drop and create nor a reverse
 rebuild is planned. A deliberate drop of the replacement, which tombstones it,
 is an ordinary drop. A saved plan carries the record like any identity entry
-and is admitted only when it validates. The format of the identity file is
-unchanged, so plan and state versions stay; a file written under the pending
-rules fails validation by name. Execution stays refused until the complete
+and is admitted only when it validates. The record's `types` and a root's
+`earlier` are omitted when empty, so no existing byte changes and plan and
+state versions stay; a file written under the pending rules fails validation
+by name. Execution stays refused until the complete
 route ships (DEC-2298.1).

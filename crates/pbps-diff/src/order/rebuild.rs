@@ -178,6 +178,14 @@ pub fn prepare(
     dialect: &dyn Dialect,
     recipes: &mut Recipes<'_>,
 ) -> Result<Prepared, String> {
+    // The copy of a chain of approvals composes their conversions and
+    // honours every link's cap; lowering it is a later change (DEC-2298.12).
+    if !input.root.earlier.is_empty() {
+        return Err(format!(
+            "{}: a rebuild composed over several approved links cannot be prepared yet",
+            input.root.table.shown()
+        ));
+    }
     if dialect.name() != "postgres" || input.mode != PlanMode::Transactional {
         return Err(format!(
             "{}: rebuild requires PostgreSQL transactional mode",

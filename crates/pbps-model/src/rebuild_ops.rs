@@ -8,9 +8,112 @@ use crate::{Collation, ColumnRef, ColumnType, Rebuild, Table, TableName, Uid};
 #[serde(deny_unknown_fields)]
 pub struct RebuildPartitionedTable {
     pub table: TableName,
+    /// The latest approval: the one the files' identities came from.
     pub intent: Rebuild,
+    /// The approvals before it, oldest first, when the environment holds an
+    /// older link of a chain. It is rebuilt once, from the oldest source it
+    /// holds to the latest replacement (DEC-2298.12). Empty for one link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<Rebuild>,
     pub before: BTreeMap<TableName, Table>,
     pub after: BTreeMap<TableName, Table>,
+}
+
+/// One state of a column on its way along a chain of approvals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnStage {
+    pub uid: Uid,
+    pub column: ColumnRef,
+    /// What the approval declared it as; `None` for the environment's own
+    /// column, whose type its baseline holds.
+    pub shape: Option<crate::ColumnShape>,
+}
+
+/// A final column's states, oldest first, ending in its latest replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnLineage {
+    /// Whether the first stage is a column the environment holds. A column born
+    /// along the chain has none: the copy gives it no source value.
+    pub from_environment: bool,
+    pub stages: Vec<ColumnStage>,
+}
+
+impl RebuildPartitionedTable {
+    /// Every link, oldest first.
+    pub fn links(&self) -> impl Iterator<Item = &Rebuild> {
+        self.earlier.iter().chain(std::iter::once(&self.intent))
+    }
+
+    /// The identities the environment holds: the oldest link's source.
+    pub fn source(&self) -> &crate::RebuildIdentities {
+        &self.links().next().expect("a root has a link").source
+    }
+
+    /// Every link's cap applies to the one copy, so the strictest is the cap.
+    pub fn cap(&self) -> u64 {
+        self.links()
+            .map(|l| l.max_rows)
+            .min()
+            .expect("a root has a link")
+    }
+
+    /// Each final column's states along the lineage UIDs: inside a link a
+    /// column keeps its name, between links it keeps its UID, so a rename in
+    /// between is followed. The states' types are the nested casts the one copy
+    /// composes. Ordinary edits made between two approvals are not states of
+    /// their own: they fold into the next cast.
+    pub fn composed_columns(&self) -> BTreeMap<ColumnRef, ColumnLineage> {
+        let links: Vec<&Rebuild> = self.links().collect();
+        let last = links.len() - 1;
+        let mut out = BTreeMap::new();
+        for (uid, column) in &links[last].replacement.columns {
+            let mut stages = vec![ColumnStage {
+                uid: uid.clone(),
+                column: column.clone(),
+                shape: links[last].types.get(uid).cloned(),
+            }];
+            let (mut current, mut from_environment) = (column.clone(), false);
+            for link in (0..=last).rev() {
+                // Inside a link the column of the same name is the source.
+                let Some((source, named)) = links[link]
+                    .source
+                    .columns
+                    .iter()
+                    .find(|(_, c)| **c == current)
+                else {
+                    break;
+                };
+                if link == 0 {
+                    stages.push(ColumnStage {
+                        uid: source.clone(),
+                        column: named.clone(),
+                        shape: None,
+                    });
+                    from_environment = true;
+                    break;
+                }
+                // Between links the UID is the previous link's replacement.
+                let Some(before) = links[link - 1].replacement.columns.get(source) else {
+                    break;
+                };
+                stages.push(ColumnStage {
+                    uid: source.clone(),
+                    column: before.clone(),
+                    shape: links[link - 1].types.get(source).cloned(),
+                });
+                current = before.clone();
+            }
+            stages.reverse();
+            out.insert(
+                column.clone(),
+                ColumnLineage {
+                    from_environment,
+                    stages,
+                },
+            );
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

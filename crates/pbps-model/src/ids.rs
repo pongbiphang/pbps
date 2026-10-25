@@ -519,6 +519,10 @@ impl IdsFile {
                 || source.validate().is_err()
                 || target.validate().is_err()
                 || rebuild.replacement_root(uid).is_none()
+                || rebuild
+                    .types
+                    .keys()
+                    .any(|u| !rebuild.replacement.columns.contains_key(u))
                 || source
                     .tables
                     .keys()

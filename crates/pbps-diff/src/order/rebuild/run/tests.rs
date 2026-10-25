@@ -112,3 +112,41 @@ fn inventory_checks_risk_strategy_scope_progress_and_budget() {
             .contains("left it unmet")
     );
 }
+
+#[test]
+fn a_rebuild_composed_over_several_links_cannot_be_prepared_yet() {
+    let (mut root, base, desired, _) = fixture::approval();
+    let schema = Schema::default();
+    let input = |root: &RebuildPartitionedTable| -> Result<(), String> {
+        let side = |ids| crate::Side {
+            schema: &schema,
+            ids,
+        };
+        crate::order::rebuild::prepare(
+            &Input {
+                root,
+                before: side(&base),
+                desired: side(&desired),
+                catalog: &Catalog::default(),
+                naming: &Fact::Absent,
+                hints: &Hints::default(),
+                mode: PlanMode::Transactional,
+            },
+            &MinimalDialect,
+            &mut |_, _, _| Ok(vec![]),
+        )
+        .map(|_| ())
+    };
+    // One link reaches the ordinary checks, which this dialect fails first.
+    assert!(
+        input(&root)
+            .unwrap_err()
+            .contains("rebuild requires PostgreSQL transactional mode")
+    );
+    root.earlier.push(root.intent.clone());
+    let why = input(&root).unwrap_err();
+    assert!(
+        why.contains("composed over several approved links"),
+        "{why}"
+    );
+}

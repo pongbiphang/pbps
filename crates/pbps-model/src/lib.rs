@@ -88,11 +88,11 @@ pub use plan::{
     RoutinePins, SavedPlan, TypePin, TypeRoutine, state_checksum, wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
-pub use rebuild::{Rebuild, RebuildIdentities};
+pub use rebuild::{ColumnShape, Rebuild, RebuildIdentities};
 pub use rebuild_ops::{
-    AnalyzeTableTree, BuildPartitionedIndex, CopyColumn, CopySource, CopyTableRows,
-    IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition, RebuildPartitionedTable,
-    RebuildRelation,
+    AnalyzeTableTree, BuildPartitionedIndex, ColumnLineage, ColumnStage, CopyColumn, CopySource,
+    CopyTableRows, IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition,
+    RebuildPartitionedTable, RebuildRelation,
 };
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};

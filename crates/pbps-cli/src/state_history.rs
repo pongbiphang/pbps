@@ -787,6 +787,7 @@ mod tests {
                 allowed_at: "2026-10-24".into(),
                 reason: "maintenance".parse().unwrap(),
                 operator: "o".into(),
+                types: Default::default(),
             },
         );
         current.validate().unwrap();
@@ -1310,6 +1311,7 @@ mod tests {
                     allowed_at: "2026-10-24".into(),
                     reason: "selected snapshot rebuild".parse().unwrap(),
                     operator: "selected".into(),
+                    types: Default::default(),
                 },
             )]
             .into(),
@@ -1433,6 +1435,7 @@ mod tests {
                     allowed_at: "2026-10-24".into(),
                     reason: "reserve past identities".parse().unwrap(),
                     operator: "selected".into(),
+                    types: Default::default(),
                 },
             )]
             .into(),

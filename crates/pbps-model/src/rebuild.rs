@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{ColumnRef, IdsFile, Reason, TableName, Uid};
+use crate::{Collation, ColumnRef, ColumnType, IdsFile, Reason, TableName, Uid};
 
 /// Both ends of one approved rewrite. The source identities are tombstones in
 /// the file that holds the record and the replacement ones are live (or later
@@ -39,6 +39,22 @@ pub struct Rebuild {
     pub allowed_at: String,
     pub reason: Reason,
     pub operator: String,
+    /// What each replacement column was declared as when this link was
+    /// approved. An environment that holds an older link is rebuilt once, to
+    /// the latest, and the conversions along the way compose as nested casts;
+    /// the declarations of the revisions in between are not available then, so
+    /// the approval keeps the types (DEC-2298.12).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub types: BTreeMap<Uid, ColumnShape>,
+}
+
+/// A replacement column's type and collation at approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnShape {
+    pub ty: ColumnType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<Collation>,
 }
 
 impl Rebuild {

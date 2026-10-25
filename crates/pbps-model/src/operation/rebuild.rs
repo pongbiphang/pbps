@@ -60,12 +60,12 @@ impl PlanOwners<'_> {
         {
             return Err(bad("missing, stale or duplicate approval"));
         }
-        for (uid, name) in &root.intent.source.tables {
+        for (uid, name) in &root.source().tables {
             if self.base.table_uid(name) != Some(uid) {
                 return Err(bad("source table lineage differs"));
             }
         }
-        for (uid, name) in &root.intent.source.columns {
+        for (uid, name) in &root.source().columns {
             if self.base.column_uid(name) != Some(uid) {
                 return Err(bad("source column lineage differs"));
             }
@@ -73,7 +73,7 @@ impl PlanOwners<'_> {
         let replacement = Side::from(&root.intent.replacement);
         let mut bound = BTreeMap::new();
         for address in addresses {
-            let (name, source) = if let Some(name) = root.intent.source.tables.get(&address.uid) {
+            let (name, source) = if let Some(name) = root.source().tables.get(&address.uid) {
                 (name, true)
             } else if let Some(name) = root.intent.replacement.tables.get(&address.uid) {
                 (name, false)
@@ -94,7 +94,7 @@ impl PlanOwners<'_> {
             }
         }
         self.rebuild = Some(Bindings {
-            source: Side::from(&root.intent.source),
+            source: Side::from(root.source()),
             replacement,
             addresses: bound,
         });

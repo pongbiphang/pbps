@@ -3077,6 +3077,7 @@ mod tests {
             };
             for change in [
                 Change::RebuildPartitionedTable(Box::new(RebuildPartitionedTable {
+                    earlier: Vec::new(),
                     table: table.clone(),
                     before: Default::default(),
                     after: Default::default(),
@@ -3088,6 +3089,7 @@ mod tests {
                         allowed_at: "2026-10-24T00:00:00Z".into(),
                         reason: "planned rewrite".parse().unwrap(),
                         operator: "operator".into(),
+                        types: Default::default(),
                     },
                 })),
                 Change::CopyTableRows(Box::new(CopyTableRows {

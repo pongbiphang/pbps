@@ -216,6 +216,14 @@ fn approval_installs_the_replacements_and_retires_the_sources_in_one_write() {
     );
     assert_eq!(record.source.tables.len(), 2);
     assert_eq!(record.replacement.tables.len(), 2);
+    // What each replacement column was approved as is kept for a later chain.
+    assert_eq!(record.types.len(), record.replacement.columns.len());
+    assert!(
+        record
+            .types
+            .values()
+            .all(|shape| shape.ty.base == "integer")
+    );
     assert_eq!(
         record.replacement.columns.len(),
         2,
@@ -346,6 +354,11 @@ fn reapproving_changed_declarations_rewrites_the_record_only_once_identity_is_re
         "the source is what the environments hold"
     );
     assert_eq!(new.replacement.tables.len(), 3);
+    assert_eq!(new.types.len(), new.replacement.columns.len());
+    assert_ne!(
+        new.types, old.types,
+        "the refreshed approval keeps what it was approved as"
+    );
     assert_ne!(new.target_checksum, old.target_checksum);
     qualify(side(&base, &ids), side(&grown, &refreshed), &table()).unwrap();
 
@@ -389,7 +402,7 @@ fn a_new_key_change_against_a_committed_approval_starts_the_next_link() {
     )
     .unwrap();
     second.validate().unwrap();
-    assert_eq!(second.rebuilds.len(), 2, "links are never merged");
+    assert_eq!(second.rebuilds.len(), 2, "one record per link");
     let head = ids.table_uid(&table()).unwrap();
     assert_eq!(
         second.rebuilds[first.table_uid(&table()).unwrap()]
@@ -1047,39 +1060,247 @@ fn an_engine_that_cannot_rebuild_refuses_every_lineage_record() {
     assert!(plain.errors.is_empty(), "{:?}", plain.errors);
 }
 
-#[test]
-fn a_chain_is_applied_link_by_link_and_never_merged() {
+/// Two approvals in a row, with ordinary identity edits between them: the
+/// first source `B` (key `k`), the middle `N` (renamed `k`, added `extra`,
+/// key `bucket`) and the last `M` (`bucket` widened). Returns the declarations
+/// and identities of each.
+struct Chain {
+    base: (Schema, IdsFile),
+    middle: (Schema, IdsFile),
+    last: (Schema, IdsFile),
+}
+
+fn chained(second_cap: u64) -> Chain {
     let (base, ids, desired) = fixture();
     let first = recorded(&base, &ids, &desired);
-    let mut widened = desired.clone();
-    widened
-        .tables
+    let mut mid = desired.clone();
+    let parent = mid.tables.get_mut(&table()).unwrap();
+    let k = parent.columns.shift_remove("k").unwrap();
+    parent.columns.insert("old_k".into(), k);
+    parent
+        .columns
+        .insert("extra".into(), Column::new("integer".parse().unwrap()));
+    let mid_ids = crate::resolve(
+        &mid,
+        &first,
+        &[pbps_model::Intent::RenameColumn {
+            table: table(),
+            from: "k".into(),
+            to: "old_k".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let mut last = mid.clone();
+    last.tables
         .get_mut(&table())
         .unwrap()
         .columns
         .get_mut("bucket")
         .unwrap()
         .ty = "bigint".parse().unwrap();
-    let second = record(
-        side(&desired, &first),
-        &widened,
-        &first,
+    let last_ids = record(
+        side(&mid, &mid_ids),
+        &last,
+        &mid_ids,
         &table(),
-        30,
+        second_cap,
         &reason(),
         &ctx(),
     )
     .unwrap();
-    let head = side(&widened, &second);
-    // An environment holding the very first source cannot jump to the end.
-    let behind = diff(side(&base, &ids), head);
-    assert!(first_rebuild_error(&behind).contains("links are never merged"));
-    // One that holds the first replacement rebuilds the last link, as recorded.
-    let current = diff(side(&desired, &first), head);
-    assert!(first_rebuild_error(&current).contains("not available yet"));
-    // One that holds the final replacement has nothing to do.
+    Chain {
+        base: (base, ids),
+        middle: (mid, mid_ids),
+        last: (last, last_ids),
+    }
+}
+
+#[test]
+fn an_environment_behind_on_a_chain_is_qualified_for_one_composed_rebuild() {
+    let chain = chained(30);
+    let head = side(&chain.last.0, &chain.last.1);
+    assert_eq!(chain.last.1.rebuilds.len(), 2);
+
+    // Holding the first source: one rebuild to the last link, shown as composed.
+    let behind = diff(side(&chain.base.0, &chain.base.1), head);
+    let why = first_rebuild_error(&behind);
+    assert!(
+        why.contains("composed over 2 approved links") && why.contains("not available yet"),
+        "{why}"
+    );
+    assert!(behind.changes.changes.is_empty());
+    let root = qualify(side(&chain.base.0, &chain.base.1), head, &table()).unwrap();
+    assert_eq!(root.earlier.len(), 1);
+    assert_eq!(
+        root.source(),
+        &records_source(&chain),
+        "the oldest source it holds"
+    );
+    assert_eq!(root.before, chain.base.0.tables);
+    assert_eq!(root.after, chain.last.0.tables);
+    // Only the last link's checksum describes today's declarations.
+    assert_ne!(root.earlier[0].target_checksum, root.intent.target_checksum);
+
+    // Holding the middle replacement: just the last link, as before.
+    let middle = qualify(side(&chain.middle.0, &chain.middle.1), head, &table()).unwrap();
+    assert!(middle.earlier.is_empty());
+    assert_eq!(middle.source(), &middle.intent.source);
+    assert!(
+        first_rebuild_error(&diff(side(&chain.middle.0, &chain.middle.1), head))
+            .ends_with("not available yet")
+    );
+
+    // Holding the last replacement, or nothing: no rebuild to plan.
     let done = diff(head, head);
     assert!(done.errors.is_empty() && done.changes.changes.is_empty());
+    let fresh = diff(side(&Schema::default(), &IdsFile::default()), head);
+    assert!(fresh.errors.is_empty(), "{:?}", fresh.errors);
+}
+
+fn records_source(chain: &Chain) -> pbps_model::RebuildIdentities {
+    let first = chain
+        .last
+        .1
+        .rebuilds
+        .get(chain.base.1.table_uid(&table()).unwrap());
+    first.unwrap().source.clone()
+}
+
+#[test]
+fn a_composed_rebuild_obeys_every_links_cap() {
+    // The earlier link allowed 20 rows, the later 30: the one copy may take 20.
+    let root = {
+        let chain = chained(30);
+        qualify(
+            side(&chain.base.0, &chain.base.1),
+            side(&chain.last.0, &chain.last.1),
+            &table(),
+        )
+        .unwrap()
+    };
+    assert_eq!((root.intent.max_rows, root.cap()), (30, 20));
+    // And the other way round, a later link may be the strict one.
+    let chain = chained(5);
+    let root = qualify(
+        side(&chain.base.0, &chain.base.1),
+        side(&chain.last.0, &chain.last.1),
+        &table(),
+    )
+    .unwrap();
+    assert_eq!(root.cap(), 5);
+    // A single link's cap is its own.
+    let middle = qualify(
+        side(&chain.middle.0, &chain.middle.1),
+        side(&chain.last.0, &chain.last.1),
+        &table(),
+    )
+    .unwrap();
+    assert_eq!(middle.cap(), 5);
+}
+
+#[test]
+fn a_composed_rebuilds_columns_follow_their_uids_with_the_types_of_each_approval() {
+    let chain = chained(30);
+    let root = qualify(
+        side(&chain.base.0, &chain.base.1),
+        side(&chain.last.0, &chain.last.1),
+        &table(),
+    )
+    .unwrap();
+    let columns = root.composed_columns();
+    let column = |name: &str| table().column(name);
+    let shape = |stage: &pbps_model::ColumnStage| stage.shape.as_ref().map(|s| s.ty.base.clone());
+    // Renamed between the approvals: followed by its uid, not its name.
+    let renamed = &columns[&column("old_k")];
+    assert!(renamed.from_environment);
+    let names: Vec<_> = renamed
+        .stages
+        .iter()
+        .map(|s| s.column.raw().to_string())
+        .collect();
+    assert_eq!(names, ["app.p.k", "app.p.k", "app.p.old_k"]);
+    assert_eq!(
+        renamed.stages.iter().map(shape).collect::<Vec<_>>(),
+        [None, Some("integer".into()), Some("integer".into())],
+        "the environment's own column keeps the type its baseline holds"
+    );
+    // Converted by the later approval: each stop keeps the type it was approved with.
+    let widened = &columns[&column("bucket")];
+    assert_eq!(
+        widened.stages.iter().map(shape).collect::<Vec<_>>(),
+        [None, Some("integer".into()), Some("bigint".into())]
+    );
+    // Born after the first approval: nothing in the environment to read.
+    let born = &columns[&column("extra")];
+    assert!(!born.from_environment);
+    assert_eq!(born.stages.len(), 1);
+    // A single link has the environment's column and its replacement only.
+    let single = qualify(
+        side(&chain.middle.0, &chain.middle.1),
+        side(&chain.last.0, &chain.last.1),
+        &table(),
+    )
+    .unwrap();
+    assert!(
+        single
+            .composed_columns()
+            .values()
+            .all(|c| c.stages.len() <= 2)
+    );
+}
+
+#[test]
+fn a_composed_rebuild_refuses_what_a_single_rebuild_would_and_what_a_chain_cannot_say() {
+    let chain = chained(30);
+    let head = side(&chain.last.0, &chain.last.1);
+    let base = side(&chain.base.0, &chain.base.1);
+    // The last link's declarations moved on: refused with the command, by the
+    // last link's cap.
+    let mut moved = chain.last.0.clone();
+    moved.tables.get_mut(&table()).unwrap().description = Some("changed".into());
+    let stale = diff(base, side(&moved, &chain.last.1));
+    assert!(
+        first_rebuild_error(&stale)
+            .contains("pbps rebuild-table app.p --max-rows 30 --reason <why>")
+    );
+    // An environment holding part of the middle link, or of two links, is never
+    // read as behind or as done.
+    let mut partial = chain.middle.1.clone();
+    let old_k = partial
+        .column_uid(&table().column("old_k"))
+        .unwrap()
+        .clone();
+    partial.columns.remove(&old_k);
+    assert!(
+        first_rebuild_error(&diff(side(&chain.middle.0, &partial), head)).contains("only part of")
+    );
+    let mut mixed = chain.base.1.clone();
+    let (uid, column) = chain.middle.1.columns.iter().next().unwrap();
+    mixed.columns.insert(uid.clone(), column.clone());
+    assert!(first_rebuild_error(&diff(side(&chain.base.0, &mixed), head)).contains("only part of"));
+    // A chain whose records no longer agree with the identities around them is
+    // refused by name rather than followed.
+    let mut broken = chain.last.1.clone();
+    let first = broken
+        .rebuilds
+        .values_mut()
+        .find(|r| r.max_rows == 20)
+        .unwrap();
+    first.replacement.tables.clear();
+    let refused = diff(base, side(&chain.last.0, &broken));
+    assert!(first_rebuild_error(&refused).contains("does not match the identities around it"));
+    assert!(qualify(base, side(&chain.last.0, &broken), &table()).is_err());
+    // The environment has to hold something of the chain to be rebuilt.
+    assert!(
+        qualify(
+            side(&Schema::default(), &IdsFile::default()),
+            head,
+            &table()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1218,6 +1439,7 @@ fn a_lineage_record_is_whole_or_the_file_is_refused() {
         "bad_digest",
         "source_live",
         "replacement_lost",
+        "types_orphan",
     ] {
         let mut bad = approval.clone();
         match defect {
@@ -1253,6 +1475,15 @@ fn a_lineage_record_is_whole_or_the_file_is_refused() {
                 let lost = bad.rebuilds[key].replacement.clone();
                 bad.tables.retain(|u, _| !lost.tables.contains_key(u));
                 bad.columns.retain(|u, _| !lost.columns.contains_key(u));
+            }
+            // A type kept for a column the record does not replace.
+            "types_orphan" => {
+                let shape = bad.rebuilds[key].types.values().next().unwrap().clone();
+                bad.rebuilds
+                    .get_mut(key)
+                    .unwrap()
+                    .types
+                    .insert(Uid::generate(UidKind::Column), shape);
             }
             _ => unreachable!(),
         }

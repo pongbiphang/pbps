@@ -529,6 +529,67 @@ fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
+#[test]
+fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() {
+    let d = Demo::new("rebuild2298-chain");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    let rev = || {
+        String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&d.dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let source = rev();
+    let approve = |cap: &str| {
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            cap,
+            "--reason",
+            "maintenance",
+        ]));
+        d.commit();
+    };
+    let second = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&second);
+    approve("20");
+    let middle = rev();
+    d.table(&second.replace("bucket: {type: integer}", "bucket: {type: bigint}"));
+    approve("30");
+    // The files hold the last link; an environment at the first source is
+    // rebuilt once, to it.
+    let behind = d.run(&["plan", "--no-dev", "--since", &source]);
+    assert_ne!(code(&behind), 0);
+    assert!(
+        stderr(&behind).contains("composed over 2 approved links"),
+        "{}",
+        stderr(&behind)
+    );
+    assert!(stderr(&behind).contains("execution is not available yet"));
+    // One at the middle link is a single rebuild; one at the last has nothing to do.
+    let current = d.run(&["plan", "--no-dev", "--since", &middle]);
+    assert_ne!(code(&current), 0);
+    assert!(
+        !stderr(&current).contains("composed"),
+        "{}",
+        stderr(&current)
+    );
+    assert!(stderr(&current).contains("execution is not available yet"));
+    succeeds(d.run(&["plan", "--no-dev"]));
+}
+
 #[path = "support/row_security_roundtrip.rs"]
 mod row_security_roundtrip;
 

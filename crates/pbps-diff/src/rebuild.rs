@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
-    IdsFile, PartitionStrategy, Reason, Rebuild, RebuildIdentities, Schema, Table, TableName, Uid,
-    UidKind,
+    ColumnShape, IdsFile, PartitionStrategy, Reason, Rebuild, RebuildIdentities, Schema, Table,
+    TableName, Uid, UidKind,
 };
 
 use crate::{Context, Side};
@@ -235,6 +235,29 @@ fn outside(
     )
 }
 
+/// What each replacement column is declared as, kept with the approval so a
+/// chain of them can be composed later (DEC-2298.12).
+fn shapes(schema: &Schema, replacement: &RebuildIdentities) -> BTreeMap<Uid, ColumnShape> {
+    replacement
+        .columns
+        .iter()
+        .filter_map(|(uid, column)| {
+            let declared = schema
+                .tables
+                .get(&column.table)?
+                .columns
+                .get(&column.name)?;
+            Some((
+                uid.clone(),
+                ColumnShape {
+                    ty: declared.ty.clone(),
+                    collation: declared.collation.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn reapprove(
     ids: &IdsFile,
     schema: &Schema,
@@ -280,12 +303,14 @@ fn reapprove(
     let approval = out.rebuilds.get_mut(key).unwrap();
     if approval.target_checksum == checksum
         && approval.replacement == replacement
+        && approval.types == shapes(schema, &replacement)
         && approval.max_rows == max_rows
         && &approval.reason == reason
     {
         return Ok(out);
     }
     approval.target_checksum = checksum.to_owned();
+    approval.types = shapes(schema, &replacement);
     approval.replacement = replacement;
     approval.max_rows = max_rows;
     approval.reason = reason.clone();
@@ -417,6 +442,7 @@ pub fn record(
         uid.clone(),
         Rebuild {
             source,
+            types: shapes(desired, &replacement),
             replacement,
             target_checksum: checksum,
             max_rows,
@@ -508,10 +534,59 @@ pub fn withdraw(ids: &IdsFile, table: &TableName) -> Result<IdsFile, RebuildErro
     Ok(out)
 }
 
+/// The approvals that lead to a live parent, oldest first. A link's source
+/// parent is the previous link's replacement parent, and a source is a
+/// tombstone while a parent is live, so walking back from a live parent ends.
+fn chain<'a>(ids: &'a IdsFile, key: &'a Uid, record: &'a Rebuild) -> Vec<(&'a Uid, &'a Rebuild)> {
+    let mut links = vec![(key, record)];
+    while let Some(previous) = ids.rebuild_into(links[0].0) {
+        links.insert(0, previous);
+    }
+    links
+}
+
+/// Where an environment stands along a chain, read from what its baseline holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stand {
+    /// It holds the source of this link, and so none of the later ones.
+    Source(usize),
+    /// It holds the last replacement: nothing to rebuild.
+    Done,
+    /// It holds nothing of the chain: the last replacement is created directly.
+    Fresh,
+    /// Parts of two links, or a link without its parent. Never "nothing to do".
+    Partial,
+}
+
+fn stand(base: &IdsFile, links: &[(&Uid, &Rebuild)]) -> Stand {
+    let held: Vec<_> = links
+        .iter()
+        .map(|(key, record)| holding(base, key, record))
+        .collect();
+    let at = |wanted| held.iter().position(|h| *h == wanted);
+    let count = |wanted| held.iter().filter(|h| **h == wanted).count();
+    match (
+        count(Holding::Partial),
+        count(Holding::Source),
+        count(Holding::Replacement),
+    ) {
+        (0, 0, 0) => Stand::Fresh,
+        (0, 1, 0) => Stand::Source(at(Holding::Source).unwrap()),
+        // Holding a replacement parent is holding the next link's source parent.
+        (0, 1, 1) if at(Holding::Replacement).unwrap() + 1 == at(Holding::Source).unwrap() => {
+            Stand::Source(at(Holding::Source).unwrap())
+        }
+        (0, 0, 1) if at(Holding::Replacement) == Some(links.len() - 1) => Stand::Done,
+        _ => Stand::Partial,
+    }
+}
+
 /// Match the approved lineage and target shape against the environment's
-/// baseline, which holds the source identities. Catalog publication/dependent
-/// readability and row/size observations belong to connected qualification,
-/// never an empty default supplied here.
+/// baseline. It holds the source of some link; a chain it is behind on is
+/// rebuilt once, from what it holds to the latest replacement, so only the
+/// latest checksum must match today's declarations (DEC-2298.12). Catalog
+/// publication/dependent readability and row/size observations belong to
+/// connected qualification, never an empty default supplied here.
 pub fn qualify(
     base: Side<'_>,
     desired: Side<'_>,
@@ -522,12 +597,29 @@ pub fn qualify(
         .ids
         .validate()
         .map_err(|_| refused(table, "the identity file is inconsistent"))?;
-    let intent = desired
+    let (key, head) = desired
         .ids
         .table_uid(table)
         .and_then(|uid| desired.ids.rebuild_into(uid))
-        .map(|(_, intent)| intent)
         .ok_or_else(|| refused(table, "no explicit rebuild intent is recorded"))?;
+    let links = chain(desired.ids, key, head);
+    let start = match stand(base.ids, &links) {
+        Stand::Source(start) => start,
+        Stand::Partial => {
+            return Err(refused(
+                table,
+                "the baseline holds only part of an approved source or replacement lineage",
+            ));
+        }
+        Stand::Done | Stand::Fresh => {
+            return Err(refused(
+                table,
+                "the baseline does not hold an approved source lineage",
+            ));
+        }
+    };
+    let used = &links[start..];
+    let (first, intent) = (used[0].1, head);
     let before = canonical_schema(base.schema, dialect);
     let after = canonical_schema(desired.schema, dialect);
     let base = Side {
@@ -552,9 +644,9 @@ pub fn qualify(
     }
     if base.ids.roles != desired.ids.roles
         || base.ids.types != desired.ids.types
-        || intent.source != source_identities(base, table)?
+        || first.source != source_identities(base, table)?
         || intent.replacement != identities(desired.ids, &tree(desired.schema, table))
-        || outside(base.ids, &intent.source) != outside(desired.ids, &intent.replacement)
+        || outside(base.ids, &first.source) != outside(desired.ids, &intent.replacement)
     {
         return Err(refused(
             table,
@@ -564,6 +656,10 @@ pub fn qualify(
     Ok(RebuildPartitionedTable {
         table: table.clone(),
         intent: intent.clone(),
+        earlier: used[..used.len() - 1]
+            .iter()
+            .map(|(_, record)| (*record).clone())
+            .collect(),
         before: tree(base.schema, table),
         after: tree(desired.schema, table),
     })
@@ -652,7 +748,7 @@ pub fn holding(base: &IdsFile, key: &Uid, record: &Rebuild) -> Holding {
 }
 
 /// The refusals the lineage records impose on a plan from `base` to `declared`.
-/// A record is read against what the environment's baseline holds of it.
+/// Each live parent's chain of approvals is read against what the baseline holds.
 pub(crate) fn lineage_errors(
     base: Side<'_>,
     declared: Side<'_>,
@@ -660,12 +756,41 @@ pub(crate) fn lineage_errors(
 ) -> Vec<crate::DiffError> {
     let error = |table: TableName, why: String| crate::DiffError::RebuildTable { table, why };
     let mut errors = Vec::new();
+    // A record the identities around it contradict is unreadable lineage, never
+    // "nothing to rebuild" (DEC-2298.12).
+    if !declared.ids.rebuilds.is_empty()
+        && let Err(unreadable) = declared.ids.validate()
+    {
+        let named = match &unreadable {
+            pbps_model::ids::IdsError::InvalidRebuild { uid } => declared
+                .ids
+                .rebuilds
+                .get(uid)
+                .and_then(|r| r.source.tables.get(uid)),
+            pbps_model::ids::IdsError::UnsupportedVersion { .. }
+            | pbps_model::ids::IdsError::LiveAndTombstoned { .. }
+            | pbps_model::ids::IdsError::DuplicateName { .. }
+            | pbps_model::ids::IdsError::KindMismatch { .. }
+            | pbps_model::ids::IdsError::OrphanColumn { .. }
+            | pbps_model::ids::IdsError::OrphanMove { .. }
+            | pbps_model::ids::IdsError::NotHeld { .. } => None,
+        };
+        errors.push(error(
+            named.cloned().unwrap_or_else(|| TableName::new("?", "?")),
+            unreadable.to_string(),
+        ));
+        return errors;
+    }
     for (key, record) in &declared.ids.rebuilds {
-        let name = |ids: &IdsFile, uid: &Uid| ids.tables.get(uid).cloned();
-        let named = record.source.tables.get(key).cloned();
-        let table = name(declared.ids, record.replacement_root(key).unwrap_or(key))
-            .or(named)
-            .unwrap_or_else(|| TableName::new("?", "?"));
+        // Only the latest link of a chain is a parent the files hold live; the
+        // earlier links are read through it.
+        let Some(table) = record
+            .replacement_root(key)
+            .and_then(|root| declared.ids.tables.get(root))
+            .cloned()
+        else {
+            continue;
+        };
         // Only PostgreSQL can hold a record the CLI wrote; one in another
         // engine's files was edited in by hand and is not read as history.
         if dialect.name() != "postgres" {
@@ -675,28 +800,25 @@ pub(crate) fn lineage_errors(
             ));
             continue;
         }
-        match holding(base.ids, key, record) {
-            Holding::Replacement | Holding::Neither => {}
-            Holding::Partial => errors.push(error(
+        let links = chain(declared.ids, key, record);
+        match stand(base.ids, &links) {
+            Stand::Done | Stand::Fresh => {}
+            Stand::Partial => errors.push(error(
                 table,
                 "the environment holds only part of the approved rewrite's source or replacement identities; \
                  it cannot be read as rebuilt or as not yet rebuilt"
                     .to_owned(),
             )),
-            Holding::Source => {
-                let current = record
-                    .replacement_root(key)
-                    .is_some_and(|root| declared.ids.tables.contains_key(root));
-                let why = if !current {
-                    "this environment holds a source that was rebuilt again; deploy the revision that approved \
-                     each link in turn, as links are never merged"
-                        .to_owned()
-                } else {
-                    match qualify(base, declared, &table, dialect) {
-                        Ok(_) => "recorded intent is valid; table rebuild execution is not available yet"
-                            .to_owned(),
-                        Err(error) => error.why,
-                    }
+            Stand::Source(start) => {
+                let composed = links.len() - start;
+                let why = match qualify(base, declared, &table, dialect) {
+                    Ok(_) if composed > 1 => format!(
+                        "recorded intent is valid, as one rebuild composed over {composed} approved links; \
+                         table rebuild execution is not available yet"
+                    ),
+                    Ok(_) => "recorded intent is valid; table rebuild execution is not available yet"
+                        .to_owned(),
+                    Err(error) => error.why,
                 };
                 errors.push(error(table, why));
             }
