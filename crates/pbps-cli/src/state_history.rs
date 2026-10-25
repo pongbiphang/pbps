@@ -500,21 +500,36 @@ fn export(
         ));
     }
     // Declarations do not carry the identity history, so the project's own
-    // identity file says which rewrites were approved after this entry. A file
-    // that cannot be read is left to the first plan, which refuses on it.
-    if let Ok(Some(current)) = crate::read_ids_opt(project)
-        && let Some(table) =
-            pbps_diff::rebuild::rebuilt_since(&entry.snapshot.ids, &current).first()
-    {
-        return Err(Refusal::new(
-            "state.export-predates-rebuild",
-            format!(
-                "Entry #{} holds {} from before its approved rebuild; restoring it would need a \
-                 reverse rebuild, which pbps does not plan. Nothing was written.",
-                entry.id,
-                table.shown()
-            ),
-        ));
+    // identity file says which rewrites were approved after this entry. An
+    // absent file approved none; one that cannot be read cannot say, and a
+    // later plan refusal would not undo what the export wrote.
+    match crate::read_ids_opt(project) {
+        Ok(Some(current)) => {
+            if let Some(table) =
+                pbps_diff::rebuild::rebuilt_since(&entry.snapshot.ids, &current).first()
+            {
+                return Err(Refusal::new(
+                    "state.export-predates-rebuild",
+                    format!(
+                        "Entry #{} holds {} from before its approved rebuild; restoring it would \
+                         need a reverse rebuild, which pbps does not plan. Nothing was written.",
+                        entry.id,
+                        table.shown()
+                    ),
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(Refusal::new(
+                "state.export-ids-unreadable",
+                format!(
+                    "Entry #{} cannot be exported: the identity file cannot be read, so it is \
+                     unknown whether a rebuild was approved since: {e:#}. Nothing was written.",
+                    entry.id
+                ),
+            ));
+        }
     }
     let schema = entry.snapshot.declared.overlay(&entry.snapshot.schema);
     let (stage, copies, files, removed, mut findings) = (|| -> anyhow::Result<_> {
@@ -622,6 +637,9 @@ fn export(
 
 #[cfg(test)]
 mod tests {
+    /// A readable identity file in a layout the tool never writes, so a test
+    /// can tell that the export left it byte for byte as it was.
+    const KEPT_IDS: &str = "{\n    \"version\":   1\n}\n";
     use super::*;
     use clap::Parser as _;
 
@@ -656,7 +674,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("custom.yml");
         std::fs::write(&old, "keep these bytes").unwrap();
-        std::fs::write(project.ids_file(), "keep identity bytes").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let dialect = crate::dialect(&project).unwrap();
         let error = crate::publication::tests::with_fault(&[("write", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
@@ -667,7 +685,7 @@ mod tests {
         assert_eq!(std::fs::read(&old).unwrap(), b"keep these bytes");
         assert_eq!(
             std::fs::read(project.ids_file()).unwrap(),
-            b"keep identity bytes"
+            KEPT_IDS.as_bytes()
         );
         let (data, findings) = crate::publication::tests::with_fault(&[("cleanup", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
@@ -687,7 +705,7 @@ mod tests {
         assert!(json.contains("state.export-backup") && json.contains("were published"));
         assert_eq!(
             std::fs::read(project.ids_file()).unwrap(),
-            b"keep identity bytes"
+            KEPT_IDS.as_bytes()
         );
     }
 
@@ -817,12 +835,54 @@ mod tests {
     }
 
     #[test]
+    fn state_history_export_reads_the_identity_file_as_absent_unreadable_or_clean() {
+        let dialect_of = |p: &crate::Project| crate::dialect(p).unwrap();
+        // Absent: no rewrite was approved, so the export proceeds.
+        let (_stage, project, entry) = fixture("history-ids-absent");
+        assert!(!project.ids_file().exists());
+        assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
+        // Readable and without a rebuild: proceeds.
+        let (_stage, project, entry) = fixture("history-ids-clean");
+        std::fs::write(
+            project.ids_file(),
+            serde_json::to_string_pretty(&pbps_model::IdsFile::default()).unwrap(),
+        )
+        .unwrap();
+        assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
+        // Present but malformed, inconsistent or empty: refused by name before
+        // anything is written, the file left as it was.
+        let orphan = r#"{"version":1,"columns":{"c_aaaaaa":{"table":"dbo.gone","name":"id"}}}"#;
+        for (label, bytes) in [
+            ("malformed", "{ not json\n"),
+            ("empty", ""),
+            ("inconsistent", orphan),
+        ] {
+            let (_stage, project, entry) = fixture(&format!("history-ids-{label}"));
+            std::fs::write(project.ids_file(), bytes).unwrap();
+            let error = export(&project, &entry, true, dialect_of(&project).as_ref())
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the export was allowed"));
+            assert_eq!(error.id, "state.export-ids-unreadable", "{label}");
+            assert!(
+                error.message.contains("schema.ids.json") || error.message.contains("identity"),
+                "{label}: {}",
+                error.message
+            );
+            assert!(
+                !project.schema_dir().exists(),
+                "{label}: wrote declarations"
+            );
+            assert_eq!(std::fs::read_to_string(project.ids_file()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn state_history_overwrite_refusal_preserves_existing_declarations_and_ids() {
         let (_stage, project, entry) = fixture("history-overwrite");
         std::fs::create_dir(project.schema_dir()).unwrap();
         let path = project.schema_dir().join("custom.yml");
         std::fs::write(&path, "keep these exact bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "identity intent, unchanged\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let dialect = crate::dialect(&project).unwrap();
         let error = export(&project, &entry, false, dialect.as_ref())
             .err()
@@ -834,7 +894,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity intent, unchanged\n"
+            KEPT_IDS
         );
         // Force changes declaration files, but neither parses nor writes ids.
         let (data, _) = export(&project, &entry, true, dialect.as_ref())
@@ -847,7 +907,7 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity intent, unchanged\n"
+            KEPT_IDS
         );
     }
 
@@ -863,7 +923,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let file = project.schema_dir().join("keep.yml");
         std::fs::write(&file, "do not touch\n").unwrap();
-        std::fs::write(project.ids_file(), "original identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let error = export(
             &project,
             &entry,
@@ -878,7 +938,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(file).unwrap(), "do not touch\n");
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "original identity bytes\n"
+            KEPT_IDS
         );
     }
 
@@ -892,7 +952,7 @@ mod tests {
         .unwrap();
         let project = Project::discover(stage.path()).unwrap();
         std::fs::create_dir(project.schema_dir()).unwrap();
-        std::fs::write(project.ids_file(), "identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let error = export(
             &project,
             &entry,
@@ -905,7 +965,7 @@ mod tests {
         assert!(error.message.contains("aliases protected project input"));
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity bytes\n"
+            KEPT_IDS
         );
     }
 
@@ -982,7 +1042,7 @@ mod tests {
                 output.clone()
             };
             std::fs::write(&old, "keep old declaration\n").unwrap();
-            std::fs::write(project.ids_file(), "keep identity bytes\n").unwrap();
+            std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
             std::fs::create_dir(&directory).unwrap();
             let notes = directory.join("notes.txt");
             std::fs::write(&notes, "keep non-declaration\n").unwrap();
@@ -1055,7 +1115,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("sales.country.yml");
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "original identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let roles = project.schema_dir().join("roles");
         std::os::unix::fs::symlink("missing-roles", &roles).unwrap();
         let before = (
@@ -1553,7 +1613,7 @@ mod tests {
             .schema_dir()
             .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let (data, findings) = export(
             &project,
             &entry,
@@ -1581,7 +1641,7 @@ mod tests {
         assert_eq!(loaded.schema, entry.snapshot.schema);
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity bytes\n"
+            KEPT_IDS
         );
     }
 
