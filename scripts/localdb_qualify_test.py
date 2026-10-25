@@ -172,7 +172,9 @@ class Plan(unittest.TestCase):
         tests = (Path(__file__).resolve().parents[1]
                  / "crates/pbps-cli/src/resolver/server/scratch/localdb_live_tests.rs").read_text(encoding="utf-8")
         defined = set(re.findall(r"async fn (localdb2271_\w+)\(", tests.replace("\n ", " ")))
-        run = set(re.findall(r'run_case\(cli, "resolver::server::scratch::localdb_live_tests::(\w+)"\)', self.source()))
+        # A case may take extra libtest arguments after its name.
+        run = set(re.findall(r'run_case\(cli, "resolver::server::scratch::localdb_live_tests::(\w+)"[,)]',
+                             self.source()))
         self.assertTrue(run)
         self.assertEqual(run, defined, "a defined case the job never runs, or a run case that is gone")
 

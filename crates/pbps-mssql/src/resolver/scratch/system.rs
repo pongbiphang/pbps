@@ -220,6 +220,16 @@ fn refused_ownership(database: &str, owned: &BTreeSet<String>) -> String {
     )
 }
 
+// The engine constructs the server-role entries from the entered owner's
+// login token. No GRANT-capable entry qualifies, even public. A Windows
+// owner's token also carries its Windows groups (measured on LocalDB:
+// `\\Everyone`), and impersonation marks them DENY ONLY too: they can only
+// subtract reach, so scratch is never wider than the owner, while a
+// GRANT-capable group still refuses (DEC-2271.2).
+fn login_token_entry_qualifies(kind: &str, usage: &str, is_owner: bool) -> bool {
+    usage == "DENY ONLY" && (is_owner || kind == "SERVER ROLE" || kind == "WINDOWS GROUP")
+}
+
 async fn login_token(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
     let owner = super::one(
         conn.query(
@@ -241,9 +251,7 @@ async fn login_token(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
         let usage = text(&row, "usage")?;
         let is_owner =
             text(&row, "sid")? == owner && ["SQL LOGIN", "WINDOWS LOGIN"].contains(&kind.as_str());
-        // The engine constructs these server-role entries from the entered
-        // owner's login token. No GRANT-capable entry qualifies, even public.
-        if usage != "DENY ONLY" || !(is_owner || kind == "SERVER ROLE") {
+        if !login_token_entry_qualifies(&kind, &usage, is_owner) {
             return Err(DbError::Refused(refused_login_token(&name, &kind, &usage)));
         }
         found_owner |= is_owner;
@@ -387,6 +395,22 @@ mod tests {
             super::refused_role_membership("msdb", "café雪"),
             "msdb guest role membership on ROLE café雪 is not allowed"
         );
+    }
+
+    #[test]
+    fn only_deny_only_owner_role_and_windows_group_entries_qualify() {
+        use super::login_token_entry_qualifies as qualifies;
+        assert!(qualifies("WINDOWS LOGIN", "DENY ONLY", true));
+        assert!(qualifies("SERVER ROLE", "DENY ONLY", false));
+        assert!(qualifies("WINDOWS GROUP", "DENY ONLY", false));
+        // A group able to grant would widen scratch past its owner.
+        assert!(!qualifies("WINDOWS GROUP", "GRANT OR DENY", false));
+        assert!(!qualifies("SERVER ROLE", "GRANT OR DENY", false));
+        // Another login, or a SQL login that is not the owner, never qualifies.
+        assert!(!qualifies("WINDOWS LOGIN", "DENY ONLY", false));
+        assert!(!qualifies("SQL LOGIN", "DENY ONLY", false));
+        assert!(!qualifies("CERTIFICATE", "DENY ONLY", false));
+        assert!(!qualifies("WINDOWS LOGIN", "GRANT OR DENY", true));
     }
 
     #[test]

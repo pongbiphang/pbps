@@ -325,6 +325,52 @@ async fn localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifi
     );
 }
 
+/// What the scratch check sees as dbo of a database the Windows login owns.
+/// The whole token is printed so the job's log shows it (the maintainer asked
+/// for it before admitting Windows groups, 2026-10-25), and the premise the
+/// check admits is pinned: besides the owner and server roles, only Windows
+/// groups appear, and every entry is DENY ONLY.
+#[tokio::test]
+#[ignore = "needs the owned Windows LocalDB job"]
+async fn localdb2271_a_windows_owners_dbo_token_adds_only_deny_only_windows_groups() {
+    let scratch_url = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, on) = create_database(&scratch_url).await;
+    let rows = connection(&on)
+        .await
+        .query(
+            "EXECUTE AS USER = N'dbo'; SELECT name, type, RTRIM(usage) AS usage \
+             FROM sys.login_token ORDER BY type, name; REVERT;",
+        )
+        .await
+        .unwrap();
+    let token: Vec<(String, String, String)> = rows
+        .iter()
+        .map(|row| {
+            let text = |c: &str| row.try_get::<&str>(c).unwrap().unwrap().to_owned();
+            (text("name"), text("type"), text("usage"))
+        })
+        .collect();
+    drop_database(&scratch_url, &name).await;
+    for (name, kind, usage) in &token {
+        println!("dbo sys.login_token: {name:?} ({kind}, {usage})");
+    }
+    assert!(
+        token.iter().all(|(_, _, usage)| usage == "DENY ONLY"),
+        "every entry of the impersonated token is DENY ONLY: {token:?}"
+    );
+    assert!(
+        token.iter().all(
+            |(_, kind, _)| ["WINDOWS LOGIN", "SERVER ROLE", "WINDOWS GROUP"]
+                .contains(&kind.as_str())
+        ),
+        "only the owner, server roles and Windows groups appear: {token:?}"
+    );
+    assert!(
+        token.iter().any(|(_, kind, _)| kind == "WINDOWS GROUP"),
+        "a Windows owner's token carries its groups, which is why the check admits them: {token:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs the owned Windows LocalDB job"]
 async fn localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe() {

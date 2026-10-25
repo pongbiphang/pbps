@@ -313,9 +313,9 @@ def main():
                 raise RuntimeError(f"{label} {filter_} exited {code}")
             results.append((label, filter_, len(cases)))
 
-    def run_case(binary, test):
+    def run_case(binary, test, *extra):
         code, text = as_user(secret, [binary, "--ignored", "--exact", test, "--test-threads=1",
-                                      "--format=pretty", "--color=never"], env=env)
+                                      "--format=pretty", "--color=never", *extra], env=env)
         print(text)
         require_case(text, test)
         if code:
@@ -324,6 +324,9 @@ def main():
 
     # The cases that exist because the scratch is reached by discovery.
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_two_instances_are_distinct_live_instances_of_one_build_run_as_the_dedicated_user")
+    # Printed, not only asserted: the log records the token the check admits.
+    run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_a_windows_owners_dbo_token_adds_only_deny_only_windows_groups",
+             "--show-output")
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_a_selector_run_reaches_reconstruction_and_leaves_both_instances_clean")
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_the_marker_separates_instances_and_same_instance_controls_hold")
     run_case(cli, "resolver::server::scratch::localdb_live_tests::localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe")

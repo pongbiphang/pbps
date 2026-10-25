@@ -4607,6 +4607,13 @@ connection string can name the instance but never its endpoint.
   spelling, `Encrypt=DANGER_PLAINTEXT`, explicitly. The traffic stays on a
   local pipe and the login is SSPI, with no password on the wire. pbps never
   writes that setting for the operator.
+- **Windows groups in the owner's token (measured, maintainer decision
+  2026-10-25).** As dbo of a database a Windows login owns, `sys.login_token`
+  also lists that login's Windows groups, such as `\\Everyone`, all DENY ONLY.
+  A DENY ONLY entry can only subtract reach, so the scratch check admits a
+  `WINDOWS GROUP` entry exactly when it is DENY ONLY. A GRANT-capable group,
+  another login and every other kind still refuse. The LocalDB job prints the
+  whole token it measured.
 - **Not widened.** The platform comparison is unchanged: a Linux target with a
   Windows LocalDB scratch stays a named platform mismatch, and major 16 is not
   admitted. Edition differences remain recorded limitations (§9).

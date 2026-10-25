@@ -2350,6 +2350,7 @@
       "ignored_on": ["win32"],
       "cases": [
         "resolver::server::scratch::localdb_live_tests::localdb2271_two_instances_are_distinct_live_instances_of_one_build_run_as_the_dedicated_user",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_a_windows_owners_dbo_token_adds_only_deny_only_windows_groups",
         "resolver::server::scratch::localdb_live_tests::localdb2271_a_selector_run_reaches_reconstruction_and_leaves_both_instances_clean",
         "resolver::server::scratch::localdb_live_tests::localdb2271_the_marker_separates_instances_and_same_instance_controls_hold",
         "resolver::server::scratch::localdb_live_tests::localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe",
