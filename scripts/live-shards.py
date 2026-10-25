@@ -11,11 +11,12 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 from statistics import median
 import subprocess
 import sys
 import tempfile
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import time
 
 
@@ -23,9 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(__file__).resolve()
 RUNNERS = {"mssql": "live-tests.sh", "pg": "live-tests-pg.sh"}
 MSSQL_SET_GIB = 9
-MSSQL_WITHOUT_EXPRESS_GIB = 5
+MSSQL_WITHOUT_EXPRESS_GIB = 4
 PG_SHARD_GIB = 1
 MEMORY_SAMPLE_SECONDS = 15
+# Allow thirty seconds for helper finally blocks to remove Docker containers
+# and volumes, while bounding interruption if a helper cannot finish cleanup.
+RUNNER_STOP_GRACE_SECONDS = 30
+EPHEMERAL_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 EXPRESS_INVENTORY = {
     ("test", "-p", "pbps-mssql", "--test", "live", "--"): {
         "binding619::a_global_temporary_table_marks_one_instance_to_every_login_on_it",
@@ -40,9 +45,9 @@ FIXTURES = {
     "mssql": [("PBPS_TEST_MSSQL_NAME", "PBPS_TEST_PORT", "mssql", 26330),
               ("PBPS_TEST_MSSQL_EXPRESS_NAME", "PBPS_TEST_EXPRESS_PORT", "mssql-express", 26331),
               ("PBPS_TEST_MSSQL_SCRATCH_NAME", "PBPS_TEST_MSSQL_SCRATCH_PORT", "mssql-scratch", 26332)],
-    "pg": [("PBPS_TEST_PG_NAME", "PBPS_TEST_PG_PORT", "pg", 56320),
-           ("PBPS_TEST_PG_OLD_NAME", "PBPS_TEST_PG_OLD_PORT", "pg16", 56321),
-           ("PBPS_TEST_PG_SCRATCH_NAME", "PBPS_TEST_PG_SCRATCH_PORT", "pg-scratch", 56322)],
+    "pg": [("PBPS_TEST_PG_NAME", "PBPS_TEST_PG_PORT", "pg", 27320),
+           ("PBPS_TEST_PG_OLD_NAME", "PBPS_TEST_PG_OLD_PORT", "pg16", 27321),
+           ("PBPS_TEST_PG_SCRATCH_NAME", "PBPS_TEST_PG_SCRATCH_PORT", "pg-scratch", 27322)],
 }
 
 
@@ -61,6 +66,7 @@ def selector(value):
 def fixture_env(suite, index, source):
     env = dict(source)
     prefix = env.get("PBPS_LIVE_PREFIX") or "pbps-live"
+    low, high = ephemeral_ports()
     for name, port, kind, default in FIXTURES[suite]:
         base = env.get(name)
         env[name] = f"{base}-s{index}" if base else f"{prefix}s{index}-{kind}"
@@ -69,9 +75,129 @@ def fixture_env(suite, index, source):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", env[name]), "invalid fixture name")
         env[port] = str(int(env.get(port) or default) + 10 * index)
         require(0 < int(env[port]) < 65536, "fixture port outside 1..65535")
+        require(not low <= int(env[port]) <= high,
+                f"fixture {env[name]}: {port}={env[port]} overlaps host ephemeral range {low}..{high}")
     require(len({env[n] for n, _, _, _ in FIXTURES[suite]}) == 3, "fixture names collide")
     require(len({env[p] for _, p, _, _ in FIXTURES[suite]}) == 3, "fixture ports collide")
     return env
+
+
+def ephemeral_ports():
+    try:
+        text = EPHEMERAL_RANGE.read_text()
+    except OSError as error:
+        raise ValueError(f"cannot read host ephemeral port range {EPHEMERAL_RANGE}: {error}") from error
+    require(re.fullmatch(r"\s*[0-9]+\s+[0-9]+\s*", text), "unreadable host ephemeral port range")
+    low, high = map(int, text.split())
+    require(0 < low <= high < 65536, "invalid host ephemeral port range")
+    return low, high
+
+
+def container_names():
+    result = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"],
+                            text=True, capture_output=True)
+    require(result.returncode == 0, f"cannot list fixture containers: {result.stderr.strip()}")
+    names = result.stdout.splitlines()
+    require(all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) for name in names),
+            "unreadable fixture container names")
+    return set(names)
+
+
+class FixtureRun:
+    """Own only a fresh assignment, and stop its writers before removing it."""
+
+    def __init__(self, names):
+        self.names = set(names)
+        self.processes = []
+        self.lock = Lock()
+        self.stopped = False
+        self.handlers = {}
+
+    def __enter__(self):
+        # Reusing a container would make an assignment insufficient proof of
+        # ownership. Canonical runners may reuse; the whole-run driver may not.
+        existing = self.names.intersection(container_names())
+        require(not existing, "fixture containers already exist: " + ", ".join(sorted(existing)))
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.handlers[sig] = signal.signal(sig, self.interrupt)
+        return self
+
+    def run(self, command, **kwargs):
+        with self.lock:
+            require(not self.stopped, "fixture run interrupted")
+            process = subprocess.Popen(command, start_new_session=True, **kwargs)
+            self.processes.append(process)
+        try:
+            return process.wait()
+        finally:
+            with self.lock:
+                self.processes.remove(process)
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+            processes = list(self.processes)
+        if not processes:
+            return
+        deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for process in processes:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        # A runner can exit before its TLS helper finishes removing its own
+        # container. Keep the whole group alive for cleanup (DEC-2366.1).
+        groups = [process.pid for process in processes]
+        while groups:
+            remaining = []
+            for pid in groups:
+                try:
+                    os.killpg(pid, 0)
+                    remaining.append(pid)
+                except ProcessLookupError:
+                    pass
+            groups = remaining
+            delay = deadline - time.monotonic()
+            if not groups or delay <= 0:
+                break
+            time.sleep(min(0.05, delay))
+        for pid in groups:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def interrupt(self, sig, frame):
+        for handled in self.handlers:
+            signal.signal(handled, signal.SIG_IGN)
+        self.stop()
+        raise InterruptedError(f"fixture run interrupted by {signal.Signals(sig).name}")
+
+    def __exit__(self, *exception):
+        # A repeated terminal signal must not interrupt removal halfway through.
+        for sig in self.handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            self.stop()
+            remaining = self.names.intersection(container_names())
+            errors = []
+            for name in sorted(remaining):
+                try:
+                    result = subprocess.run(["docker", "rm", "-f", "-v", name],
+                                            text=True, capture_output=True)
+                    if result.returncode:
+                        errors.append(f"{name}: {result.stderr.strip()}")
+                except OSError as error:
+                    errors.append(f"{name}: {error}")
+            require(not errors, "fixture cleanup failed: " + "; ".join(errors))
+        finally:
+            for sig, handler in self.handlers.items():
+                signal.signal(sig, handler)
 
 
 def partition(names, count, identity, weights, pinned=False):
@@ -317,14 +443,14 @@ def shard_counts(suites, memory, mssql=None, pg=None):
     for suite, requested in (("mssql", mssql), ("pg", pg)):
         if suite in suites and requested is not None:
             require(requested > 0, "shard count must be positive")
-            require(suite != "mssql" or requested <= 3, "at most three SQL Server shards are supported")
+            require(suite != "mssql" or requested <= 4, "at most four SQL Server shards are supported")
             counts[suite] = requested
     if "pg" in suites and "pg" not in counts:
         reserve = mssql_memory(counts.get("mssql", 1)) if "mssql" in suites else 0
         counts["pg"] = max(1, min(4, int((memory - reserve) // PG_SHARD_GIB)))
     if "mssql" in suites and "mssql" not in counts:
         remaining = memory - PG_SHARD_GIB * counts.get("pg", 0)
-        counts["mssql"] = max(1, min(3, 1 + int((remaining - MSSQL_SET_GIB) // MSSQL_WITHOUT_EXPRESS_GIB)))
+        counts["mssql"] = max(1, min(4, 1 + int((remaining - MSSQL_SET_GIB) // MSSQL_WITHOUT_EXPRESS_GIB)))
     required = mssql_memory(counts.get("mssql", 0)) + PG_SHARD_GIB * counts.get("pg", 0)
     require(required <= memory,
             f"shards need about {required} GiB; only {memory:.2f} GiB is available")
@@ -390,8 +516,8 @@ def drive(args):
                          PBPS_LIVE_SHARD_DIR=str(shard_dir))
         try:
             with (suite_root / f"{index}.log").open("w") as log:
-                code = subprocess.run(["bash", str(ROOT / "scripts" / RUNNERS[suite])], cwd=ROOT,
-                                      env=shard_env, stdout=log, stderr=subprocess.STDOUT).returncode
+                code = fixtures.run(["bash", str(ROOT / "scripts" / RUNNERS[suite])], cwd=ROOT,
+                                    env=shard_env, stdout=log, stderr=subprocess.STDOUT)
         except OSError as error:
             print(f"{suite}/{index}: {error}", file=sys.stderr, flush=True)
             code = 1
@@ -403,13 +529,15 @@ def drive(args):
     memory_samples, memory_errors = [memory], []
     stop = Event()
     sampler = Thread(target=sample_memory, args=(stop, memory_samples, memory_errors))
-    sampler.start()
-    try:
-        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            finished = list(pool.map(launch, tasks))
-    finally:
-        stop.set()
-        sampler.join()
+    with FixtureRun(used_names) as fixtures:
+        try:
+            sampler.start()
+            with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+                finished = list(pool.map(launch, tasks))
+        finally:
+            stop.set()
+            if sampler.ident is not None:
+                sampler.join()
     failed = bool(memory_errors)
     for suite in suites:
         count = counts[suite]

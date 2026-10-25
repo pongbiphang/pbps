@@ -10,10 +10,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -55,6 +57,232 @@ def job_commands(workflow, job):
 
 
 class ShardedExecution(unittest.TestCase):
+    def test_descendant_cleanup_finishes_after_its_runner_leader_exits(self):
+        events, elapsed, _ = self.stop_fake_runners(["cleanup"])
+        kinds = [event[0] for event in events]
+        self.assertIn("cleanup", kinds, "SIGKILL must not bypass the helper's finally block")
+        self.assertLess(kinds.index("leader-exit"), kinds.index("cleanup"))
+        self.assertNotIn("kill", kinds)
+        self.assertLess(elapsed, 0.2)
+
+    def test_ignoring_descendant_is_killed_at_the_deadline_after_its_leader_exits(self):
+        events, elapsed, fixture = self.stop_fake_runners(["ignore"])
+        self.assertEqual(fixture.processes, [], "the leader was already reaped")
+        self.assertEqual([event[0] for event in events], ["term", "wait", "leader-exit", "kill"])
+        self.assertAlmostEqual(elapsed, 0.2)
+        self.assertAlmostEqual(events[-1][2], 0.2)
+
+    def test_runner_shutdown_uses_one_deadline_and_releases_the_registry_lock(self):
+        events, elapsed, _ = self.stop_fake_runners(["blocked", "blocked"])
+        self.assertEqual([event[0] for event in events], ["term", "term", "wait", "wait", "kill", "kill"])
+        waits = [event[2] for event in events if event[0] == "wait"]
+        self.assertEqual(waits, [0.2, 0])
+        self.assertAlmostEqual(elapsed, 0.2)
+
+    def test_already_gone_runner_groups_need_no_escalation(self):
+        events, elapsed, _ = self.stop_fake_runners(["gone"])
+        self.assertNotIn("kill", [event[0] for event in events])
+        self.assertEqual(elapsed, 0)
+
+    def stop_fake_runners(self, behaviors):
+        fixture = SHARDS.FixtureRun([])
+        clock, events = [0.0], []
+        groups = {1000 + index: {"behavior": behavior, "alive": behavior != "gone", "term": None}
+                  for index, behavior in enumerate(behaviors)}
+
+        def send(pid, sig):
+            group = groups[pid]
+            if sig == signal.SIGTERM:
+                self.assertTrue(fixture.lock.acquire(blocking=False))
+                fixture.lock.release()
+                events.append(("term", pid, clock[0]))
+                group["term"] = clock[0]
+            elif sig == signal.SIGKILL:
+                events.append(("kill", pid, clock[0]))
+                group["alive"] = False
+                return
+            elif group["behavior"] == "cleanup" and group["term"] is not None:
+                if clock[0] >= group["term"] + 0.05:
+                    events.append(("cleanup", pid, clock[0]))
+                    group["alive"] = False
+            if not group["alive"]:
+                raise ProcessLookupError(pid)
+
+        def wait(process, timeout):
+            # The real worker removes its leader under this lock after wait().
+            # Holding the registry lock throughout shutdown would deadlock it.
+            self.assertTrue(fixture.lock.acquire(blocking=False))
+            try:
+                self.assertTrue(fixture.stopped)
+                events.append(("wait", process.pid, timeout))
+                if groups[process.pid]["behavior"] != "blocked":
+                    fixture.processes.remove(process)
+                    events.append(("leader-exit", process.pid, clock[0]))
+                    return 0
+            finally:
+                fixture.lock.release()
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("fake runner", timeout)
+
+        for pid in groups:
+            process = mock.Mock(pid=pid)
+            process.wait.side_effect = lambda timeout, process=process: wait(process, timeout)
+            fixture.processes.append(process)
+
+        def sleep(seconds):
+            self.assertGreater(seconds, 0)
+            clock[0] += seconds
+
+        with mock.patch.object(SHARDS, "RUNNER_STOP_GRACE_SECONDS", 0.2, create=True), \
+             mock.patch.object(SHARDS.os, "killpg", side_effect=send), \
+             mock.patch.object(SHARDS.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(SHARDS.time, "sleep", side_effect=sleep):
+            fixture.stop()
+        return events, clock[0], fixture
+
+    def test_default_ports_avoid_ephemeral_and_canonical_runner_ports(self):
+        ports = []
+        with mock.patch.object(SHARDS, "ephemeral_ports", return_value=(32768, 60999)):
+            for suite, count in (("mssql", 4), ("pg", 4)):
+                for index in range(count):
+                    env = SHARDS.fixture_env(suite, index, {})
+                    ports.extend(int(env[port]) for _, port, _, _ in SHARDS.FIXTURES[suite])
+        self.assertEqual(len(ports), len(set(ports)))
+        self.assertTrue(all(port < 32768 for port in ports))
+        self.assertTrue(set(ports).isdisjoint({14330, 14331, 14332, 54320, 54321, 54322}))
+
+    def test_ephemeral_overlap_names_each_fixture_and_refuses_before_launch(self):
+        for suite in SHARDS.RUNNERS:
+            for name, port, _, _ in SHARDS.FIXTURES[suite]:
+                for base in (39990, 40000):
+                    with self.subTest(suite=suite, port=port, base=base), \
+                         mock.patch.object(SHARDS, "ephemeral_ports", return_value=(40000, 40010)):
+                        with self.assertRaisesRegex(ValueError, f"owned-s1.*{port}=400[01]0"):
+                            SHARDS.fixture_env(suite, 1, {name: "owned", port: str(base)})
+        with mock.patch.object(SHARDS, "ephemeral_ports", return_value=(27320, 27330)):
+            with self.assertRaisesRegex(ValueError, "overlaps host ephemeral range"):
+                self.overlap_run()
+        with mock.patch.object(SHARDS, "ephemeral_ports", return_value=(40000, 40010)):
+            self.assertEqual(SHARDS.fixture_env("pg", 0, {"PBPS_TEST_PG_PORT": "39999"})
+                             ["PBPS_TEST_PG_PORT"], "39999")
+            self.assertEqual(SHARDS.fixture_env("pg", 0, {"PBPS_TEST_PG_PORT": "40011"})
+                             ["PBPS_TEST_PG_PORT"], "40011")
+
+    def test_unreadable_or_malformed_ephemeral_range_is_a_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "range"
+            with mock.patch.object(SHARDS, "EPHEMERAL_RANGE", path):
+                with self.assertRaisesRegex(ValueError, "cannot read host ephemeral port range"):
+                    self.overlap_run()
+                for text in ("", "32768", "low high", "32768 60999 extra", "0 65535", "40000 30000"):
+                    path.write_text(text)
+                    with self.subTest(text=text), self.assertRaisesRegex(ValueError, "ephemeral port range"):
+                        SHARDS.fixture_env("pg", 0, {})
+                path.write_text("32768\t60999\n")
+                self.assertEqual(SHARDS.ephemeral_ports(), (32768, 60999))
+                with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+                    with self.assertRaisesRegex(ValueError, "cannot read host ephemeral port range"):
+                        SHARDS.fixture_env("pg", 0, {})
+
+    def test_cleanup_removes_exact_owned_names_and_volumes_on_success_failure_and_failed_bind(self):
+        foreign = ["pbps-test-shards0-pg-foreign", "pbps-test-shards0-pg16.extra"]
+        for mode in ("ok", "failed", "bind-failed"):
+            with self.subTest(mode=mode):
+                remaining = []
+                result, calls, _, _ = self.fake_run("pg", 1, mode, existing=foreign, remaining=remaining)
+                self.assertEqual(result.returncode == 0, mode == "ok", result.stderr)
+                created = [r["command"][r["command"].index("--name") + 1] for r in calls
+                           if r["command"][:2] == ["docker", "run"]]
+                removed = [r["command"][2:] for r in calls if r["command"][:2] == ["docker", "rm"]]
+                self.assertTrue(created)
+                self.assertCountEqual(removed, [["-f", "-v", name] for name in created])
+                self.assertCountEqual(remaining, foreign)
+
+    def test_cleanup_stops_runner_descendants_on_sigint_and_sigterm(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                remaining = []
+                result, calls, _, _ = self.fake_run("pg", 2, "interrupt", interrupt=sig,
+                                                  remaining=remaining)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(signal.Signals(sig).name, result.stderr)
+                self.assertEqual(remaining, [])
+                created = [r["command"][r["command"].index("--name") + 1] for r in calls
+                           if r["command"][:2] == ["docker", "run"]]
+                removed = [r["command"][-1] for r in calls if r["command"][:2] == ["docker", "rm"]]
+                self.assertTrue(created)
+                self.assertCountEqual(removed, created)
+
+    def test_interrupt_during_sampler_start_stops_the_started_thread(self):
+        for create_thread in (False, True):
+            with self.subTest(create_thread=create_thread), tempfile.TemporaryDirectory() as directory:
+                self.check_sampler_start_interruption(directory, create_thread)
+
+    def check_sampler_start_interruption(self, directory, create_thread):
+        args = argparse.Namespace(suite="pg", mssql_shards=None, pg_shards=1,
+                                  prefix="sampler", weights=None, measure=None, output=directory)
+        started = []
+        original_start = SHARDS.Thread.start
+
+        def interrupt_start(thread):
+            started.append((thread, thread._args[0]))
+            if create_thread:
+                original_start(thread)
+            # A signal may arrive after start() creates the thread but
+            # before the caller executes its next statement.
+            raise InterruptedError("interrupted during sampler start")
+
+        try:
+            with mock.patch.object(SHARDS, "available_gb", return_value=32), \
+                 mock.patch.object(SHARDS, "container_names", return_value=set()), \
+                 mock.patch.object(SHARDS.Thread, "start", interrupt_start), \
+                 redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(InterruptedError, "sampler start"):
+                    SHARDS.drive(args)
+            self.assertTrue(started)
+            self.assertFalse(started[0][0].is_alive(), "interruption must not strand a non-daemon sampler")
+        finally:
+            for thread, stop in started:
+                stop.set()
+                if thread.ident is not None:
+                    thread.join()
+
+    def test_consecutive_prefixes_release_the_same_ports_for_the_next_run(self):
+        remaining = []
+        result, calls, summary, _ = self.fake_run("pg", 1, remaining=remaining, repeat_prefix="next-shard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(summary["pg"]["union"], "exact")
+        self.assertEqual(remaining, [])
+        created = [r["command"][r["command"].index("--name") + 1] for r in calls
+                   if r["command"][:2] == ["docker", "run"]]
+        self.assertEqual(len(created), 6)
+        self.assertTrue(any(name.startswith("pbps-test-shard") for name in created))
+        self.assertTrue(any(name.startswith("next-shard") for name in created))
+
+    def test_cleanup_failure_is_reported_and_other_owned_containers_are_still_removed(self):
+        remaining = []
+        result, calls, _, _ = self.fake_run("pg", 1, "cleanup-failed", remaining=remaining)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture cleanup failed", result.stderr)
+        self.assertIn("pbps-test-shards0-pg: removal denied", result.stderr)
+        self.assertEqual(remaining, ["pbps-test-shards0-pg"])
+        self.assertEqual(sum(r["command"][:2] == ["docker", "rm"] for r in calls), 3)
+
+    def test_existing_assignment_and_unreadable_container_listing_are_never_owned(self):
+        existing = ["pbps-test-shards0-pg"]
+        remaining = []
+        result, calls, _, _ = self.fake_run("pg", 1, existing=existing, remaining=remaining)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture containers already exist", result.stderr)
+        self.assertEqual(remaining, existing)
+        self.assertFalse(any(r["command"][:2] in (["docker", "run"], ["docker", "rm"]) for r in calls))
+        for mode in ("list-failed", "cleanup-list-failed"):
+            with self.subTest(mode=mode):
+                result, calls, _, _ = self.fake_run("pg", 1, mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot list fixture containers", result.stderr)
+                self.assertFalse(any(r["command"][:2] == ["docker", "rm"] for r in calls))
+
     def test_available_memory_requires_readable_memavailable(self):
         with mock.patch.object(SHARDS.subprocess, "check_output", return_value="Mem: 4096 1 2 3 4 3072\n"):
             self.assertEqual(SHARDS.available_gb(), 3)
@@ -65,22 +293,34 @@ class ShardedExecution(unittest.TestCase):
                     SHARDS.available_gb()
 
     def test_joint_defaults_reserve_postgresql_before_sql_server(self):
-        for memory, expected in ((64, {"mssql": 3, "pg": 4}),
+        for memory, expected in ((64, {"mssql": 4, "pg": 4}),
+                                 (25, {"mssql": 4, "pg": 4}),
                                  (24.96, {"mssql": 3, "pg": 4}),
                                  (23, {"mssql": 3, "pg": 4}),
-                                 (22, {"mssql": 2, "pg": 4}),
+                                 (22, {"mssql": 3, "pg": 4}),
+                                 (21.99, {"mssql": 3, "pg": 4}),
+                                 (21, {"mssql": 3, "pg": 4}),
+                                 (20.99, {"mssql": 2, "pg": 4}),
+                                 (19, {"mssql": 2, "pg": 4}),
                                  (18, {"mssql": 2, "pg": 4}),
-                                 (17, {"mssql": 1, "pg": 4}),
+                                 (17, {"mssql": 2, "pg": 4}),
+                                 (16.99, {"mssql": 1, "pg": 4}),
                                  (16, {"mssql": 1, "pg": 4}),
+                                 (15.99, {"mssql": 1, "pg": 4}),
+                                 (13, {"mssql": 1, "pg": 4}),
                                  (11, {"mssql": 1, "pg": 2})):
             with self.subTest(memory=memory):
                 counts = SHARDS.shard_counts(["mssql", "pg"], memory)
                 self.assertEqual(counts, expected)
                 self.assertLessEqual(SHARDS.mssql_memory(counts["mssql"]) + counts["pg"], memory)
         self.assertEqual(SHARDS.shard_counts(["pg"], 20), {"pg": 4})
-        self.assertEqual(SHARDS.shard_counts(["mssql"], 24), {"mssql": 3})
-        for memory, overrides in ((9, {}), (17, {"mssql": 2, "pg": 4}),
-                                  (64, {"mssql": 4}),
+        self.assertEqual(SHARDS.shard_counts(["mssql"], 24), {"mssql": 4})
+        self.assertEqual(SHARDS.shard_counts(["mssql", "pg"], 25, mssql=4, pg=4), {"mssql": 4, "pg": 4})
+        self.assertEqual(SHARDS.shard_counts(["mssql"], 21, mssql=4), {"mssql": 4})
+        for memory, overrides in ((9, {}), (16.99, {"mssql": 2, "pg": 4}),
+                                  (24.99, {"mssql": 4, "pg": 4}),
+                                  (21.99, {"mssql": 4, "pg": None}),
+                                  (64, {"mssql": 5}),
                                   (32, {"pg": 0}), (32, {"mssql": -1})):
             with self.assertRaises(ValueError):
                 SHARDS.shard_counts(["mssql", "pg"], memory, **overrides)
@@ -90,23 +330,27 @@ class ShardedExecution(unittest.TestCase):
         names = express + ["a", "b", "c"]
         weights = {"bin:" + name: 10 for name in express}
         weights.update({"bin:a": 20, "bin:b": 15, "bin:c": 5})
-        groups = SHARDS.partition(names, 3, "bin", weights)
-        self.assertEqual(groups, [express, ["a"], ["b", "c"]])
+        groups = SHARDS.partition(names, 4, "bin", weights)
+        self.assertEqual(groups, [express, ["a"], ["b"], ["c"]])
         SHARDS.verify_express(groups)
-        SHARDS.verify_express(SHARDS.partition(names, 3, "bin", None))
+        SHARDS.verify_express(SHARDS.partition(names, 4, "bin", None))
         with self.assertRaisesRegex(ValueError, "Express"):
             SHARDS.verify_express([[], express, ["a", "b", "c"]])
 
     def test_express_classification_fails_before_launch_and_nonzero_shards_start_none(self):
-        result, calls, _, _ = self.fake_run("mssql", 3, "express-missing")
+        result, calls, _, _ = self.fake_run("mssql", 4, "express-missing")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("classified exact name", result.stderr)
         self.assertFalse(any(row["command"][0] == "docker" for row in calls))
-        result, calls, summary, receipts = self.fake_run("mssql", 3)
+        result, calls, summary, receipts = self.fake_run("mssql", 4)
         self.assertEqual(result.returncode, 0, result.stderr)
         started = [row for row in calls if row["command"][:2] == ["docker", "run"]
                    and "MSSQL_PID=Express" in row["command"]]
-        self.assertEqual([row["environment"]["PBPS_LIVE_SHARD"] for row in started], ["0/3"])
+        self.assertEqual([row["environment"]["PBPS_LIVE_SHARD"] for row in started], ["0/4"])
+        fourth = [row["command"] for row in calls if row["command"][:2] == ["docker", "run"]
+                  and row["environment"]["PBPS_LIVE_SHARD"] == "3/4"]
+        self.assertCountEqual([row[row.index("-p") + 1] for row in fourth],
+                              ["26360:1433", "127.0.0.1:26362:1433"])
         for row in receipts:
             SHARDS.verify_express(row["groups"])
         self.assertEqual(summary["mssql"]["union"], "exact")
@@ -242,6 +486,7 @@ sys.exit(1 if failed else 0)
                  mock.patch.object(SHARDS, "available_gb", return_value=32) as memory, \
                  mock.patch.object(SHARDS, "ThreadPoolExecutor", side_effect=pool), \
                  mock.patch.object(SHARDS, "sample_memory", side_effect=sample), \
+                 mock.patch.object(SHARDS, "container_names", return_value=set()), \
                  mock.patch.object(SHARDS, "preflight_express", return_value=sorted(SHARDS.EXPRESS_TESTS)), \
                  mock.patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()):
                 try:
@@ -404,14 +649,19 @@ sys.exit(1 if failed else 0)
                 with self.assertRaises(ValueError):
                     SHARDS.read_weights(path)
 
-    def fake_run(self, suite, count, mode="ok", selector=None):
+    def fake_run(self, suite, count, mode="ok", selector=None, existing=(), remaining=None,
+                 interrupt=None, repeat_prefix=None):
         with tempfile.TemporaryDirectory(prefix="pbps-shard-regression-") as directory:
             root = Path(directory)
+            containers = root / "containers"
+            containers.mkdir()
+            for name in existing:
+                (containers / name).touch()
             clients = root / "clients"
             clients.mkdir()
             fake = clients / "client"
             fake.write_text(f"#!{sys.executable}\n" + r'''
-import json, os, shutil, subprocess, sys
+import json, os, shutil, signal, subprocess, sys, time
 from pathlib import Path
 root = Path(os.environ["PBPS_SHARD_FAKE_ROOT"])
 command = [Path(sys.argv[0]).name, *sys.argv[1:]]
@@ -422,13 +672,31 @@ record = {"command": command, "environment": {k: v for k, v in os.environ.items(
 with (root / "calls").open("a") as log:
     log.write(json.dumps(record) + "\n")
 if command[:2] == ["docker", "ps"]:
-    pass
+    if os.environ["PBPS_SHARD_FAKE_MODE"] == "list-failed" or (
+            os.environ["PBPS_SHARD_FAKE_MODE"] == "cleanup-list-failed" and (root / "tested").exists()):
+        print("listing denied", file=sys.stderr)
+        sys.exit(1)
+    for path in (root / "containers").iterdir():
+        print(path.name)
+elif command[:2] == ["docker", "rm"]:
+    assert command[2:4] == ["-f", "-v"] and len(command) == 5, command
+    if os.environ["PBPS_SHARD_FAKE_MODE"] == "cleanup-failed" and command[-1].endswith("s0-pg"):
+        print("removal denied", file=sys.stderr)
+        sys.exit(1)
+    (root / "containers" / command[-1]).unlink()
 elif command[0] == "free":
     print("Mem: 65536 0 65536 0 0 65536")
 elif command[:2] == ["docker", "exec"]:
     if "SELECT CONVERT" in command[-1]:
         print("SQL_Latin1_General_CP1_CI_AS")
-elif command[:2] == ["docker", "run"] or command[0] == "sleep":
+elif command[:2] == ["docker", "run"]:
+    binding = command[command.index("-p") + 1]
+    occupied = any(p.read_text() == binding for p in (root / "containers").iterdir())
+    (root / "containers" / command[command.index("--name") + 1]).write_text(binding)
+    if occupied or os.environ["PBPS_SHARD_FAKE_MODE"] == "bind-failed":
+        print("failed to bind host port", file=sys.stderr)
+        sys.exit(1)
+elif command[0] == "sleep":
     pass
 elif command[:2] == ["python3", "scripts/live-transport.py"]:
     for name in ("tls_a", "tls_b"):
@@ -457,6 +725,13 @@ elif command[0] == "cargo":
         print(f"\n{len(names)} tests, 0 benchmarks")
     else:
         mode = os.environ["PBPS_SHARD_FAKE_MODE"]
+        (root / "tested").touch()
+        if mode == "interrupt":
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            (root / ("waiting-" + str(os.getpid()))).touch()
+            while True:
+                time.sleep(1)
         selected = names[1:] if mode == "missing" else ([] if mode == "empty" else names)
         print(f"\nrunning {len(selected)} tests")
         for index, name in enumerate(selected):
@@ -493,8 +768,56 @@ elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
                 command = [sys.executable, "scripts/live-shards.py", "--suite", suite,
                            "--" + suite + "-shards", str(count), "--prefix", "pbps-test-shard",
                            "--output", str(output), "--measure", str(root / "weights.json")]
-            result = subprocess.run(command, cwd=ROOT, env=env, text=True,
-                                    capture_output=True, timeout=60)
+            if interrupt is not None:
+                # Exercise escalation without waiting the production grace.
+                entry = root / "driver.py"
+                entry.write_text("import importlib.util, sys\n"
+                                 f"spec = importlib.util.spec_from_file_location('driver', {str(SHARDS.SCRIPT)!r})\n"
+                                 "driver = importlib.util.module_from_spec(spec)\n"
+                                 "spec.loader.exec_module(driver)\n"
+                                 "driver.RUNNER_STOP_GRACE_SECONDS = 0.2\n"
+                                 "sys.exit(driver.main())\n")
+                command[1] = str(entry)
+            with subprocess.Popen(command, cwd=ROOT, env=env, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                if interrupt is not None:
+                    deadline = time.monotonic() + 20
+                    while not list(root.glob("waiting-*")) and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(list(root.glob("waiting-*")), "runner must reach the interrupt barrier")
+                    process.send_signal(interrupt)
+                try:
+                    stdout, stderr = process.communicate(timeout=60 if interrupt is None else 10)
+                except subprocess.TimeoutExpired:
+                    # Keep a broken implementation from stranding fake clients.
+                    for path in root.glob("waiting-*"):
+                        try:
+                            os.kill(int(path.name.split("-")[1]), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    process.kill()
+                    process.communicate(timeout=10)
+                    self.fail("driver did not stop runner descendants and clean up")
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            if repeat_prefix is not None:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command[command.index("--prefix") + 1] = repeat_prefix
+                output = root / "next-results"
+                command[command.index("--output") + 1] = str(output)
+                result = subprocess.run(command, cwd=ROOT, env=env, text=True,
+                                        capture_output=True, timeout=60)
+            if remaining is not None:
+                remaining.extend(p.name for p in containers.iterdir())
+            for path in root.glob("waiting-*"):
+                status = Path("/proc") / path.name.split("-")[1] / "status"
+                if status.exists():
+                    state = status.read_text()
+                    if not re.search(r"State:\s+Z", state):
+                        try:
+                            os.kill(int(path.name.split("-")[1]), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    self.assertRegex(state, r"State:\s+Z", "interrupted client must be stopped")
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             summary = json.loads((output / "summary.json").read_text()) if (output / "summary.json").exists() else {}
             receipts = [json.loads(p.read_text()) for p in output.glob("*/*/*.json")]

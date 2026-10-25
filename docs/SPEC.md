@@ -3499,8 +3499,10 @@ libtest stdout parser.
 `python3 scripts/live-shards.py --suite all` runs both suites concurrently in
 one pool. It chooses counts jointly from available memory at startup: reserve
 approximately 1 GiB per PostgreSQL set (up to four by default), then allocate
-9 GiB for SQL Server shard 0, which includes Express, and 5 GiB for each
-additional SQL Server shard without Express (at least one, capped at three).
+9 GiB for SQL Server shard 0, which includes Express, and 4 GiB for each
+additional SQL Server shard without Express (at least one, capped at four).
+Four SQL Server and four PostgreSQL shards require 25 GiB under this budget;
+explicit counts use the same admission formula without over-commit.
 `--mssql-shards` and `--pg-shards` override counts within the joint memory budget.
 The chosen counts and available memory are printed before launching runners.
 `--suite mssql|pg` selects one engine. `--output` names a fresh directory for
@@ -3516,7 +3518,16 @@ Shard fixture names default to `<prefix>s<i>-<kind>` (`--prefix`, default
 `pbps-live`); explicit name overrides instead gain `-s<i>`. SQL Server scratch
 still derives from the resolved primary name unless explicitly overridden.
 Shard ports add `10*i` to the existing port overrides, with shard-mode defaults
-26330–26332 and 56320–56322. Name and port collisions refuse before provisioning.
+26330–26332 and 27320–27322. Every assigned port must be outside the host's
+ephemeral range, read from `/proc/sys/net/ipv4/ip_local_port_range`; unreadable
+or invalid range evidence refuses. Overlap refusals name the fixture and port.
+Name and port collisions refuse before provisioning. The whole-run driver
+refuses existing containers with its assigned exact names; it removes its own
+fixtures and anonymous volumes on success, failure, SIGINT or SIGTERM, including
+containers left behind by a failed bind. It stops runner process groups before
+cleanup, leaves similarly named containers alone, and reports cleanup failures
+as run failures. Ports are independent of the prefix; run only one sharded driver
+at a time on a host (DEC-2366.1).
 `--weights file.json` uses positive per-test seconds for deterministic
 longest-first balancing when the file exists; missing entries use its median
 (one second for an empty file). Keys combine the binary selector's hash and
