@@ -8580,3 +8580,16 @@ PostgreSQL copy uses explicit typed projections and checks ROW_COUNT in the
 same DO statement. Exceeding max_rows raises P0001 and rolls back, rather than
 silently copying a prefix with LIMIT. This guard does not replace the later
 pre-write count, locks and recertification; admission remains closed.
+
+<a id="dec-2230-1"></a>
+
+**DEC-2230.1. A detach's same-owner name exemption requires an exact
+retained-clone fact.** Ownership alone includes sequences and non-clone
+indexes the batch never renames. The existing unique clone match supplies
+both moving-name releases and retained-name membership, from the same
+catalog read; membership releases no slot. A retained own clone must stay
+admitted: the PostgreSQL 16/18 rename-handover control keeps `a_key` and
+`a_unique` while moving `a_index`. The existing per-detach apply block and
+guards stay unchanged (DEC-1558.1). Pinned by
+`a_detach_refuses_owned_non_clones_at_its_requested_clone_name` and
+`a_detach_admits_its_exact_retained_clones_and_internal_exchanges`.

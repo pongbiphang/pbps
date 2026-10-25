@@ -778,16 +778,16 @@ pub(crate) fn occupant_slots(
     }
 }
 
-/// Names a detach certainly vacates, not every index on its table. An
-/// unnamed key keeps its engine name, and ambiguity keeps the DO guard's
-/// existing refusal instead of inventing a release (DEC-1558.1).
-pub(crate) fn detach_release_slots(
+/// Names a detach certainly vacates or retains, not every index on its
+/// table. An unnamed key keeps its engine name, and ambiguity keeps the DO
+/// guard's existing refusal instead of inventing a release (DEC-1558.1).
+pub(crate) fn detach_clone_slots(
     uid: &pbps_model::Uid,
     names: &[pbps_model::DetachedName],
     clones: &[pbps_pg::catalog::DetachClone],
-) -> BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid> {
-    use pbps_dialect::slots::{Namespace, SlotKey};
-    let mut releases = BTreeMap::new();
+) -> pbps_dialect::slots::CatalogFacts {
+    use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
+    let mut facts = CatalogFacts::default();
     for wanted in names {
         let Some(to) = &wanted.name else { continue };
         let matching: Vec<_> = clones
@@ -798,17 +798,20 @@ pub(crate) fn detach_release_slots(
             })
             .collect();
         let [clone] = matching[..] else { continue };
-        if clone.name.name != to.raw() {
-            releases.insert(
-                SlotKey {
-                    namespace: Namespace::Relations(clone.name.schema.clone()),
-                    name: clone.name.name.clone(),
-                },
-                uid.clone(),
-            );
-        }
+        let slots = if clone.name.name != to.raw() {
+            &mut facts.detach_releases
+        } else {
+            &mut facts.detach_retained
+        };
+        slots.insert(
+            SlotKey {
+                namespace: Namespace::Relations(clone.name.schema.clone()),
+                name: clone.name.name.clone(),
+            },
+            uid.clone(),
+        );
     }
-    releases
+    facts
 }
 
 /// The names a table rename takes as it runs: its target and, on its way
@@ -987,24 +990,38 @@ fn name_clashes(
                     ),
                 ));
             }
-            let detaching = if let pbps_model::Change::DetachPartition { table, .. } = &p.change {
-                Some(table)
-            } else {
-                None
-            };
-            // A detach vacates its own changing names inside one DO block.
-            // Its guard owns intra-detach exchanges and retained clone names.
+            let detaching =
+                if let pbps_model::Change::DetachPartition { uid, table, .. } = &p.change {
+                    Some((uid, table))
+                } else {
+                    None
+                };
+            // Moving clones were released above. Only an exact retained
+            // clone may still hold its batch's name: ownership alone also
+            // includes sequences and indexes the detach never renames
+            // (DEC-2230.1). The fact uses the original catalog identity even
+            // after an earlier change moves its owner.
             taken.extend(
                 present
                     .iter()
                     .filter(|o| {
-                        o.name == name && !(detaching.is_some() && o.owner.as_ref() == detaching)
+                        use pbps_dialect::slots::{Namespace, SlotKey};
+                        o.name == name
+                            && !detaching.is_some_and(|(uid, table)| {
+                                o.owner.as_ref() == Some(table)
+                                    && catalog.detach_retained.get(&SlotKey {
+                                        namespace: Namespace::Relations(
+                                            o.found.name.schema.clone(),
+                                        ),
+                                        name: o.found.name.name.clone(),
+                                    }) == Some(uid)
+                            })
                     })
                     .map(|o| {
                         (
                             None,
                             match detaching {
-                                Some(table) => format!(
+                                Some((_, table)) => format!(
                                     "detach of `{}` claims `{}`: {}",
                                     table.shown(),
                                     name.shown(),
@@ -1015,7 +1032,7 @@ fn name_clashes(
                         )
                     }),
             );
-            if let Some(table) = detaching {
+            if let Some((_, table)) = detaching {
                 taken.extend(
                     held.iter()
                         .filter(|(at, _)| at == &name)
@@ -13636,36 +13653,180 @@ mod tests {
                 parent: "parent_object".into(),
                 name: Some("declared".into()),
             };
-            let read = detach_release_slots(
+            let read = detach_clone_slots(
                 &uid,
                 std::slice::from_ref(&wanted),
                 std::slice::from_ref(&clone),
             );
-            assert_eq!(read.len(), 1);
-            assert_eq!(read.values().next(), Some(&uid));
-            assert!(detach_release_slots(&uid, std::slice::from_ref(&wanted), &[]).is_empty());
-            assert!(
-                detach_release_slots(
+            assert_eq!(read.detach_releases.len(), 1);
+            assert_eq!(read.detach_releases.values().next(), Some(&uid));
+            assert!(read.detach_retained.is_empty());
+            assert_eq!(
+                detach_clone_slots(&uid, std::slice::from_ref(&wanted), &[]),
+                Default::default()
+            );
+            assert_eq!(
+                detach_clone_slots(
                     &uid,
                     std::slice::from_ref(&wanted),
                     &[clone.clone(), clone.clone()]
-                )
-                .is_empty()
+                ),
+                Default::default()
             );
             for kept in [None, Some("engine_name".into())] {
+                let retained = kept.is_some();
                 let wanted = DetachedName {
                     name: kept,
                     ..wanted.clone()
                 };
-                assert!(
-                    detach_release_slots(&uid, &[wanted], std::slice::from_ref(&clone)).is_empty()
-                );
+                let read = detach_clone_slots(&uid, &[wanted], std::slice::from_ref(&clone));
+                assert!(read.detach_releases.is_empty());
+                assert_eq!(read.detach_retained.len(), usize::from(retained));
+                if retained {
+                    assert_eq!(read.detach_retained.values().next(), Some(&uid));
+                }
             }
             let another = pbps_pg::catalog::DetachClone {
                 kind: DetachedKind::Check,
                 ..clone
             };
-            assert!(detach_release_slots(&uid, &[wanted], &[another]).is_empty());
+            assert_eq!(
+                detach_clone_slots(&uid, &[wanted], &[another]),
+                Default::default()
+            );
+        }
+    }
+
+    #[test]
+    fn a_detach_refuses_owned_non_clones_at_its_requested_clone_name() {
+        use pbps_model::{
+            Change, ChangeSet, DetachedKind, DetachedName, PlannedChange, Uid, UidKind,
+        };
+        use pbps_pg::catalog::{DetachClone, NameOccupant};
+        let table = TableName::new("app", "a");
+        let uid = Uid::derived(UidKind::Table, "a", 0);
+        let names = vec![DetachedName {
+            kind: DetachedKind::Index,
+            parent: "p_index".into(),
+            name: Some("claimed".into()),
+        }];
+        let clone = DetachClone {
+            kind: DetachedKind::Index,
+            parent: "p_index".into(),
+            name: TableName::new("app", "a_index"),
+        };
+        let facts = detach_clone_slots(&uid, &names, std::slice::from_ref(&clone));
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::DetachPartition {
+                uid,
+                table: table.clone(),
+                parent: TableName::new("app", "p"),
+                names,
+                shape: Box::default(),
+            })],
+        };
+        for kind in ["sequence", "index"] {
+            let occupants = [
+                NameOccupant {
+                    name: clone.name.clone(),
+                    kind: "index",
+                    owner: Some(table.clone()),
+                    owner_column: None,
+                },
+                NameOccupant {
+                    name: TableName::new("app", "claimed"),
+                    kind,
+                    owner: Some(table.clone()),
+                    owner_column: (kind == "sequence").then(|| "id".into()),
+                },
+            ];
+            let error = refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts)
+                .expect_err("the detach does not rename this same-owner occupant")
+                .to_string();
+            assert!(
+                error.contains("detach of `app.a` claims `app.claimed`"),
+                "{error}"
+            );
+            assert!(error.contains(&format!("{kind} `app.claimed`")), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_detach_admits_its_exact_retained_clones_and_internal_exchanges() {
+        use pbps_model::{
+            Change, ChangeSet, DetachedKind as K, DetachedName, PlannedChange, Uid, UidKind,
+        };
+        use pbps_pg::catalog::{DetachClone, NameOccupant};
+        let table = TableName::new("app", "a");
+        let uid = Uid::derived(UidKind::Table, "a", 0);
+        for exchange in [false, true] {
+            let bindings = [
+                (
+                    K::PrimaryKey,
+                    "p_pk",
+                    "a_key",
+                    if exchange { "a_unique" } else { "a_key" },
+                ),
+                (
+                    K::Unique,
+                    "p_uq",
+                    "a_unique",
+                    if exchange { "a_key" } else { "a_unique" },
+                ),
+                (K::Index, "p_v", "a_index", "released_index"),
+                (K::Index, "p_kept", "a_kept_index", "a_kept_index"),
+            ];
+            let names: Vec<_> = bindings
+                .iter()
+                .map(|&(kind, parent, _, to)| DetachedName {
+                    kind,
+                    parent: parent.into(),
+                    name: Some(to.into()),
+                })
+                .collect();
+            let clones: Vec<_> = bindings
+                .iter()
+                .map(|&(kind, parent, from, _)| DetachClone {
+                    kind,
+                    parent: parent.into(),
+                    name: TableName::new("app", from),
+                })
+                .collect();
+            let mut facts = detach_clone_slots(&uid, &names, &clones);
+            assert_eq!(facts.detach_releases.len(), if exchange { 3 } else { 1 });
+            assert_eq!(facts.detach_retained.len(), if exchange { 1 } else { 3 });
+            let occupants: Vec<_> = clones
+                .iter()
+                .map(|clone| NameOccupant {
+                    name: clone.name.clone(),
+                    kind: "index",
+                    owner: Some(table.clone()),
+                    owner_column: None,
+                })
+                .collect();
+            let changes = ChangeSet {
+                changes: vec![PlannedChange::new(Change::DetachPartition {
+                    uid: uid.clone(),
+                    table: table.clone(),
+                    parent: TableName::new("app", "p"),
+                    names,
+                    shape: Box::default(),
+                })],
+            };
+            refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts)
+                .expect("retaining a_key/a_unique or exchanging them is a valid detach");
+            for owner in facts.detach_retained.values_mut() {
+                *owner = Uid::derived(UidKind::Table, "other", 0);
+            }
+            assert!(
+                refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts).is_err(),
+                "another detach's batch is no exemption"
+            );
+            facts.detach_retained.clear();
+            assert!(
+                refuse_uninventoried_occupants(&changes, &occupants, &[], "prod", &facts).is_err(),
+                "ownership without an exact retained-clone fact is no exemption"
+            );
         }
     }
 

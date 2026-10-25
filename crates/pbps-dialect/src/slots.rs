@@ -88,6 +88,9 @@ pub struct CatalogFacts {
     /// Exact catalog releases by a partition's detach, keyed by its recorded
     /// identity rather than a position a later planning pass may change.
     pub detach_releases: BTreeMap<SlotKey, pbps_model::Uid>,
+    /// Uniquely matched clones whose detach keeps their catalog name. These
+    /// belong to that batch but release no name to another operation.
+    pub detach_retained: BTreeMap<SlotKey, pbps_model::Uid>,
     /// Every slot the catalog was asked to compare.
     pub compared: BTreeSet<SlotKey>,
     /// The pairs among them it reports alike.
