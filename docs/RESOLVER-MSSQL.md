@@ -203,16 +203,20 @@ for a moment keeps that type.
   impersonation authority cannot return to the sandbox (15517); neither
   entry can REVERT (15196)
   [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
-- **Order and transport (DEC-2374.1, DEC-2374.2).** The emitter's statements
-  compile in the scratch route's order, not the ordinary plan's. A table is
-  created bare: its `CREATE` carries computed columns and defaults inline, and
-  a computed column naming a declared function fails there with 4121.
-  Modules follow. Defaults, checks, computed columns and the keys and indexes
-  over a computed column come after the modules, and a module that reads a
-  computed column waits for it. Only the column is held, never the table:
-  table, then function, then `ALTER TABLE .. ADD c AS f(..)` compiles even
-  where `f` is schema-bound and reads the table. A function that reads the
-  column it serves refuses by name. Each `Statement` is its own batch, in
+- **Order and transport (DEC-2374.1, DEC-2374.2, DEC-2374.5).** The emitter's
+  statements compile in the scratch route's order, not the ordinary plan's. A
+  new table whose computed column, default or check calls a planned function
+  is split by `Mssql::generated_table_parts`: a computed column naming a
+  declared function fails in the `CREATE` with 4121, and a default with 342.
+  The columns before the first such computed column stay in the `CREATE`,
+  every later one is added in declared order (positions are compared as
+  reported and the engine appends), and what names a late column is its own
+  part. `generated::constraints` orders them: the function before each part
+  that calls it, the late columns after the bare table and in order, a module
+  after the columns it reads. Table, then function, then `ALTER TABLE .. ADD
+  c AS f(..)` compiles even where `f` is schema-bound and reads the table. A
+  declaration whose order cannot both compile and keep the declared positions
+  refuses by name, with the remedy. Each `Statement` is its own batch, in
   autocommit, on the deployer's connection: a failed statement leaves nothing
   behind and the connection usable, so no transaction frames the run. A
   failure naming a deadlock, a lock or a resource limit answers nothing about

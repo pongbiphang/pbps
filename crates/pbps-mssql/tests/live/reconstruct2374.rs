@@ -88,15 +88,33 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> Change {
     }
 }
 
-fn reconstruction(changes: Vec<Change>) -> Reconstruction {
+fn reconstruction(changes: Vec<Change>) -> Result<Reconstruction, ReconstructError> {
+    // The identities the declarations record: a split default names its column.
+    let mut declared = pbps_model::Schema::default();
+    for change in &changes {
+        if let Change::CreateTable { name, table, .. } = change {
+            declared.tables.insert(name.clone(), (**table).clone());
+        }
+    }
+    let ids = pbps_diff::resolve(
+        &declared,
+        &IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "reconstruct-live-tests".into(),
+            today: "2026-10-25".into(),
+        },
+    )
+    .unwrap()
+    .ids;
     let plan = pbps_diff::order::propose(ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     });
-    Reconstruction::new(&Mssql, &plan, &IdsFile::default(), &ModuleDeps::new()).unwrap()
+    Reconstruction::new(&Mssql, &plan, &ids, &ModuleDeps::new())
 }
 
 async fn compile(conn: &mut Conn, changes: Vec<Change>) -> Result<(), ReconstructError> {
-    let reconstruction = reconstruction(changes);
+    let reconstruction = reconstruction(changes)?;
     reconstruction
         .compile_steps(conn, 0..reconstruction.len())
         .await
@@ -458,23 +476,22 @@ fn reading(function: &str, column: &str) -> Change {
     )
 }
 
-/// Each computed column is held on its own: `d AS (id + 1)` calls nothing, so
-/// the function that reads it need not wait for `c`, which calls that
-/// function. Bare table, `d`, `f`, `c` compiles; one group for both columns
-/// asked `f` to follow a column that must follow `f`.
+/// `a AS (id + 1)` is declared before `c AS (f(id))`, and `f` reads `a`: it
+/// stays in the CREATE, so bare table with `a`, then `f`, then `c` compiles,
+/// and the columns are in declared order, as on the target.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_function_reading_one_computed_column_compiles_before_a_column_that_calls_it() {
     for (tag, functions_first) in [("per_a", false), ("per_b", true)] {
         case(tag, move |mut conn| async move {
             let table = table("t", |t| {
+                t.computed.insert("a".into(), computed("id + 1"));
                 t.computed.insert("c".into(), computed("app.f(id)"));
-                t.computed.insert("d".into(), computed("id + 1"));
             });
             let changes = if functions_first {
-                vec![reading("f", "d"), table]
+                vec![reading("f", "a"), table]
             } else {
-                vec![table, reading("f", "d")]
+                vec![table, reading("f", "a")]
             };
             compile(&mut conn, changes).await.unwrap();
             assert_eq!(
@@ -636,6 +653,62 @@ async fn names_that_only_look_like_a_read_or_a_call_make_no_cycle() {
         )
         .await
         .unwrap();
+    })
+    .await;
+}
+
+/// A mid-table computed column keeps its position. The model writes a table's
+/// plain columns, then its computed ones in name order, and the split adds the
+/// late ones in that order: the columns of the table the reconstruction makes
+/// are the target's, position for position (`column_id` is compared as
+/// reported). `b` calls a planned function and `a` before it does not, so `a`
+/// stays in the CREATE, `b` and `c` are added in order after the function.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_mid_table_computed_column_keeps_the_target_s_column_positions() {
+    case("positions", |mut conn| async move {
+        let wanted = |t: &mut Table| {
+            t.columns.insert("w".into(), int());
+            t.computed.insert("a".into(), computed("id + 1"));
+            t.computed.insert("b".into(), computed("app.f(id)"));
+            t.computed.insert("c".into(), computed("v + 1"));
+        };
+        compile(
+            &mut conn,
+            vec![
+                table("t", wanted),
+                module(ModuleKind::Function, "f", FUNCTION),
+            ],
+        )
+        .await
+        .unwrap();
+        // The target: the same declarations created inline, in one CREATE.
+        conn.execute(
+            "CREATE TABLE app.target (id int, v int, w int, a AS (id + 1), b AS (app.f(id)), c AS (v + 1));",
+        )
+        .await
+        .unwrap();
+        let columns = async |conn: &mut Conn, table: &str| -> Vec<(String, i32)> {
+            conn.query(&format!(
+                "SELECT name, column_id FROM sys.columns WHERE object_id = OBJECT_ID(N'app.{table}') ORDER BY column_id"
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+                    row.try_get::<i32>("column_id").unwrap().unwrap(),
+                )
+            })
+            .collect()
+        };
+        let scratch = columns(&mut conn, "t").await;
+        assert_eq!(scratch, columns(&mut conn, "target").await);
+        assert_eq!(
+            scratch.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            ["id", "v", "w", "a", "b", "c"]
+        );
     })
     .await;
 }

@@ -4396,25 +4396,38 @@ rehearsal lands, and `--dev` output is unchanged.
 
 <a id="dec-2374-1"></a>
 
-**DEC-2374.1. SQL Server's reconstruction creates a table bare and holds only
-what can name a module.** The ordinary plan order is not a compile order: a
-table's `CREATE` carries its computed columns and defaults inline, and a
-computed column naming a declared function fails there with 4121, as the
-ordinary planner refuses the plan outright. Measured on 17.0: bare table, then
-function, then `ALTER TABLE .. ADD c AS f(..)` compiles, even where `f` is
-schema-bound and reads the table. So defaults and checks come after every
-module, and computed columns come after the functions they call. The held part
-is only the computed column and the keys and indexes over it, never the table
-(PostgreSQL holds the table because its generated column is inline in the
-`CREATE`), and a module reads the held column only if it names both the table
-and the column, so a schema-bound function over the table's other columns is
-no reader. A function that reads the column it serves has no order and
-refuses by name. Roles, grants and rows are skipped: none changes what a name
-binds to, and the plan's schema grants, the only kind it carries, are replayed
-before anything compiles (measured: a deployer that does not own its schema
-fails 229 and 15247 without `REFERENCES`, and compiles identically with the
-schema-level grant). `pbps_diff`'s scratch route owns the order (DEC-1959.6);
-no SQL Server reorder pass exists.
+**DEC-2374.1. SQL Server splits a new table through `generated_table_parts`,
+and the shared constraints order the parts.** The ordinary plan order is not a
+compile order: a table's `CREATE` carries its computed columns, defaults and
+checks inline, and one that names a declared function fails there (4121 for a
+computed column or a check, 342 for a default; measured on 17.0). The ordinary
+planner refuses a plan that creates such a table and its function together
+(`ComputedFunctionChanged`), so `expand` never receives one. The scratch route
+does, and DEC-1503.1's seam handles it: `Mssql::generated_table_parts` cuts the
+table at the first computed column whose expression calls a planned function
+(the plain columns precede the computed ones, so the cut is among the computed
+columns): the columns before it stay in the `CREATE`, every later one is an
+`AddComputedColumn`, and a key, index, check or default that names a late
+column or calls a planned function is its own part. `generated::constraints`
+orders the parts, as it does PostgreSQL's: the bare table, the late columns in
+declared order, each part that names them, a function before each part whose
+text calls it, and a module after the columns it reads. Defaults and checks
+need the functions they call and no other module (measured: they compile after
+the function, before or after any unrelated module), which the function edges
+express; "after every module" was only a stand-in. A reader waits for the
+columns it names (`Dialect::generation_column_names`, which returns the
+identifiers of its code with variables and parameters removed, since the
+dialect's name test reads `c` out of `@c`) and for every column when it
+projects `*` (a view or an inline table-valued function binds its column list
+when it is created; `EXISTS (SELECT * ..)` projects none). A call is found by
+the two-part name SQL Server requires of a function in an expression (a
+one-part call is 195, measured), exact by schema (`Dialect::generation_calls`).
+Every default is `None` or the leaf test, so PostgreSQL's route does not change.
+Roles, grants and rows are skipped: none changes what a name binds to, and the
+plan's schema grants, the only kind it carries, are replayed before anything
+compiles (measured: a deployer that does not own its schema fails 229 and
+15247 without `REFERENCES`, and compiles identically with the schema-level
+grant). No SQL Server reorder pass exists (DEC-1959.6).
 
 <a id="dec-2374-2"></a>
 
@@ -4461,3 +4474,24 @@ difference is a recorded limitation and a hosted family refuses by name; the
 reported build is a keyed fingerprint of the product version, level and
 update level, with an RTM build's absent update level a known absence and an
 unreadable one no fingerprint.
+
+<a id="dec-2374-5"></a>
+
+**DEC-2374.5. Computed columns are added in declared order, and a declaration
+that cannot be is refused by name.** `sys.columns.column_id` is compared as
+reported, `ALTER TABLE ADD` appends a column, and nothing reorders columns:
+measured on 17.0, for `(id, v, c AS app.f(id), d AS id + 1)` the target created
+inline has `c=3, d=4`, adding `c` then `d` reproduces it, and adding `d` then
+`c` gives `d=3, c=4`. So the declared chain is hard (DEC-1503.1's suffix rule,
+for the computed columns). A table whose earlier column calls a function that
+reads a later one, `c AS app.f(id)` declared before `d AS id + 1` with `f`
+reading `d`, has no order that compiles and reproduces the positions: `d` must
+precede `f` and `f` precede `c`. It refuses by name, with the remedy: declare
+the column the function reads first (a column named to sort before `c`, since
+declared order is name order). A soft chain, dropped when it cycles, was
+rejected: the scratch table would then differ from the target in an opaque
+capture difference instead of a named refusal. A cycle that only looks like
+one, because a function shares a name with a column through an alias or another
+table's column, is a lexical over-read and refuses the same way, naming the
+alias or column to rename.
+

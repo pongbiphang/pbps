@@ -2,36 +2,24 @@
 //! docs/RESOLVER-MSSQL.md §5; issue #2374).
 //!
 //! The statements are the emitter's own: a fresh bootstrap of the declared
-//! schema. This module supplies the order constraints and `pbps_diff`'s
-//! scratch route owns the order (DEC-1959.6); no SQL Server reorder pass is
-//! written here.
+//! schema, ordered by `pbps_diff`'s scratch route (DEC-1959.6). The route
+//! first splits a new table whose generation calls a planned function
+//! through `Mssql::generated_table_parts` (DEC-1503.1, `generated.rs`), then
+//! orders the parts by the constraints it derives for every split table:
+//! the bare table, each late computed column in declared order, and what
+//! names them. This module supplies one part per change and nothing else.
 //!
-//! The ordinary plan order is not a compile order. A table's `CREATE`
-//! carries its computed columns and defaults inline, and a computed column
-//! that names a declared function fails there with 4121, as a plan that
-//! creates both is refused outright. So a table is created bare, the modules
-//! follow, and what can name a module (defaults, checks, computed columns,
-//! and the keys and indexes over a computed column) comes last. Measured on
-//! 17.0: table, then function, then `ALTER TABLE .. ADD c AS f(..)` compiles,
-//! even where `f` is schema-bound and reads the table.
+//! Declared order is a hard chain: a computed column's position is compared
+//! as reported, the engine appends it, and nothing reorders columns, so a
+//! column added before an earlier-declared one lands elsewhere than on the
+//! target. A table whose earlier column calls a function that reads a later
+//! one has therefore no order that compiles and reproduces the positions,
+//! and refuses by name ([`ReconstructError::Cycle`]), with the remedy.
 //!
-//! A module that reads a computed column must follow it, and the column
-//! must follow the functions it calls: PostgreSQL's "late table" question
-//! over a smaller unit, the one computed column, never the table (SQL Server
-//! may create it before the function that reads it) and not a table's
-//! columns as a group. A key, index or primary key is held with the last
-//! computed column it names and follows the others; a foreign key with
-//! either end on a computed column waits for every module.
-//!
-//! Per column is sound because columns have no order among themselves (a
-//! computed column may not use another, 1759, measured on 17.0): a column's
-//! only constraints are the functions it calls before it and the modules that
-//! read it after. A group adds every column's constraints to each: with
-//! `d AS (id + 1)` and `c AS (f(id))` where `f` reads `d`, it calls `f` a
-//! reader of what must follow `f`, though bare table, `d`, `f`, `c` compiles.
-//! A cycle that remains is real: an existing table's column is bound when a
-//! module is created (measured for scalar functions, schema-bound ones and
-//! views), so `f` reading `c` while `c` calls `f` has no order.
+//! Every part is in one phase, so the route's phase pass only keeps the order
+//! the plan gives, which is the schedule's tie-break (the constraints
+//! `settle` then applies are a fresh schedule over that order): a constraint
+//! moves a part later and nothing else does.
 //!
 //! Roles, grants and rows are not reproduced. None changes what a name
 //! binds to, and the plan's schema grants, the only kind it carries, are
@@ -39,9 +27,8 @@
 
 use super::capture::{ObjectIdentity, class, object};
 use crate::Mssql;
-use pbps_dialect::Dialect;
-use pbps_diff::order::scratch::{HeldTable, Input, Part, Phase};
-use pbps_model::{Change, ModuleKind, PlannedChange, Strategy, TableName, ValueSource};
+use pbps_diff::order::scratch::{Input, Part, Phase};
+use pbps_model::{Change, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Why the desired namespace could not be built on scratch. A named limit,
@@ -60,25 +47,24 @@ pub enum ReconstructError {
     #[error("scratch compilation of {declaration} was interrupted: {reason}")]
     Interrupted { declaration: String, reason: String },
     #[error(
-        "scratch cannot order {0}: a computed column and a declared function each need the other. \
-         A function needs a column wherever it names the table and the column, so one that only \
-         shares the column's name (an alias, another table's column, a table of the table's name \
-         in another schema) needs it too: rename the alias or the column"
+        "scratch cannot order {0}. Either a computed column and a declared function each need \
+         the other, or a column that calls a function reads a column declared after it: \
+         columns are added in the order they are declared, which fixes their positions, and \
+         SQL Server cannot reorder them, so declare the column the function reads first. A \
+         function is read as needing a column wherever it names the column, so one that only \
+         shares a column's name (an alias, another table's column, a table of the same name in \
+         another schema) needs it too: rename the alias or the column"
     )]
     Cycle(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
-    phase: Phase,
     /// What an error names: the declaration, never the statement text.
     declaration: String,
     /// The roots this step creates: a table, a module or a type. A child
     /// arrives with its parent and is not listed.
     created: Vec<ObjectIdentity>,
-    /// The computed columns a key or index over them waits for, by the id
-    /// each column's step makes resolvable.
-    follows: Vec<String>,
 }
 
 /// SQL-free lowering input. The lexical observations are finite answers from
@@ -91,9 +77,8 @@ impl pbps_diff::order::scratch::Engine for Mssql {
     fn blueprint(&self, input: Self::Input) -> Input<Metadata> {
         input.0
     }
-    fn phase(metadata: &mut Metadata, phase: Phase) {
-        metadata.phase = phase;
-    }
+    // Phases only chain parts in input order, and this route runs none.
+    fn phase(_: &mut Metadata, _: Phase) {}
 }
 
 #[derive(Debug, Clone)]
@@ -117,84 +102,34 @@ pub struct Reconstruction {
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
 }
 
-/// One computed column, and what stands over it, held until the functions it
-/// calls exist. `id` stands for the column wherever the scratch route knows a
-/// table: the column's own name made resolvable by its step and read by the
-/// parts that name it.
-struct Late {
-    id: TableName,
-    table: TableName,
-    column: String,
-    expression: String,
-    /// The declared functions its expression calls, as `schema.name`: found
-    /// once every function is known, and exact by schema (see `new`).
-    callees: Vec<String>,
-}
-
-fn column_id(table: &TableName, column: &str) -> TableName {
-    TableName::new(table.schema.clone(), format!("{}.{column}", table.name))
-}
-
 type Draft = Part<Metadata>;
 
-/// Each table's computed columns, by table: a column that exists only once
-/// its `ADD` has run, so a key or constraint that names one cannot be in the
-/// `CREATE` that precedes it, nor before a key it references is built.
-type Computed = BTreeMap<TableName, BTreeSet<String>>;
-
-/// Whether `columns` of `table` name a computed column.
-fn names_computed(
-    computed: &Computed,
-    table: &TableName,
-    columns: &[pbps_model::ColumnName],
-) -> bool {
-    computed
-        .get(table)
-        .is_some_and(|held| columns.iter().any(|c| held.contains(c.raw())))
-}
-
-/// A foreign key waits for every module when either end is a computed
-/// column: its own columns exist after their `ADD`, and the key it references
-/// is a key over a computed column, built after that column. Measured on
-/// 17.0: the key before either exists fails 1769 and 1776. Every other key
-/// stays with the tables, which is where a module that reads it expects it.
-fn foreign_key_phase(computed: &Computed, table: &TableName, fk: &pbps_model::ForeignKey) -> Phase {
-    if names_computed(computed, table, &fk.columns)
-        || names_computed(computed, &fk.references_table, &fk.references_columns)
-    {
-        Phase::Expressions
-    } else {
-        Phase::Keys
-    }
-}
-
+/// One part: validated where it is made, so a declaration the emitter cannot
+/// write is refused by name before anything is ordered.
 fn part(
-    phase: Phase,
-    declaration: &str,
-    change: Change,
-    names: Vec<String>,
+    operation: usize,
+    planned: &pbps_model::PlannedChange,
+    declaration: String,
     created: Vec<ObjectIdentity>,
 ) -> Result<Draft, ReconstructError> {
-    // Validate each part where it is made, so a declaration the emitter
-    // cannot write is refused by name before anything is ordered.
-    crate::emit::emit(&change, Strategy::default()).map_err(|error| ReconstructError::Emit {
-        declaration: declaration.to_owned(),
-        reason: error.to_string(),
+    crate::emit::emit(&planned.change, Strategy::default()).map_err(|error| {
+        ReconstructError::Emit {
+            declaration: declaration.clone(),
+            reason: error.to_string(),
+        }
     })?;
     Ok(Part {
-        operation: 0,
+        operation,
         slot: 0,
-        change: PlannedChange::new(change),
-        phase,
-        declaration: declaration.to_owned(),
-        names,
+        change: planned.clone(),
+        phase: Phase::Tables,
+        declaration: declaration.clone(),
+        names: Vec::new(),
         calls: BTreeSet::new(),
         tables: BTreeSet::new(),
         metadata: Metadata {
-            phase,
-            declaration: declaration.to_owned(),
+            declaration,
             created,
-            follows: Vec::new(),
         },
     })
 }
@@ -220,63 +155,56 @@ impl Reconstruction {
     ) -> Result<Self, ReconstructError> {
         let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
-        let computed: Computed = prepared
-            .changes()
-            .changes
-            .iter()
-            .filter_map(|planned| match &planned.change {
-                Change::CreateTable { name, table, .. } if !table.computed.is_empty() => Some((
-                    name.clone(),
-                    table.computed.keys().map(|c| c.raw().to_owned()).collect(),
-                )),
-                _ => None,
-            })
-            .collect();
         let mut steps: Vec<Draft> = Vec::new();
-        let mut late: Vec<(Late, std::ops::Range<usize>)> = Vec::new();
-        let mut functions: Vec<(usize, String)> = Vec::new();
         for (operation, planned) in prepared.changes().changes.iter().enumerate() {
-            let change = &planned.change;
-            let first = steps.len();
-            match change {
-                Change::CreateTable { name, table, .. } => {
-                    table_steps(name, table, change, &computed, &mut steps, &mut late)?;
-                }
-                Change::CreateModule { id, module } => {
-                    if module.kind == ModuleKind::Function {
-                        functions.push((steps.len(), format!("{}.{}", id.schema(), id.name())));
-                    }
-                    steps.push(part(
-                        Phase::Modules,
-                        &format!("{} {}", module.kind, id.shown()),
-                        change.clone(),
-                        vec![id.name().to_owned()],
-                        vec![object(id.schema(), id.name())],
-                    )?);
-                }
-                Change::CreateType { name, .. } => {
-                    steps.push(part(
-                        Phase::Tables,
-                        &format!("type {}", name.shown()),
-                        change.clone(),
-                        vec![name.name().to_owned()],
-                        vec![ObjectIdentity {
-                            class: class::TYPE.into(),
-                            name: vec![name.schema().to_owned(), name.name().to_owned()],
-                            signature: Vec::new(),
-                        }],
-                    )?);
-                }
-                // The differ splits a new table's foreign keys out of its
-                // CREATE. A key names only tables and their keys, so it
-                // follows every table.
-                Change::AddForeignKey {
-                    table, constraint, ..
-                } => steps.push(part(
-                    foreign_key_phase(&computed, table, constraint),
-                    &format!("a foreign key of {}", table.shown()),
-                    change.clone(),
+            let step = |declaration: String, created: Vec<ObjectIdentity>| {
+                part(operation, planned, declaration, created)
+            };
+            match &planned.change {
+                Change::CreateTable { name, .. } => steps.push(step(
+                    format!("table {}", name.shown()),
+                    vec![object(&name.schema, &name.name)],
+                )?),
+                Change::CreateModule { id, module } => steps.push(step(
+                    format!("{} {}", module.kind, id.shown()),
+                    vec![object(id.schema(), id.name())],
+                )?),
+                Change::CreateType { name, .. } => steps.push(step(
+                    format!("type {}", name.shown()),
+                    vec![ObjectIdentity {
+                        class: class::TYPE.into(),
+                        name: vec![name.schema().to_owned(), name.name().to_owned()],
+                        signature: Vec::new(),
+                    }],
+                )?),
+                // What a split table is made of, and the differ's own foreign
+                // keys: created after what they name by the route's constraints.
+                Change::AddComputedColumn { table, name, .. } => steps.push(step(
+                    format!("computed column {}", table.column(name.clone()).shown()),
                     Vec::new(),
+                )?),
+                Change::SetPrimaryKey { table, .. } => steps.push(step(
+                    format!("primary key of {}", table.shown()),
+                    Vec::new(),
+                )?),
+                Change::AddUnique { table, name, .. } => steps.push(step(
+                    format!("unique {} on {}", name.shown(), table.shown()),
+                    Vec::new(),
+                )?),
+                Change::AddIndex { table, name, .. } => steps.push(step(
+                    format!("index {} on {}", name.shown(), table.shown()),
+                    Vec::new(),
+                )?),
+                Change::AddForeignKey { table, name, .. } => steps.push(step(
+                    format!("foreign key {} of {}", name.shown(), table.shown()),
+                    Vec::new(),
+                )?),
+                Change::AlterColumnDefault { column, .. } => steps.push(step(
+                    format!("the default of {}", column.shown()),
+                    Vec::new(),
+                )?),
+                Change::AddCheck { table, name, .. } => steps.push(step(
+                    format!("check {} on {}", name.shown(), table.shown()),
                     Vec::new(),
                 )?),
                 // None of these changes what a name resolves to.
@@ -300,41 +228,12 @@ impl Reconstruction {
                     ));
                 }
             }
-            for made in &mut steps[first..] {
-                made.operation = operation;
-            }
         }
-        // A column calls a declared function by a two-part name only, so the
-        // callee is found by schema and name, not by a name that merely
-        // appears in the expression (a column named like a function, or a
-        // function of the same name in another schema, is no callee).
-        for (late, _) in &mut late {
-            let called = dialect.qualified_calls(&late.expression);
-            late.callees = functions
-                .iter()
-                .map(|(_, token)| token)
-                .filter(|token| {
-                    called.iter().any(|(schema, name)| {
-                        format!("{schema}.{name}").to_lowercase() == token.to_lowercase()
-                    })
-                })
-                .cloned()
-                .collect();
-        }
-        observe(dialect, &mut steps, &late);
-        let held = late
-            .into_iter()
-            .map(|(late, range)| HeldTable {
-                table: late.id,
-                generated: late.callees,
-                steps: range,
-            })
-            .collect::<Vec<_>>();
         let input = ScratchBlueprint(Input::new(
             prepared,
             steps,
-            held,
-            functions,
+            Vec::new(),
+            Vec::new(),
             BTreeSet::new(),
         ));
         let ordered =
@@ -413,333 +312,6 @@ impl Reconstruction {
         }
         Ok(())
     }
-}
-
-/// The table, bare, then what waits for the modules.
-fn table_steps(
-    name: &TableName,
-    table: &pbps_model::Table,
-    original: &Change,
-    all_computed: &Computed,
-    steps: &mut Vec<Draft>,
-    late: &mut Vec<(Late, std::ops::Range<usize>)>,
-) -> Result<(), ReconstructError> {
-    let Change::CreateTable { uid, .. } = original else {
-        unreachable!("the caller matched a CreateTable");
-    };
-    let declaration = format!("table {}", name.shown());
-    let mut bare = table.clone();
-    let computed = std::mem::take(&mut bare.computed);
-    let checks = std::mem::take(&mut bare.checks);
-    let keys = std::mem::take(&mut bare.foreign_keys);
-    // The computed columns, by position, that `columns` name.
-    let naming = |columns: Vec<&str>| -> Vec<usize> {
-        computed
-            .keys()
-            .enumerate()
-            .filter(|(_, c)| columns.contains(&c.raw()))
-            .map(|(at, _)| at)
-            .collect()
-    };
-    // What cannot be in the first `CREATE` because it names a computed
-    // column that does not exist yet (the primary key: 1911, measured), each
-    // with the columns it names, to be added under the name and layout it is
-    // declared with.
-    let mut over: Vec<(Vec<usize>, Draft)> = Vec::new();
-    let mut keep = |named: Vec<usize>, subject: String, change: Change| {
-        part(Phase::Keys, &subject, change, Vec::new(), Vec::new())
-            .map(|draft| over.push((named, draft)))
-    };
-    let nonclustered = !table.primary_key_is_clustered();
-    if let Some(pk) = bare
-        .primary_key
-        .take_if(|pk| !naming(pk.columns.iter().map(|c| c.raw()).collect()).is_empty())
-    {
-        keep(
-            naming(pk.columns.iter().map(|c| c.raw()).collect()),
-            format!("primary key of {}", name.shown()),
-            Change::SetPrimaryKey {
-                table: name.clone(),
-                from: None,
-                to: Some(pk),
-                nonclustered,
-            },
-        )?;
-    }
-    for (n, constraint) in std::mem::take(&mut bare.unique) {
-        let named = naming(constraint.columns.iter().map(|c| c.raw()).collect());
-        if named.is_empty() {
-            bare.unique.insert(n, constraint);
-            continue;
-        }
-        keep(
-            named,
-            format!("unique {} on {}", n.shown(), name.shown()),
-            Change::AddUnique {
-                table: name.clone(),
-                clustered: table.unique_is_clustered(n.raw()),
-                name: n,
-                constraint,
-            },
-        )?;
-    }
-    for (n, index) in std::mem::take(&mut bare.indexes) {
-        // An expression key or a filter can name any computed column.
-        let named = if index.holds_expression() {
-            (0..computed.len()).collect()
-        } else {
-            naming(
-                index
-                    .column_keys()
-                    .iter()
-                    .flatten()
-                    .chain(&index.include)
-                    .map(|c| c.raw())
-                    .collect(),
-            )
-        };
-        if named.is_empty() {
-            bare.indexes.insert(n, index);
-            continue;
-        }
-        keep(
-            named,
-            format!("index {} on {}", n.shown(), name.shown()),
-            Change::AddIndex {
-                table: name.clone(),
-                clustered: table.index_is_clustered(n.raw()),
-                name: n,
-                index: Box::new(index),
-            },
-        )?;
-    }
-    let mut defaults = Vec::new();
-    for (column, spec) in &mut bare.columns {
-        if let ValueSource::Default(default) = &mut spec.value_source {
-            defaults.push((column.clone(), std::mem::take(default)));
-            spec.value_source = ValueSource::None;
-        }
-    }
-    steps.push(part(
-        Phase::Tables,
-        &declaration,
-        Change::CreateTable {
-            uid: uid.clone(),
-            name: name.clone(),
-            table: Box::new(bare),
-            beside_default: None,
-            moves_at_most: None,
-        },
-        vec![name.name.clone()],
-        vec![object(&name.schema, &name.name)],
-    )?);
-    for (key, constraint) in keys {
-        steps.push(part(
-            foreign_key_phase(all_computed, name, &constraint),
-            &declaration,
-            Change::AddForeignKey {
-                table: name.clone(),
-                name: key,
-                constraint: Box::new(constraint),
-            },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    // Each computed column is its own held unit, then the keys that end at it.
-    // Phase Tables, so that without a declared callee the column is added
-    // right after its table, before any module can read it.
-    let ids: Vec<TableName> = computed.keys().map(|c| column_id(name, c.raw())).collect();
-    for (at, (column, expression)) in computed.iter().enumerate() {
-        let from = steps.len();
-        steps.push(part(
-            Phase::Tables,
-            &format!("computed column {}", name.column(column.clone()).shown()),
-            Change::AddComputedColumn {
-                table: name.clone(),
-                name: column.clone(),
-                computed: expression.clone(),
-            },
-            vec![ids[at].name.clone()],
-            Vec::new(),
-        )?);
-        let (mine, rest) = std::mem::take(&mut over)
-            .into_iter()
-            .partition(|(named, _)| named.last() == Some(&at));
-        over = rest;
-        for (named, mut dependent) in mine {
-            dependent.metadata.follows = named.iter().map(|&n| ids[n].name.clone()).collect();
-            steps.push(dependent);
-        }
-        late.push((
-            Late {
-                id: ids[at].clone(),
-                table: name.clone(),
-                column: column.raw().to_owned(),
-                expression: expression.expression.clone(),
-                callees: Vec::new(),
-            },
-            from..steps.len(),
-        ));
-    }
-    for (column, default) in defaults {
-        steps.push(part(
-            Phase::Expressions,
-            &format!("the default of {}", name.column(column.clone()).shown()),
-            Change::AlterColumnDefault {
-                uid: uid.clone(),
-                column: pbps_model::ColumnRef::new(name.clone(), column),
-                from: None,
-                to: Some(default),
-            },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    for (check, constraint) in checks {
-        steps.push(part(
-            Phase::Expressions,
-            &format!("check {} on {}", check.shown(), name.shown()),
-            Change::AddCheck {
-                table: name.clone(),
-                name: check,
-                constraint,
-            },
-            Vec::new(),
-            Vec::new(),
-        )?);
-    }
-    Ok(())
-}
-
-/// What each part may name, by the same lexical test the ordinary planner
-/// uses: a declared name it may call, and the computed columns it may read.
-/// A part reads a column by naming its table and the column (any kind of
-/// module: the column is bound when it is created), or its table and every
-/// column at once (`*`, `alias.*`) in a view or an inline table-valued
-/// function, whose creation binds the column list (measured on 17.0: a view
-/// `SELECT * FROM t` created before `ADD c` never exposes `c`, and a view
-/// over it naming `c` fails 207). A procedure or a trigger expands its `*`
-/// when it runs, and a scalar function's `EXISTS (SELECT * ..)` projects no
-/// list, so a function any column of the table calls (necessarily scalar) is
-/// never a wildcard reader: that rule cannot refuse a valid order.
-fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<usize>)]) {
-    let ids: BTreeSet<&String> = late.iter().map(|(l, _)| &l.id.name).collect();
-    let names: BTreeSet<String> = steps
-        .iter()
-        .flat_map(|s| s.names.iter())
-        .filter(|name| !ids.contains(name))
-        .cloned()
-        .chain(late.iter().map(|(l, _)| l.table.name.clone()))
-        .collect();
-    for part in steps {
-        // The text this part could read or call through. A module's header is
-        // its own declaration, never a read of itself: a function `f` is no
-        // reader of a column `f` because its header says `f`.
-        let sources: Vec<String> = if let Change::CreateModule { module, .. } = &part.change.change
-        {
-            vec![module.definition.clone()]
-        } else {
-            crate::emit::emit(&part.change.change, part.change.strategy)
-                .expect("this part's private validation probe already succeeded")
-                .into_iter()
-                .map(|statement| statement.sql)
-                .collect()
-        };
-        let readable: Vec<String> = sources
-            .iter()
-            .map(|text| without_variables(&dialect.code_only(text)))
-            .collect();
-        let names_text = |name: &str| {
-            readable
-                .iter()
-                .any(|text| dialect.generation_may_call(text, name))
-        };
-        // Only a module whose creation binds a column list can see `*`.
-        let lists_columns = matches!(
-            &part.change.change,
-            Change::CreateModule { module, .. }
-                if matches!(module.kind, ModuleKind::View | ModuleKind::Function)
-        );
-        let callee = if let Change::CreateModule { id, module } = &part.change.change
-            && module.kind == ModuleKind::Function
-        {
-            Some(format!("{}.{}", id.schema(), id.name()))
-        } else {
-            None
-        };
-        let wildcard = lists_columns && readable.iter().any(|text| selects_all(text));
-        part.calls = names
-            .iter()
-            .filter(|n| names_text(n))
-            .cloned()
-            .chain(part.metadata.follows.iter().cloned())
-            .collect();
-        part.tables = late
-            .iter()
-            .filter(|(l, _)| {
-                let called = callee.as_ref().is_some_and(|callee| {
-                    late.iter()
-                        .any(|(other, _)| other.table == l.table && other.callees.contains(callee))
-                });
-                names_text(&l.table.name) && (names_text(&l.column) || (wildcard && !called))
-            })
-            .map(|(l, _)| l.id.clone())
-            .collect();
-    }
-}
-
-/// `code` without the names that are never a column: a variable or parameter
-/// (`@c`, `@@c`) and a temporary object (`#c`). The dialect's name test reads
-/// `c` out of all three (measured), so a function with a parameter `@c` would
-/// be taken for a reader of a column `c`.
-fn without_variables(code: &str) -> String {
-    let mut clean = String::with_capacity(code.len());
-    let mut chars = code.chars().peekable();
-    while let Some(c) = chars.next() {
-        if matches!(c, '@' | '#') {
-            while chars
-                .next_if(|n| n.is_alphanumeric() || matches!(n, '_' | '@' | '#' | '$'))
-                .is_some()
-            {}
-            clean.push(' ');
-        } else {
-            clean.push(c);
-        }
-    }
-    clean
-}
-
-/// Whether `code`, a definition with strings and comments blanked
-/// (`Dialect::code_only`), projects every column: a `*` that ends a select
-/// list or stands before a comma (`SELECT *`, `TOP 5 * FROM`, `*, a`), or
-/// follows `alias.` or `SELECT`/`DISTINCT`/`ALL`. `COUNT(*)` and a
-/// multiplication are none of these: their `*` is followed by `)` or an
-/// operand, and preceded by `(` or an operand.
-fn selects_all(code: &str) -> bool {
-    // The identifier next to `*`, reading outward from it.
-    let word = |chars: &mut dyn Iterator<Item = char>| -> String {
-        chars
-            .skip_while(|c| c.is_whitespace())
-            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'))
-            .collect()
-    };
-    let chars: Vec<char> = code.chars().collect();
-    (0..chars.len()).filter(|&at| chars[at] == '*').any(|at| {
-        let before = chars[..at].iter().rev().find(|c| !c.is_whitespace());
-        let next = chars[at + 1..].iter().find(|c| !c.is_whitespace());
-        let after = word(&mut chars[at + 1..].iter().copied());
-        let preceding: String = word(&mut chars[..at].iter().rev().copied())
-            .chars()
-            .rev()
-            .collect();
-        before == Some(&'.')
-            || next == Some(&',')
-            || after.eq_ignore_ascii_case("FROM")
-            || ["SELECT", "DISTINCT", "ALL"]
-                .iter()
-                .any(|keyword| preceding.eq_ignore_ascii_case(keyword))
-    })
 }
 
 /// Whether a failed statement is a verdict on the declaration. A deadlock,

@@ -1,8 +1,10 @@
 use super::*;
+use crate::generated::{selects_all, without_variables};
 use indexmap::IndexMap;
 use pbps_model::{
     ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleDeps, ModuleId, Uid, UidKind,
 };
+use pbps_model::{ModuleKind, PlannedChange, TableName, ValueSource};
 
 fn name(table: &str) -> TableName {
     TableName::new("app", table)
@@ -71,10 +73,29 @@ fn view(view: &str, definition: &str) -> Change {
 }
 
 fn build(changes: Vec<Change>) -> Result<Reconstruction, ReconstructError> {
+    // The identities the declarations record, as the planner holds them: the
+    // split parts of a default name their column by it.
+    let mut declared = pbps_model::Schema::default();
+    for change in &changes {
+        if let Change::CreateTable { name, table, .. } = change {
+            declared.tables.insert(name.clone(), (**table).clone());
+        }
+    }
+    let ids = pbps_diff::resolve(
+        &declared,
+        &IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "reconstruct-tests".into(),
+            today: "2026-10-25".into(),
+        },
+    )
+    .unwrap()
+    .ids;
     let plan = pbps_diff::order::propose(ChangeSet {
         changes: changes.into_iter().map(PlannedChange::new).collect(),
     });
-    Reconstruction::new(&Mssql, &plan, &IdsFile::default(), &ModuleDeps::new())
+    Reconstruction::new(&Mssql, &plan, &ids, &ModuleDeps::new())
 }
 
 fn sql(reconstruction: &Reconstruction) -> Vec<String> {
@@ -117,7 +138,9 @@ fn a_computed_column_calling_a_declared_function_follows_it_and_leaves_the_table
         );
         let routine = at(&statements, "FUNCTION [app].[f]");
         let column = at(&statements, "ADD [c] AS (app.f(v)");
-        assert!(create < routine && routine < column, "{statements:#?}");
+        // The bare table and the function may come either way round; the
+        // column needs both.
+        assert!(create < column && routine < column, "{statements:#?}");
     }
 }
 
@@ -400,7 +423,6 @@ fn only_a_select_all_is_a_wildcard_and_a_count_or_a_product_is_not() {
         "SELECT *, a FROM t",
         "SELECT a, * FROM t",
         "SELECT COUNT(*) AS n, * FROM t",
-        "SELECT a FROM t WHERE EXISTS (SELECT * FROM u)",
     ] {
         assert!(selects_all(wildcard), "{wildcard}");
     }
@@ -412,6 +434,8 @@ fn only_a_select_all_is_a_wildcard_and_a_count_or_a_product_is_not() {
         "SELECT a * from_date FROM t",
         "SELECT (a + 1) * (b + 2) FROM t",
         "SELECT a FROM t",
+        "SELECT a FROM t WHERE EXISTS (SELECT * FROM u)",
+        "SELECT a FROM t WHERE NOT EXISTS ( SELECT * FROM u WHERE u.k = t.k)",
         "",
     ] {
         assert!(!selects_all(plain), "{plain}");
@@ -626,47 +650,88 @@ fn function_named(function_name: &str, definition: &str) -> Change {
 }
 
 #[test]
-fn a_function_reading_one_computed_column_does_not_wait_for_a_column_that_calls_it() {
-    // `d AS (id + 1)` and `c AS (f(id))`, with `f` reading `d`: bare table,
-    // `d`, `f`, `c` compiles (measured on 17.0), though `f` reads a column of
-    // the table whose other column must follow it. Held as one group that is
-    // a cycle; held per column `d` calls nothing and is never held.
+fn a_function_reading_a_column_declared_before_the_one_that_calls_it_follows_that_column() {
+    // `a AS (id + 1)` declared before `c AS (f(id))`, with `f` reading `a`:
+    // bare table, `a`, `f`, `c` compiles (measured on 17.0), and the columns
+    // are added in declared order, so their positions are the target's.
     for functions_first in [false, true] {
-        let table = table("t", &[("c", "app.f(id)"), ("d", "id + 1")]);
+        let table = table("t", &[("a", "id + 1"), ("c", "app.f(id)")]);
         let changes = if functions_first {
-            vec![reads("f", "d"), table]
+            vec![reads("f", "a"), table]
         } else {
-            vec![table, reads("f", "d")]
+            vec![table, reads("f", "a")]
         };
         let statements = sql(&build(changes).unwrap());
         let create = at(&statements, "CREATE TABLE [app].[t]");
-        let d = at(&statements, "ADD [d] AS");
         let routine = at(&statements, "FUNCTION [app].[f]");
         let c = at(&statements, "ADD [c] AS");
+        // `a` is before the first column that calls a planned function, so it
+        // stays in the CREATE, and `f` that reads it needs nothing more.
         assert!(
-            create < d && d < routine && routine < c,
+            statements[create].contains("[a] AS (id + 1"),
+            "{statements:#?}"
+        );
+        assert!(
+            create < c && routine < c,
             "functions_first={functions_first}: {statements:#?}"
         );
     }
 }
 
 #[test]
-fn a_function_reading_the_column_that_calls_it_is_still_a_cycle_per_column() {
+fn a_function_reading_a_column_declared_after_the_one_that_calls_it_is_refused_with_its_remedy() {
+    // `c AS (f(id))` is declared before `d AS (id + 1)` and `f` reads `d`.
+    // `d` must exist before `f`, and `f` before `c`, but declared order is a
+    // hard chain: positions are compared as reported, columns are appended
+    // and cannot be reordered (measured on 17.0: `d` then `c` gives `d=3, c=4`
+    // where the target has `c=3, d=4`), so no order both compiles and
+    // reproduces them. It is refused by name, with the remedy.
+    let refused = build(vec![
+        table("t", &[("c", "app.f(id)"), ("d", "id + 1")]),
+        reads("f", "d"),
+    ])
+    .expect_err("no order compiles and keeps the declared positions");
+    let ReconstructError::Cycle(subject) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(subject.contains("app.f()"), "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("declare the column the function reads first"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_function_reading_the_column_that_calls_it_is_still_a_cycle() {
     // Measured on 17.0: the column cannot be added before the function, nor
     // the function created before the column it reads (207). Another column
-    // of the table makes no difference to that. (A cycle across two columns,
-    // each function reading the other's column, is left to the engine: the
-    // scratch route finds only a reader that its own column calls, and the
-    // order it gives then fails to compile, naming the function: see the live
-    // test.)
+    // of the table makes no difference to that.
     let own = build(vec![
         table("t", &[("c", "app.f(id)"), ("d", "id + 1")]),
         reads("f", "c"),
     ])
     .expect_err("f reads the column that calls it");
     assert!(
-        matches!(&own, ReconstructError::Cycle(subject) if subject.contains("app.t.c")),
+        matches!(&own, ReconstructError::Cycle(subject) if subject.contains("app.f()")),
         "{own:?}"
+    );
+}
+
+#[test]
+fn a_cycle_across_two_columns_is_refused_before_anything_compiles() {
+    // Each function reads the other's column: a graph cycle, now found in the
+    // route and not by the engine's 207.
+    let refused = build(vec![
+        table("t", &[("c1", "app.g1(id)"), ("c2", "app.g2(id)")]),
+        reads("g1", "c2"),
+        reads("g2", "c1"),
+    ])
+    .expect_err("each column needs the function that reads the other");
+    assert!(
+        matches!(&refused, ReconstructError::Cycle(_)),
+        "{refused:?}"
     );
 }
 
@@ -794,7 +859,7 @@ fn a_name_shared_with_the_column_by_an_alias_or_another_table_is_a_refusal_namin
             panic!("{refused:?}");
         };
         assert!(
-            subject.contains("app.t.c") && refused.to_string().contains("rename"),
+            subject.contains("app.g()") && refused.to_string().contains("rename"),
             "{refused}"
         );
     }
@@ -831,9 +896,15 @@ fn a_column_named_like_a_function_calls_no_function() {
         ),
     ])
     .unwrap());
-    let column = at(&statements, "ADD [c] AS");
+    // Nothing calls a planned function, so the table is not split: `c` stays
+    // in the CREATE, which precedes the function that reads it.
+    let create = at(&statements, "CREATE TABLE [app].[t]");
     assert!(
-        column < at(&statements, "FUNCTION [app].[v]"),
+        statements[create].contains("[c] AS (v + 1"),
+        "{statements:#?}"
+    );
+    assert!(
+        create < at(&statements, "FUNCTION [app].[v]"),
         "{statements:#?}"
     );
 }
@@ -861,5 +932,119 @@ fn a_variable_name_is_not_a_name_in_the_code() {
     assert_eq!(
         without_variables("SELECT @c, @@rowcount, #t.c, x@y FROM #t WHERE c = @c2"),
         "SELECT  ,  ,  .c, x  FROM   WHERE c =  "
+    );
+}
+
+#[test]
+fn a_composite_key_over_a_late_and_an_inline_looking_column_follows_both() {
+    // `c1 AS (f(id))` is late and `c2 AS (id + 1)` is declared after it, so it
+    // is added after `c1` too: the key names both, and `c2` is no exception
+    // that stays ahead of the key (a held group with no callee used to).
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.columns.get_mut("id").unwrap().nullable = false;
+            t.computed.insert("c1".into(), persisted("app.f(id)"));
+            t.computed.insert("c2".into(), persisted("id + 1"));
+            t.unique.insert(
+                "uq_both".into(),
+                pbps_model::UniqueConstraint {
+                    columns: vec!["c1".into(), "c2".into()],
+                    storage_parameters: Default::default(),
+                },
+            );
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let routine = at(&statements, "FUNCTION [app].[f]");
+    let first = at(&statements, "ADD [c1] AS");
+    let second = at(&statements, "ADD [c2] AS");
+    let key = at(&statements, "[uq_both]");
+    assert!(
+        routine < first && first < second && second < key,
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_table_that_calls_no_planned_function_is_not_split() {
+    // Nothing in the CREATE names a function that does not exist yet, so the
+    // table is written whole, computed column, default, check and key included.
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.computed.insert("c".into(), computed("id + 1"));
+            t.columns.get_mut("v").unwrap().value_source = ValueSource::Default("0".into());
+            t.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "v >= 0".into(),
+                },
+            );
+            t.primary_key = Some(primary_key("id"));
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let create = at(&statements, "CREATE TABLE [app].[t]");
+    assert!(
+        statements[create].contains("[c] AS (id + 1"),
+        "{statements:#?}"
+    );
+    assert!(statements[create].contains("DEFAULT (0"), "{statements:#?}");
+    assert!(
+        statements.iter().all(|s| !s.contains("ADD [c]")),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn ordinary_planning_still_refuses_a_computed_column_over_a_function_the_plan_creates() {
+    // The split exists for the scratch route only: the ordinary plan never
+    // receives such a table, because the differ refuses it first.
+    let mut desired = pbps_model::Schema::default();
+    desired.tables.insert(
+        name("t"),
+        pbps_model::Table {
+            columns: IndexMap::from([("id".into(), int())]),
+            computed: [("c".into(), computed("app.f(id)"))].into(),
+            ..Default::default()
+        },
+    );
+    desired.modules.insert(
+        "app.f()".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            definition: FUNCTION.into(),
+            description: None,
+        },
+    );
+    let empty = pbps_model::Schema::default();
+    let ids = pbps_diff::resolve(
+        &desired,
+        &IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "reconstruct-tests".into(),
+            today: "2026-10-25".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let refused = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &Mssql,
+        &Default::default(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:?}").contains("ComputedFunctionChanged"),
+        "{refused:?}"
     );
 }

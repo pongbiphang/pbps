@@ -2560,6 +2560,35 @@ pub trait Dialect {
         self.may_name(text, name)
     }
 
+    /// [`Dialect::generation_may_call`] for a declared function known by its
+    /// full identity, asked of the text of a table's own part (a computed
+    /// expression, a default, a check). The default is the leaf-name test
+    /// every caller made before this method existed, so an engine that does
+    /// not override it is unchanged. An engine whose calls in those texts
+    /// are schema-qualified can answer exactly: a function of the same leaf
+    /// name in another schema, or a column named like the function, is no
+    /// callee. Module bodies may call by a bare name and keep the leaf test.
+    fn generation_calls(&self, text: &str, function: &pbps_model::ModuleId) -> bool {
+        self.generation_may_call(text, function.name())
+    }
+
+    /// The names `text` may read as columns of `table`, for an engine that
+    /// can say. `None` is unknown, and keeps the whole-shape rule every
+    /// reader of a split table followed before this method existed: wait for
+    /// the first part when only the name is used, otherwise the complete
+    /// shape. `Some(names)` makes a reader wait only for the parts of the
+    /// columns it names, so a reader of one late column does not wait for
+    /// the others. A projection of every column (`*`) is `None`: it reads
+    /// them all. The names may over-approximate (every identifier in the
+    /// code): a name that is no column of the table matches no part.
+    fn generation_column_names(
+        &self,
+        _text: &str,
+        _table: &pbps_model::TableName,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        None
+    }
+
     /// Whether a consumer may name a table, its row type or its array type.
     /// A positive answer requires the complete creation shape (DEC-1503.4).
     fn generation_names_table(&self, text: &str, table: &pbps_model::TableName) -> bool {

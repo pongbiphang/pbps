@@ -1126,6 +1126,7 @@
         "reconstruct2374::a_key_over_two_computed_columns_follows_both_and_their_functions",
         "reconstruct2374::a_cycle_across_two_computed_columns_is_refused_naming_the_declaration",
         "reconstruct2374::names_that_only_look_like_a_read_or_a_call_make_no_cycle",
+        "reconstruct2374::a_mid_table_computed_column_keeps_the_target_s_column_positions",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",
