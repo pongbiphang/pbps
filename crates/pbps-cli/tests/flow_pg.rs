@@ -10863,14 +10863,27 @@ fn an_array_column_widens_through_the_cli() {
          END $$",
     );
 
-    // Negative: narrowing back is previewed as refused, and refused by name
-    // when the plan is computed against the database.
+    // Negative: narrowing back, with no conversion recorded, is refused by
+    // name even offline: the plan stops at the finding that asks for the
+    // expression (#2331) instead of previewing the change, and records
+    // nothing. It is refused again when the plan is computed against the
+    // database.
     std::fs::write(&path, widened.replacen("bigint[]", "integer[]", 1)).unwrap();
+    let ids_before = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
     let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
     assert!(
-        stdout(&o).contains("narrows or converts an array's elements"),
+        stderr(&o).contains("`bigint[]` to `integer[]`")
+            && stderr(&o).contains("no conversion is recorded")
+            && stderr(&o).contains("pbps convert app.t.tags --using -"),
         "{}",
-        stdout(&o)
+        stderr(&o)
+    );
+    assert!(!stdout(&o).contains("USING"), "{}", stdout(&o));
+    assert_eq!(
+        std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
+        ids_before,
+        "a refused plan records nothing"
     );
     d.commit();
     let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
