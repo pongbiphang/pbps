@@ -1096,6 +1096,10 @@ mod tests {
         }
     }
 
+    // A key file's owner-only permission is provable only on Unix, and the
+    // environment route would need `set_var`, which the workspace forbids as
+    // unsafe; scope.rs gates its key-backed case the same way.
+    #[cfg(unix)]
     fn key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -1166,6 +1170,7 @@ mod tests {
     /// The build is what the rule compares: version, level and update level.
     /// An RTM build's absent update level is a known absence; an unreadable
     /// one is no fingerprint at all.
+    #[cfg(unix)]
     #[test]
     fn the_reported_build_moves_with_version_level_and_update_and_refuses_unreadable_ones() {
         let key = key();
