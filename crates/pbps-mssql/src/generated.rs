@@ -217,8 +217,7 @@ pub(crate) fn column_names(dialect: &Mssql, text: &str) -> Option<BTreeSet<Strin
             }
             c if c.is_alphanumeric() || matches!(c, '_' | '$') => {
                 let mut name = String::from(c);
-                while let Some(n) = chars.next_if(|n| n.is_alphanumeric() || matches!(n, '_' | '$'))
-                {
+                while let Some(n) = chars.next_if(|n| is_identifier_part(*n)) {
                     name.push(n);
                 }
                 name
@@ -233,22 +232,48 @@ pub(crate) fn column_names(dialect: &Mssql, text: &str) -> Option<BTreeSet<Strin
 /// `code` without the names that are never a column: a variable or parameter
 /// (`@c`, `@@c`) and a temporary object (`#c`). The dialect's name test reads
 /// `c` out of all three (measured), so a function with a parameter `@c` would
-/// be taken for a reader of a column `c`.
+/// be taken for a reader of a column `c`. Only a token that starts at a
+/// boundary is one: `@` and `#` inside a delimited identifier (`[c#d]`,
+/// `"c#d"`) or after an identifier character (`c#d`, a legal column name) are
+/// part of the name.
 pub(crate) fn without_variables(code: &str) -> String {
     let mut clean = String::with_capacity(code.len());
     let mut chars = code.chars().peekable();
+    let mut previous = ' ';
     while let Some(c) = chars.next() {
-        if matches!(c, '@' | '#') {
-            while chars
-                .next_if(|n| n.is_alphanumeric() || matches!(n, '_' | '@' | '#' | '$'))
-                .is_some()
-            {}
-            clean.push(' ');
-        } else {
-            clean.push(c);
+        match c {
+            '[' | '"' => {
+                // Kept whole, a doubled closing delimiter being part of the name.
+                let close = if c == '[' { ']' } else { '"' };
+                clean.push(c);
+                while let Some(n) = chars.next() {
+                    clean.push(n);
+                    if n == close {
+                        if chars.next_if_eq(&close).is_none() {
+                            break;
+                        }
+                        clean.push(close);
+                    }
+                }
+                previous = close;
+            }
+            '@' | '#' if !is_identifier_part(previous) => {
+                while chars.next_if(|n| is_identifier_part(*n)).is_some() {}
+                clean.push(' ');
+                previous = ' ';
+            }
+            _ => {
+                clean.push(c);
+                previous = c;
+            }
         }
     }
     clean
+}
+
+/// A character a regular identifier continues with.
+fn is_identifier_part(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')
 }
 
 /// Whether `code`, a definition with strings and comments blanked

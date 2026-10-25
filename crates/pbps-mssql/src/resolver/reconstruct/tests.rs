@@ -1,5 +1,5 @@
 use super::*;
-use crate::generated::{selects_all, without_variables};
+use crate::generated::{column_names, selects_all, without_variables};
 use indexmap::IndexMap;
 use pbps_model::{
     ChangeSet, Column, ComputedColumn, IdsFile, Module, ModuleDeps, ModuleId, Uid, UidKind,
@@ -931,7 +931,65 @@ fn a_function_of_the_same_name_in_another_schema_is_no_callee() {
 fn a_variable_name_is_not_a_name_in_the_code() {
     assert_eq!(
         without_variables("SELECT @c, @@rowcount, #t.c, x@y FROM #t WHERE c = @c2"),
-        "SELECT  ,  ,  .c, x  FROM   WHERE c =  "
+        "SELECT  ,  ,  .c, x@y FROM   WHERE c =  "
+    );
+    // Not a token where it is part of a name: delimited, or after a letter.
+    for named in [
+        "[c#d] > 0",
+        "\"c#d\" > 0",
+        "[c]]#d] > 0",
+        "c#d > 0",
+        "[@c] > 0",
+    ] {
+        assert_eq!(without_variables(named), named, "{named}");
+    }
+}
+
+#[test]
+fn a_column_named_with_a_hash_is_read_by_its_whole_name() {
+    // `[c#d]` is the column `c#d`, not `c` followed by a temporary name.
+    // Every word is a candidate (a literal number too), so the test is of
+    // what is, and is not, among them.
+    let names = |text: &str| column_names(&Mssql, text).unwrap();
+    for (text, column) in [
+        ("[c#d] > 0", "c#d"),
+        ("\"c#d\" > 0", "c#d"),
+        ("c#d > 0", "c#d"),
+        ("[c]]#d] > 0", "c]#d"),
+    ] {
+        let read = names(text);
+        assert!(read.contains(column), "{text}: {read:?}");
+        assert!(
+            !read.contains("c") && !read.contains("d"),
+            "{text}: {read:?}"
+        );
+    }
+    // Negative: a real variable and a temporary object are still no column.
+    let read = names("c > @d + #t.e");
+    assert!(read.contains("c") && read.contains("e"), "{read:?}");
+    assert!(!read.contains("d") && !read.contains("t"), "{read:?}");
+}
+
+#[test]
+fn a_check_over_a_hash_named_computed_column_follows_the_column() {
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.computed.insert("c#d".into(), persisted("app.f(id)"));
+            t.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "[c#d] > 0".into(),
+                },
+            );
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let create = at(&statements, "CREATE TABLE [app].[t]");
+    assert!(!statements[create].contains("[c#d]"), "{statements:#?}");
+    assert!(
+        at(&statements, "ADD [c#d] AS") < at(&statements, "[ck]"),
+        "{statements:#?}"
     );
 }
 

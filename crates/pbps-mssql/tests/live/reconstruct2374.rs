@@ -245,6 +245,39 @@ async fn defaults_checks_and_keys_over_a_computed_column_compile_after_their_fun
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn a_check_over_a_hash_named_computed_column_compiles_after_the_column() {
+    case("hashed", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert(
+                        "c#d".into(),
+                        ComputedColumn {
+                            persisted: true,
+                            ..computed("app.f(v)")
+                        },
+                    );
+                    t.checks.insert(
+                        "ck".into(),
+                        pbps_model::CheckConstraint {
+                            expression: "[c#d] > 0".into(),
+                        },
+                    );
+                }),
+                module(ModuleKind::Function, "f", FUNCTION),
+            ],
+        )
+        .await
+        .unwrap();
+        let sql = "SELECT COUNT(*) FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID(N'app.t')";
+        assert_eq!(count(&mut conn, sql).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
     case("seeded", |mut conn| async move {
         compile(
