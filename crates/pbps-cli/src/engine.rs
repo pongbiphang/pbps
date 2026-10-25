@@ -846,6 +846,7 @@ pub async fn refuse_created_name_occupants<S: Clone>(
             asked.extend(crate::deploy::rename_claims(cs));
             let mut owners = crate::deploy::transferred_tables(cs);
             let mut detach_releases = std::collections::BTreeMap::new();
+            let mut detach_retained = std::collections::BTreeMap::new();
             for change in &cs.changes {
                 if let pbps_model::Change::DetachPartition {
                     uid, parent, names, ..
@@ -866,8 +867,9 @@ pub async fn refuse_created_name_occupants<S: Clone>(
                         continue;
                     };
                     let clones = pbps_pg::catalog::detach_clone_names(conn, table, parent).await?;
-                    detach_releases
-                        .extend(crate::deploy::detach_release_slots(uid, names, &clones));
+                    let slots = crate::deploy::detach_clone_slots(uid, names, &clones);
+                    detach_releases.extend(slots.detach_releases);
+                    detach_retained.extend(slots.detach_retained);
                 }
             }
             let mut occupants =
@@ -931,6 +933,7 @@ pub async fn refuse_created_name_occupants<S: Clone>(
                 relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
                 occupants,
                 detach_releases,
+                detach_retained,
             };
             facts.order_relations_and_refuse(cs, label, plan)?;
             Ok(Some(facts))
@@ -947,6 +950,7 @@ pub struct NameFacts {
     occupants: Vec<pbps_pg::catalog::NameOccupant>,
     relations: Vec<(TableName, &'static str)>,
     detach_releases: std::collections::BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid>,
+    detach_retained: std::collections::BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid>,
 }
 
 /// What the name passes read the plan's names through: its two sides and the
@@ -1050,6 +1054,7 @@ impl NameFacts {
                     }),
             );
         slots.detach_releases.clone_from(&self.detach_releases);
+        slots.detach_retained.clone_from(&self.detach_retained);
         slots
     }
 }
@@ -1108,6 +1113,7 @@ mod type_slot_tests {
             occupants: vec![],
             relations: vec![],
             detach_releases: Default::default(),
+            detach_retained: Default::default(),
         };
         let error = facts
             .order_and_refuse(&mut cs, "target", plan)
