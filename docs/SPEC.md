@@ -1302,6 +1302,13 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
   same plan is refused: split the plan. A partition-key column keeps its
   refusal (4.3). SQL Server refuses `convert` and the section (the engine converts
   implicitly).
+- **Beside a foreign key** (DEC-2359.1). A type change that leaves the types a
+  key can join, a conversion or an ordinary retype, takes the key down before the
+  first change and puts it back after the last, so converting both ends applies
+  and the re-added key checks the converted rows; a mismatch rolls the whole
+  apply back. A key the plan would leave between two types the engine cannot
+  join (one end converted and the other not) is refused by `plan`, naming the
+  constraint, both columns and types, and the next step.
 - **Dropped by the tool** when identities are written and the column's declared
   type is no longer `to`, or the column is gone. There is nothing in the YAML to
   delete.

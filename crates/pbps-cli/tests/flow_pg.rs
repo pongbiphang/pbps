@@ -31,6 +31,9 @@ mod rebuild_members;
 #[path = "support/conversions2331.rs"]
 mod conversions2331;
 
+#[path = "support/conversions2359.rs"]
+mod conversions2359;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 #[path = "support/refusal_next_steps_pg.rs"]

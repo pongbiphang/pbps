@@ -2268,6 +2268,99 @@ fn outside_quotes(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
     })
 }
 
+/// The groups of types a foreign key can join (#2359), as the engine groups
+/// them: a key is accepted when the referenced column's equality operator
+/// takes the referencing column's type, either as its own or by an implicit
+/// coercion. **Measured on 16 and 18**, creating a key between every pair of
+/// the catalogue's types; the live suite re-measures it
+/// (`foreign_key_type_compatibility_matches_the_engine`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyClass {
+    /// Whole, exact decimal and approximate numbers, in that order: a column
+    /// coerces to a type at or above its own, and never down.
+    Number(u8),
+    /// `text`, `varchar` and `char` join one another in either direction.
+    Text,
+    /// `date`, `timestamp` and `timestamptz`, in either direction.
+    Moment,
+    Time,
+    TimeOffset,
+    Interval,
+    /// `inet` and `cidr`.
+    Network,
+    /// A type that joins only itself.
+    Alone(&'static str),
+}
+
+fn key_class(t: &ColumnType) -> Option<KeyClass> {
+    if t.is_array() || t.type_ref().is_some() {
+        return None;
+    }
+    Some(match t.base.as_str() {
+        "smallint" | "integer" | "bigint" => KeyClass::Number(0),
+        "numeric" => KeyClass::Number(1),
+        "real" | "double precision" => KeyClass::Number(2),
+        "text" | "character varying" | "character" => KeyClass::Text,
+        "date" | "timestamp without time zone" | "timestamp with time zone" => KeyClass::Moment,
+        "time without time zone" => KeyClass::Time,
+        "time with time zone" => KeyClass::TimeOffset,
+        "interval" => KeyClass::Interval,
+        "inet" | "cidr" => KeyClass::Network,
+        "boolean" => KeyClass::Alone("boolean"),
+        "bytea" => KeyClass::Alone("bytea"),
+        "uuid" => KeyClass::Alone("uuid"),
+        "macaddr" => KeyClass::Alone("macaddr"),
+        "jsonb" => KeyClass::Alone("jsonb"),
+        _ => return None,
+    })
+}
+
+/// Whether a foreign key can join `referencing` to `referenced` (#2359).
+///
+/// `Some(false)` is the engine's `datatype_mismatch` (42804) on the key:
+/// *Key columns are of incompatible types*. `None` where the types are not
+/// ones the table above holds, an array, a user-defined type or a type the
+/// engine cannot key on, unless they are one type: the plan is then not
+/// refused on a guess, and the engine answers at the apply. Both must
+/// already be normalized.
+pub fn foreign_key_types_compatible(
+    referencing: &ColumnType,
+    referenced: &ColumnType,
+) -> Option<bool> {
+    let (Some(child), Some(parent)) = (key_class(referencing), key_class(referenced)) else {
+        return (referencing == referenced).then_some(true);
+    };
+    Some(match (child, parent) {
+        (KeyClass::Number(c), KeyClass::Number(p)) => c <= p,
+        (KeyClass::Time, KeyClass::TimeOffset | KeyClass::Interval) => true,
+        _ => child == parent,
+    })
+}
+
+/// What a type change has to have out of its way on this engine: foreign
+/// keys, and only where the change leaves the group of types a key can join
+/// (#2359).
+///
+/// Within a group the engine rebuilds the key itself and checks it against
+/// the rows (`bigint` to `integer` on either end of a key). Across groups it
+/// refuses the first `ALTER` of a pair of columns that change together, because
+/// the key stands between the new type and the old one at that moment:
+/// **measured**, `integer` to `text` on both ends of one key is
+/// `foreign key constraint cannot be implemented` on the first. So the key
+/// comes down before the change and goes back after, as the differ does it for
+/// an engine that always asks (`recreate_retyped_dependents`). A pair the table
+/// cannot place keeps the engine's own handling, as it was before.
+pub fn retype_dependents(from: &ColumnType, to: &ColumnType) -> pbps_dialect::RetypeDependents {
+    let (Ok(from), Ok(to)) = (normalize(from), normalize(to)) else {
+        return pbps_dialect::RetypeDependents::default();
+    };
+    pbps_dialect::RetypeDependents {
+        foreign_keys: foreign_key_types_compatible(&from, &to) == Some(false)
+            || foreign_key_types_compatible(&to, &from) == Some(false),
+        ..pbps_dialect::RetypeDependents::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3630,6 +3723,107 @@ mod tests {
                 "`{to}`"
             );
         }
+    }
+
+    /// The table the live suite measures on both versions, here with its
+    /// direction: an integer column may reference a numeric key and not the
+    /// reverse, and the string types join one another either way (#2359).
+    #[test]
+    fn a_foreign_key_joins_the_types_the_engine_joins_and_only_in_its_direction() {
+        let joins = |referencing: &str, referenced: &str| {
+            foreign_key_types_compatible(&normalized(referencing), &normalized(referenced))
+        };
+        for (referencing, referenced, expected) in [
+            ("integer", "bigint", true),
+            ("bigint", "integer", true),
+            ("integer", "numeric(10,2)", true),
+            ("numeric(10,2)", "integer", false),
+            ("integer", "double precision", true),
+            ("double precision", "numeric", false),
+            ("varchar(9)", "text", true),
+            ("text", "char(5)", true),
+            ("date", "timestamptz", true),
+            ("timestamp", "date", true),
+            ("time", "interval", true),
+            ("interval", "time", false),
+            ("timetz", "time", false),
+            ("inet", "cidr", true),
+            ("text", "integer", false),
+            ("integer", "text", false),
+            ("uuid", "text", false),
+            ("boolean", "integer", false),
+            ("jsonb", "jsonb", true),
+            ("jsonb", "text", false),
+        ] {
+            assert_eq!(
+                joins(referencing, referenced),
+                Some(expected),
+                "`{referencing}` referencing `{referenced}`"
+            );
+        }
+    }
+
+    /// A pair this table does not hold is not refused on a guess: an array, a
+    /// user-defined type or a type the engine cannot key on answers only when
+    /// the two are one type.
+    #[test]
+    fn a_type_the_table_cannot_place_is_never_called_incompatible() {
+        let joins = |referencing: &str, referenced: &str| {
+            foreign_key_types_compatible(&normalized(referencing), &normalized(referenced))
+        };
+        assert_eq!(joins("integer[]", "integer[]"), Some(true));
+        assert_eq!(joins("integer[]", "text[]"), None);
+        assert_eq!(joins("integer[]", "integer"), None);
+        assert_eq!(joins("json", "jsonb"), None);
+        assert_eq!(joins("tsvector", "text"), None);
+        let reference = |name: &str| ColumnType::reference(name.parse().unwrap());
+        let (status, other) = (reference("app.status"), reference("app.other"));
+        assert_eq!(foreign_key_types_compatible(&status, &status), Some(true));
+        assert_eq!(foreign_key_types_compatible(&status, &other), None);
+        assert_eq!(
+            foreign_key_types_compatible(&status, &normalized("text")),
+            None
+        );
+    }
+
+    /// A key comes down around a type change only where the change leaves the
+    /// group of types a key can join, in either direction; inside one group
+    /// the engine rebuilds the key and checks it itself, as it did before
+    /// (#2359).
+    #[test]
+    fn a_retype_takes_foreign_keys_down_only_across_the_types_a_key_joins() {
+        let takes_keys_down = |from: &str, to: &str| {
+            retype_dependents(&normalized(from), &normalized(to)).foreign_keys
+        };
+        for (from, to) in [
+            ("text", "integer"),
+            ("integer", "text"),
+            ("timestamp", "integer"),
+            ("integer", "numeric(10,2)"),
+            ("double precision", "numeric"),
+            ("uuid", "text"),
+        ] {
+            assert!(takes_keys_down(from, to), "`{from}` -> `{to}`");
+        }
+        for (from, to) in [
+            ("integer", "bigint"),
+            ("bigint", "smallint"),
+            ("varchar(5)", "varchar(9)"),
+            ("varchar(9)", "text"),
+            ("text", "char(3)"),
+            ("timestamp", "timestamptz"),
+            ("numeric(5,2)", "numeric(9,2)"),
+            ("inet", "cidr"),
+            // Not placed by the table: left to the engine.
+            ("integer[]", "text[]"),
+            ("json", "jsonb"),
+        ] {
+            assert!(!takes_keys_down(from, to), "`{from}` -> `{to}`");
+        }
+        // Nothing else comes down: the engine rebuilds keys, indexes and
+        // checks over a retyped column on its own.
+        let all = retype_dependents(&normalized("text"), &normalized("integer"));
+        assert!(!all.keys_and_indexes && !all.checks && !all.filtered_indexes);
     }
 
     /// The zone question is asked of the pair, not of the risk class: every row

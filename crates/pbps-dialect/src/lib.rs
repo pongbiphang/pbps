@@ -2423,6 +2423,20 @@ pub trait Dialect {
         RetypeDependents::default()
     }
 
+    /// Whether the engine can join a referencing column of one type to a
+    /// referenced column of another in a foreign key (#2359). `Some(false)`
+    /// only where it is known to refuse the key, so a caller refuses a plan on
+    /// it; `None` where this dialect cannot say, which refuses nothing. Both
+    /// types are normalized, and the answer is directional: an integer column
+    /// may reference a numeric key and not the other way round.
+    fn foreign_key_types_compatible(
+        &self,
+        _referencing: &ColumnType,
+        _referenced: &ColumnType,
+    ) -> Option<bool> {
+        None
+    }
+
     /// Expands aliases and fills in omitted default arguments, so that two
     /// semantically identical spellings become the same value.
     ///

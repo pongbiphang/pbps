@@ -955,6 +955,92 @@ async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible()
         .expect("drop");
 }
 
+/// Which pairs of types a foreign key can join, asked of the engine on both
+/// versions the project supports and held against the dialect's table
+/// (`foreign_key_types_compatible`, #2359). The table decides which plans the
+/// differ refuses by name and which type changes take a key down around them,
+/// so it is measured and not recalled: a pair it calls impossible that the
+/// engine accepts refuses a valid plan, and one it calls possible that the
+/// engine refuses sends a plan to the apply that is rolled back there.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn foreign_key_type_compatibility_matches_the_engine() {
+    let types = [
+        "smallint",
+        "integer",
+        "bigint",
+        "numeric(10,2)",
+        "real",
+        "double precision",
+        "boolean",
+        "character(5)",
+        "character varying(9)",
+        "text",
+        "bytea",
+        "date",
+        "time without time zone",
+        "time with time zone",
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "interval",
+        "uuid",
+        "jsonb",
+        "inet",
+        "cidr",
+        "macaddr",
+    ];
+    let normalize = |s: &str| {
+        Postgres::new()
+            .normalize_type(&s.parse::<ColumnType>().expect("a type parses"))
+            .unwrap_or_else(|e| panic!("`{s}` should normalize: {e}"))
+    };
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for (version, url) in [("current", conn_str()), ("16", old)] {
+        let mut conn = Conn::connect(Driver::Postgres, &url)
+            .await
+            .expect("connect to the live server");
+        on_public(&mut conn).await;
+        let (parent, child) = (
+            format!("pbps_fk_parent_{}", std::process::id()),
+            format!("pbps_fk_child_{}", std::process::id()),
+        );
+        for referenced in types {
+            for referencing in types {
+                for table in [&child, &parent] {
+                    conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+                        .await
+                        .expect("drop");
+                }
+                conn.execute(&format!(
+                    "CREATE TABLE {parent} (id {referenced} PRIMARY KEY)"
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("create `{referenced}`: {e}"));
+                let accepted = conn
+                    .execute(&format!(
+                        "CREATE TABLE {child} (v {referencing} REFERENCES {parent}(id))"
+                    ))
+                    .await
+                    .is_ok();
+                let judged = Postgres::new()
+                    .foreign_key_types_compatible(&normalize(referencing), &normalize(referenced));
+                assert_eq!(
+                    judged,
+                    Some(accepted),
+                    "PostgreSQL {version}: `{referencing}` referencing `{referenced}`: the \
+                     dialect says {judged:?} and the engine {} it",
+                    if accepted { "accepts" } else { "refuses" }
+                );
+            }
+        }
+        for table in [&child, &parent] {
+            conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+                .await
+                .expect("drop");
+        }
+    }
+}
+
 /// ADR-0012 §6's first trap, measured here so that introspection (Phase 5 step
 /// 3) does not walk into it: **a dropped column does not leave**. The catalog
 /// keeps the slot with a placeholder name, `attnum` keeps the hole, and the
@@ -22926,9 +23012,13 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
     fresh(&mut conn, &s).await;
     // `5000000000` cannot become an `integer`, and the parent's own key
     // column is what this plan narrows.
+    // The child's column is `bigint`: a key from `numeric` to the `integer` this
+    // plan narrows the parent to is one the engine refuses, and the differ names
+    // it at plan time (#2359). A `bigint` joins an `integer` key, and the probe
+    // compares the same values.
     conn.execute(&format!(
         "CREATE TABLE {s}.parent (code numeric(20,0) PRIMARY KEY, label text);
-         CREATE TABLE {s}.child (code text PRIMARY KEY, parent numeric(20,0));
+         CREATE TABLE {s}.child (code text PRIMARY KEY, parent bigint);
          INSERT INTO {s}.parent VALUES (5000000000, 'Big'), (2, 'Keep'), (3, 'Removed');
          INSERT INTO {s}.child VALUES ('c1', 3);"
     ))
@@ -22964,7 +23054,7 @@ async fn a_narrowed_parent_column_is_probed_without_raising_on_either_alias() {
         .insert("code".into(), Column::new(ty("text")).not_null());
     child
         .columns
-        .insert("parent".into(), Column::new(ty("numeric(20,0)")));
+        .insert("parent".into(), Column::new(ty("bigint")));
     child.primary_key = Some(PrimaryKey {
         name: None,
         columns: vec!["code".into()],
