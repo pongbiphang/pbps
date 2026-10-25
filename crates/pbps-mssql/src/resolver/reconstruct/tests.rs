@@ -1227,6 +1227,66 @@ fn a_name_that_is_equal_under_no_collation_is_no_read() {
 }
 
 #[test]
+fn a_wildcard_inside_exists_is_no_whole_shape_read_whatever_the_select_list_opens_with() {
+    for exists in [
+        "EXISTS (SELECT TOP (1) * FROM t)",
+        "EXISTS (SELECT TOP 1 * FROM t)",
+        "EXISTS (SELECT DISTINCT * FROM t)",
+        "EXISTS (SELECT ALL * FROM t)",
+        "EXISTS (SELECT TOP 10 PERCENT WITH TIES * FROM t ORDER BY a)",
+        "EXISTS (SELECT TOP (1) PERCENT * FROM t)",
+        "NOT EXISTS ( SELECT DISTINCT TOP (2) * FROM t WHERE a = 1)",
+        "EXISTS (SELECT TOP (1) t.* FROM t)",
+        "EXISTS (SELECT TOP (1) *, 1 FROM t)",
+        // A parenthesis in a delimited name is no syntax.
+        "EXISTS (SELECT [a(b], * FROM t)",
+        "EXISTS (SELECT \"a)b\", * FROM t)",
+    ] {
+        assert!(!selects_all(exists), "{exists}");
+    }
+    // Negative: the wildcard is the query's own, not the subquery's.
+    for wildcard in [
+        "SELECT TOP (1) * FROM t",
+        "SELECT DISTINCT * FROM t WHERE EXISTS (SELECT 1 FROM u)",
+        "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u)",
+        "SELECT a FROM (SELECT TOP (1) * FROM t) AS d",
+        "SELECT a FROM (SELECT * FROM t) AS d WHERE EXISTS (SELECT 1)",
+        "SELECT a FROM t JOIN (SELECT TOP (1) * FROM u) AS d ON 1 = 1",
+        "SELECT COUNT(*), TOP (1) * FROM t",
+    ] {
+        assert!(selects_all(wildcard), "{wildcard}");
+    }
+}
+
+#[test]
+fn a_function_with_an_exists_over_a_top_wildcard_makes_no_cycle() {
+    for select in [
+        "TOP (1) *",
+        "DISTINCT *",
+        "TOP 10 PERCENT WITH TIES *",
+        "TOP (1) PERCENT t.*",
+    ] {
+        let statements = sql(&build(vec![
+            table("t", &[("c", "app.f(id)")]),
+            function(
+                "f",
+                &format!(
+                    "(@x int) RETURNS int AS BEGIN RETURN (CASE WHEN EXISTS (SELECT {select} FROM app.t WHERE id = @x) THEN 1 ELSE 0 END); END"
+                ),
+            ),
+        ])
+        .unwrap());
+        let create = at(&statements, "CREATE TABLE [app].[t]");
+        let routine = at(&statements, "FUNCTION [app].[f]");
+        let column = at(&statements, "ADD [c] AS (app.f(id)");
+        assert!(
+            create < routine && routine < column,
+            "{select}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
 fn a_function_called_by_a_name_equal_under_some_collation_is_called() {
     // The same comparison, for the function a column calls: `app.cafe(..)`
     // binds `app.[café]` on an accent-insensitive catalog, and the column then

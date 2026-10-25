@@ -291,9 +291,11 @@ fn is_identifier_part(c: char) -> bool {
 /// Whether `code`, a definition with strings and comments blanked
 /// (`Dialect::code_only`), projects every column: a `*` that ends a select
 /// list or stands before a comma (`SELECT *`, `TOP 5 * FROM`, `*, a`), or
-/// follows `alias.` or `SELECT`/`DISTINCT`/`ALL`. `COUNT(*)`, a multiplication
-/// and `EXISTS (SELECT * ..)` are none of these: the first two have an operand
-/// beside the `*`, and the last projects no column list at all.
+/// follows `alias.` or `SELECT`/`DISTINCT`/`ALL`. `COUNT(*)` and a
+/// multiplication have an operand beside the `*`, and a `*` in the select list
+/// of an `EXISTS (..)` query projects no column list at all, whatever the list
+/// opens with (`TOP (1)`, `DISTINCT`, `WITH TIES`): it is told by the query
+/// the `*` belongs to, not by the word before it (#2408).
 pub(crate) fn selects_all(code: &str) -> bool {
     // The identifier next to `*`, reading outward from it.
     let word = |chars: &mut dyn Iterator<Item = char>| -> String {
@@ -302,7 +304,7 @@ pub(crate) fn selects_all(code: &str) -> bool {
             .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'))
             .collect()
     };
-    let chars: Vec<char> = code.chars().collect();
+    let chars = without_delimited(code);
     (0..chars.len()).filter(|&at| chars[at] == '*').any(|at| {
         let before = chars[..at].iter().rev().find(|c| !c.is_whitespace());
         let next = chars[at + 1..].iter().find(|c| !c.is_whitespace());
@@ -312,8 +314,7 @@ pub(crate) fn selects_all(code: &str) -> bool {
             .rev()
             .collect();
         let select = preceding.eq_ignore_ascii_case("SELECT");
-        let exists = select && inside_exists(&chars, at);
-        !exists
+        !in_exists(&chars, at)
             && (before == Some(&'.')
                 || next == Some(&',')
                 || after.eq_ignore_ascii_case("FROM")
@@ -324,24 +325,56 @@ pub(crate) fn selects_all(code: &str) -> bool {
     })
 }
 
-/// Whether the `SELECT` before the `*` at `at` opens an `EXISTS (` subquery.
-fn inside_exists(chars: &[char], at: usize) -> bool {
-    let skip_space = |mut i: usize| {
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
+/// `code` as characters with the inside of every delimited identifier blanked,
+/// so a parenthesis or a `*` in a name is no syntax.
+fn without_delimited(code: &str) -> Vec<char> {
+    let mut chars = code.chars().peekable();
+    let mut out = Vec::new();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if matches!(c, '[' | '"') {
+            let close = if c == '[' { ']' } else { '"' };
+            while let Some(n) = chars.next() {
+                if n == close {
+                    if chars.next_if_eq(&close).is_none() {
+                        out.push(close);
+                        break;
+                    }
+                    out.push(' ');
+                }
+                out.push(' ');
+            }
         }
-        i
-    };
-    // Past the `SELECT` word, then the `(` that opens the subquery.
-    let i = skip_space(skip_space(at).saturating_sub("SELECT".len()));
-    if i == 0 || chars[i - 1] != '(' {
+    }
+    out
+}
+
+/// Whether the query the `*` at `at` belongs to opens with a `(` that follows
+/// `EXISTS`: the nearest unclosed parenthesis before it.
+fn in_exists(chars: &[char], at: usize) -> bool {
+    let mut depth = 0usize;
+    let Some(open) = (0..at).rev().find(|&i| match chars[i] {
+        ')' => {
+            depth += 1;
+            false
+        }
+        '(' if depth == 0 => true,
+        '(' => {
+            depth -= 1;
+            false
+        }
+        _ => false,
+    }) else {
         return false;
-    }
-    let end = skip_space(i - 1);
-    let mut start = end;
-    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
-        start -= 1;
-    }
+    };
+    let end = chars[..open]
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    let start = chars[..end]
+        .iter()
+        .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
+        .map_or(0, |i| i + 1);
     chars[start..end]
         .iter()
         .collect::<String>()

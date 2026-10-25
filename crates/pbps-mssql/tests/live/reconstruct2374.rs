@@ -385,6 +385,38 @@ async fn a_check_naming_a_column_by_an_accent_insensitive_equal_compiles_and_kee
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn a_scalar_function_with_an_exists_over_a_top_wildcard_compiles_before_the_column_it_serves()
+{
+    case("exists_top", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("app.f(id)"));
+                }),
+                module(
+                    ModuleKind::Function,
+                    "f",
+                    "(@x int) RETURNS int AS BEGIN RETURN (CASE WHEN EXISTS (SELECT TOP (1) * FROM app.t WHERE id = @x) THEN 1 ELSE 0 END); END",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t')"
+            )
+            .await,
+            1
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn a_declaration_that_does_not_compile_names_itself_and_leaves_the_connection_usable() {
     case("refused", |mut conn| async move {
         let refused = compile(
