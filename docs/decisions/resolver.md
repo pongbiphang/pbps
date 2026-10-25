@@ -4784,3 +4784,51 @@ anyway. The sandbox user is the supplied record and goes last: the release
 empties the database as that user and drops it only after the cleanup has
 fully succeeded, and a cleanup that fails keeps it.
 
+<a id="dec-2379-2"></a>
+
+**DEC-2379.2. A connected PostgreSQL plan is rehearsed on the selected entry's
+scratch, comparing what is structural apart from how the engine spells it
+(#2379).** The maintainer decided: on by default when an entry is selected, an
+off switch (`rehearse: false`, `plan --no-rehearse`) sealed as `off`, one
+scratch and not two containers, a failed rehearsal refuses the plan, and apply
+only displays the record. Built as follows.
+
+*One acquisition path.* `resolution::Entry` holds the selected entry for the
+run. The resolver and the rehearsal both ask it for the scratch, so a `docker`
+entry is one container (`Held`, confirmed removed before the plan goes on or is
+refused; the container's drop guard covers any other way out), and each use
+makes and releases its own database on it. A rehearsal reads no fingerprint key
+and reaches no compatibility verdict: it answers whether the statements run and
+converge, and a scratch of another build proves syntax and convergence only.
+
+*What is rehearsed.* The base is the plan's own base side, lowered from empty
+(`lower_from_empty`), and the plan runs as apply runs it. Changes to roles,
+their grants and row-security policies (which name roles) are left out of both
+and out of the comparison: a scratch server is shared, so a role created on it
+outlives the run, and a grant or a policy naming a role the target holds and the
+scratch does not fails for a reason that says nothing about the plan. Measured on PostgreSQL 18.6 and 16.15: tables with serial keys,
+foreign keys, checks and partial indexes, a view over a function, and declared
+rows all lower from empty and compile in one pass, so the scratch route's
+reconstruction ordering is not needed for the base.
+
+*What differs.* PostgreSQL stores a check, a default, an index predicate and a
+module body as its parser deparses them, so a textual comparison finds a
+difference in nearly every declaration. Structure is what remains once the
+declared text stands in for the stored one (`Declared::overlay`, as `plan --db`
+compares against the ledger); the respelling is what is sealed and printed.
+
+*Refusals.* A statement the engine rejects is `rehearsal.statement` and a
+structural difference `rehearsal.structural`, both findings that write nothing.
+A scratch that cannot be used, an externals file the target does not match, or
+a catalog read that fails is an error, as for the resolver, and so is a role
+that may not read the cluster's identity, with the grant and the switch named.
+The externals comparison reuses the resolver's reconstruction and runs only when
+something is staged. A managed type, which the resolver's fill does not know, and
+a fill chained to managed relations are refused with the switch named.
+
+*The record.* `Converged` carries the entry, the scratch, the layout the run
+found and the spellings; `Off` is sealed only where an entry is selected and the
+engine rehearses. SQL Server selects `Skip` for any entry and any switch until
+its own rehearsal lands, so its plans carry no record and acquire nothing. The
+`explain`, `plan --format json` and `apply` displays share one line.
+

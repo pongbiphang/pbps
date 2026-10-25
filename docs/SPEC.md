@@ -2143,7 +2143,7 @@ states that separation from production is operator-vouched. A shared entry's
 `externals` file is staged before the baseline, with no comparison to any target;
 the report states both facts. There is no target capture, compatibility verdict
 or resolver evidence. `--dev` remains refused with `--db`, `--env` and `--check`.
-Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing.
+Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing. Nor does `apply`.
 
 The container is used three ways, all on the preview side:
 
@@ -2172,6 +2172,57 @@ turned the rehearsal off. `explain` prints it and `apply` only displays it.
 Absence means the rehearsal was never asked for; it is not read as `off`, and
 neither is read as rehearsed unless the record says `converged`. A failed
 rehearsal writes no plan, so no record names one (DEC-2379.1).
+
+#### The connected rehearsal (PostgreSQL)
+
+With a scratch entry selected (`resolve_with`, on the project or the
+environment, or `--resolve-with`), `plan --db/--env` rehearses every plan it is
+about to write, whether or not the resolver was needed (#2379, DEC-2379.2):
+
+1. The target's current managed model, with its declared rows, is lowered from
+   empty by the emitter, as `bootstrap` lowers it, and created on the scratch.
+2. The plan's statements run in order, as `apply` runs them: the dialect's
+   session pins and the target's time zone, in one transaction unless the plan
+   is staged.
+3. The scratch is read back and compared with the declarations by the ordinary
+   differ. A statement the engine rejects, or a structural difference, refuses
+   the plan: no file is written, and the message names the statement or the
+   difference. A difference that is only how the engine spells a check, a
+   default, an index predicate or a module body is sealed in the plan's
+   `rehearsal` record and printed with the form the engine stored.
+
+The scratch is the entry's, acquired through the resolver's layers: separation
+from the target, the layout the account decides (a fresh database, or the
+supplied database after the resolver's owned cleanup, found empty again),
+externals staged and compared with the target, and owned cleanup. A `docker`
+entry is one container for the resolver and the rehearsal together. The
+rehearsal needs no fingerprint key and reaches no compatibility verdict: it
+validates syntax and convergence on the scratch's build, never that build's
+behaviour.
+
+It is on by default. `rehearse: false` under an environment and
+`plan --no-rehearse` turn it off, and the plan is sealed `off`, never as
+rehearsed. With no entry selected the plan carries no record. `apply` only
+displays the record and never acquires a scratch. SQL Server keeps its present
+behaviour until it has a connected rehearsal.
+
+What it does not reproduce, stated rather than implied:
+
+- **Rows and data-dependent failures.** The scratch holds the managed schema
+  and the declared rows only, so a CHECK or UNIQUE added over rows the
+  declarations do not list, or a conversion of existing data, is not tried
+  (#1165's fixtures are that territory).
+- **Authorization.** Roles, memberships, grants and row-security policies are
+  neither created on a shared scratch cluster nor compared: a role created there
+  outlives the run, and a grant or a policy naming a role the scratch lacks
+  would fail a plan for a reason that says nothing about it.
+- **The engine's edition and build.** As above, a scratch validates syntax and
+  convergence; it is not qualified against the target.
+- **Declarations the resolver's externals fill cannot answer for.** A managed
+  type, or a fill that reads managed relations, is refused with the switch
+  named.
+
+A target changed after planning is caught by the checksum at apply, as before.
 
 Three stances govern this preview rehearsal:
 
@@ -2435,7 +2486,10 @@ or registry. A plan the lightweight assessment answers in full opens nothing
 the resolver owns — no fingerprint key, Docker socket or scratch connection —
 and its connected summary reports `resolver_selection` with status
 `not_acquired` and `resolver_assessment` with `need: not_needed`, outside the
-saved plan and its checksum. A plan that requires the resolver reads the key
+saved plan and its checksum. (The connected rehearsal of 9.3.1 is a separate
+use of the same entry, on by default for PostgreSQL; `--no-rehearse` leaves a
+plan that needs no resolver opening nothing at all.) A plan that requires the
+resolver reads the key
 first, then runs it, and publishes its answer (DEC-1516.1):
 1. **The run ends.** Its scratch is released before anything else.
 2. **The ordinary checks run on the resolver's plan**, every connected pass
