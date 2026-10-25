@@ -3,6 +3,7 @@
 
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
+use pbps_model::escape::Escaped;
 
 pub mod companion;
 pub mod inventory;
@@ -238,6 +239,18 @@ pub(crate) async fn deployer_checks(
     context_checks(conn, databases, scratch, entered.is_dbo()).await
 }
 
+fn unreadable_database_access(name: &str) -> String {
+    format!("HAS_DBACCESS is unreadable for database {}", Escaped(name))
+}
+
+fn guest_database_access(name: &str) -> String {
+    format!(
+        "database {} admits the scratch sandbox through guest; REVOKE CONNECT \
+         FROM guest in that database",
+        Escaped(name)
+    )
+}
+
 async fn context_checks(
     conn: &mut impl ExecuteConnection,
     databases: &[String],
@@ -281,17 +294,13 @@ async fn context_checks(
             .await?,
             "guest admission",
         )?;
-        let access = text(&row, "access").map_err(|_| {
-            DbError::Refused(format!("HAS_DBACCESS is unreadable for database {name}"))
-        })?;
+        let access =
+            text(&row, "access").map_err(|_| DbError::Refused(unreadable_database_access(name)))?;
         if access != "0"
             && name != scratch
             && !["master", "tempdb", "msdb"].contains(&name.as_str())
         {
-            return Err(DbError::Refused(format!(
-                "database {name} admits the scratch sandbox through guest; REVOKE CONNECT \
-                 FROM guest in that database"
-            )));
+            return Err(DbError::Refused(guest_database_access(name)));
         }
     }
     system::check(conn, dbo).await
@@ -301,4 +310,35 @@ async fn context_checks(
 /// The same derivation is used for LOGIN, Docker environment and connection.
 pub fn password(entropy: &str) -> String {
     format!("P!9a{entropy}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_refusals_render_database_names_once_while_sql_stays_raw() {
+        let name = "na\n\u{1b}\u{202e}\\n\\u{202e}雪']";
+        assert_eq!(
+            unreadable_database_access(name),
+            r"HAS_DBACCESS is unreadable for database na\n\u{1b}\u{202e}\\n\\u{202e}雪']"
+        );
+        assert_eq!(
+            guest_database_access(name),
+            r"database na\n\u{1b}\u{202e}\\n\\u{202e}雪'] admits the scratch sandbox through guest; REVOKE CONNECT FROM guest in that database"
+        );
+        assert_eq!(
+            format!("SELECT HAS_DBACCESS({});", literal(name)),
+            "SELECT HAS_DBACCESS(N'na\n\u{1b}\u{202e}\\n\\u{202e}雪'']');"
+        );
+        assert_eq!(ident(name), "[na\n\u{1b}\u{202e}\\n\\u{202e}雪']]]");
+        assert_eq!(
+            unreadable_database_access("café雪"),
+            "HAS_DBACCESS is unreadable for database café雪"
+        );
+        assert_eq!(
+            guest_database_access("café雪"),
+            "database café雪 admits the scratch sandbox through guest; REVOKE CONNECT FROM guest in that database"
+        );
+    }
 }

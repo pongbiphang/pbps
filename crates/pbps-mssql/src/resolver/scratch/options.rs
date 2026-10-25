@@ -5,6 +5,7 @@
 use super::{one, text};
 use pbps_db::DbError;
 use pbps_db::transport::QueryConnection;
+use pbps_model::escape::Escaped;
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 
@@ -85,6 +86,20 @@ fn cell(value: &RawValue) -> Result<Cell, DbError> {
     })
 }
 
+fn unreadable_options(database: &str) -> String {
+    format!(
+        "sys.databases options for database {} are unreadable",
+        Escaped(database)
+    )
+}
+
+fn missing_options_row(database: &str) -> String {
+    format!(
+        "sys.databases did not report exactly one row for {}",
+        Escaped(database)
+    )
+}
+
 pub async fn read(
     conn: &mut impl QueryConnection,
     database: &str,
@@ -112,17 +127,11 @@ pub async fn read(
         .await?,
         "the database options",
     )?;
-    let json = text(&row, "options").map_err(|_| {
-        DbError::Refused(format!(
-            "sys.databases options for database {database} are unreadable"
-        ))
-    })?;
+    let json = text(&row, "options").map_err(|_| DbError::Refused(unreadable_options(database)))?;
     let mut rows: Vec<BTreeMap<String, Box<RawValue>>> = serde_json::from_str(&json)
         .map_err(|_| DbError::BadRow("sys.databases did not report a JSON row".into()))?;
     if rows.len() != 1 {
-        return Err(DbError::Refused(format!(
-            "sys.databases did not report exactly one row for {database}"
-        )));
+        return Err(DbError::Refused(missing_options_row(database)));
     }
     let values = rows
         .pop()
@@ -240,6 +249,27 @@ pub fn recipe_differences(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn options_refusals_render_database_names_once() {
+        let database = "na\n\u{1b}\u{202e}\\n\\u{202e}雪";
+        assert_eq!(
+            unreadable_options(database),
+            r"sys.databases options for database na\n\u{1b}\u{202e}\\n\\u{202e}雪 are unreadable"
+        );
+        assert_eq!(
+            missing_options_row(database),
+            r"sys.databases did not report exactly one row for na\n\u{1b}\u{202e}\\n\\u{202e}雪"
+        );
+        assert_eq!(
+            unreadable_options("café雪"),
+            "sys.databases options for database café雪 are unreadable"
+        );
+        assert_eq!(
+            missing_options_row("café雪"),
+            "sys.databases did not report exactly one row for café雪"
+        );
+    }
 
     #[test]
     fn fresh_row_exclusions_are_exactly_the_database_facts_compared_with_the_target() {

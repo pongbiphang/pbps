@@ -5,6 +5,7 @@
 use super::{ident, literal, text};
 use pbps_db::transport::ExecuteConnection;
 use pbps_db::{DbError, Row};
+use pbps_model::escape::Escaped;
 use std::collections::BTreeSet;
 
 const ROLE_MEMBERSHIPS: &str = "SELECT USER_NAME(role_principal_id) AS role \
@@ -60,6 +61,24 @@ fn object_rule(
         }
         Some(_) => Err("the object is not ms-shipped"),
     }
+}
+
+fn refused_permission(
+    database: &str,
+    grantee: &str,
+    permission: &str,
+    state: &str,
+    object: &str,
+    minor: i32,
+    reason: &str,
+) -> String {
+    // This fragment contains only raw identities and fixed separators. The
+    // reason is already prose and must not pass through the adapter again.
+    format!(
+        "{database} {grantee} {permission} {state} on {} (minor_id {minor}) \
+         refuses: {reason}",
+        Escaped(object)
+    )
 }
 
 fn permission(
@@ -132,9 +151,14 @@ fn permission(
         ),
     };
     if let Err(reason) = rule {
-        return Err(DbError::Refused(format!(
-            "{database} {grantee} {permission} {state} on {object} (minor_id {minor}) \
-             refuses: {reason}"
+        return Err(DbError::Refused(refused_permission(
+            database,
+            &grantee,
+            &permission,
+            &state,
+            &object,
+            minor,
+            reason,
         )));
     }
     Ok(())
@@ -158,6 +182,42 @@ fn user_token_qualifies(token: &[(String, String, String)], dbo: bool) -> bool {
     }
     base.sort();
     base == ["guest", "public"]
+}
+
+fn refused_login_token(name: &str, kind: &str, usage: &str) -> String {
+    format!(
+        "dbo sys.login_token entry {} ({kind}, {usage}) is not an owner DENY ONLY entry",
+        Escaped(name)
+    )
+}
+
+fn refused_role_membership(database: &str, role: &str) -> String {
+    format!(
+        "{database} guest role membership on ROLE {} is not allowed",
+        Escaped(role)
+    )
+}
+
+fn refused_user_token(database: &str, token: &[(String, String, String)]) -> String {
+    format!(
+        "{database} guest/public token membership on DATABASE {database} differs: {}",
+        token
+            .iter()
+            .map(|(name, kind, usage)| format!("{} ({kind}, {usage})", Escaped(name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn refused_ownership(database: &str, owned: &BTreeSet<String>) -> String {
+    format!(
+        "{database} guest/public ownership must be only guest's SCHEMA guest: {}",
+        owned
+            .iter()
+            .map(|key| Escaped(key).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 async fn login_token(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
@@ -184,9 +244,7 @@ async fn login_token(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
         // The engine constructs these server-role entries from the entered
         // owner's login token. No GRANT-capable entry qualifies, even public.
         if usage != "DENY ONLY" || !(is_owner || kind == "SERVER ROLE") {
-            return Err(DbError::Refused(format!(
-                "dbo sys.login_token entry {name} ({kind}, {usage}) is not an owner DENY ONLY entry"
-            )));
+            return Err(DbError::Refused(refused_login_token(&name, &kind, &usage)));
         }
         found_owner |= is_owner;
         found_public |= name == "public" && kind == "SERVER ROLE";
@@ -219,9 +277,9 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection, dbo: bool) -> Resul
             .await?
             .first()
         {
-            return Err(DbError::Refused(format!(
-                "{database} guest role membership on ROLE {} is not allowed",
-                text(row, "role")?
+            return Err(DbError::Refused(refused_role_membership(
+                database,
+                &text(row, "role")?,
             )));
         }
         let token = read(
@@ -235,14 +293,7 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection, dbo: bool) -> Resul
         .map(|row| Ok((text(row, "name")?, text(row, "type")?, text(row, "usage")?)))
         .collect::<Result<Vec<_>, DbError>>()?;
         if !user_token_qualifies(&token, dbo) {
-            return Err(DbError::Refused(format!(
-                "{database} guest/public token membership on DATABASE {database} differs: {}",
-                token
-                    .iter()
-                    .map(|(name, kind, usage)| format!("{name} ({kind}, {usage})"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            return Err(DbError::Refused(refused_user_token(database, &token)));
         }
         let mut database_grants = BTreeSet::new();
         for row in read(conn, database, "database_permissions", PERMISSIONS).await? {
@@ -279,10 +330,7 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection, dbo: bool) -> Resul
             }
         }
         if owned != BTreeSet::from(["guest|schemas:guest".into()]) {
-            return Err(DbError::Refused(format!(
-                "{database} guest/public ownership must be only guest's SCHEMA guest: {}",
-                owned.into_iter().collect::<Vec<_>>().join(", ")
-            )));
+            return Err(DbError::Refused(refused_ownership(database, &owned)));
         }
     }
     Ok(())
@@ -291,6 +339,122 @@ pub(super) async fn check(conn: &mut impl ExecuteConnection, dbo: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::object_rule;
+
+    #[test]
+    fn permission_and_role_refusals_render_raw_fragments_once() {
+        let name = "na\n\u{1b}\u{202e}\\n\\u{202e}雪";
+        assert_eq!(
+            super::refused_permission(
+                "master",
+                "public",
+                "SELECT",
+                "GRANT",
+                &format!("app.{name}"),
+                7,
+                r"already shown \n"
+            ),
+            r"master public SELECT GRANT on app.na\n\u{1b}\u{202e}\\n\\u{202e}雪 (minor_id 7) refuses: already shown \n"
+        );
+        assert_eq!(
+            super::refused_permission(
+                "master",
+                "guest",
+                "CONTROL",
+                "DENY",
+                &format!("SCHEMA {name}"),
+                0,
+                "permissions of this class are not allowed"
+            ),
+            r"master guest CONTROL DENY on SCHEMA na\n\u{1b}\u{202e}\\n\\u{202e}雪 (minor_id 0) refuses: permissions of this class are not allowed"
+        );
+        assert_eq!(
+            super::refused_role_membership("msdb", name),
+            r"msdb guest role membership on ROLE na\n\u{1b}\u{202e}\\n\\u{202e}雪 is not allowed"
+        );
+        assert_eq!(
+            super::refused_permission(
+                "master",
+                "public",
+                "SELECT",
+                "GRANT",
+                "app.café雪",
+                0,
+                "reason"
+            ),
+            "master public SELECT GRANT on app.café雪 (minor_id 0) refuses: reason"
+        );
+        assert_eq!(
+            super::refused_role_membership("msdb", "café雪"),
+            "msdb guest role membership on ROLE café雪 is not allowed"
+        );
+    }
+
+    #[test]
+    fn token_refusals_render_names_once_without_changing_qualification() {
+        let name = "na\n\u{1b}\u{202e}\\n\\u{202e}雪";
+        assert_eq!(
+            super::refused_login_token(name, "SQL LOGIN", "GRANT OR DENY"),
+            r"dbo sys.login_token entry na\n\u{1b}\u{202e}\\n\\u{202e}雪 (SQL LOGIN, GRANT OR DENY) is not an owner DENY ONLY entry"
+        );
+        assert_eq!(
+            super::refused_login_token("café雪", "SERVER ROLE", "GRANT OR DENY"),
+            "dbo sys.login_token entry café雪 (SERVER ROLE, GRANT OR DENY) is not an owner DENY ONLY entry"
+        );
+        let mut token = vec![
+            ("guest".into(), "SQL USER".into(), "GRANT OR DENY".into()),
+            ("public".into(), "ROLE".into(), "GRANT OR DENY".into()),
+        ];
+        assert!(super::user_token_qualifies(&token, true));
+        token.push((name.into(), "ROLE".into(), "DENY ONLY".into()));
+        token.push((r"literal\n".into(), "ROLE".into(), "DENY ONLY".into()));
+        let before = token.clone();
+        assert!(!super::user_token_qualifies(&token, true));
+        assert_eq!(
+            super::refused_user_token("tempdb", &token),
+            r"tempdb guest/public token membership on DATABASE tempdb differs: guest (SQL USER, GRANT OR DENY), public (ROLE, GRANT OR DENY), na\n\u{1b}\u{202e}\\n\\u{202e}雪 (ROLE, DENY ONLY), literal\\n (ROLE, DENY ONLY)"
+        );
+        assert_eq!(token, before);
+        assert!(!super::user_token_qualifies(&token, true));
+        assert_eq!(
+            super::refused_user_token(
+                "msdb",
+                &[("café雪".into(), "ROLE".into(), "DENY ONLY".into())]
+            ),
+            "msdb guest/public token membership on DATABASE msdb differs: café雪 (ROLE, DENY ONLY)"
+        );
+    }
+
+    #[test]
+    fn ownership_refusal_preserves_raw_keys_and_their_order() {
+        let owned = std::collections::BTreeSet::from([
+            "public|objects:na\n\u{1b}\u{202e}\\n\\u{202e}雪".to_owned(),
+            r"public|objects:na\n".to_owned(),
+        ]);
+        let before = owned.clone();
+        // The real LF sorts before the literal backslash; sorting the shown
+        // forms would reverse these entries. They remain distinct raw keys.
+        assert_eq!(owned.len(), 2);
+        assert_eq!(
+            owned.first().unwrap(),
+            "public|objects:na\n\u{1b}\u{202e}\\n\\u{202e}雪"
+        );
+        assert_eq!(
+            super::refused_ownership("msdb", &owned),
+            r"msdb guest/public ownership must be only guest's SCHEMA guest: public|objects:na\n\u{1b}\u{202e}\\n\\u{202e}雪, public|objects:na\\n"
+        );
+        assert_eq!(owned, before);
+        assert_ne!(
+            owned,
+            std::collections::BTreeSet::from(["guest|schemas:guest".into()])
+        );
+        assert_eq!(
+            super::refused_ownership(
+                "msdb",
+                &std::collections::BTreeSet::from(["public|schemas:café雪".into()])
+            ),
+            "msdb guest/public ownership must be only guest's SCHEMA guest: public|schemas:café雪"
+        );
+    }
 
     #[test]
     fn dbo_system_tokens_admit_only_the_measured_deny_only_extras() {

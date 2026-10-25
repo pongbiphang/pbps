@@ -322,6 +322,54 @@ async fn error_code(conn: &mut Conn, sql: &str) -> String {
 
 #[tokio::test]
 #[ignore = "needs the serial SQL Server resolver fixtures"]
+async fn staged_refusals_show_hostile_names_while_lookups_and_recorded_identities_stay_raw() {
+    case("shown_names", |mut f| async move {
+        let name = "na\n\u{1b}\u{202e}\\n\\u{202e}雪']";
+        let quoted = name.replace(']', "]]");
+        let ddl = format!("CREATE TABLE app.[{quoted}]([{quoted}] int);");
+        f.target.execute(&ddl).await.unwrap();
+        // prepare reads the target's permissions and reconstructs the scratch
+        // owner: both OBJECT_ID lookups must succeed with the raw spelling.
+        let p = f.prepare(true, &[&ddl], &[("app", name)]).await;
+        let id = capture::object("app", name);
+        assert_eq!(p.context.staged.keys().collect::<Vec<_>>(), [&id]);
+        assert!(
+            p.context.staged[&id]
+                .permissions
+                .contains(&(name.into(), "SELECT".into()))
+        );
+        let staged = p.target_owners.restricted_to(&BTreeSet::from([id.clone()]));
+        f.scratch
+            .execute(&format!("DROP TABLE app.[{quoted}];"))
+            .await
+            .unwrap();
+        let expected =
+            r"staged object [app].[na\n\u{1b}\u{202e}\\n\\u{202e}雪']]] is absent or unreadable";
+        let error = auth::reconstruct_owners(&mut f.scratch, &p.map, &staged)
+            .await
+            .unwrap_err();
+        let DbError::Refused(message) = error else {
+            panic!("expected a missing staged object, got {error:?}")
+        };
+        assert_eq!(message, expected, "owner reconstruction refusal");
+        let mut context = p.context.clone();
+        let canonical = context.canonical();
+        let error = auth::read_staged_permissions(&mut f.scratch, &mut context, &staged)
+            .await
+            .unwrap_err();
+        let DbError::Refused(message) = error else {
+            panic!("expected a missing staged object, got {error:?}")
+        };
+        assert_eq!(message, expected, "permission capture refusal");
+        assert_eq!(context.canonical(), canonical);
+        assert_eq!(context.staged.keys().collect::<Vec<_>>(), [&id]);
+        assert_eq!(id.name, ["app", name]);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs the serial SQL Server resolver fixtures"]
 async fn sandbox_deployer_reproduces_database_context_without_revert() {
     case("context",|mut f| async move {
         f.target.execute("ALTER USER dep WITH DEFAULT_SCHEMA=app; DENY CREATE PROCEDURE TO outer_role; SET LANGUAGE Deutsch; SET DATEFIRST 3; SET DATEFORMAT ymd; SET ARITHABORT OFF; SET NUMERIC_ROUNDABORT ON; SET QUOTED_IDENTIFIER OFF;").await.unwrap();
