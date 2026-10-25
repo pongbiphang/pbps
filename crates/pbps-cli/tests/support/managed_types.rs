@@ -1775,6 +1775,102 @@ fn bootstrap_refuses_existing_declared_types_without_recording_a_failed_state() 
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_history_bootstraps_final_labels_connected_and_through_psql() {
+    for (container, server) in [
+        ("PBPS_TEST_PG_CONTAINER", server()),
+        (
+            "PBPS_TEST_PG_OLD_CONTAINER",
+            std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+        ),
+    ] {
+        let source = OwnDatabase::new(&server, "label_history1635");
+        on_server(source.connection(), "CREATE SCHEMA app");
+        let d = Demo::new("label-history1635");
+        let file = d.dir.join("schema/app.e.type.yml");
+        std::fs::write(&file, "enum: app.e\nvalues: [sad, ok]\n").unwrap();
+        d.table("table: app.t\ncolumns:\n  m: {type: app.e}\n");
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", source.connection()]));
+        on_server(source.connection(), "INSERT INTO app.t VALUES ('sad')");
+
+        let annotated = "enum: app.e\nvalues: [{name: blue, renamed_from: sad}, ok]\n";
+        std::fs::write(&file, annotated).unwrap();
+        d.commit();
+        let path = d.dir.join("label-history.plan.json");
+        let rename = label_plan(&d, source.connection(), &path);
+        assert_eq!(rename.changes.changes.len(), 1);
+        assert!(matches!(
+            rename.changes.changes[0].change,
+            pbps_model::Change::RenameEnumValue { .. }
+        ));
+        succeeds(d.run(&[
+            "apply",
+            "--db",
+            source.connection(),
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&path),
+            "--allow",
+            "rename",
+        ]));
+        assert_eq!(
+            scalar(
+                source.connection(),
+                "SELECT count(*)::bigint FROM app.t WHERE m::text='blue'"
+            ),
+            1
+        );
+        assert!(
+            label_plan(&d, source.connection(), &path)
+                .changes
+                .is_empty()
+        );
+
+        for scripted in [false, true] {
+            let fresh = OwnDatabase::new(
+                &server,
+                if scripted {
+                    "label_history_script1635"
+                } else {
+                    "label_history_connected1635"
+                },
+            );
+            on_server(fresh.connection(), "CREATE SCHEMA app");
+            if scripted {
+                let path = d.dir.join("label-history-bootstrap.sql");
+                succeeds(d.run(&["bootstrap", "--sql", path.to_str().unwrap()]));
+                succeeds(psql_script_in(
+                    container,
+                    &fresh,
+                    &std::fs::read_to_string(path).unwrap(),
+                ));
+                // SQL output creates no ledger; adopt the replay before planning.
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    fresh.connection(),
+                    "--reason",
+                    "adopt replayed bootstrap SQL",
+                ]));
+            } else {
+                succeeds(d.run(&["bootstrap", "--db", fresh.connection()]));
+            }
+            assert_eq!(
+                latest_snapshot(fresh.connection()).schema.types[&"app.e".parse().unwrap()],
+                ManagedType::Enum {
+                    values: vec!["blue".into(), "ok".into()]
+                }
+            );
+            assert!(label_plan(&d, fresh.connection(), &path).changes.is_empty());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), annotated);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn bootstrap_creates_identified_enums_domains_and_their_table_and_records_all_of_them() {
     for server in [
         server(),

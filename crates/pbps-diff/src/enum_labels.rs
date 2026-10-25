@@ -35,17 +35,8 @@ pub(crate) fn changes(
             .name(TypeSide::Base, uid)
             .and_then(|n| base.schema.types.get(n))
         else {
-            if let Some(renames) = hints.enum_value_renames.get(name) {
-                for from in renames.values() {
-                    errors.push(refusal(
-                        name,
-                        format!(
-                            "enum label `{}` named by renamed_from does not exist",
-                            pbps_model::escape::Escaped(from)
-                        ),
-                    ));
-                }
-            }
+            // Creation has no old label identity, even if a name is reused.
+            // Absorb history like identity::intent_is_absorbed (DEC-1635.6).
             continue;
         };
         if old == wanted
@@ -660,6 +651,109 @@ mod tests {
             desired,
             ids,
         )
+    }
+
+    fn annotated_creation(
+        base: &(Schema, IdsFile),
+        desired: &(Schema, IdsFile),
+        renames: &[(&str, &str)],
+    ) -> ChangeSet {
+        let hints = Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                renames
+                    .iter()
+                    .map(|(to, from)| ((*to).into(), (*from).into()))
+                    .collect(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let before = Side {
+            schema: &base.0,
+            ids: &base.1,
+        };
+        let after = Side {
+            schema: &desired.0,
+            ids: &desired.1,
+        };
+        let plan = crate::diff(before, after, &pbps_dialect::MinimalDialect, &hints)
+            .expect("a created type has final labels, not pending label identities");
+        assert_eq!(probe_schema(before, after, &hints), desired.0);
+        plan.changes().clone()
+    }
+
+    #[test]
+    fn created_enum_labels_ignore_history_when_other_base_types_exist() {
+        let mut base = world(&["kept"]);
+        let definition = base.0.types.remove(&"app.e".parse().unwrap()).unwrap();
+        base.0.types.insert("app.kept".parse().unwrap(), definition);
+        *base.1.types.values_mut().next().unwrap() = "app.kept".parse().unwrap();
+        let mut desired = base.clone();
+        desired
+            .0
+            .types
+            .insert("app.e".parse().unwrap(), enumeration(&["blue", "ok"]));
+        desired
+            .1
+            .types
+            .insert("y_000002".parse().unwrap(), "app.e".parse().unwrap());
+        let plan = annotated_creation(&base, &desired, &[("blue", "sad")]);
+        assert_eq!(plan.changes.len(), 1);
+        assert!(matches!(&plan.changes[0].change,
+            Change::CreateType { uid, name, definition }
+                if uid.to_string() == "y_000002"
+                    && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
+                    && **definition == enumeration(&["blue", "ok"])));
+    }
+
+    #[test]
+    fn created_enum_labels_ignore_history_and_swaps_in_an_empty_bootstrap_base() {
+        for (values, renames) in [
+            (vec!["blue", "ok"], vec![("blue", "sad")]),
+            (vec!["a", "b"], vec![("a", "b"), ("b", "a")]),
+            (
+                vec!["a", "b", "c"],
+                vec![("a", "b"), ("b", "c"), ("c", "a")],
+            ),
+        ] {
+            let base = (Schema::default(), IdsFile::default());
+            let desired = world(&values);
+            let plan = annotated_creation(&base, &desired, &renames);
+            assert_eq!(plan.changes.len(), 1);
+            assert!(matches!(&plan.changes[0].change,
+                Change::CreateType { uid, name, definition }
+                    if uid.to_string() == "y_000001"
+                        && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
+                        && **definition == enumeration(&values)));
+        }
+    }
+
+    #[test]
+    fn created_enum_labels_use_the_new_uid_when_replacing_the_same_name() {
+        let base = world(&["unrelated", "old"]);
+        let mut desired = world(&["blue", "ok"]);
+        desired.1.types = [("y_000002".parse().unwrap(), "app.e".parse().unwrap())].into();
+        let plan = annotated_creation(&base, &desired, &[("blue", "sad")]);
+        assert_eq!(plan.changes.len(), 2);
+        assert!(plan.changes.iter().any(|step| matches!(&step.change,
+            Change::DropType { uid, .. } if uid.to_string() == "y_000001")));
+        assert!(plan.changes.iter().any(|step| matches!(&step.change,
+            Change::CreateType { uid, name, definition }
+                if uid.to_string() == "y_000002"
+                    && name == &"app.e".parse::<pbps_model::TypeRef>().unwrap()
+                    && **definition == enumeration(&["blue", "ok"]))));
+    }
+
+    #[test]
+    fn existing_enum_labels_still_refuse_an_absent_rename_source_and_target() {
+        let (_, errors, _, _) = planned(&["a", "b"], &["blue", "b"], &[("blue", "sad")]);
+        assert!(
+            errors.iter().any(|error| error
+                .to_string()
+                .contains("enum label `sad` named by renamed_from does not exist")),
+            "{errors:?}"
+        );
     }
 
     #[test]

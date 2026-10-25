@@ -2909,6 +2909,9 @@ ALTER TYPE RENAME VALUE. A label accepts a string or `{name, renamed_from}`;
 one-shot intent stays beside Schema, never in its equality. Adding a label
 carries no intrinsic risk, as CreateType does. Renaming carries Rename, as
 RenameType does, because existing stored values return a different spelling.
+With no base definition for its uid, a type is created with its final labels
+and ignores label rename hints, like `identity::intent_is_absorbed`; loader
+validation still applies.
 Both operations use the existing class-7 type subrank and approved ordinal;
 whole-type rename stays class 1. Exists/final-type rewrite effects and the
 existing schedule place labels before their dependents; no pass is added.
