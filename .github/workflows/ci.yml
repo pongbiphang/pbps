@@ -152,6 +152,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: python3 scripts/live_transport_test.py
       - run: python3 scripts/release_qualification_test.py
+      - run: python3 scripts/findings_to_github_test.py
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
 

@@ -1052,12 +1052,26 @@ Each option takes two values and may be repeated: `--rename <COLUMN> <NEW>`,
 `--drop <COLUMN> <REASON>`, `--drop-table <TABLE> <REASON>`, and
 `--drop-role <ROLE> <REASON>`. At least one option is required. Qualified name shapes and
 nonblank reasons are checked before project discovery. A missing value cannot
-consume the next option; hyphen-leading values are not accepted.
+consume the next option; hyphen-leading values, including `-`, are not accepted.
+For stdin reasons, use the single commands described below.
 
 Annotations and the complete explicit batch go through one identity resolution.
 An invalid, conflicting, or incomplete batch writes nothing; no partial answers
 are saved. The existing single-intent commands use the same path with one
 decision (DEC-1791.1). Compose's existing single-intent input is unchanged.
+
+For `drop`, `drop-table`, `drop-role`, `move-rows` and `rebuild-table`,
+`--reason -` reads UTF-8 from stdin to EOF. Exactly one final LF or CRLF is
+removed; all other characters, including surrounding whitespace and embedded
+newlines, are recorded verbatim. Empty, whitespace-only or non-UTF-8 input is
+a usage error (exit 2) before project discovery or writes. The literal `-`
+selects stdin on these single commands and on one drop reason of a
+`pbps intent` batch; a second `-` in a batch is a usage error before stdin is
+read. In PowerShell, use PowerShell 7 or set
+`$OutputEncoding = [System.Text.UTF8Encoding]::new()` before piping non-ASCII
+text. On Windows a stdin reason containing `?` prints an encoding hint because
+PowerShell 5.1's default US-ASCII output can have replaced characters; the hint
+changes neither the recorded reason nor the exit code (DEC-2332.1).
 
 `drop`, `drop-table` and `drop-role` require a reason containing at least one
 non-whitespace character. A blank `--reason` is a usage error (exit 2), refused
@@ -1143,17 +1157,27 @@ error: 1 change could not be decided automatically
   dbo.customer: customer_name disappeared, full_name is new
 
   if renamed:  pbps rename dbo.customer.customer_name full_name
-  if dropped:  pbps drop dbo.customer.customer_name --reason "<why>"
+  if dropped:  pbps drop dbo.customer.customer_name --reason ""
 ```
 
 For several pending decisions, human and JSON reports also give one `pbps intent`
-batch. Drops have their own reason placeholders; ambiguous renames remain
+batch. Every missing reason is an empty double-quoted argument (`""`), so
+pasting a remedy without filling its reasons is refused by the nonblank rule
+and writes nothing. Single quotes are not used: `cmd` treats them as literal
+characters. Older PowerShell versions that lose an empty native argument still
+get a usage error. Drops have their own reasons; ambiguous renames remain
 explicit alternatives for the human to choose. If a single command leaves other
 decisions unresolved, its valid but unrecorded intent is included in the batch
 remedy. A column decision under a provisional table rename remains conditional
 on that table choice. Values that cannot be quoted safely across supported
 shells use quoted placeholders, to be replaced with the original values using
 the operator's shell quoting.
+
+`scripts/findings-to-github.py --pr-comment` turns the JSON findings envelope
+into Markdown on stdout: blockers first, then fenced remedies with the complete
+batch last. It performs no network calls and preserves the envelope's exit
+status: ok 0, findings 2, unanswerable 1. The default output remains GitHub
+Actions annotations.
 
 **No flag may stand in for that answer.** Similarity is allowed to order the
 candidates in 6.3's prompt, one pair at a time, but an `--assume-renames` would

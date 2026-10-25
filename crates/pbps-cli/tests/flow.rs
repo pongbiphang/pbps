@@ -367,6 +367,19 @@ fn ci_operators_are_recorded_and_blank_overrides_leave_the_ledger_unchanged() {
     audit_operators::connected("mssql", own.connection());
 }
 
+#[path = "support/intent_reason_ux.rs"]
+mod intent_reason_ux;
+
+#[test]
+fn stdin_reasons_and_unedited_remedies_preserve_human_intent() {
+    intent_reason_ux::stdin_reasons("mssql");
+}
+
+#[test]
+fn stdin_refusal_precedes_discovery_and_plan_apply_cannot_record_intent() {
+    intent_reason_ux::refusal_before_io("mssql");
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 

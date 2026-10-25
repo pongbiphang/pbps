@@ -127,7 +127,14 @@ fn pair_flag(flag: &str, first: &str, second: &str, second_name: &str) -> String
     format!(
         "{flag} {} {}",
         shell_arg(first).unwrap_or_else(|| placeholder("object name")),
-        shell_arg(second).unwrap_or_else(|| placeholder(second_name)),
+        shell_arg(second).unwrap_or_else(|| {
+            // Placeholder prose must never become a recorded audit reason.
+            if second_name == "why" {
+                "\"\"".into()
+            } else {
+                placeholder(second_name)
+            }
+        }),
     )
 }
 
@@ -229,7 +236,7 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
         }
         choices.push(format!(
             "    if dropped: {}",
-            pair_flag(drop, from, "<why>", "why")
+            pair_flag(drop, from, "", "why")
         ));
     };
     match blocker {
@@ -246,12 +253,9 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 );
             }
         }
-        Blocker::DropTypeNeedsReason { name } => fixed.push(pair_flag(
-            "--drop-type",
-            &name.raw().to_string(),
-            "<why>",
-            "why",
-        )),
+        Blocker::DropTypeNeedsReason { name } => {
+            fixed.push(pair_flag("--drop-type", &name.raw().to_string(), "", "why"))
+        }
         Blocker::AmbiguousColumns {
             table,
             disappeared,
@@ -297,20 +301,17 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 );
             }
         }
-        Blocker::DropColumnNeedsReason { column } => fixed.push(pair_flag(
-            "--drop",
-            &column.raw().to_string(),
-            "<why>",
-            "why",
-        )),
+        Blocker::DropColumnNeedsReason { column } => {
+            fixed.push(pair_flag("--drop", &column.raw().to_string(), "", "why"))
+        }
         Blocker::DropTableNeedsReason { table } => fixed.push(pair_flag(
             "--drop-table",
             &table.raw().to_string(),
-            "<why>",
+            "",
             "why",
         )),
         Blocker::DropRoleNeedsReason { role } => {
-            fixed.push(pair_flag("--drop-role", role.raw(), "<why>", "why"))
+            fixed.push(pair_flag("--drop-role", role.raw(), "", "why"))
         }
         Blocker::ProvisionalTableIdentity { from, to, blocker } => {
             // A derived column choice is conditional on its table identity.
@@ -373,7 +374,7 @@ mod batch_tests {
                         "drop-table".into(),
                         format!("app.{part}"),
                         "--reason".into(),
-                        "<why>".into(),
+                        "".into(),
                     ],
                 ),
                 (
@@ -384,7 +385,7 @@ mod batch_tests {
                         "drop".into(),
                         format!("app.{part}.{part}"),
                         "--reason".into(),
-                        "<why>".into(),
+                        "".into(),
                     ],
                 ),
                 (
@@ -420,8 +421,9 @@ mod batch_tests {
                 assert!(output.status.success(), "{output:?}");
                 let args: Vec<&[u8]> = output
                     .stdout
+                    .strip_suffix(&[0])
+                    .expect("printf terminates the final argument")
                     .split(|&b| b == 0)
-                    .filter(|s| !s.is_empty())
                     .collect();
                 assert_eq!(
                     args,
@@ -435,7 +437,7 @@ mod batch_tests {
                 table: TableName::new("app", part),
             });
             assert!(
-                text.contains("pbps drop-table \"<table>\" --reason \"<why>\""),
+                text.contains("pbps drop-table \"<table>\" --reason \"\""),
                 "{text:?}"
             );
         }
@@ -461,8 +463,9 @@ mod batch_tests {
             assert!(output.status.success(), "{output:?}");
             let args: Vec<&[u8]> = output
                 .stdout
+                .strip_suffix(&[0])
+                .expect("printf terminates the final argument")
                 .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
                 .collect();
             assert_eq!(
                 args,
@@ -485,8 +488,9 @@ mod batch_tests {
                 .unwrap();
             let args: Vec<&[u8]> = output
                 .stdout
+                .strip_suffix(&[0])
+                .expect("printf terminates the final argument")
                 .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
                 .collect();
             assert_eq!(args[1], format!("app.{part}.{part}").as_bytes());
         }
@@ -525,10 +529,46 @@ mod batch_tests {
         assert_eq!(findings[1].id, "identity.drop-role-needs-reason");
         let remedy = findings[2].remedy.as_ref().unwrap();
         assert!(human.contains(remedy));
-        assert!(remedy.contains(
-            "pbps intent --drop app.t.old \"<why>\" --drop-role \"old reader\" \"<why>\""
-        ));
+        assert!(
+            remedy.contains("pbps intent --drop app.t.old \"\" --drop-role \"old reader\" \"\"")
+        );
         assert_eq!(blocker_findings(&blockers[..1]).len(), 1);
+    }
+
+    #[test]
+    fn every_missing_identity_reason_is_an_empty_double_quoted_argument() {
+        for blocker in [
+            Blocker::DropColumnNeedsReason {
+                column: "app.t.a".parse().unwrap(),
+            },
+            Blocker::DropTableNeedsReason {
+                table: "app.t".parse().unwrap(),
+            },
+            Blocker::DropRoleNeedsReason {
+                role: "reader".into(),
+            },
+            Blocker::DropTypeNeedsReason {
+                name: r#"app."type space""#.parse().unwrap(),
+            },
+            Blocker::AmbiguousTypes {
+                disappeared: vec!["app.old".parse().unwrap()],
+                appeared: vec!["app.new".parse().unwrap()],
+            },
+        ] {
+            let human = one_blocker(&blocker);
+            assert!(human.contains("\"\""), "{human}");
+            assert!(!human.contains("<why>") && !human.contains("<reason>"));
+            if matches!(&blocker, Blocker::DropTypeNeedsReason { .. }) {
+                assert!(!has_bare_placeholder(&human));
+            }
+            let json = blocker_finding(&blocker);
+            assert!(
+                json.remedy
+                    .as_deref()
+                    .unwrap_or(&json.message)
+                    .contains("\"\"")
+            );
+        }
     }
 
     #[test]
@@ -548,7 +588,7 @@ mod batch_tests {
             for to in ["x", "y"] {
                 assert!(remedy.contains(&format!("--rename app.t.{from} {to}")));
             }
-            assert!(remedy.contains(&format!("--drop app.t.{from} \"<why>\"")));
+            assert!(remedy.contains(&format!("--drop app.t.{from} \"\"")));
         }
     }
 
@@ -567,9 +607,7 @@ mod batch_tests {
         )
         .unwrap();
         assert!(remedy.contains("valid but not recorded"));
-        assert!(
-            remedy.contains("pbps intent --drop app.t.a \"first reason\" --drop app.t.b \"<why>\"")
-        );
+        assert!(remedy.contains("pbps intent --drop app.t.a \"first reason\" --drop app.t.b \"\""));
         let invalid = Blocker::UnusedIntent {
             intent: supplied.clone(),
         };
@@ -594,7 +632,7 @@ mod batch_tests {
             .lines()
             .find(|line| line.contains("pbps intent"))
             .unwrap();
-        assert_eq!(command.trim(), "pbps intent --drop-role reader \"<why>\"");
+        assert_eq!(command.trim(), "pbps intent --drop-role reader \"\"");
         assert!(!remedy.contains("$REASON"));
         assert!(remedy.contains("only if app.old -> app.new"));
         assert!(remedy.contains("--drop app.new.old"));
@@ -643,13 +681,13 @@ pub fn blocker_finding(b: &Blocker) -> crate::output::Finding {
 }
 
 fn one_blocker(b: &Blocker) -> String {
-    let why = placeholder("why");
+    let why = "\"\"";
     match b {
         Blocker::AmbiguousTypes {
             disappeared,
             appeared,
         } => format!(
-            "  types {} disappeared; {} are new. Record a rename with renamed_from or pbps intent --rename-type, or supply pbps intent --drop-type <type> <reason>.\n",
+            "  types {} disappeared; {} are new. Record a rename with renamed_from or pbps intent --rename-type, or supply pbps intent --drop-type {type_arg} {why}.\n",
             disappeared
                 .iter()
                 .map(|n| n.shown().to_string())
@@ -659,13 +697,17 @@ fn one_blocker(b: &Blocker) -> String {
                 .iter()
                 .map(|n| n.shown().to_string())
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            type_arg = placeholder("type"),
         ),
-        Blocker::DropTypeNeedsReason { name } => format!(
-            "  type {} disappeared; record its reason with pbps intent --drop-type {} <reason>\n",
-            name.shown(),
-            name.shown()
-        ),
+        Blocker::DropTypeNeedsReason { name } => {
+            let argument =
+                shell_arg(&name.raw().to_string()).unwrap_or_else(|| placeholder("type"));
+            format!(
+                "  type {} disappeared; record its reason with pbps intent --drop-type {argument} {why}\n",
+                name.shown(),
+            )
+        }
         Blocker::MissingType {
             name,
             unrepresentable,
@@ -2566,7 +2608,7 @@ mod tests {
         let text = one_blocker(&Blocker::DropTableNeedsReason {
             table: "dbo.t".parse().unwrap(),
         });
-        assert!(text.contains("--reason \"<why>\""), "{text}");
+        assert!(text.contains("--reason \"\""), "{text}");
         assert!(!has_bare_placeholder(&text), "{text}");
     }
 

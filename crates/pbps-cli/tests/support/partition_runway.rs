@@ -288,7 +288,7 @@ pub fn check(server: &str, slug: &str) {
     );
     assert_eq!(
         held[0]["remedy"],
-        "pbps move-rows app.withdef_2027_01 --max-rows \"<max-rows>\" --reason \"<why>\"",
+        "pbps move-rows app.withdef_2027_01 --max-rows \"<max-rows>\" --reason \"\"",
         "{}",
         held[0]
     );

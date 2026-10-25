@@ -19,6 +19,7 @@ fn table(d: &Demo, schema: &str, columns: &[&str]) {
 }
 
 pub fn complete(dialect: &str) {
+    ambiguous_column_and_companion_remedy(dialect);
     let schema = if dialect == "postgres" { "app" } else { "dbo" };
     for scenario in ["drops", "renames", "mixed"] {
         let d = Demo::new(&format!("batch1791-{scenario}"));
@@ -55,6 +56,19 @@ pub fn complete(dialect: &str) {
             .as_str()
             .unwrap();
         assert!(stderr(&human).contains(remedy));
+        if scenario == "drops" {
+            let line = remedy
+                .lines()
+                .find(|line| line.trim_start().starts_with("pbps intent "))
+                .unwrap();
+            assert!(line.contains("\"\""));
+            assert!(!line.contains("<why>"));
+            let names = [&email, &phone];
+            let unedited = d.run(&["intent", "--drop", names[0], "", "--drop", names[1], ""]);
+            assert_eq!(code(&unedited), 2);
+            assert!(stderr(&unedited).contains("empty"));
+            assert_eq!(ids(&d), before);
+        }
         let unreachable = if dialect == "postgres" {
             "host=127.0.0.1 port=1 user=unused dbname=unused sslmode=disable"
         } else {
@@ -316,6 +330,67 @@ pub fn annotations_and_single_edits(dialect: &str) {
     success(
         &d,
         &["drop", &format!("{schema}.t.c"), "--reason", "retire c"],
+    );
+    success(&d, &["plan", "--check"]);
+}
+
+// One vanished/new column plus a companion role exercises the complete batch
+// without changing DEC-1791.1's threshold for offering batch remedies.
+fn ambiguous_column_and_companion_remedy(dialect: &str) {
+    let schema = if dialect == "postgres" { "app" } else { "dbo" };
+    let d = Demo::new("batch2332-ambiguous");
+    table(&d, schema, &["old"]);
+    let role = d.dir.join("schema/reader.yml");
+    std::fs::write(&role, "role: reader\n").unwrap();
+    success(&d, &["plan", "--no-dev"]);
+    d.commit();
+    table(&d, schema, &["new"]);
+    std::fs::remove_file(role).unwrap();
+    let before = ids(&d);
+    let human = d.run(&["plan", "--check"]);
+    let json = d.run(&["plan", "--check", "--format", "json"]);
+    assert_eq!(code(&human), 2);
+    assert_eq!(code(&json), 2);
+    let json: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let remedy = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "identity.batch-required")
+        .unwrap()["remedy"]
+        .as_str()
+        .unwrap();
+    assert!(stderr(&human).contains(remedy));
+    assert!(remedy.contains("--drop-role reader \"\""));
+    let old = format!("{schema}.t.old");
+    assert!(remedy.contains(&format!("--drop {old} \"\"")));
+    let out = d.run(&["intent", "--drop-role", "reader", ""]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("empty"));
+    assert_eq!(ids(&d), before);
+    success(
+        &d,
+        &[
+            "intent",
+            "--drop-role",
+            "reader",
+            "role retired",
+            "--drop",
+            &old,
+            "old retired",
+        ],
+    );
+    let after: IdsFile = serde_json::from_slice(&ids(&d)).unwrap();
+    assert!(
+        after
+            .tombstones
+            .values()
+            .any(|t| t.was == old && t.reason == "old retired")
+    );
+    assert!(
+        after
+            .column_uid(&format!("{schema}.t.new").parse().unwrap())
+            .is_some()
     );
     success(&d, &["plan", "--check"]);
 }

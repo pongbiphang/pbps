@@ -1558,3 +1558,41 @@ the existing per-engine storage bounds. Attribution changes no plan checksum,
 identity intent or deployment approval. Subprocess tests isolate environment
 changes and pin explicit intent attribution, fallback ordering and pre-I/O
 refusals; the registered engine tests pin ledger attribution and preservation.
+
+
+<a id="dec-2332-1"></a>
+
+**DEC-2332.1. Intent remedies leave reasons empty; single commands accept stdin**
+
+Every missing reason in a remedy is `""`, including batch, type-drop and
+move-rows remedies. An unedited command fails the existing nonblank validation
+before discovery and writes nothing. Double quotes work across the supported
+shells; `cmd` treats single quotes as reason text. Shell-unsafe supplied reasons
+also fall back to an empty argument, never an invented audit explanation.
+
+Only `drop`, `drop-table`, `drop-role`, `move-rows` and `rebuild-table` read
+`--reason -` from stdin. Read UTF-8 to EOF, remove exactly one final LF or CRLF,
+then use the same nonblank validator while preserving everything else. Decode,
+read and blank-input errors are usage errors before project discovery. In a
+`pbps intent` batch, one drop reason may be `-` and is read the same way; stdin
+is one stream, so a second `-` is a usage error raised before stdin is read.
+Every other hyphen-leading batch value is refused. These conveniences change how a human supplies intent, never
+allow a plan/apply flag to choose it or change the identity recording path.
+Compose passes its explicitly supplied literal `-` reason through stdin so its
+existing reason input remains unchanged.
+
+On Windows only, a stdin reason containing `?` warns about PowerShell 5.1's
+US-ASCII pipe encoding and suggests a reason argument or PowerShell 7. This is
+a hint, not a refusal: a legitimate question mark and the original bytes of
+valid UTF-8 input are preserved. SPEC §6.1 also documents explicit UTF-8 piping.
+
+The external findings adapter's `--pr-comment` writes Markdown without network
+access. Messages precede remedies, the complete batch comes last, and fences
+outgrow backtick runs in the remedy. Both output modes use the envelope's same
+0/1/2 result mapping and refuse unsupported schemas. This stays outside the
+binary under SPEC §14.1.
+
+Pinned by `stdin_reasons_and_unedited_remedies_preserve_human_intent`,
+`stdin_refusal_precedes_discovery_and_plan_apply_cannot_record_intent`,
+`stdin_preserves_the_reason_except_one_final_line_ending`, the batch/report
+regressions, and `scripts/findings_to_github_test.py`.

@@ -857,6 +857,19 @@ fn ci_operators_are_recorded_and_blank_overrides_leave_the_ledger_unchanged() {
     audit_operators::connected("postgres", own.connection());
 }
 
+#[path = "support/intent_reason_ux.rs"]
+mod intent_reason_ux;
+
+#[test]
+fn stdin_reasons_and_unedited_remedies_preserve_human_intent() {
+    intent_reason_ux::stdin_reasons("postgres");
+}
+
+#[test]
+fn stdin_refusal_precedes_discovery_and_plan_apply_cannot_record_intent() {
+    intent_reason_ux::refusal_before_io("postgres");
+}
+
 #[path = "support/audit_reasons.rs"]
 mod audit_reasons;
 
@@ -29723,7 +29736,7 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
         "the data will not accept this plan",
         "2 rows of app.ev_rest are inside the range of app.ev_2025",
         "no move of them was allowed",
-        "pbps move-rows app.ev_2025 --max-rows <N> --reason <why>",
+        "pbps move-rows app.ev_2025 --max-rows <N> --reason \"\"",
         "LOCK TABLE ONLY \"app\".\"ev_rest\" IN SHARE MODE;",
     ] {
         assert!(refused.contains(said), "{said}: {refused}");
