@@ -7603,10 +7603,24 @@ pub fn cmd_plan_db(
                         );
                         resolution = Some((selection.name.clone(), unsealed, asked));
                     }
-                    Err(crate::resolution::Refused::Finding(finding)) => {
-                        return Ok(Connected::Refused { finding, findings });
+                    Err(refused) => {
+                        // The container the resolver used is confirmed gone
+                        // before the refusal, as it was when the resolver
+                        // owned it alone.
+                        let released = scratch.as_mut().map(|entry| entry.finish());
+                        if let Some(released) = released
+                            && let Err(crate::resolution::Refused::Unanswerable(error)) =
+                                released.await
+                        {
+                            return Err(error);
+                        }
+                        match refused {
+                            crate::resolution::Refused::Finding(finding) => {
+                                return Ok(Connected::Refused { finding, findings });
+                            }
+                            crate::resolution::Refused::Unanswerable(error) => return Err(error),
+                        }
                     }
-                    Err(crate::resolution::Refused::Unanswerable(error)) => return Err(error),
                 }
             }
         }
