@@ -11,35 +11,216 @@
 //! is the ordinary differ followed by [`classify`], so a rehearsal cannot
 //! disagree with `plan` about what a difference is.
 
+pub mod connected;
+
 use anyhow::Context as _;
 
 use pbps_db::Conn;
-use pbps_dialect::Dialect;
-use pbps_model::{Change, ChangeSet, IdsFile, Schema};
+use pbps_dialect::{Dialect, Statement};
+use pbps_model::{Change, ChangeSet, IdsFile, Schema, SessionZone};
 
 /// The state the plan's statements run on top of.
 pub enum Base<'a> {
     /// The git baseline, lowered from empty: what `plan --dev` previews.
     Baseline {
-        statements: &'a crate::emission::LoweredPlan,
+        statements: &'a [Statement],
         /// The identity mapping the baseline was built under, which names the
         /// objects the scratch database holds before the plan runs.
         ids: &'a IdsFile,
     },
+    /// The target's current managed model and declared rows, lowered from
+    /// empty by the same emitter: the base of a connected plan (#2379).
+    Target {
+        statements: &'a [Statement],
+        /// The identity mapping the plan was computed against on its base
+        /// side, which names what the scratch holds before the plan runs.
+        ids: &'a IdsFile,
+        /// The session the target's statements ran in, and so the scratch's.
+        execution: Execution<'a>,
+    },
+}
+
+/// How the statements are sent. `--dev` sends each as it is; a connected
+/// rehearsal sends them as `apply` does, so a statement that only fails
+/// inside the apply's transaction fails here too.
+#[derive(Clone, Copy)]
+pub struct Execution<'a> {
+    /// The target's session time zone, which every offset-less value the
+    /// statements write is read in (DEC-1916.1).
+    pub zone: &'a SessionZone,
+    /// Whether the plan's statements run in one transaction, as a staged
+    /// plan's do not. The base always does: it is a bootstrap.
+    pub transactional: bool,
 }
 
 impl<'a> Base<'a> {
-    fn statements(&self) -> &'a crate::emission::LoweredPlan {
+    fn statements(&self) -> &'a [Statement] {
         match self {
-            Base::Baseline { statements, .. } => statements,
+            Base::Baseline { statements, .. } | Base::Target { statements, .. } => statements,
         }
     }
 
     fn ids(&self) -> &'a IdsFile {
         match self {
-            Base::Baseline { ids, .. } => ids,
+            Base::Baseline { ids, .. } | Base::Target { ids, .. } => ids,
         }
     }
+
+    /// Whether the engine stores declared text in a spelling of its own, so
+    /// that the text of an object cannot decide whether it converged.
+    fn respells_text(&self) -> bool {
+        matches!(self, Base::Target { .. })
+    }
+
+    /// Whether roles are part of what the scratch is compared on.
+    fn compares_roles(&self) -> bool {
+        matches!(self, Base::Baseline { .. })
+    }
+
+    fn execution(&self) -> Option<Execution<'a>> {
+        match self {
+            Base::Baseline { .. } => None,
+            Base::Target { execution, .. } => Some(*execution),
+        }
+    }
+
+    /// Whether the declared rows still have to be asked of the engine. A
+    /// connected plan asked its target before it was computed, and its
+    /// declarations are already in the engine's own spelling.
+    fn asks_spelling(&self) -> bool {
+        matches!(self, Base::Baseline { .. })
+    }
+
+    fn words(&self) -> Words {
+        match self {
+            Base::Baseline { .. } => Words {
+                database: "the dev database",
+                base: "baseline",
+                broken: "The baseline itself does not compile, so nothing can be said about the plan.",
+                read: "cannot read the dev database back",
+                rows: "cannot read the declared rows back from the dev database",
+            },
+            Base::Target { .. } => Words {
+                database: "the rehearsal scratch",
+                base: "target's current state",
+                broken: "The target's current managed state does not compile on the scratch, so \
+                         nothing can be said about the plan.",
+                read: "cannot read the rehearsal scratch back",
+                rows: "cannot read the declared rows back from the rehearsal scratch",
+            },
+        }
+    }
+}
+
+/// What the messages call the base and the engine it ran on.
+struct Words {
+    database: &'static str,
+    base: &'static str,
+    broken: &'static str,
+    read: &'static str,
+    rows: &'static str,
+}
+
+/// Changes about who may do what: the cluster's principals, the privileges
+/// they hold, and the row-security policies that name them. A scratch server
+/// is shared and a rehearsal may touch nothing that is not its own, so they
+/// are left out of both the base and the plan, and out of the comparison
+/// (SPEC §9.3.1): a role created on a shared cluster outlives the run, and a
+/// grant or a policy naming a role the target holds and the scratch does not
+/// fails for a reason that says nothing about the plan.
+pub fn is_authorization(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::CreateRole { .. }
+            | Change::DropRole { .. }
+            | Change::RenameRole { .. }
+            | Change::Grant { .. }
+            | Change::Revoke { .. }
+            | Change::CreatePolicy { .. }
+            | Change::DropPolicy { .. }
+            | Change::SetRowSecurity { .. }
+    )
+}
+
+/// The statements of `lowered` that belong to a change about the database's
+/// own objects, in order. `operations` are the ordered plan's, which `lowered`
+/// was lowered from: a group names its operation, and an operation names the
+/// change it performs.
+pub fn local_statements(
+    lowered: &crate::emission::LoweredPlan,
+    operations: &pbps_model::operation::Operations,
+) -> Vec<Statement> {
+    let authorization: std::collections::BTreeSet<_> = operations
+        .iter()
+        .filter(|operation| is_authorization(operation.change()))
+        .map(pbps_model::operation::Operation::id)
+        .collect();
+    lowered
+        .groups()
+        .iter()
+        .filter(|group| !authorization.contains(&group.operation()))
+        .flat_map(|group| group.statements().iter().cloned())
+        .collect()
+}
+
+/// The statements that build `schema` from nothing, as `bootstrap` writes
+/// them, with the changes they were lowered from.
+///
+/// Reusing the differ rather than a second code path is what keeps a
+/// rehearsal a rehearsal of the real thing. The scheduler runs as bootstrap
+/// runs it (#1955): whichever passes an engine has for a plan built from
+/// nothing, the base gets.
+pub fn lower_from_empty<D: crate::emission::Engine>(
+    selected: &D,
+    schema: &Schema,
+    ids: &IdsFile,
+    hints: &pbps_model::Hints,
+) -> anyhow::Result<(
+    crate::emission::LoweredPlan,
+    pbps_model::operation::Operations,
+)> {
+    let dialect = selected.as_ref();
+    let build = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &IdsFile::default(),
+        },
+        pbps_diff::Side { schema, ids },
+        dialect,
+        // The base's own hints, from the revision it came from. The
+        // strategies in them are irrelevant here (nothing has rows yet), but
+        // `depends_on:` is the edge the identifier scan could not find — drop it
+        // and the rehearsal fails while compiling a base that was always
+        // valid, before it has said anything about the plan.
+        hints,
+    )
+    .map_err(|errs| {
+        anyhow::anyhow!(
+            "the baseline cannot be expressed: {} problem(s)",
+            errs.len()
+        )
+    })?;
+    // SQL Server has no passes of its own today.
+    let build = crate::dependents::schedule::schedule(
+        build,
+        &crate::dependents::schedule::Declarations {
+            schema,
+            sources: crate::dependents::Sources {
+                before: pbps_diff::Side {
+                    schema: &Schema::default(),
+                    ids: &IdsFile::default(),
+                },
+                after: ids,
+            },
+            module_deps: &hints.module_deps,
+        },
+        &crate::dependents::schedule::Facts::default(),
+        dialect,
+    )?
+    .changes;
+    let ordered = build.ordered(pbps_model::PlanMode::Transactional, dialect);
+    let lowered = crate::statements(&ordered, selected)?;
+    Ok((lowered, pbps_dialect::PlanPayload::operations(&ordered)))
 }
 
 /// What a rehearsal found.
@@ -72,7 +253,7 @@ impl Findings {
 pub async fn rehearse_in(
     conn: &mut Conn,
     base: Base<'_>,
-    plan: &crate::emission::LoweredPlan,
+    plan: &[Statement],
     declared: &Schema,
     declared_ids: &IdsFile,
     dialect: &dyn Dialect,
@@ -85,46 +266,79 @@ pub async fn rehearse_in(
     // Under the names the rehearsal database has: the base was built from the
     // *previous* revision, so a table or key column this plan renames is still
     // spelt the old way here too (DECISIONS 148).
-    let mut unasked = Vec::new();
-    let refused = crate::deploy::refuse_misspelt(
-        conn,
-        declared,
-        &crate::deploy::catalogued_as(declared, declared_ids, base.ids()),
-        &mut unasked,
-        false, // SQL Server-only; PostgreSQL is refused before connecting.
-    )
-    .await;
-    // Before the refusal, beside it, as the plan prints them (DEC-1726.1).
-    crate::deploy::warn_unasked(&unasked);
-    // What the rows are compared against: a date or time as the engine reads
-    // it, which is what the plan's statements stored (DEC-1883.1).
-    let declared = &refused?;
+    let mut declared = if base.asks_spelling() {
+        let mut unasked = Vec::new();
+        let refused = crate::deploy::refuse_misspelt(
+            conn,
+            declared,
+            &crate::deploy::catalogued_as(declared, declared_ids, base.ids()),
+            &mut unasked,
+            false, // SQL Server-only; PostgreSQL is refused before connecting.
+        )
+        .await;
+        // Before the refusal, beside it, as the plan prints them (DEC-1726.1).
+        crate::deploy::warn_unasked(&unasked);
+        // What the rows are compared against: a date or time as the engine reads
+        // it, which is what the plan's statements stored (DEC-1883.1).
+        refused?
+    } else {
+        declared.clone()
+    };
+    // The scratch holds no authorization (see `is_authorization`), so
+    // neither side of the comparison does: a role the declarations name is
+    // not a difference the plan failed to make.
+    let without_roles;
+    let declared_ids = if base.compares_roles() {
+        declared_ids
+    } else {
+        declared.roles.clear();
+        clear_row_security(&mut declared);
+        without_roles = {
+            let mut ids = declared_ids.clone();
+            ids.roles.clear();
+            ids
+        };
+        &without_roles
+    };
+    let declared = &declared;
+    let words = base.words();
 
     let build = base.statements();
-    for (i, stmt) in build.iter().enumerate() {
-        conn.execute(&stmt.sql).await.map_err(|e| {
-            anyhow::anyhow!(
-                "the dev database rejected statement {} of the baseline:\n{}\n\n{e}\n\n\
-                 The baseline itself does not compile, so nothing can be said about the plan.",
+    run_statements(
+        conn,
+        build,
+        base.execution().map(|e| (dialect, e.zone, true)),
+        |i, sql, e| {
+            Rejected::of(format!(
+                "{} rejected statement {} of the {}:\n{}\n\n{e}\n\n{}",
+                words.database,
                 i + 1,
-                stmt.sql
-            )
-        })?;
-    }
-    for (i, stmt) in plan.iter().enumerate() {
-        conn.execute(&stmt.sql).await.map_err(|e| {
-            anyhow::anyhow!(
-                "the dev database rejected statement {} of the plan:\n{}\n\n{e}\n\n\
+                words.base,
+                sql,
+                words.broken
+            ))
+        },
+    )
+    .await?;
+    run_statements(
+        conn,
+        plan,
+        base.execution().map(|e| (dialect, e.zone, e.transactional)),
+        |i, sql, e| {
+            Rejected::of(format!(
+                "{} rejected statement {} of the plan:\n{}\n\n{e}\n\n\
                  This plan would fail at apply time; nothing was changed anywhere real.",
+                words.database,
                 i + 1,
-                stmt.sql
-            )
-        })?;
-    }
+                sql
+            ))
+        },
+    )
+    .await?;
 
     let built = crate::engine::introspect(conn, crate::engine::Read::Snapshot)
         .await
-        .context("cannot read the dev database back")?;
+        .context(words.read)?;
     let modules: std::collections::BTreeSet<_> = declared.modules.keys().cloned().collect();
     let scoped = pbps_diff::scope(
         &built.schema,
@@ -157,34 +371,54 @@ pub async fn rehearse_in(
         .collect();
     let rows = crate::engine::read_rows(conn, &scoped.schema, &read, crate::engine::Read::Snapshot)
         .await
-        .context("cannot read the declared rows back from the dev database")?;
-    let engine = scoped
+        .context(words.rows)?;
+    let mut engine = scoped
         .schema
         .with_observed_rows(&rows, &declared_data, declared)?;
+    if !base.compares_roles() {
+        engine.roles.clear();
+        clear_row_security(&mut engine);
+    }
     // As `plan --db` compares it: a collation equal to this database's
     // default reads back as none (#1175).
     let declared_here =
         crate::deploy::declarations_as_compared(declared, built.database_collation.as_deref());
-    let remaining = pbps_diff::diff(
-        pbps_diff::Side {
-            schema: &engine,
-            ids: &observed,
-        },
-        pbps_diff::Side {
-            schema: &declared_here,
-            ids: declared_ids,
-        },
-        dialect,
-        hints,
-    )
-    .map_err(|errs| {
-        anyhow::anyhow!(
-            "the rehearsal produced {} inexpressible difference(s)",
-            errs.len()
+    let compare = |engine: &Schema| {
+        pbps_diff::diff(
+            pbps_diff::Side {
+                schema: engine,
+                ids: &observed,
+            },
+            pbps_diff::Side {
+                schema: &declared_here,
+                ids: declared_ids,
+            },
+            dialect,
+            hints,
         )
-    })?;
-
-    let (structural, spelling) = classify(&remaining, &engine);
+        .map_err(|errs| {
+            anyhow::anyhow!(
+                "the rehearsal produced {} inexpressible difference(s)",
+                errs.len()
+            )
+        })
+    };
+    let remaining = compare(&engine)?;
+    let (structural, spelling) = if base.respells_text() {
+        // PostgreSQL stores a check, a default, an index predicate and a
+        // module body as its parser deparses them, never as written, so a
+        // textual comparison finds a difference in nearly every declaration.
+        // What is structural is what remains once the declared text stands
+        // in for the stored one, as `plan --db` compares against the
+        // ledger's declared forms (ADR-0009 §2.2); the respelling itself is
+        // what the report prints (DEC-2379.2).
+        let declared_forms = pbps_model::Declared::from_schema(&declared_here).overlay(&engine);
+        let left = compare(&declared_forms)?;
+        let structural = classify(&left, &declared_forms).0;
+        (structural, respelt(&remaining, &engine))
+    } else {
+        classify(&remaining, &engine)
+    };
     Ok(Findings {
         built: build.len(),
         applied: plan.len(),
@@ -192,6 +426,122 @@ pub async fn rehearse_in(
         spelling,
         externals_staged: false,
     })
+}
+
+/// The engine refused one of the statements. Kept apart from the failures
+/// around it (a connection lost, a catalog unreadable), which say nothing
+/// about the plan: only this one refuses a plan for its own sake.
+#[derive(Debug)]
+pub struct Rejected(String);
+
+impl Rejected {
+    fn of(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn of_test(message: &str) -> Self {
+        Self(message.to_owned())
+    }
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// Sends `statements` in order. `framed` is the connected rehearsal's way:
+/// the dialect's session pins, then, when `transactional`, one transaction as
+/// `apply` opens it. `--dev` sends each statement as it is.
+async fn run_statements(
+    conn: &mut Conn,
+    statements: &[Statement],
+    framed: Option<(&dyn Dialect, &SessionZone, bool)>,
+    failed: impl Fn(usize, &str, &pbps_db::DbError) -> anyhow::Error,
+) -> anyhow::Result<()> {
+    let framing = framed.and_then(|(dialect, zone, transactional)| {
+        transactional.then(|| dialect.transaction_framing(zone))
+    });
+    if let Some((dialect, zone, _)) = framed
+        && let Some(pins) = dialect.session_pins(zone)
+    {
+        conn.execute(&pins)
+            .await
+            .context("cannot pin the rehearsal session")?;
+    }
+    if let Some(framing) = &framing {
+        conn.begin(framing)
+            .await
+            .context("cannot open the rehearsal's transaction")?;
+    }
+    for (i, statement) in statements.iter().enumerate() {
+        if let Err(e) = conn.execute(&statement.sql).await {
+            if let Some(framing) = &framing {
+                // Its own error must not replace the statement's.
+                let _ = conn.rollback(framing).await;
+            }
+            return Err(failed(i, &statement.sql, &e));
+        }
+    }
+    if let Some(framing) = &framing {
+        conn.commit(framing)
+            .await
+            .context("the rehearsal's transaction could not be committed")?;
+    }
+    Ok(())
+}
+
+/// A schema without the row security its tables declare: see
+/// [`is_authorization`].
+fn clear_row_security(schema: &mut Schema) {
+    for table in schema.tables.values_mut() {
+        table.row_security = Default::default();
+        table.row_policies.clear();
+    }
+}
+
+/// What the engine respelt: the declared text and the form it stored, for each
+/// object whose text differs and which is there. Only the engines that deparse
+/// what they store reach this; an object that is not there is not a respelling
+/// and is [`classify`]'s to report.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn respelt(remaining: &ChangeSet, engine: &Schema) -> Vec<String> {
+    let mut lines = classify(remaining, engine).1;
+    for planned in &remaining.changes {
+        match &planned.change {
+            Change::AlterModule { id, module, .. } => {
+                if let Some(stored) = engine.modules.get(id) {
+                    lines.push(format!(
+                        "{} {id}: declared `{}`, the engine stores `{}`",
+                        module.kind,
+                        module.definition.trim(),
+                        stored.definition.trim(),
+                        id = id.shown()
+                    ));
+                }
+            }
+            Change::AddIndex {
+                table, name, index, ..
+            } => {
+                if let Some(stored) = engine.tables.get(table).and_then(|t| t.indexes.get(name))
+                    && index.filter != stored.filter
+                {
+                    lines.push(format!(
+                        "index {name} on {table}: declared where `{}`, the engine stores `{}`",
+                        index.filter.as_deref().unwrap_or("(none)"),
+                        stored.filter.as_deref().unwrap_or("(none)"),
+                        name = name.shown(),
+                        table = table.shown(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    lines
 }
 
 /// Splits what is left over into "the plan is wrong" and "the engine spells it
@@ -418,5 +768,126 @@ mod tests {
         let (structural, spelling) = classify(&remaining, &Schema::default());
         assert_eq!(structural.len(), 1, "{structural:?}");
         assert!(spelling.is_empty(), "{spelling:?}");
+    }
+    fn index_on(table: &str, name: &str, filter: Option<&str>) -> pbps_model::Index {
+        let _ = (table, name);
+        pbps_model::Index {
+            columns: Vec::new(),
+            include: Vec::new(),
+            unique: false,
+            filter: filter.map(str::to_owned),
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        }
+    }
+
+    fn engine_with_index(filter: Option<&str>) -> Schema {
+        let mut engine = Schema::default();
+        let mut table = pbps_model::Table::default();
+        table
+            .indexes
+            .insert("ix".into(), index_on("app.t", "ix", filter));
+        engine.tables.insert("app.t".parse().unwrap(), table);
+        engine
+    }
+
+    fn adding_index(filter: Option<&str>) -> ChangeSet {
+        ChangeSet {
+            changes: vec![planned(Change::AddIndex {
+                table: "app.t".parse().unwrap(),
+                name: "ix".into(),
+                index: Box::new(index_on("app.t", "ix", filter)),
+                clustered: false,
+            })],
+        }
+    }
+
+    /// An engine that deparses what it stores respells a module body and an
+    /// index predicate; only an object that is there can be respelt.
+    #[test]
+    fn a_respelling_needs_the_object_to_be_there_and_the_text_to_differ() {
+        let remaining = adding_index(Some("note IS NOT NULL"));
+        let lines = respelt(&remaining, &engine_with_index(Some("(note IS NOT NULL)")));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("the engine stores `(note IS NOT NULL)`"),
+            "{lines:?}"
+        );
+        // Negative: the engine holds no such index, so nothing was respelt.
+        assert!(respelt(&remaining, &Schema::default()).is_empty());
+        // Negative: the same predicate is not a difference to report.
+        let same = respelt(&remaining, &engine_with_index(Some("note IS NOT NULL")));
+        assert!(same.is_empty(), "{same:?}");
+        // Negative: a module the engine lacks is the plan's failure, and
+        // `classify` reports it.
+        let module = ChangeSet {
+            changes: vec![planned(Change::AlterModule {
+                id: "app.v".parse().unwrap(),
+                module: Box::new(view("SELECT 1 AS one")),
+            })],
+        };
+        assert!(respelt(&module, &Schema::default()).is_empty());
+        let mut engine = Schema::default();
+        engine
+            .modules
+            .insert("app.v".parse().unwrap(), view("SELECT 1 AS one;"));
+        assert_eq!(respelt(&module, &engine).len(), 1);
+    }
+
+    /// The scratch is shared, so what a rehearsal may not create is exactly
+    /// the cluster's principals and the privileges they hold.
+    #[test]
+    fn only_changes_about_who_may_do_what_are_left_out_of_a_rehearsal() {
+        use pbps_model::{Uid, UidKind};
+        let role = || Uid::generate(UidKind::Role);
+        for change in [
+            Change::CreateRole {
+                uid: role(),
+                name: "r".into(),
+            },
+            Change::DropRole {
+                uid: role(),
+                name: "r".into(),
+                members: Vec::new(),
+            },
+            Change::RenameRole {
+                uid: role(),
+                from: "r".into(),
+                to: "s".into(),
+            },
+            Change::CreatePolicy {
+                table: "app.t".parse().unwrap(),
+                name: "p".into(),
+                policy: Default::default(),
+                origin: pbps_model::RowSecurityOrigin::Created,
+            },
+            Change::DropPolicy {
+                table: "app.t".parse().unwrap(),
+                name: "p".into(),
+                policy: Default::default(),
+            },
+            Change::SetRowSecurity {
+                uid: Uid::generate(UidKind::Table),
+                table: "app.t".parse().unwrap(),
+                from: Default::default(),
+                to: Default::default(),
+                origin: pbps_model::RowSecurityOrigin::Created,
+            },
+        ] {
+            assert!(is_authorization(&change), "{change:?}");
+        }
+        // Negative: the database's own objects are rehearsed.
+        for change in [
+            Change::DropColumn {
+                uid: "c_a1b2c3".parse().unwrap(),
+                column: "dbo.t.gone".parse().unwrap(),
+            },
+            Change::DropIndex {
+                table: "app.t".parse().unwrap(),
+                name: "ix".into(),
+            },
+        ] {
+            assert!(!is_authorization(&change), "{change:?}");
+        }
     }
 }

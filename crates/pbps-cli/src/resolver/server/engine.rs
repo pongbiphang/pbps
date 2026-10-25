@@ -300,6 +300,18 @@ impl Prepared {
             Self::Mssql(prepared) => prepared.scratch_catalog,
         }
     }
+    /// The session the scratch's statements run on: the reproduced
+    /// deployer's where the run made its own login, the checked connection
+    /// where the scratch account compiles as itself.
+    pub(super) fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        match self {
+            Self::Postgres(prepared) => match prepared.compile.as_mut() {
+                Some(compile) => compile,
+                None => admin,
+            },
+            Self::Mssql(_) => admin,
+        }
+    }
     pub(super) fn differences(&self) -> &[String] {
         match self {
             Self::Postgres(prepared) => &prepared.differences,

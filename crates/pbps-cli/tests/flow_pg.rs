@@ -1131,6 +1131,71 @@ fn old_server() -> String {
         .expect("PBPS_TEST_PG_OLD_DB is not set; see scripts/live-tests-pg.sh")
 }
 
+#[path = "support/rehearsal2379.rs"]
+mod rehearsal2379;
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_connected_plan_is_rehearsed_and_sealed_on_every_kind_of_scratch() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::converges(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn the_resolver_and_the_rehearsal_share_one_scratch() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::shares_one_scratch(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_default_postgresql_cannot_parse_is_refused_at_plan_time_by_the_rehearsal() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::refuses_the_ungrouped_default_of_issue_2312(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn both_rehearsal_switches_seal_a_plan_as_not_rehearsed() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::off_switches_seal_off(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_plan_with_no_scratch_entry_selected_carries_no_rehearsal() {
+    rehearsal2379::no_entry_no_record(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_supplied_scratch_database_is_empty_after_every_use() {
+    rehearsal2379::supplied_database_is_empty_after_each_use(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_rehearsal_stages_the_entrys_externals_and_compares_them_with_the_target() {
+    rehearsal2379::stages_and_compares_externals(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_rehearsal_creates_no_role_on_the_scratch_cluster() {
+    rehearsal2379::leaves_roles_and_grants_out(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_project_declaring_a_managed_type_is_refused_with_the_switch_named() {
+    rehearsal2379::managed_types_name_the_switch(&server());
+}
+
 #[test]
 #[ignore = "needs live postgres"]
 fn resolver_publishes_its_rechecked_plan_in_the_exact_order() {

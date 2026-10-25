@@ -116,6 +116,9 @@ pub fn offline(dialect: &str) {
             "--format",
             "json",
         ],
+        // The rehearsal switch belongs to a connected plan (#2379).
+        vec!["plan", "--no-rehearse", "--format", "json"],
+        vec!["plan", "--check", "--no-rehearse", "--format", "json"],
         vec![
             "plan",
             "--dev",
@@ -234,8 +237,19 @@ pub fn connected(server: &str, dialect: &str) {
         if let Some(cli) = cli {
             args.extend(["--resolve-with", cli]);
         }
-        args.extend(["--out", artifact.to_str().unwrap(), "--format", "json"]);
+        // The rehearsal is on by default and acquires the entry's scratch
+        // (#2379), which is what this case proves the *resolver* does not.
+        args.extend([
+            "--no-rehearse",
+            "--out",
+            artifact.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
         let value = report(successful(run(&d, &args, Some(connection))));
+        if dialect == "postgres" {
+            assert_eq!(value["data"]["rehearsal"]["outcome"], "off", "{value}");
+        }
         assert_eq!(value["result"], "ok");
         assert!(value["data"]["changes"].as_u64().unwrap() > 0, "{value}");
         let selected = &value["data"]["resolver_selection"];
@@ -264,14 +278,30 @@ pub fn connected(server: &str, dialect: &str) {
         assert!(saved.get("resolver_selection").is_none(), "{saved}");
         assert!(!saved.to_string().contains("PBPS_RESOLVER_UNSET_606"));
     }
+    if dialect == "postgres" {
+        // Negative: left on, the same plan acquires the entry's scratch, and
+        // here the entry's variable is not set.
+        let rehearsed = run(&d, &["plan", "--env", "prod"], Some(connection));
+        assert_ne!(
+            code(&rehearsed),
+            0,
+            "{}{}",
+            stdout(&rehearsed),
+            stderr(&rehearsed)
+        );
+        assert!(
+            stderr(&rehearsed).contains("PBPS_RESOLVER_UNSET_606, which is not set"),
+            "{}",
+            stderr(&rehearsed)
+        );
+    }
     let human = stdout(&successful(run(
         &d,
-        &["plan", "--env", "prod"],
+        &["plan", "--env", "prod", "--no-rehearse"],
         Some(connection),
     )));
     assert!(
-        human.contains("Resolver profile: scratch")
-            && human.contains("not needed, so not acquired"),
+        human.contains("Resolver profile: scratch") && human.contains("not needed for binding"),
         "{human}"
     );
     assert!(!key_file(&d).exists());
@@ -290,7 +320,7 @@ pub fn connected(server: &str, dialect: &str) {
     let output = Command::new(BIN)
         .arg("--project")
         .arg(&d.dir)
-        .args(["plan", "--env", "prod", "--format", "json"])
+        .args(["plan", "--env", "prod", "--no-rehearse", "--format", "json"])
         .env("PBPS_TARGET_606", connection)
         .env("PBPS_RESOLVER_UNSET_606", "resolver-secret-606")
         .output()

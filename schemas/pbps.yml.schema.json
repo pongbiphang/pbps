@@ -152,6 +152,13 @@
             "string",
             "null"
           ]
+        },
+        "rehearse": {
+          "description": "`false` turns the connected rehearsal off for this environment: a plan\ncomputed against it is then sealed as not rehearsed, never as\nrehearsed (#2379). The default is on whenever a scratch entry is\nselected, and `plan --no-rehearse` turns it off for one run.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

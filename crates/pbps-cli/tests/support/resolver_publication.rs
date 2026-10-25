@@ -572,15 +572,15 @@ fn successful(output: Output) -> Output {
 }
 
 /// A login confined to a database it owns on `server`, dropped with it.
-struct Confined {
+pub struct Confined {
     server: String,
     login: String,
     database: String,
-    connection: String,
+    pub connection: String,
 }
 
 impl Confined {
-    fn new(server: &str) -> Self {
+    pub fn new(server: &str) -> Self {
         let token = format!("{}_{:08x}", std::process::id(), rand::random::<u32>());
         let login = format!("pbps_cli_s1516_{token}");
         let database = format!("pbps_cli_s1516_{token}");

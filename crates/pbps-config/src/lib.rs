@@ -187,6 +187,13 @@ pub struct Environment {
     /// `fingerprint_key_env`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint_key_file: Option<PathBuf>,
+
+    /// `false` turns the connected rehearsal off for this environment: a plan
+    /// computed against it is then sealed as not rehearsed, never as
+    /// rehearsed (#2379). The default is on whenever a scratch entry is
+    /// selected, and `plan --no-rehearse` turns it off for one run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehearse: Option<bool>,
 }
 
 /// Where an environment's fingerprint key is read from. Keys are never shared
@@ -960,6 +967,7 @@ mod tests {
             resolve_with: None,
             fingerprint_key_env: None,
             fingerprint_key_file: None,
+            rehearse: None,
         };
         let err = env.connection_string("prod").unwrap_err();
         assert!(

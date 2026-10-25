@@ -28,6 +28,9 @@ use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 use crate::report::{placeholder, shell_arg};
 
 mod rehearsal;
+pub use rehearsal::{
+    RehearsalDetail, detail as rehearsal_detail, line as rehearsal_line, render as rehearsal_render,
+};
 mod resolver;
 use crate::{db, output, report};
 

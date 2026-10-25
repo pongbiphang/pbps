@@ -225,6 +225,12 @@ enum Command {
         #[arg(long, value_name = "PROFILE")]
         resolve_with: Option<String>,
 
+        /// Skip the rehearsal of a connected plan on the selected resolver's scratch,
+        /// and seal the plan as not rehearsed. Needs --db/--env; the same switch as
+        /// `rehearse: false` under an environment
+        #[arg(long)]
+        no_rehearse: bool,
+
         /// human (default) or json. With --db/--env, JSON reports change counts,
         /// connected checks and findings. --out writes the separate saved plan
         /// accepted by apply; inspect it with `pbps explain --plan`
@@ -1110,6 +1116,7 @@ fn run() -> anyhow::Result<()> {
             dev,
             no_dev,
             resolve_with,
+            no_rehearse,
             format,
         } => {
             // Every refusal below goes through the envelope, not `bail!`. These
@@ -1194,6 +1201,7 @@ fn run() -> anyhow::Result<()> {
                     staged,
                     json,
                     resolver_selection,
+                    no_rehearse,
                     &mut carried,
                 );
                 // A typed refusal already emitted its findings envelope. Only
@@ -1219,6 +1227,11 @@ fn run() -> anyhow::Result<()> {
             if resolve_with.is_some() {
                 refuse(
                     "--resolve-with selects a resolver for target planning; pass --db or --env. Offline previews and --check never use a resolver",
+                )?;
+            }
+            if no_rehearse {
+                refuse(
+                    "--no-rehearse turns off the rehearsal of a connected plan; pass --db or --env. Offline previews rehearse only with --dev, and --no-dev skips it",
                 )?;
             }
             if staged {
@@ -3658,6 +3671,10 @@ pub struct PlanData {
     /// is selected: that plan was never assessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_assessment: Option<resolution::ResolverAssessment>,
+    /// How the plan was rehearsed on a scratch engine, or that the rehearsal
+    /// was turned off (#2379). Absent when no scratch entry was configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rehearsal: Option<explain::RehearsalDetail>,
 }
 
 /// What an offline `plan` was asked to do.
@@ -4386,6 +4403,7 @@ fn cmd_plan(
                     cost: None,
                     resolver_selection: None,
                     resolver_assessment: None,
+                    rehearsal: None,
                 }),
             );
             // A non-converging rehearsal is an error finding, so `outcome` exits 2

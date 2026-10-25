@@ -129,56 +129,8 @@ pub fn rehearse<D: crate::emission::Engine>(
             dialect.name()
         );
     }
-    // Building the baseline is the same operation as `bootstrap`: the plan from
-    // nothing. Reusing the differ rather than a second code path is what keeps
-    // the rehearsal a rehearsal of the real thing.
-    let build = pbps_diff::diff(
-        pbps_diff::Side {
-            schema: &Schema::default(),
-            ids: &IdsFile::default(),
-        },
-        pbps_diff::Side {
-            schema: baseline,
-            ids: baseline_ids,
-        },
-        dialect,
-        // The baseline's own hints, from the revision it came from. The
-        // strategies in them are irrelevant here (nothing has rows yet), but
-        // `depends_on:` is the edge the identifier scan could not find — drop it
-        // and the rehearsal fails while compiling a baseline that was always
-        // valid, before it has said anything about the plan.
-        baseline_hints,
-    )
-    .map_err(|errs| {
-        anyhow::anyhow!(
-            "the baseline cannot be expressed: {} problem(s)",
-            errs.len()
-        )
-    })?;
-    // Through the schedule as bootstrap is (#1955): whichever passes an
-    // engine has for a plan built from nothing, the rehearsal's baseline gets.
-    // SQL Server has none today.
-    let build = crate::dependents::schedule::schedule(
-        build,
-        &crate::dependents::schedule::Declarations {
-            schema: baseline,
-            sources: crate::dependents::Sources {
-                before: pbps_diff::Side {
-                    schema: &Schema::default(),
-                    ids: &IdsFile::default(),
-                },
-                after: baseline_ids,
-            },
-            module_deps: &baseline_hints.module_deps,
-        },
-        &crate::dependents::schedule::Facts::default(),
-        dialect,
-    )?
-    .changes;
-    let build = crate::statements(
-        &build.ordered(pbps_model::PlanMode::Transactional, dialect),
-        selected,
-    )?;
+    let (build, _) =
+        crate::rehearsal::lower_from_empty(selected, baseline, baseline_ids, baseline_hints)?;
 
     let (source, externals) = match spec {
         Spec::Docker(image) => (
