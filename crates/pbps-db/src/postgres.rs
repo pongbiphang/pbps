@@ -238,6 +238,19 @@ impl Conn {
         Self::connect_as(connection_string, cfg!(target_os = "linux")).await
     }
 
+    /// [`connect`] with `application_name` given as a **startup parameter**,
+    /// which a pooler's `DISCARD ALL` does not clear (measured on 16 and 18,
+    /// #2410). A string that names its own `application_name` loses it: the
+    /// name is the run's identity among the live sessions.
+    pub(crate) async fn connect_named(
+        connection_string: &str,
+        application_name: &str,
+    ) -> Result<Self, DbError> {
+        let (mut config, defaulted) = Self::parse(connection_string)?;
+        config.application_name(application_name);
+        Self::connect_config(config, cfg!(target_os = "linux"), defaulted).await
+    }
+
     /// [`connect`]'s body, taking the platform as a parameter rather than
     /// reading `cfg!(target_os = "linux")` itself.
     ///

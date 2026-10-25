@@ -7,6 +7,7 @@ pub mod draft;
 pub mod environment;
 pub mod externals;
 pub mod reconstruct;
+pub mod recovery;
 pub mod scratch;
 pub mod standard;
 
@@ -282,16 +283,34 @@ pub async fn drop_scratch(
     conn: &mut impl ExecuteConnection,
     names: &ScratchNames,
 ) -> Result<(), DbError> {
-    let database = conn
-        .execute(&format!(
-            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
-            names.database()
-        ))
-        .await;
-    let login = conn
-        .execute(&format!("DROP ROLE IF EXISTS \"{}\"", names.login()))
-        .await;
+    let database = drop_database(conn, names.database(), true).await;
+    let login = drop_login(conn, names.login()).await;
     database.and(login)
+}
+
+/// Drops a run-owned database. `force` closes sessions still connected to
+/// it, which only the run that owns it may do; a later run removing a dead
+/// run's database does not, so that a session the engine still shows
+/// connected makes the drop fail, as a second guard behind the decision that
+/// the run is gone (`recovery`, #2410; measured on 16 and 18: `database is
+/// being accessed by other users`).
+pub async fn drop_database(
+    conn: &mut impl ExecuteConnection,
+    database: &str,
+    force: bool,
+) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "DROP DATABASE IF EXISTS \"{database}\"{}",
+        if force { " WITH (FORCE)" } else { "" }
+    ))
+    .await
+}
+
+/// Drops the run's login. It goes last: it is the record by which a later
+/// run finds what an interrupted release left (`recovery`).
+pub async fn drop_login(conn: &mut impl ExecuteConnection, login: &str) -> Result<(), DbError> {
+    conn.execute(&format!("DROP ROLE IF EXISTS \"{login}\""))
+        .await
 }
 
 // Version-dependent locale fields are projected by name from this one catalog

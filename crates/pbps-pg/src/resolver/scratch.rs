@@ -11,6 +11,23 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
 
+/// What the run's keeper session sets so the engine notices a client that
+/// vanished (#2410). `application_name` is the session's identity and is given
+/// at connection, where `DISCARD ALL` leaves it; these four are `SET`s, which
+/// `RESET ALL` and `DISCARD ALL` clear, so a session that runs either sends
+/// them again. A dead client's idle session is gone at once, a vanished
+/// host's after at most idle + interval x count seconds, and one that dies
+/// inside a long statement within the check interval.
+pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
+     SET tcp_keepalives_interval = 10; \
+     SET tcp_keepalives_count = 3; \
+     SET client_connection_check_interval = '10s'";
+
+/// Applies [`KEEPER_SETTINGS`], in one round trip.
+pub async fn keep(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(KEEPER_SETTINGS).await
+}
+
 /// The first OID a database assigns after initdb. Everything below it was
 /// created by initdb itself, in every database alike; anything at or above it
 /// was created afterwards, in this database or in the template it was cloned

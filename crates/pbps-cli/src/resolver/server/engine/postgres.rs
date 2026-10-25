@@ -13,10 +13,29 @@ use pbps_db::{Conn, Driver};
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::OutsideWrites;
 use pbps_pg::resolver::capture::{self, Managed, Paths, RecordedOwnership, StageError, Staged};
+use pbps_pg::resolver::recovery as record;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod recovery;
+#[cfg(test)]
+pub(in crate::resolver::server) use recovery::sweep_cluster_on;
+
+/// The two places a session's settings are reset, for the test that the
+/// keeper's survive them.
+#[cfg(test)]
+pub(in crate::resolver::server) async fn reset_for_test(session: &mut Conn) {
+    reset_settings(session, "the test").await.unwrap();
+}
+
+#[cfg(test)]
+pub(in crate::resolver::server) async fn externals_for_test(session: &mut Conn) {
+    run_externals(session, "SELECT 1", OutsideWrites::Refused)
+        .await
+        .unwrap();
+}
 
 /// Where the scratch session is relative to the target's. Each session marks
 /// itself, and the scratch session looks for both marks: one it can see is a
@@ -158,6 +177,9 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     /// next is read.
     externals: Option<&'a str>,
     provenance: &'a Provenance,
+    /// The run's token: in every name it creates, and on the session that
+    /// stays open for the run (#2410).
+    token: String,
     created: Created,
 }
 
@@ -208,10 +230,11 @@ impl Scratch<'_> {
         };
         let recipe = scope::recipe(driver, target_catalog)
             .map_err(|error| Error::Scope(error.to_string()))?;
-        let names = super::super::generated_names()?;
+        // Every name carries the run's token, so a later run can find what
+        // this one leaves if it is killed (#2410).
+        let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
-        let token = login[login.len().saturating_sub(16)..].to_owned();
-        let map = scope::Principals::generate(authorization, &request.planned, &login, &token);
+        let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
         // Recorded before anything is created, so a failure part-way still
         // drops what was made.
         self.created = Created::RunOwned {
@@ -380,6 +403,25 @@ impl Scratch<'_> {
         };
         let map =
             scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
+        // The first object the run creates here, and its record: who it is,
+        // and the state its release puts back. A run killed after this is
+        // found and cleaned by the next one (`recovery`, #2410); two runs
+        // that start together cannot both make it.
+        record::claim(
+            admin,
+            &record::Claim::new(&self.token, defaults.clone(), acl.clone()),
+        )
+        .await
+        .map_err(|error| match error {
+            record::ClaimError::Taken => Error::Unusable(
+                "another run claimed the scratch database first; wait for it to finish, or \
+                 use another scratch database"
+                    .into(),
+            ),
+            record::ClaimError::Db(error) => {
+                Error::Read(format!("the scratch database's claim: {error}"))
+            }
+        })?;
         // Every write, the cleanup included, goes through the connection the
         // checks were made on. Another connection from the same string need
         // not reach the same server: a name may resolve to several hosts or a
@@ -522,20 +564,7 @@ impl Scratch<'_> {
         match std::mem::replace(&mut self.created, Created::Nothing) {
             Created::Nothing => Ok(()),
             Created::RunOwned { names, roles } => {
-                let mut remaining = Vec::new();
-                if pbps_pg::resolver::drop_scratch(admin, &names)
-                    .await
-                    .is_err()
-                {
-                    remaining.push(format!("database {}", names.database()));
-                    remaining.push(format!("role {}", names.login()));
-                }
-                remaining.extend(
-                    pbps_pg::resolver::drop_roles(admin, &roles)
-                        .await
-                        .into_iter()
-                        .map(|role| format!("role {}", role.shown())),
-                );
+                let remaining = release_run_owned(admin, &names, &roles).await;
                 if remaining.is_empty() {
                     Ok(())
                 } else {
@@ -559,6 +588,41 @@ impl Scratch<'_> {
             }
         }
     }
+}
+
+/// Drops a run-owned run's database, run-local roles and login, in that order,
+/// and names what is left. The login is the run's record (`recovery`): it
+/// goes last, and stays while anything it names does, so that a later run
+/// still finds what is left.
+pub(in crate::resolver::server) async fn release_run_owned(
+    admin: &mut Conn,
+    names: &ScratchNames,
+    roles: &[pbps_model::RoleName],
+) -> Vec<String> {
+    let mut remaining = Vec::new();
+    if pbps_pg::resolver::drop_database(admin, names.database(), true)
+        .await
+        .is_err()
+    {
+        remaining.push(format!("database {}", names.database()));
+    }
+    remaining.extend(
+        pbps_pg::resolver::drop_roles(admin, roles)
+            .await
+            .into_iter()
+            .map(|role| format!("role {}", role.shown())),
+    );
+    if remaining.is_empty() {
+        if pbps_pg::resolver::drop_login(admin, names.login())
+            .await
+            .is_err()
+        {
+            remaining.push(format!("role {}", names.login()));
+        }
+    } else {
+        remaining.push(format!("role {}", names.login()));
+    }
+    remaining
 }
 
 /// Empties the supplied database and puts it back into its standard state,
@@ -919,6 +983,8 @@ async fn reset_settings(session: &mut Conn, which: &str) -> Result<(), Error> {
             .await
             .map_err(|error| Error::Read(format!("{which}'s settings: {error}")))?;
     }
+    // `RESET ALL` took the keeper's settings too (`sql::keep`).
+    keep_alive(session).await?;
     Ok(())
 }
 
@@ -1128,6 +1194,8 @@ async fn run_externals(
         .execute("SET search_path = ''")
         .await
         .map_err(read("the externals file session's path"))?;
+    // The discard took the keeper's settings too (`sql::keep`).
+    keep_alive(session).await?;
     Ok(())
 }
 
@@ -1402,6 +1470,7 @@ pub(super) async fn scratch<'a>(
             standard,
             externals,
             provenance,
+            token: tokens.scratch.clone(),
             created: Created::Nothing,
         },
     ))
@@ -1423,10 +1492,12 @@ impl Scratch<'_> {
     ) -> Result<Prepared, Error> {
         match provisioning {
             Provisioning::RunOwned => {
+                self.sweep_cluster(admin).await;
                 self.run_owned(admin, target_catalog, authorization, scope_schemas, fill)
                     .await
             }
             Provisioning::Supplied => {
+                self.recover_supplied(admin).await?;
                 self.supplied(admin, authorization, scope_schemas, fill)
                     .await
             }
@@ -1836,6 +1907,21 @@ impl Binding {
         pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
             .map_err(|error| Error::Binding(error.to_string()))
     }
+}
+
+/// The keeper's settings on a session whose `RESET ALL` or `DISCARD ALL` took
+/// them (`sql::keep`).
+async fn keep_alive(session: &mut Conn) -> Result<(), Error> {
+    sql::keep(session)
+        .await
+        .map_err(|error| Error::Read(format!("the session's keepalive settings: {error}")))
+}
+
+/// Makes the scratch session the run's keeper (#2410).
+pub(super) async fn keep(admin: &mut Conn) -> Result<(), ProduceError> {
+    sql::keep(admin)
+        .await
+        .map_err(|error| unusable(format!("the scratch session's keepalive settings: {error}")))
 }
 
 pub(super) async fn reset_role(admin: &mut Conn) -> Result<(), ProduceError> {

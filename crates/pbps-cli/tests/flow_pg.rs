@@ -1096,6 +1096,33 @@ fn a_required_resolver_refuses_by_class_and_keeps_existing_files() {
     resolver_selection::required(&server(), "postgres");
 }
 
+#[path = "support/recovery2410.rs"]
+mod recovery2410;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_run_owned_run_killed_after_creating_its_database_is_recovered_by_the_next_run() {
+    recovery2410::run_owned_after_creation(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_run_owned_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
+    recovery2410::run_owned_during_use(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_supplied_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
+    recovery2410::supplied_during_use(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_supplied_database_a_live_run_holds_is_refused_and_left_alone() {
+    recovery2410::supplied_held_by_a_live_run(&server());
+}
+
 #[path = "support/resolver_publication.rs"]
 mod resolver_publication;
 

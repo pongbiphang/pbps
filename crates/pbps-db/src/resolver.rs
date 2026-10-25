@@ -67,6 +67,26 @@ impl ScratchNames {
         })
     }
 
+    /// The names a run creates, each carrying the run's token (#2410). The
+    /// token is what ties a leftover database to its login and roles, and
+    /// what a later run looks for among the live sessions to learn that the
+    /// run is gone, so no generated name omits it. `token` is the run's 32
+    /// lowercase hexadecimal digits.
+    pub fn for_run(token: &str, password: String) -> Result<Self, UnsupportedScratchName> {
+        if token.len() != 32
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(UnsupportedScratchName);
+        }
+        Self::new(
+            format!("pbps_scratch_{token}"),
+            format!("pbps_run_{token}"),
+            password,
+        )
+    }
+
     pub fn database(&self) -> &str {
         &self.database
     }
@@ -210,6 +230,26 @@ mod tests {
             "private-input-handling",
         ] {
             assert!(!discovery.qualification.contains_key(removed), "{removed}");
+        }
+    }
+
+    #[test]
+    fn a_run_names_every_resource_with_its_token_and_nothing_else_is_a_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let names = ScratchNames::for_run(token, "0".repeat(32)).unwrap();
+        assert_eq!(names.database(), format!("pbps_scratch_{token}"));
+        assert_eq!(names.login(), format!("pbps_run_{token}"));
+        // The database and the login are linked by the token alone: that is
+        // what lets a later run remove the one it finds beside the other.
+        assert!(names.database().ends_with(&names.login()[9..]));
+        for bad in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert!(ScratchNames::for_run(bad, "0".repeat(32)).is_err(), "{bad}");
         }
     }
 

@@ -3210,6 +3210,48 @@ pub(crate) fn catalogued_as(
 
 /// Prints what [`refuse_misspelt`] could not ask, for a command whose
 /// warnings go to stderr.
+/// The sweeps this command made for scratch that killed runs left (#2410),
+/// as the findings the JSON envelope carries: a note for what was removed, a
+/// warning with the removing statement for what was not.
+fn recovery_findings() -> Vec<crate::output::Finding> {
+    let collected = pbps_cli::resolver::server::scratch::recovery::take();
+    let mut findings = Vec::new();
+    for why in collected.unread {
+        findings.push(crate::output::Finding::warning(
+            "scratch.leftovers-unread",
+            format!("scratch left by earlier runs could not be looked for: {why}"),
+        ));
+    }
+    for group in collected.groups {
+        for resource in &group.removed {
+            findings.push(crate::output::Finding::note(
+                "scratch.recovered",
+                format!(
+                    "removed {} {}, left by run {} which ended without cleaning up",
+                    resource.kind,
+                    resource.names.join(", "),
+                    group.token
+                ),
+            ));
+        }
+        for kept in group.kept {
+            let mut finding = crate::output::Finding::warning(
+                "scratch.leftover",
+                format!(
+                    "{} {} left by run {} was not removed: {}",
+                    kept.resource.kind,
+                    kept.resource.names.join(", "),
+                    group.token,
+                    kept.why
+                ),
+            );
+            finding.remedy = Some(kept.statement);
+            findings.push(finding);
+        }
+    }
+    findings
+}
+
 pub(crate) fn warn_unasked(unasked: &[String]) {
     for w in unasked {
         eprintln!("warning: {}", w);
@@ -8194,6 +8236,7 @@ pub fn cmd_plan_db(
             );
         }
         if json {
+            let findings = findings.into_iter().chain(recovery_findings()).collect();
             return crate::output::Report::new("plan", findings, Some(data)).emit_json();
         }
         Ok(())
