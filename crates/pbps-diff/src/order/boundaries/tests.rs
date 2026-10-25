@@ -277,3 +277,84 @@ fn appending_a_step_retains_boundary_event_ids_and_requires_new_discharge() {
         .unwrap();
     assert!(plan::canonical(p, &pbps_dialect::MinimalDialect).is_ok());
 }
+
+#[test]
+fn only_a_parent_whose_columns_change_beside_its_members_is_read() {
+    use pbps_model::{Column, IdsFile, PartitionBound, PartitionBy, PartitionOf, Schema, Table};
+    let side = |member: bool| {
+        let (p, a): (TableName, TableName) = ("app.p".parse().unwrap(), "app.a".parse().unwrap());
+        let mut parent = Table {
+            partition_by: Some(PartitionBy {
+                strategy: Default::default(),
+                columns: vec!["d".into()],
+                external: false,
+            }),
+            ..Default::default()
+        };
+        parent
+            .columns
+            .insert("d".into(), Column::new("integer".parse().unwrap()));
+        let child = Table {
+            partition_of: member.then(|| PartitionOf {
+                parent: p.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), p.clone());
+        ids.tables.insert("t_bbbbbb".parse().unwrap(), a.clone());
+        ids.columns
+            .insert("c_aaaaaa".parse().unwrap(), p.column("d"));
+        let mut schema = Schema::default();
+        schema.tables.extend([(p, parent), (a, child)]);
+        (schema, ids)
+    };
+    let attach = |column_change: bool| {
+        let mut changes = vec![Change::AttachPartition {
+            uid: "t_bbbbbb".parse().unwrap(),
+            table: "app.a".parse().unwrap(),
+            parent: "app.p".parse().unwrap(),
+            bound: PartitionBound::Default,
+            key: Default::default(),
+            shape: Box::default(),
+        }];
+        if column_change {
+            changes.push(Change::AlterColumnDefault {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "app.p.d".parse().unwrap(),
+                from: None,
+                to: Some("1".into()),
+            });
+        }
+        ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        }
+    };
+    let ((b, b_ids), (a, a_ids)) = (side(false), side(true));
+    let (before, after) = (
+        crate::Side {
+            schema: &b,
+            ids: &b_ids,
+        },
+        crate::Side {
+            schema: &a,
+            ids: &a_ids,
+        },
+    );
+    let read = |changes: &ChangeSet, before, after| catalog_tables(changes, before, after);
+    let tables: Vec<_> = read(&attach(true), before, after)
+        .into_iter()
+        .map(|u| u.to_string())
+        .collect();
+    assert_eq!(tables, ["t_aaaaaa", "t_bbbbbb"]);
+    // A move alone, and columns alone, read nothing.
+    assert!(read(&attach(false), before, after).is_empty());
+    let (still, still_ids) = side(true);
+    let held = crate::Side {
+        schema: &still,
+        ids: &still_ids,
+    };
+    assert!(read(&attach(true), held, held).is_empty());
+}

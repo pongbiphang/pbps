@@ -2329,6 +2329,15 @@ impl Dialect for Postgres {
         true
     }
 
+    fn symbolic_facts(
+        &self,
+        before: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
+        stored: &pbps_model::operation::MembershipCatalog,
+    ) -> pbps_model::operation::symbolic::Facts {
+        engine_effects::facts::of(self, stored, before, after)
+    }
+
     /// What PostgreSQL's catalog does beyond the portable effects
     /// (DEC-1954.3):
     ///

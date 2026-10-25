@@ -8593,3 +8593,24 @@ admitted: the PostgreSQL 16/18 rename-handover control keeps `a_key` and
 guards stay unchanged (DEC-1558.1). Pinned by
 `a_detach_refuses_owned_non_clones_at_its_requested_clone_name` and
 `a_detach_admits_its_exact_retained_clones_and_internal_exchanges`.
+
+<a id="dec-2296-3"></a>
+
+**DEC-2296.3. A child's physical column is a lineage query, and stored column
+facts travel in the schedule's facts.** Which column of a partition carries a
+parent's column is a question about two snapshots. `operation::Lineage` answers
+it by UID for every family that gains or loses a member: the child's role at
+each end, the parent's name for each column at each end, the physical column
+(a member's inherited slot, or a standalone's own recorded column found under
+the name the parent gives it at either end), and the reverse claim, which two
+parent columns on one physical column void. It is the only constructor of
+inherited column slots; facts, movements and projections read it and never
+match names again. It describes both ends, prefers none, and orders nothing.
+What the connected seam read of the baseline's stored columns (the DEFAULT text
+and what it binds, a NOT NULL of its own) is a `MembershipCatalog` carried by
+`schedule::Facts::with_membership_catalog`, read by `references` in the
+dependency reader in the same call and transaction as the module dependents,
+and only for a plan that moves a partition while changing its parent's
+columns. It is not a field of the dialect or the engine. A default whose
+references the facts cannot represent is unrepresented, never an empty
+binding set. No guard, plan byte, saved field or wire version changes.

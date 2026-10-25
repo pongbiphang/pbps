@@ -1227,6 +1227,10 @@ mod slots;
 pub use slots::{Address, NameKind, Named, Names, baseline_names, names};
 
 mod effects;
+mod lineage;
+pub use lineage::{End, Family, Lineage, Physical, Standing};
+mod stored;
+pub use stored::{MembershipCatalog, StoredColumn};
 pub mod symbolic;
 pub use effects::{
     BaseTable, BoundInput, Effects, ForeignKeyBinding, Requirement, Resource, Snapshot, base_table,

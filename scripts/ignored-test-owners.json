@@ -1526,6 +1526,7 @@
         "dependencies_tests::outgoing_foreign_keys_keep_undeclared_candidate_keys_as_binding_evidence",
         "dependencies_tests::an_undeclared_primary_key_in_the_rebuilt_tree_is_refused",
         "dependencies_tests::publication_modes_missing_trees_and_unreadable_catalogs_are_named",
+        "dependencies_tests::references_sort_what_a_stored_default_binds_and_what_the_facts_cannot_hold",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "a_backfilled_literal_is_compared_through_its_columns_type",
         "a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting",

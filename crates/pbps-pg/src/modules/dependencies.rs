@@ -6,7 +6,8 @@ use pbps_diff::{
     Side,
     order::catalog::{Holds, Part, graph::*},
 };
-use pbps_model::{ModuleId, ObjectName, TableName, escape::Escaped};
+use pbps_model::operation::{MembershipCatalog, Snapshot, StoredColumn};
+use pbps_model::{ModuleId, ObjectName, TableName, Uid, escape::Escaped};
 use serde::Deserialize;
 
 fn object(catalog: &str, id: u64, attribute: i32) -> Object {
@@ -526,6 +527,186 @@ async fn read(
     out.publications = Fact::Present(publications);
     Ok(out)
 }
+
+/// What the stored DEFAULT of each column of `tables` binds, and whether a
+/// column holds a NOT NULL of its own: the references of the nodes `collect`
+/// reaches as dependents, read in the opposite direction and from the same
+/// catalog classes. This is the connected half of a membership boundary's
+/// facts; it executes no input expression and grants no admission. A column
+/// whose default binds anything the facts cannot represent says so
+/// (`unrepresented`), which is never an empty binding set.
+pub async fn references(
+    conn: &mut Conn,
+    before: Snapshot<'_>,
+    tables: &BTreeSet<Uid>,
+) -> Result<MembershipCatalog, DbError> {
+    super::require_the_callers_transaction(conn).await?;
+    conn.query(super::CANONICAL_PATH).await?;
+    let mut found = MembershipCatalog::default();
+    for uid in tables {
+        let table = before.ids.tables.get(uid).ok_or_else(|| {
+            DbError::Refused(format!(
+                "{uid}: membership catalog table is absent from the baseline"
+            ))
+        })?;
+        let rows = conn
+            .query_with(
+                STORED_COLUMNS,
+                &[Param::Str(&table.schema), Param::Str(&table.name)],
+            )
+            .await?;
+        for row in rows {
+            let missing = |what: &str| DbError::BadRow(format!("membership column {what}"));
+            let name = row
+                .try_get::<&str>("attname")?
+                .ok_or_else(|| missing("name"))?;
+            let default = row
+                .try_get::<i64>("default_id")?
+                .ok_or_else(|| missing("default"))?;
+            let mut column = StoredColumn {
+                default: row.try_get::<&str>("definition")?.map(str::to_owned),
+                local_not_null: row
+                    .try_get::<bool>("local_not_null")?
+                    .ok_or_else(|| missing("local NOT NULL"))?,
+                ..Default::default()
+            };
+            if default != 0 {
+                let own = row
+                    .try_get::<i64>("table_id")?
+                    .ok_or_else(|| missing("table"))?;
+                bound_by(
+                    conn,
+                    &mut column,
+                    object("pg_attrdef", default as u64, 0),
+                    own as u64,
+                )
+                .await?;
+            }
+            found.columns.insert(table.column(name), column);
+        }
+    }
+    Ok(found)
+}
+
+/// Sorts the references of one default into what the facts represent: a
+/// routine, an owned sequence, a column of the same table; anything else
+/// through a normal dependency, of any catalog, is unrepresented.
+async fn bound_by(
+    conn: &mut Conn,
+    column: &mut StoredColumn,
+    default: Object,
+    table: u64,
+) -> Result<(), DbError> {
+    for edge in references_of(conn, &default).await? {
+        let (catalog, id, attribute, normal) = edge;
+        match (catalog.as_str(), attribute) {
+            ("pg_proc", _) => {
+                let m = meta(conn, &object("pg_proc", id, 0)).await?;
+                let args: Result<Vec<_>, _> = m.args.iter().map(|a| a.parse()).collect();
+                match args {
+                    Ok(args) if m.kind == "routine" => {
+                        column
+                            .routines
+                            .insert(ModuleId::Routine(pbps_model::RoutineId::new(
+                                ObjectName::new(&m.schema, &m.name),
+                                args,
+                            )));
+                    }
+                    Ok(_) | Err(_) => column.unrepresented |= normal,
+                }
+            }
+            ("pg_class", 0) => {
+                let owner = conn
+                    .query_with(SEQUENCE_OWNER, &[Param::I64(id as i64)])
+                    .await?;
+                let owner = owner.first().ok_or_else(|| super::vanished(id as i64))?;
+                let field = |key| owner.try_get::<&str>(key);
+                match (
+                    field("kind")?,
+                    field("owner_schema")?,
+                    field("owner_table")?,
+                    field("owner_column")?,
+                ) {
+                    (Some("S"), Some(schema), Some(table), Some(name)) => {
+                        column
+                            .sequences
+                            .insert(TableName::new(schema, table).column(name));
+                    }
+                    (..) => column.unrepresented |= normal,
+                }
+            }
+            ("pg_class", _) => column.unrepresented |= normal && id != table,
+            // An operator, type, collation or anything else a default
+            // depends on normally is bound by something the facts do not
+            // hold: dropping it would read as a smaller binding set.
+            _ => column.unrepresented |= normal,
+        }
+    }
+    Ok(())
+}
+
+/// The mirror of `EDGES`: what `from` depends on. Each row is the referenced
+/// catalog, OID, attribute, and whether the dependency is a normal one.
+async fn references_of(
+    conn: &mut Conn,
+    from: &Object,
+) -> Result<Vec<(String, u64, i32, bool)>, DbError> {
+    let rows = conn
+        .query_with(
+            REFERENCES,
+            &[
+                Param::Str(&from.catalog),
+                Param::I64(from.id as i64),
+                Param::I32(from.attribute),
+            ],
+        )
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let field = |what: &str| DbError::BadRow(format!("missing referenced {what}"));
+            Ok((
+                row.try_get::<&str>("catalog")?
+                    .ok_or_else(|| field("catalog"))?
+                    .to_owned(),
+                row.try_get::<i64>("id")?.ok_or_else(|| field("OID"))? as u64,
+                row.try_get::<i32>("attribute")?
+                    .ok_or_else(|| field("attribute"))?,
+                row.try_get::<&str>("kind")?
+                    .ok_or_else(|| field("category"))?
+                    == "n",
+            ))
+        })
+        .collect()
+}
+
+async fn meta(conn: &mut Conn, of: &Object) -> Result<Meta, DbError> {
+    let rows = conn
+        .query_with(
+            METADATA,
+            &[
+                Param::Str(&of.catalog),
+                Param::I64(of.id as i64),
+                Param::I32(of.attribute),
+            ],
+        )
+        .await?;
+    let json = rows
+        .first()
+        .and_then(|r| r.try_get::<&str>("meta").transpose())
+        .transpose()?
+        .ok_or_else(|| super::vanished(of.id as i64))?;
+    serde_json::from_str(json).map_err(|e| DbError::BadRow(format!("dependency metadata: {e}")))
+}
+
+const REFERENCES: &str = "SELECT c.relname::text AS catalog, d.refobjid::int8 AS id, d.refobjsubid AS attribute, d.deptype::text AS kind FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid=d.refclassid WHERE d.classid=pg_catalog.to_regclass('pg_catalog.' || $1) AND d.objid=$2::int8::oid AND d.objsubid=$3";
+
+// A sequence is owned when an automatic or internal dependency ties it to a
+// column; a relation of another kind, or an unowned sequence, has no owner row.
+const SEQUENCE_OWNER: &str = "SELECT s.relkind::text AS kind, n.nspname::text AS owner_schema, o.relname::text AS owner_table, a.attname::text AS owner_column FROM pg_catalog.pg_class s LEFT JOIN pg_catalog.pg_depend own ON own.classid='pg_catalog.pg_class'::regclass AND own.objid=s.oid AND own.refclassid='pg_catalog.pg_class'::regclass AND own.deptype IN ('a','i') AND own.refobjsubid>0 LEFT JOIN pg_catalog.pg_class o ON o.oid=own.refobjid LEFT JOIN pg_catalog.pg_namespace n ON n.oid=o.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=o.oid AND a.attnum=own.refobjsubid WHERE s.oid=$1::int8::oid";
+
+// The convenience views omit what is not a plain column; read the base catalogs.
+// conislocal exists on every version; contype 'n' rows exist from PostgreSQL 18.
+const STORED_COLUMNS: &str = "SELECT a.attname::text AS attname, pg_catalog.pg_get_expr(ad.adbin,ad.adrelid) AS definition, COALESCE(ad.oid,0)::int8 AS default_id, t.oid::int8 AS table_id, EXISTS(SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conrelid=t.oid AND k.contype='n' AND a.attnum=ANY(k.conkey) AND k.conislocal) AS local_not_null FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=t.oid AND ad.adnum=a.attnum WHERE n.nspname=$1 AND t.relname=$2 ORDER BY a.attnum";
 
 const EDGES: &str = "SELECT c.relname::text AS catalog, d.objid::int8 AS id, d.objsubid AS attribute, d.deptype::text AS kind FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid=d.classid WHERE d.refclassid=pg_catalog.to_regclass('pg_catalog.' || $1) AND d.refobjid=$2::int8::oid AND d.refobjsubid=$3";
 
