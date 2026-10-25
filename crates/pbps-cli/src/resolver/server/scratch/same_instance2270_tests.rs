@@ -24,7 +24,7 @@ async fn file_case(file: &'static str) {
         assert!(matches!(&missing, ProduceError::Run(Error::Unusable(reason)) if reason.contains("same_instance runtime")), "{missing}");
         let allowed = Box::pin(refusal_policy_inner(&target, &scratch, Some(file), &policy(SameInstance::Allowed))).await;
         if file.is_empty() {
-            assert!(matches!(&allowed, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2238")), "{allowed}");
+            assert!(matches!(&allowed, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2143")), "{allowed}");
         } else {
             assert!(matches!(&allowed, ProduceError::Run(Error::Externals(reasons)) if reasons.iter().any(|r| r.contains("file-ran-2270"))), "{allowed}");
         }

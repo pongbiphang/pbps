@@ -136,6 +136,28 @@ async fn refusal_policy_inner(
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> ProduceError {
+    declared_refusal(target, scratch, &Declared::default(), externals, provenance).await
+}
+
+/// The managed declarations a run is asked about: what the target holds as
+/// managed, and what the plan makes of it.
+#[derive(Default)]
+struct Declared {
+    base: Schema,
+    desired: Schema,
+}
+
+/// Every run here ends in an error: until planning from evidence exists
+/// (#2143) the run stops at the first step that needs it, so reaching that
+/// boundary is the proof that everything before it, the compile and both
+/// captures included, succeeded.
+async fn declared_refusal(
+    target: &str,
+    scratch: &str,
+    declared: &Declared,
+    externals: Option<&str>,
+    provenance: &Provenance,
+) -> ProduceError {
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
@@ -144,15 +166,42 @@ async fn refusal_policy_inner(
     let path = key.project.root.join("pbps.yml");
     std::fs::write(&path, config).unwrap();
     key.project.config = pbps_config::Config::parse(config, &path).unwrap();
-    let schema = Schema::default();
-    let ids = IdsFile::default();
-    let side = pbps_diff::Side {
-        schema: &schema,
-        ids: &ids,
+    let ids = |schema: &Schema| {
+        pbps_diff::resolve(
+            schema,
+            &IdsFile::default(),
+            &[],
+            &pbps_diff::Context {
+                operator: "resolver-live-tests".into(),
+                today: "2026-10-25".into(),
+            },
+        )
+        .unwrap()
+        .ids
     };
-    let bootstrap =
-        pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
-            .expect("an empty SQL Server schema has an empty ordinary plan");
+    let (base_ids, desired_ids) = (ids(&declared.base), ids(&declared.desired));
+    let nothing = (Schema::default(), IdsFile::default());
+    let base = pbps_diff::Side {
+        schema: &declared.base,
+        ids: &base_ids,
+    };
+    let desired = pbps_diff::Side {
+        schema: &declared.desired,
+        ids: &desired_ids,
+    };
+    // As the planner forms it: the differ's plan from nothing to the
+    // declarations, which may name a function a computed column calls
+    // before it exists (`ordinary` refuses that, and is not the bootstrap).
+    let bootstrap = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &nothing.0,
+            ids: &nothing.1,
+        },
+        desired,
+        &pbps_mssql::Mssql,
+        &Hints::default(),
+    )
+    .expect("the declared schema has a bootstrap plan");
     match super::produce_unsealed(
         Driver::Mssql,
         scratch,
@@ -161,11 +210,11 @@ async fn refusal_policy_inner(
         &BindingRequest {
             dependencies: &Default::default(),
             bootstrap: &bootstrap,
-            base: &schema,
-            desired: &schema,
+            base: &declared.base,
+            desired: &declared.desired,
         },
-        side,
-        side,
+        base,
+        desired,
         &Hints::default(),
         &[],
         &key.project,
@@ -177,7 +226,7 @@ async fn refusal_policy_inner(
     .await
     {
         Err(error) => error,
-        Ok(_) => panic!("SQL Server must refuse at the #2238 reconstruction boundary"),
+        Ok(_) => panic!("SQL Server must refuse where planning from evidence begins (#2143)"),
     }
 }
 
@@ -329,7 +378,7 @@ async fn supplied_contract(target: &str, server: &str) {
     assert!(
         matches!(
             positive,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
         ),
         "{positive}"
     );
@@ -343,7 +392,7 @@ async fn supplied_contract(target: &str, server: &str) {
     assert!(
         matches!(
             full_recovery,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
         ),
         "{full_recovery}"
     );
@@ -428,7 +477,7 @@ async fn mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract() {
             let owned=refusal(&target_for_run,url).await;
             assert!(matches!(
             owned,
-            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")
+            ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")
         ),"{owned}");
             supplied_contract(&target_for_run, url).await;
             inherited_model_refusal(&target_for_run,url).await;
@@ -467,7 +516,7 @@ async fn mssql_run_owned_acquisition_needs_only_login_and_database_creation_priv
         .await
         .unwrap();
     assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
         "{outcome}"
     );
     assert!(remaining.is_empty());
@@ -621,7 +670,7 @@ async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_external
         matches!(
             boundary,
             ProduceError::Run(Error::Binding(ref reason))
-                if reason == "SQL Server resolver reconstruction is not implemented yet (#2238)"
+                if reason == "SQL Server planning from evidence is not implemented yet (#2143)"
         ),
         "{boundary}"
     );
@@ -740,7 +789,7 @@ async fn instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans
     }
     for outcome in allowed {
         assert!(
-            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
+            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
             "{outcome}"
         );
     }
@@ -770,7 +819,7 @@ async fn mssql_run_owned_acquisition_removes_its_login_database_and_reference_on
     let after = inventory().await;
     inherited_model_refusal(&primary, &scratch).await;
     assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
         "{outcome}"
     );
     assert_eq!(after, before);
@@ -1022,7 +1071,7 @@ async fn mssql_supplied_built_in_refusals_preserve_state_and_residuals_reach_reh
                         )))
                     && remaining == names && before == after
             } else {
-                refused.contains("#2238") && names.is_empty() && cleanup.is_ok()
+                refused.contains("#2143") && names.is_empty() && cleanup.is_ok()
                     && remaining.is_empty() && before == after
             };
             if !valid {
@@ -1112,7 +1161,7 @@ async fn mssql_externals_file_is_compared_then_reaches_reconstruction_refusal() 
     let extra_acl = Box::pin(refusal_file_inner(&target,&scratch_server,Some("CREATE SCHEMA unused2269 AUTHORIZATION dbo;\nGO\nCREATE TABLE unused2269.external2269(i int CONSTRAINT external2269_pk PRIMARY KEY); GRANT INSERT ON unused2269.external2269 TO public;"))).await;
     drop_database(&target_server, &name).await;
     assert!(
-        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
+        matches!(outcome,ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
         "{outcome}"
     );
     assert!(
@@ -1239,3 +1288,6 @@ mod same_instance2270;
 
 #[path = "dependencies2323_tests.rs"]
 mod dependencies2323;
+
+#[path = "reconstruct2374_tests.rs"]
+mod reconstruct2374;
