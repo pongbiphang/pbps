@@ -647,6 +647,7 @@ fn reads(
 /// A reader of only some columns waits for the first part and for the part
 /// of each late column it names, not for the columns it does not.
 fn wait_for(
+    dialect: &(impl Dialect + ?Sized),
     out: &mut Schedule,
     first: usize,
     own: &[(usize, &PlannedChange)],
@@ -661,7 +662,7 @@ fn wait_for(
     wait(first);
     for (part, p) in own {
         if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } = &p.change
-            && columns.contains(&name.raw().to_lowercase())
+            && columns.contains(&dialect.generation_column_key(name.raw()))
         {
             wait(*part);
         }
@@ -841,7 +842,7 @@ pub fn constraints(
                 // Called readers already chose a full-shape placeholder or
                 // the whole-table hold; every consumer sees that full shape.
                 if let Some(columns) = reads(dialect, &[module.definition.as_str()], name) {
-                    wait_for(&mut out, first, &own, &columns, *i);
+                    wait_for(dialect, &mut out, first, &own, &columns, *i);
                 } else {
                     edge(&mut out, if whole { first } else { complete }, *i);
                 }

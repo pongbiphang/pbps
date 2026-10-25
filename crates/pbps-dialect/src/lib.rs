@@ -2589,6 +2589,15 @@ pub trait Dialect {
         None
     }
 
+    /// The form of a column's name that `generation_column_names` returns, so
+    /// that a name the engine may bind to a column compares equal to it. An
+    /// engine whose binding follows a collation pbps cannot read offline folds
+    /// every name the collation may equate; the default is the lowercase
+    /// comparison of an engine that folds only case.
+    fn generation_column_key(&self, name: &str) -> String {
+        name.to_lowercase()
+    }
+
     /// Whether a consumer may name a table, its row type or its array type.
     /// A positive answer requires the complete creation shape (DEC-1503.4).
     fn generation_names_table(&self, text: &str, table: &pbps_model::TableName) -> bool {

@@ -596,7 +596,7 @@ fn check_may_read_computed(expression: &str, column: &str) -> bool {
     false
 }
 
-fn computed_note_fold(text: &str) -> String {
+pub(crate) fn computed_note_fold(text: &str) -> String {
     // Compatibility decomposition supplies the width mapping, including
     // halfwidth kana; canonical decomposition alone supplies neither.
     text.nfkd()

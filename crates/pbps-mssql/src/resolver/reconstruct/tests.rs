@@ -1151,3 +1151,117 @@ fn a_seed_row_for_a_table_with_a_split_computed_column_makes_no_cycle() {
         );
     }
 }
+
+#[test]
+fn a_name_equal_under_some_catalog_collation_is_read() {
+    // The catalog collation decides what binds, and pbps cannot read it
+    // offline: on an accent-, width- or kana-insensitive catalog `cafe`
+    // binds `[café]`. A read that may be the column defers the check after
+    // it, the order that always compiles (#2408).
+    for (pending, read) in [
+        ("café", "cafe"),
+        ("cafe", "café"),
+        ("cafe", "ｃａｆｅ"),
+        ("ｃａｆｅ", "cafe"),
+        ("ひらがな", "ヒラガナ"),
+        ("ヒラガナ", "ひらがな"),
+        ("kıt", "KIT"),
+        ("CAFÉ", "cafe"),
+    ] {
+        let statements = sql(&build(vec![
+            table_with("t", |t| {
+                t.computed.insert(pending.into(), persisted("app.f(v)"));
+                t.checks.insert(
+                    "ck".into(),
+                    pbps_model::CheckConstraint {
+                        expression: format!("[{read}] > 0"),
+                    },
+                );
+            }),
+            function("f", FUNCTION),
+        ])
+        .unwrap());
+        let create = at(&statements, "CREATE TABLE [app].[t]");
+        assert!(
+            !statements[create].contains("[ck]"),
+            "{pending}/{read}: {statements:#?}"
+        );
+        assert!(
+            at(&statements, &format!("ADD [{pending}] AS")) < at(&statements, "[ck]"),
+            "{pending}/{read}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_name_that_is_equal_under_no_collation_is_no_read() {
+    // An unrelated ASCII column, and the name only inside a literal or a
+    // comment, still leave the check in the CREATE.
+    for expression in [
+        "[cafe2] > 0",
+        "v > 0 AND N'café' <> N'x'",
+        "v > 0 /* café */",
+        "v > 0 AND [kafe] > 0",
+    ] {
+        let statements = sql(&build(vec![
+            table_with("t", |t| {
+                t.columns.insert("cafe2".into(), int());
+                t.columns.insert("kafe".into(), int());
+                t.computed.insert("café".into(), persisted("app.f(v)"));
+                t.checks.insert(
+                    "ck".into(),
+                    pbps_model::CheckConstraint {
+                        expression: expression.into(),
+                    },
+                );
+            }),
+            function("f", FUNCTION),
+        ])
+        .unwrap());
+        // Written with the bare table, not held for the column.
+        assert!(
+            at(&statements, "[ck]") < at(&statements, "ADD [café] AS"),
+            "{expression}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_function_called_by_a_name_equal_under_some_collation_is_called() {
+    // The same comparison, for the function a column calls: `app.cafe(..)`
+    // binds `app.[café]` on an accent-insensitive catalog, and the column then
+    // has to follow the function (#2408).
+    for (declared, called) in [("café", "cafe"), ("cafe", "café"), ("cafe", "ｃａｆｅ")] {
+        let statements = sql(&build(vec![
+            table("t", &[("c", &format!("app.[{called}](id)"))]),
+            function(declared, FUNCTION),
+        ])
+        .unwrap());
+        let create = at(&statements, "CREATE TABLE [app].[t]");
+        assert!(
+            !statements[create].contains(" AS ("),
+            "{declared}/{called}: {statements:#?}"
+        );
+        assert!(
+            at(&statements, &format!("FUNCTION [app].[{declared}]"))
+                < at(&statements, "ADD [c] AS"),
+            "{declared}/{called}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_module_reading_a_column_by_an_equal_name_waits_for_it() {
+    // A view binds the table's columns when it is created (207 otherwise,
+    // measured), so the one that names `cafe` for `[café]` follows the column.
+    let statements = sql(&build(vec![
+        view("v", "SELECT cafe FROM app.t"),
+        table("t", &[("café", "app.g(v)")]),
+        function("g", FUNCTION),
+    ])
+    .unwrap());
+    assert!(
+        at(&statements, "ADD [café] AS") < at(&statements, "VIEW [app].[v]"),
+        "{statements:#?}"
+    );
+}

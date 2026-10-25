@@ -18,13 +18,15 @@ use crate::Mssql;
 use pbps_dialect::{Dialect, DialectError};
 use pbps_model::{Change, IdsFile, ModuleId, ValueSource};
 use std::collections::BTreeSet;
+use unicode_normalization::char::is_combining_mark;
 
 /// Whether `text` calls a declared function: by the two-part name SQL Server
 /// requires of a scalar function in an expression (a one-part call is 195,
-/// measured), exact by schema and leaf name.
+/// measured), by schema and leaf name as `name_key` compares them.
 pub(crate) fn calls(dialect: &Mssql, text: &str, function: &ModuleId) -> bool {
     dialect.qualified_calls(text).iter().any(|(schema, name)| {
-        schema.eq_ignore_ascii_case(function.schema()) && name.eq_ignore_ascii_case(function.name())
+        name_key(schema) == name_key(function.schema())
+            && name_key(name) == name_key(function.name())
     })
 }
 
@@ -61,7 +63,7 @@ pub(crate) fn parts(
         .computed
         .keys()
         .skip(cut)
-        .map(|c| c.raw().to_lowercase())
+        .map(|c| name_key(c.raw()))
         .collect();
     let reads_pending = |text: &str| {
         column_names(dialect, text).is_none_or(|read| !read.is_disjoint(&pending))
@@ -69,9 +71,7 @@ pub(crate) fn parts(
     };
     let late_text = |text: &str| calling(text) || reads_pending(text);
     let late_column = |columns: &[pbps_model::ColumnName]| {
-        columns
-            .iter()
-            .any(|c| pending.contains(&c.raw().to_lowercase()))
+        columns.iter().any(|c| pending.contains(&name_key(c.raw())))
     };
     let mut bare = (**table).clone();
     bare.computed = table
@@ -190,7 +190,18 @@ pub(crate) fn parts(
     Ok(Some(parts))
 }
 
-/// The names `text` may read as columns of a table, lowercased, or `None`
+/// The form a column or function name is compared in: every name some catalog collation
+/// may equate with it folds to the same text. The engine binds names under
+/// the collation of the catalog, which pbps cannot read offline, so a read
+/// that may be the column counts as one (`computed_note_fold`, the fold the
+/// declaration notes use). Over-reading defers a part after a column it might
+/// read, the order that always compiles; under-reading leaves it in a
+/// `CREATE` that fails (#2408).
+pub(crate) fn name_key(name: &str) -> String {
+    crate::validate::computed_note_fold(name)
+}
+
+/// The names `text` may read as columns of a table, in `name_key` form, or `None`
 /// where it projects every column. Every identifier in the code counts,
 /// variables and parameters excepted (`@c` is no column): a name that is no
 /// column of the table matches no part, and one that is an alias or another
@@ -224,7 +235,7 @@ pub(crate) fn column_names(dialect: &Mssql, text: &str) -> Option<BTreeSet<Strin
             }
             _ => continue,
         };
-        names.insert(name.to_lowercase());
+        names.insert(name_key(&name));
     }
     Some(names)
 }
@@ -271,9 +282,10 @@ pub(crate) fn without_variables(code: &str) -> String {
     clean
 }
 
-/// A character a regular identifier continues with.
+/// A character a regular identifier continues with; a combining mark is one,
+/// so a decomposed `é` is read whole.
 fn is_identifier_part(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')
+    c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$') || is_combining_mark(c)
 }
 
 /// Whether `code`, a definition with strings and comments blanked

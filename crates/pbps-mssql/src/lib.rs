@@ -174,6 +174,10 @@ impl Dialect for Mssql {
         generated::column_names(self, text)
     }
 
+    fn generation_column_key(&self, name: &str) -> String {
+        generated::name_key(name)
+    }
+
     /// What SQL Server's catalog refuses beyond the portable effects
     /// (DEC-1954.3):
     ///

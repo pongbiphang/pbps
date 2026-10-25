@@ -19,11 +19,22 @@ where
     F: FnOnce(Conn) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    case_collated(tag, None, run).await;
+}
+
+/// The same, on a database whose catalog has the given collation: it decides
+/// which names bind, which pbps cannot read offline.
+async fn case_collated<F, Fut>(tag: &str, collation: Option<&str>, run: F)
+where
+    F: FnOnce(Conn) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let server = std::env::var("PBPS_TEST_DB").unwrap();
     let name = format!("pbps2374_{tag}_{}", std::process::id());
     let mut admin = connect_live(&server).await.unwrap();
+    let collate = collation.map_or(String::new(), |c| format!(" COLLATE {c}"));
     admin
-        .execute(&format!("CREATE DATABASE [{name}];"))
+        .execute(&format!("CREATE DATABASE [{name}]{collate};"))
         .await
         .unwrap();
     let mut conn = connect_live(&format!("{server};Database={name}"))
@@ -307,6 +318,66 @@ async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
         .await
         .unwrap();
         let sql = "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID(N'app.t') AND name = N'c'";
+        assert_eq!(count(&mut conn, sql).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_check_naming_a_column_by_an_accent_insensitive_equal_compiles_and_keeps_positions() {
+    // On a CI_AI catalog `cafe` binds `[café]` (measured), so the check must
+    // follow the column; on the target created inline the positions are these.
+    case_collated("accent", Some("Latin1_General_100_CI_AI"), |mut conn| async move {
+        let declare = |t: &mut Table| {
+            t.computed.insert(
+                "café".into(),
+                ComputedColumn {
+                    persisted: true,
+                    ..computed("app.f(v)")
+                },
+            );
+            t.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "cafe > 0".into(),
+                },
+            );
+        };
+        compile(
+            &mut conn,
+            vec![
+                table("t", declare),
+                module(ModuleKind::Function, "f", FUNCTION),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE app.target (id int, v int, [café] AS (app.f(v)) PERSISTED NOT NULL, CONSTRAINT ck_target CHECK (cafe > 0));",
+        )
+        .await
+        .unwrap();
+        let positions = async |conn: &mut Conn, table: &str| -> Vec<(String, i32)> {
+            conn.query(&format!(
+                "SELECT name, column_id FROM sys.columns WHERE object_id = OBJECT_ID(N'app.{table}') ORDER BY column_id"
+            ))
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<&str>("name").unwrap().unwrap().to_owned(),
+                    row.try_get::<i32>("column_id").unwrap().unwrap(),
+                )
+            })
+            .collect()
+        };
+        assert_eq!(
+            positions(&mut conn, "t").await,
+            positions(&mut conn, "target").await
+        );
+        let sql = "SELECT COUNT(*) FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID(N'app.t')";
         assert_eq!(count(&mut conn, sql).await, 1);
     })
     .await;
