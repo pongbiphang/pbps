@@ -10,6 +10,7 @@ pub mod compatibility;
 pub mod dependencies;
 pub mod environment;
 pub mod externals;
+pub mod localdb;
 pub mod reconstruct;
 pub mod scratch;
 

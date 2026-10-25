@@ -178,6 +178,22 @@ test('a pull request omits exactly the declared jobs, and every other event runs
   assert.match(verdict[1], /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
 });
 
+test('the LocalDB job runs on every event and nothing in it can pass without running', () => {
+  const block = job('resolver-localdb');
+  assert.match(block, /^    runs-on: windows-/m, 'LocalDB exists only on Windows');
+  assert.match(block, /^    needs: \[approve, lint\]$/m);
+  // A pull request must be asked about the Windows route too (#2271): the job
+  // is neither in the omitted set nor conditional.
+  const omitted = workflow.match(/^          PR_OMITTED: (.+)$/m)[1].trim().split(/\s+/);
+  assert.ok(!omitted.includes('resolver-localdb'), 'a pull request runs the LocalDB job');
+  assert.doesNotMatch(block, /^    if:/m, 'no event skips it');
+  assert.doesNotMatch(block, /continue-on-error/, 'its failure is the job\'s failure');
+  assert.doesNotMatch(block, /^        if:/m, 'no step is conditional');
+  assert.match(block, /^      - run: python3 scripts\/localdb_qualify\.py$/m);
+  assert.match(block, /^    timeout-minutes: \d+$/m, 'a hang ends in a failure, not an open run');
+  assert.match(job('gate'), /needs: \[[^\]]*\bresolver-localdb\b/, 'the gate waits on it');
+});
+
 test('master runs nightly rather than on push, and only master saves caches', () => {
   const triggers = workflow.match(/^on:\n([\s\S]*?)(?=^\S)/m);
   assert.ok(triggers, 'the workflow declares its triggers');

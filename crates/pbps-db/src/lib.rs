@@ -50,6 +50,7 @@ pub use ledger::{
     LedgerEntry, LedgerError, LockHolder, LockInfo, OPERATOR_CHARS, TimelineEntry, TimelineStaged,
     TimelineState, clip_utf16, holder_application_name,
 };
+pub use mssql::LocalDbSelector;
 
 /// The application name every connection this process opens carries, unless
 /// its connection string names one: `pbps/<pid>/<nonce>` (#1188).

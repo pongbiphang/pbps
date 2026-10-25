@@ -96,6 +96,18 @@ pub fn declared_standard(
     }
 }
 
+/// The string the scratch server is reached by for this run. An ordinary
+/// string is itself; a SQL Server `(localdb)` selector is resolved to the pipe
+/// its instance listens on now, once, so that every connection of the run
+/// opens the same endpoint and a pipe that has gone is a failure rather than a
+/// reason to look again (DEC-2271.2).
+pub(super) async fn endpoint(driver: Driver, connection: &str) -> Result<String, ProduceError> {
+    match driver {
+        Driver::Postgres => Ok(connection.to_owned()),
+        Driver::Mssql => mssql::endpoint(connection).await,
+    }
+}
+
 pub(super) async fn reset_role(driver: Driver, admin: &mut Conn) -> Result<(), ProduceError> {
     match driver {
         Driver::Postgres => postgres::reset_role(admin).await,

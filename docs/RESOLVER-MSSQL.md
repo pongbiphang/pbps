@@ -435,8 +435,23 @@ for a moment keeps that type.
       (DEC-1674.1).
     - On Windows, a per-user LocalDB instance is another instance with its
       own `tempdb`. It is Express, so an edition difference is a recorded
-      limitation (§9). #620 (b) qualifies it on Windows; it is not measured
-      here.
+      limitation (§9).
+      - The operator provides and starts the instance and names it in the
+        scratch variable, `Server=(localdb)\<name>;Integrated Security=SSPI`.
+        A named instance only: the default, shared and versioned forms are
+        refused.
+      - The engine finds its pipe once per run by asking `SqlLocalDB.exe`
+        (a fixed path, no shell, bounded output and time) and opens that
+        endpoint for every connection of the run. No pipe, two pipes or a
+        pipe of another shape is a named failure, never an empty result.
+      - A vanished pipe or a restart fails the next connection, and a
+        restarted instance has lost the marker: the run is invalid and
+        never continues or cleans up on the restarted instance. A new
+        invocation discovers again (DEC-2271.2).
+      - The Linux-target-with-Windows-scratch pair stays a named platform
+        mismatch (§9).
+      - Measured support is what the `resolver-localdb` job has run; see
+        STATUS. Nothing in this section was measured on Linux.
 - **The layout.** The run-owned layout creates the run's login and
   database, so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`. It runs
   on another instance. On the target's instance only the supplied layout
@@ -819,6 +834,11 @@ the assembly's binary, so it refuses by name as an unstaged external object
 (#1517). An assembly nothing reaches binds nothing. #721 (an assembly's
 identity covers only its manifest file) and #718 (an assembly the deployer
 cannot see reads as absent) are closed with that change in #2270.
+
+A LocalDB scratch reports `host_platform` Windows and is compared like any
+other instance: a Linux target paired with it is a named platform mismatch,
+and supporting that pair, or a major other than 17, is a separate rule
+decision (#2271, DEC-2271.2).
 
 #719's telemetry, long-running runtime and Express questions remain
 prerequisites before the complete SQL Server path is advertised.

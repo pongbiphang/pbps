@@ -121,6 +121,10 @@ pub async fn produce_unsealed(
     let request =
         request(driver, base, desired, hints, write_path_extras).map_err(ProduceError::Run)?;
     let standard = standard.into();
+    // Before either connection opens: a LocalDB instance that cannot be found
+    // is known without touching the target, and every connection of the run
+    // then opens the one endpoint found here (DEC-2271.2).
+    let scratch = &engine::endpoint(driver, scratch).await?;
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| unusable(format!("the target could not be connected: {error}")))?;
@@ -535,6 +539,10 @@ mod live_tests;
 #[cfg(test)]
 mod mssql_live_tests;
 
+// Windows LocalDB is the only place these can run (#2271).
+#[cfg(all(test, windows))]
+mod localdb_live_tests;
+
 #[cfg(test)]
 use super::engine::release_supplied;
 
@@ -624,6 +632,58 @@ mod tests {
                     and plan with `--env` again"
                 );
             }
+        }
+    }
+
+    /// A LocalDB selector is resolved before the target or the scratch server
+    /// is touched: the target here would refuse a connection if it were tried.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_localdb_selector_is_resolved_before_any_connection_opens() {
+        use super::fixtures::{ENVIRONMENT, ProjectKey};
+        let mut key = ProjectKey::new(true);
+        let config = "dialect: mssql\nenvironments:\n  fixture:\n    url_env: PBPS_2271_UNUSED\n    \
+            fingerprint_key_file: key\n";
+        let path = key.project.root.join("pbps.yml");
+        std::fs::write(&path, config).unwrap();
+        key.project.config = pbps_config::Config::parse(config, &path).unwrap();
+        let schema = Schema::default();
+        let ids = IdsFile::default();
+        let side = pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        let bootstrap =
+            pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
+                .unwrap();
+        let outcome = produce_unsealed(
+            Driver::Mssql,
+            r"Server=(localdb)\x;Integrated Security=SSPI",
+            "Server=127.0.0.1,1;User Id=sa;Password=never-tried",
+            "",
+            &BindingRequest {
+                dependencies: &Default::default(),
+                bootstrap: &bootstrap,
+                base: &schema,
+                desired: &schema,
+            },
+            side,
+            side,
+            &Hints::default(),
+            &[],
+            &key.project,
+            Some(ENVIRONMENT),
+            super::Standard::Mssql,
+            None,
+            &Provenance::server(),
+        )
+        .await;
+        match outcome {
+            Err(ProduceError::Acquire(reason)) => {
+                assert!(reason.contains("LocalDB instance"), "{reason}");
+            }
+            Err(other) => panic!("not the LocalDB acquire failure: {other}"),
+            Ok(_) => panic!("a selector with no Windows to resolve it was accepted"),
         }
     }
 }
