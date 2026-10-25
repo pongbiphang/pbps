@@ -479,6 +479,74 @@ impl IndexKind {
     }
 }
 
+/// An indexed view's indexes and which is clustered, or why the view cannot be
+/// managed: the first index the model cannot hold (DEC-2329.3).
+///
+/// The view is inventoried whole rather than managed without the index, since
+/// restating a managed view drops every index it has and would silently take
+/// the one the model could not hold with them. The same refusals a table's
+/// index gets: disabled, `IGNORE_DUP_KEY`, partitioned, a kind that is not a
+/// rowstore B-tree; and a filter, which a view's index cannot have.
+fn indexed_view(
+    raw: &RawCatalog,
+    object_id: i32,
+) -> Result<
+    (
+        BTreeMap<pbps_model::ObjectLocalName, Index>,
+        Option<pbps_model::ObjectLocalName>,
+    ),
+    String,
+> {
+    let mut indexes: BTreeMap<pbps_model::ObjectLocalName, Index> = BTreeMap::new();
+    let mut clustered = None;
+    for i in raw
+        .index_columns
+        .iter()
+        .filter(|i| i.object_id == object_id)
+    {
+        let name = i.index_name.shown();
+        let why = |what: &str| format!("its index `{name}` {what}, which pbps cannot reproduce");
+        if i.is_disabled {
+            return Err(why("is disabled"));
+        }
+        if i.is_unique && i.ignore_dup_key {
+            return Err(why("has IGNORE_DUP_KEY"));
+        }
+        if i.rows_partitioned {
+            return Err(why("is on a partition scheme"));
+        }
+        if i.filter.is_some() {
+            return Err(why("is filtered"));
+        }
+        if let IndexKind::Unmodelled(code) = i.kind {
+            return Err(why(&format!("is {}", index_type_name(code))));
+        }
+        if i.kind == IndexKind::Clustered {
+            clustered = Some(i.index_name.clone());
+        }
+        let index = indexes
+            .entry(i.index_name.clone())
+            .or_insert_with(|| Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: i.is_unique,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            });
+        if i.is_included {
+            index.include.push(i.column.clone().into());
+        } else {
+            index.columns.push(IndexColumn {
+                key: pbps_model::IndexKey::Column(i.column.clone().into()),
+                descending: i.is_descending,
+                opclass: None,
+            });
+        }
+    }
+    Ok((indexes, clustered))
+}
+
 /// Whether the reader leaves this clustered index out. A unique one with
 /// unmodelled write behavior is left out by the rule every unique index
 /// follows; a disabled one of any kind is too, because disabling the
@@ -548,6 +616,12 @@ pub struct RawModule {
     pub definition: Option<String>,
     /// A trigger's table, as `(schema, table)`.
     pub parent: Option<(String, String)>,
+    /// `sys.sql_modules.is_schema_bound`: the catalog's own answer, which the
+    /// text of a view's header must agree with before the view is managed
+    /// (the word in a definition is no proof of the clause, DEC-1431.1).
+    pub schema_bound: bool,
+    /// A CLR object (`PC`, `FS`, `FT`): its body is an assembly, not text.
+    pub clr: bool,
     /// Views, inline table-valued functions and schema-bound modules require
     /// referenced objects at creation. Non-schema-bound scalar and multi-
     /// statement table-valued functions permit deferred table resolution.
@@ -704,11 +778,12 @@ fn push_limitation(
 /// rather than guessing — the module is then reported as unmanaged, which is
 /// the rule `pull` already follows for everything it cannot express.
 ///
-/// A view with options between its name and `AS` (`WITH SCHEMABINDING`) is one
-/// of those cases. The model has nowhere to keep them, and dropping them
-/// silently would have the next apply recreate the view *without*
-/// SCHEMABINDING — a change nobody asked for, in the one direction that
-/// removes a guarantee.
+/// A view's `WITH SCHEMABINDING` is the one option between its name and `AS`
+/// that [`pbps_model::ModuleOptions::schemabinding`] keeps, and the third element says
+/// it was there (DEC-2329.1). Any other option (`VIEW_METADATA`, `ENCRYPTION`),
+/// alone or beside it, is a case the model cannot hold: dropping it silently
+/// would have the next apply recreate the view *without* it — a change nobody
+/// asked for, in the one direction that removes a guarantee.
 /// `has_parent` says whether the catalog can supply the trigger's target. When
 /// it can, an unqualified `ON customer` is no obstacle: the schema the text
 /// omits is exactly what `sys.objects` records, and `assemble` substitutes it.
@@ -718,7 +793,7 @@ pub fn split_module(
     kind: ModuleKind,
     stored: &str,
     has_parent: bool,
-) -> Option<(Option<TableName>, String)> {
+) -> Option<(Option<TableName>, String, bool)> {
     let s = stored;
     let mut i = keyword(s, 0, "create")?;
     // `OR ALTER` is optional: pbps emits it, a hand-written module has not.
@@ -741,9 +816,16 @@ pub fn split_module(
 
     match kind {
         ModuleKind::View => {
-            // Anything but `AS` here is an option the model cannot hold.
-            let at = keyword(s, i, "as")?;
-            Some((None, s[at..].trim().to_owned()))
+            // `WITH SCHEMABINDING` is the one option the model holds. Anything
+            // else here, or after it, is one it cannot: `?` refuses.
+            let (bound, at) = match keyword(s, i, "with") {
+                Some(after_with) => (
+                    true,
+                    keyword(s, keyword(s, after_with, "schemabinding")?, "as")?,
+                ),
+                None => (false, keyword(s, i, "as")?),
+            };
+            Some((None, s[at..].trim().to_owned(), bound))
         }
         ModuleKind::Trigger => {
             i = keyword(s, i, "on")?;
@@ -756,10 +838,10 @@ pub fn split_module(
                 [_] if has_parent => None,
                 _ => return None,
             };
-            Some((on, s[after..].trim().to_owned()))
+            Some((on, s[after..].trim().to_owned(), false))
         }
         ModuleKind::Procedure | ModuleKind::Function => {
-            Some((None, s[after_name..].trim().to_owned()))
+            Some((None, s[after_name..].trim().to_owned(), false))
         }
     }
 }
@@ -2073,10 +2155,16 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             continue;
         }
 
+        // Told apart because the remedy differs: a CLR object is never
+        // text, an encrypted module is text the engine will not give back,
+        // and a login without VIEW DEFINITION sees NULL for any module.
         let Some(stored) = &m.definition else {
-            unmanageable(
-                "its definition cannot be read back (a CLR object, or created WITH ENCRYPTION)",
-            );
+            unmanageable(if m.clr {
+                "it is a CLR object, whose body is an assembly and not a definition"
+            } else {
+                "its definition cannot be read back (created WITH ENCRYPTION, or hidden from this \
+                 login by a missing VIEW DEFINITION permission)"
+            });
             continue;
         };
         if !m.default_set_options {
@@ -2086,13 +2174,44 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             );
             continue;
         }
-        let Some((on, definition)) = split_module(m.kind, stored, m.parent.is_some()) else {
-            unmanageable(
-                "its definition is not of a shape pbps can reproduce (a view with options such \
-                 as SCHEMABINDING, or a trigger on an unqualified table)",
-            );
+        let Some((on, definition, schemabinding)) =
+            split_module(m.kind, stored, m.parent.is_some())
+        else {
+            unmanageable(if m.kind == ModuleKind::View && m.schema_bound {
+                "it is a schema-bound view that also carries an option pbps cannot hold \
+                 (VIEW_METADATA), which recreating it would remove"
+            } else {
+                "its definition is not of a shape pbps can reproduce (a view with an option \
+                 pbps cannot hold, such as VIEW_METADATA, or a trigger on an unqualified table)"
+            });
             continue;
         };
+        let mut options = pbps_model::ModuleOptions {
+            schemabinding,
+            ..Default::default()
+        };
+        if m.kind == ModuleKind::View {
+            match indexed_view(raw, m.object_id) {
+                Ok((indexes, clustered)) => {
+                    options.indexes = indexes;
+                    options.clustered = clustered;
+                }
+                Err(why) => {
+                    unmanageable(&why);
+                    continue;
+                }
+            }
+        }
+        // The header says what the text says; the catalog says what the
+        // engine holds. They differ only where the scan misread the header,
+        // and a flag taken from the wrong one would be recreated wrongly.
+        if m.kind == ModuleKind::View && schemabinding != m.schema_bound {
+            unmanageable(
+                "its header and `sys.sql_modules.is_schema_bound` disagree about SCHEMABINDING, \
+                 so pbps cannot tell which one to reproduce",
+            );
+            continue;
+        }
         // The catalog knows a trigger's table even when the definition text
         // does not qualify it, so the more reliable answer wins.
         let on = m
@@ -2160,6 +2279,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 // would make every pulled module compare unequal.
                 description: None,
                 definition,
+                options,
             },
         );
     }
@@ -4776,6 +4896,11 @@ mod module_tests {
             definition: definition.map(str::to_owned),
             parent: None,
             requires_bound_references: kind == ModuleKind::View,
+            // The catalog's flag, which a real read gets from
+            // `sys.sql_modules`; the fixtures spell the clause in the text.
+            schema_bound: definition
+                .is_some_and(|d| d.to_ascii_uppercase().contains("SCHEMABINDING")),
+            clr: false,
             default_set_options: true,
         }
     }
@@ -5305,30 +5430,211 @@ mod module_tests {
     /// silence, which would leave the next plan proposing its destruction.
     #[test]
     fn unmanageable_modules_are_inventoried_with_the_reason() {
+        let mut clr = module("dbo", "sp_clr", ModuleKind::Procedure, None);
+        clr.clr = true;
         let p = assemble(&catalog_with(vec![
-            // Encrypted or CLR: no definition at all.
+            // Encrypted, or hidden from this login: no definition at all.
             module("dbo", "sp_secret", ModuleKind::Procedure, None),
-            // A view whose options the model cannot hold. Recreating it without
-            // SCHEMABINDING would silently remove a guarantee.
+            clr,
+            // An option the model cannot hold, beside the one it can.
+            // Recreating the view without it would silently remove it.
             module(
                 "dbo",
                 "v_bound",
                 ModuleKind::View,
-                Some("CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT 1"),
+                Some("CREATE VIEW dbo.v_bound WITH SCHEMABINDING, VIEW_METADATA AS SELECT 1"),
+            ),
+            module(
+                "dbo",
+                "v_meta",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.v_meta WITH VIEW_METADATA AS SELECT 1"),
             ),
         ]));
         assert!(p.schema.modules.is_empty());
-        assert_eq!(p.unmanaged_modules.len(), 2);
-        assert!(
-            p.unmanaged_modules[0].why.contains("ENCRYPTION"),
-            "{:?}",
+        let why = |name: &str| {
             p.unmanaged_modules
-        );
+                .iter()
+                .find(|u| u.target.object_name().name == name)
+                .unwrap_or_else(|| panic!("{name} not inventoried: {:?}", p.unmanaged_modules))
+                .why
+                .clone()
+        };
+        assert_eq!(p.unmanaged_modules.len(), 4);
         assert!(
-            p.unmanaged_modules[1].why.contains("SCHEMABINDING"),
-            "{:?}",
-            p.unmanaged_modules
+            why("sp_secret").contains("ENCRYPTION"),
+            "{}",
+            why("sp_secret")
         );
+        assert!(why("sp_clr").contains("CLR"), "{}", why("sp_clr"));
+        assert!(!why("sp_secret").contains("CLR"));
+        assert!(
+            why("v_bound").contains("schema-bound"),
+            "{}",
+            why("v_bound")
+        );
+        assert!(why("v_bound").contains("VIEW_METADATA"));
+        assert!(!why("v_meta").contains("schema-bound"), "{}", why("v_meta"));
+    }
+
+    fn view_index(
+        object_id: i32,
+        name: &str,
+        column: &str,
+        kind: IndexKind,
+        flags: (bool, bool, bool),
+    ) -> RawIndexColumn {
+        let (unique, included, disabled) = flags;
+        RawIndexColumn {
+            is_disabled: disabled,
+            ignore_dup_key: false,
+            object_id,
+            index_name: name.into(),
+            is_unique: unique,
+            kind,
+            filter: None,
+            column: column.into(),
+            is_included: included,
+            is_descending: false,
+            rows_partitioned: false,
+        }
+    }
+
+    /// An indexed view keeps its indexes and which is clustered, so the next
+    /// alter can restate them (`CREATE OR ALTER VIEW` drops them all). DEC-2329.3.
+    #[test]
+    fn an_indexed_view_is_managed_with_its_indexes() {
+        let mut raw = catalog_with(vec![module(
+            "dbo",
+            "v",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a, b FROM dbo.t"),
+        )]);
+        let on = raw.modules[0].object_id;
+        raw.index_columns = vec![
+            view_index(
+                on,
+                "ix_a",
+                "a",
+                IndexKind::Nonclustered,
+                (false, false, false),
+            ),
+            view_index(
+                on,
+                "ix_a",
+                "b",
+                IndexKind::Nonclustered,
+                (false, true, false),
+            ),
+            view_index(on, "ux_v", "id", IndexKind::Clustered, (true, false, false)),
+        ];
+        let p = assemble(&raw);
+        assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
+        let options = &p.schema.modules.values().next().unwrap().options;
+        assert_eq!(options.clustered.as_ref().map(|c| c.raw()), Some("ux_v"));
+        assert_eq!(options.indexes.len(), 2);
+        let ix = &options.indexes[&pbps_model::ObjectLocalName::from("ix_a")];
+        assert_eq!(ix.include, ["b".into()]);
+        assert!(!ix.unique);
+        assert!(options.indexes[&pbps_model::ObjectLocalName::from("ux_v")].unique);
+    }
+
+    /// An index the model cannot hold keeps the whole view unmanaged: managing
+    /// the view without it would drop it on the next restatement.
+    #[test]
+    fn a_view_with_an_index_the_model_cannot_hold_is_inventoried() {
+        for (kind, flags, filter, why) in [
+            (
+                IndexKind::Nonclustered,
+                (false, false, true),
+                None,
+                "disabled",
+            ),
+            (
+                IndexKind::Nonclustered,
+                (false, false, false),
+                Some("a > 0"),
+                "filtered",
+            ),
+            (
+                IndexKind::Unmodelled(6),
+                (false, false, false),
+                None,
+                "columnstore",
+            ),
+        ] {
+            let mut raw = catalog_with(vec![module(
+                "dbo",
+                "v",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a FROM dbo.t"),
+            )]);
+            let on = raw.modules[0].object_id;
+            let mut column = view_index(on, "ix", "a", kind, flags);
+            column.filter = filter.map(str::to_owned);
+            raw.index_columns = vec![
+                view_index(on, "ux_v", "id", IndexKind::Clustered, (true, false, false)),
+                column,
+            ];
+            let p = assemble(&raw);
+            assert!(p.schema.modules.is_empty(), "{why}");
+            assert_eq!(p.unmanaged_modules.len(), 1, "{why}");
+            assert!(
+                p.unmanaged_modules[0].why.contains(why)
+                    && p.unmanaged_modules[0].why.contains("`ix`"),
+                "{why}: {:?}",
+                p.unmanaged_modules
+            );
+        }
+    }
+
+    /// A schema-bound view is managed, and the flag is read from its header
+    /// and cross-checked against the catalog (DEC-2329.1).
+    #[test]
+    fn a_schema_bound_view_is_managed_with_its_flag() {
+        let p = assemble(&catalog_with(vec![
+            module(
+                "dbo",
+                "v_bound",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id FROM dbo.t"),
+            ),
+            module(
+                "dbo",
+                "v_plain",
+                ModuleKind::View,
+                Some("CREATE VIEW dbo.v_plain AS SELECT id FROM dbo.t"),
+            ),
+        ]));
+        assert!(p.unmanaged_modules.is_empty(), "{:?}", p.unmanaged_modules);
+        let by_name = |name: &str| {
+            p.schema
+                .modules
+                .iter()
+                .find(|(id, _)| id.name() == name)
+                .map(|(_, m)| m)
+                .unwrap_or_else(|| panic!("{name} missing"))
+        };
+        assert!(by_name("v_bound").options.schemabinding);
+        assert_eq!(by_name("v_bound").definition, "SELECT id FROM dbo.t");
+        assert!(!by_name("v_plain").options.schemabinding);
+    }
+
+    /// The header and the catalog must agree before a view is managed: a flag
+    /// taken from the wrong one would recreate the view wrongly.
+    #[test]
+    fn a_view_whose_header_and_catalog_disagree_about_schemabinding_is_inventoried() {
+        let mut lying = module(
+            "dbo",
+            "v_lying",
+            ModuleKind::View,
+            Some("CREATE VIEW dbo.v_lying WITH SCHEMABINDING AS SELECT 1"),
+        );
+        lying.schema_bound = false;
+        let p = assemble(&catalog_with(vec![lying]));
+        assert!(p.schema.modules.is_empty());
+        assert_eq!(p.unmanaged_modules.len(), 1);
+        assert!(p.unmanaged_modules[0].why.contains("disagree"));
     }
 
     /// A quoted identifier may hold the punctuation the id's string form uses
@@ -5489,6 +5795,7 @@ mod module_tests {
                 kind,
                 description: None,
                 definition: body.to_owned(),
+                options: Default::default(),
             };
             let on: Option<ObjectName> = on.map(|t| t.parse().unwrap());
             let id = match &on {
@@ -5499,11 +5806,55 @@ mod module_tests {
                 None => pbps_model::ModuleId::Named(name.clone()),
             };
             let stored = crate::emit::module_definition(&id, &module).expect("emit");
-            let (back_on, back_body) = split_module(kind, &stored, false)
+            let (back_on, back_body, back_bound) = split_module(kind, &stored, false)
                 .unwrap_or_else(|| panic!("could not split:\n{stored}"));
             assert_eq!(back_body, body, "{kind}");
             assert_eq!(back_on, on, "{kind}");
+            assert!(!back_bound, "{kind}");
         }
+    }
+
+    /// The option sits between the name and the `AS`, written by the emitter
+    /// and read back by the splitter, in whatever case and spacing a person
+    /// puts it (DEC-2329.1).
+    #[test]
+    fn a_views_schemabinding_round_trips_through_the_emitter_and_the_splitter() {
+        let id = pbps_model::ModuleId::Named(ObjectName::new("dbo".to_owned(), "v".to_owned()));
+        for bound in [true, false] {
+            let module = Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT id FROM dbo.t".to_owned(),
+                options: pbps_model::ModuleOptions {
+                    schemabinding: bound,
+                    ..Default::default()
+                },
+            };
+            let stored = crate::emit::module_definition(&id, &module).expect("emit");
+            assert_eq!(stored.contains("WITH SCHEMABINDING"), bound, "{stored}");
+            let (_, body, back) = split_module(ModuleKind::View, &stored, false)
+                .unwrap_or_else(|| panic!("could not split:\n{stored}"));
+            assert_eq!((body.as_str(), back), ("SELECT id FROM dbo.t", bound));
+        }
+        for stored in [
+            "create view dbo.v with schemabinding as select 1",
+            "CREATE VIEW dbo.v\n  WITH\n  SCHEMABINDING\nAS select 1",
+            "CREATE VIEW dbo.v /* bound */ WITH SCHEMABINDING -- why\nAS select 1",
+        ] {
+            let (_, body, bound) = split_module(ModuleKind::View, stored, false)
+                .unwrap_or_else(|| panic!("could not split: {stored}"));
+            assert!(bound, "{stored}");
+            assert_eq!(body.to_lowercase(), "select 1", "{stored}");
+        }
+        // The word in a place that is not the header says nothing: a column
+        // alias, or a comment inside the query.
+        let (_, _, bound) = split_module(
+            ModuleKind::View,
+            "CREATE VIEW dbo.v AS SELECT 1 AS schemabinding -- WITH SCHEMABINDING",
+            false,
+        )
+        .unwrap();
+        assert!(!bound);
     }
 
     /// A hand-written module was not written by the emitter, and the shapes it
@@ -5541,7 +5892,11 @@ mod module_tests {
             "CREATE VIEW \"dbo\".\"active customer\" AS SELECT 1",
             false,
         );
-        assert_eq!(split, Some((None, "SELECT 1".to_owned())), "ANSI quoting");
+        assert_eq!(
+            split,
+            Some((None, "SELECT 1".to_owned(), false)),
+            "ANSI quoting"
+        );
         // Including its doubled-quote escape.
         assert!(
             split_module(
@@ -5560,7 +5915,10 @@ mod module_tests {
             "CREATE TRIGGER dbo.trg ON customer AFTER INSERT AS SELECT 1",
             true,
         );
-        assert_eq!(split, Some((None, "AFTER INSERT AS SELECT 1".to_owned())));
+        assert_eq!(
+            split,
+            Some((None, "AFTER INSERT AS SELECT 1".to_owned(), false))
+        );
     }
 
     /// A comment in the header is skipped as one however it is terminated and
@@ -5570,7 +5928,7 @@ mod module_tests {
     #[test]
     fn a_header_comment_ends_where_the_engine_ends_it() {
         let plain = split_module(ModuleKind::View, "CREATE VIEW dbo.v AS SELECT 1", false);
-        assert_eq!(plain, Some((None, "SELECT 1".to_owned())));
+        assert_eq!(plain, Some((None, "SELECT 1".to_owned(), false)));
         for stored in [
             // A carriage return ends a line comment here, so the `AS` after it
             // is code. Ending the comment at `\n` alone took the whole rest of
@@ -5605,7 +5963,8 @@ mod module_tests {
             ),
             Some((
                 Some(TableName::new("dbo".to_owned(), "customer".to_owned())),
-                "AFTER INSERT AS SELECT 1".to_owned()
+                "AFTER INSERT AS SELECT 1".to_owned(),
+                false
             ))
         );
     }
@@ -5616,7 +5975,12 @@ mod module_tests {
     #[test]
     fn an_unaccountable_definition_does_not_split() {
         for stored in [
-            "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT 1",
+            // Another option, alone or beside the one pbps holds: recreating
+            // the view without it would change what the view does.
+            "CREATE VIEW dbo.v WITH VIEW_METADATA AS SELECT 1",
+            "CREATE VIEW dbo.v WITH SCHEMABINDING, VIEW_METADATA AS SELECT 1",
+            "CREATE VIEW dbo.v WITH ENCRYPTION AS SELECT 1",
+            "CREATE VIEW dbo.v WITH SCHEMABINDING SELECT 1",
             // Unqualified, and this time the catalog has no parent to fall back
             // on: guessing a schema would attach the trigger to the wrong table.
             "CREATE TRIGGER trg ON customer AFTER INSERT AS SELECT 1",

@@ -11834,7 +11834,7 @@ fn catalog_handover_fixture(db: &OwnDatabase, k: usize) -> Demo {
         "SELECT state_json FROM public.__pbps_state ORDER BY id DESC LIMIT 1",
     ))
     .unwrap();
-    assert_eq!(recorded["version"], 32);
+    assert_eq!(recorded["version"], pbps_model::state::CURRENT_VERSION);
     assert_eq!(
         recorded["baseline_evidence"]["tables"]
             .as_object()
@@ -12135,7 +12135,7 @@ fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
         &["--allow", "destructive"],
     ));
     let applied = latest_snapshot(&connection);
-    assert_eq!(applied.version, 32);
+    assert_eq!(applied.version, pbps_model::state::CURRENT_VERSION);
     assert!(
         applied.baseline_evidence.is_some(),
         "apply recorded no catalog evidence"

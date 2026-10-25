@@ -680,6 +680,8 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             definition: opt::<&str>(&row, "definition")?.map(str::to_owned),
             parent,
             requires_bound_references: requires_bound_references(code, schema_bound),
+            schema_bound,
+            clr: matches!(code.trim(), "PC" | "FS" | "FT"),
         });
     }
 

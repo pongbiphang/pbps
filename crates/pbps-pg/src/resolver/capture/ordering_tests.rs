@@ -41,6 +41,7 @@ fn declared(body: &str) -> Schema {
             kind: ModuleKind::Function,
             description: None,
             definition: format!("() {body}"),
+            options: Default::default(),
         },
     );
     schema.modules.insert(
@@ -49,6 +50,7 @@ fn declared(body: &str) -> Schema {
             kind: ModuleKind::Function,
             description: None,
             definition: "() RETURNS integer LANGUAGE SQL IMMUTABLE RETURN app.f()".into(),
+            options: Default::default(),
         },
     );
     schema

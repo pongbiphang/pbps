@@ -79,6 +79,7 @@ fn schema(reference: bool, local_prefix: &str) -> Schema {
                 kind,
                 description: None,
                 definition: definition.into(),
+                options: Default::default(),
             },
         );
     }

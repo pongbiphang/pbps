@@ -6020,6 +6020,7 @@ mod tests {
                     "AFTER INSERT ON {on} FOR EACH {} EXECUTE FUNCTION app.f()",
                     if row { "ROW" } else { "STATEMENT" }
                 ),
+                options: Default::default(),
             });
             pbps_model::PlannedChange::new(if alter {
                 Change::AlterModule { id, module }

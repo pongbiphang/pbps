@@ -153,6 +153,7 @@ fn unsupported_descriptions_are_shown_once_and_reasons_stay_rendered() {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT 1".into(),
+            options: Default::default(),
         },
     );
     let d = Dependent {

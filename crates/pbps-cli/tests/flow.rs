@@ -3986,6 +3986,403 @@ fn computed_function_drops_follow_the_catalogs_edges() {
     ]));
 }
 
+/// #2329: a `WITH SCHEMABINDING` view is managed. `pull` writes `schemabinding:
+/// true` and keeps the query apart from the header, `plan` is empty against
+/// the database it came from, and turning the option off is an in-place
+/// alter that leaves the view's grant standing. A view with an option the
+/// model cannot hold (`VIEW_METADATA`) and an encrypted one stay unmanaged and
+/// are named.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_schema_bound_view_round_trips_through_pull_plan_and_apply() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "bound2329");
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a varchar(10) NOT NULL, b int NULL);",
+        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a FROM dbo.t;",
+        "CREATE VIEW dbo.v_plain AS SELECT id FROM dbo.t;",
+        "CREATE VIEW dbo.v_meta WITH SCHEMABINDING, VIEW_METADATA AS SELECT id FROM dbo.t;",
+        "CREATE VIEW dbo.v_enc WITH ENCRYPTION AS SELECT id FROM dbo.t;",
+        "CREATE ROLE r_reader;",
+        "GRANT SELECT ON dbo.v TO r_reader;",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("bound2329");
+    let pulled = d.run(&["pull", "--db", own.connection()]);
+    ok(&pulled);
+    d.commit();
+    let view_file = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("dbo.v.") && !n.starts_with("dbo.v_"))
+        })
+        .expect("the bound view's declaration");
+    let declared = std::fs::read_to_string(&view_file).unwrap();
+    assert!(declared.contains("schemabinding: true"), "{declared}");
+    assert!(!declared.contains("WITH SCHEMABINDING"), "{declared}");
+    // What stays unmanaged is named, with the reason that is its own.
+    let note = stderr(&pulled);
+    assert!(
+        note.contains("v_meta") && note.contains("VIEW_METADATA"),
+        "{note}"
+    );
+    assert!(
+        note.contains("v_enc") && note.contains("ENCRYPTION"),
+        "{note}"
+    );
+    assert!(
+        !note.contains("dbo.v —"),
+        "the bound view is managed: {note}"
+    );
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+
+    // Against the database it came from the plan has nothing to say.
+    let empty = d.dir.join("empty.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        empty.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&empty), 0);
+
+    // Turning the option off restates the view in place, with its grant.
+    std::fs::write(&view_file, declared.replace("schemabinding: true\n", "")).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(
+        script.contains("CREATE OR ALTER VIEW [dbo].[v]\nAS"),
+        "{script}"
+    );
+    assert!(!script.contains("DROP VIEW"), "{script}");
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+    ]));
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT CONVERT(varchar(1), is_schema_bound) FROM sys.sql_modules \
+             WHERE object_id = OBJECT_ID(N'dbo.v')"
+        ),
+        "0"
+    );
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT permission_name FROM sys.database_permissions \
+             WHERE major_id = OBJECT_ID(N'dbo.v') AND state = 'G'"
+        ),
+        "SELECT"
+    );
+    let again = d.dir.join("again.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        again.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&again), 0);
+}
+
+/// #2329: a retype of a column a schema-bound view reads brackets the view's
+/// drop and recreate around the change, which the engine would otherwise
+/// refuse (5074 behind 4922). The option and the view's grant survive the
+/// rebuild, and the next plan is empty. A view over a column the change does
+/// not touch, and one that is not bound, are left standing.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_schema_bound_view_is_rebuilt_around_a_column_change() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "rebuilt2329");
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a varchar(10) NOT NULL, b int NULL);",
+        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a FROM dbo.t;",
+        "CREATE VIEW dbo.v_b WITH SCHEMABINDING AS SELECT id, b FROM dbo.t;",
+        "CREATE VIEW dbo.v_plain AS SELECT id, a FROM dbo.t;",
+        "CREATE ROLE r_reader;",
+        "GRANT SELECT ON dbo.v TO r_reader;",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("rebuilt2329");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let table = d.dir.join("schema/dbo.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let wider = text.replacen("varchar(10)", "varchar(20)", 1);
+    assert_ne!(wider, text, "{text}");
+    std::fs::write(&table, wider).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP VIEW [dbo].[v];") < at("ALTER COLUMN [a]"),
+        "{script}"
+    );
+    assert!(
+        at("ALTER COLUMN [a]") < at("CREATE OR ALTER VIEW [dbo].[v]\nWITH SCHEMABINDING"),
+        "{script}"
+    );
+    // `v_b` reads a column the change leaves alone, and `v_plain` is not
+    // bound: the engine allows the change beside either.
+    assert!(
+        !script.contains("[v_b]") && !script.contains("[v_plain]"),
+        "{script}"
+    );
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT CONVERT(varchar(1), is_schema_bound) FROM sys.sql_modules \
+             WHERE object_id = OBJECT_ID(N'dbo.v')"
+        ),
+        "1"
+    );
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT permission_name FROM sys.database_permissions \
+             WHERE major_id = OBJECT_ID(N'dbo.v') AND state = 'G'"
+        ),
+        "SELECT"
+    );
+    let again = d.dir.join("again.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        again.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&again), 0);
+}
+
+/// #2329: an indexed view round trips with its indexes. `pull` writes them and
+/// the clustered one, `plan` is empty, an edit to one index restates the view
+/// and every index (`CREATE OR ALTER VIEW` drops them all), and a retype of a
+/// column the view reads brackets the whole view, indexes included. A view with
+/// an index the model cannot hold stays unmanaged and is named. The
+/// connection's own session options are enough to write to a table under an
+/// indexed view.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn an_indexed_view_round_trips_and_is_restated_with_its_indexes() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "indexed2329");
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a varchar(10) NOT NULL, b int NULL);",
+        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a, b FROM dbo.t;",
+        "CREATE UNIQUE CLUSTERED INDEX ux_v ON dbo.v (id);",
+        "CREATE INDEX ix_v_a ON dbo.v (a DESC) INCLUDE (b);",
+        "CREATE VIEW dbo.v_off WITH SCHEMABINDING AS SELECT id FROM dbo.t;",
+        "CREATE UNIQUE CLUSTERED INDEX ux_off ON dbo.v_off (id);",
+        "CREATE INDEX ix_off ON dbo.v_off (id DESC);",
+        "ALTER INDEX ix_off ON dbo.v_off DISABLE;",
+        // A write under an indexed view needs the session's SET options right
+        // (1934): the connection pbps writes rows through is this one.
+        "INSERT INTO dbo.t (id, a, b) VALUES (1, 'x', 2);",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("indexed2329");
+    let pulled = d.run(&["pull", "--db", own.connection()]);
+    ok(&pulled);
+    d.commit();
+    let view_file = walk(&d.dir.join("schema"))
+        .into_iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("dbo.v.") && !n.starts_with("dbo.v_"))
+        })
+        .expect("the indexed view's declaration");
+    let declared = std::fs::read_to_string(&view_file).unwrap();
+    assert!(declared.contains("clustered: ux_v"), "{declared}");
+    assert!(
+        declared.contains("ix_v_a") && declared.contains("a desc"),
+        "{declared}"
+    );
+    let note = stderr(&pulled);
+    assert!(
+        note.contains("v_off") && note.contains("`ix_off`") && note.contains("disabled"),
+        "{note}"
+    );
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let empty = d.dir.join("empty.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        empty.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&empty), 0);
+
+    // One index edited: the view is restated, and so is every index on it.
+    std::fs::write(&view_file, declared.replace("    include: [b]\n", "")).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    let plan_to = |out: &std::path::Path| {
+        ok(&d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            out.to_str().unwrap(),
+        ]))
+    };
+    plan_to(&sql);
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(!script.contains("DROP VIEW"), "{script}");
+    assert!(
+        at("CREATE OR ALTER VIEW [dbo].[v]") < at("CREATE UNIQUE CLUSTERED INDEX [ux_v]")
+            && at("CREATE UNIQUE CLUSTERED INDEX [ux_v]") < at("CREATE INDEX [ix_v_a]"),
+        "{script}"
+    );
+    let apply = |plan: &std::path::Path| {
+        ok(&d.run(&[
+            "apply",
+            "--db",
+            own.connection(),
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(plan),
+            "--allow",
+            "destructive",
+        ]))
+    };
+    apply(&plan);
+    let indexes = |view: &str| {
+        text_on_server(
+            own.connection(),
+            &format!(
+                "SELECT STRING_AGG(name + ':' + CONVERT(varchar(2), type), ',') \
+                 WITHIN GROUP (ORDER BY name) FROM sys.indexes \
+                 WHERE object_id = OBJECT_ID(N'dbo.{view}')"
+            ),
+        )
+    };
+    let included = |view: &str| {
+        text_on_server(
+            own.connection(),
+            &format!(
+                "SELECT CONVERT(varchar(3), COUNT(*)) FROM sys.index_columns \
+                 WHERE object_id = OBJECT_ID(N'dbo.{view}') AND is_included_column = 1"
+            ),
+        )
+    };
+    // The edit took the INCLUDE column off the nonclustered index.
+    assert_eq!(included("v"), "0");
+    assert_eq!(indexes("v"), "ix_v_a:2,ux_v:1");
+
+    // A column the view reads grows: the view goes, indexes with it, and comes
+    // back with all of them.
+    let table = d.dir.join("schema/dbo.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let wider = text.replacen("varchar(10)", "varchar(20)", 1);
+    assert_ne!(wider, text, "{text}");
+    std::fs::write(&table, wider).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    plan_to(&sql);
+    let script = std::fs::read_to_string(&sql).unwrap();
+    assert!(
+        script.find("DROP VIEW [dbo].[v];").unwrap() < script.find("ALTER COLUMN [a]").unwrap(),
+        "{script}"
+    );
+    assert!(
+        script.find("ALTER COLUMN [a]").unwrap()
+            < script.find("CREATE UNIQUE CLUSTERED INDEX [ux_v]").unwrap(),
+        "{script}"
+    );
+    apply(&plan);
+    assert_eq!(indexes("v"), "ix_v_a:2,ux_v:1");
+    let again = d.dir.join("again.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        again.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&again), 0);
+}
+
+/// How many steps the saved plan at `path` holds; none when the command wrote
+/// no file because there was nothing to do.
+fn changes_in(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map_or(0, |raw| {
+        serde_json::from_str::<pbps_model::SavedPlan>(&raw)
+            .unwrap()
+            .changes
+            .changes
+            .len()
+    })
+}
+
 /// #1461: the drops the computed edges order keep that order when a name only
 /// the catalog holds makes the search reorder the renames (DEC-1366.1). A
 /// default adopted as `s1.c` on `s1.old` holds the name `s1.a` is renamed to,
@@ -4809,14 +5206,35 @@ fn the_catalogs_edges_refuse_what_the_engine_would() {
         "--allow",
         "destructive",
     ]));
+    // The schema-bound view reads the computed column. It is a managed module
+    // now (DEC-2329.1), so the plan that drops the column drops the view
+    // before and creates it after (DEC-2329.2) instead of leaving it standing
+    // for the engine to refuse (4922).
     change("bound");
-    let o = plan_against(&d, own.connection());
-    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let sql = d.dir.join("bound.sql");
+    ok(&plan_against_with(&d, own.connection(), &sql));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
     assert!(
-        stderr(&o).contains("the schema-bound dbo.v_bound reads it"),
-        "{}",
-        stderr(&o)
+        at("DROP VIEW [dbo].[v_bound];") < at("DROP COLUMN [c]"),
+        "{script}"
     );
+    assert!(
+        at("DROP COLUMN [c]") < at("CREATE OR ALTER VIEW [dbo].[v_bound]"),
+        "{script}"
+    );
+    assert!(!script.contains("[v_plain]"), "{script}");
+}
+
+/// `plan --db`, with the statements written to `sql`.
+fn plan_against_with(d: &Demo, connection: &str, sql: &std::path::Path) -> Output {
+    let _ = d.run(&["plan"]);
+    d.commit();
+    d.run(&["plan", "--db", connection, "--sql", sql.to_str().unwrap()])
 }
 
 /// A computed column rewritten off the function it called lets the same plan
@@ -5128,6 +5546,7 @@ fn a_staged_resume_rechecks_the_pinned_default_collation() {
                             kind: pbps_model::ModuleKind::View,
                             description: None,
                             definition: "SELECT 1 AS id".into(),
+                            options: Default::default(),
                         }),
                     },
                 )],
@@ -6747,6 +7166,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
                         description: None,
                         definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
                             .into(),
+                        options: Default::default(),
                     }),
                 }),
                 // `risks: []` is consistent with what this says, which is the
@@ -6815,6 +7235,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
                         description: None,
                         definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"
                             .into(),
+                        options: Default::default(),
                     }),
                 },
                 risks: Default::default(),
@@ -17361,6 +17782,7 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
                         definition: "SELECT 1 AS id".into(),
+                        options: Default::default(),
                     }),
                 },
             )],

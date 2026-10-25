@@ -40,6 +40,7 @@ impl Declared {
                 kind,
                 description: None,
                 definition: definition.to_owned(),
+                options: Default::default(),
             },
         );
         self

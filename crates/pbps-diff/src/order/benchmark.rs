@@ -142,6 +142,7 @@ fn chain(size: usize) -> Shape {
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT 1 AS n".into(),
+                options: Default::default(),
             },
         );
         if i > 0 {

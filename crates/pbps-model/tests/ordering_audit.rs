@@ -237,6 +237,7 @@ mod effects_of_each_kind {
                     kind,
                     definition: "SELECT 1".into(),
                     description: None,
+                    options: Default::default(),
                 },
             );
         }
@@ -307,6 +308,7 @@ mod effects_of_each_kind {
             kind: ModuleKind::Function,
             definition: "SELECT 1".into(),
             description: None,
+            options: Default::default(),
         };
         let t = uid(UidKind::Table, "t");
         let p = uid(UidKind::Table, "p");

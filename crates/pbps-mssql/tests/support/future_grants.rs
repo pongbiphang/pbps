@@ -324,6 +324,7 @@ async fn future_grant_proof_respects_collation_missing_schemas_and_recorded_modu
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: "SELECT 1 AS id".into(),
+            options: Default::default(),
         },
     );
     recorded.roles.insert(

@@ -582,6 +582,7 @@ mod tests {
                         kind: pbps_model::ModuleKind::Function,
                         definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
                         description: None,
+                        options: Default::default(),
                     }),
                 }),
                 PlannedChange::new(Change::PublicExecution {

@@ -949,6 +949,7 @@ mod tests {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
                         definition: "SELECT 1".into(),
+                        options: Default::default(),
                     }),
                 }),
             ],

@@ -38,6 +38,7 @@ fn module(schema: &mut Schema, id: &str, kind: ModuleKind, definition: &str) {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         },
     );
 }

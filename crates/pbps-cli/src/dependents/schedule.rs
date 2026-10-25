@@ -612,6 +612,7 @@ mod tests {
             kind: ModuleKind::Function,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }
     }
 
@@ -1155,6 +1156,7 @@ mod tests {
                         definition:
                             "CONSTRAINT AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
                                 .into(),
+                        options: Default::default(),
                     },
                 );
                 let mut after = before.clone();

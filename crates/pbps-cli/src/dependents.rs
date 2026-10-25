@@ -4630,6 +4630,7 @@ mod tests {
             kind: ModuleKind::Function,
             description: None,
             definition: "() RETURNS boolean LANGUAGE sql AS 'SELECT false'".into(),
+            options: Default::default(),
         };
         let declared = Schema {
             tables: [(
@@ -4718,6 +4719,7 @@ mod tests {
                     kind: ModuleKind::Function,
                     description: None,
                     definition: "() RETURNS boolean LANGUAGE sql AS 'SELECT false'".into(),
+                    options: Default::default(),
                 };
                 declared.modules.insert(root.clone(), next.clone());
                 steps.push(Change::CreateModule {
@@ -4775,6 +4777,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }
     }
 
@@ -9536,6 +9539,7 @@ mod tests {
                     "{}AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f()",
                     if constraint { "CONSTRAINT " } else { "" }
                 ),
+                options: Default::default(),
             })
         };
         let mut baseline = Schema::default();
@@ -9847,6 +9851,7 @@ mod tests {
             kind: ModuleKind::Trigger,
             description: None,
             definition: "AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+            options: Default::default(),
         };
         let mut declared = baseline.clone();
         declared.modules.insert(id.clone(), ordinary.clone());
@@ -9926,6 +9931,7 @@ mod tests {
                 definition: format!(
                     "{marker}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
                 ),
+                options: Default::default(),
             }),
         };
         let refused_over = |changes: Vec<Change>, holders: &[KeyNameHolder]| -> Vec<String> {

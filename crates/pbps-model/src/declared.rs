@@ -1102,6 +1102,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: body.to_owned(),
+            options: Default::default(),
         }
     }
 

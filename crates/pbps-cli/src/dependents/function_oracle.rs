@@ -182,6 +182,7 @@ fn routine(name: &str, definition: &str, kind: ModuleKind) -> Change {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }),
     }
 }

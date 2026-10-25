@@ -556,7 +556,7 @@ derive:
 
 | Kind | Emitted prefix | `definition:` starts at |
 |---|---|---|
-| view | `CREATE OR ALTER VIEW <name> AS` | the `SELECT` |
+| view | `CREATE OR ALTER VIEW <name> [WITH SCHEMABINDING] AS` | the `SELECT` |
 | trigger | `CREATE OR ALTER TRIGGER <name> ON <on>` | `AFTER INSERT ...` |
 | procedure | `CREATE OR ALTER PROCEDURE <name>` | the parameter list, then `AS` |
 | function | `CREATE OR ALTER FUNCTION <name>` | the parameter list, then `RETURNS` |
@@ -565,8 +565,25 @@ A parameter list stays inside `definition` because it is part of the object's
 contract, and modelling T-SQL parameter syntax would mean parsing SQL — which
 this tool does not do (8.2).
 
-Two more rules, both consequences of the model rather than choices:
+Three more rules, all consequences of the model rather than choices:
 
+- **A SQL Server view says `schemabinding: true` to be created `WITH
+  SCHEMABINDING`** (DEC-2329.1). It is part of the module, not an annotation:
+  the engine records it, `pull` reads it back from `sys.sql_modules`, turning
+  it on or off is an in-place `CREATE OR ALTER`, and an identical declaration
+  is no change. The key is refused on a function, whose header is the user's
+  text and keeps `WITH SCHEMABINDING` where they wrote it, and on a procedure
+  or trigger. A bound module is a dependent the engine enforces: a plan that
+  retypes, drops or renames a column it reads, drops or renames its table, or
+  alters a view or function it reads, drops it first and creates it after,
+  without the declarations saying so (DEC-2329.2).
+- **An indexed view declares `indexes:` and the `clustered:` one** (DEC-2329.3).
+  The indexes are written as a table's are (`columns:`, `include:`, `unique:`)
+  and travel with the view: the engine drops every index when a view is
+  restated, so each create and alter of the view restates them, the clustered
+  one first. The clustered index must be unique, the view must be
+  schema-bound, and a view with an index the model cannot hold (disabled,
+  filtered, partitioned) stays unmanaged.
 - **`depends_on:` is an annotation, not state.** Creation order is invisible in
   the database, so it lives beside the model exactly as `strategy:` does. It is
   needed only where the identifier scan of ADR-0002 cannot see a dependency.
@@ -605,19 +622,22 @@ A module created `WITH ENCRYPTION`, a CLR object, one created with
 `QUOTED_IDENTIFIER` or `ANSI_NULLS` OFF (the engine persists those with the
 module and re-applies them on every execution, so the same text recreated under
 the deployment connection's settings would not mean the same thing), and a view
-carrying options the model cannot hold (`WITH SCHEMABINDING`) have no
-manageable form. `pull` inventories them with the reason and leaves them alone;
-it never recreates one without the option nobody noticed it had.
+carrying an option the model cannot hold (`VIEW_METADATA`, beside or instead of
+`SCHEMABINDING`) have no manageable form. `pull` inventories them with the
+reason, which tells an encrypted or hidden definition from a CLR object from a
+view option, and leaves them alone; it never recreates one without the option
+nobody noticed it had.
 
-**One ordering case is knowingly unserved.** Module drops sort before the table
-changes and creates and alters after them, which is right for an alter that
-begins using a column the same plan adds, and wrong for an alter that *releases*
-a schema-bound dependency the same plan then drops. The second needs to run
-first, one rank cannot be both, and telling them apart needs facts the model
-does not carry. The plan fails at apply, loudly and with nothing changed; the
-alternative — drop and recreate the module around the table changes — succeeds
-while destroying its GRANTs, which pbps cannot see, restore, or warn about
-until ADR-0005. ADR-0002 records the trade in full.
+**One ordering case is served for schema-bound modules only.** Module drops sort
+before the table changes and creates and alters after them, which is right for
+an alter that begins using a column the same plan adds, and wrong for a module
+that *holds* a schema binding on what the plan changes: the engine refuses the
+change while it stands. For SQL Server's `WITH SCHEMABINDING` the plan now drops
+such a module before the change and creates it after (DEC-2329.2), and ADR-0005's
+declared grants are written again after the create. Any other alter that
+releases a dependency the same plan drops is still not served: telling it apart
+needs facts the model does not carry, and the plan fails at apply, loudly and
+with nothing changed. ADR-0002 records the original trade in full.
 
 ---
 

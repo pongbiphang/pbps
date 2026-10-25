@@ -231,6 +231,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::Function,
                 description: None,
                 definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
+                options: Default::default(),
             }),
         };
         let access = |name: &str| Change::PublicExecution {

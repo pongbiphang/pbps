@@ -1468,6 +1468,7 @@ mod tests {
                     kind,
                     description: None,
                     definition: definition.into(),
+                    options: Default::default(),
                 });
                 steps.changes.push(PlannedChange::new(if alter {
                     Change::AlterModule { id, module }
@@ -1878,6 +1879,7 @@ mod rebuild_tests {
                         description: None,
                         definition: "(x app.e) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
                             .into(),
+                        options: Default::default(),
                     },
                 );
             },
@@ -2316,6 +2318,7 @@ mod rebuild_tests {
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: text.into(),
+            options: Default::default(),
         };
         let (mut base, mut desired) = (world(&["sad", "ok"]), world(&["ok"]));
         base.0

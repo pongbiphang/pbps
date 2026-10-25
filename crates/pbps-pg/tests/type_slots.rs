@@ -175,6 +175,7 @@ fn a_type_meets_table_and_view_row_types_but_not_indexes_or_sequences() {
                 kind: pbps_model::ModuleKind::View,
                 definition: "CREATE VIEW app.x AS SELECT 1 AS v".into(),
                 description: None,
+                options: Default::default(),
             }),
         };
         assert!(

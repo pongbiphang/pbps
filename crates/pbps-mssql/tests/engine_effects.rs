@@ -20,6 +20,7 @@ fn setup() -> (Schema, IdsFile, ModuleId, Module) {
         kind: ModuleKind::Function,
         definition: "CREATE FUNCTION dbo.f(@a int) RETURNS int AS BEGIN RETURN @a END".into(),
         description: None,
+        options: Default::default(),
     };
     let mut table = Table {
         columns: IndexMap::from([("a".into(), Column::new("int".parse().unwrap()))]),
@@ -291,10 +292,16 @@ struct Diffed {
 
 impl Diffed {
     fn new(base: &Schema, desired: &Schema) -> Diffed {
+        Diffed::deciding(base, desired, &[])
+    }
+
+    /// [`Diffed::new`] with the intents a person would have supplied: a drop
+    /// and a rename are never inferred.
+    fn deciding(base: &Schema, desired: &Schema, intents: &[pbps_model::Intent]) -> Diffed {
         let base_ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &ctx())
             .expect("resolve the base")
             .ids;
-        let ids = pbps_diff::resolve(desired, &base_ids, &[], &ctx())
+        let ids = pbps_diff::resolve(desired, &base_ids, intents, &ctx())
             .expect("resolve the desired state")
             .ids;
         let changes = pbps_diff::diff(
@@ -598,6 +605,7 @@ fn module_pair(caller: &str, alter_caller: bool) -> (Schema, Schema, ModuleId, M
         kind: ModuleKind::Function,
         definition: text.into(),
         description: None,
+        options: Default::default(),
     };
     let mut before = Schema::default();
     before.modules.insert(
@@ -739,6 +747,7 @@ fn schema_bound_callers_require_their_callees_final_definition() {
         kind: ModuleKind::Procedure,
         definition: text.into(),
         description: None,
+        options: Default::default(),
     };
     let f = ModuleId::Named(TableName::new("app", "f"));
     before
@@ -762,6 +771,7 @@ fn schema_bound_callers_require_their_callees_final_definition() {
         kind: ModuleKind::Function,
         definition: text.into(),
         description: None,
+        options: Default::default(),
     };
     let (f, g) = (
         ModuleId::Named(TableName::new("app", "f")),
@@ -839,6 +849,7 @@ fn case_distinct_callees_do_not_invent_a_schema_bound_cycle() {
         kind: ModuleKind::Function,
         definition: format!("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {body} END"),
         description: None,
+        options: Default::default(),
     };
     let named = |name| ModuleId::Named(TableName::new("app", name));
     let (a, upper, lower) = (named("A"), named("F"), named("f"));
@@ -943,6 +954,7 @@ fn an_unambiguous_case_insensitive_callee_still_binds() {
                         kind,
                         definition: "SELECT 1 AS n".into(),
                         description: None,
+                        options: Default::default(),
                     },
                 );
             }
@@ -992,6 +1004,7 @@ fn an_exact_callee_spelling_wins_over_a_case_only_neighbour() {
                             kind,
                             definition: "SELECT 1 AS n".into(),
                             description: None,
+                            options: Default::default(),
                         },
                     );
                 }
@@ -1022,4 +1035,464 @@ fn an_exact_callee_spelling_wins_over_a_case_only_neighbour() {
             assert_eq!(diffed.verify(&[0]), []);
         }
     }
+}
+
+// ---- schema binding (DEC-2329.1) ----
+//
+// Measured on 17.0: a `WITH SCHEMABINDING` view stops a retype, a collation or
+// nullability change, a drop and a rename of a column it reads (5074 behind
+// 4922, 15336), a drop or rename of its table, and an `ALTER` or `DROP` of a
+// view it reads (3729); a column it does not read, a default, a check and a
+// primary key are not stopped.
+
+fn view_of(body: &str, bound: bool) -> Module {
+    Module {
+        kind: ModuleKind::View,
+        definition: body.into(),
+        description: None,
+        options: pbps_model::ModuleOptions {
+            schemabinding: bound,
+            ..Default::default()
+        },
+    }
+}
+
+fn vid(name: &str) -> ModuleId {
+    ModuleId::Named(TableName::new("dbo", name))
+}
+
+/// `dbo.t(id, a, b)` with `a` typed as given, and these views.
+fn with_views(a: &str, views: &[(&str, Module)]) -> Schema {
+    let table = Table {
+        columns: IndexMap::from([
+            ("id".into(), Column::new(ty("int")).not_null()),
+            ("a".into(), Column::new(ty(a))),
+            ("b".into(), Column::new(ty("int"))),
+        ]),
+        ..Table::default()
+    };
+    let mut schema = Schema::default();
+    schema.tables.insert(t(), table);
+    for (name, module) in views {
+        schema.modules.insert(vid(name), module.clone());
+    }
+    schema
+}
+
+/// What each step of the plan does, in the plan's order.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn steps(plan: &Diffed) -> Vec<String> {
+    plan.changes
+        .iter()
+        .map(|p| match &p.change {
+            Change::DropModule { id, .. } => format!("drop {}", id.shown()),
+            Change::CreateModule { id, .. } => format!("create {}", id.shown()),
+            Change::AlterModule { id, .. } => format!("alter {}", id.shown()),
+            Change::AlterColumnType { column, .. } => format!("retype {}", column.name.shown()),
+            Change::AlterColumnNullability { column, .. } => {
+                format!("nullability {}", column.name.shown())
+            }
+            Change::DropColumn { column, .. } => format!("drop column {}", column.name.shown()),
+            Change::AddColumn { name, .. } => format!("add column {}", name.shown()),
+            Change::DropTable { name, .. } => format!("drop table {}", name.shown()),
+            Change::RenameTable { to, .. } => format!("rename table {}", to.shown()),
+            other => format!("other {}", other.subject()),
+        })
+        .collect()
+}
+
+/// The property the issue asks for: a column change under a bound view orders
+/// the view's drop and recreate around the change. The differ's own plan
+/// verifies, and the order that leaves the view standing is refused by name.
+#[test]
+fn a_bound_view_is_dropped_before_and_created_after_a_retype_of_a_column_it_reads() {
+    let view = view_of("SELECT id, a FROM dbo.t", true);
+    let plan = Diffed::new(
+        &with_views("varchar(10)", &[("v", view.clone())]),
+        &with_views("varchar(20)", &[("v", view)]),
+    );
+    assert_eq!(steps(&plan), ["drop dbo.v", "retype a", "create dbo.v"]);
+    assert_eq!(plan.verify(&[0, 1, 2]), []);
+    // The engine's 4922: the retype runs while the view stands.
+    let standing = plan.verify(&[1, 0, 2]);
+    assert!(
+        standing.iter().any(|v| matches!(
+            v,
+            Violation::StillPresent { key: ObjectKey::Module(id), .. } if *id == vid("v")
+        )),
+        "{standing:?}"
+    );
+    // The view comes back last: created before the change, it would bind the
+    // old column.
+    assert!(!plan.verify(&[0, 2, 1]).is_empty());
+}
+
+/// Every change the engine refuses beside a bound view brackets it, and the
+/// change that is not refused leaves the view alone.
+#[test]
+fn a_bound_view_is_rebuilt_only_around_the_changes_the_engine_refuses() {
+    let view = view_of("SELECT id, a FROM dbo.t", true);
+    let base = with_views("varchar(10)", &[("v", view.clone())]);
+    let table_without = |column: &str| {
+        let mut s = base.clone();
+        s.tables.get_mut(&t()).unwrap().columns.shift_remove(column);
+        s
+    };
+    let nullable_a = {
+        let mut s = base.clone();
+        s.tables.get_mut(&t()).unwrap().columns["a"] = Column::new(ty("varchar(10)")).not_null();
+        s
+    };
+    let added = {
+        let mut s = base.clone();
+        s.tables
+            .get_mut(&t())
+            .unwrap()
+            .columns
+            .insert("c".into(), Column::new(ty("int")));
+        s
+    };
+    let drops = |column: &str| {
+        [pbps_model::Intent::DropColumn {
+            column: t().column(column),
+            reason: "no longer needed".parse().unwrap(),
+        }]
+    };
+    for (desired, expected, intents) in [
+        // Read by the view: refused by the engine, so the view brackets it.
+        (
+            nullable_a,
+            vec!["drop dbo.v", "nullability a", "create dbo.v"],
+            Vec::new(),
+        ),
+        (
+            {
+                let mut s = table_without("a");
+                s.modules
+                    .insert(vid("v"), view_of("SELECT id FROM dbo.t", true));
+                s
+            },
+            vec!["drop dbo.v", "drop column a", "create dbo.v"],
+            drops("a").to_vec(),
+        ),
+        // Not read by the view, or not an alteration of an existing column:
+        // the engine allows them, and a rebuild would only cost the view.
+        (
+            table_without("b"),
+            vec!["drop column b"],
+            drops("b").to_vec(),
+        ),
+        (added, vec!["add column c"], Vec::new()),
+    ] {
+        let plan = Diffed::deciding(&base, &desired, &intents);
+        assert_eq!(steps(&plan), expected);
+        let own: Vec<usize> = (0..plan.changes.len()).collect();
+        assert_eq!(plan.verify(&own), [], "{expected:?}");
+    }
+}
+
+/// Binding is what makes a view a dependent: the same change beside a view
+/// that is not bound leaves it standing, and an in-place alter stays one.
+#[test]
+fn an_unbound_view_is_left_standing_beside_the_same_retype() {
+    let view = view_of("SELECT id, a FROM dbo.t", false);
+    let plan = Diffed::new(
+        &with_views("varchar(10)", &[("v", view.clone())]),
+        &with_views("varchar(20)", &[("v", view)]),
+    );
+    assert_eq!(steps(&plan), ["retype a"]);
+}
+
+/// A bound view over a table the plan drops goes with it, and one over a
+/// table renamed away: both are what `sp_rename` and `DROP TABLE` refuse.
+#[test]
+fn a_bound_view_goes_before_the_drop_or_rename_of_its_table() {
+    let view = view_of("SELECT id FROM dbo.t", true);
+    let base = with_views("int", &[("v", view.clone())]);
+    // The table is dropped and the view is rewired to a new one.
+    let mut rewired = Schema::default();
+    rewired
+        .tables
+        .insert(TableName::new("dbo", "u"), base.tables[&t()].clone());
+    rewired
+        .modules
+        .insert(vid("v"), view_of("SELECT id FROM dbo.u", true));
+    let plan = Diffed::deciding(
+        &base,
+        &rewired,
+        &[pbps_model::Intent::DropTable {
+            table: t(),
+            reason: "replaced by dbo.u".parse().unwrap(),
+        }],
+    );
+    let steps = steps(&plan);
+    let at = |what: &str| {
+        steps
+            .iter()
+            .position(|s| s == what)
+            .unwrap_or_else(|| panic!("{what} missing: {steps:?}"))
+    };
+    assert!(at("drop dbo.v") < at("drop table dbo.t"), "{steps:?}");
+    assert!(at("create dbo.v") > at("drop table dbo.t"), "{steps:?}");
+    assert!(!steps.iter().any(|s| s.starts_with("alter")), "{steps:?}");
+}
+
+/// A bound view cannot be dropped while a bound view reads it, so the
+/// reader is rebuilt with it, outside first and inside first on the way back.
+#[test]
+fn a_view_bound_to_a_rebuilt_view_is_rebuilt_with_it() {
+    let inner = view_of("SELECT id, a FROM dbo.t", true);
+    let outer = view_of("SELECT id FROM dbo.v", true);
+    let unbound = view_of("SELECT id FROM dbo.v", false);
+    let base = with_views(
+        "varchar(10)",
+        &[
+            ("v", inner.clone()),
+            ("w", outer.clone()),
+            ("x", unbound.clone()),
+        ],
+    );
+    let plan = Diffed::new(
+        &base,
+        &with_views("varchar(20)", &[("v", inner), ("w", outer), ("x", unbound)]),
+    );
+    // `x` reads the inner view without binding it: nothing stops it standing.
+    assert_eq!(
+        steps(&plan),
+        [
+            "drop dbo.w",
+            "drop dbo.v",
+            "retype a",
+            "create dbo.v",
+            "create dbo.w"
+        ]
+    );
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+}
+
+/// Altering a view in place while a bound view reads it is the engine's 3729,
+/// so the reader is dropped before the alter and created after it.
+#[test]
+fn a_bound_view_is_rebuilt_around_an_in_place_alter_of_the_view_it_reads() {
+    let outer = view_of("SELECT id FROM dbo.v", true);
+    let base = with_views(
+        "int",
+        &[
+            ("v", view_of("SELECT id, a FROM dbo.t", true)),
+            ("w", outer.clone()),
+        ],
+    );
+    let plan = Diffed::new(
+        &base,
+        &with_views(
+            "int",
+            &[
+                ("v", view_of("SELECT id, a, b FROM dbo.t", true)),
+                ("w", outer),
+            ],
+        ),
+    );
+    assert_eq!(steps(&plan), ["drop dbo.w", "alter dbo.v", "create dbo.w"]);
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+}
+
+/// A view changed in the same revision is rebuilt, not altered in place: the
+/// alter would run after the retype and the engine would refuse the retype.
+#[test]
+fn a_bound_view_edited_beside_a_retype_is_dropped_and_created_not_altered() {
+    let plan = Diffed::new(
+        &with_views(
+            "varchar(10)",
+            &[("v", view_of("SELECT id, a FROM dbo.t", true))],
+        ),
+        &with_views(
+            "varchar(20)",
+            &[("v", view_of("SELECT id, a, b FROM dbo.t", true))],
+        ),
+    );
+    assert_eq!(steps(&plan), ["drop dbo.v", "retype a", "create dbo.v"]);
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+}
+
+/// The match needs the table as well as the column: a bound view over another
+/// table with a column of the same name is not stranded by the retype.
+#[test]
+fn a_bound_view_over_another_table_with_the_same_column_name_is_left_standing() {
+    let other = |a: &str| {
+        let mut s = with_views(a, &[("v", view_of("SELECT id, a FROM dbo.u", true))]);
+        let u = Table {
+            columns: IndexMap::from([
+                ("id".into(), Column::new(ty("int")).not_null()),
+                ("a".into(), Column::new(ty("varchar(10)"))),
+            ]),
+            ..Table::default()
+        };
+        s.tables.insert(TableName::new("dbo", "u"), u);
+        s
+    };
+    let plan = Diffed::new(&other("varchar(10)"), &other("varchar(20)"));
+    assert_eq!(steps(&plan), ["retype a"]);
+}
+
+/// A bound function is a dependent too: a retype of a column it reads
+/// brackets it as it does a view, with the option in its own header.
+#[test]
+fn a_bound_function_is_rebuilt_around_a_retype_of_a_column_it_reads() {
+    let function = |bound: bool| Module {
+        kind: ModuleKind::Function,
+        definition: format!(
+            "() RETURNS int {} AS BEGIN RETURN (SELECT COUNT(a) FROM dbo.t) END",
+            if bound { "WITH SCHEMABINDING" } else { "" }
+        ),
+        description: None,
+        options: Default::default(),
+    };
+    for (bound, expected) in [
+        (true, vec!["drop dbo.f", "retype a", "create dbo.f"]),
+        (false, vec!["retype a"]),
+    ] {
+        let mut base = with_views("varchar(10)", &[]);
+        base.modules.insert(vid("f"), function(bound));
+        let mut desired = with_views("varchar(20)", &[]);
+        desired.modules.insert(vid("f"), function(bound));
+        let plan = Diffed::new(&base, &desired);
+        assert_eq!(steps(&plan), expected, "bound={bound}");
+    }
+}
+
+/// A computed column a bound view reads is a column of its table: dropping it
+/// brackets the view (4922 otherwise).
+#[test]
+fn a_bound_view_is_rebuilt_around_the_drop_of_a_computed_column_it_reads() {
+    let with_computed = |computed: bool, view: &str| {
+        let mut s = with_views("int", &[("v", view_of(view, true))]);
+        if computed {
+            s.tables.get_mut(&t()).unwrap().computed.insert(
+                "c".into(),
+                ComputedColumn {
+                    expression: "a * 2".into(),
+                    persisted: false,
+                    not_null: false,
+                },
+            );
+        }
+        s
+    };
+    let plan = Diffed::new(
+        &with_computed(true, "SELECT id, c FROM dbo.t"),
+        &with_computed(false, "SELECT id FROM dbo.t"),
+    );
+    let steps = steps(&plan);
+    let at = |what: &str| steps.iter().position(|s| s == what).unwrap_or(usize::MAX);
+    assert!(steps.contains(&"drop dbo.v".to_owned()), "{steps:?}");
+    assert!(
+        at("drop dbo.v") < at("other dbo.t") && at("other dbo.t") < at("create dbo.v"),
+        "{steps:?}"
+    );
+}
+
+/// `sp_rename` of a table a bound view reads is refused (15336), so the view
+/// goes before the rename and comes back, reading the new name, after it.
+#[test]
+fn a_bound_view_goes_around_the_rename_of_its_table() {
+    let base = with_views("int", &[("v", view_of("SELECT id FROM dbo.t", true))]);
+    let mut desired = Schema::default();
+    desired
+        .tables
+        .insert(TableName::new("dbo", "t2"), base.tables[&t()].clone());
+    desired
+        .modules
+        .insert(vid("v"), view_of("SELECT id FROM dbo.t2", true));
+    let plan = Diffed::deciding(
+        &base,
+        &desired,
+        &[pbps_model::Intent::RenameTable {
+            from: t(),
+            to: TableName::new("dbo", "t2"),
+        }],
+    );
+    assert_eq!(
+        steps(&plan),
+        ["drop dbo.v", "rename table dbo.t2", "create dbo.v"]
+    );
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+}
+
+/// The option is part of the module: turning it on or off is an in-place
+/// alter (`CREATE OR ALTER` sets it either way, measured on 17.0), and an
+/// identical declaration is no change.
+#[test]
+fn toggling_schemabinding_is_an_alter_and_an_identical_view_is_none() {
+    let bound = view_of("SELECT id FROM dbo.t", true);
+    let plain = view_of("SELECT id FROM dbo.t", false);
+    for (from, to) in [(&plain, &bound), (&bound, &plain)] {
+        let plan = Diffed::new(
+            &with_views("int", &[("v", from.clone())]),
+            &with_views("int", &[("v", to.clone())]),
+        );
+        assert_eq!(steps(&plan), ["alter dbo.v"]);
+    }
+    let same = Diffed::new(
+        &with_views("int", &[("v", bound.clone())]),
+        &with_views("int", &[("v", bound)]),
+    );
+    assert_eq!(steps(&same), Vec::<String>::new());
+}
+
+/// An index on a view is part of the module (DEC-2329.3): adding one is an
+/// in-place alter, which restates all of them (`CREATE OR ALTER VIEW` drops
+/// every index), and a rebuild around a retype carries them in its create.
+#[test]
+fn a_views_indexes_are_compared_and_survive_a_rebuild() {
+    let indexed = |extra: bool| {
+        let mut view = view_of("SELECT id, a FROM dbo.t", true);
+        let index = |column: &str, unique: bool| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn::column(column)],
+            include: Vec::new(),
+            unique,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        view.options.indexes.insert("ux".into(), index("id", true));
+        view.options.clustered = Some("ux".into());
+        if extra {
+            view.options.indexes.insert("ix".into(), index("a", false));
+        }
+        view
+    };
+    let plan = Diffed::new(
+        &with_views("int", &[("v", indexed(false))]),
+        &with_views("int", &[("v", indexed(true))]),
+    );
+    assert_eq!(steps(&plan), ["alter dbo.v"]);
+    let Change::AlterModule { module, .. } = &plan.changes[0].change else {
+        panic!("{:?}", plan.changes);
+    };
+    assert_eq!(module.options.indexes.len(), 2);
+
+    let plan = Diffed::new(
+        &with_views("varchar(10)", &[("v", indexed(true))]),
+        &with_views("varchar(20)", &[("v", indexed(true))]),
+    );
+    assert_eq!(steps(&plan), ["drop dbo.v", "retype a", "create dbo.v"]);
+    let Change::CreateModule { module, .. } = &plan.changes[2].change else {
+        panic!("{:?}", plan.changes);
+    };
+    assert_eq!(module.options.indexes.len(), 2);
+    assert_eq!(
+        module.options.clustered.as_ref().map(|c| c.raw()),
+        Some("ux")
+    );
+
+    // And the same declaration is no change at all.
+    let same = Diffed::new(
+        &with_views("int", &[("v", indexed(true))]),
+        &with_views("int", &[("v", indexed(true))]),
+    );
+    assert_eq!(steps(&same), Vec::<String>::new());
 }

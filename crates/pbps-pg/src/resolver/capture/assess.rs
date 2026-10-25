@@ -1124,6 +1124,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::Function,
                 description: None,
                 definition: String::new(),
+                options: Default::default(),
             },
         );
         let managed = Managed::from_schema(&schema);

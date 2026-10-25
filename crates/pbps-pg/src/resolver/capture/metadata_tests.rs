@@ -141,6 +141,7 @@ async fn exercise(connection: String) {
                 kind,
                 description: None,
                 definition: definition.into(),
+                options: Default::default(),
             },
         );
     }

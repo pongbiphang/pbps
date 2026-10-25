@@ -13,6 +13,7 @@ pub fn combined(callee: &str) -> (Schema, Schema, IdsFile, ChangeSet) {
             if bound { "WITH SCHEMABINDING" } else { "" }
         ),
         description: None,
+        options: Default::default(),
     };
     let mut before = Schema::default();
     for (name, body) in [("f", "@x"), ("g", "app.f(@x)"), ("z", "@x")] {

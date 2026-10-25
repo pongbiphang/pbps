@@ -98,6 +98,7 @@ fn observed(ty: &str) -> Schema {
                 kind: ModuleKind::View,
                 description: None,
                 definition: format!("SELECT {cast} AS v"),
+                options: Default::default(),
             },
         )]
         .into(),

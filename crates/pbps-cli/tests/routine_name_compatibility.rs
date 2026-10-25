@@ -40,6 +40,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
                     kind: ModuleKind::View,
                     definition: "SELECT 1 AS id".into(),
                     description: None,
+                    options: Default::default(),
                 },
             ),
             (
@@ -48,6 +49,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
                     kind: ModuleKind::Function,
                     definition,
                     description: None,
+                    options: Default::default(),
                 },
             ),
         ]
@@ -232,6 +234,7 @@ fn a_routine_refusal_is_escaped_exactly_once() {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: String::new(),
+                options: Default::default(),
             }),
         };
         let error = pbps_pg::Postgres::new()

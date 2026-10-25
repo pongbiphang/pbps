@@ -30,6 +30,7 @@ use pbps_model::{
     Change, ColumnType, Module, ModuleId, RiskClass, Role, Schema, Strategy, Table, TableName,
 };
 
+mod binding;
 pub mod catalog;
 pub mod dependencies;
 pub mod doctor;
@@ -213,11 +214,19 @@ impl Dialect for Mssql {
                 .merged(pbps_dialect::engine_effects::retype_blockers(
                     self, op, owners, before, after,
                 )?);
+        // A module bound to what this step changes must be gone while it
+        // runs: the plan drops it before and creates it again after
+        // (DEC-2329.1). The differ asks the same question, so the order it
+        // writes is the order checked here.
+        for bound in binding::torn_down_by(self, before.schema, op.change()) {
+            fx.requires
+                .push(Requirement::Absent(ObjectKey::Module(bound)));
+        }
         if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change()
-            // Functions retain their header options in the model; views do
-            // not (DECISIONS 29). Read this step's payload, not its endpoint.
-            && module.kind == pbps_model::ModuleKind::Function
-            && introspect::function_is_schema_bound(&module.definition)
+            // A function keeps its header options in its text and a view in
+            // its flag (DEC-2329.1). Read this step's payload, not its
+            // endpoint.
+            && binding::is_schema_bound(module)
         {
             for callee in schema_bound_callees(self, id, module, after.schema) {
                 fx.requires.push(Requirement::Is(
@@ -237,11 +246,10 @@ impl Dialect for Mssql {
         };
         if let Some((id, replacement)) = releasing
             && let Some(old) = before.schema.modules.get(id)
-            && old.kind == pbps_model::ModuleKind::Function
-            && introspect::function_is_schema_bound(&old.definition)
+            && binding::is_schema_bound(old)
         {
             let kept = replacement
-                .filter(|module| introspect::function_is_schema_bound(&module.definition))
+                .filter(|module| binding::is_schema_bound(module))
                 .map(|module| schema_bound_callees(self, id, module, after.schema))
                 .unwrap_or_default();
             for callee in schema_bound_callees(self, id, old, before.schema) {
@@ -418,6 +426,19 @@ impl Dialect for Mssql {
 
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         types::normalize(ty)
+    }
+
+    /// SQL Server's `WITH SCHEMABINDING` (DEC-2329.1): see [`binding`].
+    fn schema_bound_teardown(
+        &self,
+        base: &Schema,
+        declared: &Schema,
+        changes: &[Change],
+    ) -> std::collections::BTreeSet<ModuleId> {
+        binding::torn_down(self, base, changes)
+            .into_iter()
+            .filter(|id| base.modules.contains_key(id) && declared.modules.contains_key(id))
+            .collect()
     }
 
     fn retype_dependents(

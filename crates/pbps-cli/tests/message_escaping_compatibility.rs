@@ -136,6 +136,7 @@ fn trigger_refusals_show_names_once_in_the_sentence_and_its_sql_example() {
             kind: ModuleKind::Trigger,
             description: None,
             definition: "AFTER INSERT ON app.other FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+            options: Default::default(),
         };
         let errors = pbps_pg::Postgres::new().validate_module(&id, &module);
         assert_eq!(errors.len(), 1, "{errors:?}");
@@ -511,6 +512,7 @@ fn bare_routine_grant_refusals_show_single_and_overloaded_signatures_once() {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "() RETURNS integer LANGUAGE sql AS 'SELECT 1'".into(),
+                options: Default::default(),
             },
         );
         for overloaded in [false, true] {
@@ -524,6 +526,7 @@ fn bare_routine_grant_refusals_show_single_and_overloaded_signatures_once() {
                         kind: ModuleKind::Function,
                         description: None,
                         definition: "() RETURNS integer LANGUAGE sql AS 'SELECT 1'".into(),
+                        options: Default::default(),
                     },
                 );
             }

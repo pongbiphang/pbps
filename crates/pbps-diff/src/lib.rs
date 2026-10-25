@@ -168,6 +168,7 @@ mod tests {
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: "definition".into(),
+            options: Default::default(),
         }
     }
 

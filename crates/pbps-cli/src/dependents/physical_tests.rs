@@ -89,6 +89,7 @@ fn changes(detach: bool, rebuild_first: bool) -> ChangeSet {
             kind: ModuleKind::Function,
             description: None,
             definition: "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x + 1 $$".into(),
+            options: Default::default(),
         }),
     };
     let changes = if rebuild_first {
@@ -447,6 +448,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         kind: ModuleKind::Function,
         description: None,
         definition: "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x + 1 $$".into(),
+        options: Default::default(),
     };
     after.modules.insert(root.clone(), module.clone());
     let before_ids = IdsFile {

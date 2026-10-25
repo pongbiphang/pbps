@@ -229,6 +229,7 @@ fn view(name: &str) -> (ModuleId, Module) {
             kind: ModuleKind::View,
             definition: "SELECT 1 AS id".into(),
             description: None,
+            options: Default::default(),
         },
     )
 }
@@ -390,6 +391,7 @@ fn rebuilt_routine() -> (Operations, Vec<Effects>, Baseline) {
                      LANGUAGE sql;"
             .into(),
         description: None,
+        options: Default::default(),
     };
     let ModuleId::Routine(routine) = id.clone() else {
         unreachable!("declared as a routine")
@@ -3100,6 +3102,7 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
             kind: ModuleKind::Trigger,
             definition: "BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()".into(),
             description: None,
+            options: Default::default(),
         },
     );
     let mut triggered = insert_beside_a_dropped_column(true);
@@ -4800,6 +4803,7 @@ fn a_routine_s_public_execution_follows_its_edit_in_place() {
             "CREATE FUNCTION app.f(a integer) RETURNS integer AS '{body}' LANGUAGE sql;"
         ),
         description: None,
+        options: Default::default(),
     };
     let ModuleId::Routine(routine) = id.clone() else {
         unreachable!("declared as a routine")
@@ -4902,6 +4906,7 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
                     kind: ModuleKind::Function,
                     definition: "() RETURNS int AS BEGIN RETURN 1 END".into(),
                     description: None,
+                    options: Default::default(),
                 }),
             })
         })

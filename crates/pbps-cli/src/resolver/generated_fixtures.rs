@@ -106,6 +106,7 @@ pub(crate) fn shape(case: &str) -> Schema {
                 "called-insert" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC INSERT INTO app.a VALUES ($1, DEFAULT, 5); SELECT $1 * 2; END",
                 _ => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2",
             }.into(),
+            options: Default::default(),
         },
     );
     if ["chain", "chain-pure", "chain-cycle"].contains(&case) {
@@ -119,6 +120,7 @@ pub(crate) fn shape(case: &str) -> Schema {
                     "chain-cycle" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT app.f($1); END",
                     _ => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT $1 * 2; END",
                 }.into(),
+                options: Default::default(),
             },
         );
     }
@@ -163,6 +165,7 @@ pub(crate) fn shape(case: &str) -> Schema {
                     kind: ModuleKind::Function,
                     description: None,
                     definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                    options: Default::default(),
                 },
             );
         }
@@ -179,6 +182,7 @@ pub(crate) fn shape(case: &str) -> Schema {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT * FROM app.a".into(),
+            options: Default::default(),
         },
     );
     schema

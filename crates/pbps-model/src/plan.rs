@@ -267,7 +267,10 @@ use crate::zone::SessionZone;
 /// refusal can name the routine (DEC-2333.1).
 /// 52 adds executable enum label changes and intermediate definitions (DEC-1635.6).
 /// 53 adds the keep-uid enum rebuild steps and the `type-rebuild` risk class (DEC-1635.7).
-pub const CURRENT_VERSION: u32 = 53;
+/// 54 adds a module's `options` (a view's `WITH SCHEMABINDING`, its indexes and
+/// clustered key; DEC-2329.1, DEC-2329.3), which an older build reads as
+/// unknown and would otherwise drop.
+pub const CURRENT_VERSION: u32 = 54;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -829,7 +832,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 53);
+        assert_eq!(CURRENT_VERSION, 54);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -1108,6 +1111,7 @@ mod tests {
                     kind: ModuleKind::View,
                     description: None,
                     definition: "SELECT 1 AS id".into(),
+                    options: Default::default(),
                 }),
             })],
         }))

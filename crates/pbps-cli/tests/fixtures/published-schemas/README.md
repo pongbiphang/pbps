@@ -63,3 +63,4 @@ DECISIONS 465).
 - `51/` adds table `row_security:` and `row_policies:` (issue #1172 PR A).
 - `52/` publishes created-table policy and row-security planning (issue #1172 PR C).
 - `53/` adds trusted roles and reviewed input-path routines for existing PostgreSQL type references (#1523, #2181).
+- `62/` adds a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).

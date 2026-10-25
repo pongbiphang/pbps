@@ -298,6 +298,8 @@ fn spellings_of(word: &str) -> String {
             "procedure": {"type": "string"},
             "view": {"type": "null"}, "function": {"type": "null"},
             "trigger": {"type": "null"}, "on": {"type": "null"},
+            "schemabinding": {"type": "null"},
+            "indexes": {"type": "null"}, "clustered": {"type": "null"},
         },
     }),
     serde_json::json!({
@@ -306,6 +308,8 @@ fn spellings_of(word: &str) -> String {
             "function": {"type": "string"},
             "view": {"type": "null"}, "procedure": {"type": "null"},
             "trigger": {"type": "null"}, "on": {"type": "null"},
+            "schemabinding": {"type": "null"},
+            "indexes": {"type": "null"}, "clustered": {"type": "null"},
         },
     }),
     serde_json::json!({
@@ -313,7 +317,8 @@ fn spellings_of(word: &str) -> String {
         "properties": {
             "trigger": {"type": "string"}, "on": {"type": "string"},
             "view": {"type": "null"}, "procedure": {"type": "null"},
-            "function": {"type": "null"},
+            "function": {"type": "null"}, "schemabinding": {"type": "null"},
+            "indexes": {"type": "null"}, "clustered": {"type": "null"},
         },
     }),
 ]))]
@@ -338,6 +343,28 @@ pub struct ModuleDto {
     #[serde(default)]
     #[schemars(with = "Option<String>")]
     pub on: Option<Spanned<String>>,
+
+    /// Makes a SQL Server view `WITH SCHEMABINDING` (DEC-2329.1). Meaningless
+    /// on anything else and rejected there: a function states the option in
+    /// its own header text, and the other kinds have none.
+    ///
+    /// Written by `fmt` only when `true`, as `public_execute:` is.
+    #[serde(default)]
+    #[schemars(with = "Option<bool>")]
+    pub schemabinding: Option<Spanned<bool>>,
+
+    /// An indexed view's indexes, as a table declares them: `columns:` (each
+    /// optionally `desc`), `include:` and `unique:`. A view takes no `where:`,
+    /// `keys:`, `method:` or `storage_parameters:`; the dialect refuses them.
+    /// Meaningless without `schemabinding: true`, and rejected on every kind
+    /// but a view (DEC-2329.3).
+    #[serde(default)]
+    pub indexes: BTreeMap<pbps_model::ObjectLocalName, IndexDto>,
+
+    /// The name of the unique index among `indexes:` that is clustered: the
+    /// engine wants one first, and says nothing about which it is.
+    #[serde(default)]
+    pub clustered: Option<pbps_model::ObjectLocalName>,
 
     /// The body. What it starts with depends on the kind; see
     /// [`pbps_model::Module`].

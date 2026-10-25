@@ -74,6 +74,7 @@ fn function() -> (ModuleId, Module) {
             kind: ModuleKind::Function,
             description: None,
             definition: "(a integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN a".into(),
+            options: Default::default(),
         },
     )
 }

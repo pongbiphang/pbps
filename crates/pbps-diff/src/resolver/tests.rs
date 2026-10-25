@@ -130,6 +130,7 @@ fn a_binding_edge_is_respected_where_the_effects_allow_the_other_order() {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT 1 AS id".into(),
+            options: Default::default(),
         },
     );
     let wanted_ids = ids(&desired, &old_ids);
@@ -250,6 +251,7 @@ mod unowned_steps {
             description: None,
             definition: "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
                 .into(),
+            options: Default::default(),
         };
         desired.modules.insert(function.clone(), module.clone());
         let before_ids = ids(&base, &IdsFile::default());
@@ -427,6 +429,7 @@ fn a_resolver_plan_with_a_cycle_through_the_evidence_is_refused_by_name() {
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT 1 AS id".into(),
+                options: Default::default(),
             },
         );
     }
@@ -540,6 +543,7 @@ fn independent_table_changes_can_cross_the_old_name_order_without_a_false_cycle(
             kind: ModuleKind::Function,
             description: None,
             definition: "fixture supplied by engine".into(),
+            options: Default::default(),
         },
     );
     let wanted_ids = ids(&desired, &old_ids);
@@ -632,6 +636,7 @@ fn explicit_module_dependencies_and_ordinary_orders_survive_resolution() {
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT 1 AS id".into(),
+                options: Default::default(),
             },
         );
     }
@@ -702,6 +707,7 @@ fn schema_authorization_precedes_binding_ddl_and_keeps_principal_creation() {
             kind: ModuleKind::Function,
             description: None,
             definition: "fixture supplied by engine".into(),
+            options: Default::default(),
         },
     );
     desired.roles.insert(
@@ -781,7 +787,7 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
         PlannedChange::new(Change::DropForeignKey { table: new.clone(), name: "fk".into() }),
         PlannedChange::new(Change::AlterColumnType { uid: old_ids.column_uid(&parent.column("id")).unwrap().clone(), column: parent.column("id"), from: "int".parse::<ColumnType>().unwrap(), to: "text".parse().unwrap(), from_nullable: false, to_nullable: false, from_collation: None, to_collation: None, through_external_partitions: false, using: None }),
         PlannedChange::new(Change::DropModule { id: routine.clone(), kind: ModuleKind::Function }),
-        PlannedChange::new(Change::CreateModule { id: routine.clone(), module: Box::new(Module { kind: ModuleKind::Function, description: None, definition: "() RETURNS integer LANGUAGE SQL RETURN (SELECT count(*)::integer FROM app.u)".into() }) }),
+        PlannedChange::new(Change::CreateModule { id: routine.clone(), module: Box::new(Module { kind: ModuleKind::Function, description: None, options: Default::default(), definition: "() RETURNS integer LANGUAGE SQL RETURN (SELECT count(*)::integer FROM app.u)".into() }) }),
     ] };
     let mut observed = observation(
         Surface::Module(routine),
@@ -841,6 +847,7 @@ fn deprecation_does_not_rebuild_unchanged_column_dependents() {
                 kind,
                 description: None,
                 definition: "fixture supplied by engine".into(),
+                options: Default::default(),
             },
         );
     }
@@ -1526,6 +1533,7 @@ mod generated_surface_coverage {
                     kind: pbps_model::ModuleKind::Function,
                     description: None,
                     definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                    options: Default::default(),
                 },
             );
             let after_ids = ids(&desired, &before_ids);
@@ -1569,6 +1577,7 @@ mod generated_surface_coverage {
                 kind: pbps_model::ModuleKind::Function,
                 description: None,
                 definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                options: Default::default(),
             },
         )
     }
@@ -2756,6 +2765,7 @@ mod generated_surface_coverage {
                     kind: pbps_model::ModuleKind::Function,
                     description: None,
                     definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                    options: Default::default(),
                 },
             )
         };
@@ -3296,6 +3306,7 @@ mod generated_surface_coverage {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            options: Default::default(),
         };
         let mut base = partitioned(Some("0"), Some("app.f(1)"));
         base.modules.insert(f.clone(), module.clone());
@@ -3398,6 +3409,7 @@ mod generated_surface_coverage {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: format!("(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN {body}"),
+            options: Default::default(),
         };
         let mut base = partitioned(Some("app.f(0)"), Some("app.f(1)"));
         base.modules.insert(f.clone(), module("$1"));
@@ -4057,6 +4069,7 @@ mod generated_surface_coverage {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            options: Default::default(),
         };
         let mut base = partitioned(Some("0"), Some("app.f(1)"));
         base.modules.insert(f.clone(), module);
@@ -4433,6 +4446,7 @@ fn evidence_replaces_the_candidate_rebuild_of_an_unchanged_module() {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT f() AS x".into(),
+            options: Default::default(),
         },
     );
     let mut desired = base.clone();
@@ -4442,6 +4456,7 @@ fn evidence_replaces_the_candidate_rebuild_of_an_unchanged_module() {
             kind: ModuleKind::Function,
             description: None,
             definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+            options: Default::default(),
         },
     );
     let old_ids = ids(&base, &IdsFile::default());
@@ -5028,6 +5043,7 @@ mod operations {
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT f() AS x".into(),
+                options: Default::default(),
             },
         );
         let mut desired = base.clone();
@@ -5037,6 +5053,7 @@ mod operations {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                options: Default::default(),
             },
         );
         let bound = |target: &str| BoundSurface {
@@ -5379,6 +5396,7 @@ fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
         kind: ModuleKind::Function,
         description: None,
         definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        options: Default::default(),
     };
     let desired = Schema {
         tables: [(name.clone(), table.clone())].into(),

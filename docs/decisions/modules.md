@@ -24,6 +24,10 @@ the [decision record](../DECISIONS.md), which says how to add an entry here.
     nowhere to keep its options, so the module is inventoried as unmanaged
     rather than recreated later without them.
 
+    *Amended by [DEC-2329.1](#dec-2329-1): `WITH SCHEMABINDING` on a view now
+    has a place in the model; other view options still make a module
+    unmanaged.*
+
 <a id="decision-164"></a>
 
 164. **A module leaves the managed set when its `DROP` runs, not when the plan
@@ -1950,3 +1954,161 @@ verifier's: `a_broken_depends_on_is_refused_as_declared`
 **DEC-2181.3. Review opaque roots; rely on DEC-319.1 for their callees.** Owner and actor trust applies to every type and routine on the whole input path, including code-free and built-in objects: an untrusted owner can add code after validation. Pinning adds to that trust; it never replaces it, including the existing `trusted_roles` rule. Do not enumerate callees or require a function-level `search_path`: PL/pgSQL and string SQL have no complete catalog dependency closure on PostgreSQL 16 and 18. Review approves the shown routine, whatever it calls as those routines stand at plan time, and SQL built from data which pbps cannot show. Sessions use DEC-1564.1's empty path, but inside an emitted statement's scoped `search_path`, an unqualified call can resolve to a routine created during apply. DEC-319.1's broad pins detect that and roll back before COMMIT in transactional apply, or detect it after a nontransactional staged step: detection, not prevention. Measured on 16 and 18, an unchanged opaque root's replaced callee is refused before statements, and a newly created scoped-path overload can execute before the closing pin check rolls back the statement.
 
 Pinned by `an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement`, `a_scoped_path_overload_created_during_a_statement_is_detected_before_commit` and `pinned_type_routines_require_owner_and_actor_trust_on_postgres_16` / `pinned_type_routines_require_owner_and_actor_trust_on_postgres_18`, plus `whole_input_path_owners_require_trust_and_later_checks_invalidate_pins_on_postgres_16` / `whole_input_path_owners_require_trust_and_later_checks_invalidate_pins_on_postgres_18`, live on 16 and 18.
+
+<a id="dec-2329-1"></a>
+
+**DEC-2329.1. A SQL Server view's `WITH SCHEMABINDING` is a module option, not
+text the model drops.** (#2329.) Decision 30 refused a schema-bound view
+because the model had nowhere to keep the option. The choices that are not the
+obvious ones:
+
+*Where the option lives.* `Module.options.schemabinding` for a view, written
+by the emitter between the name and `AS` and read back by `split_module` from
+the same place. A function keeps `WITH SCHEMABINDING` in its header text,
+which is the user's from the name on (parameters, return type): a flag beside
+that text would be a second source of truth, and inserting the clause would
+mean parsing it. So the YAML key is refused on a function, a procedure and a
+trigger, by the loader and again by validation for a module that reaches the
+emitter another way, and on PostgreSQL. The options sit in one struct so a
+later option does not touch every place a `Module` is written. This change moves the plan format to 54, the state format to 33 and the
+schema set to 62, because an older build would read the key as unknown or
+drop it.
+
+*It is compared.* The differ compares the options with the definition, so an
+identical view is no change and turning the option on or off is an in-place
+`CREATE OR ALTER`, which sets it either way (measured on 17.0.4075.5, the
+view keeping its grants). The word in a definition is no proof of the clause
+(DEC-1431.1): the splitter reads only the header, and the header must agree
+with `sys.sql_modules.is_schema_bound` before a view is managed.
+
+*What pull keeps unmanaged, and why it says so.* Any other view option
+(`VIEW_METADATA`, alone or beside `SCHEMABINDING`) still makes the view
+unmanaged. The reason now names which: a CLR object, a definition the login
+cannot read (created `WITH ENCRYPTION`, or no `VIEW DEFINITION`), a view with
+an option pbps cannot hold. Recreating a view without an option nobody noticed
+it had is the one direction that removes a guarantee.
+
+Pinned by `toggling_schemabinding_is_an_alter_and_an_identical_view_is_none`
+(`crates/pbps-mssql/tests/engine_effects.rs`);
+`a_schema_bound_view_is_managed_with_its_flag`,
+`unmanageable_modules_are_inventoried_with_the_reason`,
+`a_view_whose_header_and_catalog_disagree_about_schemabinding_is_inventoried`,
+`a_views_schemabinding_round_trips_through_the_emitter_and_the_splitter` and
+`an_unaccountable_definition_does_not_split`
+(`crates/pbps-mssql/src/introspect.rs`);
+`a_view_declares_schemabinding_and_absent_means_off` and
+`only_a_view_may_say_schemabinding` (`crates/pbps-load/src/lib.rs`);
+`a_views_schemabinding_survives_formatting_and_the_default_writes_nothing`
+(`crates/pbps-load/src/fmt.rs`);
+`only_a_view_carries_schemabinding_as_an_option`
+(`crates/pbps-mssql/src/validate.rs`); and the live
+`a_schema_bound_view_round_trips_through_pull_plan_and_apply` and
+`pull_reads_every_kind_of_module_back`.
+
+<a id="dec-2329-2"></a>
+
+**DEC-2329.2. A plan drops and creates again the schema-bound modules a change
+would strand, through the classes and the effects, not a pass.** (#2329.) A
+schema-bound module is a dependent the engine enforces, and the order of
+module drops (first) and creates (after the table changes) already brackets
+what is needed. All that was missing was which modules need it.
+
+*What the engine refuses* (measured on 17.0.4075.5). A bound view stops
+`ALTER COLUMN` of a column it reads for a retype, a collation change and a
+nullability change (5074 behind 4922), `DROP COLUMN` (4922), `sp_rename` of
+the column or the table (15336), `DROP TABLE` (3729), and `ALTER` or `DROP`
+of a view or function it reads (3729). A column it does not read, adding a
+column, a default, a check and a primary key are not stopped.
+
+*The rule.* `Dialect::schema_bound_teardown` names the bound modules the
+plan's changes strand, plus every bound module bound to one of those, and the
+differ writes a `DropModule` and a `CreateModule` in place of any `AlterModule`
+or absence of change, before `diff_roles`, so the grants a rebuilt module
+loses are written again. `Mssql::engine_effects` asks the same question
+(`binding::torn_down_by`) and requires the module `Absent` while the change
+runs, so the verifier refuses an order that leaves the view standing and one
+that creates it before the change. No pass, rank or tie-break was added.
+Creates already require a bound caller's callees `Final` (DEC-2192.1); that
+now covers a bound view.
+
+*Which callers.* The match is the lexical, over-approximating scan the rest of
+the dialect uses (`may_name_qualified`, `may_name`): a false yes rebuilds a
+view that needed no rebuild, a false no leaves the engine to refuse the apply,
+which rolls back. A view over a column needs both its table and the column
+named. A bound function is rebuilt around a column or table change like a view
+is; around an in-place alter of a callee it keeps the ordering of DEC-2192.1
+and DEC-2228.1, which is why only a view is stranded by a callee's alter.
+
+*What a rebuild costs.* The drop keeps its `destructive` risk gate, as a kind
+change does; a waiver would need the saved-plan validator to derive risks
+across changes. Declared grants come back through `diff_roles`, which treats
+the drop as it treats any other; a grant to a principal no declaration names
+does not, as for any drop and create. An in-place alter is still `CREATE OR
+ALTER` and keeps its grants.
+
+Pinned by `a_bound_view_is_dropped_before_and_created_after_a_retype_of_a_column_it_reads`,
+`a_bound_view_is_rebuilt_only_around_the_changes_the_engine_refuses`,
+`an_unbound_view_is_left_standing_beside_the_same_retype`,
+`a_bound_view_goes_before_the_drop_or_rename_of_its_table`,
+`a_view_bound_to_a_rebuilt_view_is_rebuilt_with_it` and
+`a_bound_view_is_rebuilt_around_an_in_place_alter_of_the_view_it_reads`
+(`crates/pbps-mssql/tests/engine_effects.rs`); and the live
+`a_schema_bound_view_is_rebuilt_around_a_column_change` and
+`the_catalogs_edges_refuse_what_the_engine_would`
+(`crates/pbps-cli/tests/flow.rs`).
+
+<a id="dec-2329-3"></a>
+
+**DEC-2329.3. An indexed view's indexes are part of the module that carries
+them, restated by every create and alter of it.** (#2329.) An indexed view is
+a schema-bound view with a unique clustered index and any others. The choices
+that are not the obvious ones:
+
+*Why the indexes ride with the view.* Measured on 17.0.4075.5, `CREATE OR
+ALTER VIEW` drops every index the view has, even when the text is identical
+and the view stays bound. A view managed without its indexes would lose them
+at the first restatement, and the read-back would show a different module.
+So `options.indexes` and `options.clustered` belong to the module: the
+differ compares them with the rest, an index edit is an in-place alter, and
+the create and the alter both emit the `CREATE OR ALTER VIEW` and then one
+`CREATE INDEX` per index, the clustered one first (1940 otherwise). A
+separate `AddIndex` per view index was the alternative; it would carry a view
+through code that finds a table by uid, and a restatement would still have to
+re-create what the alter dropped. Restating all of them for one edit costs a
+rebuild of the view's indexes, which is what the engine does anyway.
+
+*What the engine wants* (measured). An index on a view that is not schema
+bound is refused (1939), the first must be unique and clustered (1940), a
+non-deterministic function in the view (`GETDATE()`) is refused at the index
+(1949), and a view created under `QUOTED_IDENTIFIER OFF` is refused (1935),
+which pull already inventories as unmanaged. Validation refuses what it can
+know offline: an index without `schemabinding`, no or a missing `clustered:`,
+a clustered index that is not unique or has `INCLUDE`, a filter, an
+expression key. Determinism is the engine's to judge, as is the body.
+
+*What pull keeps unmanaged.* A view with an index the model cannot hold (a
+disabled one, `IGNORE_DUP_KEY`, a partition scheme, a filter, another kind)
+is inventoried whole, naming the index. Managing the view without it would
+drop it at the next restatement.
+
+*Session options.* A write to a table under an indexed view needs
+`ANSI_NULLS`, `ANSI_PADDING`, `ANSI_WARNINGS`, `ARITHABORT`,
+`CONCAT_NULL_YIELDS_NULL` and `QUOTED_IDENTIFIER` on and `NUMERIC_ROUNDABORT`
+off (1934 otherwise). The live test writes a row through the connection pbps
+uses and it succeeds, so nothing is set per connection.
+
+The same bump (plan 54, state 33, schema set 62) covers them: an older build
+would not read the keys and would restate the view unindexed.
+
+Pinned by `an_indexed_view_restates_its_indexes_after_every_create_and_alter`
+(`crates/pbps-mssql/src/emit.rs`); `an_indexed_view_is_managed_with_its_indexes`
+and `a_view_with_an_index_the_model_cannot_hold_is_inventoried`
+(`crates/pbps-mssql/src/introspect.rs`);
+`an_indexed_view_is_validated_against_what_the_engine_demands`
+(`crates/pbps-mssql/src/validate.rs`);
+`a_views_indexes_are_compared_and_survive_a_rebuild`
+(`crates/pbps-mssql/tests/engine_effects.rs`);
+`a_view_declares_indexes_and_only_a_view_may` (`crates/pbps-load/src/lib.rs`);
+`an_indexed_views_indexes_survive_formatting` (`crates/pbps-load/src/fmt.rs`);
+and the live `an_indexed_view_round_trips_and_is_restated_with_its_indexes`
+(`crates/pbps-cli/tests/flow.rs`).

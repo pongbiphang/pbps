@@ -644,6 +644,7 @@ mod tests {
                     kind: ModuleKind::View,
                     description: None,
                     definition: "SELECT 1".into(),
+                    options: Default::default(),
                 },
             )]
             .into(),
@@ -705,6 +706,7 @@ mod tests {
                     kind: ModuleKind::View,
                     description: None,
                     definition: "SELECT 2".into(),
+                    options: Default::default(),
                 }),
             }]);
             let v = verdict(

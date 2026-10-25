@@ -129,6 +129,7 @@ async fn automatic_externals(default: &'static str) {
         schema.modules.insert("dbo.managed2270".parse().unwrap(), pbps_model::Module {
             kind: pbps_model::ModuleKind::View, description: None,
             definition: "CREATE VIEW dbo.managed2270 AS SELECT i FROM dbo.external2270;".into(),
+            options: Default::default(),
         });
         let ids = IdsFile::default();
         let side = pbps_diff::Side { schema: &schema, ids: &ids };

@@ -648,6 +648,7 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
             definition:
                 "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $value$ SELECT $1 * 2 $value$"
                     .into(),
+            options: Default::default(),
         },
     );
     let mut generated = column();
@@ -828,6 +829,7 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
                     kind: pbps_model::ModuleKind::Function,
                     description: None,
                     definition: "() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'".into(),
+                    options: Default::default(),
                 },
             );
             before

@@ -4905,6 +4905,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::Trigger,
                 description: None,
                 definition: "BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+                options: Default::default(),
             }),
         };
         for change in [drop_trigger("app.t"), alter_trigger()] {
@@ -5529,6 +5530,7 @@ mod tests {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "SELECT 1".into(),
+                options: Default::default(),
             }),
         }));
         assert_eq!(

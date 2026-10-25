@@ -965,12 +965,61 @@ pub struct Module {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<crate::Text>,
 
+    /// What a view has beyond its query (DEC-2329.1). Default everywhere else.
+    #[serde(default, skip_serializing_if = "ModuleOptions::is_default")]
+    pub options: ModuleOptions,
+
     /// The body, kept verbatim and **never parsed**.
     ///
     /// The same rule as check and default expressions (SPEC §8.2): the database
     /// is the normalizer. After an apply the stored text is read back, so both
     /// sides of the drift check live in the engine's own space.
     pub definition: String,
+}
+
+/// The parts of a SQL Server view that its header and the catalog keep and
+/// that `definition`, which stays the query, does not.
+///
+/// A view's header is the emitter's (`CREATE OR ALTER VIEW name [WITH
+/// SCHEMABINDING] AS`), so what a view can have that pbps manages lives here.
+/// A function keeps the same option in its own header text instead: everything
+/// after its name is the user's (parameters, return type), and inserting a
+/// clause into that would mean parsing it.
+///
+/// Each part is part of what the module *is*, so it is compared, saved and
+/// read back like the definition. Kept in one struct so that a new part does
+/// not touch every place a [`Module`] is written down.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleOptions {
+    /// `WITH SCHEMABINDING`: the engine records it
+    /// (`sys.sql_modules.is_schema_bound`), refuses changes to what the view
+    /// reads while it holds, and recreating the view without it would remove a
+    /// guarantee nobody asked to remove.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub schemabinding: bool,
+
+    /// The view's indexes, by name: an indexed view (DEC-2329.3). The first
+    /// must be the unique clustered one, named by [`ModuleOptions::clustered`].
+    ///
+    /// Part of the module because `CREATE OR ALTER VIEW` drops every index the
+    /// view has, even when the text is identical (measured on 17.0.4075.5), so
+    /// an alter that restated the view alone would leave the view unindexed.
+    /// Carried here, the same change restates them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub indexes: BTreeMap<crate::ObjectLocalName, crate::schema::Index>,
+
+    /// Which of [`ModuleOptions::indexes`] is the clustered one. An indexed
+    /// view must have exactly that index first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustered: Option<crate::ObjectLocalName>,
+}
+
+impl ModuleOptions {
+    /// Whether nothing is set: what every module but a bound view has.
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Explicit creation-order edges, `module -> the modules it needs first`.
@@ -1954,6 +2003,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         }
     }
 

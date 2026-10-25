@@ -308,6 +308,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }
     }
 
@@ -456,6 +457,7 @@ mod tests {
                         kind: ModuleKind::Function,
                         description: None,
                         definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                        options: Default::default(),
                     }),
                 },
                 Change::AlterModule {
@@ -480,6 +482,7 @@ mod tests {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                options: Default::default(),
             },
         );
         let found = assessed(&base, &desired);
@@ -518,6 +521,7 @@ mod tests {
                             kind: ModuleKind::Function,
                             description: None,
                             definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                            options: Default::default(),
                         }),
                     },
                     Change::AlterModule {

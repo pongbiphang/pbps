@@ -59,6 +59,7 @@ fn projection_work_depends_on_steps_not_evidence_width() {
                     kind: ModuleKind::View,
                     description: None,
                     definition: format!("CREATE VIEW {name} AS SELECT * FROM app.input"),
+                    options: Default::default(),
                 },
             );
             let bound = BoundSurface {
@@ -165,6 +166,7 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
             kind: ModuleKind::Function,
             description: None,
             definition: "CREATE FUNCTION app.f() RETURNS int LANGUAGE SQL AS 'SELECT 2'".into(),
+            options: Default::default(),
         },
     );
     let after_ids = identifiers(&after, &ids);

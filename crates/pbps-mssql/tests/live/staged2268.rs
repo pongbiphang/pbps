@@ -845,6 +845,7 @@ async fn managed_aliases_are_rejected_as_overlap() {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
                 definition: "SELECT a FROM Ext.t".into(),
+                options: Default::default(),
             },
         );
         let Err(StageError::Refused(findings)) = capture::compare_staged(
