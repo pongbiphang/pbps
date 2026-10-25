@@ -1457,8 +1457,8 @@ membership or the serial execution within each shard.
 With both suites selected, one pool launches every shard concurrently and
 audits both suites even when one fails. Choose counts from one startup memory
 snapshot: reserve roughly 1 GiB for each PostgreSQL set (up to four by default),
-then allocate 9 GiB for SQL Server shard 0 and 5 GiB for each additional set
-without Express (up to three SQL Server shards). Explicit counts
+then allocate 9 GiB for SQL Server shard 0 and 4 GiB for each additional set
+without Express (up to four SQL Server shards; DEC-2366.1). Explicit counts
 must also fit the joint budget. Missing weights use the observed median so an
 unmeasured test does not look artificially cheap.
 Use the measured working budget rather than the containers' worst-case caps;
@@ -1471,3 +1471,40 @@ launching any runner, then check it again at execution and audit. Seed weighted
 balancing with that pinned load; an Express reader may never fall through to a
 hash-selected nonzero shard. This preserves every test while removing unused
 Express servers from the other shards.
+
+<a id="dec-2366-1"></a>
+
+**DEC-2366.1. A whole sharded run owns a fresh exact-name fixture assignment,
+removes it at exit, and refuses ports in the host's ephemeral range.** The
+canonical runners retain fixtures for reuse; the whole-run driver instead
+refuses any existing assigned name before launching runners. On success,
+failure, SIGINT or SIGTERM, stop the run's runner process groups before removing
+existing assigned containers with `docker rm -f -v` by exact name. Include
+containers created before a failed port bind. Never select by a prefix or
+pattern, and never treat a failed container listing as an empty set. Report
+cleanup failures and fail the run, attempting the other removals as well.
+
+Keep fixed shard bases 26330–26332 for SQL Server and use 27320–27322 for
+PostgreSQL, distinct from canonical runner defaults and below the usual Linux
+ephemeral range. Read `/proc/sys/net/ipv4/ip_local_port_range` and check every
+resolved port, including overrides and shard offsets, before launch; unreadable,
+malformed or invalid range evidence refuses. Name the fixture and port on
+overlap. Fixed bases keep runner endpoint handling unchanged, but prefixes do
+not reserve ports: support one whole sharded run at a time per host. The shared
+gate slot enforces that scheduling contract locally. Canonical runner defaults
+and fixture retention are unchanged.
+
+Budget 9 GiB for SQL Server shard 0 with Express, 4 GiB per Express-free SQL
+Server shard, and 1 GiB per PostgreSQL shard; cap SQL Server at four shards.
+The maintainer's 2026-10-25 measurement of three SQL Server plus four PostgreSQL
+shards started with 24.9 GiB available and retained about 14.4 GiB at the low
+point: about 10.5 GiB used by the whole run, including cargo. That aggregate
+does not establish a safe per-shard floor: the maintainer's 2026-10-17 host
+measurement hit SQL Server error 701 in `binding619` below about 4 GB per
+engine. Keep the Express-free estimate at 4 GiB rather than 3 GiB on that
+evidence. Four plus
+four needs 25 GiB by the ordinary joint admission formula; below that, use
+three plus four when its 21 GiB budget fits. No over-commit exception applies.
+Record the chosen counts and the run's minimum available memory. A minimum
+below 3 GiB must be reported, identifying the Express-free SQL Server shard
+budget as the budget to raise before repeating that assignment.
