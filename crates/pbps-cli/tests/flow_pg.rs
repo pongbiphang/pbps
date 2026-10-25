@@ -15464,6 +15464,143 @@ fn a_released_input_dropped_past_an_inserted_row_carries_its_consumers() {
     assert!(stdout(&succeeds(d.run(&["plan", "--db", &connection]))).contains("No changes"));
 }
 
+/// A defaulted input's release must preserve the Default effect edge in the
+/// debug final check (#2291). PG16 reaches its existing capability refusal
+/// and uses the supported drop/re-add SQL control instead.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_defaulted_generated_input_is_released_before_its_insert() {
+    for (label, server, modern) in [
+        ("pg18", server(), true),
+        (
+            "pg16",
+            std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB is not set"),
+            false,
+        ),
+    ] {
+        let own = OwnDatabase::new(&server, &format!("defaulted_release_{label}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.t (id integer PRIMARY KEY, a integer NOT NULL DEFAULT 7, \
+                                 b integer, g integer GENERATED ALWAYS AS (a * 2) STORED)",
+        );
+        let d = Demo::new(&format!("defaulted-release-{label}"));
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let path = d.dir.join("schema/app.t.yml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        let start = text.find("  a:\n").unwrap();
+        let end = text.find("  b:\n").unwrap();
+        text.replace_range(start..end, "");
+        let mut desired = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("generated:") {
+                    "    generated: {expression: 'app.f(b)', stored: true}"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        desired.push_str("\ndata:\n  mode: exact\n  rows:\n    1: {b: 3}\n");
+        std::fs::write(path, desired).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.f%28integer%29.function.yml"),
+            "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+             (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["drop", "app.t.a", "--reason", "release generated input"]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        let planned = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        if modern {
+            succeeds(planned);
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+            use pbps_model::Change;
+            let at = |predicate: fn(&Change) -> bool| {
+                saved
+                    .changes
+                    .changes
+                    .iter()
+                    .position(|p| predicate(&p.change))
+                    .unwrap()
+            };
+            let function = at(|c| matches!(c, Change::CreateModule { .. }));
+            let release = at(|c| matches!(c, Change::AlterColumnExpression { .. }));
+            let drop = at(|c| matches!(c, Change::DropColumn { .. }));
+            let insert = at(|c| matches!(c, Change::InsertRow { .. }));
+            assert!(
+                function < release && release < drop && drop < insert,
+                "{:?}",
+                saved.changes
+            );
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "narrowing", "--allow", "destructive"],
+            ));
+            succeeds(d.run(&["verify", "--db", connection]));
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        } else {
+            assert!(!planned.status.success());
+            let error = stderr(&planned);
+            assert!(
+                error.contains("generation_support")
+                    && error.contains(
+                        "changing a generated column's expression needs PostgreSQL 17 or later"
+                    )
+                    && !error.contains("effects contradict this order"),
+                "{error}"
+            );
+            assert!(!plan.exists());
+            assert_eq!(scalar(connection, "SELECT count(*) FROM app.t"), 0);
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_catalog.pg_attribute \
+                    WHERE attrelid='app.t'::regclass AND attname='a' AND NOT attisdropped"
+                ),
+                1
+            );
+            // This is the supported PG16 SQL shape, not admission of an
+            // AlterColumnExpression that the server cannot execute.
+            on_server(
+                connection,
+                "CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+                 AS $$ SELECT x * 3 $$; \
+                 ALTER TABLE app.t DROP COLUMN g; \
+                 ALTER TABLE app.t ADD COLUMN g integer GENERATED ALWAYS AS (app.f(b)) STORED; \
+                 ALTER TABLE app.t DROP COLUMN a; \
+                 INSERT INTO app.t(id,b) VALUES(1,3)",
+            );
+        }
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.t WHERE id=1 AND b=3 AND g=9"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_attribute \
+                WHERE attrelid='app.t'::regclass AND attname='a' AND NOT attisdropped"
+            ),
+            0
+        );
+    }
+}
+
 /// The same plan as above, on a `NOT NULL` input a `BEFORE INSERT` trigger
 /// fills (#2178). The trigger kept, the row is let in and the plan applies.
 /// The trigger dropped by the same plan, the one that would fill `a` may be

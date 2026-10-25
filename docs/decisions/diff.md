@@ -8376,6 +8376,8 @@ rows and replans empty. The existing pre-17 expression-change refusal stays;
 the sibling is not evidence that the newer SQL works on 16. Unit pins cover
 child rows, later same-table rows, keys and retained provenance.
 
+*Amended for disappearing defaults by [DEC-2291.1](#dec-2291-1).*
+
 
 <a id="dec-2296-1"></a>
 
@@ -8526,3 +8528,14 @@ separate plans remains the user's choice. Remaining capability, ambiguous-cut
 and conflicting-boundary refusals retain that remedy. This adds no ordering
 pass, rank, tie-break, settlement, proof union, saved field or wire version;
 ordinary unprovided requirements remain observational (DEC-1954.6).
+
+<a id="dec-2291-1"></a>
+
+**DEC-2291.1. A delayed generated-input drop carries omitted-default inserts
+through the existing effect closure.** The required-input-only selection missed
+Absent(Default), so debug Final replay refused an engine-valid order.
+Frees(Default) edges seed those inserts and their consumers; the catalog's
+trigger-sensitive selection stays unchanged. A baseline-default reader still
+precedes removal, and nullable inputs without defaults retain their order.
+Effects and the verifier are unchanged. PG16 retains its SET EXPRESSION refusal;
+its supported SQL control drops and re-adds the generated column.
