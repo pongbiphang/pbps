@@ -1094,3 +1094,69 @@ Pinned by `a_release_older_than_the_minimum_is_refused_by_name`,
 `crates/pbps-db/src/postgres.rs`. Measured by hand on 15.19 and 10.21 with
 `pull`, `plan --db` and `doctor` (comment on #2151); no CI job has a pre-16
 server.
+
+<a id="dec-2271-1"></a>
+
+**DEC-2271.1. The SQL Server driver admits exactly two connection shapes, a
+host with SQL authentication and a local named pipe with the current Windows
+user, and refuses every other combination by name (#2271).** Windows LocalDB
+accepts only a named pipe and only integrated authentication, and the driver
+opened TCP with a SQL login. The driver's own defaults would have hidden the
+gap: it read `Server=np:\\.\pipe\x` as a host called `np:`, and without a
+Windows backend it read `Integrated Security=SSPI` as a SQL login with an
+empty name. Either would turn "this pipe, as this user" into a different
+connection, so `Endpoint::admit` in `pbps-db/src/mssql.rs` decides the shape
+before anything is opened:
+- `Server=np:\\.\pipe\<name>` with `Integrated Security=SSPI` (or `true` or
+  `yes`) is a pipe. The name is spelled out from letters, digits and
+  `$#_-.@~` in non-empty segments, so a remote pipe or a `..` segment cannot
+  be written.
+- Everything else with SQL authentication is TCP, as before.
+- Integrated authentication over TCP is refused, a pipe without it is
+  refused, a pipe off Windows is refused, a `(localdb)` selector is refused
+  (resolving one is discovery, not the driver's business), and so are SQL
+  credentials beside integrated authentication, two spellings of the setting,
+  an unreadable value, and `Trusted_Connection` (the driver does not read it).
+- Admission reads the string with a port of the driver's own reader
+  (`Options` in `pbps-db/src/mssql.rs`), and the driver is handed that
+  reader's canonical spelling, never the caller's text. The driver exposes no
+  accessor for what it parsed, and a second, different parser can accept the
+  same string and disagree about it (`Description=x{;Integrated
+  Security=SSPI;a=}`): the one that is wrong about it admits TCP while the
+  driver sends the Windows identity. With one reader, and the driver reading
+  only what that reader produced, a disagreement changes what a string means
+  and can never change what was admitted. A string the reader rejects gets the
+  driver's own error.
+- No refusal retries as the other transport or the other authentication, and a
+  failed pipe open is final apart from the bounded wait on a busy pipe.
+
+Integrated authentication over TCP is refused because the design admits it
+only for the LocalDB path; allowing it is a separate decision with its own
+measurement. TLS follows the string as before (`Encrypt` defaults to
+required, and certificate trust is never implied by the pipe); the pipe's host
+name for certificate verification is `localhost` unless `HostNameInCertificate`
+says otherwise.
+
+`winauth` is enabled for the Windows target only. It adds `winauth` and its
+older `rand`, `winapi`, `md5` and `base64` to the lockfile, which lists every
+target.
+
+Rejected:
+- **Reading the pipe out of the driver's parsed `Config`.** The parse
+  discards the path and keeps `np:` as the host.
+- **Mapping `Trusted_Connection` to `Integrated Security`.** The canonical
+  spelling now makes a rewrite safe, but the setting would then mean two
+  things in one string; it stays refused.
+- **A second, general-purpose parser plus a screen for words that matter.**
+  That was this entry's first form. A word list cannot name what a parser
+  hides from it, and refusing every quote or brace would reject the quoted
+  passwords the driver's own error message recommends.
+
+Pinned by the `admission_tests` module in `crates/pbps-db/src/mssql.rs`
+(`a_quote_or_brace_inside_a_value_cannot_hide_a_setting_from_admission` and
+`driver_and_port_read_the_same_options` pin the shared reader); each refusal
+was watched to fail with its guard removed. The Windows transport
+tests in `pipe_tests` compile only on Windows and were not run on the
+machine that wrote this entry. SSPI authentication, the TLS handshake over a
+pipe and a real LocalDB are unmeasured until the Windows qualification in the
+second half of #2271.

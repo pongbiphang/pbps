@@ -24,8 +24,6 @@ tokio.workspace = true
 # One driver per module, named nowhere else in the workspace: `tiberius` in
 # `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 225).
 tiberius.workspace = true
-# Inspect the same effective ADO.NET keys as the driver before its handshake.
-connection-string.workspace = true
 tokio-util.workspace = true
 tokio-postgres.workspace = true
 # TLS for the PostgreSQL driver, chosen here because `tokio-postgres` leaves it
@@ -49,6 +47,14 @@ sha2-hmac.workspace = true
 # listening socket and time the attempts against it.
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+# Windows current-user integrated authentication (SSPI), for the named-pipe
+# transport LocalDB requires (#2271). Windows only: elsewhere the feature has
+# no backend, and the driver would read `Integrated Security` as SQL
+# authentication, so `mssql.rs` refuses it by name instead. The TLS features
+# stay the workspace's explicit set.
+[target.'cfg(windows)'.dependencies]
+tiberius = { workspace = true, features = ["winauth"] }
 
 [lints]
 workspace = true
