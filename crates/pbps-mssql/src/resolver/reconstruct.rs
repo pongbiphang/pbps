@@ -503,15 +503,44 @@ fn table_steps(
 
 /// What each part may name, by the same lexical test the ordinary planner
 /// uses: a declared name it may call, and a table whose computed column it
-/// may read. A held table is read only by a part naming both the table and
-/// one of the held columns, so a schema-bound function that reads the
-/// table's other columns is no reader (measured: it compiles before the
-/// column is added).
+/// may read. A held table is read by a part naming it and either one of the
+/// held columns or every column at once (`*`, `alias.*`) in a module whose
+/// creation binds its column list: a view or an inline table-valued function
+/// (measured on 17.0: a view `SELECT * FROM t` created before `ALTER TABLE ..
+/// ADD c` never exposes `c`, and a view over it naming `c` fails 207, though
+/// the same two views compile with the column first). A schema-bound
+/// function that reads the table's other columns is no reader (measured: it
+/// compiles before the column is added), and neither is a procedure, a
+/// trigger or a scalar function, whose body binds when it runs.
+///
+/// The wildcard rule cannot make a cycle that refuses a valid order. A cycle
+/// needs a reader that is also a callee of the held column, and a column
+/// calls scalar functions only, which cannot list columns; so a function
+/// the held expressions call is never taken for a wildcard reader (measured:
+/// a scalar function with `EXISTS (SELECT * FROM t)` compiles before the
+/// column). What remains is the refusal every reader already carries: a
+/// callee that names a reader module is refused by name as a cycle, which
+/// is never a wrong order.
 fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<usize>)]) {
     let names: BTreeSet<String> = steps
         .iter()
         .flat_map(|s| s.names.iter().cloned())
         .chain(late.iter().map(|(l, _)| l.table.name.clone()))
+        .collect();
+    let held: Vec<Vec<String>> = late
+        .iter()
+        .map(|(_, range)| {
+            range
+                .clone()
+                .filter_map(|at| {
+                    if let Change::AddComputedColumn { computed, .. } = &steps[at].change.change {
+                        Some(computed.expression.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
         .collect();
     for part in steps {
         let statements = crate::emit::emit(&part.change.change, part.change.strategy)
@@ -521,13 +550,71 @@ fn observe(dialect: &Mssql, steps: &mut [Draft], late: &[(Late, std::ops::Range<
                 .iter()
                 .any(|s| dialect.generation_may_call(&s.sql, name))
         };
+        // Only a module whose creation binds a column list can see `*`.
+        let lists_columns = matches!(
+            &part.change.change,
+            Change::CreateModule { module, .. }
+                if matches!(module.kind, ModuleKind::View | ModuleKind::Function)
+        );
+        let callee_name = if let Change::CreateModule { id, module } = &part.change.change
+            && module.kind == ModuleKind::Function
+        {
+            Some(id.name())
+        } else {
+            None
+        };
+        let wildcard = lists_columns
+            && statements
+                .iter()
+                .any(|s| selects_all(&dialect.code_only(&s.sql)));
         part.calls = names.iter().filter(|n| names_text(n)).cloned().collect();
         part.tables = late
             .iter()
-            .filter(|(l, _)| names_text(&l.table.name) && l.computed.iter().any(|c| names_text(c)))
-            .map(|(l, _)| l.table.clone())
+            .zip(&held)
+            .filter(|((l, _), expressions)| {
+                let called = callee_name.is_some_and(|name| {
+                    expressions
+                        .iter()
+                        .any(|expression| dialect.generation_may_call(expression, name))
+                });
+                names_text(&l.table.name)
+                    && (l.computed.iter().any(|c| names_text(c)) || (wildcard && !called))
+            })
+            .map(|((l, _), _)| l.table.clone())
             .collect();
     }
+}
+
+/// Whether `code`, a definition with strings and comments blanked
+/// (`Dialect::code_only`), projects every column: a `*` that ends a select
+/// list or stands before a comma (`SELECT *`, `TOP 5 * FROM`, `*, a`), or
+/// follows `alias.` or `SELECT`/`DISTINCT`/`ALL`. `COUNT(*)` and a
+/// multiplication are none of these: their `*` is followed by `)` or an
+/// operand, and preceded by `(` or an operand.
+fn selects_all(code: &str) -> bool {
+    // The identifier next to `*`, reading outward from it.
+    let word = |chars: &mut dyn Iterator<Item = char>| -> String {
+        chars
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'))
+            .collect()
+    };
+    let chars: Vec<char> = code.chars().collect();
+    (0..chars.len()).filter(|&at| chars[at] == '*').any(|at| {
+        let before = chars[..at].iter().rev().find(|c| !c.is_whitespace());
+        let next = chars[at + 1..].iter().find(|c| !c.is_whitespace());
+        let after = word(&mut chars[at + 1..].iter().copied());
+        let preceding: String = word(&mut chars[..at].iter().rev().copied())
+            .chars()
+            .rev()
+            .collect();
+        before == Some(&'.')
+            || next == Some(&',')
+            || after.eq_ignore_ascii_case("FROM")
+            || ["SELECT", "DISTINCT", "ALL"]
+                .iter()
+                .any(|keyword| preceding.eq_ignore_ascii_case(keyword))
+    })
 }
 
 /// Whether a failed statement is a verdict on the declaration. A deadlock,

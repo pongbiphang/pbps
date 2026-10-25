@@ -262,3 +262,75 @@ async fn a_declaration_that_does_not_compile_names_itself_and_leaves_the_connect
     })
     .await;
 }
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_view_projecting_every_column_of_a_held_table_exposes_its_computed_column() {
+    case("wildcard", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("app.f(v)"));
+                }),
+                module(ModuleKind::View, "s", "SELECT * FROM app.t"),
+                module(ModuleKind::View, "a", "SELECT x.* FROM app.t AS x"),
+                module(ModuleKind::View, "down", "SELECT id, c FROM app.s"),
+                module(ModuleKind::View, "down_a", "SELECT c FROM app.a"),
+                module(
+                    ModuleKind::Function,
+                    "tvf",
+                    "() RETURNS TABLE AS RETURN SELECT * FROM app.t",
+                ),
+                module(ModuleKind::Function, "f", FUNCTION),
+            ],
+        )
+        .await
+        .unwrap();
+        for (view, kind) in [("s", "view"), ("a", "view"), ("tvf", "function")] {
+            assert_eq!(
+                count(
+                    &mut conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID(N'app.{view}') AND name = N'c'"
+                    )
+                )
+                .await,
+                1,
+                "the {kind} {view} lists the computed column"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_scalar_function_with_an_exists_select_all_compiles_before_the_column_it_serves() {
+    case("exists", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.computed.insert("c".into(), computed("app.f(id)"));
+                }),
+                module(
+                    ModuleKind::Function,
+                    "f",
+                    "(@x int) RETURNS int AS BEGIN RETURN (CASE WHEN EXISTS (SELECT * FROM app.t WHERE id = @x) THEN 1 ELSE 0 END); END",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(
+                &mut conn,
+                "SELECT COUNT(*) FROM sys.computed_columns WHERE object_id = OBJECT_ID(N'app.t')"
+            )
+            .await,
+            1
+        );
+    })
+    .await;
+}

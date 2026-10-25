@@ -323,3 +323,97 @@ fn a_compiled_root_missing_from_its_capture_is_named() {
     // Nothing captured at all names every root, never reads as "none".
     assert_eq!(reconstruction.absent_from(&BTreeSet::new()).len(), 3);
 }
+
+#[test]
+fn a_view_projecting_every_column_of_a_held_table_waits_for_the_column() {
+    // A non-schema-bound view binds its `*` when it is created (measured on
+    // 17.0), so one created before the column never exposes it, and a view
+    // over it naming the column then fails 207.
+    for star in [
+        "SELECT * FROM app.t",
+        "SELECT x.* FROM app.t AS x",
+        "SELECT TOP 5 * FROM app.t",
+        "SELECT id, * FROM app.t",
+    ] {
+        let statements = sql(&build(vec![
+            table("t", &[("c", "app.f(v)")]),
+            view("s", star),
+            view("down", "SELECT id, c FROM app.s"),
+            function("f", FUNCTION),
+        ])
+        .unwrap());
+        let routine = at(&statements, "FUNCTION [app].[f]");
+        let column = at(&statements, "ADD [c] AS (app.f(v)");
+        let all = at(&statements, "VIEW [app].[s]");
+        let down = at(&statements, "VIEW [app].[down]");
+        assert!(
+            routine < column && column < all && all < down,
+            "{star}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_inline_table_valued_function_projecting_every_column_waits_for_the_column() {
+    let statements = sql(&build(vec![
+        table("t", &[("c", "app.f(v)")]),
+        function("tvf", "() RETURNS TABLE AS RETURN SELECT * FROM app.t"),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let column = at(&statements, "ADD [c] AS (app.f(v)");
+    assert!(
+        column < at(&statements, "FUNCTION [app].[tvf]"),
+        "{statements:#?}"
+    );
+}
+
+#[test]
+fn a_scalar_function_the_column_calls_is_no_wildcard_reader_and_makes_no_cycle() {
+    // `EXISTS (SELECT * ..)` projects no column list, and the column calls
+    // scalar functions only, so the callee is never held after the column it
+    // serves: a valid order exists (measured on 17.0) and it is found.
+    let statements = sql(&build(vec![
+        table("t", &[("c", "app.f(id)")]),
+        function(
+            "f",
+            "(@x int) RETURNS int AS BEGIN RETURN (CASE WHEN EXISTS (SELECT * FROM app.t WHERE id = @x) THEN 1 ELSE 0 END); END",
+        ),
+    ])
+    .unwrap());
+    let create = at(&statements, "CREATE TABLE [app].[t]");
+    let routine = at(&statements, "FUNCTION [app].[f]");
+    let column = at(&statements, "ADD [c] AS (app.f(id)");
+    assert!(create < routine && routine < column, "{statements:#?}");
+}
+
+#[test]
+fn only_a_select_all_is_a_wildcard_and_a_count_or_a_product_is_not() {
+    for wildcard in [
+        "SELECT * FROM t",
+        "select\n  *\nfrom t",
+        "SELECT t.* FROM t",
+        "SELECT [t].* FROM t",
+        "SELECT DISTINCT * FROM t",
+        "SELECT TOP 5 * FROM t",
+        "SELECT TOP (5) PERCENT * FROM t",
+        "SELECT *, a FROM t",
+        "SELECT a, * FROM t",
+        "SELECT COUNT(*) AS n, * FROM t",
+        "SELECT a FROM t WHERE EXISTS (SELECT * FROM u)",
+    ] {
+        assert!(selects_all(wildcard), "{wildcard}");
+    }
+    for plain in [
+        "SELECT COUNT(*) FROM t",
+        "SELECT COUNT( * ) FROM t",
+        "SELECT a * b FROM t",
+        "SELECT a*2 AS twice, MAX(b * 3) FROM t",
+        "SELECT a * from_date FROM t",
+        "SELECT (a + 1) * (b + 2) FROM t",
+        "SELECT a FROM t",
+        "",
+    ] {
+        assert!(!selects_all(plain), "{plain}");
+    }
+}

@@ -1119,6 +1119,8 @@
         "reconstruct2374::a_schema_bound_function_over_the_table_compiles_before_the_column_it_serves",
         "reconstruct2374::defaults_checks_and_keys_over_a_computed_column_compile_after_their_function",
         "reconstruct2374::a_declaration_that_does_not_compile_names_itself_and_leaves_the_connection_usable",
+        "reconstruct2374::a_view_projecting_every_column_of_a_held_table_exposes_its_computed_column",
+        "reconstruct2374::a_scalar_function_with_an_exists_select_all_compiles_before_the_column_it_serves",
         "role_catalog_keeps_raw_owner_grantee_and_grantor_identity",
         "insensitive_catalog_names_bind_computed_columns_before_checks_are_refused",
         "a_computed_column_or_filter_reading_a_left_out_column_goes_with_it",
