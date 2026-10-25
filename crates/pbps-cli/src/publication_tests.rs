@@ -10,6 +10,14 @@ thread_local! {
 
 // Scoped to the test thread: no product flag or parallel-test interference.
 pub(super) fn fault(event: &str, _path: &Path) -> io::Result<()> {
+    // Model Windows filesystems without POSIX deletion even on the Unix lane.
+    // Windows CI runs the same publication scenario against its native APIs.
+    if event == "remove" && fs::symlink_metadata(_path)?.permissions().readonly() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "filesystem refuses read-only deletion",
+        ));
+    }
     #[cfg(unix)]
     if event == "write" {
         use std::os::unix::fs::MetadataExt as _;
@@ -512,4 +520,22 @@ fn backup_names_fit_when_declaration_filenames_are_at_the_filesystem_limit() {
     );
     assert!(!f.old[0].exists());
     assert!(!f.dir.join(BACKUP).exists());
+}
+
+#[test]
+fn read_only_replacements_are_removed_before_restoring_after_a_later_failure() {
+    let mut f = Fixture::new(2);
+    let output = f.copies[0].1.clone();
+    fs::rename(&f.old[0], &output).unwrap();
+    f.old[0] = output.clone();
+    let mut permissions = fs::metadata(&output).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&output, permissions).unwrap();
+    fs::create_dir(&f.copies[1].1).unwrap();
+    let before = snapshot(&f.dir);
+    let message = format!("{:#}", f.publish().unwrap_err());
+    assert!(message.contains("cannot create declaration"), "{message}");
+    assert!(message.contains("the project is unchanged"), "{message}");
+    assert_eq!(snapshot(&f.dir), before);
+    assert!(fs::metadata(&output).unwrap().permissions().readonly());
 }

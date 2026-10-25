@@ -220,6 +220,37 @@ fn create_directories(path: &Path, created: &mut Vec<PathBuf>) -> io::Result<()>
     Ok(())
 }
 
+fn remove_output(path: &Path) -> io::Result<()> {
+    let remove = || {
+        #[cfg(test)]
+        tests::fault("remove", path)?;
+        fs::remove_file(path)
+    };
+    match remove() {
+        // Rust's POSIX-delete retry cannot serve every Windows filesystem.
+        // Preserve its native success path, then retry a read-only output we
+        // created; original backup metadata stays intact.
+        #[cfg(any(windows, test))]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let metadata = fs::symlink_metadata(path)?;
+            let mut permissions = metadata.permissions();
+            if metadata.is_symlink() || !permissions.readonly() {
+                return Err(error);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                permissions.set_mode(permissions.mode() | 0o200);
+            }
+            #[cfg(not(unix))]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)?;
+            remove()
+        }
+        result => result,
+    }
+}
+
 fn restore(
     outputs: &[PathBuf],
     moved: &[(PathBuf, PathBuf)],
@@ -229,7 +260,7 @@ fn restore(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for path in outputs.iter().rev() {
-        if let Err(e) = fs::remove_file(path)
+        if let Err(e) = remove_output(path)
             && e.kind() != io::ErrorKind::NotFound
         {
             failures.push(format!(
