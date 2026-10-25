@@ -319,12 +319,8 @@ impl<'a> Allocation<'a> {
             while names.contains(&name) {
                 suffix += 1;
                 let digits = suffix.to_string();
-                name = format!(
-                    "{}{}",
-                    super::prefix(key.raw(), (63 - digits.len()).min(key.raw().len())),
-                    digits
-                )
-                .into();
+                let stem = super::prefix(key.raw(), (63 - digits.len()).min(key.raw().len()));
+                name = format!("{stem}{digits}").into();
             }
             names.push(name);
         }

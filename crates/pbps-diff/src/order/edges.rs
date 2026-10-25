@@ -288,7 +288,8 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
                 | Requirement::Absent(_)
                 | Requirement::NotBoundTo { .. }
                 | Requirement::Reads(_)
-                | Requirement::BeforeRewrite(_)) => other.clone(),
+                | Requirement::BeforeRewrite(_)
+                | Requirement::Holds(_)) => other.clone(),
             })
             .collect(),
     }
@@ -412,6 +413,13 @@ pub fn graph(
                 }
                 for &a in rewriters {
                     if renames(&operations[a]) {
+                        if fx
+                            .requires
+                            .iter()
+                            .any(|r| matches!(r, Requirement::Holds(n) if &n.holder == key))
+                        {
+                            continue; // Shared slots own explicit input addresses.
+                        }
                         if reads_before(&operations[b], &operations[a]) {
                             edge(b, a, Source::Effect, Because::Rewrites(key.clone()));
                         } else {
@@ -473,7 +481,12 @@ pub fn graph(
                     // (DEC-1954.4, #1998). Another rewrite is not: the
                     // baseline's instance is read whatever the plan does to
                     // it in place.
-                    if !own_rewrite {
+                    if !own_rewrite
+                        && !fx
+                            .requires
+                            .iter()
+                            .any(|r| matches!(r, Requirement::Holds(n) if &n.holder == key))
+                    {
                         for &a in rewriters.iter().filter(|&&a| renames(&operations[a])) {
                             if reads_before(&operations[b], &operations[a]) {
                                 edge(b, a, Source::Effect, Because::Rewrites(key.clone()));
@@ -567,9 +580,30 @@ pub fn graph(
                         edge(b, a, Source::Effect, Because::BeforeRewrite(key.clone()));
                     }
                 }
+                Requirement::Holds(_) => {} // Edges and replay use the shared slot description.
                 Requirement::Reads(_) => {
                     for &a in index.valuers.get(key).unwrap_or(&none) {
-                        edge(a, b, Source::Effect, Because::Writes(key.clone()));
+                        let ends_values =
+                            effects[a].removes.contains(&Resource::Column(key.clone()));
+                        let incarnation = fx.read_incarnation(key);
+                        // A removal ends values; only a later incarnation waits
+                        // for it. Base and bound-current readers precede it.
+                        let later_creation = creators
+                            .iter()
+                            .any(|&c| operations[c].id() > operations[a].id());
+                        let later_values = held(key) == Some(true)
+                            && !creators.is_empty()
+                            && (effects[a].creates.contains(&Resource::Column(key.clone()))
+                                || effects[a].read_incarnation(key) == Some(Incarnation::Final));
+                        if (ends_values
+                            && (incarnation == Some(Incarnation::Base)
+                                || (incarnation == Some(Incarnation::Final) && !later_creation)))
+                            || (incarnation == Some(Incarnation::Base) && later_values)
+                        {
+                            edge(b, a, Source::Effect, Because::Removes(key.clone()));
+                        } else {
+                            edge(a, b, Source::Effect, Because::Writes(key.clone()));
+                        }
                     }
                 }
             }

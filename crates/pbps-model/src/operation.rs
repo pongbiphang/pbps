@@ -411,6 +411,11 @@ pub trait Owners {
         })
     }
 
+    /// Explicit intermediate inputs use shared slot holders (DEC-2298.9).
+    fn address_qualified(&self) -> bool {
+        false
+    }
+
     /// The uid of the table a step spells as `name`.
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError>;
     /// The uid of the column a step spells as `column`.
@@ -488,6 +493,10 @@ impl Owners for PlanOwners<'_> {
                 spelling,
             }),
         }
+    }
+
+    fn address_qualified(&self) -> bool {
+        self.rebuild.is_some()
     }
 
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {

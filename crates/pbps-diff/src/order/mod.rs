@@ -113,3 +113,6 @@ pub(crate) use plan::differ;
 
 #[cfg(test)]
 mod rebuild_tests;
+
+#[cfg(test)]
+mod read_tests;

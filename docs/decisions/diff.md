@@ -8539,3 +8539,22 @@ trigger-sensitive selection stays unchanged. A baseline-default reader still
 precedes removal, and nullable inputs without defaults retain their order.
 Effects and the verifier are unchanged. PG16 retains its SET EXPRESSION refusal;
 its supported SQL control drops and re-adds the generated column.
+
+<a id="dec-2298-9"></a>
+
+**DEC-2298.9. Explicit input reads bind shared slots and incarnation value lifetimes.**
+An intermediate input requires its object UID to hold its spelled address at
+that operation. The shared Names description carries these reads beside
+claims and releases: a read follows its holder's claim and precedes its
+release. Slot replay checks the actual holder before each operation; a
+release encountered first cannot invent a baseline holder. Source, temporary
+and backup inputs use this one rule. Ordinary inputs retain reads_before's
+origin comparison, with no origin splitting, extra pass, rank or tie-break.
+
+Removing an incarnation ends its values. An Is(Base) or bound-current reader
+precedes its value remover; only a reader of a later incarnation waits for
+that remover. The rule covers both tree and column inputs. Independent replay
+tracks live values and rejects a read after their lifetime ends. Agreement
+checks enumerate every small ordering around the address and value boundaries.
+Ordinary operation, SQL, checksum and order oracles remain unchanged. This
+contract grants no rebuild lowering, certification, admission or execution.

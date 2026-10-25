@@ -110,6 +110,7 @@ pub(crate) fn verify_with(
             plan_target: plan.then(|| baseline.bound_target(key).cloned()).flatten(),
         }
     };
+    let mut values: BTreeMap<ObjectKey, (bool, bool)> = BTreeMap::new();
     for (operation, fx) in operations.iter().zip(effects) {
         for requirement in &fx.requires {
             let key = requirement.key();
@@ -147,7 +148,23 @@ pub(crate) fn verify_with(
                     }
                 }
                 // Ordering requirements are checked below against the whole graph.
-                Requirement::Reads(_) | Requirement::BeforeRewrite(_) => true,
+                Requirement::Holds(_) => true, // Independently checked by slot replay.
+                Requirement::Reads(_) => {
+                    let state = values.entry(key.clone()).or_insert_with(|| {
+                        let live = held(key) != Some(false);
+                        (live, live)
+                    });
+                    match checks
+                        .incarnations
+                        .then(|| fx.read_incarnation(key))
+                        .flatten()
+                    {
+                        Some(Incarnation::Base) => state.0,
+                        Some(Incarnation::Final) => state.1,
+                        None => true,
+                    }
+                }
+                Requirement::BeforeRewrite(_) => true,
                 Requirement::NotBoundTo { target, .. } => {
                     let still_bound = unknown
                         || (now.base && now.base_target.as_ref().is_none_or(|t| t == target))
@@ -178,6 +195,9 @@ pub(crate) fn verify_with(
             }
         }
         for resource in &fx.removes {
+            if let Resource::Column(key) = resource {
+                values.insert(key.clone(), (false, false));
+            }
             if let Resource::Object(key, _) = resource {
                 let s = replay.entry(key.clone()).or_insert_with(|| start(key));
                 if checks.incarnations {
@@ -193,6 +213,20 @@ pub(crate) fn verify_with(
                 } else {
                     s.base = false;
                     s.plan = false;
+                }
+            }
+        }
+        for resource in &fx.creates {
+            if let Resource::Column(key) = resource {
+                let live = held(key) != Some(false);
+                values.entry(key.clone()).or_insert((live, live)).1 = true;
+            }
+        }
+        for resource in &fx.rewrites {
+            if let Resource::Column(key) = resource {
+                let now = replay.entry(key.clone()).or_insert_with(|| start(key));
+                if now.base || now.plan || held(key).is_none() {
+                    values.entry(key.clone()).or_insert((now.base, now.plan)).1 = true;
                 }
             }
         }

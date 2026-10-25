@@ -90,6 +90,8 @@ pub struct BoundInput {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Requirement {
     Exists(ObjectKey),
+    /// The shared slot description checks this holder at its input address.
+    Holds(super::Named),
     Is(ObjectKey, Incarnation),
     Bound(ObjectKey, BoundInput),
     Absent(ObjectKey),
@@ -99,7 +101,9 @@ pub enum Requirement {
         surface: ObjectKey,
         target: Recorded,
     },
-    /// The values under the key, after every write of them. Not in the
+    /// Values within the input's required incarnation, before its removal;
+    /// an unqualified read retains the ordinary after-every-write rule.
+    /// Not in the
     /// issue's list of four: `Exists` on a table cannot tell a reader of its
     /// rows from a user of its definition (DEC-1954.2).
     Reads(ObjectKey),
@@ -112,6 +116,7 @@ impl Requirement {
     /// The key a requirement is about.
     pub fn key(&self) -> &ObjectKey {
         match self {
+            Requirement::Holds(named) => &named.holder,
             Requirement::NotBoundTo { surface, .. } => surface,
             Requirement::Exists(key)
             | Requirement::Is(key, _)
@@ -145,6 +150,25 @@ pub struct Effects {
 }
 
 impl Effects {
+    /// The incarnation explicitly required by a row/tree or column input.
+    /// Unknown or conflicting evidence does not invent a lifetime.
+    pub fn read_incarnation(&self, key: &ObjectKey) -> Option<Incarnation> {
+        let mut incarnations = self.requires.iter().filter_map(|r| match r {
+            Requirement::Is(k, incarnation) if k == key => Some(*incarnation),
+            Requirement::Bound(_, b) if &b.input == key => Some(b.incarnation),
+            Requirement::Is(..)
+            | Requirement::Bound(..)
+            | Requirement::Holds(_)
+            | Requirement::Exists(_)
+            | Requirement::Absent(_)
+            | Requirement::NotBoundTo { .. }
+            | Requirement::Reads(_)
+            | Requirement::BeforeRewrite(_) => None,
+        });
+        let first = incarnations.next()?;
+        incarnations.all(|i| i == first).then_some(first)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
             && self.creates.is_empty()
@@ -344,6 +368,11 @@ pub fn effects(
     }
     cx.by_kind()?;
     cx.type_inputs();
+    cx.fx.requires.extend(
+        super::slots::read_names(op, owners)?
+            .into_iter()
+            .map(Requirement::Holds),
+    );
     cx.binding_facts();
     Ok(cx.fx)
 }

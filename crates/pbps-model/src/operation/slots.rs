@@ -23,7 +23,7 @@ use crate::change::DetachedKind;
 use crate::{Change, ModuleId, ModuleKind, Table, TableName};
 
 /// The kind of a name. The dialect maps each to the namespace that holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NameKind {
     Type,
     Table,
@@ -40,7 +40,7 @@ pub enum NameKind {
 }
 
 /// A name as a step spells it, with what scopes it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address {
     pub kind: NameKind,
     /// The schema the name is in, as the step spells it. Empty for a role,
@@ -56,7 +56,7 @@ pub struct Address {
 }
 
 /// A name and the object that holds it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Named {
     pub address: Address,
     pub holder: ObjectKey,
@@ -65,13 +65,15 @@ pub struct Named {
 /// The names one operation claims and releases.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Names {
+    /// Inputs must find this exact holder at this address before the step.
+    pub reads: Vec<Named>,
     pub claims: Vec<Named>,
     pub releases: Vec<Named>,
 }
 
 impl Names {
     pub fn is_empty(&self) -> bool {
-        self.claims.is_empty() && self.releases.is_empty()
+        self.reads.is_empty() && self.claims.is_empty() && self.releases.is_empty()
     }
 }
 
@@ -263,7 +265,10 @@ pub fn names(
     let mut nx = Nx {
         op,
         owners,
-        names: Names::default(),
+        names: Names {
+            reads: read_names(op, owners)?,
+            ..Names::default()
+        },
     };
     match op.change() {
         Change::BuildPartitionedIndex(r) => {
@@ -659,6 +664,150 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
     out
 }
 
+/// Shared input addresses for explicit intermediate operations. Ordinary plans
+/// keep their origin-based fallback; no origin splitting is needed (DEC-2298.9).
+pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Named>, OwnerError> {
+    let change = op.change();
+    if !owners.address_qualified()
+        && !matches!(
+            change,
+            Change::CopyTableRows(_)
+                | Change::AnalyzeTableTree(_)
+                | Change::BuildPartitionedIndex(_)
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut table = |name: &TableName, uid: crate::Uid| {
+        let named = Named {
+            holder: ObjectKey::Table(Recorded(uid)),
+            address: Address {
+                kind: NameKind::Table,
+                schema: name.schema.clone(),
+                table: None,
+                name: name.name.clone(),
+                signature: None,
+            },
+        };
+        if !out.contains(&named) {
+            out.push(named);
+        }
+    };
+    if let Change::CopyTableRows(c) = change {
+        for (relations, spelling) in [
+            (
+                std::iter::once(&c.source)
+                    .chain(&c.source_partitions)
+                    .collect::<Vec<_>>(),
+                Spelling::Base,
+            ),
+            (
+                std::iter::once(&c.target)
+                    .chain(&c.target_partitions)
+                    .collect(),
+                Spelling::Final,
+            ),
+        ] {
+            for relation in relations {
+                table(
+                    &relation.name,
+                    super::checked_relation(owners, relation, spelling)?
+                        .uid()
+                        .clone(),
+                );
+            }
+        }
+    } else if let Change::AnalyzeTableTree(a) = change {
+        for relation in std::iter::once(&a.parent).chain(&a.partitions) {
+            table(
+                &relation.name,
+                super::checked_relation(owners, relation, Spelling::Final)?
+                    .uid()
+                    .clone(),
+            );
+        }
+    } else if let Change::BuildPartitionedIndex(i) = change {
+        for relation in std::iter::once(&i.parent).chain(i.clones.iter().map(|c| &c.leaf)) {
+            table(
+                &relation.name,
+                super::checked_relation(owners, relation, Spelling::Final)?
+                    .uid()
+                    .clone(),
+            );
+        }
+    } else if let Change::DropTable { uid, name, .. }
+    | Change::RenameTable {
+        uid, from: name, ..
+    } = change
+    {
+        table(name, uid.clone());
+    } else if !matches!(
+        change,
+        Change::CreateTable { .. } | Change::RebuildPartitionedTable(_)
+    ) && let Some(name) = change.table()
+    {
+        table(name, owners.table(name, op.origin().spelling())?);
+    }
+    let mut input = |name: &TableName| -> Result<(), OwnerError> {
+        table(name, owners.table(name, op.origin().spelling())?);
+        Ok(())
+    };
+    if let Change::CreateTable { table, name, .. } = change {
+        if let Some(of) = &table.partition_of {
+            input(&of.parent)?;
+        }
+        // A self-reference reads the table this creation supplies, not an
+        // earlier holder, as effects.rs's CreateTable arm also treats it.
+        for fk in table.foreign_keys.values() {
+            if fk.references_table != *name {
+                input(&fk.references_table)?;
+            }
+        }
+    }
+    if let Change::DropTable {
+        detach_from: Some(parent),
+        ..
+    }
+    | Change::AttachPartition { parent, .. }
+    | Change::DetachPartition { parent, .. } = change
+    {
+        input(parent)?;
+    }
+    if let Change::AddForeignKey { constraint, .. } = change {
+        input(&constraint.references_table)?;
+    }
+    if let Some(crate::ModuleId::Trigger { on, .. }) = change.module_id() {
+        input(on)?;
+    }
+    if let Change::CopyTableRows(c) = change {
+        for projection in &c.columns {
+            for (column, spelling) in projection
+                .source
+                .iter()
+                .map(|s| (&s.column, Spelling::Base))
+                .chain(std::iter::once((&projection.target, Spelling::Final)))
+            {
+                out.push(Named {
+                    holder: ObjectKey::Column(ColumnKey::Recorded(Recorded(
+                        owners.column(column, spelling)?,
+                    ))),
+                    address: Address {
+                        kind: NameKind::Column,
+                        schema: column.table.schema.clone(),
+                        table: Some(ObjectKey::Table(Recorded(
+                            owners.table(&column.table, spelling)?,
+                        ))),
+                        name: column.name.raw().to_owned(),
+                        signature: None,
+                    },
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -680,6 +829,50 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_created_table_reads_the_tables_it_references_but_not_itself() {
+        struct Qualified;
+        impl Owners for Qualified {
+            fn address_qualified(&self) -> bool {
+                true
+            }
+            fn table(&self, name: &TableName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                Ok(crate::Uid::derived(crate::UidKind::Table, &name.name, 0))
+            }
+            fn column(&self, _: &crate::ColumnRef, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a creation reads no column")
+            }
+            fn role(&self, _: &crate::RoleName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a creation reads no role")
+            }
+        }
+        let fk = |to: &str| crate::ForeignKey {
+            columns: vec!["p".into()],
+            references_table: TableName::new("app", to),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let mut table = crate::Table::default();
+        table.foreign_keys.insert("self_fk".into(), fk("t"));
+        table.foreign_keys.insert("other_fk".into(), fk("other"));
+        let create = crate::PlannedChange::new(Change::CreateTable {
+            uid: crate::Uid::derived(crate::UidKind::Table, "t", 0),
+            name: TableName::new("app", "t"),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        });
+        let ops = super::super::Operations::of_plan(&[create], super::super::ModuleEdits::InPlace);
+        let read: Vec<_> = read_names(&ops.as_slice()[0], &Qualified)
+            .unwrap()
+            .into_iter()
+            .map(|named| named.address.name)
+            .collect();
+        // The creation supplies `t`, so no earlier holder may be required.
+        assert_eq!(read, ["other"]);
+    }
 
     #[test]
     fn a_routine_claim_and_release_use_the_same_raw_signature() {
