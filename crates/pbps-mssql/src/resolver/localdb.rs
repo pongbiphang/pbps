@@ -248,8 +248,10 @@ pub fn listed(output: &[u8], instance: &str) -> bool {
 
 /// The helper's output as text: UTF-16, which has a NUL beside each ASCII
 /// byte, is decoded as such, and anything else as UTF-8.
+/// A leading byte-order mark is dropped: it decodes to U+FEFF, which `trim`
+/// keeps, so the first listed name would otherwise never match.
 fn decode(output: &[u8]) -> String {
-    if output.starts_with(&[0xFF, 0xFE])
+    let text = if output.starts_with(&[0xFF, 0xFE])
         || output.iter().filter(|b| **b == 0).count() * 4 > output.len()
     {
         let units: Vec<u16> = (0..output.len() / 2)
@@ -258,6 +260,10 @@ fn decode(output: &[u8]) -> String {
         String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(output).into_owned()
+    };
+    match text.strip_prefix('\u{FEFF}') {
+        Some(rest) => rest.to_owned(),
+        None => text,
     }
 }
 
@@ -372,6 +378,10 @@ mod tests {
         let mut utf16 = vec![0xFF, 0xFE];
         utf16.extend(list.encode_utf16().flat_map(u16::to_le_bytes));
         assert!(super::listed(&utf16, "pbps_scratch"));
+        // The byte-order mark is no part of the first name, in either encoding.
+        assert!(super::listed(&utf16, "MSSQLLocalDB"));
+        let utf8 = [b"\xEF\xBB\xBF".as_slice(), list.as_bytes()].concat();
+        assert!(super::listed(&utf8, "MSSQLLocalDB"));
         // A prefix, a longer name or an empty list is not the instance.
         for absent in ["pbps", "pbps_scratch2", "scratch"] {
             assert!(!super::listed(list.as_bytes(), absent), "{absent}");
