@@ -38,6 +38,7 @@ pub mod impact;
 pub mod ledger;
 mod mssql;
 mod postgres;
+pub mod query;
 // Cross-crate test support is opt-in because cfg(test) does not reach a
 // dependency. Neither this API nor its driver hooks exists in normal builds.
 #[cfg(feature = "test-request-count")]
@@ -700,6 +701,21 @@ impl Conn {
         match self {
             Conn::Mssql(c) => Ok(c.query(sql).await?.into_iter().map(Row::Mssql).collect()),
             Conn::Postgres(c) => Ok(c.query(sql).await?.into_iter().map(Row::Postgres).collect()),
+        }
+    }
+
+    /// Streams one extended-protocol query into bounded assertion evidence.
+    /// A truncated result closes the session; callers must discard it.
+    pub async fn query_bounded(
+        &mut self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<query::QueryEvidence, DbError> {
+        match self {
+            Conn::Postgres(c) => c.query_bounded(sql, timeout).await,
+            Conn::Mssql(_) => Err(DbError::Refused(
+                "bounded assertion queries are implemented for PostgreSQL only".into(),
+            )),
         }
     }
 

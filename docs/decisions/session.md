@@ -600,3 +600,61 @@ resumed applies refused after the zone moved) and
 `the_scratch_compiles_in_the_targets_zone_or_not_at_all` (pbps-pg, on 16 and 18)
 and `doctor_reads_a_runway_in_utc_on_a_database_in_another_zone` (CLI, on 16 and
 18).
+
+<a id="dec-1165-1"></a>
+
+**DEC-1165.1. An assertion must return at least one output column.** On both
+PostgreSQL 16.15 and 18.6, `SELECT WHERE false` returns zero rows with zero
+columns, while `SELECT FROM generate_series(1,1)` returns one zero-column row.
+The existing driver (tokio-postgres 0.7.18) collapses a zero-field
+RowDescription and NoData into the
+same empty column list; after an empty stream it cannot distinguish the first
+query from a command without a result set. Treating that shape as empty success
+would also pass commands. ADR-0019 §7 and SPEC §9.9 therefore require at least
+one output column, of arbitrary types. A zero-column result is invalid for both
+row shapes, distinct from pass and violation, with `SELECT 1 ...` as its remedy.
+This also applies when the evidence row bound closes a zero-column stream.
+The runner still executes transaction control and verifies completed streams,
+so COMMIT/ROLLBACK retain their transaction-boundary diagnosis.
+
+<a id="dec-1165-2"></a>
+
+**DEC-1165.2. Assertion identity includes the virtual transaction, without assigning an xid.**
+ADR-0019 §7 requires the first read to prevent a leading READ WRITE switch
+and a postcheck that catches COMMIT/ROLLBACK even when the replacement
+transaction is read-only. On PostgreSQL 16.15 and 18.6, backend PID,
+transaction timestamp and the session's exclusive `virtualxid` lock were
+stable within one transaction; all 50 successive read-only transactions
+had distinct timestamps and virtual IDs while their assigned xid stayed
+NULL. The runner compares PID, timestamp (epoch text, independent of session
+date/time formatting) and virtual ID, and requires read-only plus a NULL
+`pg_current_xact_id_if_assigned()` before and after the original statement.
+A NULL xid or backend PID alone cannot distinguish these transactions;
+assigning an xid to obtain identity defeats the NULL check.
+
+The driver prepares the original SQL through the extended protocol,
+preserves column metadata for empty results, and streams bounded evidence.
+Cells are NULL, bounded rendered text with an explicit truncation flag, or
+explicitly unrenderable binary types. Unsupported types remain violation
+evidence; no SQL rewriting or server output function is needed. Twenty rows
+and 64 KiB bound retained cell text, with metadata/cell slots additionally
+bounded by PostgreSQL's column limit. Individual wire rows and the driver's
+bounded receive buffers can exceed 64 KiB; the result is never collected in
+full. Reaching either evidence bound closes the unfinished connection,
+records possible further rows and cannot produce pass. Zero-row pass needs
+successful stream completion and the unchanged transaction postcheck.
+The runner sets LOCAL statement_timeout immediately after BEGIN READ ONLY
+to the remaining deadline, rounded up to milliseconds (minimum one, capped
+at PostgreSQL's integer limit). Closing the client alone does not interrupt
+a backend that is still computing; this server limit also stops it without
+waiting for another socket write. Driver/deadline timeout, server cancellation
+(57014) and connection termination are unanswerable; other server SQL errors
+remain distinct. Dropping a PostgreSQL connection aborts
+its owned socket task, including cancellation paths, rather than detaching
+the task by dropping only its JoinHandle.
+
+Qualification evidence: the two pinned image builds from ADR-0019 §8,
+with stable-identity, standalone COMMIT/ROLLBACK, replacement READ ONLY,
+leading READ WRITE (25001), extended multi-statement (42601), and 50 fresh
+read-only transactions on each. Live regressions exercise both builds and
+distinguish boundary refusal from invalid shape and from SQL error.

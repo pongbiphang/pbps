@@ -40,6 +40,7 @@ use pbps_model::{
 };
 
 mod ambiguity;
+pub mod assertions;
 pub mod catalog;
 pub mod data_triggers;
 pub mod doctor;

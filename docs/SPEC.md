@@ -3422,8 +3422,12 @@ SQL Server fixtures use generated identities with OUTPUT/INSERT SELECT or a
 business-key lookup; they cannot enable IDENTITY_INSERT by acquiring ALTER.
 No user SQL runs with provisioning credentials or production connections.
 
-Each assertion file holds one query returning one tabular result set: zero rows
-passes, any row (including NULL) violates, and evidence is bounded. Errors,
+Each assertion file holds one query returning one tabular result set with at
+least one output column, of arbitrary types. A zero-column result is an invalid
+assertion whether it contains zero rows or any rows, distinct from pass and
+violation; the refusal points to `SELECT 1 ...` (DEC-1165.1). For a valid result
+shape, zero rows is pass and any row (including NULL) is a violation. Evidence
+is bounded. Errors,
 missing/unreadable results and driver timeouts are never pass. PostgreSQL uses
 a fresh runner-owned READ ONLY transaction, a runner first read establishing
 transaction identity, one extended-protocol statement, and a postcheck that the

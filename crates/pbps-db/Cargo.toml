@@ -21,6 +21,7 @@ serde.workspace = true
 schemars.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+futures-util.workspace = true
 # One driver per module, named nowhere else in the workspace: `tiberius` in
 # `mssql`, `tokio-postgres` in `postgres` (ADR-0007 decision 5, DECISIONS 225).
 tiberius.workspace = true

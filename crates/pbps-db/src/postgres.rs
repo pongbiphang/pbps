@@ -13,9 +13,9 @@
 //! and that it stays inside the crate: no caller of `crate::Conn` sees it, and
 //! no signature changed for it.
 //!
-//! Dropping the handle is what closes the connection, so it is held rather than
-//! detached: a detached task would outlive the `Conn` that owns it and keep a
-//! server-side session open after the command that opened it has exited.
+//! The task owner aborts on drop to close the transport. Dropping a
+//! JoinHandle alone would detach it and keep a session alive after its owner
+//! exited or its assertion timed out.
 
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
@@ -35,7 +35,17 @@ pub struct Conn {
     /// `TimeZone` as this session started, before anything pbps sets.
     zone: SessionZone,
     /// The polled connection future. Held, not detached — see the module header.
-    _driver: tokio::task::JoinHandle<()>,
+    _driver: DriverTask,
+}
+
+// Abort also on cancellation: dropping a JoinHandle alone detaches the socket
+// task, which could otherwise keep a timed-out assertion running server-side.
+struct DriverTask(tokio::task::JoinHandle<()>);
+
+impl Drop for DriverTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The `TimeZone` a fresh session got: server, then database, then role
@@ -513,6 +523,73 @@ impl Conn {
             .collect())
     }
 
+    pub(crate) async fn query_bounded(
+        &mut self,
+        sql: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::query::QueryEvidence, DbError> {
+        match tokio::time::timeout(timeout, self.read_bounded(sql)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self._driver.0.abort();
+                Err(DbError::Refused("assertion query driver timeout".into()))
+            }
+        }
+    }
+
+    async fn read_bounded(&mut self, sql: &str) -> Result<crate::query::QueryEvidence, DbError> {
+        use crate::query::{MAX_BYTES, MAX_ROWS, QueryColumn, QueryEvidence};
+        use futures_util::TryStreamExt;
+        // Parse exactly the original statement. Preparing also retains column
+        // metadata for zero rows, and refuses multiple statements with 42601.
+        let statement = self.client.prepare(sql).await?;
+        let mut evidence = QueryEvidence {
+            columns: statement
+                .columns()
+                .iter()
+                .map(|c| QueryColumn {
+                    name: c.name().to_owned(),
+                    type_name: format!("{}.{}", c.type_().schema(), c.type_().name()),
+                })
+                .collect(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+        let stream = self
+            .client
+            .query_raw(&statement, std::iter::empty::<&str>())
+            .await?;
+        let mut stream = std::pin::pin!(stream);
+        let mut remaining = MAX_BYTES;
+        while let Some(row) = stream.try_next().await? {
+            let cells = (0..row.len())
+                .map(|i| render_cell(&row, i, &mut remaining))
+                .collect();
+            evidence.rows.push(cells);
+            if evidence.rows.len() == MAX_ROWS
+                || remaining == 0
+                || evidence.rows.last().is_some_and(|row| {
+                    row.iter().any(|cell| {
+                        matches!(
+                            cell,
+                            crate::query::EvidenceCell::Text {
+                                truncated: true,
+                                ..
+                            }
+                        )
+                    })
+                })
+            {
+                evidence.truncated = true;
+                // Closing avoids draining an unbounded stream, and prevents
+                // queued postchecks from running behind an unfinished query.
+                self._driver.0.abort();
+                break;
+            }
+        }
+        Ok(evidence)
+    }
+
     /// Runs one batch of statements and discards any results.
     ///
     /// `batch_execute` is the analogue of the other driver's `simple_query`
@@ -972,18 +1049,18 @@ fn alpn(config: &Config) -> Vec<Vec<u8>> {
 /// Held, not detached — see the module header. Generic because the future's
 /// type carries the transport, and the transport is the one thing the two
 /// branches of [`Conn::connect`] do not share.
-fn hold<S, T>(connection: tokio_postgres::Connection<S, T>) -> tokio::task::JoinHandle<()>
+fn hold<S, T>(connection: tokio_postgres::Connection<S, T>) -> DriverTask
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    DriverTask(tokio::spawn(async move {
         // The connection future resolves when the socket closes. Its error is
         // the socket's, and the next statement reports it with the context of
         // what was being run; logging it here would print a second failure
         // beside the real one.
         let _ = connection.await;
-    })
+    }))
 }
 
 /// The TLS stack, chosen here rather than pinned by the driver.
@@ -1710,5 +1787,98 @@ mod tests {
             "keepalives=0 must leave the OS default off, not the driver's own \
              default of on"
         );
+    }
+}
+
+/// Borrow the wire cell, avoiding an allocation proportional to its size.
+struct WireCell<'a>(&'a [u8]);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for WireCell<'a> {
+    fn from_sql(
+        _: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw))
+    }
+    fn accepts(_: &tokio_postgres::types::Type) -> bool {
+        true
+    }
+}
+
+fn render_cell(
+    row: &tokio_postgres::Row,
+    index: usize,
+    remaining: &mut usize,
+) -> crate::query::EvidenceCell {
+    use crate::query::EvidenceCell;
+    use tokio_postgres::types::{Kind, Type};
+    let raw = match row.try_get::<_, Option<WireCell<'_>>>(index) {
+        Ok(None) => return EvidenceCell::Null,
+        Ok(Some(raw)) => raw.0,
+        Err(_) => return EvidenceCell::Unrenderable,
+    };
+    let ty = row.columns()[index].type_();
+    // Binary strings/enums are UTF-8; other arbitrary types are explicitly
+    // unrenderable. Never invoke an output function or rewrite the user's SQL.
+    let text = match *ty {
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            std::str::from_utf8(raw).ok()
+        }
+        _ if matches!(ty.kind(), Kind::Enum(_)) => std::str::from_utf8(raw).ok(),
+        _ => None,
+    };
+    let scalar;
+    let text = if let Some(text) = text {
+        text
+    } else {
+        macro_rules! decode {
+            ($t:ty) => {
+                row.try_get::<_, $t>(index).ok().map(|v| v.to_string())
+            };
+        }
+        scalar = match *ty {
+            Type::BOOL => decode!(bool),
+            Type::INT2 => decode!(i16),
+            Type::INT4 => decode!(i32),
+            Type::INT8 => decode!(i64),
+            Type::OID => decode!(u32),
+            Type::FLOAT4 => decode!(f32),
+            Type::FLOAT8 => decode!(f64),
+            _ => None,
+        };
+        let Some(text) = scalar.as_deref() else {
+            return EvidenceCell::Unrenderable;
+        };
+        text
+    };
+    let mut end = text.len().min(*remaining);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    *remaining -= end;
+    EvidenceCell::Text {
+        value: text[..end].to_owned(),
+        truncated: end != text.len(),
+    }
+}
+
+#[cfg(test)]
+mod assertion_task_tests {
+    use super::DriverTask;
+
+    #[tokio::test]
+    async fn cancellation_during_connection_setup_does_not_detach_the_socket_task() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        // No Conn exists yet during the initial server-version/zone reads.
+        drop(DriverTask(task));
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        abort.abort();
+        assert!(stopped.is_ok(), "the dropped owner detached its task");
     }
 }
