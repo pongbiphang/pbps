@@ -558,6 +558,7 @@
         "managed_types::enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns",
         "managed_types::enum_rebuild_after_a_rename_in_the_same_plan_maps_labels_by_their_final_names",
         "managed_types::enum_rebuild_stages_and_resumes_across_its_steps",
+        "managed_types::enum_rebuild_staged_closing_read_refuses_a_moved_column_another_session_retyped",
         "managed_types::enum_rebuild_applies_with_a_view_the_same_plan_redefines",
         "managed_types::enum_rebuild_applies_with_a_routine_body_the_same_plan_changes",
         "managed_types::enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes",

@@ -15659,6 +15659,7 @@ mod tests {
                             .parse::<pbps_model::TableName>()
                             .unwrap()
                             .column("m"),
+                        to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                         array: false,
                         removed: vec![],
                     },

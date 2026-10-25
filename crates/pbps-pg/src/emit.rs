@@ -152,6 +152,7 @@ mod declared_type_emission_tests {
             let moved = sql(&step(Step::Retype {
                 column_uid: "c_aaaaaa".parse().unwrap(),
                 column: table.column("m"),
+                to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array,
                 removed: vec![],
             }));

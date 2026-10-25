@@ -325,7 +325,7 @@ fn rebuild(
                     reference.shown()
                 ));
             }
-            columns.push((column_uid.clone(), reference, column.ty.is_array()));
+            columns.push((column_uid.clone(), reference, column.ty.clone()));
         }
     }
     for (partition, table) in &desired.schema.tables {
@@ -365,14 +365,15 @@ fn rebuild(
     out.extend(
         columns
             .into_iter()
-            .map(|(column_uid, column, array)| Change::EnumRebuild {
+            .map(|(column_uid, column, to)| Change::EnumRebuild {
                 uid: uid.clone(),
                 name: name.clone(),
                 tmp: tmp.clone(),
                 step: EnumRebuildStep::Retype {
                     column_uid,
                     column,
-                    array,
+                    array: to.is_array(),
+                    to,
                     removed: removed.clone(),
                 },
             }),
@@ -2038,6 +2039,7 @@ mod rebuild_tests {
             step: EnumRebuildStep::Retype {
                 column_uid: uid.clone(),
                 column: column.clone(),
+                to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array: false,
                 removed: vec![],
             },

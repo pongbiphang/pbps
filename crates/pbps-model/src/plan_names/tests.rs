@@ -59,6 +59,7 @@ fn a_rebuilds_retype_is_a_step_of_its_column_and_must_agree_with_the_identities(
             step: crate::EnumRebuildStep::Retype {
                 column_uid: c.clone(),
                 column: address,
+                to: crate::ColumnType::reference("app.e".parse().unwrap()),
                 array: false,
                 removed: vec![],
             },

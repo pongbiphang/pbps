@@ -234,6 +234,7 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
     let retype = |column: &str| EnumRebuildStep::Retype {
         column_uid: column.parse().unwrap(),
         column: "app.t.m".parse().unwrap(),
+        to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
         array: false,
         removed: vec![],
     };

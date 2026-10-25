@@ -2246,6 +2246,7 @@ mod tests {
                 table: "app.t".parse().unwrap(),
                 name: "m".into(),
             },
+            to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
             array: false,
             removed: vec![],
         }));

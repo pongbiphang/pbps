@@ -2369,6 +2369,13 @@ impl Change {
                     ColumnPromise::Collation(to_collation.as_ref()),
                 ),
             ],
+            // The type alone: the statement leaves the other fields as they
+            // were, and `columns_redefined` excludes only this one. Held at
+            // the closing read, the replacement having been named back.
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, to, .. },
+                ..
+            } => vec![(column.clone(), ColumnPromise::Type(to))],
             Change::AlterColumnNullability {
                 column,
                 to_nullable,
@@ -3515,6 +3522,21 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn enum_retype(column: &ColumnRef, to: &str) -> Change {
+        Change::EnumRebuild {
+            uid: uid("y_p3n8vd"),
+            name: "app.mood".parse().unwrap(),
+            tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
+            step: crate::EnumRebuildStep::Retype {
+                column_uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                to: ty(to),
+                array: false,
+                removed: vec![],
+            },
+        }
+    }
+
     fn drop_column() -> Change {
         Change::DropColumn {
             uid: uid("c_k7x2mq"),
@@ -4034,6 +4056,45 @@ mod tests {
         assert_eq!(routine.subject(), "app.f(integer,text)");
     }
 
+    /// The column a rebuild moves is held to the type it has once the swap
+    /// has named the replacement back, so a session that retypes it in
+    /// between is found at the closing read (SPEC §7.6). The other steps move
+    /// no column and promise none.
+    #[test]
+    fn a_rebuilds_retype_promises_its_column_the_final_type_and_no_other_step_promises() {
+        let column: ColumnRef = "app.t".parse::<TableName>().unwrap().column("m");
+        let retype = enum_retype(&column, "app.mood");
+        let promised = retype.columns_promised();
+        assert_eq!(promised.len(), 1);
+        assert_eq!(promised[0].0, column);
+        assert!(matches!(&promised[0].1, ColumnPromise::Type(t) if **t == ty("app.mood")));
+        // An array column is held to the array.
+        let array = enum_retype(&column, "app.mood[]");
+        assert!(matches!(&array.columns_promised()[0].1, ColumnPromise::Type(t) if t.is_array()));
+        let definition = Box::new(crate::ManagedType::Enum {
+            values: vec!["ok".into()],
+        });
+        for step in [
+            crate::EnumRebuildStep::Create {
+                definition: definition.clone(),
+                removed: vec![],
+                ordinal: 0,
+            },
+            crate::EnumRebuildStep::Swap {
+                definition,
+                comment: None,
+            },
+        ] {
+            let change = Change::EnumRebuild {
+                uid: uid("y_p3n8vd"),
+                name: "app.mood".parse().unwrap(),
+                tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
+                step,
+            };
+            assert!(change.columns_promised().is_empty());
+        }
+    }
+
     /// Every field a change excludes from the shape comparison is a field
     /// the change promises a value for, so the exclusion is never wider than
     /// the check that stands in for it (173, 189). `Whole` on a column that
@@ -4077,6 +4138,7 @@ mod tests {
                 column: column.clone(),
                 reason: None,
             },
+            enum_retype(&column, "app.mood"),
         ];
         for change in &changes {
             for (excluded, field) in change.columns_redefined() {

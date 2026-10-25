@@ -2589,3 +2589,55 @@ fn row_security_standing_guard_owns_only_touched_policy_fields_and_exact_target_
         );
     }
 }
+
+#[test]
+fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
+    let name = TableName::new("app", "t");
+    let mut t = Table::default();
+    for column in ["m", "other"] {
+        t.columns
+            .insert(column.into(), Column::new("app.mood".parse().unwrap()));
+    }
+    let before = schema(t);
+    let changes = plan(vec![Change::EnumRebuild {
+        uid: "y_000001".parse().unwrap(),
+        name: "app.mood".parse().unwrap(),
+        tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
+        step: pbps_model::EnumRebuildStep::Retype {
+            column_uid: "c_000001".parse().unwrap(),
+            column: name.column("m"),
+            to: "app.mood".parse().unwrap(),
+            array: false,
+            removed: vec![],
+        },
+    }]);
+    let mut ids = pbps_model::IdsFile::default();
+    ids.tables.insert("t_000001".parse().unwrap(), name.clone());
+    ids.columns
+        .insert("c_000001".parse().unwrap(), name.column("m"));
+    let check = |m: &str, other: &str| {
+        let mut after = before.clone();
+        let t = after.tables.get_mut(&name).unwrap();
+        t.columns.get_mut("m").unwrap().ty = m.parse().unwrap();
+        t.columns.get_mut("other").unwrap().ty = other.parse().unwrap();
+        super::super::refuse_pinned_movement(
+            &pbps_pg::Postgres::new(),
+            super::Read::transactional(super::Plan {
+                changes: &changes,
+                ids: &ids,
+            }),
+            &before,
+            &after,
+            "test",
+        )
+    };
+    check("app.mood", "app.mood").expect("the column ends as the declaration has it");
+    // Another session's retype of the moved column is found...
+    let error = check("text", "app.mood").expect_err("a moved column that ends as text");
+    assert!(
+        format!("{error:#}").contains("does not have the type this plan gives it"),
+        "{error:#}"
+    );
+    // ...and a column the plan does not move is not excused by the rebuild.
+    assert!(check("app.mood", "text").is_err());
+}

@@ -366,6 +366,7 @@ mod effects_of_each_kind {
                     step: pbps_model::EnumRebuildStep::Retype {
                         column_uid: x.clone(),
                         column: xref.clone(),
+                        to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                         array: false,
                         removed: vec![],
                     },

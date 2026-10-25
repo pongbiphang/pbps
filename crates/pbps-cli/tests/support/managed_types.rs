@@ -3969,6 +3969,132 @@ fn enum_rebuild_after_a_rename_in_the_same_plan_maps_labels_by_their_final_names
     }
 }
 
+/// A staged rebuild of `app.mood` that has made the replacement and moved every
+/// column to it, with the swap held back by a lock on the old type.
+struct HeldAtItsSwap {
+    child: std::process::Child,
+    release: std::sync::mpsc::Sender<()>,
+    gate: std::thread::JoinHandle<()>,
+    args: Vec<String>,
+}
+
+impl HeldAtItsSwap {
+    /// The process is killed and the run unlocked; the arguments that resume
+    /// it come back.
+    fn killed(mut self, d: &Demo, db: &str) -> Vec<String> {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.release.send(()).unwrap();
+        self.gate.join().unwrap();
+        succeeds(d.run(&["unlock", "--db", db]));
+        self.args
+    }
+
+    /// The lock goes, and the run goes on to its swap and its closing read.
+    fn released(mut self) -> std::process::ExitStatus {
+        self.release.send(()).unwrap();
+        self.gate.join().unwrap();
+        self.child.wait().unwrap()
+    }
+}
+
+fn staged_rebuild_held_at_its_swap(d: &Demo, db: &str, path: &std::path::Path) -> HeldAtItsSwap {
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        db,
+        "--staged",
+        "--out",
+        path.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(path);
+    let args = [
+        "apply",
+        "--db",
+        db,
+        "--plan",
+        path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "type-rebuild",
+        "--staged",
+    ];
+    // A lock on the old type holds the swap's `DROP TYPE`, so the process
+    // stands after the replacement exists and both columns have moved.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (ready, locked) = std::sync::mpsc::channel::<()>();
+    let gate = {
+        let db = db.to_owned();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &db)
+                        .await
+                        .unwrap();
+                    conn.execute("BEGIN; COMMENT ON TYPE app.mood IS 'held'")
+                        .await
+                        .unwrap();
+                    ready.send(()).unwrap();
+                    held.recv().unwrap();
+                    conn.execute("ROLLBACK").await.unwrap();
+                });
+        })
+    };
+    locked.recv().unwrap();
+    let mut child = std::process::Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(args)
+        .stdout(std::fs::File::create(d.dir.join("staged.stdout")).unwrap())
+        .stderr(std::fs::File::create(d.dir.join("staged.stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        let done = latest_snapshot(db).staged.map_or(0, |s| s.completed);
+        if done >= 3 {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the apply ended early: {}{}",
+            std::fs::read_to_string(d.dir.join("staged.stdout")).unwrap_or_default(),
+            std::fs::read_to_string(d.dir.join("staged.stderr")).unwrap_or_default()
+        );
+        assert!(
+            start.elapsed().as_secs() < 120,
+            "the staged steps never ran"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Mid-rebuild: the replacement and the old type both stand, and both
+    // columns hold the replacement.
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_type WHERE typname LIKE 'pbps_rebuild_%' AND typtype = 'e'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid OR t.typarray = a.atttypid WHERE a.attrelid = 'app.t'::regclass AND t.typname LIKE 'pbps_rebuild_%'"
+        ),
+        2
+    );
+    HeldAtItsSwap {
+        child,
+        release,
+        gate,
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn enum_rebuild_stages_and_resumes_across_its_steps() {
@@ -3984,102 +4110,10 @@ fn enum_rebuild_stages_and_resumes_across_its_steps() {
         let db = own.connection();
         declare_mood(&d, "[happy, ok]");
         let path = d.dir.join("staged-rebuild.plan.json");
-        succeeds(d.run(&[
-            "plan",
-            "--db",
-            db,
-            "--staged",
-            "--out",
-            path.to_str().unwrap(),
-        ]));
-        let checksum = plan_checksum(&path);
-        let args = [
-            "apply",
-            "--db",
-            db,
-            "--plan",
-            path.to_str().unwrap(),
-            "--checksum",
-            &checksum,
-            "--allow",
-            "type-rebuild",
-            "--staged",
-        ];
-        // A lock on the old type holds the swap's `DROP TYPE`, so the process
-        // stands after the replacement exists and both columns have moved.
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let (ready, locked) = std::sync::mpsc::channel::<()>();
-        let gate = {
-            let db = db.to_owned();
-            std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &db)
-                            .await
-                            .unwrap();
-                        conn.execute("BEGIN; COMMENT ON TYPE app.mood IS 'held'")
-                            .await
-                            .unwrap();
-                        ready.send(()).unwrap();
-                        held.recv().unwrap();
-                        conn.execute("ROLLBACK").await.unwrap();
-                    });
-            })
-        };
-        locked.recv().unwrap();
-        let mut child = std::process::Command::new(BIN)
-            .arg("--project")
-            .arg(&d.dir)
-            .args(args)
-            .stdout(std::fs::File::create(d.dir.join("staged.stdout")).unwrap())
-            .stderr(std::fs::File::create(d.dir.join("staged.stderr")).unwrap())
-            .spawn()
-            .unwrap();
-        let start = std::time::Instant::now();
-        loop {
-            let done = latest_snapshot(db).staged.map_or(0, |s| s.completed);
-            if done >= 3 {
-                break;
-            }
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "the apply ended early: {}{}",
-                std::fs::read_to_string(d.dir.join("staged.stdout")).unwrap_or_default(),
-                std::fs::read_to_string(d.dir.join("staged.stderr")).unwrap_or_default()
-            );
-            assert!(
-                start.elapsed().as_secs() < 120,
-                "the staged steps never ran"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // Mid-rebuild: the replacement and the old type both stand, and both
-        // columns hold the replacement.
-        assert_eq!(
-            scalar(
-                db,
-                "SELECT count(*)::bigint FROM pg_type WHERE typname LIKE 'pbps_rebuild_%' AND typtype = 'e'"
-            ),
-            1
-        );
-        assert_eq!(
-            scalar(
-                db,
-                "SELECT count(*)::bigint FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid OR t.typarray = a.atttypid WHERE a.attrelid = 'app.t'::regclass AND t.typname LIKE 'pbps_rebuild_%'"
-            ),
-            2
-        );
-        child.kill().unwrap();
-        child.wait().unwrap();
-        release.send(()).unwrap();
-        gate.join().unwrap();
-        succeeds(d.run(&["unlock", "--db", db]));
-        let mut resume = args.to_vec();
-        resume.push("--resume");
-        succeeds(d.run(&resume));
+        let args = staged_rebuild_held_at_its_swap(&d, db, &path).killed(&d, db);
+        let mut resume = args.clone();
+        resume.push("--resume".into());
+        succeeds(d.run(&resume.iter().map(String::as_str).collect::<Vec<_>>()));
         assert!(mood_is(db, &["happy", "ok"]));
         assert!(no_replacement_left(db));
         succeeds(d.run(&["verify", "--db", db]));
@@ -4387,5 +4421,46 @@ fn enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cann
             1
         );
         assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_staged_closing_read_refuses_a_moved_column_another_session_retyped() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'ok','{happy}'),(2,'happy',NULL);";
+        let (own, d) = adopted(&server, "rebuild_staged_retyped1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("staged-retyped.plan.json");
+        let held = staged_rebuild_held_at_its_swap(&d, db, &path);
+        // Between the column's retype and the closing read, another session
+        // moves it on to text. The swap has nothing to refuse it by: the old
+        // type no longer holds the column.
+        on_server(
+            db,
+            "ALTER TABLE app.t ALTER COLUMN m TYPE text USING m::text",
+        );
+        assert!(!held.released().success());
+        let text = [
+            std::fs::read_to_string(d.dir.join("staged.stdout")).unwrap_or_default(),
+            std::fs::read_to_string(d.dir.join("staged.stderr")).unwrap_or_default(),
+        ]
+        .concat();
+        assert!(
+            text.contains("app.t")
+                && text.contains("`m`")
+                && text.contains("does not have the type this plan gives it"),
+            "{text}"
+        );
+        // The column the session left alone was held to its type too, and
+        // passed: only the one it moved is named.
+        assert!(!text.contains("`tags`"), "{text}");
     }
 }

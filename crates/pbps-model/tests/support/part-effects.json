@@ -1383,6 +1383,7 @@
         "step": "retype",
         "column_uid": "c_aaaaaa",
         "column": "app.t.n",
+        "to": "app.e",
         "array": false,
         "removed": [
           "old"

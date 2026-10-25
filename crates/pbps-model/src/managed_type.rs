@@ -106,6 +106,12 @@ pub enum EnumRebuildStep {
     Retype {
         column_uid: crate::Uid,
         column: crate::ColumnRef,
+        /// The type the column has once the swap has named the replacement
+        /// back: the enum, or an array of it, as the declaration spells it.
+        /// The closing read holds the column to it (SPEC §7.6), since a
+        /// concurrent retype between this step and the last would otherwise
+        /// leave the column as that session made it.
+        to: crate::ColumnType,
         array: bool,
         /// The labels the rebuild removes, as stored now: the cast refuses a
         /// row holding one, and the plan-time probe counts them.
@@ -201,6 +207,7 @@ mod rebuild_tests {
                     table: "app.t".parse().unwrap(),
                     name: "m".into(),
                 },
+                to: crate::ColumnType::reference("app.e".parse().unwrap()),
                 array: true,
                 removed: vec!["gone".into()],
             }),

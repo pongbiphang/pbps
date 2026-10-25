@@ -3179,6 +3179,20 @@ aborts on. Pinned by `a_default_the_plan_drops_under_the_names_it_renames_to_is_
 `enum_rebuild_applies_beside_a_table_and_column_rename_*` and
 `enum_rebuild_rebuilds_a_view_over_a_partitions_column_*` tests.
 
+A moved column's type is exempt from the checkpoint comparison while the
+rebuild runs, since it holds the replacement until the swap names it back. The
+exemption is paired with a promise (SPEC §7.6), as every excluded field is:
+each `Retype` carries the type the declaration gives the column, and the
+closing read holds the column to it, so a session that retypes it in between
+leaves the swap finished and the success unrecorded, with the column named.
+The restored default, check, key and index are plain `AlterColumnDefault`,
+`AddCheck`, `AddForeignKey` and `AddIndex` changes and are held by the
+promises and part checks those already carry; a partition's column is its
+root's and is moved only with it. Pinned by
+`a_rebuilds_retype_promises_its_column_the_final_type_and_no_other_step_promises`,
+`a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read` and the
+live `enum_rebuild_staged_closing_read_refuses_*` test.
+
 Census at apply: the same census runs again where the plan runs, in the apply's
 own transaction after the lock and before the first statement. A staged run
 reads it in a transaction it rolls back, at its start and at every resume (a
