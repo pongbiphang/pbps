@@ -21,6 +21,7 @@
 //! The draft is for review: whatever the file ends up holding is compared
 //! with the target the same way, whoever wrote it (DEC-1673.1).
 
+use pbps_model::escape::Escaped;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::transport::QueryConnection;
@@ -720,9 +721,9 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
                          externals file can stage before the managed objects exist; adopt {} \
                          into the managed set too, or select no resolver and keep ADR-0013's \
                          conservative rebuild",
-                        described(key),
-                        described(named),
-                        described(key)
+                        Escaped(&described(key)),
+                        Escaped(&described(named)),
+                        Escaped(&described(key))
                     ),
                 ),
                 Some(Chain::Foreign) => Item::listed(
@@ -730,7 +731,7 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
                     format!(
                         "{} cannot be staged: the comparison does not qualify a foreign \
                          table's properties",
-                        described(key)
+                        Escaped(&described(key))
                     ),
                 ),
                 Some(Chain::Through(other)) => Item::listed(
@@ -738,8 +739,8 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
                     format!(
                         "{} cannot be staged: its shape names {}, which cannot be staged \
                          either",
-                        described(key),
-                        described(other)
+                        Escaped(&described(key)),
+                        Escaped(&described(other))
                     ),
                 ),
                 None => item(facts, key, &described(key)),
@@ -872,7 +873,8 @@ impl Staging {
             self.chained_objects.remove(&described);
             self.unfillable.push(format!(
                 "{described} is not filled: its shape names a managed relation the scratch \
-                 compile does not create"
+                 compile does not create",
+                described = Escaped(&described)
             ));
         }
         self.chained = kept.iter().map(|(_, sql, _)| sql.as_str()).collect();
@@ -918,7 +920,8 @@ impl Fill {
                 staging.unfillable.push(format!(
                     "{} is not filled: the externals file created its {part}; write the whole \
                      of it in the externals file if a binding needs it",
-                    object.described
+                    Escaped(&object.described),
+                    part = Escaped(part)
                 ));
                 State::Missing
             } else if let Some(&missing) = object
@@ -928,7 +931,8 @@ impl Fill {
             {
                 staging.unfillable.push(format!(
                     "{} cannot be filled: its shape names {}, which cannot be filled either",
-                    object.described, self.objects[missing].described
+                    Escaped(&object.described),
+                    Escaped(&self.objects[missing].described)
                 ));
                 State::Missing
             } else {
@@ -937,7 +941,7 @@ impl Fill {
                         staging.unfillable.push(format!(
                             "{} cannot be filled: {why}; write it in the externals file, or \
                              select no resolver and keep ADR-0013's conservative rebuild",
-                            object.described
+                            Escaped(&object.described)
                         ));
                         State::Missing
                     }
@@ -961,7 +965,7 @@ impl Fill {
                              extension's script runs code and creates names fill cannot order \
                              between two parts of the compile; select no resolver and keep \
                              ADR-0013's conservative rebuild",
-                            object.described
+                            Escaped(&object.described)
                         ));
                         State::Missing
                     }
@@ -1106,7 +1110,7 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
                                     How::Not(format!(
                                         "its shape names the managed {}, and fill orders a \
                                          shape only after the managed relations it names",
-                                        described(named)
+                                        Escaped(&described(named))
                                     ))
                                 });
                             }
@@ -1342,6 +1346,7 @@ impl<'a> Folded<'a> {
 
 /// What the draft writes for one object it stages.
 fn item(facts: &Facts, key: &Key, described: &str) -> Item {
+    let described = Escaped(described);
     let by_hand = |what: &str| {
         Item::listed(
             key,

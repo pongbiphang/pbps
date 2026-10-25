@@ -10,6 +10,7 @@ use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
+use pbps_model::escape::Escaped;
 use pbps_model::resolver::OutsideWrites;
 use pbps_pg::resolver::capture::{self, Managed, Paths, RecordedOwnership, StageError, Staged};
 use pbps_pg::resolver::scratch::{self as sql, Placement};
@@ -512,7 +513,7 @@ impl Scratch<'_> {
             "the scratch account {login} has objects or privileges that emptying its database \
              with DROP OWNED would also drop or revoke ({}); use an account with none outside \
              that database",
-            reach.join(", ")
+            described_list(&reach)
         )))
     }
 
@@ -579,7 +580,7 @@ pub(in crate::resolver::server) async fn release_supplied(
         Ok((named, total)) => Err(vec![format!(
             "{total} object(s) in database {database} owned by a role other than \
              the scratch account ({})",
-            named.join(", ")
+            described_list(&named)
         )]),
         Err(error) => Err(vec![format!(
             "every object the scratch account owns in database {database} ({error})"
@@ -990,7 +991,8 @@ async fn run_fill(
                              scratch database: something the externals file created, such as \
                              an event trigger, ran on fill's statements; an externals file \
                              creates only objects in the database, unless the resolver sets \
-                             `outside_writes: allow`"
+                             `outside_writes: allow`",
+                            name = Escaped(&name)
                         )
                     })
                     .collect(),
@@ -1098,7 +1100,8 @@ async fn run_externals(
                         format!(
                             "it changed {name}, outside the scratch database; an externals file \
                              creates only objects in the database, unless the resolver \
-                             sets `outside_writes: allow`"
+                             sets `outside_writes: allow`",
+                            name = Escaped(&name)
                         )
                     })
                     .collect(),
@@ -1128,6 +1131,16 @@ async fn run_externals(
     Ok(())
 }
 
+// The readers also serve raw comparisons. Only the descriptions entering a
+// sentence are shown; the separators remain tool prose (DEC-2084.1).
+fn described_list(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| Escaped(name).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn refuse_foreign_objects(conn: &mut Conn) -> Result<(), Error> {
     let (named, total) = sql::foreign_objects(conn)
         .await
@@ -1137,7 +1150,7 @@ async fn refuse_foreign_objects(conn: &mut Conn) -> Result<(), Error> {
     }
     Err(Error::Unusable(format!(
         "the scratch database is not empty: {total} object(s) initdb did not create, including {}",
-        named.join(", ")
+        described_list(&named)
     )))
 }
 

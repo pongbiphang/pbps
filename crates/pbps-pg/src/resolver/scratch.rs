@@ -9,6 +9,7 @@
 
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
+use pbps_model::escape::Escaped;
 
 /// The first OID a database assigns after initdb. Everything below it was
 /// created by initdb itself, in every database alike; anything at or above it
@@ -196,7 +197,7 @@ impl Account {
         .chain(
             self.shared
                 .iter()
-                .map(|authority| format!("no {authority}")),
+                .map(|authority| format!("no {}", Escaped(authority))),
         )
         .chain(self.logins.iter().map(|login| {
             format!(
@@ -1248,5 +1249,30 @@ mod tests {
         for bad in ["", "0A9F", "x'); DROP", "a b"] {
             assert!(token_literal(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn catalog_prose_account_authority_is_shown_only_when_explained() {
+        let authority = "ownership of database a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+        let account = Account {
+            superuser: false,
+            create_role: false,
+            create_db: false,
+            replication: false,
+            login_superuser: false,
+            predefined: vec![],
+            shared: vec![authority.into()],
+            logins: vec![],
+            target_login: false,
+        };
+        assert_eq!(
+            account.excess(),
+            [r"no ownership of database a\n\u{1b}\u{202e}\\n\\u{1b}é*/"]
+        );
+        assert_eq!(account.shared, [authority]);
+        assert!(!account.confined());
+        let mut empty = account;
+        empty.shared.clear();
+        assert!(empty.confined());
     }
 }
