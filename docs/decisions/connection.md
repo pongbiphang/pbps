@@ -1117,10 +1117,16 @@ before anything is opened:
   (resolving one is discovery, not the driver's business), and so are SQL
   credentials beside integrated authentication, two spellings of the setting,
   an unreadable value, and `Trusted_Connection` (the driver does not read it).
-- A string that the parser here rejects is passed on only if nothing in it
-  mentions a transport or the authentication; otherwise it is refused as not
-  inspectable. The driver's parser reads quoting this one does not, and a key
-  seen by one parser only must not choose the connection.
+- Admission reads the string with a port of the driver's own reader
+  (`Options` in `pbps-db/src/mssql.rs`), and the driver is handed that
+  reader's canonical spelling, never the caller's text. The driver exposes no
+  accessor for what it parsed, and a second, different parser can accept the
+  same string and disagree about it (`Description=x{;Integrated
+  Security=SSPI;a=}`): the one that is wrong about it admits TCP while the
+  driver sends the Windows identity. With one reader, and the driver reading
+  only what that reader produced, a disagreement changes what a string means
+  and can never change what was admitted. A string the reader rejects gets the
+  driver's own error.
 - No refusal retries as the other transport or the other authentication, and a
   failed pipe open is final apart from the bounded wait on a busy pipe.
 
@@ -1138,11 +1144,18 @@ target.
 Rejected:
 - **Reading the pipe out of the driver's parsed `Config`.** The parse
   discards the path and keeps `np:` as the host.
-- **Mapping `Trusted_Connection` to `Integrated Security`.** It would work
-  only by rewriting the string, and a rewrite has to round-trip quoting.
+- **Mapping `Trusted_Connection` to `Integrated Security`.** The canonical
+  spelling now makes a rewrite safe, but the setting would then mean two
+  things in one string; it stays refused.
+- **A second, general-purpose parser plus a screen for words that matter.**
+  That was this entry's first form. A word list cannot name what a parser
+  hides from it, and refusing every quote or brace would reject the quoted
+  passwords the driver's own error message recommends.
 
-Pinned by the `admission_tests` module in `crates/pbps-db/src/mssql.rs`; each
-refusal was watched to fail with its guard removed. The Windows transport
+Pinned by the `admission_tests` module in `crates/pbps-db/src/mssql.rs`
+(`a_quote_or_brace_inside_a_value_cannot_hide_a_setting_from_admission` and
+`driver_and_port_read_the_same_options` pin the shared reader); each refusal
+was watched to fail with its guard removed. The Windows transport
 tests in `pipe_tests` compile only on Windows and were not run on the
 machine that wrote this entry. SSPI authentication, the TLS handshake over a
 pipe and a real LocalDB are unmeasured until the Windows qualification in the

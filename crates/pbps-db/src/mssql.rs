@@ -16,18 +16,162 @@ use crate::{DbError, Param};
 /// string names one under either key the driver reads (#1188).
 ///
 /// The driver's parsed `Config` does not say whether the name came from the
-/// string, so the string is read with an ADO.NET parser. One that does not
-/// parse is left to `from_ado_string`, which has already accepted it by the
-/// time this runs.
-fn name_session(config: &mut Config, connection_string: &str) {
-    let named = connection_string
-        .parse::<connection_string::AdoNetString>()
-        .is_ok_and(|options| {
-            options.get("application name").is_some() || options.get("applicationname").is_some()
-        });
-    if !named {
+/// string, so the options this module already read are asked.
+fn name_session(config: &mut Config, options: &Options) {
+    if options.get("application name").is_none() && options.get("applicationname").is_none() {
         config.application_name(crate::session_application_name());
     }
+}
+
+/// The options of an ADO.NET connection string, read exactly as the driver
+/// reads them (#2271).
+///
+/// Admission decides what the connection is from these, so they must be the
+/// options the driver would act on. Two parsers that accept the same string
+/// can still disagree about it (`Description=x{;Integrated Security=SSPI;a=}`
+/// hides the setting from a parser that opens a brace anywhere, and shows it
+/// to one that opens a brace only at the start of a value), and the one that
+/// is wrong about it decides to send the Windows identity over TCP. The driver
+/// exposes no accessor for its parsed options, so this is a port of its
+/// reader (`tiberius` 0.13.0, pinned exactly) and the driver is never handed
+/// the caller's text: it is handed [`Options::canonical`], which any reader
+/// of this grammar must read as these options. A disagreement between this
+/// port and the driver therefore changes what a string means, never what was
+/// admitted; `driver_and_port_read_the_same_options` pins that they agree.
+#[derive(Debug, PartialEq, Eq)]
+struct Options(std::collections::BTreeMap<String, String>);
+
+impl Options {
+    /// Keys are lower-cased and trimmed, the last duplicate wins, and a value
+    /// is unquoted, `'...'` or `"..."` (a doubled quote is a literal one) or
+    /// `{...}` (to the first `}`), where the quote or brace counts only as the
+    /// first character of a value. Non-ASCII text is refused up front, as the
+    /// driver does.
+    fn parse(input: &str) -> Result<Self, &'static str> {
+        if !input.is_ascii() {
+            return Err("the connection string contains non-ASCII characters");
+        }
+        let b = input.as_bytes();
+        let n = b.len();
+        let mut i = 0;
+        let mut pairs = std::collections::BTreeMap::new();
+        while i < n {
+            while i < n && (b[i] == b';' || b[i].is_ascii_whitespace()) {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            // The key runs to the first single `=`; a `==` is a literal `=`.
+            let mut key = String::new();
+            loop {
+                if i >= n || b[i] == b';' {
+                    return Err("key-value pairs must be joined by a `=`");
+                }
+                if b[i] == b'=' {
+                    if i + 1 < n && b[i + 1] == b'=' {
+                        key.push('=');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                key.push(char::from(b[i]));
+                i += 1;
+            }
+            let key = key
+                .trim_matches(|c: char| c.is_ascii_whitespace())
+                .to_ascii_lowercase();
+            if key.is_empty() {
+                return Err("a key in the connection string is empty");
+            }
+            while i < n && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let value = if i < n && (b[i] == b'\'' || b[i] == b'"') {
+                let quote = b[i];
+                i += 1;
+                let mut v = String::new();
+                loop {
+                    if i >= n {
+                        return Err("the connection string has an unclosed quote");
+                    }
+                    if b[i] == quote {
+                        if i + 1 < n && b[i + 1] == quote {
+                            v.push(char::from(quote));
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    v.push(char::from(b[i]));
+                    i += 1;
+                }
+                skip_trailing(b, &mut i)?;
+                v
+            } else if i < n && b[i] == b'{' {
+                i += 1;
+                let start = i;
+                while i < n && b[i] != b'}' {
+                    i += 1;
+                }
+                if i >= n {
+                    return Err("the connection string has an unclosed brace");
+                }
+                let v = input[start..i].to_owned();
+                i += 1;
+                skip_trailing(b, &mut i)?;
+                v
+            } else {
+                let start = i;
+                while i < n && b[i] != b';' {
+                    i += 1;
+                }
+                input[start..i]
+                    .trim_end_matches(|c: char| c.is_ascii_whitespace())
+                    .to_owned()
+            };
+            pairs.insert(key, value);
+            if i < n && b[i] == b';' {
+                i += 1;
+            }
+        }
+        Ok(Self(pairs))
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    /// These options in the one spelling that has no second reading: every
+    /// value single-quoted, so it is read as a value whatever it holds, and
+    /// every `=` in a key doubled.
+    fn canonical(&self) -> String {
+        self.0
+            .iter()
+            .map(|(key, value)| {
+                format!("{}='{}'", key.replace('=', "=="), value.replace('\'', "''"))
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+}
+
+/// After a closing quote or brace only whitespace may precede the next `;`.
+fn skip_trailing(b: &[u8], i: &mut usize) -> Result<(), &'static str> {
+    while *i < b.len() && b[*i] != b';' {
+        if !b[*i].is_ascii_whitespace() {
+            return Err("unexpected characters after a quoted value");
+        }
+        *i += 1;
+    }
+    Ok(())
 }
 
 /// The transport a connection string asks for, decided before anything opens
@@ -59,11 +203,6 @@ const INTEGRATED_KEYS: [&str; 3] = [
     "trusted_connection",
 ];
 const CREDENTIAL_KEYS: [&str; 6] = ["uid", "username", "user", "user id", "password", "pwd"];
-/// Substrings that make a string this module must inspect. A string whose
-/// quoting this module's parser rejects is not parsed, so these decide whether
-/// it can be passed on unread.
-const ADMISSION_WORDS: [&str; 5] = ["integrated", "trusted", "np:", "localdb", "pipe"];
-
 fn refuse(reason: &str) -> DbError {
     DbError::Refused(reason.to_owned())
 }
@@ -71,24 +210,8 @@ fn refuse(reason: &str) -> DbError {
 impl Endpoint {
     /// `windows` is a parameter so the Windows rules are testable anywhere;
     /// production passes `cfg!(windows)`.
-    fn admit(connection_string: &str, windows: bool) -> Result<Self, DbError> {
-        let Ok(options) = connection_string.parse::<connection_string::AdoNetString>() else {
-            // The driver reads quoting this parser does not (single-quoted
-            // values), so an unparsed string may still be one the driver
-            // accepts. It can be passed on only if nothing in it concerns the
-            // transport or the authentication: otherwise a key this module
-            // never saw could select a pipe or integrated authentication.
-            let lowered = connection_string.to_ascii_lowercase();
-            return if ADMISSION_WORDS.iter().any(|word| lowered.contains(word)) {
-                Err(refuse(
-                    "the connection string names a transport or integrated authentication, \
-                     but its quoting cannot be inspected; quote values with braces or double quotes",
-                ))
-            } else {
-                Ok(Self::Tcp)
-            };
-        };
-        let value = |keys: &[&str]| keys.iter().find_map(|key| options.get(*key));
+    fn admit(options: &Options, windows: bool) -> Result<Self, DbError> {
+        let value = |keys: &[&str]| keys.iter().find_map(|key| options.get(key));
 
         let pipe = match value(&SERVER_KEYS).map(|server| server.trim()) {
             Some(server) if server.to_ascii_lowercase().contains("(localdb)") => {
@@ -114,11 +237,17 @@ impl Endpoint {
 
         let spelled: Vec<&str> = INTEGRATED_KEYS
             .into_iter()
-            .filter(|key| options.contains_key(*key))
+            .filter(|key| options.contains_key(key))
             .collect();
         let integrated = match spelled[..] {
             [] => false,
-            [key] => match options[key].trim().to_ascii_lowercase().as_str() {
+            [key] => match options
+                .get(key)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "true" | "yes" | "sspi" => true,
                 "false" | "no" => false,
                 _ => {
@@ -141,7 +270,7 @@ impl Endpoint {
                 "a named-pipe connection is only available on Windows",
             ));
         }
-        if integrated && CREDENTIAL_KEYS.iter().any(|key| options.contains_key(*key)) {
+        if integrated && CREDENTIAL_KEYS.iter().any(|key| options.contains_key(key)) {
             return Err(refuse(
                 "`Integrated Security` uses the current Windows user and cannot be \
                  combined with a user name or password",
@@ -234,10 +363,23 @@ impl Conn {
     /// local named pipe as the current Windows user instead (#2271); see
     /// [`Endpoint`] for what is refused.
     pub(crate) async fn connect(connection_string: &str) -> Result<Self, DbError> {
-        let endpoint = Endpoint::admit(connection_string, cfg!(windows))?;
-        let mut config = Config::from_ado_string(connection_string)
+        let options = match Options::parse(connection_string) {
+            Ok(options) => options,
+            // The driver's own message, with its quoting hint, when it agrees.
+            // If it does not, the two read this string differently and
+            // nothing may be admitted from it.
+            Err(_) => {
+                return Err(match Config::from_ado_string(connection_string) {
+                    Err(e) => DbError::BadConnectionString(e.to_string()),
+                    Ok(_) => refuse("the connection string is read differently by the driver"),
+                });
+            }
+        };
+        let endpoint = Endpoint::admit(&options, cfg!(windows))?;
+        // The driver reads the canonical spelling, never the caller's text.
+        let mut config = Config::from_ado_string(&options.canonical())
             .map_err(|e| DbError::BadConnectionString(e.to_string()))?;
-        name_session(&mut config, connection_string);
+        name_session(&mut config, &options);
         match endpoint {
             Endpoint::Tcp => Self::connect_config(config).await,
             Endpoint::Pipe(path) => {
@@ -547,11 +689,13 @@ mod admission_tests {
     const PIPE: &str = r"\\.\pipe\LOCALDB#8A1B2C3D\tsql\query";
 
     fn admit(connection_string: &str, windows: bool) -> Result<Endpoint, String> {
-        Endpoint::admit(connection_string, windows).map_err(|e| e.to_string())
+        let options = Options::parse(connection_string).expect("a readable string");
+        Endpoint::admit(&options, windows).map_err(|e| e.to_string())
     }
 
     fn refusal(connection_string: &str, windows: bool) -> String {
-        match Endpoint::admit(connection_string, windows) {
+        let options = Options::parse(connection_string).expect("a readable string");
+        match Endpoint::admit(&options, windows) {
             Err(DbError::Refused(reason)) => reason,
             other => panic!("expected a refusal for `{connection_string}`, got {other:?}"),
         }
@@ -736,29 +880,128 @@ mod admission_tests {
         assert!(reason.contains("Trusted_Connection"), "{reason}");
     }
 
+    /// The class behind a review finding: a parser that opens a quote or a
+    /// brace anywhere in a value hides, from admission, a setting the driver
+    /// reads as its own. Each of these was admitted as plain TCP or as a
+    /// credential-free pipe when admission used a different parser.
     #[test]
-    fn a_string_that_cannot_be_inspected_is_refused_only_when_it_could_matter() {
-        // An apostrophe inside an unquoted value is read by the driver and
-        // rejected by the parser used here. Without a transport or
-        // authentication word the string passes through for the driver to
-        // read; with one, a key this module never saw could select a pipe
-        // or integrated authentication.
-        let plain = "Server=db;User Id=u;Password=it's";
-        assert!(
-            Config::from_ado_string(plain).is_ok(),
-            "the driver accepts this string"
-        );
-        assert!(plain.parse::<connection_string::AdoNetString>().is_err());
-        assert_eq!(admit(plain, true), Ok(Endpoint::Tcp));
-        for word in [
-            "Integrated Security=SSPI",
-            "Trusted_Connection=yes",
-            "Server=np:x",
-            "Server=(localdb)\\x",
+    fn a_quote_or_brace_inside_a_value_cannot_hide_a_setting_from_admission() {
+        for windows in [false, true] {
+            for hidden in [
+                "Description=x{;Integrated Security=SSPI;ignored=}",
+                "Description=x';Integrated Security=SSPI;a=b'",
+                "Description=x\";Integrated Security=SSPI;a=b\"",
+                "Description=a{b;Trusted_Connection=yes;c=}",
+            ] {
+                let reason = refusal(&format!("Server=db.example;{hidden}"), windows);
+                assert!(
+                    reason.contains("only supported over a local named pipe"),
+                    "{hidden}: {reason}"
+                );
+            }
+        }
+        for hidden in [
+            "Description=x{;User Id=u;Password=p;ignored=}",
+            "Description=x';pwd=p;a=b'",
+            "Description=x\";uid=u;a=b\"",
         ] {
-            let string = format!("Password=it's;{word}");
-            let reason = refusal(&string, true);
-            assert!(reason.contains("cannot be inspected"), "{string}: {reason}");
+            let reason = refusal(
+                &format!("Server=np:{PIPE};Integrated Security=SSPI;{hidden}"),
+                true,
+            );
+            assert!(reason.contains("cannot be combined"), "{hidden}: {reason}");
+        }
+        let reason = refusal(
+            &format!("Description=x{{;Server=np:{PIPE};a=}};Integrated Security=SSPI"),
+            false,
+        );
+        assert!(reason.contains("only available on Windows"), "{reason}");
+    }
+
+    #[test]
+    fn a_setting_inside_a_properly_quoted_value_is_only_text() {
+        for quoted in [
+            "Description='x;Integrated Security=SSPI'",
+            "Description=\"x;Integrated Security=SSPI\"",
+            "Description={x;Integrated Security=SSPI}",
+            "Description='it''s;User Id=u'",
+        ] {
+            assert_eq!(
+                admit(&format!("Server=db;User Id=u;Password=p;{quoted}"), true),
+                Ok(Endpoint::Tcp),
+                "{quoted}"
+            );
+        }
+    }
+
+    /// The port and the driver must read a string alike, or admission judges
+    /// something the driver does not do. `Config`'s `Debug` shows the options
+    /// the driver took from the string (secrets redacted), so reading the
+    /// string itself and reading its canonical spelling must give the same.
+    #[test]
+    fn driver_and_port_read_the_same_options() {
+        for string in [
+            "Server=db,1433;Database=app;User Id=u;Password=p;Application Name=a",
+            "  SERVER = db,1433 ; database = app ;; user id = u ",
+            "Server=db;Database='a;b';User Id=\"u;v\";Application Name={x;y}",
+            "Server=db;Database='it''s';Application Name=\"say \"\"hi\"\"\"",
+            "Server=db;Application Name='  padded  '",
+            "Server=db;Application Name=  padded  ",
+            "Server=db;Description=x{;Database=hidden;ignored=};User Id=u",
+            "Server=db;Description=x';Database=hidden;a=b'",
+            "Server=db;Description=x\";Database=hidden;a=b\"",
+            "Server=db;Database={a'b\"c};User Id=u",
+            "Server=db;a==b=c;Database=app",
+            "Server=db;Database=app;Database=last",
+            "Server=db;Database=\tapp\t;User\tId=tab",
+            "Server=db;Database=line\nbreak",
+            "Server=db\\inst;Database=app",
+            "Server=tcp:db,1433;Encrypt=false;TrustServerCertificate=true",
+        ] {
+            let options = Options::parse(string).expect(string);
+            let canonical = options.canonical();
+            assert_eq!(
+                Options::parse(&canonical).as_ref(),
+                Ok(&options),
+                "{string}"
+            );
+            let driver = |s: &str| format!("{:?}", Config::from_ado_string(s));
+            assert!(
+                !driver(string).contains("Err("),
+                "the driver accepts `{string}`: {}",
+                driver(string)
+            );
+            assert_eq!(driver(string), driver(&canonical), "{string}");
+        }
+    }
+
+    #[test]
+    fn a_string_the_port_cannot_read_is_one_the_driver_cannot_read() {
+        for string in [
+            "Server=db;Database='unclosed",
+            "Server=db;Database=\"unclosed",
+            "Server=db;Database={unclosed",
+            "Server=db;Database='a'b",
+            "Server=db;Database={a}b",
+            "Server=db;nokey",
+            "Server=db;=value",
+            "Server=db;k==v",
+            "Server=db;Database=\u{e9}",
+        ] {
+            assert!(Options::parse(string).is_err(), "{string}");
+            assert!(Config::from_ado_string(string).is_err(), "{string}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_string_is_the_drivers_own_error_and_opens_nothing() {
+        let result = Conn::connect("Server=db;Integrated Security=SSPI;Password='open").await;
+        match result {
+            Err(DbError::BadConnectionString(reason)) => {
+                assert!(reason.contains("unclosed"), "{reason}");
+            }
+            Err(other) => panic!("expected a malformed-string error, got: {other}"),
+            Ok(_) => panic!("an unreadable string must not connect"),
         }
     }
 

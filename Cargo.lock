@@ -1405,7 +1405,6 @@ name = "pbps-db"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
- "connection-string",
  "hmac",
  "pbps-dialect",
  "pbps-model",
