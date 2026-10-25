@@ -329,13 +329,14 @@ async fn localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifi
 #[ignore = "needs the owned Windows LocalDB job"]
 async fn localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe() {
     let found = resolved(&server("PBPS_TEST_LOCALDB_SCRATCH")).await;
-    let trusted = found.connection().to_owned();
-    // The job's strings ask to trust the instance's self-signed certificate.
-    // Asking for encryption without that trust must not connect: the pipe
-    // does not change what the string requested.
-    let strict = {
+    let plain = found.connection().to_owned();
+    // LocalDB offers no encryption on its pipe, so the job's strings say
+    // `Encrypt=false` (DEC-2271.2). A string that asks for encryption, by
+    // saying so or by omitting `Encrypt` (which means required), must not
+    // connect: the pipe never downgrades what the string requested.
+    let asking = |encrypt: &str| {
         let selector = LocalDbSelector::read(&format!(
-            "Server=(localdb)\\{};Integrated Security=SSPI;Encrypt=true",
+            "Server=(localdb)\\{};Integrated Security=SSPI{encrypt}",
             found.instance()
         ))
         .unwrap()
@@ -343,12 +344,14 @@ async fn localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe() {
         selector.with_pipe(found.pipe()).unwrap()
     };
     assert!(
-        Conn::connect(Driver::Mssql, &trusted).await.is_ok(),
-        "the trusting string connects"
+        Conn::connect(Driver::Mssql, &plain).await.is_ok(),
+        "the string that declines encryption connects"
     );
-    let refused = Conn::connect(Driver::Mssql, &strict).await;
-    assert!(
-        refused.is_err(),
-        "encryption without trust of a self-signed certificate must be refused, not downgraded"
-    );
+    for encrypt in [";Encrypt=true;TrustServerCertificate=true", ""] {
+        let refused = Conn::connect(Driver::Mssql, &asking(encrypt)).await;
+        assert!(
+            refused.is_err(),
+            "a string requiring encryption ({encrypt:?}) must be refused, not downgraded"
+        );
+    }
 }

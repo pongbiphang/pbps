@@ -4598,6 +4598,13 @@ connection string can name the instance but never its endpoint.
   DEC-1835.1's set. A failed install or discovery, a case that did not run
   (libtest passes a filter that selects nothing, so each run is held to the
   cases it listed), a timeout and a skip all fail it.
+- **TLS (measured, maintainer decision 2026-10-25).** LocalDB 17.0.4025.3
+  offers no encryption on its pipe: a string that requires it fails with
+  "Server does not allow the requested encryption level". pbps keeps its rule
+  that an omitted `Encrypt` means required and that nothing is ever downgraded,
+  so a LocalDB selector names `Encrypt=false` explicitly. The traffic stays on
+  a local pipe and the login is SSPI, with no password on the wire. pbps never
+  writes that setting for the operator.
 - **Not widened.** The platform comparison is unchanged: a Linux target with a
   Windows LocalDB scratch stays a named platform mismatch, and major 16 is not
   admitted. Edition differences remain recorded limitations (§9).
@@ -4622,6 +4629,6 @@ the `localdb2271_*` cases and the shared SQL Server suites in the Windows job.
 **Unmeasured until that job has run:** the utility's real output and exit
 codes, the install path of its tools, whether the installer property and
 silent flags are as written, the dedicated user's privileges and so the layout
-chosen, SSPI over the pipe and the TLS policy over it, every instance
+chosen, SSPI over the pipe, every instance
 restart timing, and which of the shared suites' cases pass on LocalDB. Nothing
 in this entry was run on Windows by the machine that wrote it.

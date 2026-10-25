@@ -50,9 +50,11 @@ HELPER = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft 
 USER = "pbpslocaldb"
 ROOT = Path(r"C:\pbps-localdb")
 TARGET, SCRATCH, DISPOSABLE = "pbps_target", "pbps_scratch", "pbps_disposable"
-# Self-signed certificates are what a LocalDB instance has; the cases that
-# check the requested policy ask for the strict spelling themselves.
-TRUST = "TrustServerCertificate=true"
+# LocalDB refuses encryption on its pipe (measured on 17.0.4025.3: "Server
+# does not allow the requested encryption level"), and pbps never downgrades a
+# string that asks for it, so the operator writes `Encrypt=false` (DEC-2271.2).
+# The case that checks the policy asks for encryption itself.
+TRUST = "Encrypt=false"
 
 # A plain pattern: the inventory's fixture grammar refuses `re.compile`.
 SUMMARY = (r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
