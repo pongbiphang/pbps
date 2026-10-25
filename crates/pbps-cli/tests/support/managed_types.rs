@@ -4157,3 +4157,146 @@ fn enum_rebuild_apply_refuses_a_dependent_created_after_the_plan_by_name_and_app
         assert!(mood_is(db, &["happy", "ok"]));
     }
 }
+
+/// Rewrites, by `edit`, the one declaration file under `schema/` that holds
+/// `needle`, and commits.
+fn redeclare(d: &Demo, needle: &str, edit: impl Fn(&str) -> String) {
+    let files: Vec<_> = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(needle)))
+        .collect();
+    assert_eq!(files.len(), 1, "{needle}: {files:?}");
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    let edited = edit(&text);
+    assert_ne!(text, edited, "{needle}: the edit changed nothing in {text}");
+    std::fs::write(&files[0], edited).unwrap();
+    d.commit();
+}
+
+fn modules_in(plan: &pbps_model::SavedPlan) -> (usize, usize, usize) {
+    let count = |f: fn(&pbps_model::Change) -> bool| {
+        plan.changes.changes.iter().filter(|p| f(&p.change)).count()
+    };
+    (
+        count(|c| matches!(c, pbps_model::Change::DropModule { .. })),
+        count(|c| matches!(c, pbps_model::Change::CreateModule { .. })),
+        count(|c| matches!(c, pbps_model::Change::AlterModule { .. })),
+    )
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_view_the_same_plan_redefines() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok'),(2,'happy'),(3,'ok');
+            CREATE VIEW app.glad AS SELECT id, m FROM app.t;";
+        let (own, d) = adopted(&server, "rebuild_redefined_view1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The view's text changes in the same plan as the labels.
+        redeclare(&d, "app.glad", |text| {
+            text.replace("FROM app.t", "FROM app.t WHERE id > 1")
+        });
+        let path = d.dir.join("redefined-view.plan.json");
+        let plan = label_plan(&d, db, &path);
+        // Down before the retypes, back after the swap with its new text; never
+        // restated in place, which would run with the old view standing.
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_views WHERE schemaname = 'app' AND viewname = 'glad' AND definition LIKE '%id > 1%'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.glad WHERE m = 'happy'"
+            ),
+            1
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.glad"), 2);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_routine_body_the_same_plan_changes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok'),(2,'happy'),(3,'ok');
+            CREATE FUNCTION app.n() RETURNS int LANGUAGE sql
+              BEGIN ATOMIC SELECT count(*)::int FROM app.t WHERE m = 'ok'; END;";
+        let (own, d) = adopted(&server, "rebuild_redefined_body1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The body counts another label from now on.
+        redeclare(&d, "app.n()", |text| {
+            text.replace("'ok'::app.mood", "'happy'::app.mood")
+        });
+        let path = d.dir.join("redefined-body.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(scalar(db, "SELECT app.n()::bigint"), 1);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL DEFAULT 'ok',
+              CONSTRAINT m_known CHECK (m IN ('ok','happy')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'ok';
+            INSERT INTO app.t VALUES (1,'happy'),(2,'happy');";
+        let (own, d) = adopted(&server, "rebuild_redefined_parts1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The default, the check and the index filter all spell another label.
+        redeclare(&d, "m_known", |text| {
+            text.replace("'ok'::app.mood", "'happy'::app.mood")
+        });
+        let path = d.dir.join("redefined-parts.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        on_server(db, "INSERT INTO app.t (id) VALUES (3)");
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.t WHERE m = 'happy'"),
+            3
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_m' AND indexdef LIKE '%happy%'"
+            ),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}

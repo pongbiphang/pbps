@@ -3155,6 +3155,18 @@ using the type (a follow-up issue), `data:` rows and partition keys of the enum
 
 Pull and re-pull keep the live label order; an unchanged type plans nothing.
 
+A dependent module the same plan restates (`AlterModule`) is not handled by that:
+restated in place it would run after the retype with the old text still
+standing. The census puts it in the rebuilt set like an unchanged one, the plan
+is made again, and the differ turns its restatement into a drop before the
+retypes and a create from the desired text after the swap; at apply a module
+the plan still only restates is refused. A module the plan drops already comes
+down in class 0, and a module it creates, or a default, check, key or index it
+adds or changes, already runs after the swap (classes 9, 13, 14), so none of
+those needed a change. Pinned by
+`a_module_the_plan_also_changes_comes_down_before_the_retypes_and_returns_with_its_new_text`
+and the live `enum_rebuild_applies_with_*` tests.
+
 Census at apply: the same census runs again where the plan runs, in the apply's
 own transaction after the lock and before the first statement. A staged run
 reads it in a transaction it rolls back, at its start and at every resume (a

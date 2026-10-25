@@ -104,12 +104,6 @@ pub async fn census(
             }
         })
         .collect();
-    let rebuilds_module = |id: &ModuleId| {
-        changes.changes.iter().any(|p| {
-            matches!(&p.change,
-                Change::AlterModule { id: m, .. } | Change::DropModule { id: m, .. } if m == id)
-        })
-    };
     for (uid, name, tmp) in rebuilt {
         let shown = name.shown().to_string();
         let rows = conn
@@ -238,32 +232,30 @@ pub async fn census(
             }
             let reached =
                 moved.contains(&(root.schema.clone(), root.table.clone(), root.column.clone()));
-            let what = match h.kind.as_str() {
+            let what: String = match h.kind.as_str() {
                 "r" | "p" if reached => continue,
                 // An index holds the type in its key; the engine rebuilds it
                 // with the table, and one with constants of the type is
                 // judged below as a dependent.
                 "i" | "I" => continue,
-                "r" | "p" => "a table the declarations do not retype",
+                "r" | "p" => "a table the declarations do not retype".into(),
                 "v" => {
                     let id = ModuleId::Named(pbps_model::ObjectName::new(&h.schema, &h.table));
-                    if rebuilds_module(&id) {
-                        continue;
-                    }
-                    if declared.is_some_and(|d| d.modules.contains_key(&id)) {
-                        out.rebuild.insert(id);
-                        continue;
-                    }
-                    if declared.is_none() {
-                        "a view that appeared after the plan was made"
-                    } else {
-                        "a view the project does not declare"
+                    match module_verdict(&id, changes, declared) {
+                        Verdict::Fine => continue,
+                        Verdict::Rebuild(id) => {
+                            out.rebuild.insert(id);
+                            continue;
+                        }
+                        Verdict::Refuse(why) => why,
                     }
                 }
-                "m" => "a materialized view, which no declaration holds",
-                "c" => "a composite type's attribute, which cannot move to a replacement enum",
-                "f" => "a foreign table",
-                _ => "a relation of a kind pbps cannot rebuild around",
+                "m" => "a materialized view, which no declaration holds".into(),
+                "c" => {
+                    "a composite type's attribute, which cannot move to a replacement enum".into()
+                }
+                "f" => "a foreign table".into(),
+                _ => "a relation of a kind pbps cannot rebuild around".into(),
             };
             return Err(refused(format!(
                 "column {shown_column} holds enum {shown}, and it is {what}; the rebuild of {shown} is refused"
@@ -349,9 +341,7 @@ pub async fn census(
             match verdict(level, &dependent, changes, declared, &parents) {
                 Verdict::Fine => {}
                 Verdict::Rebuild(id) => {
-                    if !rebuilds_module(&id) {
-                        out.rebuild.insert(id);
-                    }
+                    out.rebuild.insert(id);
                 }
                 Verdict::Refuse(why) => {
                     return Err(refused(format!(
@@ -395,6 +385,45 @@ fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
     })
 }
 
+/// A module standing on a moved column comes down before the retypes and goes
+/// back after the swap: dropped by the plan, it already does. One the plan
+/// only restates in place would run after the retype with the old text
+/// standing at it, so it joins the rebuilt set and the plan is made again with
+/// its drop and create around the retypes, the create from the desired text.
+/// Where nothing is declared, at apply, that second plan is the only one that
+/// is admitted.
+fn module_verdict(id: &ModuleId, changes: &ChangeSet, declared: Option<&Schema>) -> Verdict {
+    let planned = |wanted: fn(&Change) -> Option<&ModuleId>| {
+        changes
+            .changes
+            .iter()
+            .any(|p| wanted(&p.change).is_some_and(|m| m == id))
+    };
+    let drops = planned(|c| {
+        if let Change::DropModule { id, .. } = c {
+            Some(id)
+        } else {
+            None
+        }
+    });
+    let restates = planned(|c| {
+        if let Change::AlterModule { id, .. } = c {
+            Some(id)
+        } else {
+            None
+        }
+    });
+    match declared {
+        _ if drops => Verdict::Fine,
+        Some(d) if restates || d.modules.contains_key(id) => Verdict::Rebuild(id.clone()),
+        Some(_) => Verdict::Refuse("a module the project does not declare".into()),
+        None if restates => {
+            Verdict::Refuse("a module the plan restates in place, after the retype".into())
+        }
+        None => Verdict::Refuse("a module that appeared after the plan was made".into()),
+    }
+}
+
 fn verdict(
     level: Level,
     dependent: &Dependent,
@@ -403,20 +432,7 @@ fn verdict(
     parents: &BTreeMap<TableName, TableName>,
 ) -> Verdict {
     match &dependent.holds {
-        Holds::Module(id) => {
-            if changes.changes.iter().any(|p| {
-                matches!(&p.change,
-                    Change::AlterModule { id: m, .. } | Change::DropModule { id: m, .. } if m == id)
-            }) {
-                Verdict::Fine
-            } else if declared.is_some_and(|d| d.modules.contains_key(id)) {
-                Verdict::Rebuild(id.clone())
-            } else if declared.is_none() {
-                Verdict::Refuse("a module that appeared after the plan was made".into())
-            } else {
-                Verdict::Refuse("a module the project does not declare".into())
-            }
-        }
+        Holds::Module(id) => module_verdict(id, changes, declared),
         Holds::TablePart { table, part } => match part {
             // Dropped and restored from the declaration, which the engine
             // would refuse to retype beside: constants typed as the old enum.
@@ -548,6 +564,33 @@ mod tests {
                 &Default::default(),
             );
             assert!(matches!(v, Verdict::Fine));
+            // A module the plan only restates in place runs after the retype:
+            // it is rebuilt around them at planning, and refused as it stands
+            // at apply.
+            let restated = plan(vec![Change::AlterModule {
+                id: id.clone(),
+                module: Box::new(Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 2".into(),
+                }),
+            }]);
+            let v = verdict(
+                level,
+                &dependent(holds.clone()),
+                &restated,
+                Some(&Schema::default()),
+                &Default::default(),
+            );
+            assert!(matches!(&v, Verdict::Rebuild(m) if *m == id));
+            let v = verdict(
+                level,
+                &dependent(holds.clone()),
+                &restated,
+                None,
+                &Default::default(),
+            );
+            assert!(matches!(v, Verdict::Refuse(why) if why.contains("restates")));
             let v = verdict(
                 level,
                 &dependent(holds),

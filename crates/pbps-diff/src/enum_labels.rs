@@ -2302,4 +2302,78 @@ mod rebuild_tests {
                 .contains(&pbps_model::RiskClass::TypeRebuild)
         );
     }
+
+    /// A view the same plan redefines, over a moved column, comes down before
+    /// the retypes and goes back after the swap, from its new text; one the
+    /// census did not find stays where the differ puts a restatement.
+    #[test]
+    fn a_module_the_plan_also_changes_comes_down_before_the_retypes_and_returns_with_its_new_text()
+    {
+        let id: pbps_model::ModuleId = "app.v".parse().unwrap();
+        let module = |text: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            definition: text.into(),
+        };
+        let (mut base, mut desired) = (world(&["sad", "ok"]), world(&["ok"]));
+        base.0
+            .modules
+            .insert(id.clone(), module("SELECT m FROM app.t"));
+        desired
+            .0
+            .modules
+            .insert(id.clone(), module("SELECT m, id FROM app.t"));
+        let order = |hints: &Hints| -> Vec<String> {
+            crate::diff(side(&base), side(&desired), &Rebuilds, hints)
+                .expect("plans")
+                .changes()
+                .changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::EnumRebuild {
+                        step: EnumRebuildStep::Retype { column, .. },
+                        ..
+                    } => Some(format!("retype {}", column.name.shown())),
+                    Change::EnumRebuild {
+                        step: EnumRebuildStep::Swap { .. },
+                        ..
+                    } => Some("swap".to_owned()),
+                    Change::DropModule { .. } => Some("drop view".to_owned()),
+                    Change::CreateModule { module, .. } => {
+                        Some(format!("create view {}", module.definition))
+                    }
+                    Change::AlterModule { module, .. } => {
+                        Some(format!("restate view {}", module.definition))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let found = Hints {
+            enum_dependents: [id].into(),
+            ..Default::default()
+        };
+        let steps = order(&found);
+        let at = |what: &str| {
+            steps
+                .iter()
+                .position(|s| s == what)
+                .unwrap_or_else(|| panic!("{what} in {steps:?}"))
+        };
+        assert!(at("drop view") < at("retype m"));
+        assert!(at("retype tags") < at("swap"));
+        assert!(at("swap") < at("create view SELECT m, id FROM app.t"));
+        assert!(
+            !steps.iter().any(|s| s.starts_with("restate view")),
+            "{steps:?}"
+        );
+        // Not found by the census, the restatement stays in its class, after
+        // the retypes, which is the plan the engine would refuse.
+        let plain = order(&Hints::default());
+        assert!(
+            plain.contains(&"restate view SELECT m, id FROM app.t".to_owned()),
+            "{plain:?}"
+        );
+        assert!(!plain.contains(&"drop view".to_owned()));
+    }
 }
