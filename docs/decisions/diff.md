@@ -8558,3 +8558,17 @@ tracks live values and rejects a read after their lifetime ends. Agreement
 checks enumerate every small ordering around the address and value boundaries.
 Ordinary operation, SQL, checksum and order oracles remain unchanged. This
 contract grants no rebuild lowering, certification, admission or execution.
+
+<a id="dec-2298-10"></a>
+
+**DEC-2298.10. Proven engine storage has no independently reusable part slots.**
+Nodes whose complete typed ownership chain includes Storage and ends at a
+source container table remain in the dependency closure with every direct
+edge. They are excluded from the shared independently reusable part-slot
+projection consumed by edges and replay. PostgreSQL allocates TOAST relation
+and index names by OID in its reserved pg_toast namespace; they do not compete
+with declared names, and replacement creation supplies its own storage.
+Storage confers no early allocator release and needs no explicit restoration.
+Classification uses only the validated typed chain. Incomplete, unreadable
+or unproved chains and non-storage owners that are not TableParts retain
+their named refusals. This grants no rebuild execution authority.

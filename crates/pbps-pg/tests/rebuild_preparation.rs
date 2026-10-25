@@ -367,3 +367,6 @@ fn partial_unreadable_unmanaged_and_published_facts_are_named_before_callback() 
             .contains("PostgreSQL")
     );
 }
+
+#[path = "support/rebuild_execution.rs"]
+mod execution;

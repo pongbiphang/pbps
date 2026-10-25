@@ -1504,6 +1504,7 @@
         "darwin"
       ],
       "cases": [
+        "dependencies_tests::execution::expansion_replays_own_parts_external_bindings_and_member_lifetimes",
         "dependencies_tests::table_catalog_keeps_physical_edges_bindings_and_clone_owners",
         "dependencies_tests::outgoing_foreign_keys_keep_undeclared_candidate_keys_as_binding_evidence",
         "dependencies_tests::an_undeclared_primary_key_in_the_rebuilt_tree_is_refused",

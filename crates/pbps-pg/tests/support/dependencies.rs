@@ -959,3 +959,6 @@ fn owned_clone_releases_feed_the_same_slot_edges_and_replay() {
         .contains("42501")
     );
 }
+
+#[path = "rebuild_live.rs"]
+mod execution;
