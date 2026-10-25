@@ -1,7 +1,7 @@
 //! SQL Server's acquisition boundary, exercised through the shared producer.
 
 use super::super::{BindingRequest, Error, ProduceError};
-use super::fixtures::{ENVIRONMENT, ProjectKey};
+use super::fixtures::{ENVIRONMENT, KEY_LINE, ProjectKey};
 use super::{Provenance, Standard};
 use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Schema};
@@ -164,11 +164,12 @@ async fn declared_refusal(
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
-    let config = "dialect: mssql\nenvironments:\n  fixture:\n    url_env: PBPS_2236_UNUSED\n    \
-        fingerprint_key_file: key\n";
+    let config = format!(
+        "dialect: mssql\nenvironments:\n  fixture:\n    url_env: PBPS_2236_UNUSED\n{KEY_LINE}"
+    );
     let path = key.project.root.join("pbps.yml");
-    std::fs::write(&path, config).unwrap();
-    key.project.config = pbps_config::Config::parse(config, &path).unwrap();
+    std::fs::write(&path, &config).unwrap();
+    key.project.config = pbps_config::Config::parse(&config, &path).unwrap();
     let ids = |schema: &Schema| {
         pbps_diff::resolve(
             schema,

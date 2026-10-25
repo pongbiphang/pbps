@@ -102,6 +102,14 @@ class Handoff(unittest.TestCase):
         self.assertNotIn("Administrators", command)
         self.assertNotIn("S-1-5-32-544", command)
 
+    def test_the_fixture_key_is_a_fresh_key_of_the_generated_size(self):
+        import base64
+        keys = {lq.fingerprint_key() for _ in range(10)}
+        self.assertEqual(len(keys), 10)
+        for key in keys:
+            self.assertEqual(len(base64.b64decode(key, validate=True)), 32)
+            lq.wrapper({"K": key}, ["x"], "o")  # survives the wrapper unchanged
+
     def test_windows_powershell_children_do_not_inherit_powershell_7s_module_path(self):
         # PowerShell 7 runs the step; its PSModulePath makes Windows
         # PowerShell 5.1 fail to load its own built-in modules.

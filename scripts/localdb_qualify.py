@@ -28,6 +28,7 @@ and a run that listed none, or whose summary is not exactly that many passes,
 fails the job. Nothing skips, and nothing here continues past an error.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -191,6 +192,11 @@ def windows_powershell_env(secret, base=None):
     return env
 
 
+def fingerprint_key():
+    """A fresh key as `pbps key generate` prints it: 32 random bytes, base64."""
+    return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
 def create_user_command():
     """The PowerShell that creates the dedicated user from $env:PBPS_LOCALDB_PASSWORD.
 
@@ -285,6 +291,9 @@ def main():
         "PBPS_TEST_MSSQL_SCRATCH_DB": resolved[SCRATCH],
         "PBPS_TEST_LOCALDB_SCRATCH": selector(SCRATCH),
         "PBPS_TEST_LOCALDB_DISPOSABLE": selector(DISPOSABLE),
+        # A key file's owner-only permission cannot be proved on Windows, so
+        # the fixtures name this variable instead (fixtures.rs KEY_LINE).
+        "PBPS_TEST_FINGERPRINT_KEY": fingerprint_key(),
     }
 
     def run_cases(binary, label, filters, minimum, exact=False):
