@@ -915,6 +915,12 @@ async fn system_database_permissions_follow_fixed_rules_and_restore_each_change(
     }
 }
 
+/// Refusals of a catalog case's statement by an installation that lacks the
+/// feature, measured on LocalDB and on the Express container: 39020, Advanced
+/// Analytics Extensions not installed; 15707, automatic tuning needs
+/// Enterprise.
+const UNAVAILABLE: &[&str] = &["39020", "15707"];
+
 /// Whether the engine reports the default FILESTREAM row for the current
 /// database on an instance whose FILESTREAM level is 0.
 async fn filestream_unrecorded(conn: &mut pbps_db::Conn) -> bool {
@@ -947,12 +953,12 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         .unwrap();
     for (expected, create) in cases.restore {
         if let Err(error) = db.conn.execute(&create).await {
-            // An installation without the feature (LocalDB has no Advanced
-            // Analytics Extensions) cannot hold the object, so its catalog
-            // stays empty; only that refusal is accepted.
-            assert_eq!(
-                error.server_error_code().as_deref(),
-                Some("39020"),
+            // An installation that cannot create the object cannot leave its
+            // catalog dirty; only these measured refusals are accepted.
+            let code = error.server_error_code();
+            assert!(
+                code.as_deref()
+                    .is_some_and(|code| UNAVAILABLE.contains(&code)),
                 "{expected}: {error}"
             );
             continue;
