@@ -195,8 +195,8 @@ pub fn differences(actual: &DatabaseOptions, reference: &DatabaseOptions) -> Vec
 
 /// The recipe already names exactly the database facts compared by §9.
 /// Comparing these here keeps the fresh-row exclusion from admitting a
-/// supplied database with different compilation options, before #2238 wires
-/// the complete compatibility and assessment path.
+/// supplied database with different compilation options, before the complete
+/// compatibility (#2374) and assessment (#2375) path is wired.
 pub fn recipe_differences(
     actual: &DatabaseOptions,
     recipe: &pbps_db::resolver::environment::DatabaseRecipe,

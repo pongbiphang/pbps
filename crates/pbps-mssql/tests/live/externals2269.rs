@@ -458,10 +458,10 @@ async fn external_depending_on_managed_object_refuses_by_name() {
         table.foreign_keys.insert("to_a".into(),pbps_model::ForeignKey {columns:vec!["i".into()],references_table:pbps_model::TableName::new("dbo","a"),references_columns:vec!["i".into()],on_delete:pbps_model::ReferentialAction::Cascade,on_update:pbps_model::ReferentialAction::NoAction});
         managed.tables.insert(pbps_model::TableName::new("dbo","managed"),table);
         let error=format!("{:?}",f.compare(&created,&[&managed]).await.unwrap_err());
-        assert!(error.contains("x_managed") && error.contains("managed") && error.contains("#2238"),"{error}");
+        assert!(error.contains("x_managed") && error.contains("managed") && error.contains("#2376"),"{error}");
         let required=capture::required_externals(&mut f.target,&[&managed]).await.unwrap();
         let error=externals::render::missing(&required,&created).unwrap_err().join(";");
-        assert!(error.contains("x_managed") && error.contains("#2238"),"{error}");
+        assert!(error.contains("x_managed") && error.contains("#2376"),"{error}");
         let more=f.file("CREATE TABLE dbo.managed(i int CONSTRAINT managed_pk PRIMARY KEY,CONSTRAINT to_a FOREIGN KEY(i) REFERENCES dbo.a(i) ON DELETE CASCADE); ALTER TABLE dbo.x ADD CONSTRAINT x_managed FOREIGN KEY(i) REFERENCES dbo.managed(i) ON DELETE CASCADE;").await.unwrap();
         let all=created.union(&more).cloned().chain([capture::object("dbo","x_managed")]).collect();
         f.compare(&all,&[]).await.unwrap();

@@ -142,6 +142,27 @@ pub fn object(schema: &str, name: &str) -> ObjectIdentity {
     }
 }
 
+/// The roots the managed declarations of each side name: its tables, modules
+/// and types, by the schema and name they are created under. A name one side
+/// lacks is simply absent when read; the capture adds each root's children
+/// and everything it binds.
+pub fn managed_scope(sides: &[&pbps_model::Schema]) -> CaptureScope {
+    let mut retained = BTreeSet::new();
+    for side in sides {
+        retained.extend(side.tables.keys().map(|t| object(&t.schema, &t.name)));
+        retained.extend(side.modules.keys().map(|id| object(id.schema(), id.name())));
+        retained.extend(side.types.keys().map(|t| ObjectIdentity {
+            class: class::TYPE.into(),
+            name: vec![t.schema().to_owned(), t.name().to_owned()],
+            signature: Vec::new(),
+        }));
+    }
+    CaptureScope {
+        retained,
+        candidates: BTreeSet::new(),
+    }
+}
+
 /// Read the objects in `scope`, everything they bind, and the candidates of
 /// every name the scope asks about, on the caller's connection.
 ///
@@ -194,7 +215,20 @@ pub async fn capture_qualified(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     recorded: &RecordedOwnership<'_>,
 ) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
-    let captured = capture(connection, scope).await?;
+    capture_qualified_declared(connection, scope, &Default::default(), key, recorded).await
+}
+
+/// [`capture_qualified`] with the declared cross-database reference
+/// boundary (DEC-2323.1), so a module naming a declared database captures
+/// as the declaration admits it and not as an uncovered name.
+pub async fn capture_qualified_declared(
+    connection: &mut impl pbps_db::transport::QueryConnection,
+    scope: &CaptureScope,
+    declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    recorded: &RecordedOwnership<'_>,
+) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
+    let captured = capture_declared(connection, scope, declarations).await?;
     captured
         .require_runtime_candidates()
         .map_err(CaptureError::Coverage)?;

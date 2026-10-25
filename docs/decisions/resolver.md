@@ -4393,3 +4393,71 @@ envelope (published schema set 61), and `apply` only displays it. The core
 moved out of `dev` into an engine-neutral `rehearsal` module that takes the
 base state as an input; the git baseline is its only base until the connected
 rehearsal lands, and `--dev` output is unchanged.
+
+<a id="dec-2374-1"></a>
+
+**DEC-2374.1. SQL Server's reconstruction creates a table bare and holds only
+what can name a module.** The ordinary plan order is not a compile order: a
+table's `CREATE` carries its computed columns and defaults inline, and a
+computed column naming a declared function fails there with 4121, as the
+ordinary planner refuses the plan outright. Measured on 17.0: bare table, then
+function, then `ALTER TABLE .. ADD c AS f(..)` compiles, even where `f` is
+schema-bound and reads the table. So defaults and checks come after every
+module, and computed columns come after the functions they call. The held part
+is only the computed column and the keys and indexes over it, never the table
+(PostgreSQL holds the table because its generated column is inline in the
+`CREATE`), and a module reads the held column only if it names both the table
+and the column, so a schema-bound function over the table's other columns is
+no reader. A function that reads the column it serves has no order and
+refuses by name. Roles, grants and rows are skipped: none changes what a name
+binds to, and the plan's schema grants, the only kind it carries, are replayed
+before anything compiles (measured: a deployer that does not own its schema
+fails 229 and 15247 without `REFERENCES`, and compiles identically with the
+schema-level grant). `pbps_diff`'s scratch route owns the order (DEC-1959.6);
+no SQL Server reorder pass exists.
+
+<a id="dec-2374-2"></a>
+
+**DEC-2374.2. The declarations compile one `Statement` per batch, in
+autocommit, on the deployer's connection.** PostgreSQL compiles in a
+transaction per range. Measured on 17.0 through the real driver: after
+`CREATE TABLE`, `@@TRANCOUNT` is 0 and another connection sees the table, a
+failed statement (4121, 4513, 208, 262, 2760, 15247, 111, and 2714 inside a
+hand-opened transaction) leaves the session's user, database and
+`@@TRANCOUNT` unchanged and the next statement runs, and a module statement
+must be a batch of its own (111 and 156 when joined). A transaction would
+buy nothing on a disposable scratch, and autocommit means a later step, or
+the setup session that reads a managed table, needs no commit before it.
+Apply sends one `Statement` per `execute` too, so this is its framing. A
+failure carrying a server code is a verdict on the declaration unless the code
+names a deadlock, a lock or a resource limit; a failure with no code is a
+transport failure and never a verdict.
+
+<a id="dec-2374-3"></a>
+
+**DEC-2374.3. Both captures read under one scope that settles over what each
+side reads.** A runtime-bound name needs its candidate sets in the scope the
+capture is sealed under, and a module only the target holds, one the plan
+drops, binds names scratch never read. Taking the scope from scratch alone
+made the target's opening capture refuse, a valid plan refused. The scope is
+therefore the union of both sides' runtime candidates, read until a pass adds
+none (bounded; an unsettled scope is a read failure). The sealed scratch read
+runs on a fresh bounded sandbox connection, because the deployer's cannot
+leave its context and may lack `VIEW DEFINITION`, and every declared root that
+compiled must appear in it: a root absent from its own capture is an
+incomplete read, never a declaration with nothing to compare.
+
+<a id="dec-2374-4"></a>
+
+**DEC-2374.4. A SQL Server run stops at assessment, naming planning from
+evidence.** Reconstruction, the compiled capture and the target's opening
+capture exist; what to conclude from their difference is the assessment
+(#2375) and planning from evidence (#2143). The run states that boundary at the
+first step that needs it, `assess`, and `surfaces` states it again, rather
+than assessing with an empty answer: an empty `Assessment` reads as "nothing
+differs", which is the absent-versus-empty confusion the repository rules
+forbid. Compatibility is wired (`mssql-reported-scope-v2`), an edition
+difference is a recorded limitation and a hosted family refuses by name; the
+reported build is a keyed fingerprint of the product version, level and
+update level, with an RTM build's absent update level a known absence and an
+unreadable one no fingerprint.

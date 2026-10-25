@@ -10,6 +10,7 @@ pub mod compatibility;
 pub mod dependencies;
 pub mod environment;
 pub mod externals;
+pub mod reconstruct;
 pub mod scratch;
 
 use pbps_db::resolver::environment::DatabaseRecipe;

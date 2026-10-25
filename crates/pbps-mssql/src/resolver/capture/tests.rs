@@ -785,3 +785,39 @@ fn skipped_children_do_not_enter_authorization_ownership_without_being_roots() {
         );
     }
 }
+
+#[test]
+fn the_managed_scope_names_the_roots_of_both_sides_and_nothing_else() {
+    use pbps_model::{Module, ModuleKind, Schema, Table};
+    let side = |table: &str, view: &str| {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert(format!("app.{table}").parse().unwrap(), Table::default());
+        schema.modules.insert(
+            format!("app.{view}").parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT 1 AS a".into(),
+            },
+        );
+        schema
+    };
+    let (base, desired) = (side("old_t", "old_v"), side("new_t", "new_v"));
+    let scope = super::managed_scope(&[&base, &desired]);
+    assert_eq!(
+        scope.retained,
+        BTreeSet::from(["old_t", "old_v", "new_t", "new_v"].map(|name| object("app", name)))
+    );
+    assert!(
+        scope.candidates.is_empty(),
+        "candidates come from what is read"
+    );
+    // No declaration is no root, never a scope that reads the whole database.
+    assert_eq!(super::managed_scope(&[]), CaptureScope::default());
+    assert_eq!(
+        super::managed_scope(&[&Schema::default()]),
+        CaptureScope::default()
+    );
+}

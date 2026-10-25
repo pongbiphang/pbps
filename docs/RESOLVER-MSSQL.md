@@ -203,6 +203,20 @@ for a moment keeps that type.
   impersonation authority cannot return to the sandbox (15517); neither
   entry can REVERT (15196)
   [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
+- **Order and transport (DEC-2374.1, DEC-2374.2).** The emitter's statements
+  compile in the scratch route's order, not the ordinary plan's. A table is
+  created bare: its `CREATE` carries computed columns and defaults inline, and
+  a computed column naming a declared function fails there with 4121.
+  Modules follow. Defaults, checks, computed columns and the keys and indexes
+  over a computed column come after the modules, and a module that reads a
+  computed column waits for it. Only the column is held, never the table:
+  table, then function, then `ALTER TABLE .. ADD c AS f(..)` compiles even
+  where `f` is schema-bound and reads the table. A function that reads the
+  column it serves refuses by name. Each `Statement` is its own batch, in
+  autocommit, on the deployer's connection: a failed statement leaves nothing
+  behind and the connection usable, so no transaction frames the run. A
+  failure naming a deadlock, a lock or a resource limit answers nothing about
+  the declaration and is a read failure, not a verdict.
 - **Fingerprints.** A module's fingerprint carries `uses_ansi_nulls`,
   `uses_quoted_identifier` and `is_schema_bound`. The database collation and
   compatibility level are compared as reported facts (`mssql-reported-scope-v2`).
@@ -715,8 +729,10 @@ post-file inventory root and accepts the corresponding target shapes. Its
 `changed_since` check compares those accepted shapes against the final target
 capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
 the canonical `mssql-capture-v3` shape and its sealed prerequisites, so later
-rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals before stopping at the named #2238
-reconstruction boundary. No planning or binding certificate is fabricated.
+rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals, compiles the declarations as the
+reproduced deployer (§5) and reads the compiled scratch and the target, then
+stops at the named boundary: planning from evidence (#2143). No planning or
+binding certificate is fabricated.
 
 **File execution and rendering (DEC-2269.1).** Preparation inventories the
 bounded scratch after generated database authorization setup, executes the
@@ -758,10 +774,10 @@ read must be empty before the sandbox user is removed.
 
 An external or cascade-closure object which needs a managed object cannot
 exist before reconstruction. At a missing scratch prerequisite, the catalog
-check names both objects and says it waits for reconstruction (#2238). The
+check names both objects and says it waits for chained staging (#2376). The
 renderer refuses the same dependency before emitting DDL. The legal chain
 `a -> managed -> x` measures error 1767 before managed exists; inventing that
-table during setup is a managed overlap. #2238 will lift this refusal through
+table during setup is a managed overlap. #2376 will lift this refusal through
 chained staging and subsequent complete comparison. The all-external chain
 is accepted. Same-instance policy and its shared evidence carrier are implemented by #2270;
 this preparation still does not publish evidence before #2143.
