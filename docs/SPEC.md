@@ -3197,6 +3197,18 @@ copy blesses files the loader refuses, and does it quietly.
 Every read-only command — `plan` (offline, including `--check`, or connected
 with `--db`/`--env`), `validate`, `fmt`, `explain`, `doctor`, `verify`, `status`,
 `state list` — takes `--format human|json` and, in JSON, emits one envelope.
+
+The confined scratch command `test` (§9.9) uses that same envelope with a
+`command: "test"` branch, even though it writes to its own disposable database.
+Its result preserves input identity, replay and executed candidate checksums,
+fixture/assertion outcomes and confirmed cleanup separately. A failed or
+unconfirmed cleanup makes the overall result `unanswerable` (exit `1`), even
+when every assertion passed; assertion violations are `findings` (exit `2`).
+Driver timeouts, unreadable results and transport loss never count as empty
+successful assertions. [ADR-0019 §9](ADR-0019-plan-tests.md#9-results-and-ci-semantics)
+defines phase classification and requires the implementation's schema-set bump
+and complete archive per DECISIONS 465; this design change alone bumps no schema.
+
 A connected plan reports change counts, named capability checks, cost estimates
 and typed findings (DECISIONS 429). This summary is distinct from the
 checksum-pinned deployment artifact written by `--out`, which `apply` accepts;
@@ -3336,6 +3348,88 @@ schedule, and each one compiled in has to be kept working by this project
 forever, including for users who run neither. `scripts/findings-to-github.py`
 reads the envelope from stdin and preserves the exit code; a team whose CI is
 the third system copies and edits it (14.3).
+
+### 9.9 Disposable plan tests
+
+`pbps test [--manifest tests/pbps-tests.yml] [--format human|json]` tests a
+candidate declaration change using SQL fixtures and assertions in a scratch
+**it created**. The accepted contract is
+[ADR-0019](ADR-0019-plan-tests.md); implementation is #1165 (PostgreSQL first,
+then SQL Server, both required). It accepts no `--db`, `--env`, supplied server
+or production plan, and writes **no applyable plan file**. The result reports
+the exact executed test-plan checksum, not a promise that a future production
+plan will have identical bytes. §9.3's preview/rehearsal remains separate.
+
+A version-1 manifest pins base and fixture `at:` revisions to immutable commits
+and the engine image to a digest, lists fixture SQL and assertion files, and
+bounds startup, steps, SQL, run and cleanup timeouts. `candidate` defaults to the
+working tree, as `plan` does, so uncommitted edits and new candidate files can
+be tested. Hash every consumed candidate file and report an **uncommitted
+candidate** with captured HEAD plus the complete content hashes. An explicit
+candidate revision selects committed contents and is labelled separately;
+CI evidence may require that committed kind. Validate declarations/intent and
+freeze input bytes/membership before provisioning. Report input hashes,
+tool/engine identity and per-phase results; missing, ambiguous, unreadable or
+mid-run changed inputs cannot qualify. The ADR specifies the format/defaults.
+
+Fixture pins must form one ancestry chain ending at base, verified with
+`git merge-base --is-ancestor`; first-parent ancestry is not required. Bootstrap
+at the oldest pin through the ordinary schema/ledger path, load that group's
+fixtures, then plan/apply endpoint jumps to the next pins and base with each
+revision's declarations and ids. Load groups in chain order, files at a pin in
+manifest order. With no fixtures, bootstrap at base. Recorded renames, drops
+and conversions are used; missing human intent refuses with a remedy. Seal the
+candidate against the prepared scratch and execute it unchanged through normal
+checksum, lock, baseline, risk, probe, pin and postcondition gates. Report replay
+hops, revision distances and elapsed cost separately from candidate execution.
+
+`pbps test fixtures repin <name> --at <revision>` validates **user-edited** SQL
+and atomically advances the manifest pin; it never generates or rewrites SQL.
+Replay the committed old fixture input to the new revision and compare it with
+loading the edited input at that revision, including shared fixture context.
+Require complete managed-row multiset equality **and** equal next values for
+every managed-table sequence (owned or default) and identity allocator. Refuse
+and name any difference or allocator whose next value cannot be established,
+including unreadable/non-standard allocation. Equal rows alone can hide a
+sequence already advanced by an inserted-then-deleted row. Confirm comparison,
+cleanup and unchanged input hashes before replacing the manifest; the ADR
+specifies old-input provenance and comparisons across other fixture groups.
+
+Version 1 uses Docker/Podman through the shared resolver scratch. A private
+creation record, unpredictable run id, process label and immutable resource
+identity prove ownership; a name prefix is insufficient. Normal runs and
+`pbps test --cleanup` reconcile proven dead owners' leftovers after SIGKILL,
+leave live/foreign runs alone, and refuse ambiguous ownership or unreadable
+inspection. Container and private-volume absence must be confirmed before
+success. This reuses the current operator-vouched resolver isolation premise;
+labels and SQL grants are not a hostile-code or network sandbox.
+
+Provision/apply/fixture/assertion identities are distinct. Fixture privileges
+are SELECT/INSERT/UPDATE/DELETE on managed tables, SELECT only on `data:`
+tables, and no permanent CREATE/ALTER. Temporary helpers are allowed (PG database
+TEMP; SQL Server `#temp` tables/procedures without permanent CREATE grants).
+SQL Server fixtures use generated identities with OUTPUT/INSERT SELECT or a
+business-key lookup; they cannot enable IDENTITY_INSERT by acquiring ALTER.
+No user SQL runs with provisioning credentials or production connections.
+
+Each assertion file holds one query returning one tabular result set: zero rows
+passes, any row (including NULL) violates, and evidence is bounded. Errors,
+missing/unreadable results and driver timeouts are never pass. PostgreSQL uses
+a fresh runner-owned READ ONLY transaction, a runner first read establishing
+transaction identity, one extended-protocol statement, and a postcheck that the
+same transaction remains open, unchanged and read-only. A boundary violation
+fails the run and discards the connection. In SQL Server scratch, close runner
+connections first and set the database READ_ONLY with a bounded wait, **without
+ROLLBACK IMMEDIATE**, before asserting with a separate least-privilege login.
+
+#2401 reuses that query format with repeatable `plan --assert <file>` at **plan
+time**, and a separate `PBPS_ASSERTION_CONN` credential. PostgreSQL retains its
+transaction boundary; a SQL Server target uses **least privilege only**, since
+the target is not switched read-only. File hashes/outcomes are checksum-covered
+plan evidence, shown by `explain` and retained in the ledger. A failure/error
+writes no plan. This accepts the plan-to-apply window; constraints and recorded
+drop preconditions cover their own stronger guarantees (§14.1). Production
+`apply` executes no fixture or arbitrary assertion SQL; §7.5 is unchanged.
 
 ---
 
@@ -3948,7 +4042,22 @@ around the typed plan and its checksum.
 | Be warned about a hazard the risk class does not name | Risk answers whether a change *can* fail; a competitor's lint catalogue also names *why* — a narrowing that depends on the data already stored, an add that will be rejected by existing rows, a change that breaks a reader still deployed | Widen the built-in analyzer catalogue over the typed ChangeSet. Every change is classified through the selected dialect's `Dialect::change_risks`, which starts from `Change::intrinsic_risks_with` under that engine's identifier boundary, and its findings are attached to `PlannedChange::risks`. Saved-plan validation re-derives them the same way (DEC-399.1). Every finding stays structured data with a stable id, so `policies:` can raise or lower its severity and `explain` can print it. This is catalogue depth, not a new mechanism — it must not become string inspection of emitted SQL | **P1** |
 | Take part in a review without a terminal | Every artifact is reachable only through the CLI, so a DBA, an auditor or a release manager either learns it or is briefed second-hand by someone who has | An optional local UI ([ADR-0006](ADR-0006-optional-ui.md)) renders the typed JSON of the read-only commands, composes intent as a commit, and triggers the same checksum-pinned plan. It holds no state and never holds the approval — the audit trail stays git plus the ledger | **P2** |
 | Wire pbps into a pipeline that stays upgradeable | The documented pipelines of 10 are copy-pasted, and a copy cannot be upgraded — the same objection that rules out a generator | A first-party, versioned CI component (a GitHub Action, a GitLab CI template) wrapping the existing commands and their exit codes. It differs from a generator in the one way that matters: it is *referenced* by version, so a fix reaches every user, and it adds no capability the CLI lacks | **P2** |
-| Assert domain invariants beyond structural convergence | The derived probes cover the hazards a change implies; teams also have rules no diff can imply ("every order has a customer") | A later `tests:` format runs read-only SQL assertions in the optional dev database and at target pre-flight. It is **deliberately separate from the probes of 7.5**, which are derived from the typed ChangeSet and are never replaced by hand-written ones — a probe nobody remembered to write is a probe that does not exist. `tests:` covers what no diff can imply, cannot mutate data, and gets an ADR before it is built | **P2** |
+| Assert domain invariants beyond structural convergence | Derived probes cover hazards implied by the change; teams also have domain rules no diff can imply ("every order has a customer") | The `tests:` capability is defined by [ADR-0019](ADR-0019-plan-tests.md) and §9.9: pinned SQL fixtures and one-query/zero-rows-pass assertions in an owned disposable `pbps test` run. Target assertions (#2401) reuse the format **at plan time**, with hashes/outcomes covered by the plan checksum; they are never target pre-flight user SQL. Constraints and recorded drop preconditions supply the other contract-verification layers below. Derived probes of §7.5 remain mandatory and are never replaced by hand-written assertions | **P2** |
+
+Contract verification has three layers, with different timing and guarantees
+([#1156 decisions](https://github.com/pongbiphang/pbps/issues/1156#issuecomment-6401634798)):
+
+| Layer | Contract | When enforced |
+|---|---|---|
+| 1 | NOT NULL, CHECK, FK and UNIQUE constraints | Existing derived probes before statements, then engine enforcement |
+| 2 | A row precondition on recorded drop intent (`--require`, #2400), vetted like a recorded conversion | A pbps-generated check under the apply lock immediately before that drop; no plan-to-drop window |
+| 3 | Reviewed read-only target assertions (#2401), using ADR-0019's format | Plan time; path/hash/outcome enter the plan checksum, `explain` and ledger; failure/error publishes no plan |
+
+Layer 3 accepts the window between plan and apply. It is not re-executed by
+`apply` and cannot replace a constraint or layer-2 predicate that must hold at
+the drop itself. SQL Server's target boundary is the separate least-privilege
+login, weaker than the scratch runner's READ_ONLY database. Fixtures and
+arbitrary assertions never become production apply hooks (§7.5, §14.3).
 
 ### 14.2 The recommended first slice
 
@@ -4033,6 +4142,13 @@ arrives again as a reasonable-sounding request.
   difference between this and a schema-sync tool — and if a shorter path
   existed, it would become the path everyone actually uses, and the reviewed one
   would quietly die.
+  The explicit confined exception is `pbps test` (§9.9,
+  [ADR-0019](ADR-0019-plan-tests.md)): it can plan and apply in one invocation
+  **only in disposable resources that invocation created and proves it owns**.
+  It has no target/env selector, imports no deployment plan and writes no
+  applyable artifact. Thus it cannot become a shorter deployment path: the
+  production change still requires a separately generated, checksum-reviewed
+  plan and ordinary `apply --plan`. Its report is sample-data test evidence.
 - **Rename suggestions, never rename decisions.** Similarity may *order the
   candidates* in the interactive prompt of 6.3, one pair at a time. Identity
   intent is recorded only by a human, and **no non-interactive flag may supply
