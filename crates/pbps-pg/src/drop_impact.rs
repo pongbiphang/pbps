@@ -3,6 +3,7 @@
 //! module reader; unknown classes and domain constraints cannot fall out of a
 //! class-specific join. Automatic removal is distinct from a blocking edge.
 
+use pbps_model::escape::Escaped;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_db::impact::{DropReport, ImpactError};
@@ -116,7 +117,7 @@ impl Graph {
                 && position(edge.dependent)
                     .is_none_or(|before| before > position(edge.referenced).unwrap_or(at_root))
             {
-                blocking.insert(edge.dependent_name.clone());
+                blocking.insert(Escaped(&edge.dependent_name).to_string());
             }
             // A replaced object keeps its owner: `SET EXPRESSION` swaps a
             // generated column's `pg_attrdef` row and leaves the column, which
@@ -129,7 +130,8 @@ impl Graph {
             {
                 blocking.insert(format!(
                     "{} (internal owner of {})",
-                    edge.referenced_name, edge.dependent_name
+                    Escaped(&edge.referenced_name),
+                    Escaped(&edge.dependent_name)
                 ));
             }
         }
@@ -1066,6 +1068,50 @@ mod tests {
         assert_eq!(
             sources.source(&u.column("other"), At::End),
             Source::Stored(t.column("other"))
+        );
+    }
+
+    #[test]
+    fn catalog_prose_drop_blockers_show_both_owner_operands_and_keep_addresses() {
+        let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+        let mut ordinary = edge(2, 1, "n");
+        ordinary.dependent_name = format!("view {raw}");
+        let graph = Graph(vec![ordinary]);
+        assert_eq!(
+            graph.blockers(address(1), 0, &[(0, address(1))], &BTreeSet::new()),
+            [r"view a\n\u{1b}\u{202e}\\n\\u{1b}é*/"]
+        );
+        assert_eq!(graph.0[0].dependent_name, format!("view {raw}"));
+        assert!(
+            graph
+                .blockers(
+                    address(1),
+                    1,
+                    &[(0, address(2)), (1, address(1))],
+                    &BTreeSet::new()
+                )
+                .is_empty()
+        );
+        let mut internal = edge(2, 3, "i");
+        internal.dependent_name = format!("rule {raw}");
+        internal.referenced_name = format!("view {raw}");
+        let graph = Graph(vec![internal]);
+        assert_eq!(
+            graph.blockers(address(2), 0, &[(0, address(2))], &BTreeSet::new()),
+            [
+                r"view a\n\u{1b}\u{202e}\\n\\u{1b}é*/ (internal owner of rule a\n\u{1b}\u{202e}\\n\\u{1b}é*/)"
+            ]
+        );
+        assert_eq!(graph.0[0].referenced_name, format!("view {raw}"));
+        assert!(
+            graph
+                .blockers(
+                    address(2),
+                    0,
+                    &[(0, address(2))],
+                    &BTreeSet::from([address(2)])
+                )
+                .is_empty()
         );
     }
 }

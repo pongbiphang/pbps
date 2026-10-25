@@ -5908,3 +5908,253 @@ async fn scratch_generated_table_parts_compile_literal_and_collision_names_befor
         }
     }
 }
+
+const CATALOG_RAW2382: &str = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+const CATALOG_SHOWN2382: &str = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn catalog_prose_shared_comments_are_shown_once_by_externals_and_fill() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let mut scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let role = format!("r2382_{}_{}", scratch.token, CATALOG_RAW2382);
+    let quoted = format!("\"{role}\"");
+    scratch
+        .admin()
+        .await
+        .execute(&format!("CREATE ROLE {quoted} NOLOGIN"))
+        .await
+        .unwrap();
+    scratch.roles.push(quoted.clone());
+    let before = target.foreign_objects(&target_db).await;
+    let control = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &plain_externals("integer"),
+    )
+    .await;
+    let comment = format!("COMMENT ON ROLE {quoted} IS 'changed'");
+    let mut results = Vec::new();
+    for fill in [false, true] {
+        let externals = if fill {
+            format!(
+                "CREATE SCHEMA {EXTERNAL}; CREATE FUNCTION {EXTERNAL}.comment2382() RETURNS event_trigger LANGUAGE plpgsql AS $f$BEGIN IF tg_tag = 'CREATE TABLE' THEN EXECUTE $comment2382${comment}$comment2382$; END IF; END$f$; CREATE EVENT TRIGGER comment2382 ON ddl_command_end EXECUTE FUNCTION {EXTERNAL}.comment2382();"
+            )
+        } else {
+            format!("{}{comment};", plain_externals("integer"))
+        };
+        let refusal = externals_refusal(
+            produce_staged(
+                &scratch.server,
+                &target.on(&target_db),
+                &inputs,
+                &key,
+                &externals,
+            )
+            .await,
+        );
+        let row = scratch.admin().await.query(&format!("SELECT pg_catalog.shobj_description(oid, 'pg_authid') AS comment FROM pg_catalog.pg_roles WHERE rolname = $role2382${role}$role2382$" )).await.unwrap();
+        let left = row[0]
+            .try_get::<&str>("comment")
+            .unwrap()
+            .map(str::to_owned);
+        results.push((fill, refusal, left));
+    }
+    // Read the same real shared-catalog producer directly, without changing
+    // either comparison row: its name stays raw until a finding renders it.
+    scratch.admin().await.execute(&comment).await.unwrap();
+    let shared = pbps_pg::resolver::externals::shared_state(&mut scratch.admin().await)
+        .await
+        .unwrap();
+    scratch
+        .admin()
+        .await
+        .execute(&format!("COMMENT ON ROLE {quoted} IS NULL"))
+        .await
+        .unwrap();
+    let after = target.foreign_objects(&target_db).await;
+    let displayed = format!(
+        "the comment on role r2382_{}_{}",
+        scratch.token, CATALOG_SHOWN2382
+    );
+    target.drop().await;
+    scratch.drop().await;
+    assert_staged(control, "t", "unchanged shared objects");
+    assert_eq!(
+        before, after,
+        "the target, including its absent ledger, is untouched"
+    );
+    assert!(
+        shared
+            .values()
+            .any(|(_, name)| name == &format!("the comment on role {role}"))
+    );
+    assert!(pbps_pg::resolver::externals::shared_changes(&shared, &shared).is_empty());
+    for (fill, refusal, left) in results {
+        let expected = if fill {
+            format!(
+                "filling what the externals file lacks changed {displayed}, outside the scratch database: something the externals file created, such as an event trigger, ran on fill's statements; an externals file creates only objects in the database, unless the resolver sets `outside_writes: allow`"
+            )
+        } else {
+            format!(
+                "it changed {displayed}, outside the scratch database; an externals file creates only objects in the database, unless the resolver sets `outside_writes: allow`"
+            )
+        };
+        assert_eq!(refusal, expected, "fill={fill}");
+        assert_eq!(left, None, "the refused comment was rolled back");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_authority() {
+    use pbps_pg::resolver::{scratch as sql, standard};
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let inputs = Inputs::overload();
+        let key = ProjectKey::new(true);
+        let before = fixture.foreign_objects(&target_db).await;
+        let function = format!("public.\"{}\"", CATALOG_RAW2382);
+        fixture.run(&scratch_db, &[&format!("CREATE FUNCTION {function}() RETURNS integer LANGUAGE sql RETURN 7; ALTER FUNCTION {function}() OWNER TO {}", login.0)]).await;
+        let foreign_raw = fixture.foreign_objects(&scratch_db).await;
+        let nonempty = resolver_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        let foreign_kept = fixture.foreign_objects(&scratch_db).await;
+        fixture
+            .run(&scratch_db, &[&format!("DROP FUNCTION {function}()")])
+            .await;
+        let other = fixture.database("a", Some(&login.0)).await;
+        let database = format!("d2382_{}_{}", fixture.token, CATALOG_RAW2382);
+        let quoted = format!("\"{database}\"");
+        fixture
+            .admin()
+            .await
+            .execute(&format!("ALTER DATABASE {other} RENAME TO {quoted}"))
+            .await
+            .unwrap();
+        *fixture.databases.iter_mut().find(|d| **d == other).unwrap() = quoted.clone();
+        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+            .await
+            .unwrap();
+        let account = sql::account(&mut conn).await.unwrap();
+        drop(conn);
+        let authority = resolver_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        fixture.admin().await.execute(&format!("ALTER DATABASE {quoted} OWNER TO CURRENT_USER; GRANT CREATE ON DATABASE {quoted} TO {}", login.0)).await.unwrap();
+        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+            .await
+            .unwrap();
+        let reach_raw = sql::cleanup_reach(&mut conn).await.unwrap();
+        drop(conn);
+        let reach = resolver_refusal(
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &inputs,
+                &key,
+            )
+            .await,
+        );
+        fixture
+            .admin()
+            .await
+            .execute(&format!(
+                "REVOKE CREATE ON DATABASE {quoted} FROM {}",
+                login.0
+            ))
+            .await
+            .unwrap();
+        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+            .await
+            .unwrap();
+        let backend = sql::backend(&mut conn).await.unwrap();
+        let defaults = sql::login_defaults(&mut conn).await.unwrap();
+        let acl = standard::read_state(&mut conn).await.unwrap().acl;
+        // This role owns the database's objects but DROP OWNED by the login
+        // cannot remove them: the leftover report must show the same scalar.
+        conn.execute(&format!("SET ROLE pg_database_owner; CREATE FUNCTION {function}() RETURNS integer LANGUAGE sql RETURN 7; SET ROLE NONE")).await.unwrap();
+        let released = super::release_supplied(
+            &mut conn,
+            &backend,
+            &Standard::default(),
+            &scratch_db,
+            &defaults,
+            &acl,
+        )
+        .await;
+        conn.execute(&format!(
+            "SET ROLE pg_database_owner; DROP FUNCTION {function}(); SET ROLE NONE"
+        ))
+        .await
+        .unwrap();
+        let success = super::release_supplied(
+            &mut conn,
+            &backend,
+            &Standard::default(),
+            &scratch_db,
+            &defaults,
+            &acl,
+        )
+        .await;
+        drop(conn);
+        let after = fixture.foreign_objects(&target_db).await;
+        let shown_function = format!("function public.\"{}\"()", CATALOG_SHOWN2382);
+        let shown_database = format!("database d2382_{}_{}", fixture.token, CATALOG_SHOWN2382);
+        fixture.drop().await;
+        assert_eq!(foreign_raw.0, [format!("function {function}()")]);
+        assert_eq!(foreign_raw, foreign_kept, "the refusal removes nothing");
+        assert_eq!(
+            nonempty,
+            format!(
+                "the scratch database is not empty: 1 object(s) initdb did not create, including {shown_function}"
+            )
+        );
+        assert_eq!(
+            account.shared,
+            [format!("ownership of database {database}")]
+        );
+        assert_eq!(
+            authority,
+            format!(
+                "the scratch account shares the target's cluster and is not confined to its database (no ownership of {shown_database}); remove them from it, or use a scratch server on another cluster"
+            )
+        );
+        assert_eq!(reach_raw, [format!("database {database}")]);
+        assert_eq!(
+            reach,
+            format!(
+                "the scratch account {} has objects or privileges that emptying its database with DROP OWNED would also drop or revoke ({shown_database}); use an account with none outside that database",
+                login.0
+            )
+        );
+        assert_eq!(
+            released,
+            Err(vec![format!(
+                "1 object(s) in database {scratch_db} owned by a role other than the scratch account ({shown_function})"
+            )])
+        );
+        assert_eq!(success, Ok(()));
+        assert_eq!(before, after, "no target write or ledger recording");
+    }
+}

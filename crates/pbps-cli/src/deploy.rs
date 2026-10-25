@@ -10299,7 +10299,7 @@ fn impact_lines(report: &pbps_db::impact::ImpactReport, notes: &[String]) -> Vec
     for r in &report.carried {
         out.push(format!(
             "  {} — carried into the new name, keeps working{}",
-            r.name,
+            pbps_model::escape::Escaped(&r.name),
             detail(r)
         ));
     }
@@ -23699,5 +23699,40 @@ mod local_name_key_tests {
                 .collect()
         );
         assert_eq!(parents, vec![table]);
+    }
+
+    #[test]
+    fn catalog_prose_carried_report_shows_the_description_without_changing_it() {
+        let raw = "view a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+        let report = pbps_db::impact::ImpactReport {
+            carried: vec![pbps_db::impact::Referrer {
+                kind: "view".into(),
+                name: raw.into(),
+                detail: None,
+                removed_with: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            impact_lines(&report, &[]),
+            [r"  view a\n\u{1b}\u{202e}\\n\\u{1b}é*/ — carried into the new name, keeps working"]
+        );
+        assert_eq!(report.carried[0].name, raw);
+        assert!(impact_lines(&Default::default(), &[]).is_empty());
+        assert_eq!(
+            impact_lines(
+                &pbps_db::impact::ImpactReport {
+                    carried: vec![pbps_db::impact::Referrer {
+                        kind: "view".into(),
+                        name: "view app.plain".into(),
+                        detail: None,
+                        removed_with: None,
+                    }],
+                    ..Default::default()
+                },
+                &[]
+            ),
+            ["  view app.plain — carried into the new name, keeps working"]
+        );
     }
 }

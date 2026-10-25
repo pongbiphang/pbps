@@ -38062,3 +38062,78 @@ mod certified_fixture {
 
 #[path = "support/rebuild_read_boundary.rs"]
 mod rebuild_read_boundary;
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments() {
+    use pbps_pg::resolver::{capture::Managed, draft, externals};
+    let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let shown = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let mut db = TestDb::create("catalog2382").await;
+    let result = async {
+        on_public(&mut db.conn).await;
+        state::ensure_tables(&mut db.conn).await?;
+        db.execute(&format!("CREATE SCHEMA c; CREATE TABLE c.t (id integer); INSERT INTO c.t VALUES (7); CREATE VIEW c.\"{raw}\" AS SELECT id FROM c.t")).await?;
+        let rename = pbps_pg::impact::rename_impact(&mut db.conn, &pbps_pg::impact::RenameTarget::Table(TableName::new("c", "t"))).await?;
+        db.execute("BEGIN").await?;
+        let blockers = physical_sources::reports(&mut db.conn, &drop_changes(vec![dropping_column("c", "id")])).await;
+        db.execute("ROLLBACK").await?;
+        let blockers = blockers?;
+        db.execute(&format!("CREATE TABLE c.\"e{raw}\" (m c.t); CREATE FUNCTION c.\"f{raw}\"() RETURNS integer LANGUAGE sql RETURN 7; CREATE VIEW c.reader AS SELECT (m).id, c.\"f{raw}\"() AS n FROM c.\"e{raw}\"")).await?;
+        let mut schema = Schema::default();
+        schema.tables.insert(TableName::new("c", "t"), Default::default());
+        schema.modules.insert(pbps_model::ModuleId::Named(TableName::new("c", "reader")), pbps_model::Module {
+            kind: pbps_model::ModuleKind::View, definition: String::new(), description: None,
+        });
+        let links = externals::links(&mut db.conn).await?;
+        let managed = Managed::from_schema(&schema);
+        let chains = externals::chains(&links, &managed, &managed, &Default::default());
+        let drafted = draft::draft(&mut db.conn, &schema, &[]).await?;
+        // The actual file, including a catalog spelling containing */, is SQL
+        // whose listings use -- on every line, never a block comment.
+        db.execute(&drafted.sql).await?;
+        let inventory = externals::inventory(&mut db.conn).await?;
+        let data = db.query("SELECT id::text AS n FROM c.t").await?;
+        let ledger = db.query("SELECT count(*)::text AS n FROM public.__pbps_state").await?;
+        Ok::<_, Box<dyn std::error::Error>>((rename, blockers, links, chains, drafted, inventory, data, ledger))
+    }.await;
+    db.drop().await;
+    let (rename, blockers, links, chains, drafted, inventory, data, ledger) = result.unwrap();
+    assert!(
+        rename
+            .carried
+            .iter()
+            .any(|r| r.name == format!("view c.\"{raw}\""))
+    );
+    assert_eq!(
+        blockers[0].blocking,
+        [format!("rule _RETURN on view c.\"{shown}\"")]
+    );
+    assert!(
+        links
+            .iter()
+            .any(|l| l.middle.described == format!("table c.\"e{raw}\"")
+                && l.middle.names == ["c", &format!("e{raw}")])
+    );
+    assert_eq!(
+        chains,
+        [format!(
+            "view c.reader binds table c.\"e{shown}\", whose shape names the managed table c.t: no externals file can stage it before the managed objects exist; adopt table c.\"e{shown}\" into the managed set too, or select no resolver and keep ADR-0013's conservative rebuild"
+        )]
+    );
+    assert!(drafted.listed.iter().any(|l| l == &format!("function c.\"f{shown}\"(): listed, never written; pbps sends no routine source to scratch, so add its definition here if a binding needs it")));
+    assert!(
+        drafted
+            .sql
+            .lines()
+            .filter(|l| l.contains("*/"))
+            .all(|l| l.starts_with("-- "))
+    );
+    assert!(
+        inventory
+            .values()
+            .any(|(name, _)| name == &format!("function c.\"f{raw}\"()"))
+    );
+    assert_eq!(data[0].try_get::<&str>("n").unwrap(), Some("7"));
+    assert_eq!(ledger[0].try_get::<&str>("n").unwrap(), Some("0"));
+}

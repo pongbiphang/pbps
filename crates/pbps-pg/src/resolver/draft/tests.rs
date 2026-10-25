@@ -900,3 +900,192 @@ fn an_extension_never_waits_for_the_managed_tables() {
         named.unfillable
     );
 }
+
+#[test]
+fn catalog_prose_staging_keeps_raw_identity_keys_and_shows_each_refusal_operand() {
+    let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let shown = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let object = |catalog: &str, how| Filled {
+        catalog: catalog.into(),
+        described: raw.into(),
+        parts: vec![],
+        schemas: vec![],
+        how,
+        names: vec![],
+        after: BTreeSet::new(),
+    };
+    let fill = Fill {
+        objects: vec![object("pg_class", How::Ahead("SELECT 1;".into()))],
+    };
+    assert_eq!(
+        fill.staging(&file_created(&[("pg_class", raw)])),
+        Staging::default()
+    );
+    let wrong_key = fill.staging(&file_created(&[("pg_class", shown)]));
+    assert_eq!(wrong_key.filled, BTreeSet::from([raw.to_owned()]));
+    assert_eq!(wrong_key.ahead, "SELECT 1;");
+    let mut part = object("pg_class", How::Ahead("SELECT 1;".into()));
+    part.parts
+        .push(("pg_class".into(), format!("sequence {raw}")));
+    let fill = Fill {
+        objects: vec![part],
+    };
+    let held = fill.staging(&file_created(&[("pg_class", &format!("sequence {raw}"))]));
+    assert_eq!(
+        held.unfillable,
+        [format!(
+            "{shown} is not filled: the externals file created its sequence {shown}; write the whole of it in the externals file if a binding needs it"
+        )]
+    );
+    assert!(held.ahead.is_empty());
+    let missing = object("pg_class", How::Not("no SQL".into()));
+    let mut dependent = object("pg_class", How::Ahead("SELECT 2;".into()));
+    dependent.described = format!("dependent {raw}");
+    dependent.names.push(0);
+    let messages = Fill {
+        objects: vec![missing, dependent],
+    }
+    .staging(&BTreeSet::new())
+    .unfillable;
+    assert_eq!(
+        messages,
+        [
+            format!(
+                "{shown} cannot be filled: no SQL; write it in the externals file, or select no resolver and keep ADR-0013's conservative rebuild"
+            ),
+            format!(
+                "dependent {shown} cannot be filled: its shape names {shown}, which cannot be filled either"
+            ),
+        ]
+    );
+    let extension = Fill {
+        objects: vec![object("pg_extension", How::Chained("SELECT 3;".into()))],
+    }
+    .staging(&BTreeSet::new());
+    assert_eq!(
+        extension.unfillable,
+        [format!(
+            "{shown} cannot be filled: its shape names a managed relation, and an extension's script runs code and creates names fill cannot order between two parts of the compile; select no resolver and keep ADR-0013's conservative rebuild"
+        )]
+    );
+    let fill = Fill {
+        objects: vec![object("pg_class", How::Chained("SELECT 4;".into()))],
+    };
+    let mut staging = fill.staging(&BTreeSet::new());
+    staging.keep_chained(|_| true);
+    assert!(staging.filled.contains(raw) && staging.chained_objects.contains(raw));
+    assert!(!staging.filled.contains(shown));
+    staging.keep_chained(|_| false);
+    assert!(
+        staging.filled.is_empty()
+            && staging.chained_objects.is_empty()
+            && staging.chained.is_empty()
+    );
+    assert_eq!(
+        staging.unfillable,
+        [format!(
+            "{shown} is not filled: its shape names a managed relation the scratch compile does not create"
+        )]
+    );
+}
+
+#[test]
+fn catalog_prose_draft_listings_use_line_comments_and_do_not_reescape_fill_reasons() {
+    let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let shown = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    for (catalog, expected) in [
+        (
+            "pg_proc",
+            format!(
+                "{shown}: listed, never written; pbps sends no routine source to scratch, so add its definition here if a binding needs it"
+            ),
+        ),
+        (
+            "pg_cast",
+            format!(
+                "{shown}: write it here by hand if a binding needs it; the draft writes no cast"
+            ),
+        ),
+    ] {
+        let item = item(&Facts::default(), &key(catalog, 20_001), raw);
+        let Body::Listed(line) = item.body else {
+            panic!("a listing, never executable source")
+        };
+        assert_eq!(line, expected);
+        let sql = comment(&line);
+        assert!(sql.lines().all(|line| line.starts_with("-- ")));
+        assert!(
+            sql.contains("*/"),
+            "a terminator is inert inside each -- line"
+        );
+        assert!(!sql.contains('\u{1b}') && !sql.contains('\u{202e}'));
+    }
+    let mut target = Target::default();
+    let managed = target.object("pg_proc", 20_100, "app", &format!("function {raw}"));
+    target.managed(&managed);
+    let table = target.relation(20_110, 'r', "ext", "t", &[("id", "integer")]);
+    target.facts.objects.get_mut(&table).unwrap().described = format!("table {raw}");
+    target.depend(&table, &managed, 'n', true);
+    let reader = target.relation(20_120, 'v', "app", "v", &[("id", "integer")]);
+    target.depend(&reader, &table, 'n', false);
+    target.managed(&reader);
+    assert_eq!(
+        target.fill().staging(&BTreeSet::new()).unfillable,
+        [format!(
+            "table {shown} cannot be filled: its shape names the managed function {shown}, and fill orders a shape only after the managed relations it names; write it in the externals file, or select no resolver and keep ADR-0013's conservative rebuild"
+        )]
+    );
+    assert_eq!(
+        target.draft(&[]).listed,
+        [format!(
+            "table {shown} cannot be staged: its shape names the managed function {shown}, which no externals file can stage before the managed objects exist; adopt table {shown} into the managed set too, or select no resolver and keep ADR-0013's conservative rebuild"
+        )]
+    );
+}
+
+#[test]
+fn catalog_prose_foreign_and_transitive_draft_findings_show_names_without_changing_order() {
+    let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let shown = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+    let mut target = Target::default();
+    let foreign = target.relation(20_200, 'f', "ext", "f", &[("id", "integer")]);
+    target.facts.objects.get_mut(&foreign).unwrap().described = format!("foreign table {raw}");
+    let through = target.relation(20_210, 'r', "ext", "t", &[("f", "ext.f")]);
+    target.facts.objects.get_mut(&through).unwrap().described = format!("table {raw}");
+    target.depend(&through, &key("pg_type", 20_201), 'n', true);
+    let reader = target.relation(20_220, 'v', "app", "v", &[("id", "integer")]);
+    target.depend(&reader, &through, 'n', false);
+    target.managed(&reader);
+    assert_eq!(
+        target.draft(&[]).listed,
+        [
+            format!(
+                "foreign table {shown} cannot be staged: the comparison does not qualify a foreign table's properties"
+            ),
+            format!(
+                "table {shown} cannot be staged: its shape names foreign table {shown}, which cannot be staged either"
+            ),
+        ]
+    );
+    assert_eq!(
+        target.facts.objects[&foreign].described,
+        format!("foreign table {raw}")
+    );
+    let (mut target, _, _, reader) = reading_a_view();
+    let first = target.object("pg_proc", 20_300, "ext", "function a\n()");
+    let second = target.object("pg_proc", 20_301, "ext", r"function a\n()");
+    target.depend(&reader, &first, 'n', false);
+    target.depend(&reader, &second, 'n', false);
+    let fill = target.fill();
+    let routines: Vec<_> = fill
+        .objects
+        .iter()
+        .filter(|o| o.catalog == "pg_proc")
+        .map(|o| o.described.as_str())
+        .collect();
+    assert_eq!(
+        routines,
+        ["function a\n()", r"function a\n()"],
+        "raw order differs from shown order"
+    );
+}

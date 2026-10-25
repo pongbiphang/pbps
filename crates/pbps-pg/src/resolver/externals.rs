@@ -12,6 +12,7 @@
 
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
+use pbps_model::escape::Escaped;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// An externals file the engine refused, with its error. Nothing it ran stays:
@@ -719,10 +720,10 @@ pub fn chains(
                 "{} binds {}, whose shape names the managed {}: no externals file can stage it before \
                  the managed objects exist; adopt {} into the managed set too, or select no \
                  resolver and keep ADR-0013's conservative rebuild",
-                link.binder.described,
-                link.middle.described,
-                link.named.described,
-                link.middle.described
+                Escaped(&link.binder.described),
+                Escaped(&link.middle.described),
+                Escaped(&link.named.described),
+                Escaped(&link.middle.described)
             )
         })
         .collect()
@@ -1157,5 +1158,47 @@ mod tests {
             assert_eq!(links[2].middle.names, ["ext", "f"], "{variable}");
             assert_eq!(links[0].binder.kind, "view", "{variable}");
         }
+    }
+
+    #[test]
+    fn catalog_prose_links_show_descriptions_but_match_raw_address_names() {
+        let raw = "a\n\u{1b}\u{202e}\\n\\u{1b}é*/";
+        let mut schema = pbps_model::Schema::default();
+        schema
+            .tables
+            .insert(pbps_model::TableName::new("app", raw), Default::default());
+        schema.modules.insert(
+            pbps_model::ModuleId::Named(pbps_model::ObjectName::new("app", raw)),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: String::new(),
+            },
+        );
+        let desired = crate::resolver::capture::Managed::from_schema(&schema);
+        let mut link = Link {
+            binder: address(&format!("view {raw}"), "view", &["app", raw]),
+            middle: address(&format!("table {raw}"), "table", &["ext", raw]),
+            named: address(&format!("table {raw}"), "table", &["app", raw]),
+        };
+        assert_eq!(
+            chains(
+                std::slice::from_ref(&link),
+                &desired,
+                &desired,
+                &Default::default()
+            ),
+            [
+                r"view a\n\u{1b}\u{202e}\\n\\u{1b}é*/ binds table a\n\u{1b}\u{202e}\\n\\u{1b}é*/, whose shape names the managed table a\n\u{1b}\u{202e}\\n\\u{1b}é*/: no externals file can stage it before the managed objects exist; adopt table a\n\u{1b}\u{202e}\\n\\u{1b}é*/ into the managed set too, or select no resolver and keep ADR-0013's conservative rebuild"
+            ]
+        );
+        assert_eq!(link.binder.described, format!("view {raw}"));
+        link.binder.names[1] = r"a\n\u{1b}\u{202e}\\n\\u{1b}é*/".into();
+        assert!(chains(&[link], &desired, &desired, &Default::default()).is_empty());
+        let before = SharedState::from([("comment:1".into(), ("row".into(), raw.into()))]);
+        let renamed =
+            SharedState::from([("comment:1".into(), ("row".into(), "another display".into()))]);
+        assert!(shared_changes(&before, &renamed).is_empty());
+        assert_eq!(shared_changes(&Default::default(), &before), [raw]);
     }
 }
