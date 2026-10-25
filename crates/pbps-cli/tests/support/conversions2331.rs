@@ -749,3 +749,204 @@ fn an_expression_is_bound_to_the_column_and_vetted_before_any_row_evaluates_it()
         succeeds(approved_apply(&d, connection, &artifact, GATE));
     }
 }
+
+/// What a plan needs beside the conversion's own two classes when it also
+/// tightens `NOT NULL`, and when it also adds a key.
+const GATE_NOT_NULL: &[&str] = &["--allow", "destructive,narrowing,not-null"];
+const GATE_ALL: &[&str] = &["--allow", "destructive,narrowing,constraint"];
+
+fn refused_in_preflight(version: i32, refused: &Output, needle: &str, connection: &str) {
+    assert_eq!(
+        code(refused),
+        1,
+        "PG{version}: {}{}",
+        stdout(refused),
+        stderr(refused)
+    );
+    let text = stderr(refused);
+    assert!(
+        text.contains(needle) && text.contains("nothing has been changed"),
+        "PG{version}: {text}"
+    );
+    assert!(still_text(connection), "PG{version}: nothing was converted");
+    assert_eq!(
+        executed(connection),
+        0,
+        "PG{version}: no statement of the plan ran"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn not_null_beside_a_conversion_is_checked_on_the_converted_value() {
+    let required = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  amount: {type: integer, nullable: false}\nprimary_key: {name: pk_t, columns: [id]}\n";
+    for (version, url) in servers() {
+        let slug = format!("convert2331-notnull{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, TEXT);
+        on_server(
+            connection,
+            "INSERT INTO app.t VALUES (1,' 41 '),(2,''),(3,NULL),(4,'7')",
+        );
+        d.table(required);
+        // The expression leaves a NULL: refused, naming the NULLs, and the
+        // count is the converted value's (rows 2 and 3), not the stored one's.
+        succeeds(with_stdin(
+            &d,
+            &CONVERT,
+            b"nullif(trim(amount), '')::integer",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        on_server(connection, WITNESS);
+        let refused = approved_apply(&d, connection, &artifact, GATE_NOT_NULL);
+        refused_in_preflight(
+            version,
+            &refused,
+            "2 existing NULLs in app.t.amount, which NOT NULL would reject",
+            connection,
+        );
+        // One that fills them is a valid plan: the stored NULL is not what
+        // `NOT NULL` meets. Recorded again on the same pair, so it replaces.
+        succeeds(with_stdin(
+            &d,
+            &["convert", "app.t.amount", "--using", "-", "--from", "text"],
+            b"coalesce(nullif(trim(amount), '')::integer, 0)",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &artifact, GATE_NOT_NULL));
+        assert_eq!(
+            scalar(connection, "SELECT sum(amount) FROM app.t"),
+            48,
+            "PG{version}"
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'app' \
+                 AND table_name = 't' AND column_name = 'amount' AND is_nullable = 'NO'"
+            ),
+            1,
+            "PG{version}: NOT NULL took"
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_value_the_target_type_refuses_is_refused_in_preflight_not_at_the_alter() {
+    let small = INTEGER.replace("integer", "smallint");
+    for (version, url) in servers() {
+        let slug = format!("convert2331-target{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, TEXT);
+        on_server(connection, "INSERT INTO app.t VALUES (1,'12'),(2,'40000')");
+        d.table(&small);
+        // The expression itself holds: 40000 is a bigint. It is the
+        // assignment to `smallint` that raises, so the probe has to make it.
+        succeeds(with_stdin(&d, &CONVERT, b"amount::bigint"));
+        let artifact = connected_artifact(&d, connection, false);
+        on_server(connection, WITNESS);
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        refused_in_preflight(
+            version,
+            &refused,
+            "the conversion `USING amount::bigint` of app.t.amount fails on a stored row (SQLSTATE 22003)",
+            connection,
+        );
+        on_server(connection, "DELETE FROM app.t WHERE id = 2");
+        succeeds(approved_apply(&d, connection, &artifact, GATE));
+        assert_eq!(scalar(connection, "SELECT sum(amount) FROM app.t"), 12);
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_bounded_string_the_assignment_refuses_is_counted_before_the_alter() {
+    // An explicit cast truncates a string and the `ALTER` refuses it
+    // (`types::cannot_become`), so it is counted on its own.
+    let table = |ty: &str| {
+        format!(
+            "table: app.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  v: {{type: \"{ty}\"}}\nprimary_key: {{name: pk_t, columns: [id]}}\n"
+        )
+    };
+    for (version, url) in servers() {
+        let slug = format!("convert2331-varchar{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, &table("character varying(10)"));
+        on_server(
+            connection,
+            "INSERT INTO app.t VALUES (1,'abc'),(2,'abcdef'),(3,'ab   ')",
+        );
+        d.table(&table("character varying(3)"));
+        succeeds(with_stdin(
+            &d,
+            &["convert", "app.t.v", "--using", "-"],
+            b"v",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        assert_eq!(code(&refused), 1, "PG{version}: {}", stderr(&refused));
+        let text = stderr(&refused);
+        assert!(
+            text.contains("1 values the conversion `USING v` of app.t.v makes that character varying(3) would refuse")
+                && text.contains("nothing has been changed"),
+            "PG{version}: {text}"
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT character_maximum_length::bigint FROM information_schema.columns \
+                 WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'v'"
+            ),
+            10,
+            "PG{version}: nothing was converted"
+        );
+        // Trailing spaces are cut by the assignment, so row 3 was never the
+        // problem: with row 2 gone the plan applies.
+        on_server(connection, "DELETE FROM app.t WHERE id = 2");
+        succeeds(approved_apply(&d, connection, &artifact, GATE));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT character_maximum_length::bigint FROM information_schema.columns \
+                 WHERE table_schema = 'app' AND table_name = 't' AND column_name = 'v'"
+            ),
+            3,
+            "PG{version}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_unique_key_added_beside_a_conversion_is_not_counted_over_the_stored_values() {
+    // `'1'` and `'01'` are one integer, and `length` makes them 1 and 2: the
+    // key holds. A probe over the stored column cast to the new type counts
+    // them as a collision and refuses a plan the engine accepts.
+    let before = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  amount: {type: text}\nprimary_key: {name: pk_t, columns: [id]}\n";
+    let after = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  amount: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\nunique:\n  uq_amount: [amount]\n";
+    for (version, url) in servers() {
+        let slug = format!("convert2331-unique{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, before);
+        on_server(connection, "INSERT INTO app.t VALUES (1,'1'),(2,'01')");
+        d.table(after);
+        succeeds(with_stdin(&d, &CONVERT, b"length(amount)"));
+        let artifact = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &artifact, GATE_ALL));
+        assert_eq!(
+            scalar(connection, "SELECT sum(amount) FROM app.t"),
+            3,
+            "PG{version}"
+        );
+        assert!(
+            try_on_server(connection, "INSERT INTO app.t VALUES (3,1)").is_err(),
+            "PG{version}: the key was added"
+        );
+    }
+}
