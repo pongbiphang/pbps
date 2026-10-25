@@ -90,6 +90,18 @@ class Handoff(unittest.TestCase):
                 self.assertTrue(set(secret) & set(pool), secret)
             self.assertFalse(set(secret) & lq.UNSAFE)
 
+    def test_the_user_is_created_without_a_console_prompt_or_the_password_in_argv(self):
+        # `net user /add` asks for confirmation of a password over 14
+        # characters and fails with no console; the password comes from the
+        # environment, never the command text.
+        command = lq.create_user_command()
+        self.assertNotIn("net user", command)
+        self.assertIn("New-LocalUser", command)
+        self.assertIn("$env:PBPS_LOCALDB_PASSWORD", command)
+        self.assertIn("S-1-5-32-545", command)
+        self.assertNotIn("Administrators", command)
+        self.assertNotIn("S-1-5-32-544", command)
+
 
 class Pinned(unittest.TestCase):
     def test_the_installer_is_pinned_by_content_on_microsoft_downloads(self):

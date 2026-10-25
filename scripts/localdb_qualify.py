@@ -173,12 +173,31 @@ def install():
         raise RuntimeError(f"LocalDB did not install (msiexec {done.returncode}; {HELPER} exists: {HELPER.exists()})")
 
 
+def create_user_command():
+    """The PowerShell that creates the dedicated user from $env:PBPS_LOCALDB_PASSWORD.
+
+    Not `net user /add`: for a password longer than 14 characters it asks for
+    confirmation on the console, and with no console it fails ("No valid
+    response was provided"). New-LocalUser takes the password from the
+    environment, so it never appears on a command line either. The user joins
+    `Users` (by SID, whatever the display language calls it) only, never
+    `Administrators`; already being a member is not an error.
+    """
+    return (
+        "$ErrorActionPreference = 'Stop';"
+        "$p = ConvertTo-SecureString $env:PBPS_LOCALDB_PASSWORD -AsPlainText -Force;"
+        f"$null = New-LocalUser -Name '{USER}' -Password $p -AccountNeverExpires "
+        "-PasswordNeverExpires -UserMayNotChangePassword;"
+        f"try {{ Add-LocalGroupMember -SID 'S-1-5-32-545' -Member '{USER}' }} "
+        "catch [Microsoft.PowerShell.Commands.MemberExistsException] { }"
+    )
+
+
 def create_user(secret):
     print(f"::add-mask::{secret}", flush=True)
-    # Not echoed: the command line holds the password. The user joins `Users`
-    # only, never `Administrators`.
-    subprocess.run(["net", "user", USER, secret, "/add", "/expires:never", "/passwordchg:no"],
-                   check=True, stdout=subprocess.DEVNULL)
+    say("create user", USER)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", create_user_command()],
+                   check=True, env={**os.environ, "PBPS_LOCALDB_PASSWORD": secret})
     tmp = Path(r"C:\tmp")  # the shared suites back databases up to `/tmp/...`
     tmp.mkdir(exist_ok=True)
     workspace = Path.cwd()
