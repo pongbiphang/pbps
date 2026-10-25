@@ -801,7 +801,13 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let mut cli = Cli::try_parse().unwrap_or_else(|mut error| {
         if error.context().any(|(kind, value)| {
-            kind == clap::error::ContextKind::Usage && value.to_string().contains("pbps intent")
+            // The usage names the binary as invoked (`pbps.exe` on Windows),
+            // so look for the subcommand word, not "pbps intent".
+            kind == clap::error::ContextKind::Usage
+                && value
+                    .to_string()
+                    .split_whitespace()
+                    .any(|word| word == "intent")
         }) {
             error.insert(
                 clap::error::ContextKind::Suggested,
