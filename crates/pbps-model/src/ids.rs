@@ -348,7 +348,7 @@ impl IdsFile {
     pub fn rebuild_into(&self, replacement_root: &Uid) -> Option<(&Uid, &crate::Rebuild)> {
         self.rebuilds
             .iter()
-            .find(|(key, rebuild)| rebuild.replacement_root(key) == Some(replacement_root))
+            .find(|(_, rebuild)| &rebuild.replacement_root == replacement_root)
     }
 
     /// Moves a table, and the columns under it, to a new name.
@@ -518,7 +518,8 @@ impl IdsFile {
                     .all(|b| b.is_ascii_hexdigit())
                 || source.validate().is_err()
                 || target.validate().is_err()
-                || rebuild.replacement_root(uid).is_none()
+                || rebuild.source_root() != Some(uid)
+                || !rebuild.continues_are_whole()
                 || rebuild
                     .types
                     .keys()

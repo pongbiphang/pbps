@@ -961,8 +961,7 @@ fn an_environment_is_read_as_source_replacement_neither_or_partial() {
     assert_eq!(holding(&IdsFile::default(), key, record), Holding::Neither);
     // Parts of both, or a parent without its members, are never "nothing to do".
     let mut both = ids.clone();
-    both.tables
-        .insert(record.replacement_root(key).unwrap().clone(), table());
+    both.tables.insert(record.replacement_root.clone(), table());
     assert_eq!(holding(&both, key, record), Holding::Partial);
     let mut orphan = IdsFile::default();
     orphan.columns.insert(
@@ -974,9 +973,7 @@ fn an_environment_is_read_as_source_replacement_neither_or_partial() {
     headless
         .tables
         .insert(key.clone(), TableName::new("app", "stale"));
-    headless
-        .tables
-        .remove(record.replacement_root(key).unwrap());
+    headless.tables.remove(&record.replacement_root);
     assert_eq!(holding(&headless, key, record), Holding::Partial);
 }
 
@@ -1586,4 +1583,385 @@ fn proposed_ledger_identities_are_the_files_and_require_the_exact_approval() {
     withdrawn.rebuilds.clear();
     assert!(transition(side(&base, &ids), side(&desired, &withdrawn), &root).is_err());
     assert_eq!(approval.rebuilds.values().next(), Some(&root.intent));
+}
+
+fn renamed_parent() -> TableName {
+    TableName::new("app", "q")
+}
+
+/// An ordinary rename of the live replacement after an approval, as the files
+/// would hold it: the parent to `app.q`, and the key column `bucket` to
+/// `slot`. The declarations and the identities that the rename intents give.
+fn renamed_after(schema: &Schema, ids: &IdsFile) -> (Schema, IdsFile) {
+    let mut schema = schema.clone();
+    let parent = schema.tables.get_mut(&table()).unwrap();
+    let column = parent.columns.shift_remove("bucket").unwrap();
+    parent.columns.insert("slot".into(), column);
+    for key in &mut parent.partition_by.as_mut().unwrap().columns {
+        if *key == pbps_model::ColumnName::from("bucket") {
+            *key = "slot".into();
+        }
+    }
+    let ids = crate::resolve(
+        &schema,
+        ids,
+        &[pbps_model::Intent::RenameColumn {
+            table: table(),
+            from: "bucket".into(),
+            to: "slot".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let parent = schema.tables.remove(&table()).unwrap();
+    schema.tables.insert(renamed_parent(), parent);
+    for leaf in schema.tables.values_mut() {
+        if let Some(of) = &mut leaf.partition_of {
+            of.parent = renamed_parent();
+        }
+    }
+    let ids = crate::resolve(
+        &schema,
+        &ids,
+        &[pbps_model::Intent::RenameTable {
+            from: table(),
+            to: renamed_parent(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    (schema, ids)
+}
+
+#[test]
+fn a_rename_after_the_approval_is_followed_by_identity_when_the_approval_is_refreshed() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let key = ids.table_uid(&table()).unwrap();
+    let old = approval.rebuilds[key].clone();
+    let (renamed, renamed_ids) = renamed_after(&desired, &approval);
+    let q = renamed_parent();
+
+    // The approval is stale, and says how to refresh it under the new name.
+    let stale = qualify(side(&base, &ids), side(&renamed, &renamed_ids), &q).unwrap_err();
+    assert!(
+        stale
+            .why
+            .contains("re-approve it with `pbps rebuild-table app.q --max-rows 20"),
+        "{stale}"
+    );
+
+    // Whichever baseline the files were compared with: the one without the
+    // approval, or the committed one that has it.
+    for committed in [(&base, &ids), (&desired, &approval)] {
+        let refreshed = record(
+            side(committed.0, committed.1),
+            &renamed,
+            &renamed_ids,
+            &q,
+            20,
+            &reason(),
+            &ctx(),
+        )
+        .unwrap();
+        refreshed.validate().unwrap();
+        let new = &refreshed.rebuilds[key];
+        assert_eq!(
+            refreshed.rebuilds.len(),
+            1,
+            "the record is rewritten in place"
+        );
+        assert_eq!(
+            new.source, old.source,
+            "the source is what the environments hold"
+        );
+        assert_eq!(new.replacement_root, old.replacement_root);
+        assert_eq!(
+            new.continues, old.continues,
+            "what continues what is by identity"
+        );
+        assert_eq!(new.replacement.tables[&new.replacement_root], q);
+        assert_eq!(
+            new.source_column(&q.column("slot")),
+            Some(&table().column("bucket")),
+            "the renamed column still continues the source's"
+        );
+        assert_eq!(
+            refreshed
+                .rebuild_into(&new.replacement_root)
+                .map(|(k, _)| k),
+            Some(key)
+        );
+    }
+}
+
+#[test]
+fn an_environment_holding_the_source_is_told_of_a_rename_it_cannot_rebuild_across() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let (renamed, renamed_ids) = renamed_after(&desired, &approval);
+    let q = renamed_parent();
+    let refreshed = record(
+        side(&desired, &approval),
+        &renamed,
+        &renamed_ids,
+        &q,
+        20,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    // Not the missing-table refusal, and not the re-approval command: the
+    // approval is current, and the rename is what the plan cannot carry.
+    let behind = diff(side(&base, &ids), side(&renamed, &refreshed));
+    let why = first_rebuild_error(&behind);
+    assert!(
+        why.contains("renamed after the approval") && why.contains("app.p"),
+        "{why}"
+    );
+    assert!(!why.contains("re-approve"), "{why}");
+    // An environment that already applied the rewrite has nothing to rebuild.
+    assert!(
+        diff(side(&renamed, &refreshed), side(&renamed, &refreshed))
+            .errors
+            .is_empty()
+    );
+    // And the unrenamed approval still qualifies for the one that holds it.
+    qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+}
+
+#[test]
+fn a_rename_after_the_head_of_a_chain_keeps_every_link_and_its_columns() {
+    let built = chained(30);
+    let key = built.base.1.table_uid(&table()).unwrap().clone();
+    let (renamed, renamed_ids) = renamed_after(&built.last.0, &built.last.1);
+    let q = renamed_parent();
+    let refreshed = record(
+        side(&built.last.0, &built.last.1),
+        &renamed,
+        &renamed_ids,
+        &q,
+        30,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    refreshed.validate().unwrap();
+    assert_eq!(refreshed.rebuilds.len(), 2);
+    let head_root = refreshed.table_uid(&q).unwrap();
+    let (head_key, head) = refreshed.rebuild_into(head_root).unwrap();
+    let links = chain(&refreshed, head_key, head);
+    assert_eq!(links.len(), 2, "both links are still read through the head");
+    assert_eq!(links[0].0, &key);
+    assert_eq!(
+        head.source, built.last.1.rebuilds[head_key].source,
+        "the head keeps the previous link's replacement as its source"
+    );
+    // The environment that holds the first source is still behind on the chain.
+    assert_eq!(stand(&built.base.1, &links), Stand::Source(0));
+    assert_eq!(stand(&built.middle.1, &links), Stand::Source(1));
+    // The columns still follow their lineage through the renamed one.
+    let lineage = pbps_model::RebuildPartitionedTable {
+        table: q.clone(),
+        earlier: vec![links[0].1.clone()],
+        intent: head.clone(),
+        before: Default::default(),
+        after: Default::default(),
+    }
+    .composed_columns();
+    let slot = &lineage[&q.column("slot")];
+    assert!(slot.from_environment, "{slot:?}");
+    assert_eq!(slot.stages.len(), 3);
+    assert_eq!(slot.stages[0].column, table().column("bucket"));
+    // Withdrawn, the head gives the middle files back exactly.
+    assert_eq!(withdraw(&refreshed, &q).unwrap(), built.middle.1);
+}
+
+#[test]
+fn a_withdrawal_after_a_rename_restores_the_file_before_the_approval() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let (renamed, renamed_ids) = renamed_after(&desired, &approval);
+    let q = renamed_parent();
+    // The sources come back under their own names whatever the replacement
+    // was renamed to meanwhile, before the approval is refreshed and after.
+    assert_eq!(withdraw(&renamed_ids, &q).unwrap(), ids);
+    let refreshed = record(
+        side(&desired, &approval),
+        &renamed,
+        &renamed_ids,
+        &q,
+        20,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    assert_eq!(withdraw(&refreshed, &q).unwrap(), ids);
+    // The name the rename left is not the table any more.
+    assert_eq!(
+        withdraw(&refreshed, &table()).unwrap_err().why,
+        "the table has no identity"
+    );
+}
+
+#[test]
+fn a_record_whose_pairing_contradicts_its_identities_is_unreadable() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let key = ids.table_uid(&table()).unwrap().clone();
+    let broken = |edit: &dyn Fn(&mut Rebuild)| {
+        let mut file = approval.clone();
+        edit(file.rebuilds.get_mut(&key).unwrap());
+        file.validate().is_err()
+    };
+    assert!(!broken(&|_| {}));
+    // The replacement parent must be one of the replacement tables.
+    assert!(broken(&|r| r.replacement_root = key.clone()));
+    // It must continue the record's own source parent.
+    assert!(broken(&|r| {
+        let column = r.source.columns.keys().next().unwrap().clone();
+        r.continues.insert(r.replacement_root.clone(), column);
+    }));
+    // A column continues a column, and no source column is continued twice.
+    assert!(broken(&|r| {
+        let (to, from) = r
+            .continues
+            .iter()
+            .find(|(to, _)| *to != &r.replacement_root)
+            .unwrap();
+        let (to, from) = (to.clone(), from.clone());
+        let other = r
+            .replacement
+            .columns
+            .keys()
+            .find(|u| **u != to)
+            .unwrap()
+            .clone();
+        r.continues.insert(other, from);
+    }));
+    assert!(broken(&|r| {
+        let table = r
+            .replacement
+            .tables
+            .keys()
+            .find(|u| **u != r.replacement_root)
+            .unwrap()
+            .clone();
+        let column = r.source.columns.keys().next().unwrap().clone();
+        r.continues.insert(table, column);
+    }));
+    // And a pairing that names no member of the record at all.
+    assert!(broken(&|r| {
+        r.continues.insert(
+            Uid::generate(UidKind::Column),
+            Uid::generate(UidKind::Column),
+        );
+    }));
+}
+
+#[test]
+fn a_column_renamed_after_the_approval_is_still_the_environments_own_column() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    // Only the column: the parent keeps its name, so the plan can qualify.
+    let mut renamed = desired.clone();
+    let parent = renamed.tables.get_mut(&table()).unwrap();
+    let column = parent.columns.shift_remove("bucket").unwrap();
+    parent.columns.insert("slot".into(), column);
+    parent.partition_by.as_mut().unwrap().columns = vec!["slot".into()];
+    let renamed_ids = crate::resolve(
+        &renamed,
+        &approval,
+        &[pbps_model::Intent::RenameColumn {
+            table: table(),
+            from: "bucket".into(),
+            to: "slot".into(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let refreshed = record(
+        side(&base, &ids),
+        &renamed,
+        &renamed_ids,
+        &table(),
+        20,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    let root = qualify(side(&base, &ids), side(&renamed, &refreshed), &table()).unwrap();
+    let slot = &root.composed_columns()[&table().column("slot")];
+    assert!(slot.from_environment, "{slot:?}");
+    assert_eq!(slot.stages[0].column, table().column("bucket"));
+    // A column the approval never paired is the one that is born.
+    let mut grown = renamed.clone();
+    grown
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .insert("extra".into(), Column::new("integer".parse().unwrap()));
+    let grown_ids = crate::resolve(&grown, &refreshed, &[], &ctx()).unwrap().ids;
+    let regrown = record(
+        side(&base, &ids),
+        &grown,
+        &grown_ids,
+        &table(),
+        20,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    let born = &qualify(side(&base, &ids), side(&grown, &regrown), &table())
+        .unwrap()
+        .composed_columns()[&table().column("extra")];
+    assert!(!born.from_environment);
+}
+
+#[test]
+fn a_column_dropped_after_the_approval_leaves_the_pairing_when_the_approval_is_refreshed() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let key = ids.table_uid(&table()).unwrap();
+    let mut dropped = desired.clone();
+    dropped
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .shift_remove("k");
+    let dropped_ids = crate::resolve(
+        &dropped,
+        &approval,
+        &[pbps_model::Intent::DropColumn {
+            column: table().column("k"),
+            reason: reason(),
+        }],
+        &ctx(),
+    )
+    .unwrap()
+    .ids;
+    let refreshed = record(
+        side(&base, &ids),
+        &dropped,
+        &dropped_ids,
+        &table(),
+        20,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    refreshed.validate().unwrap();
+    let (old, new) = (&approval.rebuilds[key], &refreshed.rebuilds[key]);
+    assert_eq!(
+        new.replacement.columns.len() + 1,
+        old.replacement.columns.len()
+    );
+    assert_eq!(new.continues.len() + 1, old.continues.len());
+    assert!(new.continues_are_whole());
+    assert_eq!(new.source, old.source);
 }

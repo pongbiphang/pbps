@@ -782,6 +782,8 @@ mod tests {
                     tables: [(replacement.clone(), table.clone())].into(),
                     columns: Default::default(),
                 },
+                replacement_root: replacement.clone(),
+                continues: [(replacement.clone(), source.clone())].into(),
                 target_checksum: "1".repeat(64),
                 max_rows: 5,
                 allowed_at: "2026-10-24".into(),
@@ -1306,6 +1308,12 @@ mod tests {
                         tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
                         columns: [("c_aaaaaa".parse().unwrap(), table.column("code"))].into(),
                     },
+                    replacement_root: "t_aaaaaa".parse().unwrap(),
+                    continues: [
+                        ("t_aaaaaa".parse().unwrap(), "t_dddddd".parse().unwrap()),
+                        ("c_aaaaaa".parse().unwrap(), "c_dddddd".parse().unwrap()),
+                    ]
+                    .into(),
                     target_checksum: "1".repeat(64),
                     max_rows: 17,
                     allowed_at: "2026-10-24".into(),
@@ -1430,6 +1438,12 @@ mod tests {
                         tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
                         columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
                     },
+                    replacement_root: "t_aaaaaa".parse().unwrap(),
+                    continues: [
+                        ("t_aaaaaa".parse().unwrap(), table_collision.clone()),
+                        ("c_aaaaaa".parse().unwrap(), column_collision.clone()),
+                    ]
+                    .into(),
                     target_checksum: "1".repeat(64),
                     max_rows: 7,
                     allowed_at: "2026-10-24".into(),

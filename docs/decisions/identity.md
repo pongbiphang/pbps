@@ -1166,6 +1166,15 @@ replacement membership are gone and later identity intents on the table are
 ordinary ones. The file is whole only while every source UID is a tombstone and
 every replacement UID is live or retired; anything else (half a withdrawal, a
 lost replacement) is refused by name and never read as "nothing to rebuild".
+The two ends are related by identity and never by equal names: the record keeps
+the replacement parent and, for each replacement column that carries a source
+column on, the source UID it continues (`replacement_root`, `continues`, paired
+by name at the approval, the one moment that is evidence of it). A rename of
+either end afterwards leaves the pairing alone, a re-approval keeps it, and a
+member the approval never paired is an addition. A current approval cannot yet
+rebuild into another name, so a plan from an environment holding the source is
+refused by name when the replacement parent was renamed since; a stale one is
+refused with the re-approval command first.
 
 A plan reads each record against what the environment's baseline holds of it:
 the replacement parent means nothing to rebuild; the source parent means the
@@ -1181,8 +1190,8 @@ earlier links' declarations no longer exist to be applied, and walking an
 environment through them would copy every row several times. Only the latest
 link's checksum must match the declarations. Every link's `max_rows` applies,
 so the strictest is the cap of the one copy. Columns compose along the lineage
-UIDs (inside a link a column keeps its name, between links its UID, so a
-rename in between is followed), and their conversions compose as nested casts
+UIDs (inside a link along the pairing the approval recorded, between links by
+UID, so a rename in between is followed), and their conversions compose as nested casts
 through the types each approval kept in the record's `types`; ordinary edits
 between two approvals fold into the next cast. A column born along the chain
 has nothing to read in the environment. The plan presents the composed rebuild

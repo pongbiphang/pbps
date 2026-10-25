@@ -369,11 +369,19 @@ pub fn prepare(
         .columns
         .iter()
         .map(|(name, c)| CopyColumn {
-            source: r.before[&r.table].columns.get(name).map(|was| CopySource {
-                column: r.table.column(name),
-                ty: was.ty.clone(),
-                collation: was.collation.clone(),
-            }),
+            // The column this one continues, by the approval's pairing and not
+            // by name: a column renamed since keeps its rows.
+            source: r
+                .intent
+                .source_column(&r.table.column(name))
+                .and_then(|was| {
+                    let declared = r.before[&r.table].columns.get(&was.name)?;
+                    Some(CopySource {
+                        column: was.clone(),
+                        ty: declared.ty.clone(),
+                        collation: declared.collation.clone(),
+                    })
+                }),
             target: parent.name.column(name),
             cast: c.ty.clone(),
             collation: c.collation.clone(),

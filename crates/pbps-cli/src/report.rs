@@ -3084,6 +3084,8 @@ mod tests {
                     intent: Rebuild {
                         source: identities.clone(),
                         replacement: identities,
+                        replacement_root: "t_aaaaaa".parse().unwrap(),
+                        continues: Default::default(),
                         target_checksum: "not an execution fixture".into(),
                         max_rows: 0,
                         allowed_at: "2026-10-24T00:00:00Z".into(),

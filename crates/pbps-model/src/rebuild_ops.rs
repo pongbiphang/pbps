@@ -58,10 +58,10 @@ impl RebuildPartitionedTable {
     }
 
     /// Each final column's states along the lineage UIDs: inside a link a
-    /// column keeps its name, between links it keeps its UID, so a rename in
-    /// between is followed. The states' types are the nested casts the one copy
-    /// composes. Ordinary edits made between two approvals are not states of
-    /// their own: they fold into the next cast.
+    /// column is followed through what the approval paired, and between links
+    /// by its UID, so a rename at either place is followed. The states' types
+    /// are the nested casts the one copy composes. Ordinary edits made between
+    /// two approvals are not states of their own: they fold into the next cast.
     pub fn composed_columns(&self) -> BTreeMap<ColumnRef, ColumnLineage> {
         let links: Vec<&Rebuild> = self.links().collect();
         let last = links.len() - 1;
@@ -72,15 +72,13 @@ impl RebuildPartitionedTable {
                 column: column.clone(),
                 shape: links[last].types.get(uid).cloned(),
             }];
-            let (mut current, mut from_environment) = (column.clone(), false);
+            let (mut current, mut from_environment) = (uid.clone(), false);
             for link in (0..=last).rev() {
-                // Inside a link the column of the same name is the source.
-                let Some((source, named)) = links[link]
-                    .source
-                    .columns
-                    .iter()
-                    .find(|(_, c)| **c == current)
-                else {
+                // The approval paired this column with the one it continues.
+                let Some(source) = links[link].continues.get(&current) else {
+                    break;
+                };
+                let Some(named) = links[link].source.columns.get(source) else {
                     break;
                 };
                 if link == 0 {
@@ -101,7 +99,7 @@ impl RebuildPartitionedTable {
                     column: before.clone(),
                     shape: links[link - 1].types.get(source).cloned(),
                 });
-                current = before.clone();
+                current = source.clone();
             }
             stages.reverse();
             out.insert(

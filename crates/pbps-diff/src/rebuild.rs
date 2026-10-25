@@ -258,6 +258,30 @@ fn shapes(schema: &Schema, replacement: &RebuildIdentities) -> BTreeMap<Uid, Col
         .collect()
 }
 
+/// The parent and the columns a rewrite carries over, paired by name at the
+/// approval: the one moment the two snapshots are evidence of what continues
+/// what. The pairing is kept as UIDs, so a rename after it breaks nothing
+/// (DEC-2298.12).
+fn continuing(
+    source: &RebuildIdentities,
+    replacement: &RebuildIdentities,
+    table: &TableName,
+) -> Option<(Uid, BTreeMap<Uid, Uid>)> {
+    let by_name = |ids: &RebuildIdentities| -> Option<Uid> {
+        ids.tables
+            .iter()
+            .find_map(|(uid, name)| (name == table).then(|| uid.clone()))
+    };
+    let (from, to) = (by_name(source)?, by_name(replacement)?);
+    let mut pairs = BTreeMap::from([(to.clone(), from)]);
+    for (uid, column) in &replacement.columns {
+        if let Some((was, _)) = source.columns.iter().find(|(_, c)| *c == column) {
+            pairs.insert(uid.clone(), was.clone());
+        }
+    }
+    Some((to, pairs))
+}
+
 fn reapprove(
     ids: &IdsFile,
     schema: &Schema,
@@ -311,6 +335,11 @@ fn reapprove(
     }
     approval.target_checksum = checksum.to_owned();
     approval.types = shapes(schema, &replacement);
+    // What a member continues does not change with its name; only a member
+    // the file no longer holds leaves the pairing.
+    approval.continues.retain(|to, _| {
+        replacement.tables.contains_key(to) || replacement.columns.contains_key(to)
+    });
     approval.replacement = replacement;
     approval.max_rows = max_rows;
     approval.reason = reason.clone();
@@ -417,6 +446,13 @@ pub fn record(
                 .insert(fresh(UidKind::Column), name.column(column));
         }
     }
+    let (replacement_root, continues) =
+        continuing(&source, &replacement, table).ok_or_else(|| {
+            refused(
+                table,
+                "the source and the replacement must both hold the parent",
+            )
+        })?;
     let mut out = ids.clone();
     for (uid, was) in source
         .tables
@@ -444,6 +480,8 @@ pub fn record(
             source,
             types: shapes(desired, &replacement),
             replacement,
+            replacement_root,
+            continues,
             target_checksum: checksum,
             max_rows,
             allowed_at: ctx.today.clone(),
@@ -490,11 +528,8 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
 pub fn logical_view(desired: &IdsFile, root: &RebuildPartitionedTable) -> IdsFile {
     let key = root
         .intent
-        .source
-        .tables
-        .iter()
-        .find_map(|(uid, name)| (name == &root.table).then_some(uid))
-        .expect("a qualified root names its source parent");
+        .source_root()
+        .expect("a qualified root pairs its replacement parent with a source parent");
     restored(desired, key, &root.intent)
 }
 
@@ -630,9 +665,8 @@ pub fn qualify(
         schema: &after.0,
         ids: desired.ids,
     };
-    shape(base.schema, desired.schema, table)?;
-    if intent.target_checksum != after.fingerprint() {
-        return Err(refused(
+    let stale = || {
+        refused(
             table,
             format!(
                 "the declarations changed after the approval; re-approve it with \
@@ -640,7 +674,32 @@ pub fn qualify(
                 table.shown(),
                 intent.max_rows
             ),
-        ));
+        )
+    };
+    // The two parents are paired by identity, so a rename since the approval
+    // is seen and not mistaken for a missing table. A stale approval is
+    // refreshed first; one that is current still cannot rebuild into another
+    // name, which one table name in the payload does not carry yet.
+    if let Some(was) = first.source.tables.get(used[0].0)
+        && was != table
+    {
+        return Err(if intent.target_checksum == after.fingerprint() {
+            refused(
+                table,
+                format!(
+                    "the replacement parent was renamed after the approval (the source is {}); \
+                     a rebuild across a rename is not available yet, so apply the rename on its \
+                     own after the rebuild or withdraw the approval",
+                    was.shown()
+                ),
+            )
+        } else {
+            stale()
+        });
+    }
+    shape(base.schema, desired.schema, table)?;
+    if intent.target_checksum != after.fingerprint() {
+        return Err(stale());
     }
     if base.ids.roles != desired.ids.roles
         || base.ids.types != desired.ids.types
@@ -729,9 +788,7 @@ pub fn holding(base: &IdsFile, key: &Uid, record: &Rebuild) -> Holding {
                 .count()
     };
     let size = |ids: &RebuildIdentities| ids.tables.len() + ids.columns.len();
-    let Some(root) = record.replacement_root(key) else {
-        return Holding::Partial;
-    };
+    let root = &record.replacement_root;
     match (
         base.tables.contains_key(key),
         base.tables.contains_key(root),
@@ -784,11 +841,7 @@ pub(crate) fn lineage_errors(
     for (key, record) in &declared.ids.rebuilds {
         // Only the latest link of a chain is a parent the files hold live; the
         // earlier links are read through it.
-        let Some(table) = record
-            .replacement_root(key)
-            .and_then(|root| declared.ids.tables.get(root))
-            .cloned()
-        else {
+        let Some(table) = declared.ids.tables.get(&record.replacement_root).cloned() else {
             continue;
         };
         // Only PostgreSQL can hold a record the CLI wrote; one in another
@@ -827,10 +880,8 @@ pub(crate) fn lineage_errors(
     // The files no longer record a rewrite this environment already applied
     // (withdrawn after the fact, or an older revision): the replacement it
     // holds would read as a table to drop and a source to create.
-    for (key, record) in &base.ids.rebuilds {
-        let Some(root) = record.replacement_root(key) else {
-            continue;
-        };
+    for record in base.ids.rebuilds.values() {
+        let root = &record.replacement_root;
         if base.ids.tables.contains_key(root)
             && !declared.ids.tables.contains_key(root)
             && !declared.ids.tombstones.contains_key(root)

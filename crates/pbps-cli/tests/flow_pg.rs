@@ -530,6 +530,80 @@ fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the
 }
 
 #[test]
+fn renaming_the_replacement_after_the_approval_can_be_reapproved_and_withdrawn() {
+    let d = Demo::new("rebuild2298-rename");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let path = d.dir.join("schema.ids.json");
+    let original: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let source = source.trim();
+    let desired = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&desired);
+    let approve = |table: &str| {
+        d.run(&[
+            "rebuild-table",
+            table,
+            "--max-rows",
+            "20",
+            "--reason",
+            "maintenance",
+        ])
+    };
+    succeeds(approve("app.p"));
+    d.commit();
+    // The ordinary rename of the live replacement, after the approval.
+    d.table(&desired.replace("table: app.p\n", "table: app.q\n"));
+    succeeds(d.run(&["rename-table", "app.p", "app.q"]));
+    let stale = d.run(&["plan", "--no-dev", "--since", source]);
+    assert!(
+        stderr(&stale).contains("re-approve it with `pbps rebuild-table app.q --max-rows 20"),
+        "{}",
+        stderr(&stale)
+    );
+    // The command the plan printed works, and keeps the source it was cut from.
+    let before: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let refreshed = approve("app.q");
+    assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
+    let after: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    after.validate().unwrap();
+    let (key, old) = before.rebuilds.iter().next().unwrap();
+    assert_eq!(after.rebuilds[key].source, old.source);
+    assert_eq!(after.rebuilds[key].continues, old.continues);
+    // The environment at the source is told of the rename, not asked to re-approve.
+    let plan = d.run(&["plan", "--no-dev", "--since", source]);
+    assert!(
+        stderr(&plan).contains("renamed after the approval")
+            && !stderr(&plan).contains("re-approve"),
+        "{}",
+        stderr(&plan)
+    );
+    // Withdrawn under the name the file has now, the sources are back.
+    assert_eq!(code(&d.run(&["rebuild-table", "app.q", "--withdraw"])), 0);
+    let withdrawn: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(withdrawn.rebuilds.is_empty() && withdrawn.tombstones.is_empty());
+    assert_eq!(
+        (&withdrawn.tables, &withdrawn.columns),
+        (&original.tables, &original.columns)
+    );
+}
+
+#[test]
 fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() {
     let d = Demo::new("rebuild2298-chain");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
