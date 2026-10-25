@@ -417,3 +417,197 @@ fn only_a_select_all_is_a_wildcard_and_a_count_or_a_product_is_not() {
         assert!(!selects_all(plain), "{plain}");
     }
 }
+
+fn persisted(expression: &str) -> ComputedColumn {
+    ComputedColumn {
+        expression: expression.into(),
+        persisted: true,
+        not_null: true,
+    }
+}
+
+fn primary_key(column: &str) -> pbps_model::PrimaryKey {
+    pbps_model::PrimaryKey {
+        name: Some(format!("pk_{column}").into()),
+        columns: vec![column.into()],
+        storage_parameters: Default::default(),
+    }
+}
+
+fn foreign_key(from: &str, to: &str, key: &str) -> pbps_model::ForeignKey {
+    pbps_model::ForeignKey {
+        columns: vec![from.into()],
+        references_table: name(to),
+        references_columns: vec![key.into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    }
+}
+
+#[test]
+fn a_primary_key_over_a_computed_column_follows_the_column_with_its_name_and_layout() {
+    // The first CREATE cannot name a column that does not exist yet (1911,
+    // measured on 17.0); the key is added after the column, spelled by the
+    // same clause the CREATE would have used.
+    for (clustered, layout) in [
+        (None, "CLUSTERED"),
+        (Some(pbps_model::Clustered::Heap), "NONCLUSTERED"),
+    ] {
+        let statements = sql(&build(vec![
+            table_with("t", |t| {
+                t.computed.insert("c".into(), persisted("app.f(v)"));
+                t.primary_key = Some(primary_key("c"));
+                t.clustered = clustered.clone();
+            }),
+            function("f", FUNCTION),
+        ])
+        .unwrap());
+        let create = at(&statements, "CREATE TABLE [app].[t]");
+        assert!(
+            !statements[create].contains("PRIMARY KEY"),
+            "{}",
+            statements[create]
+        );
+        let routine = at(&statements, "FUNCTION [app].[f]");
+        let column = at(&statements, "ADD [c] AS (app.f(v)");
+        let key = at(
+            &statements,
+            &format!("CONSTRAINT [pk_c] PRIMARY KEY {layout} ([c])"),
+        );
+        assert!(
+            routine < column && column < key,
+            "{layout}: {statements:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_primary_key_over_a_plain_column_stays_in_the_create() {
+    let statements = sql(&build(vec![
+        table_with("t", |t| {
+            t.computed.insert("c".into(), persisted("app.f(v)"));
+            t.primary_key = Some(primary_key("id"));
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let create = at(&statements, "PRIMARY KEY");
+    assert_eq!(create, at(&statements, "CREATE TABLE [app].[t]"));
+    assert!(
+        statements[create].contains("CONSTRAINT [pk_id] PRIMARY KEY CLUSTERED ([id])"),
+        "{}",
+        statements[create]
+    );
+}
+
+#[test]
+fn a_foreign_key_from_or_to_a_computed_column_waits_for_every_module_and_the_key_it_references() {
+    // Measured on 17.0: a key before its own computed column fails 1769 and a
+    // key before the key it references fails 1776, whichever table the
+    // declarations list first, and whether the differ split the key out of
+    // its table or the table still holds it. `from` is the key's own column:
+    // computed (the key's own end) or plain (only the referenced end is).
+    for from in ["ref", "id"] {
+        for child_first in [false, true] {
+            for inline in [false, true] {
+                let parent = table_with("parent", |t| {
+                    t.computed.insert("k".into(), persisted("app.f(v)"));
+                    t.primary_key = Some(primary_key("k"));
+                });
+                let fk = foreign_key(from, "parent", "k");
+                let child = table_with("child", |t| {
+                    t.computed.insert("ref".into(), persisted("app.f(v)"));
+                    if inline {
+                        t.foreign_keys.insert("fk_child".into(), fk.clone());
+                    }
+                });
+                let mut changes = vec![parent, child];
+                if child_first {
+                    changes.reverse();
+                }
+                if !inline {
+                    changes.push(Change::AddForeignKey {
+                        table: name("child"),
+                        name: "fk_child".into(),
+                        constraint: Box::new(fk),
+                    });
+                }
+                changes.push(function("f", FUNCTION));
+                let statements = sql(&build(changes).unwrap());
+                let routine = at(&statements, "FUNCTION [app].[f]");
+                let key = at(&statements, "CONSTRAINT [pk_k] PRIMARY KEY");
+                let reference = at(&statements, &format!("FOREIGN KEY ([{from}])"));
+                let columns: Vec<_> = statements
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.contains("ADD [k] AS") || s.contains("ADD [ref] AS"))
+                    .map(|(at, _)| at)
+                    .collect();
+                assert_eq!(columns.len(), 2, "{statements:#?}");
+                assert!(
+                    routine < columns[0].min(columns[1])
+                        && columns[0].max(columns[1]) < reference
+                        && key < reference,
+                    "from={from} child_first={child_first} inline={inline}: {statements:#?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_foreign_key_from_a_computed_column_to_a_plain_key_waits_for_the_column() {
+    // Only the key's own end is computed: its column is added after the
+    // function, so the key cannot come before it.
+    for inline in [false, true] {
+        for plain_first in [false, true] {
+            let plain = table_with("plain", |t| {
+                t.primary_key = Some(primary_key("id"));
+            });
+            let fk = foreign_key("ref", "plain", "id");
+            let child = table_with("child", |t| {
+                t.computed.insert("ref".into(), persisted("app.f(v)"));
+                if inline {
+                    t.foreign_keys.insert("fk_child".into(), fk.clone());
+                }
+            });
+            let mut changes = vec![plain, child];
+            if !plain_first {
+                changes.reverse();
+            }
+            if !inline {
+                changes.push(Change::AddForeignKey {
+                    table: name("child"),
+                    name: "fk_child".into(),
+                    constraint: Box::new(fk),
+                });
+            }
+            changes.push(function("f", FUNCTION));
+            let statements = sql(&build(changes).unwrap());
+            let column = at(&statements, "ADD [ref] AS");
+            let key = at(&statements, "FOREIGN KEY ([ref])");
+            assert!(
+                at(&statements, "FUNCTION [app].[f]") < column && column < key,
+                "inline={inline} plain_first={plain_first}: {statements:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_foreign_key_between_plain_columns_stays_with_the_tables() {
+    let statements = sql(&build(vec![
+        table("parent", &[("k", "app.f(v)")]),
+        table_with("child", |t| {
+            t.foreign_keys
+                .insert("fk_plain".into(), foreign_key("id", "parent", "id"));
+        }),
+        function("f", FUNCTION),
+    ])
+    .unwrap());
+    let plain = at(&statements, "FOREIGN KEY ([id])");
+    assert!(
+        plain < at(&statements, "FUNCTION [app].[f]"),
+        "{statements:#?}"
+    );
+}

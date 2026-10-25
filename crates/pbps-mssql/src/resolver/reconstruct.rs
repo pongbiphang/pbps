@@ -109,6 +109,37 @@ struct Late {
 
 type Draft = Part<Metadata>;
 
+/// Each table's computed columns, by table: a column that exists only once
+/// its `ADD` has run, so a key or constraint that names one cannot be in the
+/// `CREATE` that precedes it, nor before a key it references is built.
+type Computed = BTreeMap<TableName, BTreeSet<String>>;
+
+/// Whether `columns` of `table` name a computed column.
+fn names_computed(
+    computed: &Computed,
+    table: &TableName,
+    columns: &[pbps_model::ColumnName],
+) -> bool {
+    computed
+        .get(table)
+        .is_some_and(|held| columns.iter().any(|c| held.contains(c.raw())))
+}
+
+/// A foreign key waits for every module when either end is a computed
+/// column: its own columns exist after their `ADD`, and the key it references
+/// is a key over a computed column, built after that column. Measured on
+/// 17.0: the key before either exists fails 1769 and 1776. Every other key
+/// stays with the tables, which is where a module that reads it expects it.
+fn foreign_key_phase(computed: &Computed, table: &TableName, fk: &pbps_model::ForeignKey) -> Phase {
+    if names_computed(computed, table, &fk.columns)
+        || names_computed(computed, &fk.references_table, &fk.references_columns)
+    {
+        Phase::Expressions
+    } else {
+        Phase::Keys
+    }
+}
+
 fn part(
     phase: Phase,
     declaration: &str,
@@ -160,6 +191,18 @@ impl Reconstruction {
     ) -> Result<Self, ReconstructError> {
         let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
+        let computed: Computed = prepared
+            .changes()
+            .changes
+            .iter()
+            .filter_map(|planned| match &planned.change {
+                Change::CreateTable { name, table, .. } if !table.computed.is_empty() => Some((
+                    name.clone(),
+                    table.computed.keys().map(|c| c.raw().to_owned()).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
         let mut steps: Vec<Draft> = Vec::new();
         let mut late: Vec<(Late, std::ops::Range<usize>)> = Vec::new();
         let mut functions: Vec<(usize, String)> = Vec::new();
@@ -168,7 +211,7 @@ impl Reconstruction {
             let first = steps.len();
             match change {
                 Change::CreateTable { name, table, .. } => {
-                    table_steps(name, table, change, &mut steps, &mut late)?;
+                    table_steps(name, table, change, &computed, &mut steps, &mut late)?;
                 }
                 Change::CreateModule { id, module } => {
                     if module.kind == ModuleKind::Function {
@@ -198,8 +241,10 @@ impl Reconstruction {
                 // The differ splits a new table's foreign keys out of its
                 // CREATE. A key names only tables and their keys, so it
                 // follows every table.
-                Change::AddForeignKey { table, .. } => steps.push(part(
-                    Phase::Keys,
+                Change::AddForeignKey {
+                    table, constraint, ..
+                } => steps.push(part(
+                    foreign_key_phase(&computed, table, constraint),
                     &format!("a foreign key of {}", table.shown()),
                     change.clone(),
                     Vec::new(),
@@ -339,6 +384,7 @@ fn table_steps(
     name: &TableName,
     table: &pbps_model::Table,
     original: &Change,
+    all_computed: &Computed,
     steps: &mut Vec<Draft>,
     late: &mut Vec<(Late, std::ops::Range<usize>)>,
 ) -> Result<(), ReconstructError> {
@@ -364,6 +410,13 @@ fn table_steps(
             bare.unique.insert(n, u);
         }
     }
+    // The key that cannot be in the first `CREATE`: it names a column that
+    // does not exist yet. Added after the column under the name and layout it
+    // is declared with (the same clause the `CREATE` would have written).
+    let primary_key = bare
+        .primary_key
+        .take_if(|pk| over_computed(pk.columns.iter().map(|c| c.raw()).collect()));
+    let nonclustered = !table.primary_key_is_clustered();
     let mut indexes = Vec::new();
     for (n, i) in std::mem::take(&mut bare.indexes) {
         let keyed = i.column_keys();
@@ -406,7 +459,7 @@ fn table_steps(
     )?);
     for (key, constraint) in keys {
         steps.push(part(
-            Phase::Keys,
+            foreign_key_phase(all_computed, name, &constraint),
             &declaration,
             Change::AddForeignKey {
                 table: name.clone(),
@@ -429,6 +482,20 @@ fn table_steps(
                 table: name.clone(),
                 name: column.clone(),
                 computed: expression.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
+        )?);
+    }
+    if let Some(pk) = primary_key {
+        steps.push(part(
+            Phase::Keys,
+            &format!("primary key of {}", name.shown()),
+            Change::SetPrimaryKey {
+                table: name.clone(),
+                from: None,
+                to: Some(pk),
+                nonclustered,
             },
             Vec::new(),
             Vec::new(),

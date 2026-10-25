@@ -334,3 +334,116 @@ async fn a_scalar_function_with_an_exists_select_all_compiles_before_the_column_
     })
     .await;
 }
+
+fn persisted(expression: &str) -> ComputedColumn {
+    ComputedColumn {
+        expression: expression.into(),
+        persisted: true,
+        not_null: true,
+    }
+}
+
+/// A key over a computed column, and a foreign key from one, compile in
+/// either table order: the first CREATE cannot name a column that does not
+/// exist yet (1911), and a foreign key before its own column or the key it
+/// references fails 1769 and 1776. The key keeps its name and layout.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_primary_key_and_foreign_key_over_computed_columns_compile_in_either_table_order() {
+    for (tag, child_first, clustered) in [
+        ("keys_a", false, None),
+        ("keys_b", true, None),
+        ("keys_c", false, Some(pbps_model::Clustered::Heap)),
+    ] {
+        case(tag, move |mut conn| async move {
+            let parent = table("parent", |t| {
+                t.computed.insert("k".into(), persisted("app.f(v)"));
+                t.primary_key = Some(pbps_model::PrimaryKey {
+                    name: Some("pk_k".into()),
+                    columns: vec!["k".into()],
+                    storage_parameters: Default::default(),
+                });
+                t.clustered = clustered.clone();
+            });
+            // The key's own end alone: a computed column referencing a plain key.
+            let plain = table("plain", |t| {
+                t.columns.get_mut("id").unwrap().nullable = false;
+                t.primary_key = Some(pbps_model::PrimaryKey {
+                    name: Some("pk_id".into()),
+                    columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
+                });
+            });
+            let child = table("child", |t| {
+                t.computed.insert("ref".into(), persisted("app.f(v)"));
+                t.foreign_keys.insert(
+                    "fk_inline".into(),
+                    pbps_model::ForeignKey {
+                        columns: vec!["ref".into()],
+                        references_table: name("plain"),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            });
+            let mut changes = vec![parent, child, plain];
+            if child_first {
+                changes.reverse();
+            }
+            changes.push(Change::AddForeignKey {
+                table: name("child"),
+                name: "fk_child".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["ref".into()],
+                    references_table: name("parent"),
+                    references_columns: vec!["k".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                }),
+            });
+            // The other end alone: a plain column referencing the computed key.
+            changes.push(Change::AddForeignKey {
+                table: name("child"),
+                name: "fk_to_key".into(),
+                constraint: Box::new(pbps_model::ForeignKey {
+                    columns: vec!["id".into()],
+                    references_table: name("parent"),
+                    references_columns: vec!["k".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                }),
+            });
+            changes.push(module(ModuleKind::Function, "f", FUNCTION));
+            compile(&mut conn, changes).await.unwrap();
+            let layout = if clustered.is_some() {
+                "NONCLUSTERED"
+            } else {
+                "CLUSTERED"
+            };
+            assert_eq!(
+                count(
+                    &mut conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM sys.key_constraints k JOIN sys.indexes i \
+                         ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id \
+                         WHERE k.name = N'pk_k' AND k.type = 'PK' AND i.type_desc = N'{layout}'"
+                    )
+                )
+                .await,
+                1,
+                "{tag}: the key keeps its name and layout"
+            );
+            assert_eq!(
+                count(
+                    &mut conn,
+                    "SELECT COUNT(*) FROM sys.foreign_keys WHERE name IN (N'fk_child', N'fk_to_key', N'fk_inline')"
+                )
+                .await,
+                3,
+                "{tag}"
+            );
+        })
+        .await;
+    }
+}
