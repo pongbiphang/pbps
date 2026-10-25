@@ -353,9 +353,11 @@ pub struct ModuleDto {
     #[schemars(with = "Option<bool>")]
     pub schemabinding: Option<Spanned<bool>>,
 
-    /// An indexed view's indexes, as a table declares them: `columns:` (each
-    /// optionally `desc`), `include:` and `unique:`. A view takes no `where:`,
-    /// `keys:`, `method:` or `storage_parameters:`; the dialect refuses them.
+    /// An indexed view's indexes, as a table declares them: plain column keys
+    /// under `columns:` or `keys:` (each optionally `desc`, or `order:` under
+    /// `keys:`), `include:` and `unique:`. A view's index takes no expression
+    /// key, `opclass:`, `where:`, `method:` or `storage_parameters:`; the
+    /// dialect refuses them.
     /// Meaningless without `schemabinding: true`, and rejected on every kind
     /// but a view (DEC-2329.3).
     #[serde(default)]

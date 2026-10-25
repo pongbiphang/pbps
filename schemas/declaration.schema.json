@@ -1507,7 +1507,7 @@
           "default": null
         },
         "indexes": {
-          "description": "An indexed view's indexes, as a table declares them: `columns:` (each\noptionally `desc`), `include:` and `unique:`. A view takes no `where:`,\n`keys:`, `method:` or `storage_parameters:`; the dialect refuses them.\nMeaningless without `schemabinding: true`, and rejected on every kind\nbut a view (DEC-2329.3).",
+          "description": "An indexed view's indexes, as a table declares them: plain column keys\nunder `columns:` or `keys:` (each optionally `desc`, or `order:` under\n`keys:`), `include:` and `unique:`. A view's index takes no expression\nkey, `opclass:`, `where:`, `method:` or `storage_parameters:`; the\ndialect refuses them.\nMeaningless without `schemabinding: true`, and rejected on every kind\nbut a view (DEC-2329.3).",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/IndexDto"
