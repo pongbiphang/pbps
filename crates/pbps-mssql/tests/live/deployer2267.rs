@@ -821,16 +821,23 @@ async fn dbo_deployer_cannot_leave_scratch() {
             assert_eq!(error_code(&mut f.scratch,&format!("ALTER SERVER ROLE [{name}_role] ADD MEMBER [{name}_owner];")).await,"15151");
             assert_eq!(error_code(&mut f.scratch,&format!("EXECUTE AS LOGIN=N'{name}_owner';")).await,"15406");
         }
-        // Match the original probe's batch boundary too. That reports file
-        // access denial 4860; a batch sent after entry reports permission
-        // denial 4834 instead. Neither may return the file's bytes.
-        let rows=f.scratch_admin.query(
+        // Match the original probe's batch boundary too. On Linux that
+        // reports file access denial 4860 to the CATCH; a batch sent after
+        // entry reports permission denial 4834 instead. LocalDB refuses this
+        // batch with 4834 too, past the CATCH (measured on the Windows job).
+        // Neither may return the file's bytes.
+        let code=match f.scratch_admin.query(
             "EXECUTE AS USER=N'sandbox2267' WITH NO REVERT; EXECUTE AS USER=N'dbo' WITH NO REVERT; \
              DECLARE @content varchar(max); BEGIN TRY SELECT @content=BulkColumn FROM OPENROWSET(BULK '/etc/hostname',SINGLE_CLOB) b; SELECT 0 AS code; \
              END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS code; END CATCH;"
-        ).await.unwrap();
-        assert_eq!(rows.len(),1);
-        assert_eq!(rows[0].try_get::<i32>("code").unwrap(),Some(4860));
+        ).await {
+            Ok(rows) => {
+                assert_eq!(rows.len(),1);
+                rows[0].try_get::<i32>("code").unwrap()
+            }
+            Err(error) => error.server_error_code().and_then(|code| code.parse().ok()),
+        };
+        assert!(matches!(code,Some(4860|4834)),"{code:?}");
     })
     .await;
     }
