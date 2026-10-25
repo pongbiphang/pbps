@@ -412,7 +412,11 @@ impl Read<'_> {
                 put(state, parent, &key, outputs, false);
             }
             for child in family.children() {
-                let slot = family.slot(uid, child, end).expect("named at an end");
+                // No slot: another column of the parent holds this one's old
+                // name here, and the slot's facts are that column's.
+                let Some(slot) = family.slot(uid, child, end) else {
+                    continue;
+                };
                 match family.standing(child, end) {
                     Standing::Standalone
                         if family.standing(child, end.other()) == Standing::Member =>
@@ -489,6 +493,14 @@ impl Read<'_> {
     /// The stored default when it is the declared one, with what it binds.
     fn observed(&self, source: &ColumnRef, expression: &str) -> Option<Fact<Value>> {
         let held = self.catalog.columns.get(source)?;
+        // What the stored default binds says nothing about another expression
+        // observed in its place, so the match comes before the bindings.
+        let matches = |actual: &str| {
+            self.pg.normalize_definition(expression) == self.pg.normalize_definition(actual)
+        };
+        if held.default.as_deref().is_some_and(|a| !matches(a)) {
+            return None;
+        }
         if held.unrepresented {
             return Some(Fact::Unsupported {
                 sqlstate: None,
@@ -496,10 +508,7 @@ impl Read<'_> {
                     .into(),
             });
         }
-        let actual = held.default.as_deref()?;
-        if self.pg.normalize_definition(expression) != self.pg.normalize_definition(actual) {
-            return None;
-        }
+        held.default.as_ref()?;
         let mut bindings = held
             .routines
             .iter()

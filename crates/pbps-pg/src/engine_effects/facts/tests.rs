@@ -334,3 +334,115 @@ fn a_generated_expression_that_may_bind_is_unread_until_the_catalog_says_what_it
     };
     assert_eq!(known.bindings.len(), 1);
 }
+
+/// A scene where the baseline parent's `d` becomes `e` and a different column
+/// is added under the name `d`: at the baseline the member's slot `d` belongs
+/// to the renamed column, not to the added one.
+fn rename_and_reuse_the_name(motion: Motion) -> Scene {
+    let mut s = build(Kind::Rename, motion, false);
+    let mut added = Column::new("integer".parse().unwrap());
+    added.nullable = true;
+    s.after
+        .tables
+        .get_mut(&name("app.p"))
+        .unwrap()
+        .columns
+        .insert("d".into(), added);
+    s.ids
+        .columns
+        .insert(uid("c_gggggg"), name("app.p").column("d"));
+    s
+}
+
+#[test]
+fn a_column_added_under_a_renamed_columns_old_name_leaves_its_occupied_slot_alone() {
+    let pg = Postgres::new().with_server_version(180000);
+    let slot_cells = |s: &Scene| {
+        let base = Snapshot {
+            schema: &s.before,
+            ids: &s.base_ids,
+        };
+        let child = base.table_identity(&name("app.a")).unwrap();
+        let slot = ColumnKey::Partition {
+            table: child.clone(),
+            column: "d".into(),
+        };
+        let cells: Vec<_> = facts(s, &pg, Stored::Defaults)
+            .base
+            .cells
+            .into_iter()
+            .filter(|((owner, p), _)| {
+                owner == &child && matches!(p, Property::Column(k, _) if k == &slot)
+            })
+            .collect();
+        cells
+    };
+    let alone = slot_cells(&build(Kind::Rename, Motion::Drop, false));
+    let reused = slot_cells(&rename_and_reuse_the_name(Motion::Drop));
+    assert!(!alone.is_empty());
+    assert_eq!(reused, alone);
+    let presence = reused
+        .iter()
+        .find(|((_, p), _)| matches!(p, Property::Column(_, Attribute::Presence)))
+        .unwrap();
+    assert!(presence.1.origin.is_some());
+    // The added column itself is still known to be absent in the parent.
+    let s = rename_and_reuse_the_name(Motion::Drop);
+    let parent = Snapshot {
+        schema: &s.before,
+        ids: &s.base_ids,
+    }
+    .table_identity(&name("app.p"))
+    .unwrap();
+    let key = Snapshot {
+        schema: &s.after,
+        ids: &s.ids,
+    }
+    .column_identity(&name("app.p").column("d"))
+    .unwrap();
+    let cell = &facts(&s, &pg, Stored::Defaults).base.cells
+        [&(parent, Property::Column(key, Attribute::Presence))];
+    assert!(cell.origin.is_none());
+    assert_ne!(cell.value, Fact::Unread);
+}
+
+#[test]
+fn a_goal_expression_is_matched_before_the_baseline_bindings_apply() {
+    let pg = Postgres::new().with_server_version(180000);
+    let s = build(Kind::DropDefault, Motion::Detach, false);
+    let before = Snapshot {
+        schema: &s.before,
+        ids: &s.base_ids,
+    };
+    let (owner, column) = (
+        before.table_identity(&name("app.p")).unwrap(),
+        before.column_identity(&name("app.p").column("d")).unwrap(),
+    );
+    let goal_default = |s: &Scene, expression: &str| {
+        let mut s = Scene {
+            before: s.before.clone(),
+            after: s.after.clone(),
+            base_ids: s.base_ids.clone(),
+            ids: s.ids.clone(),
+        };
+        s.after
+            .tables
+            .get_mut(&name("app.p"))
+            .unwrap()
+            .columns
+            .get_mut("d")
+            .unwrap()
+            .value_source = ValueSource::Default(expression.into());
+        facts(&s, &pg, Stored::Unrepresented).goal.cells[&(
+            owner.clone(),
+            Property::Column(column.clone(), Attribute::Default),
+        )]
+            .value
+            .clone()
+    };
+    // The baseline default is stored as `1`, unrepresented. A goal constant
+    // that replaces it is not that default and keeps its own known value.
+    assert!(matches!(goal_default(&s, "7"), Fact::Known(_)));
+    // The same text is the stored default, so the baseline status applies.
+    assert!(matches!(goal_default(&s, "1"), Fact::Unsupported { .. }));
+}

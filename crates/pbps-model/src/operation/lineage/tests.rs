@@ -75,7 +75,7 @@ const ROWS: &[Row] = &[
     Row { label: "two parent columns claiming one standalone column claim none",
         parent: [&[("c_aaaaaa", "d")], &[("c_aaaaaa", "e"), (B, "d")]],
         children: &[(C, [Alone(D), Member])],
-        asks: &[("c_aaaaaa", C, Base, Some("c_dddddd"), Some("~d")), (B, C, Base, Some("c_dddddd"), Some("~d"))],
+        asks: &[("c_aaaaaa", C, Base, Some("c_dddddd"), Some("~d")), (B, C, Base, Some("c_dddddd"), None)],
         claims: &[(C, Base, "c_dddddd", None)] },
     Row { label: "an unrelated column of a standalone claims no parent column", parent: [P, P],
         children: &[(C, [Alone(&[("c_dddddd", "z")]), Member])],
@@ -83,6 +83,18 @@ const ROWS: &[Row] = &[
     Row { label: "a table the family never held has no physical column in it", parent: [P, P],
         children: &[(C, [Member, Gone]), ("t_ffffff", [Gone, Gone])],
         asks: &[(B, "t_ffffff", Base, None, None)], claims: &[] },
+    Row { label: "a column added under a renamed column's old name has no slot where that name is taken",
+        parent: [P, &[("c_aaaaaa", "k"), (B, "e"), ("c_gggggg", "d")]],
+        children: &[(C, [Member, Gone])],
+        asks: &[(B, C, Base, Some("~d"), Some("~d")), ("c_gggggg", C, Base, None, None),
+                (B, C, Goal, None, Some("~e")), ("c_gggggg", C, Goal, None, Some("~d"))],
+        claims: &[] },
+    Row { label: "a column dropped and re-added under one name holds the slot at its own end only",
+        parent: [P, &[("c_aaaaaa", "k"), ("c_gggggg", "d")]],
+        children: &[(C, [Member, Gone])],
+        asks: &[(B, C, Base, Some("~d"), Some("~d")), ("c_gggggg", C, Base, None, None),
+                (B, C, Goal, None, None), ("c_gggggg", C, Goal, None, Some("~d"))],
+        claims: &[] },
 ];
 
 fn table(uid: &str) -> TableName {

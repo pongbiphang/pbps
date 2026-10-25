@@ -92,14 +92,21 @@ impl Family {
     /// The namespace slot the parent column occupies in a child at `end`: the
     /// name the parent gives it there, else the name it gives it at the other
     /// end. A column the parent lacks at `end` still has a slot, which is
-    /// known to be empty. A table the family never held has no slot.
+    /// known to be empty, unless another parent column holds that name at
+    /// `end`: the slot is then that column's. A table the family never held
+    /// has no slot.
     pub fn slot(&self, column: &Uid, child: &Recorded, end: End) -> Option<Physical> {
         if !self.roles.contains_key(child) {
             return None;
         }
-        let name = self
-            .name(column, end)
-            .or_else(|| self.name(column, end.other()))?;
+        let name = self.name(column, end).or_else(|| {
+            let other = self.name(column, end.other())?;
+            let taken = self
+                .names
+                .iter()
+                .any(|(uid, n)| uid != column && n[end.at()].as_ref() == Some(other));
+            (!taken).then_some(other)
+        })?;
         Some(Physical {
             key: ColumnKey::Partition {
                 table: child.clone(),
