@@ -2148,7 +2148,10 @@ fn an_approval_over_a_recorded_conversion_of_a_source_column_is_refused() {
         &reason(),
         &ctx(),
     );
-    assert!(refused.is_err());
+    let why = refused.unwrap_err().why;
+    for named in ["app.p.bucket", "from `text` to `integer`", "apply it first"] {
+        assert!(why.contains(named), "{named}: {why}");
+    }
     // The same file without the conversion is approved.
     ids.conversions.remove(&bucket);
     assert!(
@@ -2205,18 +2208,23 @@ fn a_chain_link_meets_the_conversion_rules_of_the_link_before_it() {
     // conversion recorded for one is refused as for any source column.
     let mut converted = first.clone();
     converted.conversions.insert(middle.clone(), conversion());
-    assert!(
+    let next = |ids: &IdsFile| {
         record(
-            side(&away, &converted),
+            side(&away, ids),
             &start,
-            &converted,
+            ids,
             &table(),
             30,
             &reason(),
             &ctx(),
         )
-        .is_err()
+    };
+    let why = next(&converted).unwrap_err().why;
+    assert!(
+        why.contains("app.p.bucket") && why.contains("apply it first"),
+        "{why}"
     );
+    assert!(next(&first).is_ok(), "the same link without the conversion");
     // Withdrawing the second link brings the middle columns back, and a
     // conversion recorded for the last link's columns goes with them.
     let last = back.column_uid(&table().column("bucket")).unwrap().clone();

@@ -429,6 +429,23 @@ pub fn record(
             ),
         ));
     }
+    // A conversion is keyed by a uid approval retires (DEC-2298.12).
+    if let Some((column, c)) = source
+        .columns
+        .iter()
+        .find_map(|(u, column)| ids.conversions.get(u).map(|c| (column, c)))
+    {
+        return Err(refused(
+            table,
+            format!(
+                "{} has a recorded conversion from `{}` to `{}`; apply it first, or delete its \
+                 `conversions` entry, then approve",
+                column.shown(),
+                c.from,
+                c.to
+            ),
+        ));
+    }
     let mut reserved = BTreeSet::new();
     let mut fresh = |kind| loop {
         let uid = Uid::generate(kind);
