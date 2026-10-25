@@ -753,12 +753,16 @@ pub(super) fn read_names(op: &Operation, owners: &dyn Owners) -> Result<Vec<Name
         table(name, owners.table(name, op.origin().spelling())?);
         Ok(())
     };
-    if let Change::CreateTable { table, .. } = change {
+    if let Change::CreateTable { table, name, .. } = change {
         if let Some(of) = &table.partition_of {
             input(&of.parent)?;
         }
+        // A self-reference reads the table this creation supplies, not an
+        // earlier holder, as effects.rs's CreateTable arm also treats it.
         for fk in table.foreign_keys.values() {
-            input(&fk.references_table)?;
+            if fk.references_table != *name {
+                input(&fk.references_table)?;
+            }
         }
     }
     if let Change::DropTable {
@@ -825,6 +829,50 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_created_table_reads_the_tables_it_references_but_not_itself() {
+        struct Qualified;
+        impl Owners for Qualified {
+            fn address_qualified(&self) -> bool {
+                true
+            }
+            fn table(&self, name: &TableName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                Ok(crate::Uid::derived(crate::UidKind::Table, &name.name, 0))
+            }
+            fn column(&self, _: &crate::ColumnRef, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a creation reads no column")
+            }
+            fn role(&self, _: &crate::RoleName, _: Spelling) -> Result<crate::Uid, OwnerError> {
+                unreachable!("a creation reads no role")
+            }
+        }
+        let fk = |to: &str| crate::ForeignKey {
+            columns: vec!["p".into()],
+            references_table: TableName::new("app", to),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let mut table = crate::Table::default();
+        table.foreign_keys.insert("self_fk".into(), fk("t"));
+        table.foreign_keys.insert("other_fk".into(), fk("other"));
+        let create = crate::PlannedChange::new(Change::CreateTable {
+            uid: crate::Uid::derived(crate::UidKind::Table, "t", 0),
+            name: TableName::new("app", "t"),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        });
+        let ops = super::super::Operations::of_plan(&[create], super::super::ModuleEdits::InPlace);
+        let read: Vec<_> = read_names(&ops.as_slice()[0], &Qualified)
+            .unwrap()
+            .into_iter()
+            .map(|named| named.address.name)
+            .collect();
+        // The creation supplies `t`, so no earlier holder may be required.
+        assert_eq!(read, ["other"]);
+    }
 
     #[test]
     fn a_routine_claim_and_release_use_the_same_raw_signature() {
