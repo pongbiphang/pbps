@@ -1039,4 +1039,67 @@ mod label_tests {
             );
         }
     }
+
+    #[test]
+    fn a_rebuilds_swap_is_accepted_at_every_boundary_and_each_drift_or_skip_is_refused() {
+        let uid: pbps_model::Uid = "y_000001".parse().unwrap();
+        let name: TypeRef = "app.e".parse().unwrap();
+        let tmp: TypeRef = "app.pbps_rebuild_y_000001".parse().unwrap();
+        let pin = DeclaredTypePin {
+            uid: uid.clone(),
+            name: name.clone(),
+            definition: enumeration(&["ok"]),
+            before: Some(DeclaredTypeBefore {
+                name: name.clone(),
+                definition: enumeration(&["sad", "ok"]),
+            }),
+        };
+        let none = pbps_model::ChangeSet::default();
+        let certify = |at: &TypeRef| {
+            let mut statement = pbps_dialect::Statement::new("metadata only");
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: at.clone(),
+                definition: Some(pin.definition.clone()),
+            });
+            statement
+        };
+        let (dropped, renamed) = (certify(&tmp), certify(&name));
+        let live = |types: &[(&TypeRef, ManagedType)]| Schema {
+            types: types
+                .iter()
+                .map(|(n, d)| ((*n).clone(), d.clone()))
+                .collect(),
+            ..Default::default()
+        };
+        let pins = std::slice::from_ref(&pin);
+        // Before any swap statement: the old type stands, and the replacement
+        // and the retyped columns are nobody's declared evidence.
+        let standing = live(&[
+            (&name, enumeration(&["sad", "ok"])),
+            (&tmp, enumeration(&["ok"])),
+        ]);
+        check_definitions(&standing, pins, false, &none, &[]).unwrap();
+        // After the drop: the uid lives at the replacement, whose labels are the final ones.
+        let moved = live(&[(&tmp, enumeration(&["ok"]))]);
+        check_definitions(&moved, pins, false, &none, std::slice::from_ref(&dropped)).unwrap();
+        // After the rename: complete.
+        let done = live(&[(&name, enumeration(&["ok"]))]);
+        let both = [dropped.clone(), renamed.clone()];
+        check_definitions(&done, pins, true, &none, &both).unwrap();
+        // A resumed check carries the same committed prefix.
+        check_definitions(&done, pins, true, &none, &both.clone()).unwrap();
+        // The negatives: the replacement holding other labels, a plan called complete before the
+        // rename, and an old type that drifted before any statement.
+        let drifted = live(&[(&tmp, enumeration(&["rogue"]))]);
+        assert!(
+            check_definitions(&drifted, pins, false, &none, std::slice::from_ref(&dropped))
+                .is_err()
+        );
+        assert!(
+            check_definitions(&moved, pins, true, &none, std::slice::from_ref(&dropped)).is_err()
+        );
+        let rogue = live(&[(&name, enumeration(&["rogue"]))]);
+        assert!(check_definitions(&rogue, pins, false, &none, &[]).is_err());
+    }
 }

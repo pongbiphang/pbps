@@ -79,6 +79,7 @@ pub mod roles;
 pub mod rows;
 pub mod staged;
 pub mod state;
+pub mod type_rebuild;
 pub mod type_refs;
 mod types;
 pub mod user_types;
@@ -1053,6 +1054,19 @@ impl pbps_dialect::PlanDialect for Postgres {
 }
 
 impl Dialect for Postgres {
+    /// Measured on 16 and 18: a CHECK, a foreign key and a partial or
+    /// expression index hold constants typed as the old enum, which the
+    /// retype refuses to compare with the replacement. Plain keys and indexes
+    /// are rebuilt by the engine (DEC-1635.7).
+    fn enum_rebuild_dependents(&self) -> pbps_dialect::RetypeDependents {
+        pbps_dialect::RetypeDependents {
+            keys_and_indexes: false,
+            checks: true,
+            filtered_indexes: true,
+            foreign_keys: true,
+        }
+    }
+
     fn statement_count(
         &self,
         change: &Change,
@@ -7889,5 +7903,28 @@ mod enum_surface_refusal_tests {
             table.columns["m"].value_source = pbps_model::ValueSource::Default("'old'".into());
             assert!(pg.validate_table(&loaded.name, &table).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod enum_rebuild_dependents_tests {
+    use super::*;
+
+    /// Measured on 16 and 18 (DEC-1635.7): constants typed as the old enum sit
+    /// in checks, foreign keys and filtered or expression indexes, and the
+    /// retype refuses them; plain keys and indexes are rebuilt by the engine.
+    #[test]
+    fn postgres_rebuilds_what_holds_constants_of_the_old_enum_and_leaves_keys_to_the_engine() {
+        let pg = Postgres::new().enum_rebuild_dependents();
+        assert!(pg.checks && pg.filtered_indexes && pg.foreign_keys);
+        assert!(!pg.keys_and_indexes);
+        // An engine without declared enums rebuilds nothing around them.
+        let other = pbps_dialect::MinimalDialect.enum_rebuild_dependents();
+        assert!(
+            !(other.checks
+                || other.filtered_indexes
+                || other.foreign_keys
+                || other.keys_and_indexes)
+        );
     }
 }

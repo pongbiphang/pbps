@@ -312,7 +312,16 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(table.column(from)),
             Some(table.column(to)),
         )),
-        Change::AlterColumnType { uid, column, .. }
+        Change::EnumRebuild {
+            step:
+                crate::EnumRebuildStep::Retype {
+                    column_uid: uid,
+                    column,
+                    ..
+                },
+            ..
+        }
+        | Change::AlterColumnType { uid, column, .. }
         | Change::AlterColumnNullability { uid, column, .. }
         | Change::AlterColumnDefault { uid, column, .. }
         | Change::AlterColumnExpression { uid, column, .. }
@@ -334,6 +343,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         )),
         Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

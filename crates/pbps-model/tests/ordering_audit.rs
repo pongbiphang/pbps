@@ -341,6 +341,51 @@ mod effects_of_each_kind {
                     }),
                 },
             ),
+            // The three steps of one rebuild share a row, as its kinds do.
+            (
+                "EnumRebuild",
+                Change::EnumRebuild {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    tmp: "app.pbps_rebuild_base".parse().unwrap(),
+                    step: pbps_model::EnumRebuildStep::Create {
+                        definition: Box::new(ManagedType::Enum {
+                            values: vec!["ok".into()],
+                        }),
+                        removed: vec!["old".into()],
+                        ordinal: 0,
+                    },
+                },
+            ),
+            (
+                "EnumRebuild",
+                Change::EnumRebuild {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    tmp: "app.pbps_rebuild_base".parse().unwrap(),
+                    step: pbps_model::EnumRebuildStep::Retype {
+                        column_uid: x.clone(),
+                        column: xref.clone(),
+                        to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+                        array: false,
+                        removed: vec![],
+                    },
+                },
+            ),
+            (
+                "EnumRebuild",
+                Change::EnumRebuild {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    tmp: "app.pbps_rebuild_base".parse().unwrap(),
+                    step: pbps_model::EnumRebuildStep::Swap {
+                        definition: Box::new(ManagedType::Enum {
+                            values: vec!["ok".into()],
+                        }),
+                        comment: None,
+                    },
+                },
+            ),
             (
                 "CreateType",
                 Change::CreateType {
@@ -1075,6 +1120,28 @@ mod effects_of_each_kind {
                     pbps_model::operation::NameKind::Policy
                 );
                 assert_eq!(names.releases[0].address.name, "policy");
+            }
+            if let Change::EnumRebuild { step, .. } = ops.as_slice()[0].change() {
+                let names =
+                    pbps_model::operation::names(&ops.as_slice()[0], &owners, snapshot).unwrap();
+                match step {
+                    // The replacement's temporary name is held from its creation
+                    // to the swap, and the retype of a defaulted column needs
+                    // the default off first (DEC-1635.7).
+                    pbps_model::EnumRebuildStep::Create { .. } => {
+                        assert_eq!((names.claims.len(), names.releases.len()), (1, 0));
+                    }
+                    pbps_model::EnumRebuildStep::Swap { .. } => {
+                        assert_eq!((names.claims.len(), names.releases.len()), (0, 1));
+                    }
+                    pbps_model::EnumRebuildStep::Retype { .. } => {
+                        assert!(names.claims.is_empty() && names.releases.is_empty());
+                        assert!(fx.requires.iter().any(|r| matches!(
+                            r,
+                            Requirement::Absent(pbps_model::operation::ObjectKey::Default(_))
+                        )));
+                    }
+                }
             }
             seen.entry(kind).or_default().extend(words(&fx));
         }

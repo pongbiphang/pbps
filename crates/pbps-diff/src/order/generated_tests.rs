@@ -44,6 +44,38 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         vec![],
         None,
     );
+    // A rebuild's retype is a table's alteration; its type-wide steps use no table.
+    for (step, complete) in [
+        (
+            EnumRebuildStep::Retype {
+                column_uid: column_uid.clone(),
+                column: column.clone(),
+                to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+                array: false,
+                removed: vec![],
+            },
+            vec![&table],
+        ),
+        (
+            EnumRebuildStep::Swap {
+                definition: definition.clone(),
+                comment: None,
+            },
+            vec![],
+        ),
+    ] {
+        pin(
+            Change::EnumRebuild {
+                uid: type_uid.clone(),
+                name: type_name.clone(),
+                tmp: "app.pbps_rebuild_y_000001".parse().unwrap(),
+                step,
+            },
+            complete,
+            vec![],
+            None,
+        );
+    }
     pin(
         Change::RenameEnumValue {
             uid: type_uid.clone(),

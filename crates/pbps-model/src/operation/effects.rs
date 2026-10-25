@@ -590,8 +590,36 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Type(Recorded(uid.clone())));
                 self.type_releases(name);
             }
+            // One column of the rebuild: a retype in everything but its type
+            // reference (DEC-1635.7). Its writes to the type's resource keep
+            // it after the replacement's creation and before the swap.
+            Change::EnumRebuild {
+                uid,
+                step:
+                    crate::EnumRebuildStep::Retype {
+                        column_uid, column, ..
+                    },
+                ..
+            } => {
+                let owner = self.table(&column.table)?;
+                self.exists(ObjectKey::Table(owner.clone()));
+                let key = ColumnKey::Recorded(Recorded(column_uid.clone()));
+                self.rewrites(Resource::Object(
+                    ObjectKey::Column(key.clone()),
+                    Incarnation::Final,
+                ));
+                self.writes_values(ObjectKey::Column(key.clone()), &owner);
+                if self.base_default(&owner, &key).is_some() {
+                    self.requires(Requirement::Absent(ObjectKey::Default(key)));
+                }
+                self.requires_foreign_keys_over_column_gone(&owner, column_uid);
+                let ty = ObjectKey::Type(Recorded(uid.clone()));
+                self.exists(ty.clone());
+                self.rewrites(Resource::Object(ty, Incarnation::Final));
+            }
             Change::AddEnumValue { uid, .. }
             | Change::RenameEnumValue { uid, .. }
+            | Change::EnumRebuild { uid, .. }
             | Change::RenameType { uid, .. } => {
                 let key = ObjectKey::Type(Recorded(uid.clone()));
                 self.exists(key.clone());

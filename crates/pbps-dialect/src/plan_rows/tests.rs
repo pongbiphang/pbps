@@ -350,6 +350,50 @@ fn a_backfill_and_a_later_retype_remain_distinct_prefix_facts() {
 }
 
 #[test]
+fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is() {
+    let step = |step| {
+        PlannedChange::new(Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step,
+        })
+    };
+    let definition = Box::new(pbps_model::ManagedType::Enum { values: vec![] });
+    let changes = [
+        step(pbps_model::EnumRebuildStep::Create {
+            definition: definition.clone(),
+            removed: vec![],
+            ordinal: 0,
+        }),
+        step(pbps_model::EnumRebuildStep::Retype {
+            column_uid: uid(UidKind::Column, "m"),
+            column: table("a").column("m"),
+            to: ColumnType::reference("app.e".parse().unwrap()),
+            array: false,
+            removed: vec![],
+        }),
+        step(pbps_model::EnumRebuildStep::Swap {
+            definition,
+            comment: None,
+        }),
+    ];
+    let ids = IdsFile {
+        tables: [(uid(UidKind::Table, "a"), table("a"))].into(),
+        columns: [(uid(UidKind::Column, "m"), table("a").column("m"))].into(),
+        ..Default::default()
+    };
+    let names = PlanNames::of(&changes, &ids).unwrap();
+    let facts = PlanFacts::of(&names);
+    let end = facts.end().events().collect::<Vec<_>>();
+    let [(1, Event::RebuildEnumColumn { column })] = end.as_slice() else {
+        panic!("{end:?}");
+    };
+    assert_eq!(**column, table("a").column("m"));
+    assert_eq!(facts.before(1).events().count(), 0);
+}
+
+#[test]
 fn row_projection_preserves_unknown_assignments_and_excludes_future_deletes() {
     let key = RowKey("1".into());
     let changes = [

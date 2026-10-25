@@ -564,6 +564,7 @@ impl Reconstruction {
                 // alterations; one that does is not a bootstrap.
                 Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }

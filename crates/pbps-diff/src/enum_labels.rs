@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnType, EnumPlacement, Hints, IdsFile, ManagedType, Schema, TypeRef,
-    Uid, ValueSource,
+    Change, ChangeSet, ColumnType, EnumPlacement, EnumRebuildStep, Hints, IdsFile, ManagedType,
+    Schema, TypeRef, Uid, ValueSource,
 };
 
 use crate::{
@@ -145,19 +145,31 @@ pub(crate) fn changes(
             });
             ordinal += 1;
         }
-        for value in &current {
-            if !wanted.contains(value) {
-                errors.push(refusal(name, format!("enum label `{}` was removed without rename intent; removal requires #1635 slice 3b", pbps_model::escape::Escaped(value))));
-            }
-        }
+        // A label absent from the declaration, or retained labels in another
+        // order, is not an `ALTER TYPE`: PostgreSQL has neither. The type is
+        // rebuilt under its uid, mapping every label by its final name.
+        // Spelled as the database has them now: a renamed label is never
+        // removed, and the rows are counted before the plan's renames run.
+        let removed: Vec<String> = current
+            .iter()
+            .zip(old)
+            .filter(|(v, _)| !wanted.contains(*v))
+            .map(|(_, stored)| stored.clone())
+            .collect();
+        let kept: Vec<_> = current.iter().filter(|v| wanted.contains(*v)).collect();
         let retained: Vec<_> = wanted.iter().filter(|v| current.contains(v)).collect();
-        if retained != current.iter().collect::<Vec<_>>() {
-            let labels = retained
-                .iter()
-                .map(|label| format!("`{}`", pbps_model::escape::Escaped(label)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            errors.push(refusal(name, format!("relative order of retained enum labels {labels} changed; reordering requires #1635 slice 3b")));
+        if !removed.is_empty() || kept != retained {
+            match rebuild(
+                base,
+                desired,
+                hints,
+                (uid, name),
+                (wanted.as_slice(), removed),
+                ordinal,
+            ) {
+                Ok(steps) => out.extend(steps),
+                Err(why) => errors.push(refusal(name, why)),
+            }
             continue;
         }
         for (index, value) in wanted.iter().enumerate() {
@@ -184,6 +196,261 @@ pub(crate) fn changes(
         }
     }
     (out, errors)
+}
+
+/// The table that holds a partition's columns: its parent, however deep.
+fn root_of<'a>(schema: &'a Schema, table: &'a pbps_model::Table) -> &'a pbps_model::Table {
+    let mut owner = table;
+    let mut seen = BTreeSet::new();
+    while let Some(of) = &owner.partition_of {
+        if !seen.insert(&of.parent) {
+            break;
+        }
+        let Some(parent) = schema.tables.get(&of.parent) else {
+            break;
+        };
+        owner = parent;
+    }
+    owner
+}
+
+/// A name no declaration or live type of the project holds. The temporary
+/// name is derived from the uid, so a resumed plan finds its own replacement;
+/// a taken name moves on to the next suffix, and the connected census refuses
+/// a live occupant the declarations do not know (DEC-1635.7).
+fn replacement_name(base: Side<'_>, desired: Side<'_>, uid: &Uid, name: &TypeRef) -> TypeRef {
+    let taken = |candidate: &TypeRef| {
+        [base.schema, desired.schema].iter().any(|schema| {
+            schema.types.contains_key(candidate)
+                || schema
+                    .tables
+                    .keys()
+                    .any(|t| t.schema == candidate.schema() && t.name == candidate.name())
+                || schema.modules.keys().any(|m| {
+                    matches!(m, pbps_model::ModuleId::Named(_))
+                        && m.schema() == candidate.schema()
+                        && m.name() == candidate.name()
+                })
+        })
+    };
+    (0..)
+        .find_map(|k| {
+            let text = if k == 0 {
+                format!("pbps_rebuild_{uid}")
+            } else {
+                format!("pbps_rebuild_{uid}_{k}")
+            };
+            TypeRef::new(name.schema(), &text)
+                .ok()
+                .filter(|candidate| !taken(candidate))
+        })
+        .expect("an unbounded search")
+}
+
+/// Rebuild an enum under its uid (DEC-1635.7): the replacement, one retype per
+/// column that holds the type, and the swap. Everything that must come down
+/// for the retype is the ordinary differ's: checks, foreign keys and indexes
+/// by the dialect's retype policy, defaults by [`rebuild_defaults`], modules by
+/// the connected rebuild of their dependents.
+fn rebuild(
+    base: Side<'_>,
+    desired: Side<'_>,
+    hints: &Hints,
+    (uid, name): (&Uid, &TypeRef),
+    (wanted, removed): (&[String], Vec<String>),
+    ordinal: usize,
+) -> Result<Vec<Change>, String> {
+    let resolver = TypeResolver::new(base.ids, desired.ids);
+    if resolver.name(TypeSide::Base, uid) != Some(name) {
+        return Err("the type is renamed or moved in this plan; do that in a plan of its own, then change its labels".into());
+    }
+    for (domain, definition) in &desired.schema.types {
+        if let ManagedType::Domain { base: ty, .. } = definition
+            && uses_enum(ty, uid, desired.schema, desired.ids)
+        {
+            return Err(format!(
+                "domain {} is over this enum; removing or reordering labels under a domain waits for the domain rebuild (#1635 slice 4)",
+                domain.shown()
+            ));
+        }
+    }
+    let spelled = name.raw().to_string();
+    for id in desired.schema.modules.keys() {
+        if let pbps_model::ModuleId::Routine(routine) = id
+            && routine.args.iter().any(|arg| {
+                let arg = arg.raw().replace('"', "");
+                arg.trim().trim_end_matches("[]").trim() == spelled.replace('"', "")
+            })
+        {
+            return Err(format!(
+                "routine {} takes this enum as an argument, which blocks DROP TYPE; declare it without the type first",
+                id.shown()
+            ));
+        }
+    }
+    let mut columns = Vec::new();
+    for (table_name, table) in &desired.schema.tables {
+        for (column_name, column) in &table.columns {
+            if !uses_enum(&column.ty, uid, desired.schema, desired.ids) {
+                continue;
+            }
+            let reference = pbps_model::ColumnRef {
+                table: table_name.clone(),
+                name: column_name.clone(),
+            };
+            let Some(column_uid) = desired.ids.column_uid(&reference) else {
+                return Err(format!("{} has no recorded identity", reference.shown()));
+            };
+            let standing = base
+                .ids
+                .columns
+                .get(column_uid)
+                .and_then(|at| base.schema.tables.get(&at.table)?.columns.get(&at.name))
+                .is_some_and(|c| uses_enum(&c.ty, uid, base.schema, base.ids));
+            if !standing {
+                return Err(format!(
+                    "{} is created or retyped to this enum in the same plan; rebuild the enum first, then change the column",
+                    reference.shown()
+                ));
+            }
+            if matches!(column.value_source, ValueSource::Generated(_)) {
+                return Err(format!(
+                    "{} is a generated column of this enum, which PostgreSQL cannot retype",
+                    reference.shown()
+                ));
+            }
+            if table.partition_by.as_ref().is_some_and(|by| by.external) {
+                return Err(format!(
+                    "{} belongs to a table with external partitions, which a rebuild cannot reach",
+                    reference.shown()
+                ));
+            }
+            columns.push((column_uid.clone(), reference, column.ty.clone()));
+        }
+    }
+    for (partition, table) in &desired.schema.tables {
+        let Some(of) = &table.partition_of else {
+            continue;
+        };
+        let root = root_of(desired.schema, table);
+        for (column, own) in &of.columns {
+            if own.default.is_some()
+                && root
+                    .columns
+                    .get(column)
+                    .is_some_and(|c| uses_enum(&c.ty, uid, desired.schema, desired.ids))
+            {
+                return Err(format!(
+                    "partition {} keeps its own default for {}, which a rebuild does not restore",
+                    partition.shown(),
+                    column.shown()
+                ));
+            }
+        }
+    }
+    let tmp = replacement_name(base, desired, uid, name);
+    let definition = ManagedType::Enum {
+        values: wanted.to_vec(),
+    };
+    let mut out = vec![Change::EnumRebuild {
+        uid: uid.clone(),
+        name: name.clone(),
+        tmp: tmp.clone(),
+        step: EnumRebuildStep::Create {
+            definition: Box::new(definition.clone()),
+            removed: removed.clone(),
+            ordinal,
+        },
+    }];
+    out.extend(
+        columns
+            .into_iter()
+            .map(|(column_uid, column, to)| Change::EnumRebuild {
+                uid: uid.clone(),
+                name: name.clone(),
+                tmp: tmp.clone(),
+                step: EnumRebuildStep::Retype {
+                    column_uid,
+                    column,
+                    array: to.is_array(),
+                    to,
+                    removed: removed.clone(),
+                },
+            }),
+    );
+    out.push(Change::EnumRebuild {
+        uid: uid.clone(),
+        name: name.clone(),
+        tmp,
+        step: EnumRebuildStep::Swap {
+            definition: Box::new(definition),
+            comment: hints.enum_comments.get(name).cloned(),
+        },
+    });
+    Ok(out)
+}
+
+/// A default written for the old type blocks the retype, one for the new type
+/// follows it: the same two halves the differ makes of a replaced default on a
+/// retyped column, here for the default the declaration keeps as it is. A
+/// default the declaration changes in the same plan joins the pair, so the
+/// old one is never standing at the retype and the new one is written after.
+pub(crate) fn rebuild_defaults(base: Side<'_>, desired: Side<'_>, changes: &mut Vec<Change>) {
+    let retyped: Vec<_> = changes
+        .iter()
+        .filter_map(|change| {
+            if let Change::EnumRebuild {
+                step:
+                    EnumRebuildStep::Retype {
+                        column_uid, column, ..
+                    },
+                ..
+            } = change
+            {
+                Some((column_uid.clone(), column.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let default = |column: Option<&pbps_model::Column>| match column.map(|c| &c.value_source) {
+        Some(ValueSource::Default(text)) => Some(text.clone()),
+        _ => None,
+    };
+    for (uid, column) in retyped {
+        changes.retain(
+            |change| !matches!(change, Change::AlterColumnDefault { column: c, .. } if *c == column),
+        );
+        let was = default(
+            base.ids
+                .columns
+                .get(&uid)
+                .and_then(|at| base.schema.tables.get(&at.table)?.columns.get(&at.name)),
+        );
+        let will = default(
+            desired
+                .schema
+                .tables
+                .get(&column.table)
+                .and_then(|t| t.columns.get(&column.name)),
+        );
+        if let Some(text) = was {
+            changes.push(Change::AlterColumnDefault {
+                uid: uid.clone(),
+                column: column.clone(),
+                from: Some(text),
+                to: None,
+            });
+        }
+        if let Some(text) = will {
+            changes.push(Change::AlterColumnDefault {
+                uid,
+                column,
+                from: None,
+                to: Some(text),
+            });
+        }
+    }
 }
 
 /// Resolve arrays and domain bases through the identity map of this side.
@@ -514,6 +781,7 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 .map(|b| (p.uid.clone(), b.definition.clone()))
         })
         .collect();
+    let mut replacements: BTreeMap<Uid, ManagedType> = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
             Change::CreateType {
@@ -583,13 +851,57 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                     return false;
                 }
             }
+            // The replacement's labels are the old type's minus `removed`,
+            // plus whatever the declaration adds; the swap installs exactly
+            // them. A step out of that order cannot certify itself.
+            Change::EnumRebuild {
+                uid, name, step, ..
+            } => {
+                if !pins.iter().any(|p| &p.uid == uid && &p.name == name) {
+                    return false;
+                }
+                match step {
+                    EnumRebuildStep::Create {
+                        definition,
+                        removed,
+                        ..
+                    } => {
+                        let Some(ManagedType::Enum { values }) = definitions.get(uid) else {
+                            return false;
+                        };
+                        let ManagedType::Enum { values: wanted } = definition.as_ref() else {
+                            return false;
+                        };
+                        let gone = values.iter().filter(|v| !wanted.contains(v)).count();
+                        if replacements
+                            .insert(uid.clone(), (**definition).clone())
+                            .is_some()
+                            || gone != removed.len()
+                        {
+                            return false;
+                        }
+                    }
+                    EnumRebuildStep::Retype { .. } => {
+                        if !replacements.contains_key(uid) {
+                            return false;
+                        }
+                    }
+                    EnumRebuildStep::Swap { definition, .. } => {
+                        if replacements.remove(uid).as_ref() != Some(definition.as_ref()) {
+                            return false;
+                        }
+                        definitions.insert(uid.clone(), (**definition).clone());
+                    }
+                }
+            }
             _ => {}
         }
     }
-    pins.iter().all(|p| {
-        !matches!(p.definition, ManagedType::Enum { .. })
-            || definitions.get(&p.uid) == Some(&p.definition)
-    })
+    replacements.is_empty()
+        && pins.iter().all(|p| {
+            !matches!(p.definition, ManagedType::Enum { .. })
+                || definitions.get(&p.uid) == Some(&p.definition)
+        })
 }
 
 #[cfg(test)]
@@ -763,13 +1075,8 @@ mod tests {
             vec!["a", "x", "b"],
             vec!["a", "b", "x"],
             vec!["x", "y", "a", "m", "n", "b", "z"],
-            vec![],
         ] {
             let (steps, errors, desired, ids) = planned(&["a", "b"], &wanted, &[]);
-            if wanted.is_empty() {
-                assert!(!errors.is_empty());
-                continue;
-            }
             assert!(errors.is_empty(), "{errors:?}");
             let (base, _) = world(&["a", "b"]);
             let pin = DeclaredTypePin {
@@ -860,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn label_intent_preserves_identity_and_refuses_missing_sources_swaps_removals_and_reorder() {
+    fn label_intent_preserves_identity_and_refuses_missing_sources_swaps_and_two_claimants() {
         let (steps, errors, _, _) = planned(&["a", "b"], &["b", "c"], &[("b", "a"), ("c", "b")]);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
@@ -878,8 +1185,6 @@ mod tests {
             (vec!["x", "b"], vec![("x", "missing")], "missing"),
             (vec!["x", "y"], vec![("x", "a"), ("y", "a")], "two labels"),
             (vec!["b", "a"], vec![("a", "b"), ("b", "a")], "swap"),
-            (vec!["b"], vec![], "3b"),
-            (vec!["b", "a"], vec![], "3b"),
         ] {
             let (_, errors, _, _) = planned(&["a", "b"], &new, &intent);
             assert!(
@@ -1322,5 +1627,755 @@ mod array_tests {
         assert!(!literal_uses("{NULL}", "NULL"));
         assert!(!literal_uses("{sadness}", "sad"));
         assert!(!literal_uses("not an array", "sad"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)] // Fixtures name only the rebuild's changes.
+mod rebuild_tests {
+    use super::*;
+    use pbps_dialect::MinimalDialect;
+    use pbps_model::{
+        Column, ColumnRef, DeclaredTypeBefore, DeclaredTypePin, PlannedChange, Table, TableName,
+        UidKind,
+    };
+
+    fn enumeration(values: &[&str]) -> ManagedType {
+        ManagedType::Enum {
+            values: values.iter().map(|v| (*v).into()).collect(),
+        }
+    }
+
+    fn type_uid() -> Uid {
+        "y_000001".parse().unwrap()
+    }
+
+    /// `app.t(id, m app.e, tags app.e[])` beside `app.e`, with identities.
+    fn world(values: &[&str]) -> (Schema, IdsFile) {
+        let mut table = Table::default();
+        for (name, ty) in [("id", "integer"), ("m", "app.e"), ("tags", "app.e[]")] {
+            table
+                .columns
+                .insert(name.into(), Column::new(ty.parse().unwrap()));
+        }
+        let t: TableName = "app.t".parse().unwrap();
+        let mut ids = IdsFile {
+            types: [(type_uid(), "app.e".parse().unwrap())].into(),
+            tables: [(Uid::derived(UidKind::Table, "t", 0), t.clone())].into(),
+            ..Default::default()
+        };
+        for column in ["id", "m", "tags"] {
+            ids.columns.insert(
+                Uid::derived(UidKind::Column, column, 0),
+                ColumnRef {
+                    table: t.clone(),
+                    name: column.into(),
+                },
+            );
+        }
+        (
+            Schema {
+                types: [("app.e".parse().unwrap(), enumeration(values))].into(),
+                tables: [(t, table)].into(),
+                ..Default::default()
+            },
+            ids,
+        )
+    }
+
+    type World = (Schema, IdsFile);
+
+    fn side<'a>(world: &'a World) -> Side<'a> {
+        Side {
+            schema: &world.0,
+            ids: &world.1,
+        }
+    }
+
+    fn rebuilds(
+        old: &[&str],
+        new: &[&str],
+        renames: &[(&str, &str)],
+    ) -> (Vec<Change>, Vec<DiffError>) {
+        let (base, desired) = (world(old), world(new));
+        let hints = Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                renames
+                    .iter()
+                    .map(|(to, from)| ((*to).into(), (*from).into()))
+                    .collect(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        changes(side(&base), side(&desired), &hints)
+    }
+
+    fn steps(changes: &[Change]) -> Vec<&EnumRebuildStep> {
+        changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild { step, .. } => Some(step),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn removing_a_label_rebuilds_under_the_uid_in_the_order_create_retypes_swap() {
+        let (out, errors) = rebuilds(&["sad", "ok", "happy"], &["ok", "happy"], &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        let [create, first, second, swap] = steps(&out)[..] else {
+            panic!("{out:?}");
+        };
+        let EnumRebuildStep::Create {
+            definition,
+            removed,
+            ordinal,
+        } = create
+        else {
+            panic!("{create:?}");
+        };
+        assert_eq!(definition.as_ref(), &enumeration(&["ok", "happy"]));
+        assert_eq!((removed.as_slice(), *ordinal), (&["sad".to_owned()][..], 0));
+        let columns: Vec<_> = [first, second]
+            .into_iter()
+            .map(|s| match s {
+                EnumRebuildStep::Retype {
+                    column,
+                    array,
+                    removed,
+                    ..
+                } => (column.name.raw().to_owned(), *array, removed.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            columns,
+            [
+                ("m".to_owned(), false, vec!["sad".to_owned()]),
+                ("tags".to_owned(), true, vec!["sad".to_owned()])
+            ]
+        );
+        assert!(matches!(
+            swap,
+            EnumRebuildStep::Swap { comment: None, definition } if **definition == enumeration(&["ok", "happy"])
+        ));
+        // One uid throughout, never a new one, and a name no label step uses.
+        for change in &out {
+            let Change::EnumRebuild { uid, name, tmp, .. } = change else {
+                panic!("{change:?}");
+            };
+            assert_eq!(uid, &type_uid());
+            assert_eq!(name.raw().to_string(), "app.e");
+            assert_eq!(
+                tmp.raw().to_string(),
+                format!("app.pbps_rebuild_{}", type_uid())
+            );
+        }
+    }
+
+    #[test]
+    fn reordering_retained_labels_rebuilds_with_nothing_removed_and_equal_labels_plan_nothing() {
+        let (out, errors) = rebuilds(&["a", "b", "c"], &["c", "a", "b"], &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(matches!(
+            steps(&out)[0],
+            EnumRebuildStep::Create { removed, .. } if removed.is_empty()
+        ));
+        assert_eq!(out.len(), 4);
+        // The same order is no change at all, and an added label alone is the
+        // ordinary `ADD VALUE`, not a rebuild.
+        assert!(rebuilds(&["a", "b"], &["a", "b"], &[]).0.is_empty());
+        let (added, errors) = rebuilds(&["a", "b"], &["a", "c", "b"], &[]);
+        assert!(errors.is_empty());
+        assert!(matches!(added.as_slice(), [Change::AddEnumValue { .. }]));
+    }
+
+    #[test]
+    fn a_removal_with_additions_creates_them_in_the_replacement_without_add_value() {
+        let (out, errors) = rebuilds(&["a", "b"], &["new", "b"], &[]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(out.iter().all(|c| matches!(c, Change::EnumRebuild { .. })));
+        assert!(matches!(
+            steps(&out)[0],
+            EnumRebuildStep::Create { removed, definition, .. }
+                if removed == &["a".to_owned()] && **definition == enumeration(&["new", "b"])
+        ));
+    }
+
+    #[test]
+    fn renames_run_first_and_the_rebuild_maps_by_final_names_and_counts_stored_ones() {
+        // sad -> blue is a rename; `ok` is what goes. The rows to count are
+        // those the database holds today, under the old spellings.
+        let (out, errors) = rebuilds(&["sad", "ok"], &["blue"], &[("blue", "sad")]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(matches!(
+            out.first(),
+            Some(Change::RenameEnumValue { from, to, ordinal: 0, .. }) if from == "sad" && to == "blue"
+        ));
+        let EnumRebuildStep::Create {
+            removed, ordinal, ..
+        } = steps(&out)[0]
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!((removed.as_slice(), *ordinal), (&["ok".to_owned()][..], 1));
+        // Renaming a label to another's spelling in a chain never counts as removal.
+        let (chain, errors) = rebuilds(&["a", "b"], &["b", "c"], &[("b", "a"), ("c", "b")]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            chain
+                .iter()
+                .all(|c| matches!(c, Change::RenameEnumValue { .. })),
+            "{chain:?}"
+        );
+    }
+
+    #[test]
+    fn what_a_rebuild_cannot_do_is_refused_by_name_with_no_step() {
+        let refuses = |edit: &dyn Fn(&mut World, &mut World), expect: &str| {
+            let mut base = world(&["sad", "ok"]);
+            let mut desired = world(&["ok"]);
+            edit(&mut base, &mut desired);
+            let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
+            let text = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains("app.") && text.contains(expect),
+                "{expect}: {text}"
+            );
+            assert!(steps(&out).is_empty(), "{expect}: {out:?}");
+        };
+        let t: TableName = "app.t".parse().unwrap();
+        // A domain over the enum waits for the domain rebuild.
+        refuses(
+            &|_, d| {
+                d.0.types.insert(
+                    "app.d".parse().unwrap(),
+                    ManagedType::Domain {
+                        base: "app.e".parse().unwrap(),
+                        not_null: false,
+                        default: None,
+                        checks: Default::default(),
+                        collation: None,
+                    },
+                );
+            },
+            "domain app.d",
+        );
+        // A routine that takes the type blocks DROP TYPE.
+        refuses(
+            &|_, d| {
+                d.0.modules.insert(
+                    "app.f(app.e)".parse().unwrap(),
+                    pbps_model::Module {
+                        kind: pbps_model::ModuleKind::Function,
+                        description: None,
+                        definition: "(x app.e) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
+                            .into(),
+                    },
+                );
+            },
+            "as an argument",
+        );
+        // A column the plan adds, or retypes to the enum, is not rebuilt around.
+        refuses(
+            &|b, _| {
+                b.1.columns.retain(|_, c| c.name.raw() != "m");
+            },
+            "app.t.m",
+        );
+        refuses(
+            &|b, _| {
+                b.0.tables.get_mut(&t).unwrap().columns["m"].ty = "integer".parse().unwrap();
+            },
+            "created or retyped",
+        );
+        // A generated column of the type cannot be retyped by the engine.
+        refuses(
+            &|_, d| {
+                d.0.tables.get_mut(&t).unwrap().columns["m"].value_source =
+                    pbps_model::ValueSource::Generated(pbps_model::Generated {
+                        expression: "'ok'::app.e".into(),
+                        stored: true,
+                    });
+            },
+            "generated",
+        );
+        // External partitions are not reached by a retype.
+        refuses(
+            &|_, d| {
+                d.0.tables.get_mut(&t).unwrap().partition_by = Some(pbps_model::PartitionBy {
+                    strategy: pbps_model::PartitionStrategy::List,
+                    columns: vec!["id".into()],
+                    external: true,
+                });
+            },
+            "external partitions",
+        );
+        // A type renamed in the same plan is not also rebuilt.
+        refuses(
+            &|_, d| {
+                let ty = d.0.types.remove(&"app.e".parse().unwrap()).unwrap();
+                d.0.types.insert("app.f".parse().unwrap(), ty);
+                for table in d.0.tables.values_mut() {
+                    for column in table.columns.values_mut() {
+                        column.ty.base = column.ty.base.replace("app.e", "app.f");
+                    }
+                }
+                d.1.types.insert(type_uid(), "app.f".parse().unwrap());
+            },
+            "renamed",
+        );
+    }
+
+    #[test]
+    fn a_partition_keeping_its_own_default_for_a_moved_column_is_refused() {
+        let mut base = world(&["sad", "ok"]);
+        let mut desired = world(&["ok"]);
+        for w in [&mut base, &mut desired] {
+            let partition = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            w.0.tables.insert("app.p".parse().unwrap(), partition);
+        }
+        desired
+            .0
+            .tables
+            .get_mut(&"app.p".parse().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .insert(
+                "m".into(),
+                pbps_model::PartitionColumn {
+                    default: Some("'ok'".into()),
+                    not_null: false,
+                },
+            );
+        let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
+        assert!(steps(&out).is_empty());
+        assert!(
+            errors[0].to_string().contains("keeps its own default"),
+            "{errors:?}"
+        );
+        // The partition without an override is simply reached through its root.
+        desired
+            .0
+            .tables
+            .get_mut(&"app.p".parse().unwrap())
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns
+            .clear();
+        let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(steps(&out).len(), 4);
+    }
+
+    #[test]
+    fn the_temporary_name_moves_on_when_a_declaration_holds_it() {
+        let base = world(&["sad", "ok"]);
+        let mut desired = world(&["ok"]);
+        let first: TypeRef = format!("app.pbps_rebuild_{}", type_uid()).parse().unwrap();
+        desired.0.types.insert(first, enumeration(&["x"]));
+        desired.0.tables.insert(
+            format!("app.pbps_rebuild_{}_1", type_uid())
+                .parse()
+                .unwrap(),
+            Table::default(),
+        );
+        let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        let Change::EnumRebuild { tmp, .. } = &out[0] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            tmp.raw().to_string(),
+            format!("app.pbps_rebuild_{}_2", type_uid())
+        );
+    }
+
+    #[test]
+    fn the_comment_the_catalog_gave_the_hints_rides_the_swap_only() {
+        let (base, desired) = (world(&["sad", "ok"]), world(&["ok"]));
+        let hints = Hints {
+            enum_comments: [("app.e".parse().unwrap(), "moods".to_owned())].into(),
+            ..Default::default()
+        };
+        let (out, _) = changes(side(&base), side(&desired), &hints);
+        let comments: Vec<_> = steps(&out)
+            .into_iter()
+            .map(|s| matches!(s, EnumRebuildStep::Swap { comment: Some(c), .. } if c == "moods"))
+            .collect();
+        assert_eq!(comments, [false, false, false, true]);
+    }
+
+    #[test]
+    fn declared_defaults_come_off_before_the_retype_and_go_back_after_even_when_unchanged() {
+        let uid = Uid::derived(UidKind::Column, "m", 0);
+        let column: ColumnRef = ColumnRef {
+            table: "app.t".parse().unwrap(),
+            name: "m".into(),
+        };
+        let retype = Change::EnumRebuild {
+            uid: type_uid(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: EnumRebuildStep::Retype {
+                column_uid: uid.clone(),
+                column: column.clone(),
+                to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+                array: false,
+                removed: vec![],
+            },
+        };
+        let (mut base, mut desired) = (world(&["a"]), world(&["a"]));
+        for (w, text) in [(&mut base, "'a'"), (&mut desired, "'b'")] {
+            w.0.tables
+                .get_mut(&"app.t".parse().unwrap())
+                .unwrap()
+                .columns["m"]
+                .value_source = pbps_model::ValueSource::Default(text.into());
+        }
+        // A default the declaration also edits joins the pair; the edit alone
+        // would have run after the retype, with the old one standing.
+        let mut plan = vec![
+            retype.clone(),
+            Change::AlterColumnDefault {
+                uid: uid.clone(),
+                column: column.clone(),
+                from: Some("'a'".into()),
+                to: Some("'b'".into()),
+            },
+        ];
+        rebuild_defaults(side(&base), side(&desired), &mut plan);
+        let defaults: Vec<_> = plan
+            .iter()
+            .filter_map(|c| match c {
+                Change::AlterColumnDefault { from, to, .. } => Some((from.clone(), to.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            defaults,
+            [
+                (Some("'a'".to_owned()), None),
+                (None, Some("'b'".to_owned()))
+            ]
+        );
+        // No default on either side: no change, and no step, no pair.
+        let (plain, mut plan) = (world(&["a"]), vec![retype]);
+        rebuild_defaults(side(&plain), side(&plain), &mut plan);
+        assert_eq!(plan.len(), 1);
+        let mut none = Vec::new();
+        rebuild_defaults(side(&plain), side(&plain), &mut none);
+        assert!(none.is_empty());
+    }
+
+    fn pin(before: &[&str], after: &[&str]) -> DeclaredTypePin {
+        DeclaredTypePin {
+            uid: type_uid(),
+            name: "app.e".parse().unwrap(),
+            definition: enumeration(after),
+            before: Some(DeclaredTypeBefore {
+                name: "app.e".parse().unwrap(),
+                definition: enumeration(before),
+            }),
+        }
+    }
+
+    fn sequence(out: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            changes: out.into_iter().map(PlannedChange::new).collect(),
+        }
+    }
+
+    #[test]
+    fn a_saved_rebuild_replays_against_its_pins_and_no_step_can_certify_itself() {
+        let (out, errors) = rebuilds(&["sad", "ok"], &["ok", "new"], &[]);
+        assert!(errors.is_empty());
+        let pins = [pin(&["sad", "ok"], &["ok", "new"])];
+        assert!(valid_steps(&sequence(out.clone()), &pins));
+        // Out of order, missing a part, repeated, or lying about what goes.
+        let (create, retype, swap) = (out[0].clone(), out[1].clone(), out[3].clone());
+        for broken in [
+            vec![swap.clone()],
+            vec![retype.clone(), create.clone(), swap.clone()],
+            vec![create.clone(), retype.clone()],
+            vec![create.clone(), create.clone(), swap.clone()],
+            vec![create.clone(), swap.clone(), swap.clone()],
+        ] {
+            assert!(!valid_steps(&sequence(broken), &pins));
+        }
+        let mut lie = out.clone();
+        if let Change::EnumRebuild {
+            step: EnumRebuildStep::Create { removed, .. },
+            ..
+        } = &mut lie[0]
+        {
+            removed.clear();
+        }
+        assert!(!valid_steps(&sequence(lie), &pins));
+        let mut other = out.clone();
+        if let Change::EnumRebuild {
+            step: EnumRebuildStep::Swap { definition, .. },
+            ..
+        } = &mut other[3]
+        {
+            **definition = enumeration(&["ok"]);
+        }
+        assert!(!valid_steps(&sequence(other), &pins));
+        // A pin for a different type certifies nothing.
+        let mut elsewhere = pins.clone();
+        elsewhere[0].uid = "y_000009".parse().unwrap();
+        assert!(!valid_steps(&sequence(out), &elsewhere));
+    }
+
+    /// A dialect whose rebuild takes checks, foreign keys and filtered
+    /// indexes down, as PostgreSQL's does.
+    struct Rebuilds;
+    impl pbps_dialect::Dialect for Rebuilds {
+        fn name(&self) -> &'static str {
+            "rebuilds"
+        }
+        fn enum_rebuild_dependents(&self) -> pbps_dialect::RetypeDependents {
+            pbps_dialect::RetypeDependents {
+                keys_and_indexes: false,
+                checks: true,
+                filtered_indexes: true,
+                foreign_keys: true,
+            }
+        }
+        fn quote_ident(&self, i: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(i)
+        }
+        fn intermediate_tables(
+            &self,
+            c: &Change,
+            s: pbps_model::Strategy,
+        ) -> Result<Vec<TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(c, s)
+        }
+        fn normalize_type(&self, t: &ColumnType) -> Result<ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(t)
+        }
+        fn type_change_risk(&self, f: &ColumnType, t: &ColumnType) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(f, t)
+        }
+        fn fold_ident<'a>(&self, i: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(i)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(&self, n: &TableName, t: &Table) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(n, t)
+        }
+        fn transaction_framing(
+            &self,
+            z: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(z)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    #[test]
+    fn the_whole_plan_drops_and_restores_what_names_a_moved_column_and_orders_the_steps() {
+        let (mut base, mut desired) = (world(&["sad", "ok"]), world(&["ok"]));
+        for w in [&mut base, &mut desired] {
+            let table = w.0.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
+            table.columns["m"].value_source = pbps_model::ValueSource::Default("'ok'".into());
+            table.checks.insert(
+                "named".into(),
+                pbps_model::CheckConstraint {
+                    expression: "m IN ('ok')".into(),
+                },
+            );
+            table.checks.insert(
+                "other".into(),
+                pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            );
+        }
+        // A partition keeps its own check over the column it takes from the
+        // root, and the root's retype reaches it.
+        for w in [&mut base, &mut desired] {
+            let uid = Uid::derived(UidKind::Table, "p", 0);
+            let name: TableName = "app.p".parse().unwrap();
+            w.1.tables.insert(uid, name.clone());
+            let mut partition = Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.t".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            partition.checks.insert(
+                "pown".into(),
+                pbps_model::CheckConstraint {
+                    expression: "m IN ('ok')".into(),
+                },
+            );
+            w.0.tables.insert(name, partition);
+        }
+        let plan = crate::diff(side(&base), side(&desired), &Rebuilds, &Hints::default())
+            .expect("a rebuild plans");
+        let rendered: Vec<String> = plan
+            .changes()
+            .changes
+            .iter()
+            .map(|p| match &p.change {
+                Change::EnumRebuild { step, .. } => match step {
+                    EnumRebuildStep::Create { .. } => "create".to_owned(),
+                    EnumRebuildStep::Retype { column, .. } => {
+                        format!("retype {}", column.name.shown())
+                    }
+                    EnumRebuildStep::Swap { .. } => "swap".to_owned(),
+                },
+                Change::DropCheck { name, .. } => format!("drop check {}", name.shown()),
+                Change::AddCheck { name, .. } => format!("add check {}", name.shown()),
+                Change::AlterColumnDefault { to: None, .. } => "drop default".to_owned(),
+                Change::AlterColumnDefault { to: Some(_), .. } => "set default".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let at = |what: &str| {
+            rendered
+                .iter()
+                .position(|r| r == what)
+                .unwrap_or_else(|| panic!("{what} in {rendered:?}"))
+        };
+        // Everything that names a moved column comes down before the retypes,
+        // the swap follows every retype, and what came down goes back after.
+        assert!(at("drop check pown") < at("retype m"));
+        assert!(at("retype tags") < at("add check pown"));
+        assert!(at("drop check named") < at("create"));
+        assert!(at("create") < at("drop default"));
+        assert!(at("drop default") < at("retype m"));
+        assert!(at("retype m") < at("retype tags"));
+        assert!(at("retype tags") < at("swap"));
+        assert!(at("swap") < at("set default"));
+        assert!(at("set default") < at("add check named"));
+        // The lexer cannot rule a check out by its text, so every check of a
+        // table with a moved column is rebuilt (`id > 0` names no label).
+        assert!(
+            rendered.contains(&"drop check other".to_owned()),
+            "{rendered:?}"
+        );
+        // A dialect that lets the engine rebuild its dependents plans none.
+        let plain = crate::diff(
+            side(&base),
+            side(&desired),
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect("a rebuild plans");
+        assert!(
+            !plain
+                .changes()
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, Change::DropCheck { .. })),
+        );
+        // Every step asks for the risk class, so the plan is gated.
+        assert!(
+            plan.changes()
+                .risks()
+                .contains(&pbps_model::RiskClass::TypeRebuild)
+        );
+    }
+
+    /// A view the same plan redefines, over a moved column, comes down before
+    /// the retypes and goes back after the swap, from its new text; one the
+    /// census did not find stays where the differ puts a restatement.
+    #[test]
+    fn a_module_the_plan_also_changes_comes_down_before_the_retypes_and_returns_with_its_new_text()
+    {
+        let id: pbps_model::ModuleId = "app.v".parse().unwrap();
+        let module = |text: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            description: None,
+            definition: text.into(),
+        };
+        let (mut base, mut desired) = (world(&["sad", "ok"]), world(&["ok"]));
+        base.0
+            .modules
+            .insert(id.clone(), module("SELECT m FROM app.t"));
+        desired
+            .0
+            .modules
+            .insert(id.clone(), module("SELECT m, id FROM app.t"));
+        let order = |hints: &Hints| -> Vec<String> {
+            crate::diff(side(&base), side(&desired), &Rebuilds, hints)
+                .expect("plans")
+                .changes()
+                .changes
+                .iter()
+                .filter_map(|p| match &p.change {
+                    Change::EnumRebuild {
+                        step: EnumRebuildStep::Retype { column, .. },
+                        ..
+                    } => Some(format!("retype {}", column.name.shown())),
+                    Change::EnumRebuild {
+                        step: EnumRebuildStep::Swap { .. },
+                        ..
+                    } => Some("swap".to_owned()),
+                    Change::DropModule { .. } => Some("drop view".to_owned()),
+                    Change::CreateModule { module, .. } => {
+                        Some(format!("create view {}", module.definition))
+                    }
+                    Change::AlterModule { module, .. } => {
+                        Some(format!("restate view {}", module.definition))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let found = Hints {
+            enum_dependents: [id].into(),
+            ..Default::default()
+        };
+        let steps = order(&found);
+        let at = |what: &str| {
+            steps
+                .iter()
+                .position(|s| s == what)
+                .unwrap_or_else(|| panic!("{what} in {steps:?}"))
+        };
+        assert!(at("drop view") < at("retype m"));
+        assert!(at("retype tags") < at("swap"));
+        assert!(at("swap") < at("create view SELECT m, id FROM app.t"));
+        assert!(
+            !steps.iter().any(|s| s.starts_with("restate view")),
+            "{steps:?}"
+        );
+        // Not found by the census, the restatement stays in its class, after
+        // the retypes, which is the plan the engine would refuse.
+        let plain = order(&Hints::default());
+        assert!(
+            plain.contains(&"restate view SELECT m, id FROM app.t".to_owned()),
+            "{plain:?}"
+        );
+        assert!(!plain.contains(&"drop view".to_owned()));
     }
 }

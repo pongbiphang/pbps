@@ -307,6 +307,20 @@ pub fn names(
         Change::DropType { uid, name, .. } => {
             nx.release(type_address(name), ObjectKey::Type(Recorded(uid.clone())))
         }
+        // The replacement holds its temporary name from its creation to the
+        // swap, which hands the type back its own (DEC-1635.7).
+        Change::EnumRebuild {
+            uid,
+            tmp,
+            step: crate::EnumRebuildStep::Create { .. },
+            ..
+        } => nx.claim(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
+        Change::EnumRebuild {
+            uid,
+            tmp,
+            step: crate::EnumRebuildStep::Swap { .. },
+            ..
+        } => nx.release(type_address(tmp), ObjectKey::Type(Recorded(uid.clone()))),
         Change::RenameType { uid, from, to, .. } => {
             let holder = ObjectKey::Type(Recorded(uid.clone()));
             nx.release(type_address(from), holder.clone());
@@ -567,6 +581,7 @@ pub fn names(
         // A module rebuilt in place keeps its name; the rest take none.
         Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::AlterModule { .. }
         | Change::AttachPartition { .. }
         | Change::AlterColumnType { .. }

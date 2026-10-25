@@ -302,6 +302,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
 
         Change::AddEnumValue { name, .. }
         | Change::RenameEnumValue { name, .. }
+        | Change::EnumRebuild { name, .. }
         | Change::CreateType { name, .. }
         | Change::DropType { name, .. }
         | Change::RenameType { from: name, .. } => Err(DialectError::Unsupported {

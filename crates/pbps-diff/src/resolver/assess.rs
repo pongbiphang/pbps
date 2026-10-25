@@ -220,7 +220,10 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         // namespace that an unqualified relation lookup on the path finds
         // (#1889). PostgreSQL's alone.
         | Change::AlterColumnNumbering { .. }
-        // A routine's identity, a view's columns, a type's existence.
+        // A routine's identity, a view's columns, a type's existence. A
+        // rebuild brings a type's temporary name in, moves columns to it and
+        // takes the old one out (DEC-1635.7).
+        | Change::EnumRebuild { .. }
         | Change::CreateModule { .. }
         | Change::DropModule { .. } => true,
         // Each creates or drops an index. Where an index's name is a

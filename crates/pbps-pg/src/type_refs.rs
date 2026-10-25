@@ -105,6 +105,8 @@ fn reference_uses<'a>(
                     types.push((TypeSide::Desired, base));
                 }
             }
+            // A rebuild's replacement is an enum with no references of its own.
+            Change::EnumRebuild { .. } => {}
             Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::DropColumn { .. }
@@ -194,6 +196,7 @@ pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeR
         match &planned.change {
             Change::AddEnumValue { name, .. }
             | Change::RenameEnumValue { name, .. }
+            | Change::EnumRebuild { name, .. }
             | Change::CreateType { name, .. }
             | Change::DropType { name, .. } => {
                 names.insert(name.clone());

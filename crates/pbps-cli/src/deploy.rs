@@ -4612,6 +4612,17 @@ fn refuse_pinned_movement(
                     expected_types.insert(name.clone(), Some(definition.as_ref()));
                 }
             }
+            // The replacement may stand anywhere between its creation and the
+            // swap, and no longer after it; the swap leaves the final labels
+            // under the type's own name (DEC-1635.7).
+            pbps_model::Change::EnumRebuild { uid, tmp, step, .. } => {
+                expected_types.entry(tmp.clone()).or_insert(None);
+                if let pbps_model::EnumRebuildStep::Swap { definition, .. } = step
+                    && let Some(name) = resolver.name(TypeSide::Desired, uid)
+                {
+                    expected_types.insert(name.clone(), Some(definition.as_ref()));
+                }
+            }
             _ => {}
         }
     }
@@ -6420,6 +6431,8 @@ pub fn cmd_bootstrap(
             // plan perfectly well.
             &pbps_model::Hints {
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
+                enum_comments: Default::default(),
+                enum_dependents: Default::default(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
                 // Carried for the same reason, and one more: it is what decides
@@ -7239,6 +7252,18 @@ pub fn cmd_plan_db(
                 hints.module_deps.insert(name.clone(), dependencies.clone());
             }
         }
+        // A rebuilt enum keeps its comment, which `CREATE TYPE` does not
+        // copy: it is a fact about the target, read before the differ writes
+        // the swap that carries it (DEC-1635.7).
+        if conn.driver() == pbps_db::Driver::Postgres {
+            let enums: Vec<_> = base
+                .types
+                .iter()
+                .filter(|(_, ty)| matches!(ty, pbps_model::ManagedType::Enum { .. }))
+                .map(|(name, _)| name.clone())
+                .collect();
+            hints.enum_comments = pbps_pg::type_rebuild::comments(&mut conn, &enums).await?;
+        }
         // SQL Server's computed columns that stand throughout are judged by
         // the catalog's edges below (`order_computed_by_edges`), under the
         // database's collation, not by the text screen (#1460).
@@ -7293,7 +7318,12 @@ pub fn cmd_plan_db(
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
+        // The modules a rebuilt enum's columns carry, found in the planning
+        // transaction and kept for every plan that follows it.
+        let enum_dependents = std::cell::RefCell::new(std::collections::BTreeSet::new());
         let diff_here = |also: &std::collections::BTreeSet<pbps_model::ModuleId>| {
+            let mut planning = hints.clone();
+            planning.enum_dependents = enum_dependents.borrow().clone();
             pbps_diff::diff_read_back(
                 pbps_diff::Side {
                     schema: &base,
@@ -7304,7 +7334,7 @@ pub fn cmd_plan_db(
                     ids: &resolved.ids,
                 },
                 dialect.as_ref(),
-                &hints,
+                &planning,
                 also,
                 screen,
                 &read_back,
@@ -7506,6 +7536,32 @@ pub fn cmd_plan_db(
                 }
                 diff_here(also).map_err(|errors| crate::Unexpressible(errors).into())
             };
+            // What stands on an enum this plan rebuilds is read first: the views,
+            // bodies and triggers over its columns come down and go back through
+            // the module rebuild below, and anything else is refused by name
+            // (DEC-1635.7).
+            let cs = if conn.driver() == pbps_db::Driver::Postgres
+                && cs.changes().changes.iter().any(|p| {
+                    matches!(p.change, pbps_model::Change::EnumRebuild { .. })
+                }) {
+                let census = pbps_pg::type_rebuild::census(
+                    &mut conn,
+                    cs.changes(),
+                    Some(&loaded.schema),
+                    &recorded_ids,
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if census.rebuild.is_empty() {
+                    cs
+                } else {
+                    enum_dependents.borrow_mut().extend(census.rebuild);
+                    rediff(&std::collections::BTreeSet::new())?
+                }
+            } else {
+                cs
+            };
             let (mut cs, dependents) = crate::engine::account_for_module_dependents(
                 &mut conn,
                 cs,
@@ -7622,6 +7678,25 @@ pub fn cmd_plan_db(
         let (mut cs, rename_evidence, dependents, rebuilds, drop_blockers, logical_slots, fills) =
             checks?;
         rollback?;
+        // Rows that hold a label an enum rebuild removes are counted now, by
+        // the same probes the apply runs, so the plan is refused by name and
+        // with a count before anything is written (DEC-1635.7).
+        if conn.driver() == pbps_db::Driver::Postgres
+            && cs.changes().changes.iter().any(|p| {
+                matches!(&p.change, pbps_model::Change::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Retype { removed, .. }, ..
+                } if !removed.is_empty())
+            })
+        {
+            run_probes(
+                &mut conn,
+                dialect.as_ref(),
+                &pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?,
+                &pbps_model::Partitions::default(),
+                None,
+            )
+            .await?;
+        }
         // Again, over what the dependents added: a rebuild the plan now
         // synthesizes needs the transaction as much as one it was given.
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
@@ -8692,6 +8767,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         )
         .await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
+        recheck_enum_rebuilds(conn, &plan.changes, &recorded_ids, false).await?;
         crate::engine::check_drop_blockers(
             conn,
             &plan.changes,
@@ -8903,9 +8979,17 @@ fn pinned_managed(
     set.extend(modules_after(recorded, changes, Settled::SoFar));
     // Existing-column operations carry no type. A missing saved pin must
     // still refuse, rather than erase a baseline reference from admission.
+    let mut references = crate::pins::external_references(&recorded.schema, &base_ids);
+    // A column a staged rebuild has already moved holds the replacement, which
+    // is the declared type's own until the swap names it back (DEC-1635.7).
+    for planned in &changes.changes {
+        if let pbps_model::Change::EnumRebuild { tmp, .. } = &planned.change {
+            references.remove(tmp);
+        }
+    }
     crate::pins::Managed {
         modules: set,
-        references: crate::pins::external_references(&recorded.schema, &base_ids),
+        references,
         declared_types: crate::pins::declared_requirements(&recorded.schema, &base_ids),
     }
 }
@@ -8981,6 +9065,29 @@ fn retain_managed_roles(schema: &mut Schema, ids: &IdsFile, dialect: &dyn Dialec
 /// hand, so the drift discipline applies to a half-finished plan as much as to
 /// a finished one: the live state has to still equal the checkpoint, or the
 /// remaining statements are being run against something nobody planned for.
+/// The census again, where the plan runs: a dependent that appeared on an
+/// enum after the plan was made is refused by name before the first statement
+/// (DEC-1635.7). Inside the apply's own transaction, after the lock.
+async fn recheck_enum_rebuilds(
+    conn: &mut Conn,
+    changes: &pbps_model::ChangeSet,
+    stored: &IdsFile,
+    resuming: bool,
+) -> anyhow::Result<()> {
+    if conn.driver() != pbps_db::Driver::Postgres
+        || !changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
+    {
+        return Ok(());
+    }
+    pbps_pg::type_rebuild::census(conn, changes, None, stored, resuming)
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 async fn apply_staged_under_lock<D: crate::emission::Engine>(
     conn: &mut Conn,
     d: &Deployment<'_, D>,
@@ -9242,6 +9349,19 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     // skips `preflight` entirely, so this is the only place the resumed
     // statements get their settings from (DECISIONS 415).
     pin_session(conn, dialect).await?;
+
+    // A staged run has no transaction of its own to carry the census: it reads
+    // in one that it rolls back, at a start and at a resume alike.
+    if start < statements.len() {
+        conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
+            .await?;
+        let seen = recheck_enum_rebuilds(conn, &plan.changes, &entry.snapshot.ids, resume).await;
+        let rolled = conn
+            .rollback(&dialect.transaction_framing(&pin_zone(conn)))
+            .await;
+        seen?;
+        rolled?;
+    }
 
     let total = statements.len();
     // Staged plans carry one logical change. A completed DROP has no catalog
@@ -15503,6 +15623,71 @@ mod tests {
             ]),
             2
         );
+    }
+
+    /// The steps of one enum's rebuild are one logical change to `--staged`,
+    /// which runs and resumes them statement by statement; the negatives are
+    /// two enums, and anything the rebuild drops and restores, each a change
+    /// of its own (DEC-1635.7).
+    #[test]
+    fn a_rebuilds_steps_are_one_logical_change_and_its_companions_are_not() {
+        use pbps_model::{Change, ChangeSet, EnumRebuildStep, ManagedType, PlannedChange};
+        let step = |uid: &str, step| Change::EnumRebuild {
+            uid: uid.parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step,
+        };
+        let definition = Box::new(ManagedType::Enum {
+            values: vec!["ok".into()],
+        });
+        let rebuild = |uid: &str| {
+            vec![
+                step(
+                    uid,
+                    EnumRebuildStep::Create {
+                        definition: definition.clone(),
+                        removed: vec![],
+                        ordinal: 0,
+                    },
+                ),
+                step(
+                    uid,
+                    EnumRebuildStep::Retype {
+                        column_uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, uid, 0),
+                        column: "app.t"
+                            .parse::<pbps_model::TableName>()
+                            .unwrap()
+                            .column("m"),
+                        to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+                        array: false,
+                        removed: vec![],
+                    },
+                ),
+                step(
+                    uid,
+                    EnumRebuildStep::Swap {
+                        definition: definition.clone(),
+                        comment: None,
+                    },
+                ),
+            ]
+        };
+        let count = |changes: Vec<Change>| {
+            crate::logical_changes(&ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            })
+        };
+        assert_eq!(count(rebuild("y_000001")), 1);
+        let mut two = rebuild("y_000001");
+        two.extend(rebuild("y_000002"));
+        assert_eq!(count(two), 2);
+        let mut with_default = rebuild("y_000001");
+        with_default.push(Change::DropCheck {
+            table: "app.t".parse().unwrap(),
+            name: "c".into(),
+        });
+        assert_eq!(count(with_default), 2);
     }
 
     /// DECISIONS 415: a probe is answered under the settings the statement it

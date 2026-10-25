@@ -650,8 +650,13 @@ impl Operation {
                 ObjectKey::Table(checked_relation(owners, &a.parent, Spelling::Final)?)
             }
 
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column_uid, .. },
+                ..
+            } => column(column_uid),
             Change::AddEnumValue { uid, .. }
             | Change::RenameEnumValue { uid, .. }
+            | Change::EnumRebuild { uid, .. }
             | Change::CreateType { uid, .. }
             | Change::DropType { uid, .. }
             | Change::RenameType { uid, .. } => ObjectKey::Type(recorded(uid)),
@@ -890,6 +895,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             // stands: neither starts or ends one.
             Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::RenameType { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }

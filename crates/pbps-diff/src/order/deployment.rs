@@ -2987,6 +2987,11 @@ fn touches(change: &Change, table: &TableName) -> bool {
         change,
         Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Create { .. }
+                    | pbps_model::EnumRebuildStep::Swap { .. },
+                ..
+            }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

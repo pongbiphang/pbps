@@ -293,6 +293,7 @@ impl<'a> TableChanges<'a> {
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }

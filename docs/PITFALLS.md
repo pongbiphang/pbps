@@ -2638,3 +2638,23 @@ the database default.
 into a code-page type. Where the column is in scope, it lends its own
 collation (`rows::in_column_collation`). Where it does not exist yet, use the
 declared one, `COLLATE` on the input.
+
+## Restored text binds to the type its name finds when it runs
+
+An enum rebuilt under its uid (DEC-1635.7) leaves the old type standing until
+its swap. Every default, check, key, index, view and body the plan restores
+from the declaration spells the type by name, and the engine binds a name when
+the statement runs: a `CHECK (m IN ('ok'))` restored while `app.mood` is still
+the old type stores constants of the old type, and the swap's `DROP TYPE` is
+then refused by the very object that was just put back. The first design put
+the swap last, in class 18, because a drop is last; measured, that is the
+wrong end. The swap sits with the retypes, in class 9, so that every restore
+of classes 9, 13 and 14 meets the final name.
+
+**The shape:** a plan that gives a name to a new object in the middle runs
+every statement that cites the name before it against the old object.
+
+**The rule.** When a step replaces the object a name finds, order it before
+the statements that cite the name, not after the statements that retire the
+old object. The restores come after the swap; the drops of what blocks it come
+before the retypes.

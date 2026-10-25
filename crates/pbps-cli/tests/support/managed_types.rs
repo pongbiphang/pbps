@@ -842,15 +842,9 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         let mood = pbps_load::load_type_str(&mood_path, &mood_text).unwrap();
         let phone = pbps_load::load_type_str(&phone_path, &phone_text).unwrap();
         let mut variants = Vec::new();
-        for labels in [vec!["sad"], vec!["ok", "sad"], vec!["blue", "ok"]] {
-            variants.push((
-                mood_path.clone(),
-                mood.name.clone(),
-                ManagedType::Enum {
-                    values: labels.into_iter().map(str::to_owned).collect(),
-                },
-            ));
-        }
+        // Enum label changes are executable (DEC-1635.6, DEC-1635.7); only the
+        // domain attributes below still refuse.
+        let _ = &mood;
         for field in 0..8 {
             let mut changed = phone.definition.clone();
             let ManagedType::Domain {
@@ -2902,8 +2896,6 @@ fn enum_label_removals_reorders_missing_sources_and_swaps_refuse_without_sql() {
         let file = d.dir.join("schema/app.e.type.yml");
         let path = d.dir.join("refused-labels.plan.json");
         for (values, expected) in [
-            ("[a]", "3b"),
-            ("[b, a]", "3b"),
             ("[{name: x, renamed_from: absent}, b]", "absent"),
             (
                 "[{name: x, renamed_from: a}, {name: red, renamed_from: a}]",
@@ -3476,5 +3468,1190 @@ fn enum_data_and_list_keys_keep_named_refusals_before_label_use_checks() {
                 assert!(!path.exists());
             }
         }
+    }
+}
+
+// ---- #1635 slice 3b: removing and reordering labels rebuilds the enum ----
+
+const MOOD_SQL: &str = "CREATE SCHEMA app;
+CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+COMMENT ON TYPE app.mood IS 'how it feels';
+CREATE TABLE app.u (m app.mood PRIMARY KEY);
+INSERT INTO app.u VALUES ('ok'),('happy');
+CREATE TABLE app.t (
+  id int PRIMARY KEY,
+  m app.mood NOT NULL DEFAULT 'ok' REFERENCES app.u (m),
+  tags app.mood[],
+  CONSTRAINT m_known CHECK (m IN ('ok','happy')));
+CREATE INDEX t_ok ON app.t (id) WHERE m = 'ok';
+INSERT INTO app.t VALUES (1,'ok','{ok,happy}'),(2,'happy',NULL);
+CREATE TABLE app.events (
+  id int NOT NULL,
+  m app.mood DEFAULT 'ok',
+  CONSTRAINT ev_known CHECK (m IN ('ok','happy'))) PARTITION BY LIST (id);
+CREATE TABLE app.events_1 PARTITION OF app.events FOR VALUES IN (1);
+INSERT INTO app.events VALUES (1,'happy');";
+
+/// A project adopted from a database that holds `sql`.
+fn adopted(server: &str, slug: &str, sql: &str) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(server, slug);
+    on_server(own.connection(), sql);
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", own.connection(), "--force"]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "adopt the enum before its rebuild",
+    ]));
+    (own, d)
+}
+
+fn declare_mood(d: &Demo, values: &str) {
+    std::fs::write(
+        d.dir.join("schema/app.mood.type.yml"),
+        format!("enum: app.mood\nvalues: {values}\n"),
+    )
+    .unwrap();
+    d.commit();
+}
+
+fn type_ids(d: &Demo) -> serde_json::Value {
+    let ids: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+    ids["types"].clone()
+}
+
+/// Whether `app.mood` holds exactly `labels`, in this order.
+fn mood_is(db: &str, labels: &[&str]) -> bool {
+    let ordered = labels
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("(n = {} AND enumlabel = '{l}')", i + 1))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    scalar(
+        db,
+        &format!(
+            "SELECT count(*)::bigint FROM (SELECT enumlabel, row_number() OVER (ORDER BY enumsortorder) AS n \
+             FROM pg_enum WHERE enumtypid = 'app.mood'::regtype) x WHERE {ordered}"
+        ),
+    ) == labels.len() as i64
+        && scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_enum WHERE enumtypid = 'app.mood'::regtype",
+        ) == labels.len() as i64
+}
+
+fn no_replacement_left(db: &str) -> bool {
+    scalar(
+        db,
+        "SELECT count(*)::bigint FROM pg_type WHERE typname LIKE 'pbps_rebuild_%'",
+    ) == 0
+}
+
+/// Everything a rebuild's plan asks for beside its own class: the checks, keys
+/// and indexes it restores are gated as they are in any plan.
+const REBUILD_ALLOW: [&str; 6] = [
+    "--allow",
+    "type-rebuild",
+    "--allow",
+    "constraint",
+    "--allow",
+    "destructive",
+];
+
+fn apply_rebuild(d: &Demo, db: &str, plan: &std::path::Path, extra: &[&str]) -> Output {
+    let checksum = plan_checksum(plan);
+    let mut args = vec![
+        "apply",
+        "--db",
+        db,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ];
+    args.extend(REBUILD_ALLOW);
+    args.extend(extra);
+    d.run(&args)
+}
+
+fn rebuild_steps(plan: &pbps_model::SavedPlan) -> usize {
+    plan.changes
+        .changes
+        .iter()
+        .filter(|p| matches!(p.change, pbps_model::Change::EnumRebuild { .. }))
+        .count()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_removes_and_reorders_labels_under_the_same_uid_and_converges() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "rebuild_labels1635", MOOD_SQL);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        assert_eq!(uids.as_object().unwrap().len(), 1);
+        // `sad` goes, and `happy` now sorts before `ok`.
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("rebuild.plan.json");
+        let plan = label_plan(&d, db, &path);
+        // Create, the retypes of t.m, t.tags, u.m and the partitioned root's m
+        // (never a partition), and the swap.
+        assert_eq!(rebuild_steps(&plan), 6, "{:#?}", plan.changes);
+        assert!(
+            plan.changes
+                .risks()
+                .contains(&pbps_model::RiskClass::TypeRebuild)
+        );
+        assert!(plan.changes.changes.iter().any(|p| matches!(
+            p.change,
+            pbps_model::Change::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Swap {
+                    comment: Some(_),
+                    ..
+                },
+                ..
+            }
+        )));
+
+        // Without the class: refused by name, and nothing ran.
+        let checksum = plan_checksum(&path);
+        let out = d.run(&[
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--allow",
+            "constraint",
+            "--allow",
+            "destructive",
+        ]);
+        assert_ne!(code(&out), 0);
+        assert!(stderr(&out).contains("type-rebuild"), "{}", stderr(&out));
+        assert!(mood_is(db, &["sad", "ok", "happy"]));
+        assert!(no_replacement_left(db));
+
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert!(no_replacement_left(db));
+        // The comment, the rows, the defaults and the checks, the key from
+        // enum to enum and the partial index all came back.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_description WHERE objoid = 'app.mood'::regtype AND description = 'how it feels'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.t WHERE m = 'ok' AND tags @> ARRAY['happy']::app.mood[]"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.events WHERE m = 'happy'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attrdef WHERE adrelid IN ('app.t'::regclass, 'app.events'::regclass)"
+            ),
+            2
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conname IN ('m_known','ev_known') AND convalidated AND conrelid IN ('app.t'::regclass, 'app.events'::regclass)"
+            ),
+            2
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE contype = 'f' AND conrelid = 'app.t'::regclass"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_ok'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid IN ('app.t'::regclass, 'app.u'::regclass, 'app.events'::regclass, 'app.events_1'::regclass) AND atttypid IN ('app.mood'::regtype, 'app.mood[]'::regtype)"
+            ),
+            5
+        );
+        // The uid is the one the project recorded, and the next plan is clean.
+        assert_eq!(type_ids(&d), uids);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        for _ in 0..2 {
+            succeeds(d.run(&["pull", "--db", db, "--force"]));
+            let pulled = pbps_load::load_schema_dir(&d.dir.join("schema"))
+                .unwrap()
+                .schema;
+            assert_eq!(
+                pulled.types[&"app.mood".parse().unwrap()],
+                ManagedType::Enum {
+                    values: vec!["happy".into(), "ok".into()]
+                }
+            );
+        }
+        assert_eq!(type_ids(&d), uids);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+
+        // A reorder alone removes nothing and rebuilds just the same.
+        declare_mood(&d, "[ok, happy]");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 6);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["ok", "happy"]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert_eq!(type_ids(&d), uids);
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_refuses_rows_holding_a_removed_label_with_a_count_per_column() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'sad','{sad,ok,sad}'),(2,'sad',NULL),(3,'ok','{happy}');";
+        let (own, d) = adopted(&server, "rebuild_rows1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[ok, happy]");
+        let path = d.dir.join("rows.plan.json");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            text.contains("2 rows of app.t.m holding a label this plan removes")
+                && text.contains("2 elements of app.t.tags holding a label this plan removes")
+                && text.contains("sad"),
+            "{text}"
+        );
+        assert!(!path.exists());
+        assert!(mood_is(db, &["sad", "ok", "happy"]));
+        assert!(no_replacement_left(db));
+        // Once no row holds the label, the same declaration plans.
+        on_server(
+            db,
+            "UPDATE app.t SET m = 'ok', tags = NULL WHERE id IN (1, 2)",
+        );
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 4);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["ok", "happy"]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let base = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood);
+            INSERT INTO app.t VALUES (1,'ok');";
+        for (slug, extra, expected) in [
+            ("domain", "CREATE DOMAIN app.d AS app.mood;", "domain app.d"),
+            (
+                "signature",
+                "CREATE FUNCTION app.f(x app.mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+                "as an argument",
+            ),
+            (
+                "policy",
+                "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY p ON app.t USING (m <> 'sad');",
+                "a policy",
+            ),
+            (
+                "generated_reader",
+                "ALTER TABLE app.t ADD COLUMN g boolean GENERATED ALWAYS AS (m = 'ok') STORED;",
+                "generated column",
+            ),
+            (
+                "generated_enum",
+                "ALTER TABLE app.t ADD COLUMN g app.mood GENERATED ALWAYS AS ('ok'::app.mood) STORED;",
+                "generated column of this enum",
+            ),
+            (
+                "composite",
+                "CREATE TYPE app.pair AS (x app.mood); CREATE TABLE app.c (p app.pair);",
+                "composite type",
+            ),
+            (
+                "privileges",
+                "REVOKE USAGE ON TYPE app.mood FROM PUBLIC;",
+                "explicit privilege list",
+            ),
+        ] {
+            let (own, d) = adopted(
+                &server,
+                &format!("rebuild_refuses_{slug}1635"),
+                &format!("{base} {extra}"),
+            );
+            let db = own.connection();
+            declare_mood(&d, "[ok, happy]");
+            let path = d.dir.join("refused.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{slug}");
+            let text = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(text.contains(expected), "{slug}: {text}");
+            assert!(!path.exists(), "{slug}");
+            assert!(mood_is(db, &["sad", "ok", "happy"]), "{slug}");
+            assert!(no_replacement_left(db), "{slug}");
+            assert_eq!(
+                scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                1,
+                "{slug}"
+            );
+        }
+        // A type owned by another role would lose its owner in the copy.
+        let role = format!("pbps_rebuild_owner_{}", std::process::id());
+        on_server(
+            &server,
+            &format!("DROP ROLE IF EXISTS {role}; CREATE ROLE {role}"),
+        );
+        let (own, d) = adopted(&server, "rebuild_refuses_owner1635", base);
+        let db = own.connection();
+        on_server(db, &format!("ALTER TYPE app.mood OWNER TO {role}"));
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "owner changed"]));
+        declare_mood(&d, "[ok, happy]");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--out",
+            d.dir.join("owner.plan.json").to_str().unwrap(),
+        ]);
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        drop(own);
+        on_server(&server, &format!("DROP ROLE IF EXISTS {role}"));
+        assert_ne!(code(&out), 0);
+        assert!(
+            text.contains("owned by a role other than the one deploying"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_rebuilds_views_bodies_and_triggers_over_its_columns() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok'),(2,'happy');
+            CREATE VIEW app.glad AS SELECT id, m FROM app.t WHERE m = 'happy'::app.mood;
+            CREATE VIEW app.moods AS SELECT m FROM app.t;
+            CREATE VIEW app.moods2 AS SELECT m FROM app.moods;
+            CREATE FUNCTION app.n() RETURNS int LANGUAGE sql
+              BEGIN ATOMIC SELECT count(*)::int FROM app.t WHERE m = 'ok'; END;
+            CREATE FUNCTION app.s() RETURNS bigint LANGUAGE sql AS $$ SELECT count(*) FROM app.t $$;
+            CREATE FUNCTION app.tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+            CREATE TRIGGER tr BEFORE UPDATE OF m ON app.t FOR EACH ROW EXECUTE FUNCTION app.tf();";
+        let (own, d) = adopted(&server, "rebuild_modules1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("modules.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let rebuilt: Vec<_> = plan
+            .changes
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
+            .collect();
+        // The views and the body that name a moved column, and the trigger,
+        // are rebuilt in place; the view over a view comes down and goes back
+        // beside them; the string-bodied function is left alone.
+        let touched = plan
+            .changes
+            .changes
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.change,
+                    pbps_model::Change::DropModule { .. } | pbps_model::Change::CreateModule { .. }
+                )
+            })
+            .count();
+        assert_eq!((rebuilt.len(), touched), (0, 10), "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.glad"), 1);
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.moods2"), 2);
+        assert_eq!(scalar(db, "SELECT app.n()::bigint"), 1);
+        assert_eq!(scalar(db, "SELECT app.s()"), 2);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_trigger WHERE tgname = 'tr' AND NOT tgisinternal"
+            ),
+            1
+        );
+        on_server(db, "UPDATE app.t SET m = 'happy' WHERE id = 1");
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_after_a_rename_in_the_same_plan_maps_labels_by_their_final_names() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'sad','{sad,ok}'),(2,'ok',NULL);";
+        let (own, d) = adopted(&server, "rebuild_rename1635", sql);
+        let db = own.connection();
+        // `sad` becomes `blue`; `happy` goes; the order changes too.
+        declare_mood(&d, "[ok, {name: blue, renamed_from: sad}]");
+        let path = d.dir.join("rename-rebuild.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+        );
+        assert_eq!(rebuild_steps(&plan), 4);
+        succeeds(apply_rebuild(&d, db, &path, &["--allow", "rename"]));
+        assert!(mood_is(db, &["ok", "blue"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.t WHERE m = 'blue' AND tags = ARRAY['blue','ok']::app.mood[]"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.t WHERE m = 'ok'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+/// A staged rebuild of `app.mood` that has made the replacement and moved every
+/// column to it, with the swap held back by a lock on the old type.
+struct HeldAtItsSwap {
+    child: std::process::Child,
+    release: std::sync::mpsc::Sender<()>,
+    gate: std::thread::JoinHandle<()>,
+    args: Vec<String>,
+}
+
+impl HeldAtItsSwap {
+    /// The process is killed and the run unlocked; the arguments that resume
+    /// it come back.
+    fn killed(mut self, d: &Demo, db: &str) -> Vec<String> {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.release.send(()).unwrap();
+        self.gate.join().unwrap();
+        succeeds(d.run(&["unlock", "--db", db]));
+        self.args
+    }
+
+    /// The lock goes, and the run goes on to its swap and its closing read.
+    fn released(mut self) -> std::process::ExitStatus {
+        self.release.send(()).unwrap();
+        self.gate.join().unwrap();
+        self.child.wait().unwrap()
+    }
+}
+
+fn staged_rebuild_held_at_its_swap(d: &Demo, db: &str, path: &std::path::Path) -> HeldAtItsSwap {
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        db,
+        "--staged",
+        "--out",
+        path.to_str().unwrap(),
+    ]));
+    let checksum = plan_checksum(path);
+    let args = [
+        "apply",
+        "--db",
+        db,
+        "--plan",
+        path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "type-rebuild",
+        "--staged",
+    ];
+    // A lock on the old type holds the swap's `DROP TYPE`, so the process
+    // stands after the replacement exists and both columns have moved.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (ready, locked) = std::sync::mpsc::channel::<()>();
+    let gate = {
+        let db = db.to_owned();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &db)
+                        .await
+                        .unwrap();
+                    conn.execute("BEGIN; COMMENT ON TYPE app.mood IS 'held'")
+                        .await
+                        .unwrap();
+                    ready.send(()).unwrap();
+                    held.recv().unwrap();
+                    conn.execute("ROLLBACK").await.unwrap();
+                });
+        })
+    };
+    locked.recv().unwrap();
+    let mut child = std::process::Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(args)
+        .stdout(std::fs::File::create(d.dir.join("staged.stdout")).unwrap())
+        .stderr(std::fs::File::create(d.dir.join("staged.stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        let done = latest_snapshot(db).staged.map_or(0, |s| s.completed);
+        if done >= 3 {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the apply ended early: {}{}",
+            std::fs::read_to_string(d.dir.join("staged.stdout")).unwrap_or_default(),
+            std::fs::read_to_string(d.dir.join("staged.stderr")).unwrap_or_default()
+        );
+        assert!(
+            start.elapsed().as_secs() < 120,
+            "the staged steps never ran"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Mid-rebuild: the replacement and the old type both stand, and both
+    // columns hold the replacement.
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_type WHERE typname LIKE 'pbps_rebuild_%' AND typtype = 'e'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid OR t.typarray = a.atttypid WHERE a.attrelid = 'app.t'::regclass AND t.typname LIKE 'pbps_rebuild_%'"
+        ),
+        2
+    );
+    HeldAtItsSwap {
+        child,
+        release,
+        gate,
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_stages_and_resumes_across_its_steps() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'ok','{happy}'),(2,'happy',NULL);";
+        let (own, d) = adopted(&server, "rebuild_staged1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("staged-rebuild.plan.json");
+        let args = staged_rebuild_held_at_its_swap(&d, db, &path).killed(&d, db);
+        let mut resume = args.clone();
+        resume.push("--resume".into());
+        succeeds(d.run(&resume.iter().map(String::as_str).collect::<Vec<_>>()));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert!(no_replacement_left(db));
+        succeeds(d.run(&["verify", "--db", db]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_apply_refuses_a_dependent_created_after_the_plan_by_name_and_applies_nothing() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'ok','{happy}'),(2,'happy',NULL);";
+        let (own, d) = adopted(&server, "rebuild_late1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let applied = scalar(
+            db,
+            "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'",
+        );
+        for staged in [false, true] {
+            let path = d.dir.join("late.plan.json");
+            let mut plan = vec!["plan", "--db", db, "--out", path.to_str().unwrap()];
+            if staged {
+                plan.push("--staged");
+            }
+            succeeds(d.run(&plan));
+            // Another session adds what the plan never saw.
+            on_server(db, "CREATE VIEW app.sneaky AS SELECT m FROM app.t");
+            let checksum = plan_checksum(&path);
+            let mut apply = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+            ];
+            apply.extend(REBUILD_ALLOW);
+            if staged {
+                apply.push("--staged");
+            }
+            let out = d.run(&apply);
+            assert_ne!(code(&out), 0, "{}", stdout(&out));
+            let text = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                text.contains("app.sneaky") && text.contains("after the plan"),
+                "{text}"
+            );
+            // Nothing ran: the old type stands and no replacement was made. A
+            // refusal inside the apply's transaction is recorded as the failed
+            // attempt it is, as any other is; no applied state follows it.
+            assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+            assert!(no_replacement_left(db));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'"
+                ),
+                applied,
+                "{text}"
+            );
+            on_server(db, "DROP VIEW app.sneaky");
+        }
+        // Once the stranger is gone, the same plan applies.
+        let path = d.dir.join("late.plan.json");
+        succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+    }
+}
+
+/// Rewrites, by `edit`, the one declaration file under `schema/` that holds
+/// `needle`, and commits.
+fn redeclare(d: &Demo, needle: &str, edit: impl Fn(&str) -> String) {
+    let files: Vec<_> = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains(needle)))
+        .collect();
+    assert_eq!(files.len(), 1, "{needle}: {files:?}");
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    let edited = edit(&text);
+    assert_ne!(text, edited, "{needle}: the edit changed nothing in {text}");
+    std::fs::write(&files[0], edited).unwrap();
+    d.commit();
+}
+
+fn modules_in(plan: &pbps_model::SavedPlan) -> (usize, usize, usize) {
+    let count = |f: fn(&pbps_model::Change) -> bool| {
+        plan.changes.changes.iter().filter(|p| f(&p.change)).count()
+    };
+    (
+        count(|c| matches!(c, pbps_model::Change::DropModule { .. })),
+        count(|c| matches!(c, pbps_model::Change::CreateModule { .. })),
+        count(|c| matches!(c, pbps_model::Change::AlterModule { .. })),
+    )
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_view_the_same_plan_redefines() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok'),(2,'happy'),(3,'ok');
+            CREATE VIEW app.glad AS SELECT id, m FROM app.t;";
+        let (own, d) = adopted(&server, "rebuild_redefined_view1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The view's text changes in the same plan as the labels.
+        redeclare(&d, "app.glad", |text| {
+            text.replace("FROM app.t", "FROM app.t WHERE id > 1")
+        });
+        let path = d.dir.join("redefined-view.plan.json");
+        let plan = label_plan(&d, db, &path);
+        // Down before the retypes, back after the swap with its new text; never
+        // restated in place, which would run with the old view standing.
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_views WHERE schemaname = 'app' AND viewname = 'glad' AND definition LIKE '%id > 1%'"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.glad WHERE m = 'happy'"
+            ),
+            1
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.glad"), 2);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_routine_body_the_same_plan_changes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok'),(2,'happy'),(3,'ok');
+            CREATE FUNCTION app.n() RETURNS int LANGUAGE sql
+              BEGIN ATOMIC SELECT count(*)::int FROM app.t WHERE m = 'ok'; END;";
+        let (own, d) = adopted(&server, "rebuild_redefined_body1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The body counts another label from now on.
+        redeclare(&d, "app.n()", |text| {
+            text.replace("'ok'::app.mood", "'happy'::app.mood")
+        });
+        let path = d.dir.join("redefined-body.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(scalar(db, "SELECT app.n()::bigint"), 1);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL DEFAULT 'ok',
+              CONSTRAINT m_known CHECK (m IN ('ok','happy')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'ok';
+            INSERT INTO app.t VALUES (1,'happy'),(2,'happy');";
+        let (own, d) = adopted(&server, "rebuild_redefined_parts1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The default, the check and the index filter all spell another label.
+        redeclare(&d, "m_known", |text| {
+            text.replace("'ok'::app.mood", "'happy'::app.mood")
+        });
+        let path = d.dir.join("redefined-parts.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        on_server(db, "INSERT INTO app.t (id) VALUES (3)");
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.t WHERE m = 'happy'"),
+            3
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_indexes WHERE schemaname = 'app' AND indexname = 't_m' AND indexdef LIKE '%happy%'"
+            ),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_beside_a_table_and_column_rename_over_a_default_and_check() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL DEFAULT 'ok',
+              CONSTRAINT m_known CHECK (m IN ('ok','happy')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'ok';
+            INSERT INTO app.t VALUES (1,'happy'),(2,'ok');";
+        let (own, d) = adopted(&server, "rebuild_renamed_parts1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The catalog still has `app.t.m` when the plan is made; the drops and
+        // restores of its default, check and index are written for the names
+        // the declarations leave.
+        redeclare(&d, "table: app.t\n", |text| {
+            text.replace("table: app.t\n", "table: app.tt\nrenamed_from: app.t\n")
+                .replace("  m:\n", "  mood:\n    renamed_from: m\n")
+                .replace("(m = ", "(mood = ")
+        });
+        // Identity for the renames is recorded locally and committed.
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("renamed-parts.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &["--allow", "rename"]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        on_server(db, "INSERT INTO app.tt (id) VALUES (3)");
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.tt WHERE mood = 'ok'"),
+            2
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+/// The check is judged by the engine against the replacement's label order, so
+/// the plan-time probe, which reads the old order, must not decide it.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'happy');";
+        let (own, d) = adopted(&server, "rebuild_order_check1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // `happy` is above `ok` today and below it once the rebuild has run.
+        redeclare(&d, "table: app.t\n", |text| {
+            format!("{text}checks:\n  m_low: m <= 'ok'::app.mood\n")
+        });
+        let path = d.dir.join("order-check.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conname = 'm_low'"
+            ),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+
+        // A check the stored data really violates under the new order is still
+        // refused. The plan-time probe stands aside for a retyped column, so
+        // the engine refuses it at apply: the transaction rolls back, the old
+        // type stands and no apply is recorded.
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok');";
+        let (own, d) = adopted(&server, "rebuild_order_check_bad1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        redeclare(&d, "table: app.t\n", |text| {
+            format!("{text}checks:\n  m_low: m <= 'happy'::app.mood\n")
+        });
+        let applied = scalar(
+            db,
+            "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'",
+        );
+        let path = d.dir.join("order-check-bad.plan.json");
+        label_plan(&d, db, &path);
+        let out = apply_rebuild(&d, db, &path, &[]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(text.contains("m_low"), "{text}");
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+        assert!(no_replacement_left(db));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            applied,
+            "{text}"
+        );
+    }
+}
+
+/// A column the plan drops, with intent, no longer holds the old type when the
+/// swap runs (classes 5 and 6 come before the create and the swap), so it is
+/// neither retyped nor refused as a blocker, and the default, check and index
+/// that stood on it go with it and are not restored.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_drops_a_column_and_its_parts_in_the_plan_that_removes_a_label() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood DEFAULT 'sad', n app.mood,
+              CONSTRAINT m_known CHECK (m IN ('sad','ok')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'sad';
+            INSERT INTO app.t VALUES (1,'sad','ok'),(2,'sad','happy');";
+        let (own, d) = adopted(&server, "rebuild_dropped_col1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        redeclare(&d, "table: app.t\n", |text| {
+            text.replace(
+                "  m:\n    type: app.mood\n    default: \"'sad'::app.mood\"\n",
+                "",
+            )
+            .replace(
+                "checks:\n  m_known: \"(m = ANY (ARRAY['sad'::app.mood, 'ok'::app.mood]))\"\n\n",
+                "",
+            )
+            .replace(
+                "indexes:\n  t_m:\n    columns: [id]\n    where: \"(m = 'sad'::app.mood)\"\n",
+                "",
+            )
+        });
+        // Without the intent the drop is not planned at all.
+        succeeds(d.run(&["intent", "--drop", "app.t.m", "column retired"]));
+        d.commit();
+        let path = d.dir.join("dropped-column.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropColumn { .. })),
+            "{:#?}",
+            plan.changes
+        );
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'm' AND NOT attisdropped"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conname = 'm_known'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_indexes WHERE indexname = 't_m'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.t WHERE n = 'happy'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+/// The same for a table the plan drops: its column, default, check and index
+/// go with it. A partitioned table cannot be dropped by a plan yet, so its
+/// partitions never reach the census this way.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_drops_a_table_holding_the_enum_in_the_plan_that_removes_a_label() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.keep (id int PRIMARY KEY, n app.mood);
+            CREATE TABLE app.gone (id int PRIMARY KEY, m app.mood DEFAULT 'sad', tags app.mood[],
+              CONSTRAINT gone_known CHECK (m IN ('sad','ok')));
+            CREATE INDEX gone_m ON app.gone (id) WHERE m = 'sad';
+            INSERT INTO app.keep VALUES (1,'ok'),(2,'happy');
+            INSERT INTO app.gone VALUES (1,'sad','{sad}'),(2,'sad',NULL);";
+        let (own, d) = adopted(&server, "rebuild_dropped_table1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        std::fs::remove_file(d.dir.join("schema/app.gone.yml")).unwrap();
+        succeeds(d.run(&["intent", "--drop-table", "app.gone", "table retired"]));
+        d.commit();
+        let path = d.dir.join("dropped-table.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_class WHERE relname = 'gone' AND relnamespace = 'app'::regnamespace"
+            ),
+            0
+        );
+        assert!(no_replacement_left(db));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The view reads the partition's column and shows text: nothing in its
+        // output is the enum, and the root's retype is what it stands in the way of.
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.parent (id int NOT NULL, m app.mood NOT NULL) PARTITION BY LIST (id);
+            CREATE TABLE app.child PARTITION OF app.parent FOR VALUES IN (1);
+            INSERT INTO app.parent VALUES (1,'ok'),(1,'happy');
+            CREATE VIEW app.shown AS SELECT m::text AS m FROM app.child;";
+        let (own, d) = adopted(&server, "rebuild_partition_view1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("partition-view.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        // Another session adds a second reader the plan never saw: refused by
+        // name before any statement, not by the engine halfway through.
+        on_server(
+            db,
+            "CREATE VIEW app.sneaky AS SELECT m::text AS m FROM app.child",
+        );
+        let out = apply_rebuild(&d, db, &path, &[]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            text.contains("app.sneaky") && text.contains("after the plan"),
+            "{text}"
+        );
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+        assert!(no_replacement_left(db));
+        on_server(db, "DROP VIEW app.sneaky");
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.shown"), 2);
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.shown WHERE m = 'ok'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_staged_closing_read_refuses_a_moved_column_another_session_retyped() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int, m app.mood, tags app.mood[]);
+            INSERT INTO app.t VALUES (1,'ok','{happy}'),(2,'happy',NULL);";
+        let (own, d) = adopted(&server, "rebuild_staged_retyped1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("staged-retyped.plan.json");
+        let held = staged_rebuild_held_at_its_swap(&d, db, &path);
+        // Between the column's retype and the closing read, another session
+        // moves it on to text. The swap has nothing to refuse it by: the old
+        // type no longer holds the column.
+        on_server(
+            db,
+            "ALTER TABLE app.t ALTER COLUMN m TYPE text USING m::text",
+        );
+        assert!(!held.released().success());
+        let text = [
+            std::fs::read_to_string(d.dir.join("staged.stdout")).unwrap_or_default(),
+            std::fs::read_to_string(d.dir.join("staged.stderr")).unwrap_or_default(),
+        ]
+        .concat();
+        assert!(
+            text.contains("app.t")
+                && text.contains("`m`")
+                && text.contains("does not have the type this plan gives it"),
+            "{text}"
+        );
+        // The column the session left alone was held to its type too, and
+        // passed: only the one it moved is named.
+        assert!(!text.contains("`tags`"), "{text}");
     }
 }

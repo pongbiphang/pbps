@@ -996,7 +996,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::RenameEnumValue { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
+        Change::AddEnumValue { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1413,6 +1413,57 @@ pub fn describe(c: &Change) -> String {
             Escaped(to),
             name.shown()
         ),
+        Change::EnumRebuild {
+            name, tmp, step, ..
+        } => match step {
+            pbps_model::EnumRebuildStep::Create {
+                definition,
+                removed,
+                ..
+            } => {
+                let labels = match definition.as_ref() {
+                    pbps_model::ManagedType::Enum { values } => values
+                        .iter()
+                        .map(|v| Escaped(v).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    pbps_model::ManagedType::Domain { .. } => String::new(),
+                };
+                let removed = if removed.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; removes {}",
+                        removed
+                            .iter()
+                            .map(|v| Escaped(v).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "~ rebuild enum {} as {} with labels {labels}{removed}",
+                    name.shown(),
+                    tmp.shown()
+                )
+            }
+            pbps_model::EnumRebuildStep::Retype { column, .. } => format!(
+                "~ move {} to the rebuilt {} (rewrites {}: ACCESS EXCLUSIVE lock and a full table rewrite)",
+                column.shown(),
+                name.shown(),
+                column.table.shown()
+            ),
+            pbps_model::EnumRebuildStep::Swap { comment, .. } => format!(
+                "~ drop the old {0} and rename {1} to {0}{2}",
+                name.shown(),
+                tmp.shown(),
+                if comment.is_some() {
+                    ", keeping its comment"
+                } else {
+                    ""
+                }
+            ),
+        },
         Change::CreateType {
             name, definition, ..
         } => format!("+ create {} {}", definition.kind(), name.shown()),
@@ -2154,6 +2205,66 @@ mod tests {
             }),
             "~ rename enum value old -> new\\nline in app.e"
         );
+    }
+
+    /// A rebuild's lines name the replacement, the labels that go, and for
+    /// each retype the table it rewrites and the lock it takes (DEC-1635.7).
+    #[test]
+    fn enum_rebuild_lines_name_the_rewritten_table_the_lock_and_the_removed_labels() {
+        use pbps_model::{Change, ColumnRef, EnumRebuildStep, ManagedType};
+        let step = |step| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step,
+        };
+        let definition = Box::new(ManagedType::Enum {
+            values: vec!["ok".into()],
+        });
+        let create = super::describe(&step(EnumRebuildStep::Create {
+            definition: definition.clone(),
+            removed: vec!["sad\nline".into()],
+            ordinal: 0,
+        }));
+        assert!(
+            create.contains("rebuild enum app.e as app.tmp")
+                && create.contains("removes sad\\nline"),
+            "{create}"
+        );
+        // A pure reorder removes nothing and says nothing about removal.
+        assert!(
+            !super::describe(&step(EnumRebuildStep::Create {
+                definition: definition.clone(),
+                removed: vec![],
+                ordinal: 0,
+            }))
+            .contains("removes")
+        );
+        let retype = super::describe(&step(EnumRebuildStep::Retype {
+            column_uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
+            column: ColumnRef {
+                table: "app.t".parse().unwrap(),
+                name: "m".into(),
+            },
+            to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+            array: false,
+            removed: vec![],
+        }));
+        assert!(
+            retype.contains("app.t.m")
+                && retype.contains("rewrites app.t")
+                && retype.contains("ACCESS EXCLUSIVE")
+                && retype.contains("full table rewrite"),
+            "{retype}"
+        );
+        let swap = |comment: Option<&str>| {
+            super::describe(&step(EnumRebuildStep::Swap {
+                definition: definition.clone(),
+                comment: comment.map(str::to_owned),
+            }))
+        };
+        assert!(swap(Some("c")).contains("keeping its comment"));
+        assert!(!swap(None).contains("comment"));
     }
 
     /// A numbering change's line shows the options each side sets, so an

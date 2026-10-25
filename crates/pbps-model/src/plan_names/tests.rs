@@ -46,6 +46,44 @@ fn alter(uid: &Uid, address: ColumnRef) -> PlannedChange {
     })
 }
 
+/// A rebuild's retype is the same column in the plan's history as any other
+/// alteration of it: an address the identities do not hold is refused.
+#[test]
+fn a_rebuilds_retype_is_a_step_of_its_column_and_must_agree_with_the_identities() {
+    let (owner, c) = (table("a"), column("c"));
+    let retype = |address: ColumnRef| {
+        p(Change::EnumRebuild {
+            uid: uid(UidKind::Type, "e"),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.pbps_rebuild_e".parse().unwrap(),
+            step: crate::EnumRebuildStep::Retype {
+                column_uid: c.clone(),
+                column: address,
+                to: crate::ColumnType::reference("app.e".parse().unwrap()),
+                array: false,
+                removed: vec![],
+            },
+        })
+    };
+    let known = ids(&[(&owner, t("a"))], &[(&c, t("a").column("c"))]);
+    let good = [retype(t("a").column("c"))];
+    let names = PlanNames::of(&good, &known).unwrap();
+    assert_eq!(
+        names.column_at(&c, At::After(0)),
+        Some((&owner, &crate::ColumnName::from("c")))
+    );
+    // The same step naming a column the identities do not hold under that
+    // address disagrees with them.
+    assert!(PlanNames::of(&[retype(t("a").column("other"))], &known).is_err());
+    assert!(
+        PlanNames::of(
+            &[retype(t("a").column("c"))],
+            &ids(&[(&owner, t("a"))], &[])
+        )
+        .is_err()
+    );
+}
+
 #[test]
 fn a_column_finds_its_untouched_owner_in_the_final_mapping() {
     let (owner, c) = (table("a"), column("c"));

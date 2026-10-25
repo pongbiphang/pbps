@@ -596,6 +596,20 @@ between a scalar and an array, which needs the `USING` of §5. User-defined
 elements are admitted by reference (#1523, DEC-1523.1). The decision record is
 DEC-1167.1.
 
+## Amendment 5 — the one `USING` pbps writes (#1635 slice 3b)
+
+§5 refuses to emit a `USING`, because a cast pbps chose is a data
+transformation nobody declared. A same-uid enum rebuild (DEC-1635.7) needs
+exactly one: `ALTER COLUMN c TYPE <replacement> USING c::text::<replacement>`
+(and `::<replacement>[]` for an array column). It is not a conversion pbps
+chose. The replacement carries the labels the declaration lists, each column
+value maps to the label of the same name, and no value changes; a row holding
+a label the declaration removed fails the cast, and the plan refuses it first
+with a per-column count. The exception is this cast alone, written for this
+change alone: no other change, type pair or declaration can obtain a `USING`,
+and a conversion that decides where data goes still needs the declared
+transformation §5 asks for.
+
 ## Placement
 
 The catalogue landed in Phase 5 step 2 (#77); the estimate landed in step 9

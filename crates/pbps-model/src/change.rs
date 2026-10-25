@@ -78,6 +78,10 @@ pub enum RiskClass {
     Numbering,
     /// Row-level access widens; explicit approval is required (DEC-1173.1).
     RowSecurity,
+    /// An enum is rebuilt under its uid (DEC-1635.7): every table with a
+    /// column of it is rewritten under ACCESS EXCLUSIVE, even for a pure
+    /// reorder.
+    TypeRebuild,
 }
 
 impl RiskClass {
@@ -95,6 +99,7 @@ impl RiskClass {
             RiskClass::GrantWiden => "grant-widen",
             RiskClass::Numbering => "numbering",
             RiskClass::RowSecurity => "row-security",
+            RiskClass::TypeRebuild => "type-rebuild",
         }
     }
 
@@ -145,13 +150,16 @@ impl RiskClass {
             RiskClass::RowSecurity => {
                 "row-level access can widen: rows previously hidden or protected can become accessible"
             }
+            RiskClass::TypeRebuild => {
+                "every table with a column of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure reorder, and the dependents on it are dropped and restored"
+            }
             RiskClass::Numbering => {
                 "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails, or one fails sooner because the numbers now end earlier"
             }
         }
     }
 
-    pub const ALL: [RiskClass; 11] = [
+    pub const ALL: [RiskClass; 12] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -163,6 +171,7 @@ impl RiskClass {
         RiskClass::GrantWiden,
         RiskClass::Numbering,
         RiskClass::RowSecurity,
+        RiskClass::TypeRebuild,
     ];
 }
 
@@ -245,6 +254,14 @@ pub enum Change {
         to: String,
         ordinal: usize,
         definition: Box<crate::ManagedType>,
+    },
+    /// A label removal or reorder, done by rebuilding the enum under the same
+    /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
+    EnumRebuild {
+        uid: Uid,
+        name: crate::TypeRef,
+        tmp: crate::TypeRef,
+        step: crate::EnumRebuildStep,
     },
     CreateType {
         uid: Uid,
@@ -1389,6 +1406,7 @@ impl Change {
         match self {
             Change::AddEnumValue { name, .. }
             | Change::RenameEnumValue { name, .. }
+            | Change::EnumRebuild { name, .. }
             | Change::CreateType { name, .. }
             | Change::DropType { name, .. } => name.raw().to_string(),
             Change::RenameType { from, .. } => from.raw().to_string(),
@@ -1483,7 +1501,11 @@ impl Change {
             | Change::SetEnsureKeys { table, .. }
             | Change::DetachPartition { table, .. }
             | Change::AttachPartition { table, .. } => table,
-            Change::DropColumn { column, .. }
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, .. },
+                ..
+            }
+            | Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
@@ -1495,6 +1517,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1599,6 +1622,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1724,6 +1748,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1786,7 +1811,11 @@ impl Change {
             Change::RenameColumn {
                 table, from, to, ..
             } => vec![table.column(from), table.column(to)],
-            Change::DropColumn { column, .. }
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, .. },
+                ..
+            }
+            | Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnExpression { column, .. }
@@ -1828,6 +1857,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1900,6 +1930,12 @@ impl Change {
                 }
                 out
             }
+            // The column holds the replacement type until the rebuild's last
+            // step names it back, so no read between them can promise it.
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, .. },
+                ..
+            } => vec![(column.clone(), ColumnField::Type)],
             // Not the type: the differ emits this change only where the type
             // is unchanged, and the statement restates the one it read.
             // Measured: `ALTER COLUMN` leaves the default constraint's stored
@@ -1956,6 +1992,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2033,6 +2070,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2130,6 +2168,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2161,6 +2200,7 @@ impl Change {
             Change::PublicExecution { .. } => (None, None),
             Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2274,6 +2314,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2328,6 +2369,13 @@ impl Change {
                     ColumnPromise::Collation(to_collation.as_ref()),
                 ),
             ],
+            // The type alone: the statement leaves the other fields as they
+            // were, and `columns_redefined` excludes only this one. Held at
+            // the closing read, the replacement having been named back.
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, to, .. },
+                ..
+            } => vec![(column.clone(), ColumnPromise::Type(to))],
             Change::AlterColumnNullability {
                 column,
                 to_nullable,
@@ -2388,6 +2436,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2425,7 +2474,11 @@ impl Change {
                 (table.column(to), Presence::Present),
             ],
             // Still there afterwards, whatever else changed about it.
-            Change::AlterColumnType { column, .. }
+            Change::EnumRebuild {
+                step: crate::EnumRebuildStep::Retype { column, .. },
+                ..
+            }
+            | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnExpression { column, .. }
@@ -2468,6 +2521,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2620,6 +2674,7 @@ impl Change {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2656,6 +2711,7 @@ impl Change {
             }
             Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2770,6 +2826,7 @@ impl Change {
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2833,6 +2890,7 @@ impl Change {
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2930,6 +2988,9 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             // application breaks on the spot. Same gate as the other renames.
             Change::RenameEnumValue { .. } | Change::RenameType { .. } | Change::RenameTable { .. } | Change::RenameColumn { .. } | Change::RenameRole { .. } => {
                 r.insert(RiskClass::Rename);
+            }
+            Change::EnumRebuild { .. } => {
+                r.insert(RiskClass::TypeRebuild);
             }
             Change::AlterColumnNullability {
                 to_nullable: false, ..
@@ -3461,6 +3522,21 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn enum_retype(column: &ColumnRef, to: &str) -> Change {
+        Change::EnumRebuild {
+            uid: uid("y_p3n8vd"),
+            name: "app.mood".parse().unwrap(),
+            tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
+            step: crate::EnumRebuildStep::Retype {
+                column_uid: uid("c_p3n8vd"),
+                column: column.clone(),
+                to: ty(to),
+                array: false,
+                removed: vec![],
+            },
+        }
+    }
+
     fn drop_column() -> Change {
         Change::DropColumn {
             uid: uid("c_k7x2mq"),
@@ -3980,6 +4056,45 @@ mod tests {
         assert_eq!(routine.subject(), "app.f(integer,text)");
     }
 
+    /// The column a rebuild moves is held to the type it has once the swap
+    /// has named the replacement back, so a session that retypes it in
+    /// between is found at the closing read (SPEC §7.6). The other steps move
+    /// no column and promise none.
+    #[test]
+    fn a_rebuilds_retype_promises_its_column_the_final_type_and_no_other_step_promises() {
+        let column: ColumnRef = "app.t".parse::<TableName>().unwrap().column("m");
+        let retype = enum_retype(&column, "app.mood");
+        let promised = retype.columns_promised();
+        assert_eq!(promised.len(), 1);
+        assert_eq!(promised[0].0, column);
+        assert!(matches!(&promised[0].1, ColumnPromise::Type(t) if **t == ty("app.mood")));
+        // An array column is held to the array.
+        let array = enum_retype(&column, "app.mood[]");
+        assert!(matches!(&array.columns_promised()[0].1, ColumnPromise::Type(t) if t.is_array()));
+        let definition = Box::new(crate::ManagedType::Enum {
+            values: vec!["ok".into()],
+        });
+        for step in [
+            crate::EnumRebuildStep::Create {
+                definition: definition.clone(),
+                removed: vec![],
+                ordinal: 0,
+            },
+            crate::EnumRebuildStep::Swap {
+                definition,
+                comment: None,
+            },
+        ] {
+            let change = Change::EnumRebuild {
+                uid: uid("y_p3n8vd"),
+                name: "app.mood".parse().unwrap(),
+                tmp: "app.pbps_rebuild_y_p3n8vd".parse().unwrap(),
+                step,
+            };
+            assert!(change.columns_promised().is_empty());
+        }
+    }
+
     /// Every field a change excludes from the shape comparison is a field
     /// the change promises a value for, so the exclusion is never wider than
     /// the check that stands in for it (173, 189). `Whole` on a column that
@@ -4023,6 +4138,7 @@ mod tests {
                 column: column.clone(),
                 reason: None,
             },
+            enum_retype(&column, "app.mood"),
         ];
         for change in &changes {
             for (excluded, field) in change.columns_redefined() {

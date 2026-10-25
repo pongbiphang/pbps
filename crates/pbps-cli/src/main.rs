@@ -4460,13 +4460,21 @@ pub(crate) fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
             built.insert(routine);
         }
     }
+    // The steps of one enum's rebuild are one change: a staged plan runs them
+    // statement by statement and resumes among them (DEC-1635.7). The
+    // defaults, checks, keys and modules it drops and restores are counted as
+    // the changes they are, so a rebuild with any is a transactional apply.
+    let mut rebuilt = std::collections::BTreeSet::new();
     cs.changes
         .iter()
         .filter(|planned| {
-            !matches!(
-                &planned.change,
-                pbps_model::Change::PublicExecution { routine, .. } if built.contains(routine)
-            )
+            if let pbps_model::Change::PublicExecution { routine, .. } = &planned.change {
+                !built.contains(routine)
+            } else if let pbps_model::Change::EnumRebuild { uid, .. } = &planned.change {
+                rebuilt.insert(uid)
+            } else {
+                true
+            }
         })
         .count()
 }
