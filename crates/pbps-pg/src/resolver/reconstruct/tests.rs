@@ -144,6 +144,80 @@ fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
     assert!(!rest.contains("GRANT"), "{rest}");
 }
 
+#[test]
+fn scratch_table_parts_lower_with_their_source_and_after_change_spelling() {
+    use pbps_model::operation::{Origin, Source, Spelling};
+    use pbps_model::plan_names::At;
+
+    let mut table = table();
+    table.foreign_keys.clear();
+    table.indexes.remove("plain");
+    let reconstruction = build_reconstruction(
+        &crate::Postgres::new(),
+        &[Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.t", 0),
+            name: TableName::new("app", "t"),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        }],
+    )
+    .unwrap();
+    let groups = reconstruction.lowered.groups();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.operation().to_string())
+            .collect::<Vec<_>>(),
+        ["0.0", "0.1", "0.2", "0.3"]
+    );
+    assert_eq!(
+        reconstruction
+            .steps
+            .iter()
+            .map(|step| (step.phase, step.declaration.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Phase::Tables, "table app.t"),
+            (Phase::Expressions, "the default of app.t.c"),
+            (Phase::Expressions, "check ck on app.t"),
+            (Phase::Expressions, "index ix on app.t"),
+        ]
+    );
+    assert_eq!(
+        reconstruction
+            .lowered
+            .statements()
+            .iter()
+            .map(|statement| statement.sql.as_str())
+            .collect::<Vec<_>>(),
+        [
+            r#"SET search_path = "app", "pg_temp";
+CREATE TABLE "app"."t" (
+    "c" numeric NULL
+) USING heap;
+SET search_path = '';"#,
+            r#"SET search_path = "app", "pg_temp";
+ALTER TABLE "app"."t" ALTER COLUMN "c" SET DEFAULT app.f(1)
+;
+SET search_path = '';"#,
+            r#"SET search_path = "app", "pg_temp";
+ALTER TABLE "app"."t" ADD CONSTRAINT "ck" CHECK (c > app.f(1)
+);
+SET search_path = '';"#,
+            r#"SET search_path = "app", "pg_temp";
+CREATE INDEX "ix" ON "app"."t" ("c" ASC) WHERE (c > app.f(1)
+);
+SET search_path = '';"#,
+        ]
+    );
+    for group in groups {
+        assert_eq!(group.origin(), &Origin::SplitPart(0));
+        assert_eq!(group.origin().source(), Source::Change(0));
+        assert_eq!(group.origin().spelling(), Spelling::At(At::After(0)));
+    }
+}
+
 /// What was made nameable after a module: every later module and every
 /// index with a predicate; one without exists before any module. A view is found by name; a routine only by the overload its step
 /// created, never by the first of its name. An object no compiled module is

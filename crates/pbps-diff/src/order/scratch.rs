@@ -2,7 +2,7 @@
 //! settlements finish before lowering; their constraints stay separate.
 use super::{Constraint, Schedule};
 use pbps_dialect::Dialect;
-use pbps_model::operation::{ModuleEdits, Operations};
+use pbps_model::operation::{ModuleEdits, Operations, Origin};
 use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
 use std::collections::BTreeSet;
 
@@ -171,11 +171,23 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         foreign,
     } = engine.blueprint(input);
     let source = &prepared.changes;
+    let mut part_counts = vec![0; source.changes.len()];
+    for part in &parts {
+        part_counts[part.operation] += 1;
+    }
     let operations = Operations::expanded(
         source.logical(),
-        parts
-            .iter()
-            .map(|p| (source.origins()[p.operation].clone(), p.change.clone())),
+        parts.iter().map(|part| {
+            // Scratch decomposition has the same source and after-change
+            // spelling as other splits, before either settlement moves it.
+            let mut origin = source.origins()[part.operation].clone();
+            if part_counts[part.operation] > 1
+                && let Origin::Whole(source) = origin
+            {
+                origin = Origin::SplitPart(source);
+            }
+            (origin, part.change.clone())
+        }),
         ModuleEdits::InPlace,
     );
     // Retain IDs assigned before either settlement; do not renumber split parts.
@@ -376,6 +388,8 @@ fn function_edges<E: Engine>(
 mod tests {
     use super::*;
     use pbps_dialect::PlanPayload;
+    use pbps_model::operation::{Source as LogicalSource, Spelling};
+    use pbps_model::plan_names::At;
     use pbps_model::resolver::OrderReason;
 
     impl Engine for pbps_dialect::MinimalDialect {
@@ -446,7 +460,98 @@ mod tests {
             .map(|op| (op.id().source(), op.id().part()))
             .collect::<Vec<_>>();
         assert_eq!(ids, [(0, 1), (0, 2), (0, 0)]);
+        for operation in plan.operations().iter() {
+            assert_eq!(operation.origin(), &Origin::SplitPart(0));
+            assert_eq!(operation.origin().source(), LogicalSource::Change(0));
+            assert_eq!(operation.origin().spelling(), Spelling::At(At::After(0)));
+        }
         assert_eq!(plan.changes().changes.len(), 3);
+    }
+    #[test]
+    fn unsplit_operations_keep_their_whole_origins_when_phases_move_them() {
+        let changes = vec![role("one"), role("two")];
+        let source = super::super::propose(ChangeSet {
+            changes: changes.clone(),
+        });
+        let prepared = prepare(
+            &source,
+            &Default::default(),
+            &Default::default(),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let plan = settle(
+            &pbps_dialect::MinimalDialect,
+            Input::new(
+                prepared,
+                parts(&changes, &[Phase::Modules, Phase::Tables]),
+                Vec::new(),
+                Vec::new(),
+                BTreeSet::new(),
+            ),
+        )
+        .unwrap();
+        let operations = plan.operations();
+        for (operation, source) in operations.iter().zip([1, 0]) {
+            assert_eq!(operation.id().to_string(), format!("{source}.0"));
+            assert_eq!(operation.origin(), &Origin::Whole(source));
+            assert_eq!(
+                operation.origin().spelling(),
+                Spelling::At(At::Before(source))
+            );
+        }
+        assert_eq!(operations.len(), 2);
+    }
+    #[test]
+    fn scratch_splits_keep_the_prepared_logical_source_and_existing_roles() {
+        let source = super::super::propose(ChangeSet {
+            changes: vec![role("other"), role("split")],
+        });
+        let mut schedule = Schedule::new(2);
+        schedule.edge(1, 0, super::super::Source::Effect, OrderReason::Structural);
+        let source = schedule.settle(source).unwrap().into_planning();
+        assert_eq!(source.origins(), [Origin::Whole(1), Origin::Whole(0)]);
+        for (origin, expected) in [
+            (Origin::Whole(1), Origin::SplitPart(1)),
+            (Origin::SplitPart(1), Origin::SplitPart(1)),
+            (
+                Origin::Teardown(LogicalSource::Change(1)),
+                Origin::Teardown(LogicalSource::Change(1)),
+            ),
+            (
+                Origin::Restoration(LogicalSource::Change(1)),
+                Origin::Restoration(LogicalSource::Change(1)),
+            ),
+        ] {
+            let mut prepared = prepare(
+                &source,
+                &Default::default(),
+                &Default::default(),
+                &pbps_dialect::MinimalDialect,
+            )
+            .unwrap();
+            // Existing expansion roles must survive any further blueprint split.
+            prepared.changes.origins[0] = origin;
+            let plan = settle(
+                &pbps_dialect::MinimalDialect,
+                Input::new(
+                    prepared,
+                    parts(&source.changes[..1], &[Phase::Expressions, Phase::Tables]),
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeSet::new(),
+                ),
+            )
+            .unwrap();
+            let operations = plan.operations();
+            assert_eq!(operations.len(), 2);
+            for (operation, part) in operations.iter().zip([1, 0]) {
+                assert_eq!(operation.id().to_string(), format!("1.{part}"));
+                assert_eq!(operation.origin(), &expected);
+                assert_eq!(operation.origin().source(), LogicalSource::Change(1));
+                assert_eq!(operation.origin().spelling(), expected.spelling());
+            }
+        }
     }
     #[test]
     fn a_generated_cycle_is_refused_with_its_original_change_names() {
