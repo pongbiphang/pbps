@@ -301,6 +301,10 @@ def main():
         # A key file's owner-only permission cannot be proved on Windows, so
         # the fixtures name this variable instead (fixtures.rs KEY_LINE).
         "PBPS_TEST_FINGERPRINT_KEY": fingerprint_key(),
+        # libtest runs each case on a thread sized by RUST_MIN_STACK (2 MiB by
+        # default). A debug build on Windows has larger frames, and the
+        # supplied-acquisition cases overflowed it (CI run 40228210801).
+        "RUST_MIN_STACK": str(8 * 1024 * 1024),
     }
 
     def run_cases(binary, label, filters, minimum, exact=False):
