@@ -1023,6 +1023,28 @@ async fn create_database(conn: &mut Conn, sql: &str) -> Result<(), pbps_db::DbEr
     }
 }
 
+/// `CREATE DATABASE` on `server` whose files carry a per-call suffix. Two
+/// LocalDB instances of one Windows user share their default directories, so
+/// the same database name on target and scratch would otherwise collide on
+/// one `.mdf` (5170, measured on the Windows job). The database name, and
+/// every option it inherits from model, are unchanged.
+async fn create_database_apart(server: &str, name: &str) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let files = format!(
+        "{name}_{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let sql = format!(
+        "DECLARE @d nvarchar(4000) = CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultDataPath')), \
+         @l nvarchar(4000) = CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultLogPath')); \
+         DECLARE @s nvarchar(max) = N'CREATE DATABASE [{name}] ON (NAME = N''{name}'', \
+         FILENAME = N''' + @d + N'{files}.mdf'') LOG ON (NAME = N''{name}_log'', \
+         FILENAME = N''' + @l + N'{files}_log.ldf'');'; EXEC (@s);"
+    );
+    let mut conn = connect_live(server).await.unwrap();
+    create_database(&mut conn, &sql).await.unwrap();
+}
+
 /// #1055: only Msg 1807 is retried, and only a bounded number of times;
 /// every other failure is reported on the first attempt.
 #[test]
