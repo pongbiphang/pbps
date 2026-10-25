@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_db::{Conn, DbError, Param};
 use pbps_diff::order::catalog::{Dependent, Holds, Part};
 use pbps_model::{
-    Change, ChangeSet, EnumRebuildStep, IdsFile, ModuleId, Schema, TableName, TypeRef,
+    Change, ChangeSet, ColumnName, EnumRebuildStep, IdsFile, ModuleId, Schema, TableName, TypeRef,
 };
 
 fn refused(why: String) -> DbError {
@@ -186,6 +186,10 @@ pub async fn census(
 
         // 1. Every column that holds the type or its array.
         let mut held = BTreeMap::new();
+        // The columns that follow a moved one down its partitions and
+        // inheritance children: the engine retypes them with the root, so
+        // what stands on them comes down with it.
+        let mut follow: BTreeSet<(String, String, String)> = BTreeSet::new();
         let mut names: BTreeMap<i64, TableName> = BTreeMap::new();
         for row in conn
             .query_with(
@@ -223,17 +227,14 @@ pub async fn census(
             let shown_column = format!("{}.{}.{}", h.schema, h.table, h.column);
             // A partition's column follows its root's retype; the root is the
             // ancestor that is not itself a partition.
-            let mut root = h;
-            while let Some(parent) = root.parent {
-                match held.get(&(parent, h.column.clone())) {
-                    Some(up) if h.kind == "r" || h.kind == "p" => root = up,
-                    _ => break,
-                }
-            }
+            let root = root_of(&held, h);
             let reached =
                 moved.contains(&(root.schema.clone(), root.table.clone(), root.column.clone()));
             let what: String = match h.kind.as_str() {
-                "r" | "p" if reached => continue,
+                "r" | "p" if reached => {
+                    follow.insert((h.schema.clone(), h.table.clone(), h.column.clone()));
+                    continue;
+                }
                 // An index holds the type in its key; the engine rebuilds it
                 // with the table, and one with constants of the type is
                 // judged below as a dependent.
@@ -296,7 +297,7 @@ pub async fn census(
         }
         // 4. Everything on a column the plan moves that the engine does not
         // rebuild: views, bodies, triggers, policies, generated columns.
-        for (schema, table, column) in &moved {
+        for (schema, table, column) in moved.union(&follow) {
             let rows = conn
                 .query_with(
                     "SELECT a.attrelid::int8 AS relation, a.attnum::int8 AS num
@@ -355,6 +356,19 @@ pub async fn census(
     Ok(out)
 }
 
+/// The column a partition's or child's follows when its root is retyped: the
+/// topmost ancestor that holds the same column.
+fn root_of<'a>(held: &'a BTreeMap<(i64, String), Held>, h: &'a Held) -> &'a Held {
+    let mut root = h;
+    while let Some(parent) = root.parent {
+        match held.get(&(parent, h.column.clone())) {
+            Some(up) if h.kind == "r" || h.kind == "p" => root = up,
+            _ => break,
+        }
+    }
+    root
+}
+
 /// Where a dependent was found: on the type, by a constant of it in an
 /// expression, or on a column the plan moves.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -370,17 +384,72 @@ enum Verdict {
     Refuse(String),
 }
 
-/// Whether the plan already drops `part` of `table`.
+/// The names the plan gives what the catalog still has under its old ones. The
+/// census reads the database before the plan runs, but the plan's own drops are
+/// written against the names the declarations give, so a table or column the
+/// same plan renames is looked up here before it is matched.
+#[derive(Default)]
+struct Renamed {
+    tables: BTreeMap<TableName, TableName>,
+    columns: BTreeMap<(TableName, ColumnName), ColumnName>,
+}
+
+impl Renamed {
+    fn of(changes: &ChangeSet) -> Self {
+        let mut out = Self::default();
+        for planned in &changes.changes {
+            if let Change::RenameTable { from, to, .. } = &planned.change {
+                out.tables.insert(from.clone(), to.clone());
+            }
+            // A column rename names its table as the plan leaves it; the
+            // catalog has the column under the table's name from before, when
+            // the plan renamed that too.
+            if let Change::RenameColumn {
+                table,
+                from,
+                to,
+                table_was,
+                ..
+            } = &planned.change
+            {
+                out.columns.insert(
+                    (
+                        table_was.clone().unwrap_or_else(|| table.clone()),
+                        from.clone(),
+                    ),
+                    to.clone(),
+                );
+            }
+        }
+        out
+    }
+
+    fn table(&self, live: &TableName) -> TableName {
+        self.tables.get(live).unwrap_or(live).clone()
+    }
+
+    fn column(&self, live: &TableName, column: &ColumnName) -> ColumnName {
+        self.columns
+            .get(&(live.clone(), column.clone()))
+            .unwrap_or(column)
+            .clone()
+    }
+}
+
+/// Whether the plan already drops `part` of `table`, a table as the database
+/// has it today.
 fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
+    let renamed = Renamed::of(changes);
+    let target = renamed.table(table);
     changes.changes.iter().any(|p| match (&p.change, part) {
-        (Change::DropCheck { table: t, name }, Part::Check(n)) => t == table && name == n,
-        (Change::DropIndex { table: t, name }, Part::Index(n)) => t == table && name == n,
+        (Change::DropCheck { table: t, name }, Part::Check(n)) => *t == target && name == n,
+        (Change::DropIndex { table: t, name }, Part::Index(n)) => *t == target && name == n,
         (
             Change::AlterColumnDefault {
                 column, to: None, ..
             },
             Part::Default(c),
-        ) => column.table == *table && column.name == *c,
+        ) => column.table == target && column.name == renamed.column(table, c),
         _ => false,
     })
 }
@@ -661,6 +730,159 @@ mod tests {
             ),
             Verdict::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn a_default_the_plan_drops_under_the_names_it_renames_to_is_the_one_the_catalog_has() {
+        // The catalog has `app.old.m`; the plan renames the table and the column
+        // and drops the default under the names it leaves.
+        let live = TableName::new("app", "old");
+        let target = TableName::new("app", "new");
+        let rename_table = Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "t", 0),
+            from: live.clone(),
+            to: target.clone(),
+            defaults: vec![],
+        };
+        let rename_column = Change::RenameColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
+            table: target.clone(),
+            from: "m".into(),
+            to: "mood".into(),
+            table_was: Some(live.clone()),
+        };
+        let drop_default = |table: &TableName, column: &str| Change::AlterColumnDefault {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
+            column: table.column(column),
+            from: Some("'a'".into()),
+            to: None,
+        };
+        let held = Holds::TablePart {
+            table: live.clone(),
+            part: Part::Default("m".into()),
+        };
+        let judge = |changes: Vec<Change>| {
+            verdict(
+                Level::Type,
+                &dependent(held.clone()),
+                &plan(changes),
+                Some(&Schema::default()),
+                &Default::default(),
+            )
+        };
+        assert!(matches!(
+            judge(vec![
+                rename_table.clone(),
+                rename_column.clone(),
+                drop_default(&target, "mood"),
+            ]),
+            Verdict::Fine
+        ));
+        // A table rename alone leaves the column's name.
+        assert!(matches!(
+            judge(vec![rename_table.clone(), drop_default(&target, "m")]),
+            Verdict::Fine
+        ));
+        // A real missing restore is still refused beside an unrelated rename,
+        // and so is a drop of another table's default or another column's.
+        assert!(matches!(
+            judge(vec![rename_table.clone(), rename_column.clone()]),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            judge(vec![
+                rename_table.clone(),
+                rename_column.clone(),
+                drop_default(&target, "m"),
+            ]),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            judge(vec![
+                rename_table,
+                rename_column,
+                drop_default(&live, "mood")
+            ]),
+            Verdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn a_check_and_an_index_on_a_renamed_table_are_matched_by_the_name_it_leaves() {
+        let live = TableName::new("app", "old");
+        let target = TableName::new("app", "new");
+        let rename = Change::RenameTable {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "t", 0),
+            from: live.clone(),
+            to: target.clone(),
+            defaults: vec![],
+        };
+        let at = |table: &TableName| {
+            [
+                Change::DropCheck {
+                    table: table.clone(),
+                    name: "c".into(),
+                },
+                Change::DropIndex {
+                    table: table.clone(),
+                    name: "i".into(),
+                },
+            ]
+        };
+        for part in [Part::Check("c".into()), Part::Index("i".into())] {
+            let held = Holds::TablePart {
+                table: live.clone(),
+                part,
+            };
+            let judge = |changes: Vec<Change>| {
+                verdict(
+                    Level::Type,
+                    &dependent(held.clone()),
+                    &plan(changes),
+                    Some(&Schema::default()),
+                    &Default::default(),
+                )
+            };
+            let mut renamed = vec![rename.clone()];
+            renamed.extend(at(&target));
+            assert!(matches!(judge(renamed), Verdict::Fine));
+            // Without the rename the drop names another table.
+            assert!(matches!(judge(at(&target).to_vec()), Verdict::Refuse(_)));
+        }
+    }
+
+    #[test]
+    fn a_partitions_column_follows_its_root_and_a_plain_table_does_not() {
+        let held = |relation: i64, parent: Option<i64>, kind: &str, table: &str| {
+            (
+                (relation, "m".to_owned()),
+                Held {
+                    parent,
+                    kind: kind.into(),
+                    schema: "app".into(),
+                    table: table.into(),
+                    column: "m".into(),
+                },
+            )
+        };
+        let all: BTreeMap<_, _> = [
+            held(1, None, "p", "root"),
+            held(2, Some(1), "p", "mid"),
+            held(3, Some(2), "r", "leaf"),
+            held(4, None, "r", "alone"),
+            // Its parent holds no such column: nothing to follow.
+            held(5, Some(9), "r", "orphan"),
+        ]
+        .into();
+        let root = |relation: i64| {
+            root_of(&all, &all[&(relation, "m".to_owned())])
+                .table
+                .clone()
+        };
+        assert_eq!(root(3), "root");
+        assert_eq!(root(2), "root");
+        assert_eq!(root(4), "alone");
+        assert_eq!(root(5), "orphan");
     }
 
     #[test]

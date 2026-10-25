@@ -4300,3 +4300,92 @@ fn enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes() {
         assert!(label_plan(&d, db, &path).changes.is_empty());
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_applies_beside_a_table_and_column_rename_over_a_default_and_check() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL DEFAULT 'ok',
+              CONSTRAINT m_known CHECK (m IN ('ok','happy')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'ok';
+            INSERT INTO app.t VALUES (1,'happy'),(2,'ok');";
+        let (own, d) = adopted(&server, "rebuild_renamed_parts1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // The catalog still has `app.t.m` when the plan is made; the drops and
+        // restores of its default, check and index are written for the names
+        // the declarations leave.
+        redeclare(&d, "table: app.t\n", |text| {
+            text.replace("table: app.t\n", "table: app.tt\nrenamed_from: app.t\n")
+                .replace("  m:\n", "  mood:\n    renamed_from: m\n")
+                .replace("(m = ", "(mood = ")
+        });
+        // Identity for the renames is recorded locally and committed.
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("renamed-parts.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &["--allow", "rename"]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        on_server(db, "INSERT INTO app.tt (id) VALUES (3)");
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.tt WHERE mood = 'ok'"),
+            2
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The view reads the partition's column and shows text: nothing in its
+        // output is the enum, and the root's retype is what it stands in the way of.
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.parent (id int NOT NULL, m app.mood NOT NULL) PARTITION BY LIST (id);
+            CREATE TABLE app.child PARTITION OF app.parent FOR VALUES IN (1);
+            INSERT INTO app.parent VALUES (1,'ok'),(1,'happy');
+            CREATE VIEW app.shown AS SELECT m::text AS m FROM app.child;";
+        let (own, d) = adopted(&server, "rebuild_partition_view1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        let path = d.dir.join("partition-view.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(modules_in(&plan), (1, 1, 0), "{:#?}", plan.changes);
+        // Another session adds a second reader the plan never saw: refused by
+        // name before any statement, not by the engine halfway through.
+        on_server(
+            db,
+            "CREATE VIEW app.sneaky AS SELECT m::text AS m FROM app.child",
+        );
+        let out = apply_rebuild(&d, db, &path, &[]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            text.contains("app.sneaky") && text.contains("after the plan"),
+            "{text}"
+        );
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+        assert!(no_replacement_left(db));
+        on_server(db, "DROP VIEW app.sneaky");
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.shown"), 2);
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.shown WHERE m = 'ok'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}

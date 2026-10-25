@@ -3167,6 +3167,18 @@ those needed a change. Pinned by
 `a_module_the_plan_also_changes_comes_down_before_the_retypes_and_returns_with_its_new_text`
 and the live `enum_rebuild_applies_with_*` tests.
 
+The census reads the database before the plan runs, so a table or column the
+same plan renames is still under its old name there while the plan's drops of
+its default, check and index are written for the names the declarations leave.
+Every match of a catalog name against the plan goes through the plan's own
+renames first (`Renamed`). A partitioned or inherited column moves with its
+root, so what stands on every such column is read, not only on the root's: a
+view of a partition's column that shows no enum is still one the retype
+aborts on. Pinned by `a_default_the_plan_drops_under_the_names_it_renames_to_is_the_one_the_catalog_has`,
+`a_partitions_column_follows_its_root_and_a_plain_table_does_not` and the live
+`enum_rebuild_applies_beside_a_table_and_column_rename_*` and
+`enum_rebuild_rebuilds_a_view_over_a_partitions_column_*` tests.
+
 Census at apply: the same census runs again where the plan runs, in the apply's
 own transaction after the lock and before the first statement. A staged run
 reads it in a transaction it rolls back, at its start and at every resume (a
