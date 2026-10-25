@@ -15896,15 +15896,22 @@ async fn wait_until_queued_for(conn: &mut Conn, relation: i64) {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized() {
     let s = emit_schema("relock_view");
-    let mut a = connect().await;
+    let db = TestDb::create("relock_view2343").await;
+    let mut a = db.second().await;
+    state::ensure_tables(&mut a).await.unwrap();
+    let name = "v\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let shown = r"v\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let v = format!("\"{name}\"");
+    let old = format!("\"{name}_old\"");
     fresh(&mut a, &s).await;
     for sql in [
         format!("CREATE TABLE {s}.t (id int primary key)"),
-        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!("INSERT INTO {s}.t VALUES (7)"),
+        format!("CREATE VIEW {s}.{v} AS SELECT id FROM {s}.t"),
     ] {
         a.execute(&sql).await.expect("build");
     }
-    let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
+    let id: pbps_model::ModuleId = format!("{s}.{name}").parse().expect("a module id");
 
     // Nothing concurrent: the lock is the view's own and the answer says so.
     let quiet = read_a_rebuild(
@@ -15914,6 +15921,7 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
         &pbps_model::ChangeSet::default(),
     )
     .await;
+    assert_eq!(quiet.refusal(), None);
     match &quiet.serialized {
         pbps_pg::modules::Serialized::By(what) => {
             assert!(what.contains("the view's own"), "{what}");
@@ -15926,16 +15934,16 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
         &format!(
             "SELECT c.oid::int8 FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+              WHERE n.nspname = '{s}' AND c.relname = '{name}'"
         ),
     )
     .await;
 
-    let mut b = connect().await;
+    let mut b = db.second().await;
     b.execute("BEGIN").await.expect("the other session's own");
     for sql in [
-        format!("ALTER VIEW {s}.v RENAME TO v_old"),
-        format!("CREATE VIEW {s}.v AS SELECT id FROM {s}.t"),
+        format!("ALTER VIEW {s}.{v} RENAME TO {old}"),
+        format!("CREATE VIEW {s}.{v} AS SELECT id FROM {s}.t"),
     ] {
         b.execute(&sql).await.expect("rename and replace");
     }
@@ -15953,24 +15961,26 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
     rollback(&mut a).await;
 
     let refused = answered.expect_err("the lock landed on the replacement");
-    let said = format!("{refused}");
-    assert!(
-        said.contains("moved between this rebuild's read and its lock"),
-        "{said}"
-    );
-    // Both objects, and by more than a name they now share.
-    assert!(said.contains(&format!("oid {original}")), "{said}");
+    let said_replacement = format!("{refused}");
     let replacement = oid(
         &mut a,
         &format!(
             "SELECT c.oid::int8 FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+              WHERE n.nspname = '{s}' AND c.relname = '{name}'"
         ),
     )
     .await;
     assert_ne!(original, replacement, "the race never happened");
-    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+    assert_eq!(number(&mut a, &format!("SELECT id FROM {s}.{v}")).await, 7);
+    assert_eq!(
+        number(&mut a, &format!("SELECT id FROM {s}.{old}")).await,
+        7
+    );
+    assert_eq!(
+        number(&mut a, "SELECT count(*)::int FROM public.__pbps_state").await,
+        0
+    );
 
     // The other shape of the same window: the name is taken by something that
     // is not a view at all. `LOCK TABLE` is happy to lock a table, and the
@@ -15982,14 +15992,15 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
         &format!(
             "SELECT c.oid::int8 FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = '{s}' AND c.relname = 'v'"
+              WHERE n.nspname = '{s}' AND c.relname = '{name}'"
         ),
     )
     .await;
     b.execute("BEGIN").await.expect("the other session's own");
     for sql in [
-        format!("DROP VIEW {s}.v"),
-        format!("CREATE TABLE {s}.v (id int primary key)"),
+        format!("DROP VIEW {s}.{v}"),
+        format!("CREATE TABLE {s}.{v} (id int primary key)"),
+        format!("INSERT INTO {s}.{v} VALUES (99)"),
     ] {
         b.execute(&sql).await.expect("drop and take the name");
     }
@@ -16005,13 +16016,111 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
     rollback(&mut a).await;
     let refused = answered.expect_err("the lock landed on a table wearing the view's name");
     let said = format!("{refused}");
-    assert!(said.contains("reaches no view at all"), "{said}");
-    assert!(
-        said.contains(&format!("oid {taken}, which is no longer in the catalog")),
-        "{said}"
+    assert_eq!(number(&mut a, &format!("SELECT id FROM {s}.{v}")).await, 99);
+    assert_eq!(
+        number(&mut a, "SELECT count(*)::int FROM public.__pbps_state").await,
+        0
+    );
+    drop(b);
+    drop(a);
+    db.drop().await;
+
+    assert_eq!(
+        said_replacement,
+        format!(
+            "`{s}.{shown}` moved between this rebuild's read and its lock: the reads that say what a \
+             rebuild would destroy are keyed to view {s}.\"{shown}_old\" (oid {original}), and with the view's own ACCESS EXCLUSIVE lock held that name \
+             means view {s}.\"{shown}\" (oid {replacement}). Another session renamed or dropped the object and gave its name away in \
+             between, and a `LOCK TABLE` resolves its name when it runs -- so the lock is held on something other than what the reads describe.\nNothing is reported rather than an answer about one \
+             object beside a lock on another: the `DROP` that follows goes by name, so it would \
+             destroy whatever stands under it -- an object no plan approved over. Run the deploy \
+             again once the other session has finished."
+        )
+    );
+    assert_eq!(
+        said,
+        format!(
+            "`{s}.{shown}` moved between this rebuild's read and its lock: the reads that say what a \
+             rebuild would destroy are keyed to oid {taken}, which is no longer in the catalog, and with the view's own ACCESS EXCLUSIVE lock held that name \
+             reaches no view at all. Another session renamed or dropped the object and gave its name away in \
+             between, and a `LOCK TABLE` resolves its name when it runs -- so the lock is held on something other than what the reads describe.\nNothing is reported rather than an answer about one \
+             object beside a lock on another: the `DROP` that follows goes by name, so it would \
+             destroy whatever stands under it -- an object no plan approved over. Run the deploy \
+             again once the other session has finished."
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn extension_catalog_descriptions_are_shown_once_in_rebuild_refusals() {
+    let mut db = TestDb::create("extension_description2343").await;
+    state::ensure_tables(&mut db.conn).await.unwrap();
+    db.conn
+        .execute("CREATE FUNCTION public.tied(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$")
+        .await
+        .unwrap();
+    let id: pbps_model::ModuleId = "public.tied(integer)".parse().unwrap();
+    let kind = pbps_model::ModuleKind::Function;
+    let changes = pbps_model::ChangeSet::default();
+    assert_eq!(
+        read_a_rebuild(&mut db.conn, &id, kind, &changes)
+            .await
+            .refusal(),
+        None
     );
 
-    drop_schema(&mut a, &s).await;
+    in_a_transaction(&mut db.conn).await;
+    db.conn
+        .execute("ALTER FUNCTION public.tied(int) DEPENDS ON EXTENSION plpgsql")
+        .await
+        .unwrap();
+    // PostgreSQL has no ALTER EXTENSION RENAME. Change only this private
+    // database's catalog row, inside the transaction rolled back below, so
+    // pg_describe_object itself supplies the hostile spelling under test.
+    let name = "ext\n\u{1b}\u{202e}\\n\\u{1b}é";
+    db.conn
+        .query_with(
+            "UPDATE pg_catalog.pg_extension SET extname = $1 WHERE extname = 'plpgsql'",
+            &[pbps_db::Param::Str(name)],
+        )
+        .await
+        .unwrap();
+    let rebuilt = pbps_pg::modules::before_a_rebuild(&mut db.conn, &id, kind, &changes)
+        .await
+        .unwrap();
+    let refused = rebuilt
+        .refusal()
+        .expect("an extension tie cannot be restored");
+    rollback(&mut db.conn).await;
+
+    assert_eq!(number(&mut db.conn, "SELECT public.tied(7)").await, 7);
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT count(*)::int FROM public.__pbps_state"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        read_a_rebuild(&mut db.conn, &id, kind, &changes)
+            .await
+            .refusal(),
+        None
+    );
+    db.drop().await;
+    assert_eq!(rebuilt.carries.len(), 1);
+    assert_eq!(
+        refused,
+        "`public.tied(integer)` cannot be rebuilt: this engine has no `CREATE OR ALTER`, so every module change \
+         is a drop and a create (ADR-0009 section 3), and the catalog holds things for this object \
+         that a `CREATE` would not put back:\n\
+         - a `DEPENDS ON EXTENSION` tie, which a `DROP` destroys and no declaration here can restore: \
+         extension ext\\n\\u{1b}\\u{202e}\\\\n\\\\u{1b}é\n\
+         Declare them, or undo them, and plan again. \
+         Proceeding would report success while quietly changing who may use this object."
+    );
 }
 
 /// The same window, one relation over: a trigger's lock is its **parent
@@ -16028,19 +16137,27 @@ async fn a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than_serialized() {
     let s = emit_schema("relock_trigger");
-    let mut a = connect().await;
+    let db = TestDb::create("relock_trigger2343").await;
+    let mut a = db.second().await;
+    state::ensure_tables(&mut a).await.unwrap();
+    let name = "a\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let shown = r"a\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let tname = format!("\"{name}\"");
     fresh(&mut a, &s).await;
     for sql in [
         format!("CREATE TABLE {s}.t (id int primary key)"),
+        format!("INSERT INTO {s}.t VALUES (7)"),
         format!(
             "CREATE FUNCTION {s}.trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
              END $$"
         ),
-        format!("CREATE TRIGGER a AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+        format!(
+            "CREATE TRIGGER {tname} AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"
+        ),
     ] {
         a.execute(&sql).await.expect("build");
     }
-    let id: pbps_model::ModuleId = format!("{s}.t.a").parse().expect("a module id");
+    let id: pbps_model::ModuleId = format!("{s}.t.{name}").parse().expect("a module id");
 
     let quiet = read_a_rebuild(
         &mut a,
@@ -16049,6 +16166,7 @@ async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than
         &pbps_model::ChangeSet::default(),
     )
     .await;
+    assert_eq!(quiet.refusal(), None);
     match &quiet.serialized {
         pbps_pg::modules::Serialized::By(what) => {
             assert!(what.contains("parent table"), "{what}");
@@ -16069,16 +16187,19 @@ async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than
         "SELECT tg.oid::int8 FROM pg_catalog.pg_trigger tg
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = '{s}' AND c.relname = 't' AND tg.tgname = 'a'"
+          WHERE n.nspname = '{s}' AND c.relname = 't' AND tg.tgname = '{name}'"
     );
     let original = oid(&mut a, &trigger).await;
 
-    let mut b = connect().await;
+    let mut b = db.second().await;
     b.execute("BEGIN").await.expect("the other session's own");
     for sql in [
         format!("ALTER TABLE {s}.t RENAME TO t_old"),
         format!("CREATE TABLE {s}.t (id int primary key)"),
-        format!("CREATE TRIGGER a AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"),
+        format!("INSERT INTO {s}.t VALUES (99)"),
+        format!(
+            "CREATE TRIGGER {tname} AFTER INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.trf()"
+        ),
     ] {
         b.execute(&sql)
             .await
@@ -16104,16 +16225,33 @@ async fn a_triggers_parent_replaced_while_its_lock_queued_is_refused_rather_than
 
     let refused = answered.expect_err("the lock landed on the replacement's parent");
     let said = format!("{refused}");
-    assert!(
-        said.contains("moved between this rebuild's read and its lock"),
-        "{said}"
-    );
-    assert!(said.contains(&format!("oid {original}")), "{said}");
     let replacement = oid(&mut a, &trigger).await;
     assert_ne!(original, replacement, "the race never happened");
-    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+    assert_eq!(number(&mut a, &format!("SELECT id FROM {s}.t")).await, 99);
+    assert_eq!(
+        number(&mut a, &format!("SELECT id FROM {s}.t_old")).await,
+        7
+    );
+    assert_eq!(
+        number(&mut a, "SELECT count(*)::int FROM public.__pbps_state").await,
+        0
+    );
+    drop(b);
+    drop(a);
+    db.drop().await;
 
-    drop_schema(&mut a, &s).await;
+    assert_eq!(
+        said,
+        format!(
+            "`{s}.t.{shown}` moved between this rebuild's read and its lock: the reads that say what a \
+             rebuild would destroy are keyed to trigger {shown} on table {s}.t_old (oid {original}), and with the trigger's parent table's ACCESS EXCLUSIVE lock held that name \
+             means trigger {shown} on table {s}.t (oid {replacement}). Another session renamed or dropped the object and gave its name away in \
+             between, and a `LOCK TABLE` resolves its name when it runs -- so the lock is held on something other than what the reads describe.\nNothing is reported rather than an answer about one \
+             object beside a lock on another: the `DROP` that follows goes by name, so it would \
+             destroy whatever stands under it -- an object no plan approved over. Run the deploy \
+             again once the other session has finished."
+        )
+    );
 }
 
 /// Waits until the rebuild is queued behind `conn`'s own transaction.
@@ -16164,18 +16302,24 @@ async fn wait_until_something_queues_behind(conn: &mut Conn) {
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialized() {
     let s = emit_schema("relock_routine");
-    let mut a = connect().await;
+    let db = TestDb::create("relock_routine2343").await;
+    let mut a = db.second().await;
+    state::ensure_tables(&mut a).await.unwrap();
+    let name = "f\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let shown = r"f\n\u{1b}\u{202e}\\n\\u{1b}é";
+    let fname = format!("\"{name}\"");
+    let old = format!("\"{name}_old\"");
     fresh(&mut a, &s).await;
     a.execute(&format!(
-        "CREATE FUNCTION {s}.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"
+        "CREATE FUNCTION {s}.{fname}(n int) RETURNS int LANGUAGE sql AS $$ SELECT n $$"
     ))
     .await
     .expect("build");
-    let id: pbps_model::ModuleId = format!("{s}.f(integer)").parse().expect("a module id");
+    let id: pbps_model::ModuleId = format!("{s}.{name}(integer)").parse().expect("a module id");
     let find = format!(
         "SELECT p.oid::int8 FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-          WHERE n.nspname = '{s}' AND p.proname = 'f'"
+          WHERE n.nspname = '{s}' AND p.proname = '{name}'"
     );
 
     // Nothing concurrent: both halves of the name are held, and the answer
@@ -16187,6 +16331,7 @@ async fn a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialize
         &pbps_model::ChangeSet::default(),
     )
     .await;
+    assert_eq!(quiet.refusal(), None);
     match &quiet.serialized {
         pbps_pg::modules::Serialized::By(what) => {
             assert!(what.contains("`pg_proc` entry"), "{what}");
@@ -16198,11 +16343,13 @@ async fn a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialize
     }
 
     let original = oid(&mut a, &find).await;
-    let mut b = connect().await;
+    let mut b = db.second().await;
     b.execute("BEGIN").await.expect("the other session's own");
     for sql in [
-        format!("ALTER FUNCTION {s}.f(int) RENAME TO f_old"),
-        format!("CREATE FUNCTION {s}.f(n int) RETURNS int LANGUAGE sql AS $$ SELECT n * 2 $$"),
+        format!("ALTER FUNCTION {s}.{fname}(int) RENAME TO {old}"),
+        format!(
+            "CREATE FUNCTION {s}.{fname}(n int) RETURNS int LANGUAGE sql AS $$ SELECT n * 2 $$"
+        ),
     ] {
         b.execute(&sql).await.expect("rename and replace");
     }
@@ -16226,20 +16373,30 @@ async fn a_routine_replaced_before_its_row_lock_is_refused_rather_than_serialize
 
     let refused = answered.expect_err("the name means the replacement");
     let said = format!("{refused}");
-    assert!(
-        said.contains("moved between this rebuild's read and its lock"),
-        "{said}"
-    );
-    // The cause named for this arm is its own: the lock is on the right row,
-    // and it is the *name* that moved. Saying a `LOCK TABLE` resolved late
-    // would send an operator looking for a statement this arm never runs.
-    assert!(said.contains("the row lock is keyed by oid"), "{said}");
-    assert!(said.contains(&format!("oid {original}")), "{said}");
     let replacement = oid(&mut a, &find).await;
     assert_ne!(original, replacement, "the race never happened");
-    assert!(said.contains(&format!("oid {replacement}")), "{said}");
+    assert_eq!(number(&mut a, &format!("SELECT {s}.{fname}(7)")).await, 14);
+    assert_eq!(number(&mut a, &format!("SELECT {s}.{old}(7)")).await, 7);
+    assert_eq!(
+        number(&mut a, "SELECT count(*)::int FROM public.__pbps_state").await,
+        0
+    );
+    drop(b);
+    drop(a);
+    db.drop().await;
 
-    drop_schema(&mut a, &s).await;
+    assert_eq!(
+        said,
+        format!(
+            "`{s}.{shown}(integer)` moved between this rebuild's read and its lock: the reads that say what a \
+             rebuild would destroy are keyed to function {s}.\"{shown}_old\"(integer) (oid {original}), and with a row lock on the routine's `pg_proc` entry held that name \
+             means function {s}.\"{shown}\"(integer) (oid {replacement}). Another session renamed or dropped the object and gave its name away in \
+             between, and the row lock is keyed by oid, so it is held on the object the reads describe -- what moved is the name, and the `DROP` that follows goes by name.\nNothing is reported rather than an answer about one \
+             object beside a lock on another: the `DROP` that follows goes by name, so it would \
+             destroy whatever stands under it -- an object no plan approved over. Run the deploy \
+             again once the other session has finished."
+        )
+    );
 }
 
 /// A relation lock holds the relation, not the qualified name: `ALTER SCHEMA
