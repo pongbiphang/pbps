@@ -134,7 +134,7 @@ fi
 # private, and the thing under test is that the second pins the session before
 # it asks anything (DECISIONS 415). Run here rather than left to
 # `cargo test --workspace`, which does not pass `--ignored`.
-cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
+cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 --skip engine::mssql_live_tests "$@"
 # The resolver end to end (#1672), with no root: the three servers above are
 # its targets and scratch servers, and a Docker scratch (#1674) starts from
 # their images, already here.
