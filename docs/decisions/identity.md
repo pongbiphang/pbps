@@ -1188,7 +1188,9 @@ environment holding an older link is qualified for **one composed rebuild** to
 the latest link against today's declarations, not for each link in turn: the
 earlier links' declarations no longer exist to be applied, and walking an
 environment through them would copy every row several times. Only the latest
-link's checksum must match the declarations. Every link's `max_rows` applies,
+link's checksum must match the declarations, and the endpoints are held to the
+shape of one rewrite without a net key change (each link met that rule at its
+approval, and `A -> B -> A` ends where it began). Every link's `max_rows` applies,
 so the strictest is the cap of the one copy. Columns compose along the lineage
 UIDs (inside a link along the pairing the approval recorded, between links by
 UID, so a rename in between is followed), and their conversions compose as nested casts

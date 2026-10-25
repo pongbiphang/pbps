@@ -664,6 +664,51 @@ fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() 
     succeeds(d.run(&["plan", "--no-dev"]));
 }
 
+#[test]
+fn a_chain_that_returns_to_the_first_key_still_plans_as_one_composed_rebuild() {
+    let d = Demo::new("rebuild2298-there-and-back");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let source = source.trim();
+    let approve = |cap: &str| {
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            cap,
+            "--reason",
+            "maintenance",
+        ]));
+        d.commit();
+    };
+    d.table(&parent.replace("partition_by: [k]", "partition_by: [bucket]"));
+    approve("20");
+    // Back to the first key: the declarations are the first revision's again.
+    d.table(parent);
+    approve("30");
+    let behind = d.run(&["plan", "--no-dev", "--since", source]);
+    assert_ne!(code(&behind), 0);
+    assert!(
+        stderr(&behind).contains("composed over 2 approved links")
+            && stderr(&behind).contains("execution is not available yet"),
+        "{}",
+        stderr(&behind)
+    );
+    succeeds(d.run(&["plan", "--no-dev"]));
+}
+
 #[path = "support/row_security_roundtrip.rs"]
 mod row_security_roundtrip;
 

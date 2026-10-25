@@ -1965,3 +1965,116 @@ fn a_column_dropped_after_the_approval_leaves_the_pairing_when_the_approval_is_r
     assert!(new.continues_are_whole());
     assert_eq!(new.source, old.source);
 }
+
+/// Two approvals that end where they began, as declarations: the key `k` to
+/// `bucket` and back, or the key column `bucket` widened and narrowed again.
+/// Returns the declarations and identities at the start and after each link.
+fn there_and_back(widen: bool) -> (Schema, IdsFile, Schema, IdsFile, IdsFile) {
+    let (base, _, away) = fixture();
+    let (start, away) = if widen {
+        let mut start = base;
+        let parent = start.tables.get_mut(&table()).unwrap();
+        parent.partition_by.as_mut().unwrap().columns = vec!["bucket".into()];
+        let mut away = start.clone();
+        away.tables
+            .get_mut(&table())
+            .unwrap()
+            .columns
+            .get_mut("bucket")
+            .unwrap()
+            .ty = "bigint".parse().unwrap();
+        (start, away)
+    } else {
+        (base, away)
+    };
+    let ids = crate::resolve(&start, &IdsFile::default(), &[], &ctx())
+        .unwrap()
+        .ids;
+    let first = recorded(&start, &ids, &away);
+    let back = record(
+        side(&away, &first),
+        &start,
+        &first,
+        &table(),
+        30,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    (start, ids, away, first, back)
+}
+
+#[test]
+fn a_chain_that_ends_where_it_began_is_qualified_as_one_composed_rebuild() {
+    for widen in [false, true] {
+        let (start, ids, away, first, back) = there_and_back(widen);
+        assert_eq!(back.rebuilds.len(), 2, "each link met its own rule");
+        // The environment at the first source: the endpoints are one shape, and
+        // the rows still need the approved identities and conversions.
+        let root = qualify(side(&start, &ids), side(&start, &back), &table()).unwrap();
+        assert_eq!(root.earlier.len(), 1, "{widen}");
+        assert_eq!(root.before, root.after, "no net change in the declarations");
+        assert_eq!(root.cap(), 20, "the strictest link's cap");
+        let columns = root.composed_columns();
+        assert!(
+            columns[&table().column("bucket")].from_environment,
+            "{widen}: a column carried through both links reads the environment's"
+        );
+        let behind = diff(side(&start, &ids), side(&start, &back));
+        let why = first_rebuild_error(&behind);
+        assert!(
+            why.contains("composed over 2 approved links"),
+            "{widen}: {why}"
+        );
+        // Holding the middle link is one ordinary rebuild, which does change.
+        qualify(side(&away, &first), side(&start, &back), &table()).unwrap();
+        // The environment that has everything has nothing to rebuild.
+        assert!(
+            diff(side(&start, &back), side(&start, &back))
+                .errors
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn a_composed_rebuild_without_a_net_change_still_meets_every_other_rule() {
+    let (start, ids, away, first, back) = there_and_back(false);
+    // A single link keeps the rule that its key or a key column type changes.
+    let error = qualify(side(&away, &first), side(&away, &back), &table()).unwrap_err();
+    assert!(
+        error
+            .why
+            .contains("neither the partition key nor a key column type changed"),
+        "{error}"
+    );
+    // The endpoints are still held to the shape of one rewrite: an unrelated
+    // edit, a list-partitioned parent, a computed column.
+    let mut unrelated = start.clone();
+    unrelated
+        .tables
+        .insert(TableName::new("app", "other"), Table::default());
+    let error = qualify(side(&start, &ids), side(&unrelated, &back), &table()).unwrap_err();
+    assert!(error.why.contains("unrelated schema edits"), "{error}");
+    let mut listed = start.clone();
+    listed
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .partition_by
+        .as_mut()
+        .unwrap()
+        .strategy = PartitionStrategy::List;
+    let error = qualify(side(&start, &ids), side(&listed, &back), &table()).unwrap_err();
+    assert!(error.why.contains("only a managed RANGE parent"), "{error}");
+    // And the last link's approval still has to match the declarations.
+    let mut moved = start.clone();
+    moved
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .insert("extra".into(), Column::new("integer".parse().unwrap()));
+    let error = qualify(side(&start, &ids), side(&moved, &back), &table()).unwrap_err();
+    assert!(error.why.contains("re-approve it with"), "{error}");
+}

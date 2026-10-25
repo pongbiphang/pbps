@@ -133,7 +133,15 @@ fn refuse_partition_column_overrides(
     Ok(())
 }
 
-fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), RebuildError> {
+/// Whether one rewrite can take the tree from `base` to `desired`. `link` also
+/// asks for what an approval requires of its own rewrite, a changed key or key
+/// column type; a composed chain does not, since `A -> B -> A` nets to none.
+fn shape(
+    base: &Schema,
+    desired: &Schema,
+    table: &TableName,
+    link: bool,
+) -> Result<(), RebuildError> {
     for schema in [base, desired] {
         let Some(root) = schema.tables.get(table) else {
             return Err(refused(
@@ -189,7 +197,7 @@ fn shape(base: &Schema, desired: &Schema, table: &TableName) -> Result<(), Rebui
                 before.columns.get(key).map(|c| (&c.ty, &c.collation))
                     != after.columns.get(key).map(|c| (&c.ty, &c.collation))
             });
-    if !changed {
+    if link && !changed {
         return Err(refused(
             table,
             "neither the partition key nor a key column type changed",
@@ -388,8 +396,8 @@ pub fn record(
     refuse_partition_column_overrides(&tree(desired, table), table)?;
     let checksum = after.fingerprint();
     if let Some((key, old)) = ids.rebuild_into(uid) {
-        let next_link =
-            base.ids.rebuilds.get(key) == Some(old) && shape(base.schema, desired, table).is_ok();
+        let next_link = base.ids.rebuilds.get(key) == Some(old)
+            && shape(base.schema, desired, table, true).is_ok();
         if !next_link {
             return reapprove(
                 ids,
@@ -400,7 +408,7 @@ pub fn record(
             );
         }
     }
-    shape(base.schema, desired, table)?;
+    shape(base.schema, desired, table, true)?;
     if base.ids.tables != ids.tables
         || base.ids.columns != ids.columns
         || base.ids.roles != ids.roles
@@ -697,7 +705,7 @@ pub fn qualify(
             stale()
         });
     }
-    shape(base.schema, desired.schema, table)?;
+    shape(base.schema, desired.schema, table, used.len() == 1)?;
     if intent.target_checksum != after.fingerprint() {
         return Err(stale());
     }
