@@ -3213,6 +3213,26 @@ of them shares the assumption. Pinned by
 `a_check_beside_an_enum_rebuild_is_not_probed_against_the_old_label_order` and
 the live `enum_rebuild_adds_an_order_sensitive_check_*` test.
 
+A column the plan removes is handled, not retyped and not refused: its own
+`DropColumn` (class 5) or the `DropTable` of its table (class 6) runs before the
+replacement is created (7) and the swap (9), so by the swap nothing of it holds
+the old type. The census reads this from the plan's `changes` alone, like
+`module_verdict`'s "the plan drops it", through the same `Renamed` names, so
+planning and apply, which both pass the same `changes`, give one verdict. A
+default on the dropped column or any part of a dropped table goes with it and is
+not restored; a check or index on a dropped column is dropped by the plan's own
+`DropCheck`/`DropIndex`, which `drops` already reads. A column the plan
+retypes away from the enum is still refused: the emitter does not render an
+`AlterColumnType` off a user-defined type reference ("retyping a user-defined
+type reference is not supported"), and nothing orders such a retype before the
+swap, so excusing it would only move the refusal. A partitioned table cannot be
+dropped by a plan yet, so a dropped table's partitions reach the census only
+through the ancestor walk the unit test pins. Pinned by
+`a_column_the_plan_drops_before_the_swap_is_not_a_blocker_and_another_is`,
+`a_table_the_plan_drops_takes_its_columns_and_its_partitions_with_it`,
+`a_default_check_or_index_goes_with_its_dropped_column_or_table` and the live
+`enum_rebuild_drops_a_column_*` and `enum_rebuild_drops_a_table_*` tests.
+
 Census at apply: the same census runs again where the plan runs, in the apply's
 own transaction after the lock and before the first statement. A staged run
 reads it in a transaction it rolls back, at its start and at every resume (a

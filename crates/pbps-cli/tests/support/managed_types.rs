@@ -4447,6 +4447,126 @@ fn enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order() {
     }
 }
 
+/// A column the plan drops, with intent, no longer holds the old type when the
+/// swap runs (classes 5 and 6 come before the create and the swap), so it is
+/// neither retyped nor refused as a blocker, and the default, check and index
+/// that stood on it go with it and are not restored.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_drops_a_column_and_its_parts_in_the_plan_that_removes_a_label() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood DEFAULT 'sad', n app.mood,
+              CONSTRAINT m_known CHECK (m IN ('sad','ok')));
+            CREATE INDEX t_m ON app.t (id) WHERE m = 'sad';
+            INSERT INTO app.t VALUES (1,'sad','ok'),(2,'sad','happy');";
+        let (own, d) = adopted(&server, "rebuild_dropped_col1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        redeclare(&d, "table: app.t\n", |text| {
+            text.replace(
+                "  m:\n    type: app.mood\n    default: \"'sad'::app.mood\"\n",
+                "",
+            )
+            .replace(
+                "checks:\n  m_known: \"(m = ANY (ARRAY['sad'::app.mood, 'ok'::app.mood]))\"\n\n",
+                "",
+            )
+            .replace(
+                "indexes:\n  t_m:\n    columns: [id]\n    where: \"(m = 'sad'::app.mood)\"\n",
+                "",
+            )
+        });
+        // Without the intent the drop is not planned at all.
+        succeeds(d.run(&["intent", "--drop", "app.t.m", "column retired"]));
+        d.commit();
+        let path = d.dir.join("dropped-column.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropColumn { .. })),
+            "{:#?}",
+            plan.changes
+        );
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'm' AND NOT attisdropped"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conname = 'm_known'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_indexes WHERE indexname = 't_m'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(db, "SELECT count(*)::bigint FROM app.t WHERE n = 'happy'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+/// The same for a table the plan drops: its column, default, check and index
+/// go with it. A partitioned table cannot be dropped by a plan yet, so its
+/// partitions never reach the census this way.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_drops_a_table_holding_the_enum_in_the_plan_that_removes_a_label() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.keep (id int PRIMARY KEY, n app.mood);
+            CREATE TABLE app.gone (id int PRIMARY KEY, m app.mood DEFAULT 'sad', tags app.mood[],
+              CONSTRAINT gone_known CHECK (m IN ('sad','ok')));
+            CREATE INDEX gone_m ON app.gone (id) WHERE m = 'sad';
+            INSERT INTO app.keep VALUES (1,'ok'),(2,'happy');
+            INSERT INTO app.gone VALUES (1,'sad','{sad}'),(2,'sad',NULL);";
+        let (own, d) = adopted(&server, "rebuild_dropped_table1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        std::fs::remove_file(d.dir.join("schema/app.gone.yml")).unwrap();
+        succeeds(d.run(&["intent", "--drop-table", "app.gone", "table retired"]));
+        d.commit();
+        let path = d.dir.join("dropped-table.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_class WHERE relname = 'gone' AND relnamespace = 'app'::regnamespace"
+            ),
+            0
+        );
+        assert!(no_replacement_left(db));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot() {

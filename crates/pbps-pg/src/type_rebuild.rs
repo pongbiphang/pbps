@@ -223,6 +223,16 @@ pub async fn census(
                 },
             );
         }
+        // A partition's default is its parent's, copied: the plan drops it
+        // where the declaration holds it, at the root.
+        let parents: BTreeMap<TableName, TableName> = held
+            .values()
+            .filter_map(|h| {
+                let parent = names.get(&h.parent?)?;
+                Some((TableName::new(&h.schema, &h.table), parent.clone()))
+            })
+            .collect();
+        let renamed = Renamed::of(changes);
         for h in held.values() {
             let shown_column = format!("{}.{}.{}", h.schema, h.table, h.column);
             // A partition's column follows its root's retype; the root is the
@@ -230,7 +240,15 @@ pub async fn census(
             let root = root_of(&held, h);
             let reached =
                 moved.contains(&(root.schema.clone(), root.table.clone(), root.column.clone()));
+            let gone = gone_before_the_swap(
+                changes,
+                &renamed,
+                &parents,
+                &TableName::new(&h.schema, &h.table),
+                &ColumnName::from(h.column.as_str()),
+            );
             let what: String = match h.kind.as_str() {
+                "r" | "p" if gone => continue,
                 "r" | "p" if reached => {
                     follow.insert((h.schema.clone(), h.table.clone(), h.column.clone()));
                     continue;
@@ -325,15 +343,6 @@ pub async fn census(
                 .map(|d| (Level::Column, d)),
             );
         }
-        // A partition's default is its parent's, copied: the plan drops it
-        // where the declaration holds it, at the root.
-        let parents: BTreeMap<TableName, TableName> = held
-            .values()
-            .filter_map(|h| {
-                let parent = names.get(&h.parent?)?;
-                Some((TableName::new(&h.schema, &h.table), parent.clone()))
-            })
-            .collect();
         let mut judged = BTreeSet::new();
         for (level, dependent) in seen {
             if !judged.insert(dependent.described.clone()) {
@@ -367,6 +376,28 @@ fn root_of<'a>(held: &'a BTreeMap<(i64, String), Held>, h: &'a Held) -> &'a Held
         }
     }
     root
+}
+
+/// Whether the plan drops a column that holds the type, by its own drop, with
+/// its table, or with the table it is a partition of. Those drops come before
+/// the replacement is created, so by the swap the column no longer holds the
+/// old type and is neither retyped nor refused.
+fn gone_before_the_swap(
+    changes: &ChangeSet,
+    renamed: &Renamed,
+    parents: &BTreeMap<TableName, TableName>,
+    table: &TableName,
+    column: &ColumnName,
+) -> bool {
+    let mut owner = Some(table.clone());
+    for _ in 0..32 {
+        let Some(table) = owner else { break };
+        if renamed.drops_column(changes, &table, column) {
+            return true;
+        }
+        owner = parents.get(&table).cloned();
+    }
+    false
 }
 
 /// Where a dependent was found: on the type, by a constant of it in an
@@ -434,6 +465,29 @@ impl Renamed {
             .unwrap_or(column)
             .clone()
     }
+
+    /// Whether the plan removes `table`, a table as the database has it today.
+    fn drops_table(&self, changes: &ChangeSet, table: &TableName) -> bool {
+        let target = self.table(table);
+        changes.changes.iter().any(
+            |p| matches!(&p.change, Change::DropTable { name, .. } if *name == target || name == table),
+        )
+    }
+
+    /// Whether the plan removes `column` of `table` (as the database has them
+    /// today), by its own `DropColumn` or with its table. Both come before the
+    /// replacement is created, so by the swap nothing of it holds the type:
+    /// neither retyped nor refused (ORDERING classes 5 and 6, before 7 and the
+    /// swap).
+    fn drops_column(&self, changes: &ChangeSet, table: &TableName, column: &ColumnName) -> bool {
+        let target = self.table(table);
+        let named = self.column(table, column);
+        self.drops_table(changes, table)
+            || changes.changes.iter().any(|p| {
+                matches!(&p.change, Change::DropColumn { column: c, .. }
+                    if c.table == target && c.name == named)
+            })
+    }
 }
 
 /// Whether the plan already drops `part` of `table`, a table as the database
@@ -441,6 +495,15 @@ impl Renamed {
 fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
     let renamed = Renamed::of(changes);
     let target = renamed.table(table);
+    // A table's parts go with it, and a column's default with the column.
+    if renamed.drops_table(changes, table) {
+        return true;
+    }
+    if let Part::Default(c) = part
+        && renamed.drops_column(changes, table, c)
+    {
+        return true;
+    }
     changes.changes.iter().any(|p| match (&p.change, part) {
         (Change::DropCheck { table: t, name }, Part::Check(n)) => *t == target && name == n,
         (Change::DropIndex { table: t, name }, Part::Index(n)) => *t == target && name == n,
@@ -848,6 +911,100 @@ mod tests {
             assert!(matches!(judge(renamed), Verdict::Fine));
             // Without the rename the drop names another table.
             assert!(matches!(judge(at(&target).to_vec()), Verdict::Refuse(_)));
+        }
+    }
+
+    fn drop_column(table: &str, column: &str) -> Change {
+        Change::DropColumn {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
+            column: TableName::new("app", table).column(column),
+        }
+    }
+
+    fn drop_table(table: &str) -> Change {
+        Change::DropTable {
+            uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+            name: TableName::new("app", table),
+            detach_from: None,
+        }
+    }
+
+    fn gone(changes: &ChangeSet, table: &str, column: &str) -> bool {
+        gone_before_the_swap(
+            changes,
+            &Renamed::of(changes),
+            &Default::default(),
+            &TableName::new("app", table),
+            &column.into(),
+        )
+    }
+
+    /// Dropped before the replacement exists, the column is not a blocker. The
+    /// negatives matter as much: a column the plan keeps stays refused by
+    /// name, and a drop on another table or of another column excuses nothing.
+    #[test]
+    fn a_column_the_plan_drops_before_the_swap_is_not_a_blocker_and_another_is() {
+        let drops = plan(vec![drop_column("t", "m")]);
+        assert!(gone(&drops, "t", "m"));
+        assert!(!gone(&drops, "t", "other"), "another column of the table");
+        assert!(!gone(&drops, "u", "m"), "the same column name elsewhere");
+        assert!(!gone(&plan(vec![]), "t", "m"), "a column nothing drops");
+        // Named as the plan leaves the table, which the catalog has under its
+        // old name.
+        let renamed = plan(vec![
+            Change::RenameTable {
+                uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
+                from: TableName::new("app", "t"),
+                to: TableName::new("app", "tt"),
+                defaults: vec![],
+            },
+            drop_column("tt", "m"),
+        ]);
+        assert!(gone(&renamed, "t", "m"));
+    }
+
+    #[test]
+    fn a_table_the_plan_drops_takes_its_columns_and_its_partitions_with_it() {
+        let drops = plan(vec![drop_table("t")]);
+        assert!(gone(&drops, "t", "m"));
+        assert!(!gone(&drops, "u", "m"), "a drop of another table");
+        let parents: BTreeMap<TableName, TableName> =
+            [(TableName::new("app", "t_1"), TableName::new("app", "t"))].into();
+        let through_parent = |changes: &ChangeSet, table: &str| {
+            gone_before_the_swap(
+                changes,
+                &Renamed::of(changes),
+                &parents,
+                &TableName::new("app", table),
+                &"m".into(),
+            )
+        };
+        assert!(
+            through_parent(&drops, "t_1"),
+            "a partition of the dropped table"
+        );
+        assert!(!through_parent(&plan(vec![drop_table("u")]), "t_1"));
+        assert!(!through_parent(&plan(vec![]), "t_1"));
+    }
+
+    /// What stands on a dropped column or table goes with it: the plan need not
+    /// also drop and restore it.
+    #[test]
+    fn a_default_check_or_index_goes_with_its_dropped_column_or_table() {
+        let table = TableName::new("app", "t");
+        let default = Part::Default("m".into());
+        let check = Part::Check("c".into());
+        let index = Part::Index("i".into());
+        let column = plan(vec![drop_column("t", "m")]);
+        assert!(drops(&column, &table, &default));
+        assert!(!drops(&column, &table, &Part::Default("other".into())));
+        // A check or index is dropped by its own change; a column's drop alone
+        // does not say which of them it takes.
+        assert!(!drops(&column, &table, &check));
+        let whole = plan(vec![drop_table("t")]);
+        for part in [&default, &check, &index] {
+            assert!(drops(&whole, &table, part));
+            assert!(!drops(&whole, &TableName::new("app", "u"), part));
         }
     }
 
