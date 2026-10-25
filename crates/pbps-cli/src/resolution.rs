@@ -316,7 +316,10 @@ pub async fn resolve(
 /// `..` or a symlink that leads outside the root is refused. Judged on the
 /// resolved path, not lexically, because a symlink inside the root can point
 /// anywhere. The file read is the one judged.
-fn read_externals(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+pub(crate) fn read_externals(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<String, String> {
     let unreadable = |error: std::io::Error| format!("could not be read: {error}");
     // Relative, as the configuration says: an absolute path would work from
     // one checkout only, even one inside the root (`join` replaces the root

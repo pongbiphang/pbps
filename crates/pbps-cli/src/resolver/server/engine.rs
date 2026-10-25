@@ -16,7 +16,7 @@ use pbps_db::{Conn, DbError, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
-mod mssql;
+pub(super) mod mssql;
 mod postgres;
 
 // These are logical planning records, not a raw engine capture or a verifier.

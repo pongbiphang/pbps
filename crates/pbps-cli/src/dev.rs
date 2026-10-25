@@ -38,11 +38,11 @@ use crate::db;
 /// Where the throwaway engine comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
-    /// A server that is already running. pbps creates and drops a database on
-    /// it and touches nothing else.
+    /// A supplied server; the account determines the shared scratch layout.
     Connection(String),
     /// A container image to start and throw away.
     Docker(String),
+    Configured(Box<pbps_config::resolver::ResolverProfile>, Option<String>),
 }
 
 /// Resolves `--dev` and `dev:` into one answer.
@@ -56,6 +56,31 @@ pub fn spec(project: &Project, flag: Option<&str>) -> anyhow::Result<Option<Spec
     let Some(dev) = &project.config.dev else {
         return Ok(None);
     };
+    if let Some(name) = &dev.resolver {
+        if dev.docker.is_some() || dev.url_env.is_some() {
+            bail!(
+                "`dev.resolver` selects a shared entry; do not combine it with `docker` or `url_env`"
+            );
+        }
+        let selected = project
+            .config
+            .select_resolver(Some(name), None)?
+            .expect("an explicit name selects an entry");
+        let (pbps_config::resolver::ResolverProfile::Server { externals, .. }
+        | pbps_config::resolver::ResolverProfile::Docker { externals, .. }) = &selected.profile;
+        let externals = externals
+            .as_ref()
+            .map(|path| {
+                crate::resolution::read_externals(project.root(), path).map_err(|why| {
+                    anyhow::anyhow!("the dev externals file {} {why}", path.display())
+                })
+            })
+            .transpose()?;
+        return Ok(Some(Spec::Configured(
+            Box::new(selected.profile),
+            externals,
+        )));
+    }
     match (&dev.docker, &dev.url_env) {
         (Some(image), None) => Ok(Some(Spec::Docker(image.clone()))),
         (None, Some(var)) => {
@@ -99,6 +124,7 @@ pub struct Rehearsal {
     /// and, until the declaration is rewritten, one line in every drift report.
     pub structural: Vec<String>,
     pub spelling: Vec<String>,
+    pub externals_staged: bool,
 }
 
 impl Rehearsal {
@@ -182,91 +208,74 @@ pub fn rehearse<D: crate::emission::Engine>(
         selected,
     )?;
 
-    let container = match spec {
-        Spec::Docker(image) => Some(Container::start(image)?),
-        Spec::Connection(_) => None,
+    let (source, externals) = match spec {
+        Spec::Docker(image) => (
+            Source::Docker(image.clone(), pbps_config::resolver::PullPolicy::IfMissing),
+            None,
+        ),
+        Spec::Connection(url) => (Source::Server(url.clone()), None),
+        Spec::Configured(profile, externals) => {
+            use pbps_config::resolver::ResolverProfile;
+            let source = match profile.as_ref() {
+                ResolverProfile::Docker { image, pull, .. } => Source::Docker(image.clone(), *pull),
+                ResolverProfile::Server {
+                    url_env, standard, ..
+                } => {
+                    pbps_cli::resolver::server::scratch::declared_standard(
+                        pbps_db::Driver::Mssql,
+                        standard.as_ref(),
+                    )?;
+                    Source::Server(std::env::var(url_env).map_err(|error| {
+                        let reason = match error {
+                            std::env::VarError::NotPresent => "not set",
+                            std::env::VarError::NotUnicode(_) => "not Unicode text",
+                        };
+                        anyhow::anyhow!("scratch credential variable ${url_env} is {reason}; export UTF-8 scratch credentials or pass --dev explicitly")
+                    })?)
+                }
+            };
+            (source, externals.as_deref())
+        }
     };
-    let connection = match (&container, spec) {
-        (Some(c), _) => c.connection.clone(),
-        (None, Spec::Connection(url)) => url.clone(),
-        // Unreachable by construction: a container is started for exactly the
-        // Docker case.
-        (None, Spec::Docker(image)) => bail!("the container for `{image}` was not started"),
-    };
-
-    let result = db::runtime()?.block_on(run(
-        &connection,
-        &build,
-        plan,
-        declared,
-        declared_ids,
-        baseline_ids,
-        dialect,
-        hints,
-    ));
-    // The container goes whatever happened; leaving one behind on a failure is
-    // how a developer's machine fills up with servers they did not know about.
-    drop(container);
-    result
+    db::runtime()?.block_on(async {
+        use pbps_cli::resolver::server::scratch::{container, preview};
+        let mut cancellation = preview::Cancellation::new()?;
+        let mut run = async |connection: &str| {
+            preview::with_server(connection, externals, &mut cancellation, async |conn| {
+                let mut report = rehearse_in(
+                    conn,
+                    &build,
+                    plan,
+                    declared,
+                    declared_ids,
+                    baseline_ids,
+                    dialect,
+                    hints,
+                )
+                .await?;
+                report.externals_staged = externals.is_some();
+                Ok(report)
+            })
+            .await
+        };
+        match source {
+            Source::Server(url) => run(&url).await,
+            Source::Docker(image, pull) => {
+                container::with_started(pbps_db::Driver::Mssql, &image, pull, run).await
+            }
+        }
+        .map_err(Into::into)
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run(
-    connection: &str,
-    build: &crate::emission::LoweredPlan,
-    plan: &crate::emission::LoweredPlan,
-    declared: &Schema,
-    declared_ids: &IdsFile,
-    baseline_ids: &IdsFile,
-    dialect: &dyn Dialect,
-    hints: &pbps_model::Hints,
-) -> anyhow::Result<Rehearsal> {
-    // SQL Server, named rather than threaded through: the rehearsal runs
-    // against the throwaway container this module starts, and that container is
-    // `mcr.microsoft.com/mssql/server` on port 1433. When `--dev` learns to
-    // rehearse on PostgreSQL, this is one of the two places that has to say so
-    // — the other is `DevServer` below.
-    let mut conn = Conn::connect(pbps_db::Driver::Mssql, connection)
-        .await
-        .context("cannot reach the dev database")?;
-
-    // A database of its own, so a dev server shared by several developers (or
-    // by two runs at once) cannot have one rehearsal walk into another's.
-    //
-    // The suffix is random rather than derived from the process id and the
-    // clock: two CI containers on one host routinely get the same pid within
-    // the same second, and the collision shows up as one run failing to create
-    // a database the other is using.
-    let name = format!("pbps_dev_{}_{}", std::process::id(), random_hex());
-    conn.execute(&format!("CREATE DATABASE [{name}];"))
-        .await
-        .with_context(|| format!("cannot create the scratch database `{name}`"))?;
-    let outcome = rehearse_in(
-        &mut conn,
-        &name,
-        build,
-        plan,
-        declared,
-        declared_ids,
-        baseline_ids,
-        dialect,
-        hints,
-    )
-    .await;
-    // Dropping is best effort: the verdict of the rehearsal must not be
-    // replaced by a cleanup failure on a database nobody will look at again.
-    let _ = conn
-        .execute(&format!(
-            "USE master; ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
-        ))
-        .await;
-    outcome
+enum Source {
+    Server(String),
+    Docker(String, pbps_config::resolver::PullPolicy),
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn rehearse_in(
     conn: &mut Conn,
-    name: &str,
     build: &crate::emission::LoweredPlan,
     plan: &crate::emission::LoweredPlan,
     declared: &Schema,
@@ -275,7 +284,6 @@ async fn rehearse_in(
     dialect: &dyn Dialect,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
-    conn.execute(&format!("USE [{name}];")).await?;
     // The rehearsal reads the rows back and compares; a spelling the engine
     // reads differently would fail that comparison without saying which
     // spelling to write. Asked first, as every connected command asks
@@ -387,6 +395,7 @@ async fn rehearse_in(
         applied: plan.len(),
         structural,
         spelling,
+        externals_staged: false,
     })
 }
 
@@ -507,473 +516,9 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
 
 /// Sixteen hex digits from the OS.
 ///
-/// `RandomState` is seeded per process by the operating system and is in std,
-/// which is why there is no `rand` dependency here for two uses of it. Each
-/// call builds a fresh hasher, so two calls do not repeat.
-fn random_hex() -> String {
-    use std::hash::{BuildHasher as _, Hasher as _};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    // Without a write the hasher would return its seed, which is per
-    // `RandomState` rather than per call.
-    h.write_usize(std::process::id() as usize);
-    format!("{:016x}", h.finish())
-}
-
-/// A container started for one rehearsal and removed when it ends.
-struct Container {
-    id: String,
-    connection: String,
-}
-
-/// How long to wait for a server that is still starting.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-impl Container {
-    fn start(image: &str) -> anyhow::Result<Container> {
-        // A password per run, never one written in the source: the container is
-        // throwaway, but a fixed credential in a published binary is the kind
-        // of thing that ends up somewhere it was not meant to.
-        //
-        // From OS randomness, not the process id and the clock. The port is
-        // published, so on a shared host anything else that can reach it could
-        // derive the password from a launch second and a small pid range, and
-        // then connect as sa while the rehearsal is deciding whether the plan
-        // converges.
-        let password = format!("Pbps!{}{}", random_hex(), random_hex());
-        eprintln!("dev: starting {image} (a throwaway container)...");
-
-        let out = std::process::Command::new("docker")
-            .args(["run", "-d", "-e", "ACCEPT_EULA=Y"])
-            .arg("-e")
-            .arg(format!("MSSQL_SA_PASSWORD={password}"))
-            // An omitted host port lets both Docker and Podman avoid an
-            // existing SQL Server. Only this host needs the scratch server.
-            .args(["-p", "127.0.0.1::1433", image])
-            .output()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "cannot run docker: {e}\n\
-                     A dev database is optional — drop --dev and the preview falls back to \
-                     lightweight normalization."
-                )
-            })?;
-        if !out.status.success() {
-            bail!(
-                "docker could not start `{image}`:\n{}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-
-        // **One** guard, mutated in place. It used to be built twice — once with
-        // an empty connection string to own the cleanup while the port was
-        // looked up, then again, shadowing the first, once the connection string
-        // was known. A shadowed binding is not dropped early: it lives to the
-        // end of the function, so the first guard's `Drop` ran `docker rm -f` on
-        // the container the second had just handed to the caller. `rehearse`
-        // then connected to a container that no longer existed.
-        //
-        // Building it before the port lookup is the point of the guard, not an
-        // accident of ordering: `docker run` has already created the container
-        // by then, so every path out of this function from here on has to be one
-        // that removes it. `?` below is such a path precisely because there is
-        // only one owner now.
-        let mut container = Container {
-            id,
-            connection: String::new(),
-        };
-        let port = Self::published_port(&container.id)?;
-        container.connection = format!(
-            "Server=127.0.0.1,{port};User Id=sa;Password={password};TrustServerCertificate=true"
-        );
-        container.wait_until_ready(&password)?;
-        Ok(container)
-    }
-
-    fn published_port(id: &str) -> anyhow::Result<u16> {
-        let out = std::process::Command::new("docker")
-            .args(["port", id, "1433/tcp"])
-            .output()
-            .map_err(|e| anyhow::anyhow!("cannot ask docker for the published port: {e}"))?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        if !out.status.success() {
-            bail!(
-                "docker could not report the published port for 1433 ({}):\n{}\n{}",
-                out.status,
-                text.trim(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        parse_published_port(&text)
-    }
-
-    /// Only a proven stop fails early: SQL Server can reject logins during
-    /// startup, and an unreadable runtime is not evidence of a dead engine.
-    fn wait_until_ready(&self, password: &str) -> anyhow::Result<()> {
-        let started = std::time::Instant::now();
-        let rt = db::runtime()?;
-        loop {
-            let answer = rt.block_on(readiness_probe(started, async {
-                let mut c = Conn::connect(pbps_db::Driver::Mssql, &self.connection).await?;
-                c.query("SELECT 1 AS ok;").await?;
-                Ok(())
-            }));
-            if answer.is_ok() {
-                return Ok(());
-            }
-            let observed = rt.block_on(async {
-                match runtime_output(
-                    &["inspect", "--format", "{{json .State}}", &self.id],
-                    runtime_budget(started),
-                )
-                .await
-                {
-                    Ok(out) => observe_container(&out, &self.id),
-                    Err(error) => Observed::Unknown(error),
-                }
-            });
-            match readiness(&observed, started.elapsed()) {
-                Poll::Exited => {
-                    let logs = rt.block_on(runtime_output(
-                        &["logs", "--tail", "20", &self.id],
-                        runtime_budget(started),
-                    ));
-                    let tail = match logs {
-                        Ok(out) => format!(
-                            "{}{}",
-                            String::from_utf8_lossy(&out.stdout),
-                            String::from_utf8_lossy(&out.stderr)
-                        ),
-                        Err(error) => format!("container logs unavailable: {error}"),
-                    };
-                    bail!(
-                        "{}",
-                        startup_diagnostic(
-                            &format!(
-                                "the dev container stopped before SQL was ready: {}; container log tail:\n{tail}",
-                                observed.describe()
-                            ),
-                            password
-                        )
-                    );
-                }
-                Poll::TimedOut => bail!(
-                    "{}",
-                    startup_diagnostic(
-                        &format!(
-                            "the dev container did not accept connections within {}s; last SQL error: {}; last runtime state: {}",
-                            READY_TIMEOUT.as_secs(),
-                            answer.unwrap_err(),
-                            observed.describe()
-                        ),
-                        password
-                    )
-                ),
-                Poll::Wait => {}
-            }
-            std::thread::sleep(
-                std::time::Duration::from_secs(2)
-                    .min(READY_TIMEOUT.saturating_sub(started.elapsed())),
-            );
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct RuntimeState {
-    running: bool,
-    exit_code: i64,
-    #[serde(rename = "OOMKilled")]
-    oom_killed: bool,
-    error: String,
-}
-
-enum Observed {
-    Running,
-    Stopped(RuntimeState),
-    Missing,
-    Unknown(String),
-}
-
-impl Observed {
-    fn describe(&self) -> String {
-        match self {
-            Self::Running => "running".into(),
-            Self::Stopped(state) => format!(
-                "exit status {}, OOM killed: {}; {}",
-                state.exit_code, state.oom_killed, state.error
-            ),
-            Self::Missing => "the owned container no longer exists".into(),
-            Self::Unknown(reason) => format!("unknown ({reason})"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Poll {
-    Wait,
-    Exited,
-    TimedOut,
-}
-
-fn readiness(state: &Observed, elapsed: std::time::Duration) -> Poll {
-    match state {
-        Observed::Stopped(_) | Observed::Missing => Poll::Exited,
-        Observed::Running | Observed::Unknown(_) if elapsed >= READY_TIMEOUT => Poll::TimedOut,
-        Observed::Running | Observed::Unknown(_) => Poll::Wait,
-    }
-}
-
-fn observe_container(out: &std::process::Output, id: &str) -> Observed {
-    if out.status.success() {
-        return match serde_json::from_slice::<RuntimeState>(&out.stdout) {
-            Ok(state) if state.running => Observed::Running,
-            Ok(state) => Observed::Stopped(state),
-            Err(error) => Observed::Unknown(format!("invalid container state: {error}")),
-        };
-    }
-    let error = String::from_utf8_lossy(&out.stderr);
-    // Match the whole diagnostic for this owned id. Daemon/permission errors,
-    // and errors merely mentioning another absent object, prove no termination.
-    if out.stdout.iter().all(u8::is_ascii_whitespace)
-        && ["object", "container"].iter().any(|kind| {
-            [id.to_owned(), format!("\"{id}\"")].iter().any(|name| {
-                error
-                    .trim()
-                    .eq_ignore_ascii_case(&format!("Error: no such {kind}: {name}"))
-            })
-        })
-    {
-        Observed::Missing
-    } else {
-        Observed::Unknown(format!(
-            "docker inspect failed ({}): {}",
-            out.status,
-            error.trim()
-        ))
-    }
-}
-
-async fn readiness_probe(
-    started: std::time::Instant,
-    attempt: impl std::future::Future<Output = anyhow::Result<()>>,
-) -> anyhow::Result<()> {
-    // Restarting a slow but valid handshake every few seconds prevents it
-    // from ever becoming ready. SQL gets the remaining overall budget.
-    tokio::time::timeout(READY_TIMEOUT.saturating_sub(started.elapsed()), attempt)
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("SQL readiness poll timed out")))
-}
-
-fn runtime_budget(started: std::time::Instant) -> std::time::Duration {
-    // An unresponsive runtime must not extend the overall readiness wait.
-    std::time::Duration::from_secs(5).min(READY_TIMEOUT.saturating_sub(started.elapsed()))
-}
-
-async fn runtime_output(
-    args: &[&str],
-    within: std::time::Duration,
-) -> Result<std::process::Output, String> {
-    tokio::time::timeout(
-        within,
-        tokio::process::Command::new("docker")
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("docker {} timed out", args[0]))?
-    .map_err(|error| format!("cannot run docker {}: {error}", args[0]))
-}
-
-fn startup_diagnostic(text: &str, password: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect::<String>()
-        .replace(password, "[redacted]")
-}
-
-fn parse_published_port(text: &str) -> anyhow::Result<u16> {
-    // Accept exactly the requested mapping. Picking one line or just its
-    // suffix would hide an additional public bind or a malformed address.
-    text.trim()
-        .strip_prefix("127.0.0.1:")
-        .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|port| port.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "docker did not publish exactly one loopback port for 1433: {}",
-                text.trim()
-            )
-        })
-}
-
-impl Drop for Container {
-    fn drop(&mut self) {
-        if self.id.is_empty() {
-            return;
-        }
-        let _ = std::process::Command::new("docker")
-            .args(["rm", "-f", &self.id])
-            .output();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn a_slow_successful_probe_keeps_the_overall_readiness_budget() {
-        let answer = readiness_probe(std::time::Instant::now(), async {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            Ok(())
-        })
-        .await;
-        assert!(answer.is_ok(), "{answer:?}");
-        let expired = std::time::Instant::now() - READY_TIMEOUT;
-        let answer = readiness_probe(expired, std::future::pending()).await;
-        assert_eq!(
-            answer.unwrap_err().to_string(),
-            "SQL readiness poll timed out"
-        );
-    }
-
-    fn runtime_answer(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        #[cfg(windows)]
-        use std::os::windows::process::ExitStatusExt;
-        std::process::Output {
-            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn only_proven_termination_shortens_the_readiness_wait() {
-        let waiting = std::time::Duration::from_secs(1);
-        // State fields measured through Docker's API and native Podman;
-        // Podman's additional runtime fields must not invalidate the read.
-        for sample in [
-            r#"{"Running":true,"ExitCode":0,"OOMKilled":false,"Error":"","Status":"running","Pid":12}"#,
-            r#"{"Running":true,"ExitCode":0,"OOMKilled":false,"Error":"","OciVersion":"1.2.1","ConmonPid":11}"#,
-        ] {
-            let state = observe_container(&runtime_answer(true, sample, ""), "owned");
-            assert!(matches!(state, Observed::Running));
-            assert_eq!(readiness(&state, waiting), Poll::Wait);
-            assert_eq!(readiness(&state, READY_TIMEOUT), Poll::TimedOut);
-        }
-        let stopped = observe_container(
-            &runtime_answer(
-                true,
-                r#"{"Running":false,"ExitCode":137,"OOMKilled":false,"Error":""}"#,
-                "",
-            ),
-            "owned",
-        );
-        assert_eq!(readiness(&stopped, waiting), Poll::Exited);
-        assert_eq!(readiness(&stopped, READY_TIMEOUT), Poll::Exited);
-        assert!(
-            stopped
-                .describe()
-                .contains("exit status 137, OOM killed: false")
-        );
-        for malformed in [
-            "",
-            "null",
-            "{}",
-            r#"{"Running":false}"#,
-            r#"{"Running":"false","ExitCode":137,"OOMKilled":false,"Error":""}"#,
-        ] {
-            let state = observe_container(&runtime_answer(true, malformed, ""), "owned");
-            assert!(matches!(state, Observed::Unknown(_)));
-            assert_eq!(readiness(&state, waiting), Poll::Wait);
-            assert_eq!(readiness(&state, READY_TIMEOUT), Poll::TimedOut);
-        }
-        for message in [
-            "permission denied",
-            "cannot connect to the Docker daemon",
-            "Error: no such object: another",
-            "Error: no such object: owned\npermission denied",
-        ] {
-            let state = observe_container(&runtime_answer(false, "", message), "owned");
-            assert!(matches!(state, Observed::Unknown(_)));
-            assert_eq!(readiness(&state, waiting), Poll::Wait);
-            assert_eq!(readiness(&state, READY_TIMEOUT), Poll::TimedOut);
-        }
-        for message in [
-            "Error: No such object: owned\n",
-            "error: no such container: owned",
-            "Error: no such object: \"owned\"\n",
-        ] {
-            let state = observe_container(&runtime_answer(false, "\n", message), "owned");
-            assert!(matches!(state, Observed::Missing));
-            assert_eq!(readiness(&state, waiting), Poll::Exited);
-        }
-    }
-
-    #[test]
-    fn startup_diagnostics_keep_causes_but_never_the_generated_password() {
-        let password = "Pbps!123secret";
-        let state = observe_container(
-            &runtime_answer(
-                true,
-                r#"{"Running":false,"ExitCode":137,"OOMKilled":true,"Error":"Pbps!123secret failed"}"#,
-                "",
-            ),
-            "owned",
-        );
-        let text = startup_diagnostic(
-            &format!(
-                "{}\nlog: {password}\nlogin: Pbps!123\rsecret; error 18456",
-                state.describe()
-            ),
-            password,
-        );
-        assert!(!text.contains(password), "{text}");
-        assert!(!text.contains('\r'), "{text}");
-        assert_eq!(text.matches("[redacted]").count(), 3);
-        assert!(text.contains("exit status 137, OOM killed: true"), "{text}");
-        assert!(text.contains("error 18456"), "{text}");
-        assert_eq!(
-            startup_diagnostic("ordinary connection refusal", password),
-            "ordinary connection refusal"
-        );
-    }
-
-    #[test]
-    fn only_a_single_nonzero_ipv4_loopback_mapping_is_accepted() {
-        for (text, port) in [
-            ("127.0.0.1:1", 1),
-            ("127.0.0.1:41417\n", 41417),
-            ("127.0.0.1:65535\r\n", 65535),
-        ] {
-            assert_eq!(parse_published_port(text).unwrap(), port);
-        }
-        for text in [
-            "0.0.0.0:49154",
-            "invalid IP:45887",
-            "[::]:49154",
-            "[::1]:49154",
-            "127.0.0.1:0",
-            "127.0.0.1:65536",
-            "127.0.0.1:+1",
-            "127.0.0.1:-1",
-            "127.0.0.1:",
-            "",
-            "garbage",
-            "0.0.0.0:49154\n[::]:49154\n",
-            "127.0.0.1:41417\n0.0.0.0:41417\n",
-            "127.0.0.1:41417\n127.0.0.1:41418\n",
-        ] {
-            let error = parse_published_port(text).unwrap_err().to_string();
-            assert!(error.contains(text.trim()), "{error}");
-        }
-    }
 
     fn planned(c: Change) -> pbps_model::PlannedChange {
         pbps_model::PlannedChange::new(c)

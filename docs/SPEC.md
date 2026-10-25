@@ -1978,14 +1978,43 @@ planning drift check (DEC-1790.1).
 ```bash
 pbps plan --dev docker://mcr.microsoft.com/mssql/server:2022-latest
 pbps plan --dev "Server=...;User Id=...;Password=..."   # a server already running
-# or `dev: { docker: ... }` / `dev: { url_env: ... }` in pbps.yml
+# or `dev: { resolver: scratch }` selects the shared entry below
 ```
 
-A container is started with a per-run password on a host-chosen loopback port
-and removed on every path out; against a server that is already running, pbps
-creates one scratch database and drops it. `--dev` and `--db` are refused together: a
-rehearsal answers a preview's question, and combining the two would invite a
-dev-verified plan to be read as a target-verified one.
+A project configures its scratch once, under `resolvers`, and selects that
+same entry for previews and connected resolution (DEC-587.1):
+
+```yaml
+resolvers:
+  scratch:
+    kind: server
+    url_env: SCRATCH_URL
+    externals: db/externals.sql
+resolve_with: scratch
+dev: { resolver: scratch }
+```
+
+`kind: docker` entries work the same way. Inline `--dev` values and the older
+`dev: { docker: ... }` / `dev: { url_env: ... }` spellings are anonymous entries
+using the same acquisition. The flag overrides configured rehearsal.
+
+Both paths use the resolver's server/Docker acquisition. The account decides
+whether pbps creates and drops run-owned scratch resources or uses the supplied
+database, which must be owned by that account and already empty, including
+objects inherited from `model`. Supplied scratch is emptied again after the run;
+cleanup removes only run-owned resources. Unconfirmed cleanup fails by name.
+A container uses a per-run password and a host-chosen loopback port, and is
+removed with its anonymous volumes. SIGINT and SIGTERM release acquired
+resources on Unix; Windows handles Ctrl-C. Abrupt process death cannot run
+database cleanup.
+
+The preview has no target. Any account, including `sa`, is accepted without a
+production-separation or confined-account requirement. The report explicitly
+states that separation from production is operator-vouched. A shared entry's
+`externals` file is staged before the baseline, with no comparison to any target;
+the report states both facts. There is no target capture, compatibility verdict
+or resolver evidence. `--dev` remains refused with `--db`, `--env` and `--check`.
+Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing.
 
 The container is used three ways, all on the preview side:
 

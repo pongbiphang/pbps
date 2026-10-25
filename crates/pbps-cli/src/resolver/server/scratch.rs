@@ -34,6 +34,8 @@ use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, Scratc
 
 pub use super::engine::{Standard, declared_standard};
 
+pub mod preview;
+
 /// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run
 /// releases everything it created before any result leaves, and a cleanup it

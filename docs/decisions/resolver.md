@@ -4341,3 +4341,29 @@ native base type, and incomplete identity metadata omits identity rather than
 guessing its specification. Strict replay still refuses unsupported facets;
 fallback retains that original replay limitation and never grants verification.
 Unreadable native types and unsafe collation names still refuse rendering.
+
+<a id="dec-587-1"></a>
+
+**DEC-587.1. Preview rehearsal shares the resolver's scratch acquisition and
+configuration, without manufacturing a target or binding evidence (#587).**
+The maintainer chose one configured scratch entry and target-less separation
+option (b): `dev: { resolver: name }` refers to the same entry connected planning
+selects. Legacy dev settings and inline flags remain anonymous server/Docker
+entries. Anonymous Docker spellings retain pull-if-missing behavior; named
+entries honor their configured pull policy. Any supplied account, including `sa`, is accepted; separation from
+production is operator-vouched and reported. The account still chooses the
+layout, and the shared acquisition enforces supplied ownership, fresh inventory
+(including inherited model objects), backend continuity and exact cleanup.
+The SQL Server adapter exposes this acquisition separately from reconstruction;
+preview never supplies a fictitious target or weakens the resolver's checks.
+
+A shared entry's externals are staged before the preview baseline and compared
+with nothing, because there is no target. The maintainer explicitly chose this
+behavior over refusing such an entry. Human and JSON reports state that they
+were staged and not compared with any target. Preview results remain outside
+deployment qualification. Interrupt and termination signals unwind the workload
+and await the shared release; acquisition finishes recording its obligations
+before cooperative cancellation can release them. Abrupt process death still
+cannot run supplied-database cleanup. Docker readiness diagnostics are shared
+with the resolver so consolidating acquisition retains preview's measured
+startup refusals and password redaction.

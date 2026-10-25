@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 59;
+pub const SCHEMA_VERSION: u32 = 60;
+// 60: preview rehearsal selects a shared scratch entry (#587).
 // 59: explicit enum label rename annotations (#1635 slice 3a).
 // 58: declared SQL Server cross-database dependencies and comparison reports (#2322).
 // 57: historical state show, diff and export envelopes (issue #2289).
@@ -327,6 +328,33 @@ pub fn cmd_man(dir: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dev_schema_permits_one_shared_or_anonymous_source() {
+        let document = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        for (dev, valid) in [
+            (serde_json::json!({"resolver":"scratch"}), true),
+            (
+                serde_json::json!({"resolver":"scratch", "docker":null}),
+                true,
+            ),
+            (serde_json::json!({"docker":"sql"}), true),
+            (serde_json::json!({"url_env":"SCRATCH"}), true),
+            (serde_json::json!({}), false),
+            (
+                serde_json::json!({"resolver":"scratch", "docker":"sql"}),
+                false,
+            ),
+            (
+                serde_json::json!({"resolver":"scratch", "url_env":"SCRATCH"}),
+                false,
+            ),
+        ] {
+            let config = serde_json::json!({"dialect":"mssql", "dev":dev});
+            assert_eq!(validator.is_valid(&config), valid, "{config}");
+        }
+    }
 
     /// The config schema and `Config::parse` agree on which `schema_dir`
     /// spellings name the project root or a directory above it (#739, review

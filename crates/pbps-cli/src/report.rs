@@ -1334,6 +1334,12 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
         "\nDev rehearsal: built the baseline in {} statement(s), applied {} more.\n",
         r.built, r.applied
     );
+    out.push_str("  Separation from production is operator-vouched.\n");
+    if r.externals_staged {
+        out.push_str(
+            "  Externals were staged before the baseline and not compared with any target.\n",
+        );
+    }
     if !r.structural.is_empty() {
         out.push_str(
             "\n  The plan does NOT converge: after applying it, the database still differs \

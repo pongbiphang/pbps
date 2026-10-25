@@ -6,6 +6,13 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
+Preview `plan --dev` shares the resolver's SQL Server server/Docker acquisition
+(#587, DEC-587.1). `dev: { resolver: scratch }` and `resolve_with: scratch` select
+one configured entry; inline and legacy dev spellings remain available.
+Reports name operator-vouched separation and, when configured, externals staged
+before the baseline without comparison to any target. This remains a preview;
+connected-plan rehearsal is #2379.
+
 SQL Server projects may declare cross-database table/view shapes with
 `dependency:` files (#2322, SPEC §4.9). Connected planning compares readable
 catalogs and labels unreadable dependencies `declared, not compared`; plan

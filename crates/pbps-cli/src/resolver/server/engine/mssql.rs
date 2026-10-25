@@ -35,7 +35,7 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     request: &'a ScopeRequest,
     // Preserve the selected source for #2270's evidence handoff.
     _provenance: &'a Provenance,
-    placement: sql::Placement,
+    placement: Option<sql::Placement>,
     companions: Vec<sql::companion::Companion>,
 }
 
@@ -69,6 +69,52 @@ pub(in crate::resolver::server) struct Prepared {
     pub(in crate::resolver::server) staged: capture::Staged,
     pub(super) scratch_catalog: CatalogFacts,
     pub(super) differences: Vec<String>,
+}
+
+pub(in crate::resolver::server) struct Acquired {
+    pub(in crate::resolver::server) owner: Conn,
+    database: String,
+    sandbox: String,
+    databases: Vec<String>,
+}
+
+/// No target identity or separation verdict is manufactured for a preview.
+pub(in crate::resolver::server) async fn preview<'a>(
+    admin: &mut Conn,
+    connection: &'a str,
+    request: &'a ScopeRequest,
+    provenance: &'a Provenance,
+) -> Result<(Provisioning, Scratch<'a>), Error> {
+    let backend = sql::backend(admin).await.map_err(read)?;
+    let mark = sql::mark(admin, &format!("{:032x}", rand::random::<u128>()))
+        .await
+        .map_err(read)?;
+    if !sql::marked(admin, &mark).await.map_err(read)? {
+        return Err(Error::Unusable(
+            "the scratch session cannot see its own live marker".into(),
+        ));
+    }
+    let provisioning = if sql::provisions(admin).await.map_err(read)? {
+        Provisioning::RunOwned
+    } else {
+        Provisioning::Supplied
+    };
+    Ok((
+        provisioning,
+        Scratch {
+            connection,
+            mark,
+            backend,
+            created: Created::Nothing,
+            entered: false,
+            acquired: None,
+            externals: None,
+            request,
+            _provenance: provenance,
+            placement: None,
+            companions: Vec::new(),
+        },
+    ))
 }
 
 fn read(error: pbps_db::DbError) -> Error {
@@ -141,7 +187,7 @@ pub(super) async fn scratch<'a>(
                 externals,
                 request,
                 _provenance: provenance,
-                placement,
+                placement: Some(placement),
                 companions: Vec::new(),
             },
         ))
@@ -151,37 +197,19 @@ pub(super) async fn scratch<'a>(
 }
 
 impl Scratch<'_> {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare(
+    /// Target-free acquisition, also used by preview rehearsal (DEC-587.1).
+    pub(in crate::resolver::server) async fn acquire(
         &mut self,
         provisioning: Provisioning,
         admin: &mut Conn,
-        target: &CatalogFacts,
-        target_connection: &mut Conn,
-        authorization: &scope::Authorization,
-        schemas: &[String],
-        binding: &BindingRequest<'_>,
-    ) -> Result<Prepared, Error> {
+        recipe: &pbps_db::resolver::environment::DatabaseRecipe,
+        dependency_inputs: Option<&mut dependencies::Inputs>,
+    ) -> Result<Acquired, Error> {
         if !sql::on_backend(admin, &self.backend).await.map_err(read)? {
             return Err(Error::Unusable(
-                "the scratch connection changed backend after separation".into(),
+                "the scratch connection changed backend after it was marked".into(),
             ));
         }
-        if self.placement == sql::Placement::SeparateInstance
-            && provisioning == Provisioning::Supplied
-            && !binding.dependencies.is_empty()
-        {
-            return Err(Error::Externals(binding.dependencies.keys().map(|name| format!(
-                "dependency `{}` requires a companion database; supplied scratch on another instance cannot create it", name.shown()
-            )).collect()));
-        }
-        let real = self.placement == sql::Placement::SameInstance;
-        let mut dependency_inputs =
-            dependencies::read(target_connection, binding.dependencies, real)
-                .await
-                .map_err(read)?;
-        let recipe = scope::recipe(Driver::Mssql, target)
-            .map_err(|error| Error::Scope(error.to_string()))?;
         let (reference, database, databases) = match provisioning {
             Provisioning::RunOwned => {
                 let names = super::super::generated_names()?;
@@ -189,10 +217,10 @@ impl Scratch<'_> {
                     names: names.clone(),
                     reference: None,
                 };
-                resolver::contained_databases_are_allowed(admin, &recipe)
+                resolver::contained_databases_are_allowed(admin, recipe)
                     .await
                     .map_err(read)?;
-                resolver::create_scratch(admin, &names, &recipe)
+                resolver::create_scratch(admin, &names, recipe)
                     .await
                     .map_err(|_| Error::Scratch)?;
                 let reference_names = super::super::generated_names()?;
@@ -207,7 +235,11 @@ impl Scratch<'_> {
                     names: names.clone(),
                     reference: None,
                 };
-                for database in dependency_inputs.databases() {
+                for database in dependency_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.databases())
+                    .unwrap_or_default()
+                {
                     let companion = sql::companion::Companion::create(admin, &database)
                         .await
                         .map_err(read)?;
@@ -271,10 +303,12 @@ impl Scratch<'_> {
                     companion_sessions.insert(companion.name().to_owned(), owner);
                 }
                 let token = format!("{:032x}", rand::random::<u128>());
-                dependency_inputs
-                    .stage(&mut companion_sessions, admin, &token)
-                    .await
-                    .map_err(read)?;
+                if let Some(inputs) = dependency_inputs {
+                    inputs
+                        .stage(&mut companion_sessions, admin, &token)
+                        .await
+                        .map_err(read)?;
+                }
                 (reference, names.database().to_owned(), databases)
             }
             Provisioning::Supplied => {
@@ -306,7 +340,7 @@ impl Scratch<'_> {
             && sql::database(&mut owner).await.map_err(read)? != self.mark.database
         {
             return Err(Error::Unusable(
-                "the supplied scratch database changed after separation".into(),
+                "the supplied scratch database changed after its session was marked".into(),
             ));
         }
         self.acquired = Some(sql::database(&mut owner).await.map_err(read)?);
@@ -322,7 +356,10 @@ impl Scratch<'_> {
             .await
             .map_err(read)?;
         let mut differences = sql::options::differences(&actual, &reference);
-        differences.extend(sql::options::recipe_differences(&actual, &recipe).map_err(read)?);
+        // A preview has no target recipe. Fresh-state checks above still apply.
+        if recipe.sql_server.is_some() {
+            differences.extend(sql::options::recipe_differences(&actual, recipe).map_err(read)?);
+        }
         if !differences.is_empty() {
             return Err(Error::Unusable(format!(
                 "scratch database options differ from a fresh database: {}",
@@ -357,6 +394,48 @@ impl Scratch<'_> {
                 inventory.names().join(", ")
             )));
         }
+        Ok(Acquired {
+            owner,
+            database,
+            sandbox,
+            databases,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare(
+        &mut self,
+        provisioning: Provisioning,
+        admin: &mut Conn,
+        target: &CatalogFacts,
+        target_connection: &mut Conn,
+        authorization: &scope::Authorization,
+        schemas: &[String],
+        binding: &BindingRequest<'_>,
+    ) -> Result<Prepared, Error> {
+        if self.placement == Some(sql::Placement::SeparateInstance)
+            && provisioning == Provisioning::Supplied
+            && !binding.dependencies.is_empty()
+        {
+            return Err(Error::Externals(binding.dependencies.keys().map(|name| format!(
+                "dependency `{}` requires a companion database; supplied scratch on another instance cannot create it", name.shown()
+            )).collect()));
+        }
+        let real = self.placement == Some(sql::Placement::SameInstance);
+        let mut dependency_inputs =
+            dependencies::read(target_connection, binding.dependencies, real)
+                .await
+                .map_err(read)?;
+        let recipe = scope::recipe(Driver::Mssql, target)
+            .map_err(|error| Error::Scope(error.to_string()))?;
+        let Acquired {
+            mut owner,
+            database,
+            sandbox,
+            databases,
+        } = self
+            .acquire(provisioning, admin, &recipe, Some(&mut dependency_inputs))
+            .await?;
         let managed = [binding.base, binding.desired];
         let required =
             capture::required_externals_declared(target_connection, &managed, binding.dependencies)
@@ -587,7 +666,10 @@ impl Scratch<'_> {
         Ok(conn)
     }
 
-    pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
+    pub(in crate::resolver::server) async fn release(
+        &mut self,
+        admin: &mut Conn,
+    ) -> Result<(), Vec<String>> {
         let mut failed = self.release_scratch(admin).await.err().unwrap_or_default();
         if !self.companions.is_empty() {
             if !matches!(sql::on_backend(admin, &self.backend).await, Ok(true)) {

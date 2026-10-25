@@ -197,9 +197,16 @@
       ]
     },
     "Dev": {
-      "description": "The optional throwaway engine of SPEC §9.3.\n\n# Why it is always optional\n\nThe air-gap promise stands: with no dev database the preview degrades to\nlightweight normalization and says so. This differs from Atlas, where a dev\ndatabase is required for many operations — and the difference is deliberate,\nbecause a tool that cannot answer without Docker cannot be used where this\none has to be.\n\nA dev-verified plan is still a **preview**. Applyable plans come only from\n`plan --db` against the target, and this does not move that line.",
+      "description": "The optional throwaway engine of SPEC §9.3.\n\n# Why it is always optional\n\nThe air-gap promise stands: with no dev database the preview degrades to\nlightweight normalization and says so. A preview remains available wherever\nDocker and a database connection are unavailable.\n\nA dev-verified plan is still a **preview**. Applyable plans come only from\n`plan --db` against the target, and this does not move that line.",
       "type": "object",
       "properties": {
+        "resolver": {
+          "description": "A shared entry under `resolvers`, also selectable by connected planning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "url_env": {
           "description": "The name of an environment variable holding a connection string to a\nthrowaway server — never the string itself, for the reason\n[`Environment`] gives.",
           "type": [
@@ -224,6 +231,9 @@
             },
             "url_env": {
               "type": "null"
+            },
+            "resolver": {
+              "type": "null"
             }
           },
           "required": [
@@ -237,10 +247,29 @@
             },
             "docker": {
               "type": "null"
+            },
+            "resolver": {
+              "type": "null"
             }
           },
           "required": [
             "url_env"
+          ]
+        },
+        {
+          "properties": {
+            "resolver": {
+              "type": "string"
+            },
+            "docker": {
+              "type": "null"
+            },
+            "url_env": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "resolver"
           ]
         }
       ]
@@ -787,6 +816,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 59,
+  "x-pbps-schema-version": 60,
   "x-pbps-tool-version": "0.0.0"
 }
