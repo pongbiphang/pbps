@@ -4376,6 +4376,77 @@ fn enum_rebuild_applies_beside_a_table_and_column_rename_over_a_default_and_chec
     }
 }
 
+/// The check is judged by the engine against the replacement's label order, so
+/// the plan-time probe, which reads the old order, must not decide it.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'happy');";
+        let (own, d) = adopted(&server, "rebuild_order_check1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        // `happy` is above `ok` today and below it once the rebuild has run.
+        redeclare(&d, "table: app.t\n", |text| {
+            format!("{text}checks:\n  m_low: m <= 'ok'::app.mood\n")
+        });
+        let path = d.dir.join("order-check.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conname = 'm_low'"
+            ),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+
+        // A check the stored data really violates under the new order is still
+        // refused. The plan-time probe stands aside for a retyped column, so
+        // the engine refuses it at apply: the transaction rolls back, the old
+        // type stands and no apply is recorded.
+        let sql = "CREATE SCHEMA app;
+            CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+            CREATE TABLE app.t (id int PRIMARY KEY, m app.mood NOT NULL);
+            INSERT INTO app.t VALUES (1,'ok');";
+        let (own, d) = adopted(&server, "rebuild_order_check_bad1635", sql);
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        redeclare(&d, "table: app.t\n", |text| {
+            format!("{text}checks:\n  m_low: m <= 'happy'::app.mood\n")
+        });
+        let applied = scalar(
+            db,
+            "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'",
+        );
+        let path = d.dir.join("order-check-bad.plan.json");
+        label_plan(&d, db, &path);
+        let out = apply_rebuild(&d, db, &path, &[]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(text.contains("m_low"), "{text}");
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+        assert!(no_replacement_left(db));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind = 'apply'"
+            ),
+            applied,
+            "{text}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot() {

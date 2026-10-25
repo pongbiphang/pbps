@@ -430,6 +430,13 @@ struct AsStored<'v, 'p> {
     /// expression (#2331), not the stored value cast to the new type. A probe
     /// that reads such a column would read a value the plan never stores.
     recorded: BTreeSet<ColumnRef>,
+    /// Columns an enum rebuild moves onto the replacement type. Kept apart
+    /// from `retyped`, whose entries drive a `CAST` to the new type: the
+    /// replacement may be named by a rename the catalog does not know yet, and
+    /// the stored labels do not change. They count as retyped only for
+    /// [`Self::retypes_in`], because the engine tests a CHECK or an index
+    /// predicate against the replacement's label order, not the old one.
+    enum_rebuilt: BTreeSet<ColumnRef>,
     /// The type of every column a row change of this plan carries a type
     /// for, as the plan leaves it: a literal the probe compares against
     /// another literal is compared through it (DECISIONS 341).
@@ -588,6 +595,7 @@ impl<'v, 'p> AsStored<'v, 'p> {
             retyped: Default::default(),
             retyped_from: Default::default(),
             recorded: Default::default(),
+            enum_rebuilt: Default::default(),
             column_types: Default::default(),
             recomputed: Default::default(),
             attached: Default::default(),
@@ -685,6 +693,9 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 }
                 Event::AlterColumnExpression { column, .. } => {
                     this.recomputed.insert(column.clone());
+                }
+                Event::RebuildEnumColumn { column } => {
+                    this.enum_rebuilt.insert(column.clone());
                 }
                 Event::DropColumn { column, .. } => {
                     this.vacated.insert(column.clone());
@@ -787,6 +798,17 @@ impl<'v, 'p> AsStored<'v, 'p> {
             })
             .collect();
         self.vacated.extend(vacated);
+        let rebuilt: Vec<ColumnRef> = self
+            .enum_rebuilt
+            .iter()
+            .flat_map(|c| {
+                partitions
+                    .of_parent(&c.table)
+                    .iter()
+                    .map(|p| p.column(&c.name))
+            })
+            .collect();
+        self.enum_rebuilt.extend(rebuilt);
     }
 
     /// Whether this plan gives one of `table`'s names to another column: a
@@ -808,7 +830,10 @@ impl<'v, 'p> AsStored<'v, 'p> {
     /// wrong, so whichever probe forgets to ask this is the one that refuses a
     /// valid plan (DECISIONS 410).
     fn retypes_in(&self, table: &TableName) -> bool {
-        self.retyped.keys().any(|c| c.table == *table)
+        self.retyped
+            .keys()
+            .chain(&self.enum_rebuilt)
+            .any(|c| c.table == *table)
     }
 
     fn renamed_column(&self, column: &ColumnRef) -> Option<&ColumnName> {
@@ -6831,6 +6856,62 @@ mod tests {
         let split = probes(&set(vec![retype(&elsewhere), check(&table)]));
         assert!(
             split.iter().any(|p| p.sql.contains("v = round(v)")),
+            "{split:#?}"
+        );
+    }
+
+    /// A rebuild retypes its column onto the replacement enum, whose label
+    /// order is the one the engine tests an order-sensitive check against: a
+    /// stored `happy` fails `CHECK (m <= 'ok')` under `[sad, ok, happy]` and
+    /// passes it under `[happy, ok]`. So a check on that table gets no probe
+    /// over the old order, as after any retype; the removed-label count still
+    /// runs before anything (DEC-1635.7).
+    #[test]
+    fn a_check_beside_an_enum_rebuild_is_not_probed_against_the_old_label_order() {
+        let table: TableName = "app.t".parse().unwrap();
+        let check = |t: &TableName| Change::AddCheck {
+            table: t.clone(),
+            name: "t_mood".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "m <= 'ok'::app.mood".to_owned(),
+            },
+        };
+        let rebuild = |t: &TableName, column: &str| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.mood".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: t.column(column),
+                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                array: false,
+                removed: vec!["sad".to_owned()],
+            },
+        };
+
+        let alone = probes(&set(vec![check(&table)]));
+        assert!(
+            alone.iter().any(|p| p.sql.contains("m <= ''ok''")),
+            "without a rebuild the check is probed: {alone:#?}"
+        );
+
+        let beside = probes(&set(vec![rebuild(&table, "m"), check(&table)]));
+        assert!(
+            beside.iter().all(|p| !p.sql.contains("m <= ''ok''")),
+            "the engine tests the check against the replacement's order: {beside:#?}"
+        );
+        assert!(
+            beside
+                .iter()
+                .any(|p| p.description.contains("holding a label this plan removes")),
+            "the removed-label count still runs: {beside:#?}"
+        );
+
+        // Only the table whose column moves is exempt.
+        let elsewhere: TableName = "app.other".parse().unwrap();
+        let split = probes(&set(vec![rebuild(&elsewhere, "m"), check(&table)]));
+        assert!(
+            split.iter().any(|p| p.sql.contains("m <= ''ok''")),
             "{split:#?}"
         );
     }

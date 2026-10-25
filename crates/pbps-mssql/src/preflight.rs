@@ -314,6 +314,7 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 | Event::DropColumn { .. }
                 | Event::AddColumn { .. }
                 | Event::AlterColumnExpression { .. }
+                | Event::RebuildEnumColumn { .. }
                 | Event::AddComputedColumn { .. }
                 | Event::DropComputedColumn { .. }
                 | Event::AddForeignKey { .. }
@@ -391,6 +392,7 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 | Event::UpdateRow { .. }
                 | Event::DeleteRow { .. }
                 | Event::AlterColumnExpression { .. }
+                | Event::RebuildEnumColumn { .. }
                 | Event::AddForeignKey { .. }
                 | Event::DropForeignKey { .. }
                 | Event::DropTable { .. }

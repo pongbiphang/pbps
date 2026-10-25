@@ -48,6 +48,14 @@ pub enum Event<'p> {
     AlterColumnExpression {
         column: &'p ColumnRef,
     },
+    /// An enum rebuild moves `column` onto the replacement type under the same
+    /// labels, so its stored values do not change but the type they are
+    /// compared through does. Not an `AlterColumnType`: there is no `from`
+    /// to convert, and the type it ends as may be named by a rename the
+    /// catalog does not yet know.
+    RebuildEnumColumn {
+        column: &'p ColumnRef,
+    },
     AddComputedColumn {
         table: &'p TableName,
         name: &'p ColumnName,
@@ -146,6 +154,10 @@ impl<'p> PlanFacts<'p> {
                 Change::AlterColumnExpression { column, .. } => {
                     Event::AlterColumnExpression { column }
                 }
+                Change::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Retype { column, .. },
+                    ..
+                } => Event::RebuildEnumColumn { column },
                 Change::AddComputedColumn { table, name, .. } => {
                     Event::AddComputedColumn { table, name }
                 }
@@ -260,6 +272,7 @@ impl<'p> PlanFacts<'p> {
                 | Event::AddColumn { .. }
                 | Event::AlterColumnType { .. }
                 | Event::AlterColumnExpression { .. }
+                | Event::RebuildEnumColumn { .. }
                 | Event::AddComputedColumn { .. }
                 | Event::DropComputedColumn { .. }
                 | Event::AddForeignKey { .. }
@@ -518,6 +531,7 @@ impl<'p> View<'_, 'p> {
                 | Event::AddColumn { .. }
                 | Event::AlterColumnType { .. }
                 | Event::AlterColumnExpression { .. }
+                | Event::RebuildEnumColumn { .. }
                 | Event::AddComputedColumn { .. }
                 | Event::DropComputedColumn { .. }
                 | Event::AddForeignKey { .. }

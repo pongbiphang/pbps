@@ -3193,6 +3193,26 @@ root's and is moved only with it. Pinned by
 `a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read` and the
 live `enum_rebuild_staged_closing_read_refuses_*` test.
 
+Plan-time probes: each `Retype` is also an event of its column in the preflight
+stream (`RebuildEnumColumn`), and the existing retype exemption (`retypes_in`)
+covers it. The engine judges a CHECK or an index predicate added beside a
+reorder against the replacement's label order, and a stored `happy` fails
+`m <= 'ok'` under `[sad, ok, happy]` and passes under `[happy, ok]`, so a probe
+over the old order refused a valid plan. The check is skipped as unchecked, as
+after any retype, and the engine decides it at apply: a check the stored data
+really violates under the new order is refused there, in the apply's
+transaction, with the old type standing and no applied state recorded. The event
+is not an `AlterColumnType`: the stored labels do not change, so key and
+foreign-key probes (equality, order-free) keep running, and the replacement may
+carry a name that a rename in the same plan has not yet given the catalog. The
+removed-label row count is the `Retype` change's own probe and still runs first,
+against the old type. The NOT NULL and unique probes read null-ness and
+equality, which the rebuild preserves, and a DEFAULT has no row probe, so none
+of them shares the assumption. Pinned by
+`an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is`,
+`a_check_beside_an_enum_rebuild_is_not_probed_against_the_old_label_order` and
+the live `enum_rebuild_adds_an_order_sensitive_check_*` test.
+
 Census at apply: the same census runs again where the plan runs, in the apply's
 own transaction after the lock and before the first statement. A staged run
 reads it in a transaction it rolls back, at its start and at every resume (a

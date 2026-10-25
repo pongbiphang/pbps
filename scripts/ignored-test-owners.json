@@ -563,6 +563,7 @@
         "managed_types::enum_rebuild_applies_with_a_routine_body_the_same_plan_changes",
         "managed_types::enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes",
         "managed_types::enum_rebuild_applies_beside_a_table_and_column_rename_over_a_default_and_check",
+        "managed_types::enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order",
         "managed_types::enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot",
         "managed_types::enum_rebuild_apply_refuses_a_dependent_created_after_the_plan_by_name_and_applies_nothing",
         "managed_types::enum_new_label_uses_refuse_before_sql_and_the_same_uses_succeed_in_a_second_plan",
