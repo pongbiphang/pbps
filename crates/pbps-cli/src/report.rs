@@ -1329,7 +1329,7 @@ pub fn drift(r: &DriftReport) -> String {
 }
 
 /// What a dev-database rehearsal found (SPEC §9.3).
-pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
+pub fn rehearsal(r: &crate::rehearsal::Findings) -> String {
     let mut out = format!(
         "\nDev rehearsal: built the baseline in {} statement(s), applied {} more.\n",
         r.built, r.applied
