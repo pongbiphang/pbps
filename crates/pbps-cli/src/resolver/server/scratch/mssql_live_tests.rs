@@ -71,11 +71,27 @@ async fn mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_s
     .unwrap();
     assert!(entered.is_dbo());
     assert!(sql::marked(&mut compile, &marker).await.unwrap());
-    // The ordinary check must still reject dbo's extra DENY ONLY entries.
-    assert!(
+    // dbo carries extra DENY ONLY entries (dbo, db_owner) into master,
+    // tempdb and msdb only when the scratch's owner also owns them, as sa does
+    // on the Linux fixtures. A LocalDB scratch's Windows owner does not, and
+    // its token there is guest and public alone (measured on 17.0). Where the
+    // extras exist, the ordinary check must still reject them.
+    let owns_system = owner
+        .query(&format!(
+            "SELECT COUNT(*) AS n FROM sys.databases s JOIN sys.databases d \
+             ON d.owner_sid = s.owner_sid WHERE s.name = N'{name}' \
+             AND d.name IN (N'master', N'tempdb', N'msdb');"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        != Some(0);
+    assert_eq!(
         sql::sandbox_checks(&mut compile, &databases, &name)
             .await
-            .is_err()
+            .is_err(),
+        owns_system
     );
     compile
         .execute("CREATE TABLE dbo.compiled2267(i int);")
