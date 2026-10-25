@@ -1113,3 +1113,75 @@ fn a_kept_unique_key_the_conversion_collides_is_refused_by_the_engine_and_change
         );
     }
 }
+
+const PARTITIONED: &str = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  k: {type: integer, nullable: false}\n  amount: {type: text}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [100]}\n";
+
+/// The converted declaration, with a unique index on the partition alone.
+fn partition_with_own_key() -> String {
+    PARTITIONED
+        .replace("amount: {type: text}", "amount: {type: integer}")
+        .replace(
+            "p1: {from: [0], to: [100]}",
+            "p1:\n    from: [0]\n    to: [100]\n    indexes:\n      p1_amount: {columns: [amount], unique: true}",
+        )
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_key_added_beside_a_conversion_on_a_partitioned_table_is_not_counted_over_the_stored_values() {
+    // The engine converts the partition's column with the parent's. `'1'` and
+    // `'01'` are one integer, and `length` makes them 1 and 2: the key holds.
+    // A probe over the partition's own key that casts what is stored counts them as a
+    // collision and refuses a plan the engine accepts (round 6 review).
+    let after = partition_with_own_key();
+    for (version, url) in servers() {
+        let slug = format!("convert2331-part{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, PARTITIONED);
+        on_server(connection, "INSERT INTO app.t VALUES (1,5,'1'),(2,5,'01')");
+        d.table(&after);
+        succeeds(with_stdin(&d, &CONVERT, b"length(amount)"));
+        let artifact = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &artifact, GATE_ALL));
+        assert_eq!(
+            scalar(connection, "SELECT sum(amount) FROM app.t"),
+            3,
+            "PG{version}"
+        );
+        assert!(
+            try_on_server(connection, "INSERT INTO app.t VALUES (3,6,1)").is_err(),
+            "PG{version}: the partition key was added"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_key_a_conversion_collides_on_a_partitioned_table_is_refused_by_the_engine_and_changes_nothing()
+{
+    // The negative of the test above: `length` makes `'ab'` and `'cd'` both 2
+    // in the partition, so its key cannot hold. The probe leaves the key to the
+    // engine, which refuses it at the rewrite and rolls the whole plan back.
+    let after = partition_with_own_key();
+    for (version, url) in servers() {
+        let slug = format!("convert2331-partclash{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, PARTITIONED);
+        on_server(connection, "INSERT INTO app.t VALUES (1,5,'ab'),(2,5,'cd')");
+        d.table(&after);
+        succeeds(with_stdin(&d, &CONVERT, b"length(amount)"));
+        let artifact = connected_artifact(&d, connection, false);
+        on_server(connection, WITNESS);
+        let refused = approved_apply(&d, connection, &artifact, GATE_ALL);
+        let text = stderr(&refused);
+        assert_eq!(code(&refused), 1, "PG{version}: {text}");
+        assert!(
+            text.contains("the whole plan was rolled back")
+                && text.contains("could not create unique index"),
+            "PG{version}: {text}"
+        );
+        assert!(still_text(connection), "PG{version}: nothing converted");
+    }
+}

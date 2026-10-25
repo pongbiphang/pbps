@@ -751,6 +751,20 @@ impl<'v, 'p> AsStored<'v, 'p> {
         reach(&mut self.retyped, partitions);
         reach(&mut self.retyped_from, partitions);
         reach(&mut self.column_types, partitions);
+        // The partitions' columns hold the parent's converted values, so a
+        // key probe over one must leave them unchecked as it does the parent's
+        // (#2331); `retyped` alone would send it a plain cast of the old text.
+        let recorded: Vec<ColumnRef> = self
+            .recorded
+            .iter()
+            .flat_map(|c| {
+                partitions
+                    .of_parent(&c.table)
+                    .iter()
+                    .map(|p| p.column(&c.name))
+            })
+            .collect();
+        self.recorded.extend(recorded);
         let recomputed: Vec<ColumnRef> = self
             .recomputed
             .iter()
