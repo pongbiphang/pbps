@@ -1825,12 +1825,57 @@ async fn direct_dependents(
         ModuleKind::Function | ModuleKind::Procedure => "pg_catalog.pg_proc",
         ModuleKind::Trigger => "pg_catalog.pg_trigger",
     };
+    read_dependents(conn, &reverse_edge(refclass), &[Param::I64(oid)]).await
+}
 
+/// What stands on one column of a table: the same reverse edges as a module's,
+/// but of a single attribute, for a retype that needs them out of its way
+/// (DEC-1635.7). Inside the caller's transaction, like [`dependents`].
+pub async fn column_dependents(
+    conn: &mut Conn,
+    table: i64,
+    attnum: i64,
+) -> Result<Vec<Dependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    conn.query(CANONICAL_PATH).await?;
+    read_dependents(
+        conn,
+        "(d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = ($1::int8)::oid \
+         AND d.refobjsubid = ($2::int8)::int AND d.deptype <> 'i')",
+        &[Param::I64(table), Param::I64(attnum)],
+    )
+    .await
+}
+
+/// What stands on an enum type or its array: every reverse edge of both,
+/// whatever its kind. A column that holds the type is an edge, and so is a
+/// routine that names it in its signature or a constant of it in a body.
+pub async fn type_dependents(
+    conn: &mut Conn,
+    ty: i64,
+    array: i64,
+) -> Result<Vec<Dependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    conn.query(CANONICAL_PATH).await?;
+    read_dependents(
+        conn,
+        "(d.refclassid = 'pg_catalog.pg_type'::regclass \
+         AND d.refobjid IN (($1::int8)::oid, ($2::int8)::oid) AND d.deptype <> 'i')",
+        &[Param::I64(ty), Param::I64(array)],
+    )
+    .await
+}
+
+async fn read_dependents(
+    conn: &mut Conn,
+    edge: &str,
+    params: &[Param<'_>],
+) -> Result<Vec<Dependent>, DbError> {
     let mut args: std::collections::BTreeMap<i64, Vec<pbps_model::RoutineArg>> =
         std::collections::BTreeMap::new();
     let mut refused_args: BTreeSet<i64> = BTreeSet::new();
     for row in conn
-        .query_with(&dependent_routine_args_query(refclass), &[Param::I64(oid)])
+        .query_with(&dependent_routine_args_query(edge), params)
         .await?
     {
         let routine = row.try_get_at::<i64>(0)?.unwrap_or_default();
@@ -1843,10 +1888,7 @@ async fn direct_dependents(
     }
 
     let mut out = Vec::new();
-    for row in conn
-        .query_with(&dependents_query(refclass), &[Param::I64(oid)])
-        .await?
-    {
+    for row in conn.query_with(&dependents_query(edge), params).await? {
         let described = text(&row, "described")?;
         let unrepresentable = text(&row, "unrepresentable")?;
         let dep_schema = text(&row, "dep_schema")?;
@@ -1925,8 +1967,7 @@ async fn direct_dependents(
 /// deduplicated where they are read; this one has to be deduplicated before
 /// the join, because duplication here changes a value instead of repeating
 /// one.
-fn dependent_routine_args_query(refclass: &str) -> String {
-    let edge = reverse_edge(refclass);
+fn dependent_routine_args_query(edge: &str) -> String {
     format!(
         "SELECT p.oid::int8 AS oid, u.pos::int8 AS pos,
                 pg_catalog.format_type(u.ty, NULL) AS ty
@@ -1980,8 +2021,7 @@ fn dependent_routine_args_query(refclass: &str) -> String {
 /// VIEW v` deletes the rule and `CREATE VIEW v` does not restore it. Only the
 /// engine's own `_RETURN` rule *is* the view; any other comes back as a
 /// dependent this model cannot put back, and refuses (DECISIONS 306).
-fn dependents_query(refclass: &str) -> String {
-    let edge = reverse_edge(refclass);
+fn dependents_query(edge: &str) -> String {
     let described = "pg_catalog.pg_describe_object(d.classid, d.objid, d.objsubid) AS described";
     let known = KNOWN_DEPENDENT_CLASSES
         .iter()
@@ -2590,9 +2630,9 @@ mod tests {
             "pg_catalog.pg_trigger",
         ] {
             let edge = reverse_edge(refclass);
-            assert!(dependents_query(refclass).contains(&edge), "{refclass}");
+            assert!(dependents_query(&edge).contains(&edge), "{refclass}");
             assert!(
-                dependent_routine_args_query(refclass).contains(&edge),
+                dependent_routine_args_query(&edge).contains(&edge),
                 "{refclass}"
             );
             assert_eq!(
@@ -2606,7 +2646,7 @@ mod tests {
 
     #[test]
     fn every_known_class_has_an_arm_and_the_rest_fall_through() {
-        let sql = dependents_query("pg_catalog.pg_proc");
+        let sql = dependents_query(&reverse_edge("pg_catalog.pg_proc"));
         for class in KNOWN_DEPENDENT_CLASSES {
             assert!(
                 sql.contains(&format!("d.classid = '{class}'::regclass")),

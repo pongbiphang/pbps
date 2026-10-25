@@ -413,6 +413,7 @@ requirement is common to all of them, so it is listed once,
 | `DropType` | 18 | P: its columns/tables and dependent domains gone or retyped; its modules gone | Removes the type, releases its Types name | Exists, Absent, removes |
 | `RenameType` | 1 | P: the target and intermediate Types names free | Rewrites the same uid at its final name | Exists, rewrites |
 | `AddEnumValue`, `RenameEnumValue` | 7, before tables; approved step ordinal | P: its type standing under its final name; its neighbour or old label present; rename target absent | Rewrites the same type uid at each intermediate definition; rename also changes deparsed constants and returned labels | Exists, rewrites |
+| `EnumRebuild` | `Create` 7 after the label renames; `Retype` and `Swap` (9, 1) at the retype rank, the swap after every retype of its type | P: `Create`: the type standing, its label renames first, the temporary Types name free. `Retype`: the replacement created, what blocks the retype gone (the defaults, checks, foreign keys and filtered or expression indexes that name the column, and its views and bodies, by the dialect's rebuild policy and the module rebuild). `Swap`: every column of the type retyped | `Create` claims a temporary Types name; `Retype` rewrites the column's table under ACCESS EXCLUSIVE; `Swap` removes the old type, releases the temporary name and gives the uid its own back | Exists, Absent, rewrites |
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
@@ -849,6 +850,12 @@ positions from the certified collection (DEC-1959.5, DEC-2181.1).
 | Label changes on one uid | approved intermediate order | rank by operation ordinal inside the existing type subrank; the existing resource-write edge preserves it |
 | AddEnumValue → any same-plan evaluation of its new label | transactional use refused by name | plan-time refusal (DEC-1635.6), including enum arrays and domains; apply the label first, then the rest |
 | Label changes → reference-data rows or enum-rooted partition bounds | not declarable today | DEC-1523.1 refuses the surface before a use check or ordering obligation; #2346 tracks admission |
+| RenameEnumValue → `EnumRebuild` `Create` | labels map by final name | class 7 type subrank, rebuild after the renames by operation ordinal |
+| Check, foreign key, index drops → `Retype` → their restores | what names the column comes down and goes back | classes 2 → 9 → 13 by the dialect's rebuild policy (`enum_rebuild_dependents`) and the differ's `recreate_retyped_dependents`; partitions' own checks and indexes included |
+| Default drop → `Retype` → `Swap` → default set | old default off, new type on, default written for the final type | class 9 ranks −2, −1, −1 (the swap after the retypes of its type by tiebreak), 0 |
+| Module drops → `Retype` → `Swap` → module creates | views, bodies and triggers over a moved column rebuilt | classes 0 → 9 → 14, the catalog census plans them again with `diff_rebuilding`; `weave` orders their own dependents |
+| `Swap` → anything naming the type | the type's own name again before text that names it | class 9 swap before classes 13 and 14 |
+| `EnumRebuild` → a same-plan table, column, domain or routine that uses the type | refused by name | plan-time refusal (DEC-1635.7); rebuild first, then add |
 | Independent type operations and all remaining pairs | no dependency | stable class/rank key; no extra pass |
 
 The shadow verifier uses the same type resources, final-incarnation requirements,

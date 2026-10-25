@@ -280,6 +280,7 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
                 change,
                 Change::AddEnumValue { .. }
                     | Change::RenameEnumValue { .. }
+                    | Change::EnumRebuild { .. }
                     | Change::CreateType { .. }
                     | Change::DropType { .. }
                     | Change::RenameType { .. }

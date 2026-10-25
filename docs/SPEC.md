@@ -831,9 +831,19 @@ identity; names are never guessed. Cross-schema moves use SET SCHEMA followed
 by RENAME when needed. Swaps refuse by name. Drops require a recorded nonblank
 reason, a tombstone and destructive approval, like table drops, and follow the
 last dependent's removal or retype. Enum labels can be added at their declared
-position or renamed with explicit label intent (DEC-1635.6). Removal without
-rename intent and reordering retained labels refuse by name until #1635 slice
-3b. Label rename chains execute in free-target order; swaps refuse by name.
+position or renamed with explicit label intent (DEC-1635.6). A label absent
+from the declaration, or retained labels in another order, rebuild the enum
+under its uid (DEC-1635.7): a replacement with the declared labels, each column
+moved to it, the old type dropped and the replacement renamed back, in one
+transaction. It needs `--allow type-rebuild`, because every table with a column
+of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure
+reorder; rows holding a removed label are refused at plan time, with a count
+per column. Defaults, checks, foreign keys and filtered or expression indexes
+that name a moved column, and the views, SQL bodies and triggers over it, come
+down and go back from the declaration. A policy, generated column, materialized
+view, publication, composite attribute, domain, routine signature, range or
+undeclared table that uses the type refuses by name, before any SQL. Label
+rename chains execute in free-target order; swaps refuse by name.
 Adding a label has no intrinsic risk class, like type creation; renaming one
 requires `rename` approval because queries see different text.
 A plan cannot also evaluate its newly added label in a column default or
@@ -1334,6 +1344,7 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
 | `row-security` | Standing-table row access widens: DISABLE, NO FORCE, create permissive policy, drop restrictive policy, or any policy replacement | Previously hidden or protected rows become accessible; **gated** by `--allow row-security` |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 | `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); the bound a sequence counts toward set or tightened with a non-cycling destination, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner. A tightened bound with a cycling destination only wraps sooner |
+| `type-rebuild` | An enum's label is removed or retained labels are reordered, so the type is rebuilt under its uid (DEC-1635.7) | Every table with a column of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure reorder, and the defaults, checks, foreign keys, indexes, views, bodies and triggers that name it are dropped and restored |
 
 On standing tables, ENABLE, FORCE, creating a restrictive policy and dropping a
 permissive policy carry `revoke`. Every policy replacement carries both `revoke`

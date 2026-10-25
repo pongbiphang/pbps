@@ -240,6 +240,7 @@ impl<'p> PlanFacts<'p> {
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }

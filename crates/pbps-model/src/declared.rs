@@ -373,6 +373,14 @@ impl Declared {
                 } => {
                     self.types.insert(name.clone(), (**definition).clone());
                 }
+                Change::EnumRebuild {
+                    name,
+                    step: crate::EnumRebuildStep::Swap { definition, .. },
+                    ..
+                } => {
+                    self.types.insert(name.clone(), (**definition).clone());
+                }
+                Change::EnumRebuild { .. } => {}
                 Change::DropType { name, .. } => {
                     self.types.remove(name);
                 }
@@ -916,6 +924,37 @@ mod tests {
         // Baseline/pull and older snapshots have no authored text to move.
         record.advance(&changes(vec![rename]));
         assert!(record.is_empty());
+    }
+
+    #[test]
+    fn an_enum_rebuild_records_its_final_definition_at_the_swap_and_not_before() {
+        use crate::{EnumRebuildStep, ManagedType};
+        let name: crate::TypeRef = "app.e".parse().unwrap();
+        let uid = crate::Uid::generate(crate::UidKind::Type);
+        let enumeration = |labels: &[&str]| ManagedType::Enum {
+            values: labels.iter().map(|l| (*l).into()).collect(),
+        };
+        let step = |step| Change::EnumRebuild {
+            uid: uid.clone(),
+            name: name.clone(),
+            tmp: "app.pbps_rebuild_e".parse().unwrap(),
+            step,
+        };
+        let mut record = Declared::default();
+        record
+            .types
+            .insert(name.clone(), enumeration(&["sad", "ok"]));
+        record.advance(&changes(vec![step(EnumRebuildStep::Create {
+            definition: Box::new(enumeration(&["ok"])),
+            removed: vec!["sad".into()],
+            ordinal: 0,
+        })]));
+        assert_eq!(record.types.get(&name), Some(&enumeration(&["sad", "ok"])));
+        record.advance(&changes(vec![step(EnumRebuildStep::Swap {
+            definition: Box::new(enumeration(&["ok"])),
+            comment: None,
+        })]));
+        assert_eq!(record.types.get(&name), Some(&enumeration(&["ok"])));
     }
 
     #[test]

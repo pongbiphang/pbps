@@ -1,0 +1,668 @@
+//! What stands on an enum a plan rebuilds under its uid, read from the catalog
+//! (DEC-1635.7, measured on PostgreSQL 16.15 and 18.6).
+//!
+//! The rebuild moves every column of the type to a replacement and drops the
+//! old type. The census is **catalog-driven** rather than a list of known
+//! kinds: every `pg_depend` edge on the type and its array, and every column
+//! of either, is classified, and one the plan neither moves nor rebuilds is
+//! refused by name before any SQL. The engine never has to abort mid-plan on a
+//! dependent this crate failed to list.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use pbps_db::{Conn, DbError, Param};
+use pbps_diff::order::catalog::{Dependent, Holds, Part};
+use pbps_model::{
+    Change, ChangeSet, EnumRebuildStep, IdsFile, ModuleId, Schema, TableName, TypeRef,
+};
+
+fn refused(why: String) -> DbError {
+    DbError::Refused(why)
+}
+
+fn quoted(name: &TypeRef) -> Result<String, DbError> {
+    let part = |ident: &str| crate::quote(ident).map_err(|e| refused(e.to_string()));
+    Ok(format!("{}.{}", part(name.schema())?, part(name.name())?))
+}
+
+/// What the plan does about what the catalog found.
+#[derive(Debug, Default)]
+pub struct Census {
+    /// Declared modules the plan must rebuild around the retypes and does not
+    /// yet: the connected planner plans again with them (`diff_rebuilding`).
+    pub rebuild: BTreeSet<ModuleId>,
+}
+
+/// The comment of each enum, read before planning so the swap can carry it.
+pub async fn comments(
+    conn: &mut Conn,
+    types: &[TypeRef],
+) -> Result<BTreeMap<TypeRef, String>, DbError> {
+    let mut out = BTreeMap::new();
+    for name in types {
+        let rows = conn
+            .query_with(
+                "SELECT pg_catalog.obj_description(t.oid, 'pg_type') AS comment
+                   FROM pg_catalog.pg_type t
+                  WHERE t.oid = pg_catalog.to_regtype($1)",
+                &[Param::Str(&quoted(name)?)],
+            )
+            .await?;
+        if let Some(comment) = rows
+            .first()
+            .map(|r| r.try_get::<&str>("comment"))
+            .transpose()?
+            .flatten()
+        {
+            out.insert(name.clone(), comment.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+struct Held {
+    parent: Option<i64>,
+    kind: String,
+    schema: String,
+    table: String,
+    column: String,
+}
+
+/// Classify everything standing on each enum `changes` rebuilds. Inside the
+/// planning transaction, so the answer holds until the plan's own reads, and
+/// again inside the apply, after the lock and before the first statement.
+///
+/// `declared` is the project's desired schema at planning: a dependent module
+/// is rebuilt only when the project holds it. At apply it is `None`, and a
+/// dependent the plan does not already rebuild appeared after the plan was
+/// made. `before` names a column as the database has it today, which a rename
+/// in the same plan changes. `resuming` is a staged run past its first
+/// statement, when the replacement may already stand.
+pub async fn census(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    declared: Option<&Schema>,
+    before: &IdsFile,
+    resuming: bool,
+) -> Result<Census, DbError> {
+    crate::modules::require_the_callers_transaction(conn).await?;
+    let mut out = Census::default();
+    let rebuilt: Vec<_> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::EnumRebuild {
+                uid,
+                name,
+                tmp,
+                step: EnumRebuildStep::Create { .. },
+            } = &p.change
+            {
+                Some((uid, name, tmp))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let rebuilds_module = |id: &ModuleId| {
+        changes.changes.iter().any(|p| {
+            matches!(&p.change,
+                Change::AlterModule { id: m, .. } | Change::DropModule { id: m, .. } if m == id)
+        })
+    };
+    for (uid, name, tmp) in rebuilt {
+        let shown = name.shown().to_string();
+        let rows = conn
+            .query_with(
+                "SELECT t.oid::int8 AS oid, t.typarray::int8 AS array, t.typtype::text AS kind,
+                        (pg_catalog.pg_get_userbyid(t.typowner) <> current_user) AS foreign_owner,
+                        (t.typacl IS NOT NULL) AS has_acl,
+                        (pg_catalog.to_regtype($2) IS NOT NULL) AS tmp_taken
+                   FROM pg_catalog.pg_type t
+                  WHERE t.oid = pg_catalog.to_regtype($1)",
+                &[Param::Str(&quoted(name)?), Param::Str(&quoted(tmp)?)],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // A run past the drop has the replacement alone, and nothing is
+            // left to block the rename.
+            let standing = conn
+                .query_with(
+                    "SELECT (pg_catalog.to_regtype($1) IS NOT NULL) AS standing",
+                    &[Param::Str(&quoted(tmp)?)],
+                )
+                .await?;
+            if resuming
+                && standing
+                    .first()
+                    .map(|r| r.try_get::<bool>("standing"))
+                    .transpose()?
+                    .flatten()
+                    == Some(true)
+            {
+                continue;
+            }
+            return Err(refused(format!("enum {shown} is not in the database")));
+        };
+        let (ty, array) = (
+            row.try_get::<i64>("oid")?.unwrap_or_default(),
+            row.try_get::<i64>("array")?.unwrap_or_default(),
+        );
+        if row.try_get::<&str>("kind")?.unwrap_or_default() != "e" {
+            return Err(refused(format!("{shown} is not an enum in the database")));
+        }
+        if row.try_get::<bool>("foreign_owner")?.unwrap_or_default() {
+            return Err(refused(format!(
+                "enum {shown} is owned by a role other than the one deploying; the replacement would not keep its owner, so the rebuild is refused"
+            )));
+        }
+        if row.try_get::<bool>("has_acl")?.unwrap_or_default() {
+            return Err(refused(format!(
+                "enum {shown} has an explicit privilege list, which the replacement would not keep; the rebuild is refused"
+            )));
+        }
+        if !resuming && row.try_get::<bool>("tmp_taken")?.unwrap_or_default() {
+            return Err(refused(format!(
+                "the type name {} that the rebuild of {shown} needs is taken in the database",
+                tmp.shown()
+            )));
+        }
+
+        // The columns the plan moves, as the database has them today.
+        let mut moved: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for planned in &changes.changes {
+            if let Change::EnumRebuild {
+                uid: u,
+                step:
+                    EnumRebuildStep::Retype {
+                        column_uid, column, ..
+                    },
+                ..
+            } = &planned.change
+                && u == uid
+            {
+                let live = before.columns.get(column_uid).unwrap_or(column);
+                moved.insert((
+                    live.table.schema.clone(),
+                    live.table.name.clone(),
+                    live.name.raw().to_owned(),
+                ));
+            }
+        }
+
+        // 1. Every column that holds the type or its array.
+        let mut held = BTreeMap::new();
+        let mut names: BTreeMap<i64, TableName> = BTreeMap::new();
+        for row in conn
+            .query_with(
+                "SELECT a.attrelid::int8 AS relation, c.relkind::text AS kind,
+                        n.nspname AS schema, c.relname AS name, a.attname AS column,
+                        (SELECT i.inhparent::int8 FROM pg_catalog.pg_inherits i
+                          WHERE i.inhrelid = c.oid LIMIT 1) AS parent
+                   FROM pg_catalog.pg_attribute a
+                   JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE a.atttypid IN (($1::int8)::oid, ($2::int8)::oid)
+                    AND a.attnum > 0 AND NOT a.attisdropped
+                  ORDER BY 3, 4, 5",
+                &[Param::I64(ty), Param::I64(array)],
+            )
+            .await?
+        {
+            let relation = row.try_get::<i64>("relation")?.unwrap_or_default();
+            let text = |c: &str| -> Result<String, DbError> {
+                Ok(row.try_get::<&str>(c)?.unwrap_or_default().to_owned())
+            };
+            names.insert(relation, TableName::new(text("schema")?, text("name")?));
+            held.insert(
+                (relation, text("column")?),
+                Held {
+                    parent: row.try_get::<i64>("parent")?,
+                    kind: text("kind")?,
+                    schema: text("schema")?,
+                    table: text("name")?,
+                    column: text("column")?,
+                },
+            );
+        }
+        for h in held.values() {
+            let shown_column = format!("{}.{}.{}", h.schema, h.table, h.column);
+            // A partition's column follows its root's retype; the root is the
+            // ancestor that is not itself a partition.
+            let mut root = h;
+            while let Some(parent) = root.parent {
+                match held.get(&(parent, h.column.clone())) {
+                    Some(up) if h.kind == "r" || h.kind == "p" => root = up,
+                    _ => break,
+                }
+            }
+            let reached =
+                moved.contains(&(root.schema.clone(), root.table.clone(), root.column.clone()));
+            let what = match h.kind.as_str() {
+                "r" | "p" if reached => continue,
+                // An index holds the type in its key; the engine rebuilds it
+                // with the table, and one with constants of the type is
+                // judged below as a dependent.
+                "i" | "I" => continue,
+                "r" | "p" => "a table the declarations do not retype",
+                "v" => {
+                    let id = ModuleId::Named(pbps_model::ObjectName::new(&h.schema, &h.table));
+                    if rebuilds_module(&id) {
+                        continue;
+                    }
+                    if declared.is_some_and(|d| d.modules.contains_key(&id)) {
+                        out.rebuild.insert(id);
+                        continue;
+                    }
+                    if declared.is_none() {
+                        "a view that appeared after the plan was made"
+                    } else {
+                        "a view the project does not declare"
+                    }
+                }
+                "m" => "a materialized view, which no declaration holds",
+                "c" => "a composite type's attribute, which cannot move to a replacement enum",
+                "f" => "a foreign table",
+                _ => "a relation of a kind pbps cannot rebuild around",
+            };
+            return Err(refused(format!(
+                "column {shown_column} holds enum {shown}, and it is {what}; the rebuild of {shown} is refused"
+            )));
+        }
+
+        // 2. Routines that name the type in a signature block DROP TYPE.
+        let routines = conn
+            .query_with(
+                "SELECT pg_catalog.pg_describe_object('pg_catalog.pg_proc'::regclass, p.oid, 0) AS described
+                   FROM pg_catalog.pg_proc p
+                  WHERE p.prorettype IN (($1::int8)::oid, ($2::int8)::oid)
+                     OR p.proargtypes::pg_catalog.oid[] && ARRAY[($1::int8)::oid, ($2::int8)::oid]
+                     OR p.proallargtypes && ARRAY[($1::int8)::oid, ($2::int8)::oid]
+                  ORDER BY 1",
+                &[Param::I64(ty), Param::I64(array)],
+            )
+            .await?;
+        if let Some(row) = routines.first() {
+            return Err(refused(format!(
+                "{} names enum {shown} in its signature, which blocks DROP TYPE; the rebuild of {shown} is refused until the routine is changed in a plan of its own",
+                row.try_get::<&str>("described")?.unwrap_or_default()
+            )));
+        }
+
+        // 3. Everything else with an edge on the type: constants in checks,
+        // defaults, partial indexes and bodies; domains, ranges and casts.
+        let mut seen: Vec<(Level, Dependent)> = Vec::new();
+        for dependent in crate::modules::type_dependents(conn, ty, array).await? {
+            // A column that holds the type was judged above, whether the
+            // reader names it a column or, for a partition's, its parent.
+            let column = dependent.described.starts_with("column ")
+                || matches!(&dependent.holds, Holds::Unrepresentable(why)
+                    if why.contains("a relation of a kind this reader does not know"));
+            if !column {
+                seen.push((Level::Type, dependent));
+            }
+        }
+        // 4. Everything on a column the plan moves that the engine does not
+        // rebuild: views, bodies, triggers, policies, generated columns.
+        for (schema, table, column) in &moved {
+            let rows = conn
+                .query_with(
+                    "SELECT a.attrelid::int8 AS relation, a.attnum::int8 AS num
+                       FROM pg_catalog.pg_attribute a
+                       JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = $1 AND c.relname = $2 AND a.attname = $3
+                        AND NOT a.attisdropped",
+                    &[Param::Str(schema), Param::Str(table), Param::Str(column)],
+                )
+                .await?;
+            let Some(row) = rows.first() else {
+                return Err(refused(format!(
+                    "column {schema}.{table}.{column} is not in the database"
+                )));
+            };
+            seen.extend(
+                crate::modules::column_dependents(
+                    conn,
+                    row.try_get::<i64>("relation")?.unwrap_or_default(),
+                    row.try_get::<i64>("num")?.unwrap_or_default(),
+                )
+                .await?
+                .into_iter()
+                .map(|d| (Level::Column, d)),
+            );
+        }
+        // A partition's default is its parent's, copied: the plan drops it
+        // where the declaration holds it, at the root.
+        let parents: BTreeMap<TableName, TableName> = held
+            .values()
+            .filter_map(|h| {
+                let parent = names.get(&h.parent?)?;
+                Some((TableName::new(&h.schema, &h.table), parent.clone()))
+            })
+            .collect();
+        let mut judged = BTreeSet::new();
+        for (level, dependent) in seen {
+            if !judged.insert(dependent.described.clone()) {
+                continue;
+            }
+            match verdict(level, &dependent, changes, declared, &parents) {
+                Verdict::Fine => {}
+                Verdict::Rebuild(id) => {
+                    if !rebuilds_module(&id) {
+                        out.rebuild.insert(id);
+                    }
+                }
+                Verdict::Refuse(why) => {
+                    return Err(refused(format!(
+                        "{} stands on enum {shown} ({why}); the rebuild of {shown} is refused",
+                        dependent.described
+                    )));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Where a dependent was found: on the type, by a constant of it in an
+/// expression, or on a column the plan moves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Type,
+    Column,
+}
+
+enum Verdict {
+    /// The engine rebuilds it, or the plan already drops and restores it.
+    Fine,
+    Rebuild(ModuleId),
+    Refuse(String),
+}
+
+/// Whether the plan already drops `part` of `table`.
+fn drops(changes: &ChangeSet, table: &TableName, part: &Part) -> bool {
+    changes.changes.iter().any(|p| match (&p.change, part) {
+        (Change::DropCheck { table: t, name }, Part::Check(n)) => t == table && name == n,
+        (Change::DropIndex { table: t, name }, Part::Index(n)) => t == table && name == n,
+        (
+            Change::AlterColumnDefault {
+                column, to: None, ..
+            },
+            Part::Default(c),
+        ) => column.table == *table && column.name == *c,
+        _ => false,
+    })
+}
+
+fn verdict(
+    level: Level,
+    dependent: &Dependent,
+    changes: &ChangeSet,
+    declared: Option<&Schema>,
+    parents: &BTreeMap<TableName, TableName>,
+) -> Verdict {
+    match &dependent.holds {
+        Holds::Module(id) => {
+            if changes.changes.iter().any(|p| {
+                matches!(&p.change,
+                    Change::AlterModule { id: m, .. } | Change::DropModule { id: m, .. } if m == id)
+            }) {
+                Verdict::Fine
+            } else if declared.is_some_and(|d| d.modules.contains_key(id)) {
+                Verdict::Rebuild(id.clone())
+            } else if declared.is_none() {
+                Verdict::Refuse("a module that appeared after the plan was made".into())
+            } else {
+                Verdict::Refuse("a module the project does not declare".into())
+            }
+        }
+        Holds::TablePart { table, part } => match part {
+            // Dropped and restored from the declaration, which the engine
+            // would refuse to retype beside: constants typed as the old enum.
+            // On a column, they only name it, and the engine rebuilds them.
+            Part::Check(_) | Part::Index(_) | Part::Default(_) => {
+                // A partition's default is its parent's, copied: the plan
+                // drops it where the declaration holds it, at the root.
+                let mut owner = table.clone();
+                for _ in 0..32 {
+                    match parents.get(&owner) {
+                        Some(parent) if matches!(part, Part::Default(_)) => {
+                            owner = parent.clone();
+                        }
+                        _ => break,
+                    }
+                }
+                if level == Level::Column || drops(changes, &owner, part) {
+                    Verdict::Fine
+                } else if matches!(part, Part::Index(_) | Part::Check(_)) {
+                    Verdict::Refuse(
+                        "the plan does not drop and restore it, which its constants of the old type require"
+                            .into(),
+                    )
+                } else {
+                    Verdict::Refuse("a default the plan does not restore".into())
+                }
+            }
+            Part::Policy(_) => Verdict::Refuse("a policy, which a rebuild does not restore".into()),
+            Part::Generated(_) => {
+                Verdict::Refuse("a generated column, which PostgreSQL cannot retype".into())
+            }
+            Part::PrimaryKey(_) | Part::Unique(_) | Part::ForeignKey(_) => Verdict::Fine,
+        },
+        Holds::Unrepresentable(why) => {
+            // Keys, unique and exclusion constraints and extended statistics
+            // are rebuilt by the engine itself; a foreign key is declared and
+            // restored by the plan.
+            if why.contains("a constraint of a kind that is not a check")
+                || why.contains("`pg_catalog.pg_statistic_ext`")
+                || why.contains("`pg_statistic_ext`")
+            {
+                Verdict::Fine
+            } else {
+                Verdict::Refuse(why.clone())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_model::{Module, ModuleKind, ObjectName, PlannedChange};
+
+    fn dependent(holds: Holds) -> Dependent {
+        Dependent {
+            described: "something".into(),
+            holds,
+        }
+    }
+
+    fn plan(changes: Vec<Change>) -> ChangeSet {
+        ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        }
+    }
+
+    fn view(name: &str) -> ModuleId {
+        ModuleId::Named(ObjectName::new("app", name))
+    }
+
+    fn declaring(id: &ModuleId) -> Schema {
+        Schema {
+            modules: [(
+                id.clone(),
+                Module {
+                    kind: ModuleKind::View,
+                    description: None,
+                    definition: "SELECT 1".into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    fn part(part: Part) -> Holds {
+        Holds::TablePart {
+            table: TableName::new("app", "t"),
+            part,
+        }
+    }
+
+    #[test]
+    fn a_declared_module_is_rebuilt_and_an_undeclared_one_is_refused() {
+        let id = view("v");
+        let kinds = [
+            (Level::Type, Holds::Module(id.clone())),
+            (Level::Column, Holds::Module(id.clone())),
+        ];
+        for (level, holds) in kinds {
+            let v = verdict(
+                level,
+                &dependent(holds.clone()),
+                &plan(vec![]),
+                Some(&declaring(&id)),
+                &Default::default(),
+            );
+            assert!(matches!(&v, Verdict::Rebuild(m) if *m == id));
+            // At apply nothing is declared: a module the plan does not already
+            // rebuild appeared after it was made, and one it rebuilds stands.
+            let v = verdict(
+                level,
+                &dependent(holds.clone()),
+                &plan(vec![]),
+                None,
+                &Default::default(),
+            );
+            assert!(matches!(v, Verdict::Refuse(why) if why.contains("after the plan")));
+            let rebuilt = plan(vec![Change::DropModule {
+                id: id.clone(),
+                kind: ModuleKind::View,
+            }]);
+            let v = verdict(
+                level,
+                &dependent(holds.clone()),
+                &rebuilt,
+                None,
+                &Default::default(),
+            );
+            assert!(matches!(v, Verdict::Fine));
+            let v = verdict(
+                level,
+                &dependent(holds),
+                &plan(vec![]),
+                Some(&Schema::default()),
+                &Default::default(),
+            );
+            assert!(matches!(v, Verdict::Refuse(why) if why.contains("does not declare")));
+        }
+    }
+
+    #[test]
+    fn constants_of_the_old_type_need_the_drop_the_plan_makes_and_a_column_alone_does_not() {
+        let table = TableName::new("app", "t");
+        let drop_check = Change::DropCheck {
+            table: table.clone(),
+            name: "c".into(),
+        };
+        let drop_default = Change::AlterColumnDefault {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "m", 0),
+            column: table.column("m"),
+            from: Some("'a'".into()),
+            to: None,
+        };
+        let planned = plan(vec![drop_check, drop_default]);
+        let none = plan(vec![]);
+        let schema = Schema::default();
+        for held in [
+            part(Part::Check("c".into())),
+            part(Part::Default("m".into())),
+        ] {
+            let fine = |p: &ChangeSet, level| {
+                matches!(
+                    verdict(
+                        level,
+                        &dependent(held.clone()),
+                        p,
+                        Some(&schema),
+                        &Default::default(),
+                    ),
+                    Verdict::Fine
+                )
+            };
+            // Typed constants refuse the retype unless the plan drops them.
+            assert!(fine(&planned, Level::Type));
+            assert!(!fine(&none, Level::Type));
+            // A name on the column alone is the engine's to rebuild.
+            assert!(fine(&none, Level::Column));
+        }
+        // An index, and a check the plan drops under another name, are refused.
+        assert!(matches!(
+            verdict(
+                Level::Type,
+                &dependent(part(Part::Index("i".into()))),
+                &planned,
+                Some(&schema),
+                &Default::default()
+            ),
+            Verdict::Refuse(_)
+        ));
+        assert!(matches!(
+            verdict(
+                Level::Type,
+                &dependent(part(Part::Check("other".into()))),
+                &planned,
+                Some(&schema),
+                &Default::default()
+            ),
+            Verdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn what_the_rebuild_cannot_restore_is_refused_whatever_the_level() {
+        let schema = Schema::default();
+        let none = plan(vec![]);
+        for level in [Level::Type, Level::Column] {
+            for held in [
+                part(Part::Policy("p".into())),
+                part(Part::Generated("g".into())),
+                Holds::Unrepresentable("a dependent in `pg_catalog.pg_publication_rel`, which this reader has no rule for".into()),
+                Holds::Unrepresentable("a materialized view, which this model does not hold".into()),
+                Holds::Unrepresentable("a dependent in `pg_type`, which this reader has no rule for".into()),
+            ] {
+                assert!(
+                    matches!(
+                        verdict(level, &dependent(held.clone()), &none, Some(&schema), &Default::default()),
+                        Verdict::Refuse(_)
+                    ),
+                    "{held:?}"
+                );
+            }
+            // Keys, unique and exclusion constraints and extended statistics
+            // are the engine's own to rebuild.
+            for held in [
+                Holds::Unrepresentable("a constraint of a kind that is not a check".into()),
+                Holds::Unrepresentable(
+                    "a dependent in `pg_statistic_ext`, which this reader has no rule for".into(),
+                ),
+                part(Part::Unique("u".into())),
+            ] {
+                assert!(
+                    matches!(
+                        verdict(
+                            level,
+                            &dependent(held.clone()),
+                            &none,
+                            Some(&schema),
+                            &Default::default()
+                        ),
+                        Verdict::Fine
+                    ),
+                    "{held:?}"
+                );
+            }
+        }
+    }
+}

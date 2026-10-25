@@ -147,7 +147,9 @@ pub fn before_changes(desired: &IdsFile, changes: &ChangeSet) -> IdsFile {
             Change::CreateType { uid, .. } => {
                 base.types.remove(uid);
             }
-            Change::AddEnumValue { uid, name, .. } | Change::RenameEnumValue { uid, name, .. } => {
+            Change::AddEnumValue { uid, name, .. }
+            | Change::RenameEnumValue { uid, name, .. }
+            | Change::EnumRebuild { uid, name, .. } => {
                 // The label operation certifies an existing holder even when
                 // only statement metadata, rather than a pin bundle, is present.
                 base.types
@@ -176,6 +178,7 @@ pub fn after_changes(base: &IdsFile, changes: &ChangeSet) -> IdsFile {
             }
             Change::AddEnumValue { uid, name, .. }
             | Change::RenameEnumValue { uid, name, .. }
+            | Change::EnumRebuild { uid, name, .. }
             | Change::CreateType { uid, name, .. }
             | Change::RenameType { uid, to: name, .. } => {
                 desired.types.insert(uid.clone(), name.clone());

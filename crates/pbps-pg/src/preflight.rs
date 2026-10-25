@@ -3217,6 +3217,68 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 None => Ok(skip(change, "the column does not exist before apply", unchecked)),
             }
         }
+        // The cast to the replacement refuses a label it does not have, naming
+        // the row only at apply: count them now, by the labels as stored today
+        // (DEC-1635.7). An array counts its elements.
+        Change::EnumRebuild {
+            step:
+                pbps_model::EnumRebuildStep::Retype {
+                    column,
+                    array,
+                    removed,
+                    ..
+                },
+            ..
+        } => {
+            if removed.is_empty() {
+                return Ok(Vec::new());
+            }
+            let Some(stored) = names.column(column) else {
+                return Ok(skip(change, "the column does not exist before apply", unchecked));
+            };
+            let table = qualified(&stored.table)?;
+            let quoted = quote(stored.name.raw())?;
+            let labels = format!(
+                "ARRAY[{}]::pg_catalog.text[]",
+                removed
+                    .iter()
+                    .map(|l| value_literal(l))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let (what, sql) = if *array {
+                (
+                    "elements",
+                    format!(
+                        "SELECT {} AS n FROM {table} AS t CROSS JOIN LATERAL \
+                         pg_catalog.unnest(t.{quoted}::pg_catalog.text[]) AS x(label) \
+                         WHERE x.label OPERATOR(pg_catalog.=) ANY ({labels});",
+                        saturated_count("count(*)")
+                    ),
+                )
+            } else {
+                (
+                    "rows",
+                    format!(
+                        "SELECT {} AS n FROM {table} WHERE {quoted}::pg_catalog.text \
+                         OPERATOR(pg_catalog.=) ANY ({labels});",
+                        saturated_count("count(*)")
+                    ),
+                )
+            };
+            Ok(vec![Probe::new(
+                format!(
+                    "{what} of {column} holding a label this plan removes ({})",
+                    removed
+                        .iter()
+                        .map(|l| pbps_model::escape::Escaped(l).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    column = column.shown(),
+                ),
+                sql,
+            )])
+        }
         Change::AlterColumnType {
             column,
             from,
@@ -3754,6 +3816,7 @@ name = name.shown(),
         // asks for a schema target belongs with that step, not ahead of it.
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
@@ -4149,6 +4212,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -5676,6 +5740,84 @@ mod tests {
 
     fn planned(change: Change) -> PlannedChange {
         PlannedChange::new(change)
+    }
+
+    /// The cast to the replacement refuses a row holding a removed label, so
+    /// the plan counts them first: rows of a scalar column, elements of an
+    /// array, by the spelling the database stores (DEC-1635.7).
+    #[test]
+    fn a_rebuilds_retype_counts_rows_and_array_elements_holding_a_removed_label() {
+        let table: TableName = "app.t".parse().unwrap();
+        let retype = |array: bool, removed: &[&str]| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("m"),
+                array,
+                removed: removed.iter().map(|l| (*l).to_owned()).collect(),
+            },
+        };
+        let report = preflight(&set(vec![retype(false, &["sad", "it's"])]));
+        assert!(report.unchecked.is_empty(), "{report:#?}");
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe
+                .description
+                .starts_with("rows of app.t.m holding a label this plan removes"),
+            "{}",
+            probe.description
+        );
+        assert!(
+            // The probe is quoted into a query of its own, so each quote doubles.
+            probe
+                .sql
+                .contains("\"m\"::pg_catalog.text OPERATOR(pg_catalog.=) ANY (ARRAY[")
+                && probe.sql.contains("E''sad''")
+                && probe.sql.contains("E''it''''s''"),
+            "{}",
+            probe.sql
+        );
+        let report = preflight(&set(vec![retype(true, &["sad"])]));
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe.description.starts_with("elements of app.t.m"),
+            "{}",
+            probe.description
+        );
+        assert!(
+            probe
+                .sql
+                .contains("pg_catalog.unnest(t.\"m\"::pg_catalog.text[])"),
+            "{}",
+            probe.sql
+        );
+        // Nothing removed, nothing to count: a pure reorder asks no question.
+        let report = preflight(&set(vec![retype(false, &[])]));
+        assert!(
+            report.probes.is_empty() && report.unchecked.is_empty(),
+            "{report:#?}"
+        );
+        // The other steps hold no rows to read.
+        let create = Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Swap {
+                definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
+                comment: None,
+            },
+        };
+        let report = preflight(&set(vec![create]));
+        assert!(
+            report.probes.is_empty() && report.unchecked.is_empty(),
+            "{report:#?}"
+        );
     }
 
     fn deleting(table: &str, key: &str) -> Change {

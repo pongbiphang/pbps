@@ -3064,3 +3064,129 @@ the YAML it would have to be deleted by hand once every environment moved.
 
 Not decided here and not done: the foreign keys on either side of a converted
 column; the same conversion for a domain's base type.
+
+<a id="dec-1635-7"></a>
+
+**DEC-1635.7. Slice 3b removes and reorders enum labels by rebuilding the enum under its uid.**
+PostgreSQL has no `DROP VALUE` and no reorder, so a declaration that removes a
+label, or changes the relative order of retained ones, plans one
+`Change::EnumRebuild` per step instead of refusing (DEC-1635.6 kept its
+refusals for this slice). Label renames of the same uid run first as
+`RENAME VALUE` on the old type, so every label maps by its final name.
+Additions need no step of their own: the replacement is created with the
+declared labels.
+
+The sequence, in one transaction or one staged step per statement:
+
+1. `Create`: `CREATE TYPE <tmp> AS ENUM (<declared labels>)`, class 7 after the
+   renames. `<tmp>` is `pbps_rebuild_<uid>`, moved on to a suffix when a
+   declaration holds the name; a live occupant refuses by name. The Types name
+   slot is claimed here and released by the swap.
+2. DropCheck, DropForeignKey and DropIndex for what names a retyped column,
+   by `Dialect::enum_rebuild_dependents` and the differ's
+   `recreate_retyped_dependents` (checks, foreign keys, filtered and
+   expression indexes; a partition's own checks and indexes are included),
+   and a drop of each default, all from the declaration. Views, SQL bodies and
+   triggers over a moved column come down and go back through the existing
+   module rebuild (`diff_rebuilding`, `weave`), found by the catalog census.
+3. `Retype`: one `ALTER COLUMN .. TYPE <tmp> USING col::text::<tmp>` per
+   column, ranked with a retype in class 9 (after the default drops at −2,
+   before the restored defaults at 0). A partitioned table is retyped at its
+   root once.
+4. `Swap`: `DROP TYPE <name>`, `ALTER TYPE <tmp> RENAME TO <name>`, then
+   `COMMENT ON TYPE` when the type had one. Class 9 beside the retypes, after
+   every retype of its type. The type's comment is read at plan time, carried
+   in the plan payload, and written after the rename. The uid in
+   `schema.ids.json` never changes.
+5. The differ's ordinary AddCheck, AddForeignKey, AddIndex, CreateModule and
+   default sets restore everything from the **declaration**, never from catalog
+   text; no SQL is rewritten lexically.
+
+`::text::` is the only `USING` pbps writes (ADR-0012 Amendment 5). Each label
+maps by name and no value changes.
+
+Measured on PostgreSQL 16.15 and 18.6 (`docs/measurements/enum-rebuild-1635.md`): the retype is refused beside a default, a check, a foreign key between
+two enum columns, a partial or expression index, a view or rule, a
+`BEGIN ATOMIC` or `RETURN` routine body, a trigger `WHEN` or `UPDATE OF`, a
+policy, a generated column reading it, a generated column of the type, a
+publication row filter or column list, and a partition's own default; it is
+accepted beside plain, unique, primary-key, exclusion, INCLUDE and GIN
+indexes, extended statistics, string-bodied SQL routines and PL/pgSQL bodies,
+and recurses through partitions and inheritance children. `DROP TYPE` is
+refused while a domain, a routine signature, a range type or a composite
+attribute uses the type.
+
+| Dependent | Handling |
+|---|---|
+| default, check, foreign key, partial or expression index | dropped and restored from the declaration |
+| view, `BEGIN ATOMIC` or `RETURN` routine, trigger | module rebuild |
+| plain index, unique, key, exclusion, statistics, string-bodied routine, PL/pgSQL | the engine |
+| policy, generated column, materialized view, rule, publication, composite attribute, domain, routine signature, range, cast, undeclared table | refused by name before any SQL |
+
+Census: every `pg_depend` edge on the type and its array, and every column of
+either, is read in the planning transaction and classified. A dependent that is
+not in the table above refuses by name, so the engine never aborts mid-plan on
+a kind the table does not list. A non-default owner or a non-empty `typacl`
+refuses, because the replacement would not keep it. A same-plan table, column
+or routine that uses the type, a type renamed in the same plan, and a
+partition with its own default for a moved column also refuse by name.
+
+Rows holding a removed label refuse at plan time. Each `Retype` carries the
+removed labels as the database stores them, and its probe counts the rows (the
+elements, for an array) per table and column; the plan stops with the counts
+and nothing runs.
+
+Risk: the new class `type-rebuild`, gated like the others, on every step. The
+plan lists each table it rewrites and says each takes an ACCESS EXCLUSIVE lock
+and a full rewrite, even for a pure reorder. Cost is not folded into a class
+(ADR-0012 §3).
+
+Pins and guards: the create statement certifies no declared type; the swap's
+two statements certify the uid at the temporary name and then at its own, as
+`SET SCHEMA` and `RENAME` do, so a per-statement check, a staged step or a
+resume accepts every intermediate state through the side-specific resolver
+(DEC-2321.1). The movement guard allows the temporary type between creation and
+swap and requires it absent at the close. Saved plan 53 carries the steps;
+published schema set 59 is unchanged (the risk class is a string in every envelope).
+
+Still refused, by name: a domain over the enum (slice 4), a routine signature
+using the type (a follow-up issue), `data:` rows and partition keys of the enum
+(DEC-1523.1, #2346), and everything the table sends to refusal.
+
+Pull and re-pull keep the live label order; an unchanged type plans nothing.
+
+Census at apply: the same census runs again where the plan runs, in the apply's
+own transaction after the lock and before the first statement. A staged run
+reads it in a transaction it rolls back, at its start and at every resume (a
+run past `DROP TYPE` has only the replacement left and skips it). Nothing is
+declared there, so a view, body, trigger, check, key, index, default or any
+other dependent that the plan does not already drop and restore appeared after
+the plan was made, and is refused by name before the first statement. The live
+test `enum_rebuild_apply_refuses_a_dependent_created_after_the_plan_by_name_and_applies_nothing`
+plans, creates an undeclared view over the column in another session, and
+applies transactionally and staged on 16 and 18: refused, the type untouched.
+A refusal inside the transaction is recorded as the failed attempt, like any
+other; no applied state follows it.
+
+Risk: restoring a check, key or index asks for `constraint` or `destructive`
+beside `type-rebuild`, as it does in any plan that drops and re-adds them;
+`--staged` counts the rebuild's steps as one change, so it admits a rebuild
+with no companion to restore and refuses one that has any.
+
+Tests: `removing_a_label_rebuilds_under_the_uid_in_the_order_create_retypes_swap`,
+`reordering_retained_labels_rebuilds_with_nothing_removed_and_equal_labels_plan_nothing`,
+`renames_run_first_and_the_rebuild_maps_by_final_names_and_counts_stored_ones`,
+`what_a_rebuild_cannot_do_is_refused_by_name_with_no_step`,
+`a_saved_rebuild_replays_against_its_pins_and_no_step_can_certify_itself` and
+`the_whole_plan_drops_and_restores_what_names_a_moved_column_and_orders_the_steps`
+pin the differ and the saved-plan replay;
+`enum_rebuild_steps_write_the_replacement_the_one_using_cast_and_a_certified_swap`,
+`a_rebuilds_retype_counts_rows_and_array_elements_holding_a_removed_label`,
+`a_rebuilds_swap_is_accepted_at_every_boundary_and_each_drift_or_skip_is_refused`
+and the census verdict tests pin emission, the row probe and the guards; the
+`enum_rebuild_*` live tests in `managed_types` run the rebuild on PostgreSQL 16
+and 18: removal and reorder with comment, defaults, checks, keys, indexes and
+partitions; the per-column row counts; each refused dependent; views, bodies and
+triggers; a rename in the same plan; and staged apply with resume across the
+steps. Each repaired site was checked by temporarily reverting its behavior
+with a copy of the file retained aside.

@@ -272,6 +272,7 @@ pub async fn drop_blockers(
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

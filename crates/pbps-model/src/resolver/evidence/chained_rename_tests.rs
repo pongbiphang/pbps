@@ -70,6 +70,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

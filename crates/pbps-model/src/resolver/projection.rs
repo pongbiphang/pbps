@@ -643,7 +643,11 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             true,
             true,
         ),
-        Change::AlterColumnType { column, .. } => {
+        Change::EnumRebuild {
+            step: crate::EnumRebuildStep::Retype { column, .. },
+            ..
+        }
+        | Change::AlterColumnType { column, .. } => {
             (WithChildren(Surface::Column(column.clone())), true, true)
         }
         Change::AlterColumnNullability { column, .. } => {
@@ -742,6 +746,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         | Change::SetColumnDeprecated { .. }
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -901,6 +906,7 @@ fn changes_catalog(c: &Change) -> bool {
             | Change::SetColumnDeprecated { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }

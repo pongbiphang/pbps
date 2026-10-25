@@ -657,6 +657,7 @@ impl Unchecked {
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2397,6 +2398,13 @@ pub trait Dialect {
     /// Engines that perform their own dependency maintenance need no extra
     /// changes. Defaults remain part of the column and are the emitter's work.
     fn retype_dependents(&self, _from: &ColumnType, _to: &ColumnType) -> RetypeDependents {
+        RetypeDependents::default()
+    }
+
+    /// Dependencies that cannot remain standing while a column moves to the
+    /// replacement of an enum rebuilt under its uid (DEC-1635.7). None by
+    /// default: only PostgreSQL has declared enums.
+    fn enum_rebuild_dependents(&self) -> RetypeDependents {
         RetypeDependents::default()
     }
 

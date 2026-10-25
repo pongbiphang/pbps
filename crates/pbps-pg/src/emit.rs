@@ -120,6 +120,90 @@ mod declared_type_emission_tests {
     }
 
     #[test]
+    fn enum_rebuild_steps_write_the_replacement_the_one_using_cast_and_a_certified_swap() {
+        use pbps_model::EnumRebuildStep as Step;
+        let uid: pbps_model::Uid = "y_000001".parse().unwrap();
+        let name = pbps_model::TypeRef::new("app", "e\"").unwrap();
+        let tmp = pbps_model::TypeRef::new("app", "pbps_rebuild_y_000001").unwrap();
+        let definition = Box::new(pbps_model::ManagedType::Enum {
+            values: vec!["it's".into(), "ok".into()],
+        });
+        let step = |step| Change::EnumRebuild {
+            uid: uid.clone(),
+            name: name.clone(),
+            tmp: tmp.clone(),
+            step,
+        };
+        let sql = |change: &Change| emit(&Postgres::new(), change, Strategy::default()).unwrap();
+        let create = sql(&step(Step::Create {
+            definition: definition.clone(),
+            removed: vec![],
+            ordinal: 0,
+        }));
+        assert_eq!(create.len(), 1);
+        assert_eq!(
+            create[0].sql,
+            "CREATE TYPE \"app\".\"pbps_rebuild_y_000001\" AS ENUM ('it''s', 'ok');"
+        );
+        // The old type still stands: no uid is certified by its creation.
+        assert!(create[0].declared_type.is_none());
+        let table = pbps_model::TableName::new("app", "t");
+        for (array, brackets) in [(false, ""), (true, "[]")] {
+            let moved = sql(&step(Step::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("m"),
+                array,
+                removed: vec![],
+            }));
+            assert_eq!(
+                moved[0].sql,
+                format!(
+                    "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"m\" TYPE \"app\".\"pbps_rebuild_y_000001\"{brackets} USING \"m\"::text::\"app\".\"pbps_rebuild_y_000001\"{brackets};"
+                )
+            );
+            assert!(moved[0].declared_type.is_none());
+        }
+        let swap = sql(&step(Step::Swap {
+            definition: definition.clone(),
+            comment: Some("moods it's".into()),
+        }));
+        let texts: Vec<_> = swap.iter().map(|s| s.sql.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "DROP TYPE \"app\".\"e\"\"\";",
+                "ALTER TYPE \"app\".\"pbps_rebuild_y_000001\" RENAME TO \"e\"\"\";",
+                "COMMENT ON TYPE \"app\".\"e\"\"\" IS 'moods it''s';",
+            ]
+        );
+        // Each type statement certifies the uid where the type then stands,
+        // under the final labels; the comment certifies nothing.
+        let certified: Vec<_> = swap
+            .iter()
+            .map(|s| {
+                s.declared_type
+                    .as_ref()
+                    .map(|d| (d.name.clone(), d.definition.clone()))
+            })
+            .collect();
+        assert_eq!(
+            certified,
+            [
+                Some((tmp.clone(), Some(*definition.clone()))),
+                Some((name.clone(), Some(*definition.clone()))),
+                None
+            ]
+        );
+        // Without a comment there is no third statement.
+        let bare = sql(&step(Step::Swap {
+            definition,
+            comment: None,
+        }));
+        assert_eq!(bare.len(), 2);
+        assert!(bare.iter().all(|s| s.transactional));
+    }
+
+    #[test]
     fn type_lifecycle_sql_quotes_names_and_labels_and_preserves_domain_attributes() {
         let pg = Postgres::new();
         let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
@@ -3270,6 +3354,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             });
             Ok(vec![statement])
         }
+        Change::EnumRebuild {
+            uid,
+            name,
+            tmp,
+            step,
+        } => emit_enum_rebuild(uid, name, tmp, step),
         Change::CreateType {
             uid,
             name,
@@ -4507,6 +4597,83 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
         ),
         pbps_model::PartitionBound::Hash { modulus, remainder } => {
             format!("FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})")
+        }
+    }
+}
+
+/// The statements of one step of an enum rebuild (DEC-1635.7). Every name is
+/// qualified, so none needs a schema's path.
+///
+/// `USING c::text::<tmp>` is the only `USING` pbps writes: each label maps by
+/// its final name and no value changes (ADR-0012 §5, amendment 5). The swap's
+/// two statements each certify the uid where the type stands after them, as a
+/// rename through `SET SCHEMA` does, so a per-statement check sees the
+/// replacement under its temporary name and then under its own.
+fn emit_enum_rebuild(
+    uid: &pbps_model::Uid,
+    name: &pbps_model::TypeRef,
+    tmp: &pbps_model::TypeRef,
+    step: &pbps_model::EnumRebuildStep,
+) -> Sql {
+    use pbps_model::EnumRebuildStep as Step;
+    let ty = |t: &pbps_model::TypeRef| -> Result<String, DialectError> {
+        Ok(format!("{}.{}", quote(t.schema())?, quote(t.name())?))
+    };
+    let certifying =
+        |sql: String, at: &pbps_model::TypeRef, definition: &pbps_model::ManagedType| {
+            let mut statement = Statement::new(sql);
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: at.clone(),
+                definition: Some(definition.clone()),
+            });
+            statement
+        };
+    match step {
+        Step::Create { definition, .. } => {
+            let pbps_model::ManagedType::Enum { values } = definition.as_ref() else {
+                return Err(invalid("an enum rebuild creates an enum".to_owned()));
+            };
+            unscoped(format!(
+                "CREATE TYPE {} AS ENUM ({});",
+                ty(tmp)?,
+                values
+                    .iter()
+                    .map(|v| literal(v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        Step::Retype { column, array, .. } => {
+            let brackets = if *array { "[]" } else { "" };
+            let c = quote(column.name.raw())?;
+            unscoped(format!(
+                "ALTER TABLE {} ALTER COLUMN {c} TYPE {}{brackets} USING {c}::text::{}{brackets};",
+                qualified(&column.table)?,
+                ty(tmp)?,
+                ty(tmp)?
+            ))
+        }
+        Step::Swap {
+            definition,
+            comment,
+        } => {
+            let mut out = vec![
+                certifying(format!("DROP TYPE {};", ty(name)?), tmp, definition),
+                certifying(
+                    format!("ALTER TYPE {} RENAME TO {};", ty(tmp)?, quote(name.name())?),
+                    name,
+                    definition,
+                ),
+            ];
+            if let Some(text) = comment {
+                out.push(Statement::new(format!(
+                    "COMMENT ON TYPE {} IS {};",
+                    ty(name)?,
+                    literal(text)
+                )));
+            }
+            Ok(out)
         }
     }
 }

@@ -394,6 +394,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }

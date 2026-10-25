@@ -321,6 +321,7 @@ impl ResolverEvidence {
                         | Change::PublicExecution { .. }
                         | Change::AddEnumValue { .. }
                         | Change::RenameEnumValue { .. }
+                        | Change::EnumRebuild { .. }
                         | Change::CreateType { .. }
                         | Change::DropType { .. }
                         | Change::RenameType { .. }

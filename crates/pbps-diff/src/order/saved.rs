@@ -233,6 +233,34 @@ pub fn seal<D: ?Sized>(
     Ok(SealedPlan { wire, ordered })
 }
 
+/// The replacement is a name of pbps's own in the type's schema, so an edited
+/// plan cannot point the swap at another type (DEC-1635.7).
+pub(super) fn rebuild_is_well_formed(
+    ids: &pbps_model::IdsFile,
+    change: &pbps_model::Change,
+) -> bool {
+    let pbps_model::Change::EnumRebuild {
+        uid,
+        name,
+        tmp,
+        step,
+    } = change
+    else {
+        return true;
+    };
+    uid.kind() == pbps_model::UidKind::Type
+        && ids.types.get(uid) == Some(name)
+        && tmp.schema() == name.schema()
+        && tmp.name().starts_with("pbps_rebuild_")
+        && match step {
+            pbps_model::EnumRebuildStep::Retype { column_uid, .. } => {
+                column_uid.kind() == pbps_model::UidKind::Column
+            }
+            pbps_model::EnumRebuildStep::Create { .. }
+            | pbps_model::EnumRebuildStep::Swap { .. } => true,
+        }
+}
+
 pub fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
     let mut built = std::collections::BTreeSet::new();
     for planned in &cs.changes {
@@ -250,13 +278,19 @@ pub fn logical_changes(cs: &pbps_model::ChangeSet) -> usize {
             built.insert(routine);
         }
     }
+    // The steps of one enum's rebuild are one change: a staged plan runs them
+    // statement by statement and resumes among them (DEC-1635.7).
+    let mut rebuilt = std::collections::BTreeSet::new();
     cs.changes
         .iter()
         .filter(|planned| {
-            !matches!(
-                &planned.change,
-                pbps_model::Change::PublicExecution { routine, .. } if built.contains(routine)
-            )
+            if let pbps_model::Change::PublicExecution { routine, .. } = &planned.change {
+                !built.contains(routine)
+            } else if let pbps_model::Change::EnumRebuild { uid, .. } = &planned.change {
+                rebuilt.insert(uid)
+            } else {
+                true
+            }
         })
         .count()
 }
@@ -471,6 +505,9 @@ pub fn validate_saved_plan(
             }
             pbps_model::Change::DropType { uid, .. } => {
                 uid.kind() == pbps_model::UidKind::Type && !plan.ids.types.contains_key(uid)
+            }
+            pbps_model::Change::EnumRebuild { .. } => {
+                rebuild_is_well_formed(&plan.ids, &step.change)
             }
             _ => true,
         };

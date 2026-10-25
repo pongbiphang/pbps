@@ -79,7 +79,8 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
             Change::AddColumn { uid, table, name, .. } => Some((uid, table.column(name), Some(name))),
             Change::RenameColumn { uid, table, from, to, .. } => Some((uid, table.column(from), Some(to))),
             Change::DropColumn { uid, column } => Some((uid, column.clone(), None)),
-            Change::AlterColumnType { uid, column, .. }
+            Change::EnumRebuild { step: pbps_model::EnumRebuildStep::Retype { column_uid: uid, column, .. }, .. }
+            | Change::AlterColumnType { uid, column, .. }
             | Change::AlterColumnNullability { uid, column, .. }
             | Change::AlterColumnDefault { uid, column, .. }
             | Change::AlterColumnExpression { uid, column, .. }

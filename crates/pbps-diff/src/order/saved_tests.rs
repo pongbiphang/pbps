@@ -190,3 +190,55 @@ fn rebuild_parts_without_an_intent_record_are_still_refused_at_admission() {
         assert!(refusal(plan, "wrong checksum").contains("approved checksum"));
     }
 }
+
+fn rebuild_step(uid: &str, tmp: &str, step: pbps_model::EnumRebuildStep) -> (IdsFile, Change) {
+    let uid: pbps_model::Uid = uid.parse().unwrap();
+    let name: pbps_model::TypeRef = "app.e".parse().unwrap();
+    let ids = IdsFile {
+        types: [("y_000001".parse().unwrap(), name.clone())].into(),
+        ..Default::default()
+    };
+    let change = Change::EnumRebuild {
+        uid,
+        name,
+        tmp: tmp.parse().unwrap(),
+        step,
+    };
+    (ids, change)
+}
+
+/// The swap drops one type and renames another to its name, so an edited plan
+/// must not be able to aim it at a type that is not the replacement pbps made
+/// (DEC-1635.7).
+#[test]
+fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
+    use pbps_model::{EnumRebuildStep, ManagedType};
+    let swap = || EnumRebuildStep::Swap {
+        definition: Box::new(ManagedType::Enum { values: vec![] }),
+        comment: None,
+    };
+    let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", swap());
+    assert!(super::saved::rebuild_is_well_formed(&ids, &change));
+    for (uid, tmp) in [
+        ("y_000001", "app.users"),
+        ("y_000001", "other.pbps_rebuild_y_000001"),
+        ("y_000002", "app.pbps_rebuild_y_000001"),
+    ] {
+        let (ids, change) = rebuild_step(uid, tmp, swap());
+        assert!(
+            !super::saved::rebuild_is_well_formed(&ids, &change),
+            "{uid} {tmp}"
+        );
+    }
+    // A retype names a column, not another kind of object.
+    let retype = |column: &str| EnumRebuildStep::Retype {
+        column_uid: column.parse().unwrap(),
+        column: "app.t.m".parse().unwrap(),
+        array: false,
+        removed: vec![],
+    };
+    let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("c_aaaaaa"));
+    assert!(super::saved::rebuild_is_well_formed(&ids, &change));
+    let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("t_aaaaaa"));
+    assert!(!super::saved::rebuild_is_well_formed(&ids, &change));
+}

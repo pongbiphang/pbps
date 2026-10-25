@@ -1349,5 +1349,64 @@
         ]
       }
     }
+  },
+  {
+    "name": "EnumRebuild/Create",
+    "change": {
+      "op": "enum_rebuild",
+      "uid": "y_aaaaaa",
+      "name": "app.e",
+      "tmp": "app.pbps_rebuild_y_aaaaaa",
+      "step": {
+        "step": "create",
+        "definition": {
+          "kind": "enum",
+          "values": [
+            "ok"
+          ]
+        },
+        "removed": [
+          "old"
+        ],
+        "ordinal": 0
+      }
+    }
+  },
+  {
+    "name": "EnumRebuild/Retype",
+    "change": {
+      "op": "enum_rebuild",
+      "uid": "y_aaaaaa",
+      "name": "app.e",
+      "tmp": "app.pbps_rebuild_y_aaaaaa",
+      "step": {
+        "step": "retype",
+        "column_uid": "c_aaaaaa",
+        "column": "app.t.n",
+        "array": false,
+        "removed": [
+          "old"
+        ]
+      }
+    }
+  },
+  {
+    "name": "EnumRebuild/Swap",
+    "change": {
+      "op": "enum_rebuild",
+      "uid": "y_aaaaaa",
+      "name": "app.e",
+      "tmp": "app.pbps_rebuild_y_aaaaaa",
+      "step": {
+        "step": "swap",
+        "definition": {
+          "kind": "enum",
+          "values": [
+            "ok"
+          ]
+        },
+        "comment": "moods"
+      }
+    }
   }
 ]

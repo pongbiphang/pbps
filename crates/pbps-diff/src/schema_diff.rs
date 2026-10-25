@@ -674,7 +674,7 @@ pub fn type_differences(
                     definition
                 };
                 let fields = normalize(old).differences(&normalize(new));
-                (!fields.is_empty()).then(|| format!("{} changed; enum removal/reordering requires #1635 slice 3b, domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
+                (!fields.is_empty()).then(|| format!("{} changed; an enum's labels change only through its recorded uid (#1635 slice 3, DEC-1635.6, DEC-1635.7), domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
             }
             (None, None) => None,
         };
@@ -1384,6 +1384,7 @@ pub(crate) fn diff_partial_rebuilding(
 
     split_tightenings_from_retypes(&mut changes);
     clear_external_partitions_after_loosening(declared.schema, &mut changes);
+    crate::enum_labels::rebuild_defaults(base, declared, &mut changes);
     recreate_retyped_dependents(base, declared, &renames, dialect, &mut changes);
     recreate_referenced_foreign_keys(base, declared, &renames, &mut changes);
     rebind_foreign_keys_to_a_new_occupant(base, declared, &mut changes);
@@ -1470,6 +1471,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1532,6 +1534,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1549,7 +1552,11 @@ pub(crate) fn diff_partial_rebuilding(
         Rebinding::Candidates => dialect.rebound_modules(declared.schema, &arriving, &changed),
         Rebinding::Evidence => BTreeSet::new(),
     };
-    let rebound: BTreeSet<ModuleId> = candidates.into_iter().chain(also.iter().cloned()).collect();
+    let rebound: BTreeSet<ModuleId> = candidates
+        .into_iter()
+        .chain(also.iter().cloned())
+        .chain(hints.enum_dependents.iter().cloned())
+        .collect();
     for id in rebound {
         if !changed.contains(&id)
             && base.schema.modules.contains_key(&id)
@@ -1560,6 +1567,29 @@ pub(crate) fn diff_partial_rebuilding(
                 module: Box::new(module.clone()),
             });
         }
+    }
+    // A module over a rebuilt enum's column cannot be restated in place after
+    // the retype: it comes down in class 0 and goes back in class 14, around
+    // the retypes and the swap (DEC-1635.7).
+    if !hints.enum_dependents.is_empty() {
+        let mut split = Vec::new();
+        for change in std::mem::take(&mut changes) {
+            if let Change::AlterModule { id, module } = &change
+                && hints.enum_dependents.contains(id)
+            {
+                split.push(Change::DropModule {
+                    id: id.clone(),
+                    kind: module.kind,
+                });
+                split.push(Change::CreateModule {
+                    id: id.clone(),
+                    module: module.clone(),
+                });
+            } else {
+                split.push(change);
+            }
+        }
+        changes = split;
     }
     diff_roles(base, declared, dialect, &mut changes);
     revoke_public_execution(base.schema, dialect, hints, &mut changes);
@@ -1734,6 +1764,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -1800,6 +1831,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -2179,8 +2211,24 @@ pub(crate) fn diff_partial_rebuilding(
             Change::CreateType { .. }
                 | Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Create { .. },
+                    ..
+                }
         ) {
             return (7, 0);
+        }
+        // The columns move and the type is swapped among the type-changing
+        // alterations of class 9, ranked with a retype (DEC-1635.7).
+        if matches!(
+            c,
+            Change::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Retype { .. }
+                    | pbps_model::EnumRebuildStep::Swap { .. },
+                ..
+            }
+        ) {
+            return (COLUMN_ALTERATIONS, 1);
         }
 
         // After every module and its PUBLIC decision, then policies before
@@ -2963,6 +3011,7 @@ fn recreate_referenced_foreign_keys(
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
             | Change::RenameEnumValue { .. }
+            | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
             | Change::DropType { .. }
             | Change::RenameType { .. }
@@ -3484,6 +3533,10 @@ fn recreate_retyped_dependents(
             to_nullable,
             ..
         } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
+        Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { column, .. },
+            ..
+        } => Some((column.clone(), dialect.enum_rebuild_dependents())),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
@@ -3526,6 +3579,7 @@ fn recreate_retyped_dependents(
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
@@ -3541,6 +3595,28 @@ fn recreate_retyped_dependents(
     }
     if retyped.is_empty() {
         return;
+    }
+    // A partition keeps its own CHECKs and filtered indexes over the columns
+    // it takes from its parent, and the parent's retype reaches them.
+    for (column, dependents) in retyped.clone() {
+        let mut parents = vec![column.table.clone()];
+        let mut reached = BTreeSet::from([column.table.clone()]);
+        while let Some(parent) = parents.pop() {
+            for (name, table) in &declared.schema.tables {
+                if table
+                    .partition_of
+                    .as_ref()
+                    .is_some_and(|of| of.parent == parent)
+                    && reached.insert(name.clone())
+                {
+                    also(
+                        retyped.entry(name.column(&column.name)).or_default(),
+                        dependents,
+                    );
+                    parents.push(name.clone());
+                }
+            }
+        }
     }
     for (uid, old_name) in &base.ids.tables {
         let Some(name) = declared.ids.tables.get(uid) else {
@@ -5237,7 +5313,11 @@ fn parent_column(change: &Change) -> Option<&ColumnName> {
     match change {
         Change::AddColumn { name, .. } => Some(name),
         Change::RenameColumn { from, .. } => Some(from),
-        Change::DropColumn { column, .. }
+        Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { column, .. },
+            ..
+        }
+        | Change::DropColumn { column, .. }
         | Change::AlterColumnType { column, .. }
         | Change::AlterColumnNullability { column, .. }
         | Change::AlterColumnDefault { column, .. }
@@ -5579,6 +5659,7 @@ fn refuse_computed_dependencies(
                     | Change::DropModule { .. }
                     | Change::AddEnumValue { .. }
                     | Change::RenameEnumValue { .. }
+                    | Change::EnumRebuild { .. }
                     | Change::CreateType { .. }
                     | Change::DropType { .. }
                     | Change::RenameType { .. }
@@ -6629,6 +6710,16 @@ fn dependency_rank(
         Change::AddEnumValue { ordinal, .. } | Change::RenameEnumValue { ordinal, .. } => {
             *ordinal as isize
         }
+        Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Create { ordinal, .. },
+            ..
+        } => *ordinal as isize,
+        // With a retype: after the defaults taken off for it (-2) and before
+        // the ones written for the type it ends with (0). The swap follows
+        // every column of its type because they share a subject and rank and
+        // the rendering that breaks the tie names `Retype` before `Swap`
+        // (pinned by `the_whole_plan_drops_and_restores_what_names_a_moved_column_and_orders_the_steps`).
+        Change::EnumRebuild { .. } => -1,
         Change::CreateType { name, .. } | Change::RenameType { to: name, .. } => {
             *type_rank.get(name).unwrap_or(&0)
         }
@@ -7393,7 +7484,12 @@ fn order_key(c: &Change) -> u8 {
         }
         Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Create { .. },
+            ..
+        }
         | Change::CreateType { .. } => 7,
+        Change::EnumRebuild { .. } => COLUMN_ALTERATIONS,
         Change::DropType { .. } => 18,
         Change::RenameType { .. } => 1,
         // A policy releases its bindings before module and column teardown.
@@ -24901,6 +24997,7 @@ mod managed_type_tests {
             created.changes[0].change,
             Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
+                | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
         ));
         let dropped = run(&base, &base_ids, &Schema::default(), &IdsFile::default()).unwrap();

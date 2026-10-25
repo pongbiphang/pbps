@@ -2022,6 +2022,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             }
             pbps_model::Change::AddEnumValue { .. }
             | pbps_model::Change::RenameEnumValue { .. }
+            | pbps_model::Change::EnumRebuild { .. }
             | pbps_model::Change::CreateType { .. }
             | pbps_model::Change::DropType { .. }
             | pbps_model::Change::RenameType { .. }

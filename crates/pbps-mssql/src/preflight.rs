@@ -871,6 +871,7 @@ name = name.shown(),
         // an impossible grant inside the transaction.
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

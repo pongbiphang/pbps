@@ -98,7 +98,11 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         | Change::DropIndex { table, .. }
         | Change::CreatePolicy { table, .. }
         | Change::SetRowSecurity { table, .. } => complete(table),
-        Change::DropColumn { column, .. }
+        Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { column, .. },
+            ..
+        }
+        | Change::DropColumn { column, .. }
         | Change::AlterColumnType { column, .. }
         | Change::AlterColumnNullability { column, .. }
         | Change::AlterColumnDefault { column, .. }
@@ -128,6 +132,7 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
@@ -614,6 +619,7 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
         | Change::RenameEnumValue { .. }
+        | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }

@@ -1020,6 +1020,16 @@ pub struct Hints {
     /// participates in Schema equality; live definitions establish absorption.
     pub enum_value_renames: BTreeMap<crate::TypeRef, BTreeMap<String, String>>,
 
+    /// The `COMMENT ON TYPE` of each live enum, read at plan time so that a
+    /// rebuild can carry it to the replacement (DEC-1635.7). A fact about the
+    /// target, not intent: it is absent offline.
+    pub enum_comments: BTreeMap<crate::TypeRef, String>,
+
+    /// Declared modules a connected plan found standing on the columns of an
+    /// enum it rebuilds: they come down before the retypes and go back after
+    /// the swap, as a trigger whose table changes hands does (DEC-1635.7).
+    pub enum_dependents: std::collections::BTreeSet<crate::ModuleId>,
+
     /// Per-table execution strategy (ADR-0003).
     pub strategies: crate::strategy::Strategies,
     /// Per-module creation-order edges (ADR-0002).
