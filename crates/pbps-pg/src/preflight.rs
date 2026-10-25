@@ -3278,7 +3278,15 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 // `coalesce` that fills them is a valid plan (round 1
                 // review). Read through the same expression, so a row it
                 // cannot convert fails here by the same name.
-                if *from_nullable && !*to_nullable {
+                //
+                // Whenever the target is `NOT NULL`, **not only when this
+                // plan tightens it** (round 4 review). A column that is
+                // already required holds no NULL, but `nullif(amount, '')::
+                // integer` makes one from a stored value, the engine refuses
+                // it, and the `count` above ignores a NULL result. "The stored
+                // column already satisfied it" is true of the old value and
+                // says nothing about the new one.
+                if !*to_nullable {
                     out.push(
                         null_probe(column, &table, &value).refusing_when_it_fails(),
                     );

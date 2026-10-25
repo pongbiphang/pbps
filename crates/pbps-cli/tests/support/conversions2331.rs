@@ -1026,3 +1026,90 @@ fn an_expression_that_closes_its_statement_runs_nothing_and_is_refused_by_name()
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_required_column_is_checked_for_the_nulls_its_conversion_makes() {
+    // `NOT NULL` before and after: the plan does not tighten anything, yet
+    // the expression can turn a stored value into a NULL (round 4 review).
+    let required = |ty: &str| {
+        TEXT.replace(
+            "amount: {type: text}",
+            &format!("amount: {{type: {ty}, nullable: false}}"),
+        )
+    };
+    for (version, url) in servers() {
+        let slug = format!("convert2331-required{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, &required("text"));
+        on_server(
+            connection,
+            "INSERT INTO app.t VALUES (1,' 41 '),(2,''),(3,'7')",
+        );
+        d.table(&required("integer"));
+        succeeds(with_stdin(
+            &d,
+            &CONVERT,
+            b"nullif(trim(amount), '')::integer",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        on_server(connection, WITNESS);
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        refused_in_preflight(
+            version,
+            &refused,
+            "1 existing NULLs in app.t.amount, which NOT NULL would reject",
+            connection,
+        );
+        // An expression that makes no NULL from these rows still applies.
+        succeeds(with_stdin(
+            &d,
+            &["convert", "app.t.amount", "--using", "-", "--from", "text"],
+            b"coalesce(nullif(trim(amount), '')::integer, 0)",
+        ));
+        let artifact = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &artifact, GATE));
+        assert_eq!(
+            scalar(connection, "SELECT sum(amount) FROM app.t"),
+            48,
+            "PG{version}"
+        );
+        succeeds(d.run(&["verify", "--db", connection]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_kept_unique_key_the_conversion_collides_is_refused_by_the_engine_and_changes_nothing() {
+    // Not a probe: a key this plan keeps is not a change, so no preflight
+    // reads it, and the engine's own check at the rewrite is what refuses
+    // `length` making both rows 2. Pinned so that it stays atomic.
+    let before = "table: app.t\ncolumns:\n  id: {type: bigint, nullable: false}\n  amount: {type: text}\nprimary_key: {name: pk_t, columns: [id]}\nunique:\n  uq_amount: [amount]\n";
+    let after = before.replace("type: text", "type: integer");
+    for (version, url) in servers() {
+        let slug = format!("convert2331-keptkey{version}");
+        let own = OwnDatabase::new(&url, &slug);
+        let connection = own.connection();
+        let d = bootstrapped_demo(connection, &slug, before);
+        on_server(connection, "INSERT INTO app.t VALUES (1,'10'),(2,'20')");
+        d.table(&after);
+        succeeds(with_stdin(&d, &CONVERT, b"length(amount)"));
+        let artifact = connected_artifact(&d, connection, false);
+        on_server(connection, WITNESS);
+        let refused = approved_apply(&d, connection, &artifact, GATE);
+        let text = stderr(&refused);
+        assert_eq!(code(&refused), 1, "PG{version}: {text}");
+        assert!(
+            text.contains("the whole plan was rolled back")
+                && text.contains("could not create unique index \"uq_amount\""),
+            "PG{version}: {text}"
+        );
+        assert!(still_text(connection), "PG{version}: nothing converted");
+        assert_eq!(
+            scalar(connection, "SELECT sum(amount::integer) FROM app.t"),
+            30,
+            "PG{version}: the rows are as they were"
+        );
+    }
+}
