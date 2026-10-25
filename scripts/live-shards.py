@@ -27,6 +27,9 @@ MSSQL_SET_GIB = 9
 MSSQL_WITHOUT_EXPRESS_GIB = 4
 PG_SHARD_GIB = 1
 MEMORY_SAMPLE_SECONDS = 15
+# Allow thirty seconds for helper finally blocks to remove Docker containers
+# and volumes, while bounding interruption if a helper cannot finish cleanup.
+RUNNER_STOP_GRACE_SECONDS = 30
 EPHEMERAL_RANGE = Path("/proc/sys/net/ipv4/ip_local_port_range")
 EXPRESS_INVENTORY = {
     ("test", "-p", "pbps-mssql", "--test", "live", "--"): {
@@ -133,13 +136,41 @@ class FixtureRun:
     def stop(self):
         with self.lock:
             self.stopped = True
-            for process in self.processes:
+            processes = list(self.processes)
+        if not processes:
+            return
+        deadline = time.monotonic() + RUNNER_STOP_GRACE_SECONDS
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for process in processes:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        # A runner can exit before its TLS helper finishes removing its own
+        # container. Keep the whole group alive for cleanup (DEC-2366.1).
+        groups = [process.pid for process in processes]
+        while groups:
+            remaining = []
+            for pid in groups:
                 try:
-                    # Killing the runner alone leaves cargo/docker descendants
-                    # able to provision fixtures after cleanup (DEC-2366.1).
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(pid, 0)
+                    remaining.append(pid)
                 except ProcessLookupError:
                     pass
+            groups = remaining
+            delay = deadline - time.monotonic()
+            if not groups or delay <= 0:
+                break
+            time.sleep(min(0.05, delay))
+        for pid in groups:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def interrupt(self, sig, frame):
         for handled in self.handlers:

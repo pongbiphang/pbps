@@ -57,6 +57,89 @@ def job_commands(workflow, job):
 
 
 class ShardedExecution(unittest.TestCase):
+    def test_descendant_cleanup_finishes_after_its_runner_leader_exits(self):
+        events, elapsed, _ = self.stop_fake_runners(["cleanup"])
+        kinds = [event[0] for event in events]
+        self.assertIn("cleanup", kinds, "SIGKILL must not bypass the helper's finally block")
+        self.assertLess(kinds.index("leader-exit"), kinds.index("cleanup"))
+        self.assertNotIn("kill", kinds)
+        self.assertLess(elapsed, 0.2)
+
+    def test_ignoring_descendant_is_killed_at_the_deadline_after_its_leader_exits(self):
+        events, elapsed, fixture = self.stop_fake_runners(["ignore"])
+        self.assertEqual(fixture.processes, [], "the leader was already reaped")
+        self.assertEqual([event[0] for event in events], ["term", "wait", "leader-exit", "kill"])
+        self.assertAlmostEqual(elapsed, 0.2)
+        self.assertAlmostEqual(events[-1][2], 0.2)
+
+    def test_runner_shutdown_uses_one_deadline_and_releases_the_registry_lock(self):
+        events, elapsed, _ = self.stop_fake_runners(["blocked", "blocked"])
+        self.assertEqual([event[0] for event in events], ["term", "term", "wait", "wait", "kill", "kill"])
+        waits = [event[2] for event in events if event[0] == "wait"]
+        self.assertEqual(waits, [0.2, 0])
+        self.assertAlmostEqual(elapsed, 0.2)
+
+    def test_already_gone_runner_groups_need_no_escalation(self):
+        events, elapsed, _ = self.stop_fake_runners(["gone"])
+        self.assertNotIn("kill", [event[0] for event in events])
+        self.assertEqual(elapsed, 0)
+
+    def stop_fake_runners(self, behaviors):
+        fixture = SHARDS.FixtureRun([])
+        clock, events = [0.0], []
+        groups = {1000 + index: {"behavior": behavior, "alive": behavior != "gone", "term": None}
+                  for index, behavior in enumerate(behaviors)}
+
+        def send(pid, sig):
+            group = groups[pid]
+            if sig == signal.SIGTERM:
+                self.assertTrue(fixture.lock.acquire(blocking=False))
+                fixture.lock.release()
+                events.append(("term", pid, clock[0]))
+                group["term"] = clock[0]
+            elif sig == signal.SIGKILL:
+                events.append(("kill", pid, clock[0]))
+                group["alive"] = False
+                return
+            elif group["behavior"] == "cleanup" and group["term"] is not None:
+                if clock[0] >= group["term"] + 0.05:
+                    events.append(("cleanup", pid, clock[0]))
+                    group["alive"] = False
+            if not group["alive"]:
+                raise ProcessLookupError(pid)
+
+        def wait(process, timeout):
+            # The real worker removes its leader under this lock after wait().
+            # Holding the registry lock throughout shutdown would deadlock it.
+            self.assertTrue(fixture.lock.acquire(blocking=False))
+            try:
+                self.assertTrue(fixture.stopped)
+                events.append(("wait", process.pid, timeout))
+                if groups[process.pid]["behavior"] != "blocked":
+                    fixture.processes.remove(process)
+                    events.append(("leader-exit", process.pid, clock[0]))
+                    return 0
+            finally:
+                fixture.lock.release()
+            clock[0] += timeout
+            raise subprocess.TimeoutExpired("fake runner", timeout)
+
+        for pid in groups:
+            process = mock.Mock(pid=pid)
+            process.wait.side_effect = lambda timeout, process=process: wait(process, timeout)
+            fixture.processes.append(process)
+
+        def sleep(seconds):
+            self.assertGreater(seconds, 0)
+            clock[0] += seconds
+
+        with mock.patch.object(SHARDS, "RUNNER_STOP_GRACE_SECONDS", 0.2, create=True), \
+             mock.patch.object(SHARDS.os, "killpg", side_effect=send), \
+             mock.patch.object(SHARDS.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(SHARDS.time, "sleep", side_effect=sleep):
+            fixture.stop()
+        return events, clock[0], fixture
+
     def test_default_ports_avoid_ephemeral_and_canonical_runner_ports(self):
         ports = []
         with mock.patch.object(SHARDS, "ephemeral_ports", return_value=(32768, 60999)):
@@ -685,6 +768,16 @@ elif command[:2] != ["python3", "scripts/check-live-fixture.py"]:
                 command = [sys.executable, "scripts/live-shards.py", "--suite", suite,
                            "--" + suite + "-shards", str(count), "--prefix", "pbps-test-shard",
                            "--output", str(output), "--measure", str(root / "weights.json")]
+            if interrupt is not None:
+                # Exercise escalation without waiting the production grace.
+                entry = root / "driver.py"
+                entry.write_text("import importlib.util, sys\n"
+                                 f"spec = importlib.util.spec_from_file_location('driver', {str(SHARDS.SCRIPT)!r})\n"
+                                 "driver = importlib.util.module_from_spec(spec)\n"
+                                 "spec.loader.exec_module(driver)\n"
+                                 "driver.RUNNER_STOP_GRACE_SECONDS = 0.2\n"
+                                 "sys.exit(driver.main())\n")
+                command[1] = str(entry)
             with subprocess.Popen(command, cwd=ROOT, env=env, text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
                 if interrupt is not None:
