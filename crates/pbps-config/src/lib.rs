@@ -252,7 +252,22 @@ pub struct Hooks {
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(deny_unknown_fields)]
-// The three spellings are exclusive after deserialization; null means absent.
+// The three fields are individually optional in Rust because serde has to read
+// the file before it can say which one is present — but `dev::spec` requires
+// **exactly one** of `docker`, `url_env` and `resolver`, and refuses `dev: {}`
+// and a block naming two. A schema that left the derive's shape alone would
+// bless pbps.yml files the CLI then cannot run a plan with, which is the one
+// thing generating the schema from these types is supposed to prevent (the
+// same reasoning as the module declaration's `oneOf`).
+//
+// Each branch constrains the other keys rather than merely requiring its own:
+// `required` alone would accept a file naming two.
+//
+// The others are pinned to null rather than to `false`, because that is
+// `dev::spec`'s own rule: YAML writes `url_env:` with nothing after it, which
+// serde reports as absent, so a block with a real `docker:` beside an empty
+// `url_env:` resolves. `false` would refuse that line, a disagreement with the
+// tool in the stricter direction.
 #[schemars(extend("oneOf" = [
     serde_json::json!({
         "required": ["docker"],
