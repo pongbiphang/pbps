@@ -666,6 +666,15 @@ pub(crate) fn lineage_errors(
         let table = name(declared.ids, record.replacement_root(key).unwrap_or(key))
             .or(named)
             .unwrap_or_else(|| TableName::new("?", "?"));
+        // Only PostgreSQL can hold a record the CLI wrote; one in another
+        // engine's files was edited in by hand and is not read as history.
+        if dialect.name() != "postgres" {
+            errors.push(error(
+                table,
+                "this engine does not support table rebuilds".to_owned(),
+            ));
+            continue;
+        }
         match holding(base.ids, key, record) {
             Holding::Replacement | Holding::Neither => {}
             Holding::Partial => errors.push(error(

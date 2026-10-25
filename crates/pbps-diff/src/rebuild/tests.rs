@@ -30,6 +30,57 @@ fn qualify(
     super::qualify(base, desired, table, &pbps_dialect::MinimalDialect)
 }
 
+/// `MinimalDialect` under PostgreSQL's name: the lineage rules that need an
+/// engine able to rebuild read the name, nothing else.
+struct Postgres;
+
+impl pbps_dialect::Dialect for Postgres {
+    fn name(&self) -> &'static str {
+        "postgres"
+    }
+    fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.quote_ident(ident)
+    }
+    fn intermediate_tables(
+        &self,
+        change: &pbps_model::Change,
+        strategy: pbps_model::Strategy,
+    ) -> Result<Vec<TableName>, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.intermediate_tables(change, strategy)
+    }
+    fn normalize_type(
+        &self,
+        ty: &pbps_model::ColumnType,
+    ) -> Result<pbps_model::ColumnType, pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.normalize_type(ty)
+    }
+    fn type_change_risk(
+        &self,
+        from: &pbps_model::ColumnType,
+        to: &pbps_model::ColumnType,
+    ) -> pbps_dialect::TypeChangeRisk {
+        pbps_dialect::MinimalDialect.type_change_risk(from, to)
+    }
+    fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+        pbps_dialect::MinimalDialect.fold_ident(ident)
+    }
+    fn lexicon(&self) -> pbps_dialect::Lexicon {
+        pbps_dialect::MinimalDialect.lexicon()
+    }
+    fn validate_table(&self, name: &TableName, table: &Table) -> Vec<pbps_dialect::DialectError> {
+        pbps_dialect::MinimalDialect.validate_table(name, table)
+    }
+    fn transaction_framing(
+        &self,
+        zone: &pbps_model::SessionZone,
+    ) -> pbps_dialect::TransactionFraming {
+        pbps_dialect::MinimalDialect.transaction_framing(zone)
+    }
+    fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+        pbps_dialect::MinimalDialect.probe_framing()
+    }
+}
+
 fn transition(
     base: Side<'_>,
     desired: Side<'_>,
@@ -134,12 +185,7 @@ fn reason() -> Reason {
 }
 
 fn diff(base: Side<'_>, desired: Side<'_>) -> crate::Diffed {
-    crate::diff_partial(
-        base,
-        desired,
-        &pbps_dialect::MinimalDialect,
-        &Default::default(),
-    )
+    crate::diff_partial(base, desired, &Postgres, &Default::default())
 }
 
 fn first_rebuild_error(diffed: &crate::Diffed) -> String {
@@ -975,6 +1021,33 @@ fn a_plan_follows_what_its_environment_holds_of_the_lineage() {
 }
 
 #[test]
+fn an_engine_that_cannot_rebuild_refuses_every_lineage_record() {
+    let (base, ids, desired) = fixture();
+    let approval = recorded(&base, &ids, &desired);
+    let target = side(&desired, &approval);
+    // Whether its baseline holds the source or the replacement: a record in
+    // another engine's files was edited in by hand.
+    for environment in [side(&base, &ids), target] {
+        let other = crate::diff_partial(
+            environment,
+            target,
+            &pbps_dialect::MinimalDialect,
+            &Default::default(),
+        );
+        assert!(first_rebuild_error(&other).contains("does not support table rebuilds"));
+        assert!(other.changes.changes.is_empty());
+    }
+    // Without a record the engine's name is irrelevant.
+    let plain = crate::diff_partial(
+        side(&base, &ids),
+        side(&base, &ids),
+        &pbps_dialect::MinimalDialect,
+        &Default::default(),
+    );
+    assert!(plain.errors.is_empty(), "{:?}", plain.errors);
+}
+
+#[test]
 fn a_chain_is_applied_link_by_link_and_never_merged() {
     let (base, ids, desired) = fixture();
     let first = recorded(&base, &ids, &desired);
@@ -1045,7 +1118,7 @@ fn an_applied_rewrite_the_files_no_longer_record_is_never_a_drop_and_create() {
         lineage_errors(
             side(&desired, &approval),
             side(&gone, &dropped_ids),
-            &pbps_dialect::MinimalDialect
+            &Postgres
         )
         .is_empty()
     );
