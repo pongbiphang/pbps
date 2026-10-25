@@ -205,6 +205,66 @@ mod declared_type_emission_tests {
     }
 
     #[test]
+    fn constraint_defaults_group_the_whole_expression_but_set_default_is_unchanged() {
+        let pg = Postgres::new();
+        let table = TableName::new("app", "t");
+        for (ty, expression) in [
+            ("boolean", "'a' IN ('a','b')"),
+            ("integer", "7"),
+            ("integer", "1 -- why"),
+            ("text", "'a' COLLATE \"C\""),
+        ] {
+            let mut column = Column::new(ty.parse().unwrap());
+            column.value_source = pbps_model::ValueSource::Default(expression.into());
+            assert_eq!(
+                column_definition(&table, "v", &column).unwrap(),
+                format!("\"v\" {ty} NULL DEFAULT ({expression}\n)")
+            );
+            let definition = pbps_model::ManagedType::Domain {
+                base: ty.parse().unwrap(),
+                not_null: false,
+                default: Some(expression.into()),
+                checks: BTreeMap::new(),
+                collation: None,
+            };
+            let statements = emit(
+                &pg,
+                &Change::CreateType {
+                    uid: "y_aaaaaa".parse().unwrap(),
+                    name: "app.d".parse().unwrap(),
+                    definition: Box::new(definition.clone()),
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+            let expected = format!("CREATE DOMAIN \"app\".\"d\" AS {ty} DEFAULT ({expression}\n);");
+            assert!(
+                statements[0].sql.contains(&expected),
+                "{}",
+                statements[0].sql
+            );
+            assert_eq!(
+                statements[0].declared_type.as_ref().unwrap().definition,
+                Some(definition)
+            );
+            let set = emit(
+                &pg,
+                &Change::AlterColumnDefault {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: table.column("v"),
+                    from: None,
+                    to: Some(expression.into()),
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+            let expected =
+                format!("ALTER TABLE \"app\".\"t\" ALTER COLUMN \"v\" SET DEFAULT {expression}\n;");
+            assert!(set[0].sql.contains(&expected), "{}", set[0].sql);
+        }
+    }
+
+    #[test]
     fn type_lifecycle_sql_quotes_names_and_labels_and_preserves_domain_attributes() {
         let pg = Postgres::new();
         let uid: pbps_model::Uid = "y_aaaaaa".parse().unwrap();
@@ -264,7 +324,12 @@ mod declared_type_emission_tests {
             definition: Box::new(definition),
         };
         let sql = &emit(&pg, &create, Strategy::default()).unwrap()[0].sql;
-        assert!(sql.replace('\n', "").contains("CREATE DOMAIN \"app\".\"phone\" AS character varying(20) COLLATE \"pg_catalog\".\"C\" DEFAULT '0' NOT NULL CONSTRAINT \"positive\" CHECK (VALUE <> '')"), "{sql}");
+        let expected = concat!(
+            "CREATE DOMAIN \"app\".\"phone\" AS character varying(20) ",
+            "COLLATE \"pg_catalog\".\"C\" DEFAULT ('0') NOT NULL ",
+            "CONSTRAINT \"positive\" CHECK (VALUE <> '')"
+        );
+        assert!(sql.replace('\n', "").contains(expected), "{sql}");
         assert!(!sql.contains("CASCADE"));
         assert!(
             emit(
@@ -1427,7 +1492,9 @@ fn column_definition(
         if let Some(e) = refuse_an_unresolved_default(name, &types::normalize(&column.ty)?, expr) {
             return Err(e);
         }
-        s.push_str(&format!(" DEFAULT {}", verbatim(expr)));
+        // A column constraint takes b_expr, so group the whole declared
+        // expression, with its trailing newline inside (DEC-2312.1).
+        s.push_str(&format!(" DEFAULT ({})", verbatim(expr)));
     }
     Ok(s)
 }
@@ -3397,7 +3464,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                         ));
                     }
                     if let Some(text) = default {
-                        sql.push_str(&format!(" DEFAULT {}", verbatim(text)));
+                        // CREATE DOMAIN takes b_expr too (DEC-2312.1).
+                        sql.push_str(&format!(" DEFAULT ({})", verbatim(text)));
                     }
                     if *not_null {
                         sql.push_str(" NOT NULL");
@@ -10109,7 +10177,7 @@ mod tests {
             },
         )
         .remove(0);
-        assert!(created.contains("DEFAULT 1 -- why\n"), "{created}");
+        assert!(created.contains("DEFAULT (1 -- why\n)"), "{created}");
         let added = sql_of(
             &Postgres::new(),
             &Change::AddColumn {
@@ -10120,7 +10188,7 @@ mod tests {
             },
         )
         .remove(0);
-        assert!(added.contains("DEFAULT 1 -- why\n"), "{added}");
+        assert!(added.contains("DEFAULT (1 -- why\n)"), "{added}");
         let set = sql_of(
             &Postgres::new(),
             &Change::AlterColumnDefault {

@@ -1054,3 +1054,26 @@ literal/unrelated-name negatives. The ignored live test
 `insensitive_catalog_names_bind_computed_columns_before_checks_are_refused`
 creates AI and AS databases, pins both accent directions' 1764/207 errors,
 checks the advisory, and accepts the persisted/plain-column/literal controls.
+
+<a id="dec-2312-1"></a>
+
+**DEC-2312.1. Group declared defaults in column constraints and CREATE DOMAIN.**
+Measured on PostgreSQL 16.15 and 18.6, these positions take `b_expr`: bare
+`IN`, `IS NULL`, `BETWEEN`, `LIKE`, `AND`/`OR` and `NOT` fail, while grouping
+admits them. `ALTER COLUMN SET DEFAULT` takes `a_expr` and stays unchanged.
+The existing newline stays inside the closing parenthesis so a trailing
+comment cannot consume it (DECISIONS 281); declaration records keep the user's
+spelling (DECISIONS 207–208).
+
+This also changes behaviour: before, an ungrouped `DEFAULT <x> COLLATE "C"`
+silently set the column or domain collation. Now the collation stays as
+declared and `COLLATE` belongs to the default. Measured, the grouped form
+stores the same expression as `SET DEFAULT`; other parseable measured forms
+keep their stored rendering. Live regressions pin execution, stored collation,
+unchanged declaration text and clean plans on both versions:
+`created_column_defaults_accept_full_expressions_and_converge_on_16`,
+`created_column_defaults_accept_full_expressions_and_converge_on_18`,
+`added_column_defaults_accept_full_expressions_and_converge_on_16`,
+`added_column_defaults_accept_full_expressions_and_converge_on_18`,
+`domain_defaults_accept_full_expressions_and_converge_on_16`,
+`domain_defaults_accept_full_expressions_and_converge_on_18`.

@@ -22,6 +22,9 @@ use std::process::{Command, Output};
 #[path = "support/managed_types.rs"]
 mod managed_types;
 
+#[path = "support/default_grouping.rs"]
+mod default_grouping;
+
 #[path = "support/type_refs.rs"]
 mod type_refs;
 

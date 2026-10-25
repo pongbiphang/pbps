@@ -3,8 +3,8 @@ CREATE TABLE "app"."child" (
     "col
 line[31m\‮名前" integer NOT NULL,
     "col
-line[31m\‮名前payload" integer NOT NULL DEFAULT 2
-,
+line[31m\‮名前payload" integer NOT NULL DEFAULT (2
+),
     CONSTRAINT "pk_child" PRIMARY KEY ("col
 line[31m\‮名前")
 ) USING heap;
