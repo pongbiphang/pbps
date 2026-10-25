@@ -715,7 +715,7 @@ async fn described(conn: &mut Conn, catalog: &str, oid: i64) -> Result<String, D
         None => None,
     };
     Ok(match named {
-        Some(named) => format!("{named} (oid {oid})"),
+        Some(named) => format!("{} (oid {oid})", pbps_model::escape::Escaped(&named)),
         None => format!("oid {oid}, which is no longer in the catalog"),
     })
 }
@@ -1456,7 +1456,7 @@ async fn read_extension_ties(
         carries.push(Carried {
             what: "a `DEPENDS ON EXTENSION` tie, which a `DROP` destroys and no declaration here \
                    can restore",
-            detail: text(&row, "on_what")?,
+            detail: pbps_model::escape::Escaped(&text(&row, "on_what")?).to_string(),
         });
     }
     Ok(())

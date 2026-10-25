@@ -1682,6 +1682,7 @@
         "a_view_occupying_the_ledgers_name_is_named_and_never_written_to",
         "a_view_over_an_array_of_a_routine_is_created_after_the_routine",
         "a_view_replaced_while_its_lock_queued_is_refused_rather_than_serialized",
+        "extension_catalog_descriptions_are_shown_once_in_rebuild_refusals",
         "a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans_it",
         "an_account_that_cannot_lock_a_routine_says_so_and_the_reads_after_it_still_run",
         "an_account_that_cannot_pin_a_schema_says_which_half_is_held",
