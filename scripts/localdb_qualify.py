@@ -173,6 +173,20 @@ def install():
         raise RuntimeError(f"LocalDB did not install (msiexec {done.returncode}; {HELPER} exists: {HELPER.exists()})")
 
 
+def windows_powershell_env(secret, base=None):
+    """The environment for a Windows PowerShell 5.1 child that receives `secret`.
+
+    The job's steps run under PowerShell 7, which puts its own module
+    directories in PSModulePath. Windows PowerShell 5.1 inherits that and then
+    cannot load its built-in modules (the first run failed with
+    "ConvertTo-SecureString ... the module could not be loaded"). Without the
+    variable, 5.1 builds its default module path.
+    """
+    env = {k: v for k, v in (os.environ if base is None else base).items() if k.upper() != "PSMODULEPATH"}
+    env["PBPS_LOCALDB_PASSWORD"] = secret
+    return env
+
+
 def create_user_command():
     """The PowerShell that creates the dedicated user from $env:PBPS_LOCALDB_PASSWORD.
 
@@ -197,7 +211,7 @@ def create_user(secret):
     print(f"::add-mask::{secret}", flush=True)
     say("create user", USER)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", create_user_command()],
-                   check=True, env={**os.environ, "PBPS_LOCALDB_PASSWORD": secret})
+                   check=True, env=windows_powershell_env(secret))
     tmp = Path(r"C:\tmp")  # the shared suites back databases up to `/tmp/...`
     tmp.mkdir(exist_ok=True)
     workspace = Path.cwd()
@@ -223,7 +237,7 @@ def as_user(secret, argv, env=None, stdout=None, stderr=None, seconds=1800):
     )
     say("as", USER, *argv[:3])
     code = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", shell],
-                          env={**os.environ, "PBPS_LOCALDB_PASSWORD": secret}).returncode
+                          env=windows_powershell_env(secret)).returncode
     text = Path(stdout).read_text(errors="replace") if Path(stdout).exists() else ""
     return code, text
 

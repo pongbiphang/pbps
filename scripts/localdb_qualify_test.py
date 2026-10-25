@@ -102,6 +102,16 @@ class Handoff(unittest.TestCase):
         self.assertNotIn("Administrators", command)
         self.assertNotIn("S-1-5-32-544", command)
 
+    def test_windows_powershell_children_do_not_inherit_powershell_7s_module_path(self):
+        # PowerShell 7 runs the step; its PSModulePath makes Windows
+        # PowerShell 5.1 fail to load its own built-in modules.
+        base = {"PSModulePath": r"C:\pwsh7\Modules", "Path": r"C:\Windows", "psmodulepath": "x"}
+        env = lq.windows_powershell_env("s3cret", base)
+        self.assertNotIn("PSMODULEPATH", {k.upper() for k in env})
+        self.assertEqual(env["Path"], r"C:\Windows")
+        self.assertEqual(env["PBPS_LOCALDB_PASSWORD"], "s3cret")
+        self.assertIn("PSModulePath", base)  # the caller's mapping is left alone
+
 
 class Pinned(unittest.TestCase):
     def test_the_installer_is_pinned_by_content_on_microsoft_downloads(self):
