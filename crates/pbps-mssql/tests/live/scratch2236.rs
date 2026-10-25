@@ -54,9 +54,17 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
     let name = format!("pbps2236_model_measure_{}", std::process::id());
     for (column, change, restore) in cases {
         let mut changed = false;
+        // A case states one direction. Where model already holds the changed
+        // value (LocalDB's model is SIMPLE recovery, a container's is FULL),
+        // the other direction is the change and the stated one restores it.
+        let mut swapped = false;
         let outcome: Result<_, pbps_db::DbError> = async {
             conn.execute(&change).await?;
             changed = true;
+            if model_row(&mut conn).await == original {
+                conn.execute(&restore).await?;
+                swapped = true;
+            }
             let reference = options::supplied_reference(&mut conn).await;
             conn.execute(&format!("CREATE DATABASE [{name}];")).await?;
             let actual = options::read(&mut conn, &name).await?;
@@ -71,7 +79,7 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
             ))
             .await;
         let restoration = if changed {
-            conn.execute(&restore).await
+            conn.execute(if swapped { &change } else { &restore }).await
         } else {
             Ok(())
         };
@@ -281,7 +289,34 @@ async fn supplied_options_compare_every_column_and_allow_log_backup_status() {
         "{:?}",
         options::differences(&actual, &reference)
     );
-    let backup = format!("/tmp/{}.bak", db.name);
+    // The server's own data directory exists and is writable on every
+    // platform; `/tmp` does not exist on Windows (LocalDB).
+    let directory = db
+        .conn
+        .query("SELECT CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultDataPath')) AS d;")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("d")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let backup = format!("{directory}{}.bak", db.name);
+    // A FULL-recovery model makes the database's own FULL a no-op. Where model
+    // is SIMPLE (LocalDB), the recovery columns are the expected difference.
+    let model = db
+        .conn
+        .query("SELECT recovery_model_desc AS r FROM sys.databases WHERE name = N'model';")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("r")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let recovery: Vec<String> = if model == "FULL" {
+        Vec::new()
+    } else {
+        vec!["recovery_model".into(), "recovery_model_desc".into()]
+    };
     db.conn
         .execute(&format!(
             "ALTER DATABASE [{}] SET RECOVERY FULL; BACKUP DATABASE [{}] TO DISK=N'{backup}' \
@@ -312,16 +347,15 @@ async fn supplied_options_compare_every_column_and_allow_log_backup_status() {
         state[0].try_get::<&str>("log_reuse_wait_desc").unwrap(),
         Some("LOG_BACKUP")
     );
-    assert!(options::differences(&waiting, &reference).is_empty());
+    assert_eq!(options::differences(&waiting, &reference), recovery);
     db.conn
         .execute(&format!("ALTER DATABASE [{}] SET AUTO_SHRINK ON;", db.name))
         .await
         .unwrap();
     let changed = options::read(&mut db.conn, &db.name).await.unwrap();
-    assert_eq!(
-        options::differences(&changed, &reference),
-        ["is_auto_shrink_on"]
-    );
+    let mut shrink = vec!["is_auto_shrink_on".to_owned()];
+    shrink.extend(recovery);
+    assert_eq!(options::differences(&changed, &reference), shrink);
     db.drop().await;
 }
 
@@ -895,7 +929,17 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         .await
         .unwrap();
     for (expected, create) in cases.restore {
-        db.conn.execute(&create).await.unwrap();
+        if let Err(error) = db.conn.execute(&create).await {
+            // An installation without the feature (LocalDB has no Advanced
+            // Analytics Extensions) cannot hold the object, so its catalog
+            // stays empty; only that refusal is accepted.
+            assert_eq!(
+                error.server_error_code().as_deref(),
+                Some("39020"),
+                "{expected}: {error}"
+            );
+            continue;
+        }
         let names = inventory::read(&mut db.conn, Some("catalog_owner"))
             .await
             .unwrap()

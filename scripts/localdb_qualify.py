@@ -294,6 +294,8 @@ def main():
     env = {
         "PBPS_TEST_DB": resolved[TARGET],
         "PBPS_TEST_MSSQL_SCRATCH_DB": resolved[SCRATCH],
+        # LocalDB is the Express edition, so the Express measurement runs here too.
+        "PBPS_TEST_EXPRESS_DB": resolved[SCRATCH],
         "PBPS_TEST_LOCALDB_SCRATCH": selector(SCRATCH),
         "PBPS_TEST_LOCALDB_DISPOSABLE": selector(DISPOSABLE),
         # A key file's owner-only permission cannot be proved on Windows, so
