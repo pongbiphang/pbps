@@ -1048,3 +1048,48 @@ fn ordinary_planning_still_refuses_a_computed_column_over_a_function_the_plan_cr
         "{refused:?}"
     );
 }
+
+#[test]
+fn a_seed_row_for_a_table_with_a_split_computed_column_makes_no_cycle() {
+    // Reconstruction never runs a row, but `prepare` settles it first: the
+    // seed must follow every column part, a split computed column included,
+    // and no part may be ordered after it.
+    let seed = Change::InsertRow {
+        table: name("t"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: pbps_model::RowKey::from("1"),
+        defaults: Default::default(),
+        types: Default::default(),
+        row: Default::default(),
+    };
+    for functions_first in [false, true] {
+        let table = table_with("t", |t| {
+            t.columns.get_mut("id").unwrap().nullable = false;
+            t.primary_key = Some(primary_key("id"));
+            t.computed.insert("c".into(), computed("app.f(id)"));
+            t.unique.insert(
+                "uq_c".into(),
+                pbps_model::UniqueConstraint {
+                    columns: vec!["c".into()],
+                    storage_parameters: Default::default(),
+                },
+            );
+        });
+        let mut changes = if functions_first {
+            vec![function("f", FUNCTION), table]
+        } else {
+            vec![table, function("f", FUNCTION)]
+        };
+        changes.push(seed.clone());
+        let statements = sql(&build(changes).unwrap());
+        assert!(
+            statements.iter().all(|s| !s.contains("INSERT")),
+            "{statements:#?}"
+        );
+        assert!(
+            at(&statements, "FUNCTION [app].[f]") < at(&statements, "ADD [c] AS"),
+            "{statements:#?}"
+        );
+    }
+}

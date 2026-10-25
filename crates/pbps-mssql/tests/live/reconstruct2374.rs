@@ -245,6 +245,42 @@ async fn defaults_checks_and_keys_over_a_computed_column_compile_after_their_fun
 
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
+async fn a_seed_row_beside_a_split_computed_column_is_skipped_and_compiles() {
+    case("seeded", |mut conn| async move {
+        compile(
+            &mut conn,
+            vec![
+                table("t", |t| {
+                    t.columns.get_mut("id").unwrap().nullable = false;
+                    t.primary_key = Some(pbps_model::PrimaryKey {
+                        name: Some("pk_id".into()),
+                        columns: vec!["id".into()],
+                        storage_parameters: Default::default(),
+                    });
+                    t.computed.insert("c".into(), computed("app.f(v)"));
+                }),
+                module(ModuleKind::Function, "f", FUNCTION),
+                Change::InsertRow {
+                    table: TableName::new("app", "t"),
+                    key_column: "id".into(),
+                    identity_key: false,
+                    key: pbps_model::RowKey::from("1"),
+                    defaults: Default::default(),
+                    types: Default::default(),
+                    row: Default::default(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let sql = "SELECT COUNT(*) FROM sys.columns WHERE object_id = OBJECT_ID(N'app.t') AND name = N'c'";
+        assert_eq!(count(&mut conn, sql).await, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
 async fn a_declaration_that_does_not_compile_names_itself_and_leaves_the_connection_usable() {
     case("refused", |mut conn| async move {
         let refused = compile(

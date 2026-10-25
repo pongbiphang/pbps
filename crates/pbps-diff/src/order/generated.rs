@@ -785,6 +785,7 @@ pub fn constraints(
                 for (part, p) in &own {
                     match &p.change {
                         Change::AddColumn { .. }
+                        | Change::AddComputedColumn { .. }
                         | Change::AlterColumnExpression { .. }
                         | Change::AlterColumnDefault { .. } => edge(&mut out, *part, i),
                         Change::CreateTable { .. } => {}
