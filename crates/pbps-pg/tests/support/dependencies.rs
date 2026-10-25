@@ -960,11 +960,16 @@ async fn references_sort_what_a_stored_default_binds_and_what_the_facts_cannot_h
         .execute(
             "CREATE SCHEMA app;
         CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+        CREATE FUNCTION app.f2(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';
         CREATE TABLE app.other(id integer);
         CREATE SEQUENCE app.free;
+        CREATE OPERATOR app.|+| (LEFTARG = integer, RIGHTARG = integer, FUNCTION = app.f2);
+        CREATE TYPE app.mood AS ENUM ('ok');
         CREATE TABLE app.parent(k integer NOT NULL, a integer DEFAULT 7, b integer DEFAULT app.f(1),
           c serial, e regclass DEFAULT 'app.other'::regclass, f integer DEFAULT nextval('app.free'),
-          g integer GENERATED ALWAYS AS (a * 2) STORED)",
+          g integer GENERATED ALWAYS AS (a * 2) STORED,
+          h integer DEFAULT 1 OPERATOR(app.|+|) 2, i app.mood DEFAULT 'ok',
+          j integer DEFAULT 1 + 2, l text DEFAULT 'x' || 'y')",
         )
         .await
         .unwrap();
@@ -1024,6 +1029,22 @@ async fn references_sort_what_a_stored_default_binds_and_what_the_facts_cannot_h
         "a sequence nobody owns is not representable"
     );
     assert!(!at("g").unrepresented && at("g").default.is_some());
+    // A normal dependency of any other catalog is just as unrepresented: a
+    // user-defined operator and a user-defined type. Built-in operators are pinned and bind nothing.
+    assert!(
+        at("h").unrepresented,
+        "a user-defined operator is not a representable binding"
+    );
+    assert!(
+        at("i").unrepresented,
+        "a user-defined type is not a representable binding"
+    );
+    for built_in in ["j", "l"] {
+        assert!(
+            !at(built_in).unrepresented && at(built_in).routines.is_empty(),
+            "{built_in}: built-in operators and types are not dependencies"
+        );
+    }
     assert_eq!(at("k").default, None);
     assert_eq!(at("k").local_not_null, version >= 180000);
     assert!(!at("a").local_not_null);

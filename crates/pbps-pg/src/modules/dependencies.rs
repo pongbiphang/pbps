@@ -590,7 +590,7 @@ pub async fn references(
 
 /// Sorts the references of one default into what the facts represent: a
 /// routine, an owned sequence, a column of the same table; anything else
-/// through a normal dependency is unrepresented.
+/// through a normal dependency, of any catalog, is unrepresented.
 async fn bound_by(
     conn: &mut Conn,
     column: &mut StoredColumn,
@@ -636,7 +636,10 @@ async fn bound_by(
                 }
             }
             ("pg_class", _) => column.unrepresented |= normal && id != table,
-            _ => {}
+            // An operator, type, collation or anything else a default
+            // depends on normally is bound by something the facts do not
+            // hold: dropping it would read as a smaller binding set.
+            _ => column.unrepresented |= normal,
         }
     }
     Ok(())
