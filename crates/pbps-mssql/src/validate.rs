@@ -387,6 +387,27 @@ pub const FIXED_ROLES: [&str; 10] = [
     "db_denydatawriter",
 ];
 
+/// An operator class on a key of an index, which SQL Server cannot honour:
+/// the emitter writes no class, so the declaration would differ from the
+/// database for good and every plan would rebuild the index (DEC-1169.1).
+/// One check for the indexes of a table and of an indexed view alike, so the
+/// two cannot disagree about what the emitter drops.
+fn operator_classes(what: &str, index: &pbps_model::Index) -> Vec<DialectError> {
+    index
+        .columns
+        .iter()
+        .filter_map(|key| {
+            let class = key.opclass.as_ref()?;
+            Some(invalid(format!(
+                "{what} indexes `{}` with `{class}`, and SQL Server has no operator classes \
+                 (if `{class}` was meant as a direction, it is `asc` or `desc`)",
+                pbps_model::escape::Escaped(key.key.text()),
+                class = pbps_model::escape::Escaped(class),
+            )))
+        })
+        .collect()
+}
+
 /// What an indexed view must satisfy before the engine is asked
 /// (DEC-2329.3), each measured on 17.0.4075.5: an index on a view that is not
 /// schema bound is refused (1939), the first must be unique and clustered
@@ -450,6 +471,10 @@ fn view_indexes(name: &str, module: &Module) -> Vec<DialectError> {
         if !index.method.is_btree() || !index.storage_parameters.is_empty() {
             say("sets a method or storage parameters, which are PostgreSQL's");
         }
+        errs.extend(operator_classes(
+            &format!("index `{shown}` on view `{name}`"),
+            index,
+        ));
     }
     errs
 }
@@ -1267,17 +1292,10 @@ pub(crate) fn table_sources(
                 n = n.shown(),
             )));
         }
-        for key in &idx.columns {
-            if let Some(class) = &key.opclass {
-                errs.push(invalid(format!(
-                    "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
-                     classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                    pbps_model::escape::Escaped(key.key.text()),
-                    n = n.shown(),
-                    class = pbps_model::escape::Escaped(class),
-                )));
-            }
-        }
+        errs.extend(operator_classes(
+            &format!("index `{n}`", n = n.shown()),
+            idx,
+        ));
         // The engine's rules for the clustered index, which is the table's
         // rows rather than a copy of some of them — so every column is in it
         // already and it covers every row. Measured on 17.0: `INCLUDE` is
@@ -3075,6 +3093,45 @@ mod tests {
         let mut function = a_module(ModuleKind::Function, "AS SELECT 1");
         function.options.indexes.insert("ux".into(), index(true));
         assert!(module_errors("dbo.f", &function).contains("schema-bound view"));
+    }
+
+    /// The emitter writes no operator class, so one on a view's index would
+    /// leave the declaration different from the database for good and rebuild
+    /// the view on every plan. Refused by name whichever way the loader reads
+    /// it, as a table's index is (DEC-1169.1).
+    #[test]
+    fn an_operator_class_on_an_indexed_views_index_is_refused_by_name() {
+        let view = |index: &str| {
+            let text = format!(
+                "view: dbo.v\nschemabinding: true\nclustered: ux\nindexes:\n  ux:\n    unique: true\n\
+                 {index}definition: SELECT id FROM dbo.t\n"
+            );
+            let loaded = pbps_load::load_module_str(std::path::Path::new("v.yml"), &text)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            module_errors("dbo.v", &loaded.module)
+        };
+        for (how, index) in [
+            ("columns", "    columns: [id int4_ops]\n"),
+            (
+                "keys",
+                "    keys:\n      - {column: id, opclass: int4_ops}\n",
+            ),
+        ] {
+            let e = view(index);
+            assert!(
+                e.contains("index `ux` on view `dbo.v` indexes `id` with `int4_ops`")
+                    && e.contains("no operator classes"),
+                "{how}: {e}"
+            );
+        }
+        // A plain index, in either spelling and with a direction, is accepted.
+        for index in [
+            "    columns: [id]\n",
+            "    columns: [id desc]\n",
+            "    keys:\n      - {column: id, order: desc}\n",
+        ] {
+            assert_eq!(view(index), "", "{index}");
+        }
     }
 
     /// An encrypted module cannot be read back, so every plan would re-state

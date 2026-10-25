@@ -2433,6 +2433,53 @@ mod tests {
         )
     }
 
+    /// Every field of an index the loader keeps is either written or refused
+    /// before a plan exists: one the emitter drops would leave the declaration
+    /// different from the database for good, and rebuild the view on every
+    /// plan. Each variant sets one field away from the plain index.
+    #[test]
+    fn no_field_of_an_indexed_views_index_is_dropped_silently() {
+        let (id, plain) = indexed_view();
+        // An error from the emitter is a refusal too, not a silent drop.
+        let restated = |module: &Module| -> Option<Vec<String>> {
+            super::view_indexes(&id, module)
+                .ok()
+                .map(|v| v.into_iter().map(|s| s.sql).collect())
+        };
+        let baseline = restated(&plain);
+        type Vary = fn(&mut pbps_model::Index);
+        let variants: [(&str, Vary); 8] = [
+            ("descending", |i| i.columns[0].descending = true),
+            ("included", |i| i.include.push("b".into())),
+            ("unique", |i| i.unique = !i.unique),
+            ("filter", |i| i.filter = Some("a > 0".into())),
+            ("opclass", |i| {
+                i.columns[0].opclass = Some("int4_ops".into());
+            }),
+            ("expression key", |i| {
+                i.columns[0].key = pbps_model::IndexKey::Expression("a + 1".into());
+            }),
+            ("method", |i| i.method = pbps_model::IndexMethod::Gin),
+            ("storage parameters", |i| {
+                i.storage_parameters
+                    .insert("fillfactor".into(), "70".into());
+            }),
+        ];
+        for (field, change) in variants {
+            let mut module = plain.clone();
+            change(
+                module
+                    .options
+                    .indexes
+                    .get_mut(&pbps_model::ObjectLocalName::from("ix_a_b"))
+                    .unwrap(),
+            );
+            let refused = !crate::validate::module(&id, &module).is_empty();
+            let written = restated(&module) != baseline;
+            assert!(refused || written, "{field} is neither written nor refused");
+        }
+    }
+
     /// `CREATE OR ALTER VIEW` drops every index the view has (measured on
     /// 17.0.4075.5), so the create and the alter both restate them, and the
     /// clustered one first: the engine refuses a nonclustered index on a view
