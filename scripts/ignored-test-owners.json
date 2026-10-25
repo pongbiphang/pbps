@@ -539,6 +539,7 @@
         "conversions2331::a_unique_key_added_beside_a_conversion_is_not_counted_over_the_stored_values",
         "conversions2331::a_value_the_target_type_refuses_is_refused_in_preflight_not_at_the_alter",
         "conversions2331::an_expression_is_bound_to_the_column_and_vetted_before_any_row_evaluates_it",
+        "conversions2331::an_expression_that_closes_its_statement_runs_nothing_and_is_refused_by_name",
         "conversions2331::not_null_beside_a_conversion_is_checked_on_the_converted_value",
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",

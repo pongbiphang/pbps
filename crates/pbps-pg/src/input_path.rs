@@ -897,11 +897,24 @@ async fn vet_in_transaction(
     let refuse = |why: &str| format!("the conversion `USING {using}` of {shown} {why}");
     // The write path the statement runs under is the session's own, set by the
     // apply's pins, so a name binds here as it will there.
+    //
+    // **One statement, by the protocol and not by reading the text** (round 3
+    // review). `execute` is a simple-protocol batch, and text such as
+    // `NULL) IS NULL) OR true)); COMMIT; SELECT f(); --` closes this statement
+    // and runs the rest before the vet has judged anything. `execute_with` goes
+    // through the extended protocol, where the server refuses a string of more
+    // than one command (SQLSTATE 42601, "cannot insert multiple commands into a
+    // prepared statement"), so the same text is refused as an expression that
+    // does not bind. No scanner for `;` or comments is written (DEC-1635.4):
+    // they are the expression's own to contain, in a string literal say.
     if let Err(e) = conn
-        .execute(&format!(
-            "CREATE TEMPORARY TABLE pg_temp.pbps_conversion ({column} {ty}, \
-             CONSTRAINT pbps_conversion CHECK ((({using}) IS NULL) OR true)) ON COMMIT DROP"
-        ))
+        .execute_with(
+            &format!(
+                "CREATE TEMPORARY TABLE pg_temp.pbps_conversion ({column} {ty}, \
+                 CONSTRAINT pbps_conversion CHECK ((({using}) IS NULL) OR true)) ON COMMIT DROP"
+            ),
+            &[],
+        )
         .await
     {
         let code = e
@@ -911,6 +924,54 @@ async fn vet_in_transaction(
             "does not bind against the column alone (SQLSTATE {code}): it may use only the \
              column itself, no other column, subquery or object the engine cannot resolve there"
         )));
+    }
+    // One statement can still be closed into more than one clause of the
+    // `CREATE TABLE`: `1) IS NULL) OR true), d integer DEFAULT (((1` adds a
+    // column. Nothing there is evaluated at creation (the table has no row, and
+    // a default, a check and a generated expression run on one), but the table
+    // is then not the one column and one check this vet reads the tree of, so
+    // it is refused here, before the tree is read, as an expression that is
+    // more than one.
+    let shape = conn
+        .query(
+            "SELECT
+               (SELECT count(*) FROM pg_catalog.pg_attribute a
+                 WHERE a.attrelid OPERATOR(pg_catalog.=) r.oid
+                   AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped)::pg_catalog.int4 AS columns,
+               (SELECT count(*) FROM pg_catalog.pg_constraint c
+                 WHERE c.conrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS constraints,
+               (SELECT count(*) FROM pg_catalog.pg_attrdef d
+                 WHERE d.adrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS defaults,
+               (SELECT count(*) FROM pg_catalog.pg_inherits i
+                 WHERE i.inhrelid OPERATOR(pg_catalog.=) r.oid
+                    OR i.inhparent OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS inherits,
+               (SELECT count(*) FROM pg_catalog.pg_index x
+                 WHERE x.indrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS indexes,
+               (r.relkind OPERATOR(pg_catalog.=) 'r'
+                 AND r.relpersistence OPERATOR(pg_catalog.=) 't')::pg_catalog.int4 AS plain
+               FROM pg_catalog.pg_class r
+              WHERE r.oid OPERATOR(pg_catalog.=) 'pg_temp.pbps_conversion'::pg_catalog.regclass",
+        )
+        .await
+        .map_err(|_| refuse("could not be vetted: the table it was bound in could not be read"))?;
+    let counts: Option<Vec<i32>> = shape.first().and_then(|row| {
+        [
+            "columns",
+            "constraints",
+            "defaults",
+            "inherits",
+            "indexes",
+            "plain",
+        ]
+        .iter()
+        .map(|name| row.try_get::<i32>(name).ok().flatten())
+        .collect()
+    });
+    if counts.as_deref() != Some(&[1, 1, 0, 0, 0, 1]) {
+        return Err(refuse(
+            "is more than one expression: it closes the check it is bound in and adds to the \
+             statement, and it may be the one expression and nothing else",
+        ));
     }
     let rows = conn
         .query(
