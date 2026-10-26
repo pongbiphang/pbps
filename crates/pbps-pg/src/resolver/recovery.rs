@@ -177,6 +177,11 @@ pub struct Claim {
     pub defaults: BTreeSet<(String, String)>,
     /// The database's ACL as the run found it.
     pub acl: BTreeSet<Entry>,
+    /// The cluster-wide roles the run made, recorded before it makes them:
+    /// they are not in the database, so emptying it does not reach them
+    /// (#2379). Left out when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
 }
 
 impl Claim {
@@ -186,6 +191,7 @@ impl Claim {
             token: token.to_owned(),
             defaults,
             acl,
+            roles: Vec::new(),
         }
     }
 }
@@ -246,6 +252,31 @@ pub async fn rebase(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
     set_comment(conn, &json).await
 }
 
+/// Adds the roles the run is about to create to its claim, so that a release,
+/// or the run that finds the claim dead, drops them too. The schema stays.
+pub async fn record_roles(
+    conn: &mut impl ExecuteConnection,
+    roles: &[String],
+) -> Result<(), DbError> {
+    transaction(conn, async |conn| {
+        let Some(Ok(mut claim)) = read_claim(conn).await? else {
+            return Err(DbError::BadRow(
+                "the run's claim is not in its scratch database".into(),
+            ));
+        };
+        for role in roles {
+            if !claim.roles.contains(role) {
+                claim.roles.push(role.clone());
+            }
+        }
+        let json =
+            serde_json::to_string(&claim).map_err(|error| DbError::BadRow(error.to_string()))?;
+        conn.execute("SET LOCAL ROLE NONE").await?;
+        set_comment(conn, &json).await
+    })
+    .await
+}
+
 /// Removes the claim: the last step of a release.
 pub async fn remove(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
     conn.execute(&format!("DROP SCHEMA IF EXISTS {CLAIM}"))
@@ -303,6 +334,23 @@ mod tests {
         ] {
             assert_eq!(token_of(&name), t);
         }
+    }
+
+    /// A rehearsal's roles are the cluster's, so the claim names them for the
+    /// release and for the run that finds the claim dead; a claim without any
+    /// is the claim it always was, on the wire and when read.
+    #[test]
+    fn a_claim_names_the_roles_a_rehearsal_made_and_omits_none() {
+        let t = "0123456789abcdef0123456789abcdef";
+        let mut claim = Claim::new(t, BTreeSet::new(), BTreeSet::new());
+        let plain = serde_json::to_value(&claim).unwrap();
+        assert!(plain.get("roles").is_none(), "{plain}");
+        claim.roles.push(format!("pbps_rehearsal_0_{t}"));
+        let named = serde_json::to_string(&claim).unwrap();
+        assert_eq!(serde_json::from_str::<Claim>(&named).unwrap(), claim);
+        // Negative: what an earlier version wrote still reads, with no roles.
+        let earlier = serde_json::from_value::<Claim>(plain).unwrap();
+        assert!(earlier.roles.is_empty());
     }
 
     #[test]

@@ -151,6 +151,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 resolve_with: None,
                 fingerprint_key_env: None,
                 fingerprint_key_file: None,
+                rehearse: None,
             },
         );
     }
@@ -700,6 +701,7 @@ mod tests {
                 resolve_with: None,
                 fingerprint_key_env: None,
                 fingerprint_key_file: None,
+                rehearse: None,
             },
         );
         let config = Config {

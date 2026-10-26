@@ -11,6 +11,7 @@
 //!    ordinary connected checks and a fresh recheck of the target
 //!    (DEC-1516.1).
 
+use pbps_cli::resolver::server::ProduceError;
 use pbps_config::resolver::ResolverSelection;
 use pbps_diff::resolver::{Answer, Assessment};
 
@@ -278,8 +279,9 @@ pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::
 ///
 /// The answer comes back unsealed: the caller runs its ordinary passes on
 /// it, rechecks the target, then seals it (#1516).
-pub async fn resolve(
+pub(crate) async fn resolve(
     request: &Request<'_>,
+    entry: &mut Entry<'_>,
 ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
     let driver = request.target.driver();
     if let Err(missing) =
@@ -307,7 +309,7 @@ pub async fn resolve(
                 .context("the declarations' bootstrap cannot be formed"),
         )
     })?;
-    producer::produce(request, driver, &bootstrap).await
+    producer::produce(request, driver, &bootstrap, entry).await
 }
 
 /// A resolver's externals file, read only from under the project root.
@@ -341,35 +343,53 @@ pub(crate) fn read_externals(
     std::fs::read_to_string(&file).map_err(unreadable)
 }
 
-/// The resolver's producer: a scratch run on a supplied server or a Docker
-/// container, bound to the target by the cluster identity the planning read
-/// recorded (DEC-1685.1). It reaches its scratch with SQL alone, so it runs
-/// on every platform pbps supports (#1636).
-mod producer {
-    use super::{Refused, Request, unresolved};
-    use pbps_cli::resolver::server::{Error, ProduceError};
+/// The scratch entry a connected plan selected, acquired at most once per run
+/// (#2379). A `kind: docker` entry is one container the resolver and the
+/// rehearsal share; a `kind: server` entry is the server they both name.
+/// Each use creates and releases its own scratch database there, so one
+/// finishes before the next begins.
+pub(crate) struct Entry<'a> {
+    selection: &'a ResolverSelection,
+    project: &'a pbps_config::Project,
+    target: &'a crate::db::Target,
+    held: Option<pbps_cli::resolver::server::scratch::container::Held>,
+}
 
-    pub(super) async fn produce(
-        request: &Request<'_>,
-        driver: pbps_db::Driver,
-        bootstrap: &pbps_diff::order::DiffPlan,
-    ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
-        let binding = pbps_cli::resolver::server::BindingRequest {
-            dependencies: request.dependencies,
-            bootstrap,
-            desired: request.desired.schema,
-            base: request.base.schema,
-        };
-        // Both kinds are the one resolver (DEC-1528.1): a
-        // supplied server, or a container started for the run (#1674).
+/// What a use of the entry runs against.
+pub(crate) struct Open {
+    pub connection: String,
+    pub standard: pbps_cli::resolver::server::scratch::Standard,
+    pub provenance: pbps_cli::resolver::server::scratch::Provenance,
+    pub externals: Option<String>,
+}
+
+impl<'a> Entry<'a> {
+    pub fn new(
+        selection: &'a ResolverSelection,
+        project: &'a pbps_config::Project,
+        target: &'a crate::db::Target,
+    ) -> Self {
+        Self {
+            selection,
+            project,
+            target,
+            held: None,
+        }
+    }
+
+    pub fn selection(&self) -> &ResolverSelection {
+        self.selection
+    }
+
+    /// The entry's scratch, acquired on the first use. A container is bound
+    /// to the target's cluster identity before it is started, so a target
+    /// connection that reaches another cluster than the planning read
+    /// refuses with nothing started.
+    pub async fn open(&mut self, driver: pbps_db::Driver, identity: &str) -> Result<Open, Refused> {
         use pbps_cli::resolver::server::scratch::{self, Provenance};
         use pbps_config::resolver::ResolverProfile;
-        let Some(identity) = request.target_identity else {
-            return Err(Refused::Unanswerable(anyhow::anyhow!(
-                "the planning read recorded no cluster identity for the resolver to bind"
-            )));
-        };
-        let (externals, outside_writes) = match &request.selection.profile {
+        let unanswerable = |error: ProduceError| Refused::Unanswerable(error.into());
+        let (externals, outside_writes) = match &self.selection.profile {
             ResolverProfile::Server {
                 externals,
                 outside_writes,
@@ -384,10 +404,10 @@ mod producer {
         let externals = externals
             .as_ref()
             .map(|path| {
-                super::read_externals(request.project.root(), path).map_err(|why| {
+                read_externals(self.project.root(), path).map_err(|why| {
                     Refused::Unanswerable(anyhow::anyhow!(
                         "the resolver `{}` names the externals file {}, which {why}",
-                        request.selection.name,
+                        self.selection.name,
                         path.display()
                     ))
                 })
@@ -401,75 +421,120 @@ mod producer {
                 pbps_model::resolver::OutsideWrites::Allowed
             }
         };
-        let same_instance = same_instance(driver, &request.selection.profile);
-        let run = async |scratch: &str, standard: &scratch::Standard, provenance: Provenance| {
-            scratch::produce_unsealed(
-                driver,
-                scratch,
-                request.target.connection(),
-                identity,
-                &binding,
-                request.base,
-                request.desired,
-                request.hints,
-                // The CLI's PostgreSQL dialect configures no write-path
-                // extras (`dialect_for`), so the plan it diffed has none.
-                &[],
-                request.project,
-                request.target.environment(),
-                standard,
-                externals.as_deref(),
-                &provenance,
-            )
-            .await
-        };
-        let produced = match &request.selection.profile {
+        let same_instance = producer::same_instance(driver, &self.selection.profile);
+        let entry = self.selection.name.to_owned();
+        match &self.selection.profile {
             ResolverProfile::Server {
                 url_env, standard, ..
-            } => {
-                let scratch = scratch_connection(request, url_env)?;
-                let provenance = Provenance {
-                    entry: request.selection.name.to_owned(),
+            } => Ok(Open {
+                connection: producer::scratch_connection(
+                    self.project,
+                    self.target,
+                    &self.selection.name,
+                    url_env,
+                )?,
+                standard: scratch::declared_standard(driver, standard.as_ref())
+                    .map_err(|error| Refused::Unanswerable(error.into()))?,
+                provenance: Provenance {
+                    entry,
                     scratch: pbps_model::resolver::ScratchSource::Server {},
                     outside_writes,
                     same_instance,
-                };
-                run(
-                    &scratch,
-                    &scratch::declared_standard(driver, standard.as_ref())
-                        .map_err(|error| refused(request, ProduceError::Run(error)))?,
-                    provenance,
-                )
-                .await
-            }
+                },
+                externals,
+            }),
             ResolverProfile::Docker { image, pull, .. } => {
-                let provenance = Provenance {
-                    entry: request.selection.name.to_owned(),
-                    scratch: pbps_model::resolver::ScratchSource::Docker {
-                        image: image.as_str().into(),
-                    },
-                    outside_writes,
-                    same_instance,
-                };
-                scratch::container::with_container(
-                    driver,
-                    request.target.connection(),
-                    identity,
-                    image,
-                    *pull,
-                    async |scratch: &str| {
-                        run(
-                            scratch,
-                            &scratch::declared_standard(driver, None).map_err(ProduceError::Run)?,
-                            provenance,
-                        )
+                if self.held.is_none() {
+                    scratch::container::bind_target(driver, self.target.connection(), identity)
                         .await
+                        .map_err(unanswerable)?;
+                    self.held = Some(
+                        scratch::container::Held::start(driver, image, *pull)
+                            .await
+                            .map_err(unanswerable)?,
+                    );
+                }
+                let held = self.held.as_ref().expect("the container was just held");
+                Ok(Open {
+                    connection: held.connection().to_owned(),
+                    standard: scratch::declared_standard(driver, None)
+                        .map_err(|error| Refused::Unanswerable(error.into()))?,
+                    provenance: Provenance {
+                        entry,
+                        scratch: pbps_model::resolver::ScratchSource::Docker {
+                            image: image.as_str().into(),
+                        },
+                        outside_writes,
+                        same_instance,
                     },
-                )
-                .await
+                    externals,
+                })
             }
+        }
+    }
+
+    /// Removes the container, if one was started, and confirms it gone. Any
+    /// other way out of the plan leaves it to the container's drop guard.
+    pub async fn finish(&mut self) -> Result<(), Refused> {
+        match self.held.take() {
+            Some(held) => held
+                .remove()
+                .await
+                .map_err(|error| Refused::Unanswerable(error.into())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The resolver's producer: a scratch run on a supplied server or a Docker
+/// container, bound to the target by the cluster identity the planning read
+/// recorded (DEC-1685.1). It reaches its scratch with SQL alone, so it runs
+/// on every platform pbps supports (#1636).
+mod producer {
+    use super::{Entry, Refused, Request, unresolved};
+    use pbps_cli::resolver::server::{Error, ProduceError};
+
+    pub(super) async fn produce(
+        request: &Request<'_>,
+        driver: pbps_db::Driver,
+        bootstrap: &pbps_diff::order::DiffPlan,
+        entry: &mut Entry<'_>,
+    ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
+        let binding = pbps_cli::resolver::server::BindingRequest {
+            dependencies: request.dependencies,
+            bootstrap,
+            desired: request.desired.schema,
+            base: request.base.schema,
         };
-        produced.map_err(|failure| refused(request, failure))
+        // Both kinds are the one resolver (DEC-1528.1): a
+        // supplied server, or a container started for the run (#1674).
+        use pbps_cli::resolver::server::scratch;
+        let Some(identity) = request.target_identity else {
+            return Err(Refused::Unanswerable(anyhow::anyhow!(
+                "the planning read recorded no cluster identity for the resolver to bind"
+            )));
+        };
+        let open = entry.open(driver, identity).await?;
+        scratch::produce_unsealed(
+            driver,
+            &open.connection,
+            request.target.connection(),
+            identity,
+            &binding,
+            request.base,
+            request.desired,
+            request.hints,
+            // The CLI's PostgreSQL dialect configures no write-path
+            // extras (`dialect_for`), so the plan it diffed has none.
+            &[],
+            request.project,
+            request.target.environment(),
+            &open.standard,
+            open.externals.as_deref(),
+            &open.provenance,
+        )
+        .await
+        .map_err(|failure| refused(request, failure))
     }
 
     /// Omission never grants consent; inapplicability stays distinct from refusal.
@@ -512,26 +577,28 @@ mod producer {
     /// The scratch server's connection string, from the variable the
     /// resolver names. Never the target's own variable: one string would
     /// then be both, and nothing after this could tell them apart by name.
-    fn scratch_connection(request: &Request<'_>, url_env: &str) -> Result<String, Refused> {
-        let target_env = request.target.environment().and_then(|name| {
-            request
-                .project
+    pub(super) fn scratch_connection(
+        project: &pbps_config::Project,
+        target: &crate::db::Target,
+        name: &str,
+        url_env: &str,
+    ) -> Result<String, Refused> {
+        let target_env = target.environment().and_then(|environment| {
+            project
                 .config
                 .environments
-                .get(name)
+                .get(environment)
                 .map(|environment| environment.url_env.as_str())
         });
         if target_env == Some(url_env) {
             return Err(Refused::Unanswerable(anyhow::anyhow!(
-                "the resolver `{}` names the target's own connection variable {url_env}; \
-                 a scratch server needs its own",
-                request.selection.name
+                "the resolver `{name}` names the target's own connection variable {url_env}; \
+                 a scratch server needs its own"
             )));
         }
         std::env::var(url_env).map_err(|_| {
             Refused::Unanswerable(anyhow::anyhow!(
-                "the resolver `{}` reads its scratch server from {url_env}, which is not set",
-                request.selection.name
+                "the resolver `{name}` reads its scratch server from {url_env}, which is not set"
             ))
         })
     }
@@ -951,6 +1018,7 @@ mod tests {
                 &pbps_model::Hints::default(),
             )
             .unwrap(),
+            &mut Entry::new(&selection, &project, &target),
         )) {
             Err(Refused::Unanswerable(error)) => error.to_string(),
             Err(Refused::Finding(finding)) => panic!("not answered: {}", finding.id),
@@ -1010,7 +1078,10 @@ mod tests {
                 hints: &hints,
                 target_identity: None,
             };
-            match rt.block_on(resolve(&request)) {
+            match rt.block_on(resolve(
+                &request,
+                &mut Entry::new(&selection, &project, &target),
+            )) {
                 Err(Refused::Finding(finding)) => finding,
                 Err(Refused::Unanswerable(error)) => panic!("unanswerable: {error}"),
                 Ok(_) => panic!("answered"),

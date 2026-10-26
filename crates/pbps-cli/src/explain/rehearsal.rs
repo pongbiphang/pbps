@@ -1,7 +1,7 @@
 //! What `explain` shows of a plan's sealed rehearsal record (#2379).
 
 use pbps_model::resolver::{ScratchLayout, ScratchSource};
-use pbps_model::{Rehearsal, Text};
+use pbps_model::{AuthorizationRehearsal, Rehearsal, Text};
 
 /// The sealed rehearsal record, flattened for `--format json`.
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -26,6 +26,13 @@ pub struct RehearsalDetail {
     /// Differences that are only the engine's own spelling, as it stored them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spelling: Vec<Text>,
+    /// `rehearsed`: the plan's role, grant and row-security policy changes ran
+    /// on roles made for the run. `not-rehearsed`: they did not, and
+    /// `authorization_reason` says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_reason: Option<Text>,
 }
 
 pub fn detail(record: &Rehearsal) -> RehearsalDetail {
@@ -37,12 +44,15 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
             image: None,
             layout: None,
             spelling: Vec::new(),
+            authorization: None,
+            authorization_reason: None,
         },
         Rehearsal::Converged {
             entry,
             scratch,
             layout,
             spelling,
+            authorization,
         } => {
             let (scratch, image) = match scratch {
                 ScratchSource::Server {} => ("server", None),
@@ -58,6 +68,14 @@ pub fn detail(record: &Rehearsal) -> RehearsalDetail {
                     ScratchLayout::Supplied => "supplied",
                 }),
                 spelling: spelling.clone(),
+                authorization: Some(match authorization {
+                    AuthorizationRehearsal::Rehearsed => "rehearsed",
+                    AuthorizationRehearsal::NotRehearsed { .. } => "not-rehearsed",
+                }),
+                authorization_reason: match authorization {
+                    AuthorizationRehearsal::Rehearsed => None,
+                    AuthorizationRehearsal::NotRehearsed { reason } => Some(reason.clone()),
+                },
             }
         }
     }
@@ -84,21 +102,33 @@ pub fn line(detail: &RehearsalDetail) -> String {
         1 => out.push_str("; 1 spelling difference"),
         n => out.push_str(&format!("; {n} spelling differences")),
     }
+    // Never left to be read as a full rehearsal.
+    if detail.authorization_reason.is_some() {
+        out.push_str("; authorization NOT rehearsed");
+    }
     out
 }
 
 /// The spellings, after the plan's summary: they are what the engine stored,
 /// which no offline normalization can produce.
 pub fn render(detail: &RehearsalDetail) -> String {
-    if detail.spelling.is_empty() {
+    if detail.spelling.is_empty() && detail.authorization_reason.is_none() {
         return String::new();
     }
     let mut out = String::from("\nRehearsal\n");
-    out.push_str(
-        "  These differ only in how the engine spells them. The plan converged on them:\n",
-    );
-    for spelling in &detail.spelling {
-        out.push_str(&format!("    {}\n", spelling.shown()));
+    if let Some(reason) = &detail.authorization_reason {
+        out.push_str(&format!(
+            "  Authorization was NOT rehearsed: {}\n",
+            reason.shown()
+        ));
+    }
+    if !detail.spelling.is_empty() {
+        out.push_str(
+            "  These differ only in how the engine spells them. The plan converged on them:\n",
+        );
+        for spelling in &detail.spelling {
+            out.push_str(&format!("    {}\n", spelling.shown()));
+        }
     }
     out
 }

@@ -572,15 +572,26 @@ fn successful(output: Output) -> Output {
 }
 
 /// A login confined to a database it owns on `server`, dropped with it.
-struct Confined {
+pub struct Confined {
     server: String,
     login: String,
     database: String,
-    connection: String,
+    pub connection: String,
 }
 
 impl Confined {
-    fn new(server: &str) -> Self {
+    pub fn new(server: &str) -> Self {
+        Self::with(server, "NOCREATEROLE")
+    }
+
+    /// An account that may create roles, which the confinement the target's
+    /// own cluster requires would refuse: a scratch on a cluster of its own
+    /// is held to no such rule (#2379).
+    pub fn creating_roles(server: &str) -> Self {
+        Self::with(server, "CREATEROLE")
+    }
+
+    fn with(server: &str, role_attribute: &str) -> Self {
         let token = format!("{}_{:08x}", std::process::id(), rand::random::<u32>());
         let login = format!("pbps_cli_s1516_{token}");
         let database = format!("pbps_cli_s1516_{token}");
@@ -589,7 +600,7 @@ impl Confined {
             server,
             &format!(
                 "CREATE ROLE {login} LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB \
-                 NOCREATEROLE; GRANT pg_read_all_settings TO {login}"
+                 {role_attribute}; GRANT pg_read_all_settings TO {login}"
             ),
         );
         on_server(

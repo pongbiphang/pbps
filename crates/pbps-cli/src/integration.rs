@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 62;
+pub const SCHEMA_VERSION: u32 = 63;
+// 63: an environment's `rehearse:` and a connected plan's `rehearsal` (#2379).
 // 62: a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).
 // 61: `explain`'s `rehearsal`, a plan's sealed rehearsal record (#2379).
 // 60: preview rehearsal selects a shared scratch entry (#587).
@@ -330,6 +331,39 @@ pub fn cmd_man(dir: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rehearse:` is a boolean per environment, and the schema and the
+    /// loader agree on it (#2379).
+    #[test]
+    fn an_environments_rehearse_switch_is_a_boolean_in_schema_and_loader() {
+        let document = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        let config = |value: serde_json::Value| {
+            serde_json::json!({
+                "dialect": "postgres",
+                "environments": {"prod": {"url_env": "P", "rehearse": value}},
+            })
+        };
+        let parsed = |config: &serde_json::Value| {
+            pbps_config::Config::parse(&config.to_string(), std::path::Path::new("pbps.yml"))
+        };
+        for (value, expected) in [(false, Some(false)), (true, Some(true))] {
+            let config = config(serde_json::json!(value));
+            assert!(validator.is_valid(&config), "{config}");
+            let loaded = parsed(&config).unwrap();
+            assert_eq!(loaded.environments["prod"].rehearse, expected);
+        }
+        // Negative: a number is no switch, for the schema an editor reads.
+        let number = config(serde_json::json!(0));
+        assert!(!validator.is_valid(&number), "{number}");
+        // And an environment that says nothing leaves the default on.
+        let silent = serde_json::json!({
+            "dialect": "postgres",
+            "environments": {"prod": {"url_env": "P"}},
+        });
+        assert!(validator.is_valid(&silent));
+        assert_eq!(parsed(&silent).unwrap().environments["prod"].rehearse, None);
+    }
 
     #[test]
     fn dev_schema_permits_one_shared_or_anonymous_source() {

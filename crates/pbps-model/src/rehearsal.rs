@@ -40,19 +40,49 @@ pub enum Rehearsal {
         /// lost with the terminal scrollback.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spelling: Vec<crate::Text>,
+        /// Whether the roles, grants and row-security policies were part of
+        /// what ran. A record that skipped them must never read as a full
+        /// rehearsal, so the field is required: a record without it is
+        /// refused, not read as either answer.
+        authorization: AuthorizationRehearsal,
     },
     /// The operator turned the rehearsal off for this run or environment.
     /// Never read as "rehearsed".
     Off,
 }
 
+/// Whether a converged rehearsal ran the plan's changes to roles, grants and
+/// row-security policies (#2379).
+///
+/// Externally tagged, as [`Rehearsal`] is.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizationRehearsal {
+    /// They ran, on roles made for the run in place of the target's, and were
+    /// compared like everything else.
+    Rehearsed,
+    /// They did not, and the plan was rehearsed without them. The scratch
+    /// account could not create the roles the run maps them to.
+    NotRehearsed { reason: crate::Text },
+}
+
 impl Rehearsal {
-    /// A record naming no entry or no image says nothing about what ran.
+    /// A record naming no entry or no image says nothing about what ran, and
+    /// one that skipped authorization without saying why says nothing about it.
     pub fn is_complete(&self) -> bool {
         match self {
-            Rehearsal::Converged { entry, scratch, .. } => {
+            Rehearsal::Converged {
+                entry,
+                scratch,
+                authorization,
+                ..
+            } => {
                 !entry.raw().is_empty()
                     && !matches!(scratch, ScratchSource::Docker { image } if image.raw().is_empty())
+                    && !matches!(
+                        authorization,
+                        AuthorizationRehearsal::NotRehearsed { reason } if reason.raw().is_empty()
+                    )
             }
             Rehearsal::Off => true,
         }
@@ -72,12 +102,30 @@ mod tests {
             },
             layout: ScratchLayout::RunOwned,
             spelling: spelling.iter().map(|s| (*s).into()).collect(),
+            authorization: AuthorizationRehearsal::Rehearsed,
+        }
+    }
+
+    fn unrehearsed(reason: &str) -> Rehearsal {
+        Rehearsal::Converged {
+            entry: "ci".into(),
+            scratch: ScratchSource::Server {},
+            layout: ScratchLayout::Supplied,
+            spelling: Vec::new(),
+            authorization: AuthorizationRehearsal::NotRehearsed {
+                reason: reason.into(),
+            },
         }
     }
 
     #[test]
     fn a_record_round_trips_and_omits_empty_spelling() {
-        for record in [converged(&[]), converged(&["check c on t"]), Rehearsal::Off] {
+        for record in [
+            converged(&[]),
+            converged(&["check c on t"]),
+            unrehearsed("the scratch account lacks CREATEROLE"),
+            Rehearsal::Off,
+        ] {
             let json = serde_json::to_value(&record).unwrap();
             assert_eq!(serde_json::from_value::<Rehearsal>(json).unwrap(), record);
         }
@@ -87,7 +135,12 @@ mod tests {
                 "entry": "ci",
                 "scratch": {"kind": "docker", "image": "postgres:18"},
                 "layout": "run-owned",
+                "authorization": "rehearsed",
             }})
+        );
+        assert_eq!(
+            serde_json::to_value(unrehearsed("no CREATEROLE")).unwrap()["converged"]["authorization"],
+            json!({"not_rehearsed": {"reason": "no CREATEROLE"}})
         );
         assert_eq!(serde_json::to_value(Rehearsal::Off).unwrap(), json!("off"));
     }
@@ -98,6 +151,7 @@ mod tests {
             "entry": "ci",
             "scratch": {"kind": "server"},
             "layout": "supplied",
+            "authorization": "rehearsed",
         }});
         assert!(serde_json::from_value::<Rehearsal>(ok.clone()).is_ok());
         let mut no_entry = ok.clone();
@@ -107,6 +161,15 @@ mod tests {
             .remove("entry");
         let mut extra = ok.clone();
         extra["converged"]["verified"] = true.into();
+        // Neither answer may be assumed: a record that does not say whether
+        // authorization ran is refused, not read as rehearsed.
+        let mut silent = ok.clone();
+        silent["converged"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorization");
+        let mut unreasoned = ok.clone();
+        unreasoned["converged"]["authorization"] = json!({"not_rehearsed": {}});
         for (bad, why) in [
             (json!("failed"), "an unknown outcome"),
             (json!({"failed": {}}), "an unknown outcome with a body"),
@@ -114,6 +177,8 @@ mod tests {
             (json!("converged"), "Converged with no fields"),
             (no_entry, "Converged with no entry"),
             (extra, "an unknown key inside the record"),
+            (silent, "a record that does not say about authorization"),
+            (unreasoned, "authorization skipped with no reason field"),
             (
                 json!({"converged": ok["converged"], "off": null}),
                 "two outcomes",
@@ -175,7 +240,7 @@ mod tests {
         let sealed = plan_with(Some(converged(&["check c on t"])));
         let fingerprint = sealed.wire_fingerprint();
         let original = serde_json::to_value(&sealed).unwrap();
-        let edits: [(&str, Edit); 5] = [
+        let edits: [(&str, Edit); 6] = [
             ("dropped", |v| {
                 v.as_object_mut().unwrap().remove("rehearsal");
             }),
@@ -192,6 +257,10 @@ mod tests {
             ("entry edited", |v| {
                 v["rehearsal"]["converged"]["entry"] = "other".into()
             }),
+            ("authorization edited", |v| {
+                v["rehearsal"]["converged"]["authorization"] =
+                    json!({"not_rehearsed": {"reason": "x"}})
+            }),
         ];
         for (what, edit) in edits {
             let mut edited = original.clone();
@@ -206,9 +275,10 @@ mod tests {
         let original = serde_json::to_value(plan_with(Some(Rehearsal::Off))).unwrap();
         for bad in [
             json!("failed"),
-            json!({"converged": {"scratch": {"kind": "server"}, "layout": "supplied"}}),
+            json!({"converged": {"scratch": {"kind": "server"}, "layout": "supplied",
+                "authorization": "rehearsed"}}),
             json!({"converged": {"entry": "ci", "scratch": {"kind": "server"},
-                "layout": "supplied", "verified": true}}),
+                "layout": "supplied", "authorization": "rehearsed", "verified": true}}),
         ] {
             let mut json = original.clone();
             json["rehearsal"] = bad.clone();
@@ -228,17 +298,22 @@ mod tests {
             scratch: ScratchSource::Server {},
             layout: ScratchLayout::Supplied,
             spelling: Vec::new(),
+            authorization: AuthorizationRehearsal::Rehearsed,
         };
         let imageless = Rehearsal::Converged {
             entry: "ci".into(),
             scratch: ScratchSource::Docker { image: "".into() },
             layout: ScratchLayout::RunOwned,
             spelling: Vec::new(),
+            authorization: AuthorizationRehearsal::Rehearsed,
         };
+        let unexplained = unrehearsed("");
         assert!(!nameless.is_complete());
         assert!(!imageless.is_complete());
+        assert!(!unexplained.is_complete());
+        assert!(unrehearsed("no CREATEROLE").is_complete());
         // The plan reader refuses what the record alone would accept.
-        for record in [nameless, imageless] {
+        for record in [nameless, imageless, unexplained] {
             assert_eq!(
                 plan_with(Some(record)).validate_analysis(),
                 Err(crate::resolver::EvidenceError::Incomplete)

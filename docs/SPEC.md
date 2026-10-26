@@ -2143,7 +2143,7 @@ states that separation from production is operator-vouched. A shared entry's
 `externals` file is staged before the baseline, with no comparison to any target;
 the report states both facts. There is no target capture, compatibility verdict
 or resolver evidence. `--dev` remains refused with `--db`, `--env` and `--check`.
-Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing.
+Ordinary offline `plan`, `--check` and `--no-dev` acquire nothing. Nor does `apply`.
 
 The container is used three ways, all on the preview side:
 
@@ -2166,12 +2166,108 @@ needed to silence it.
 The rehearsal core takes its base state as an input (#2379). The git baseline
 is the only base today, and it is never sealed. A plan file may carry an
 optional `rehearsal` record, covered by the plan checksum and omitted when
-absent: `converged` names the resolver entry, the scratch kind and layout, and
-the spelling differences the rehearsal accepted, and `off` says the operator
-turned the rehearsal off. `explain` prints it and `apply` only displays it.
+absent: `converged` names the resolver entry, the scratch kind and layout, the
+spelling differences the rehearsal accepted and whether authorization was
+rehearsed (`rehearsed`, or `not_rehearsed` with a reason), and `off` says the
+operator turned the rehearsal off. `explain` prints it and `apply` only displays it.
 Absence means the rehearsal was never asked for; it is not read as `off`, and
 neither is read as rehearsed unless the record says `converged`. A failed
 rehearsal writes no plan, so no record names one (DEC-2379.1).
+
+#### The connected rehearsal (PostgreSQL)
+
+With a scratch entry selected (`resolve_with`, on the project or the
+environment, or `--resolve-with`), `plan --db/--env` rehearses every plan it is
+about to write, whether or not the resolver was needed (#2379, DEC-2379.2):
+
+1. The target's current managed model, with its declared rows, is lowered from
+   empty by the emitter, as `bootstrap` lowers it, and created on the scratch.
+   The roles the plan, that base or the declarations name are named as the
+   scratch's placement decides (below), so the roles' grants and the
+   row-security policies are part of what is created.
+2. The plan's statements run in order, as `apply` runs them: the dialect's
+   session pins and the target's time zone, in one transaction unless the plan
+   is staged.
+3. The scratch is read back and compared with the declarations by the ordinary
+   differ. A statement the engine rejects, or a structural difference, refuses
+   the plan: no file is written, and the message names the statement or the
+   difference. A difference that is only how the engine spells a check, a
+   default, an index predicate or a module body is sealed in the plan's
+   `rehearsal` record and printed with the form the engine stored.
+
+The scratch is the entry's, acquired through the resolver's layers: separation
+from the target, the layout the account decides (a fresh database, or the
+supplied database after the resolver's owned cleanup, found empty again),
+externals staged and compared with the target, and owned cleanup. A `docker`
+entry is one container for the resolver and the rehearsal together. The
+rehearsal needs no fingerprint key and reaches no compatibility verdict: it
+validates syntax and convergence on the scratch's build, never that build's
+behaviour.
+
+**Roles.** A role is a cluster object, so what its name means depends on whose
+cluster the scratch is. One naming for each placement (#2432):
+
+- **On the target's own cluster** (the confined account of §9.3.2) the roles are
+  the target's, they are there, and the planner has refused any it lacks. The
+  rehearsal uses their real names, makes and records nothing, and does not ask
+  the account for `CREATEROLE`, which that layout forbids it. The grants,
+  default privileges and policies are in the scratch database, so emptying it
+  takes them.
+- **In a container**, a cluster of the run's own, the real names are made,
+  but only those the cluster lacks: the bootstrap superuser, the engine's `pg_*`
+  roles and a role the externals file made are not the run's. What the run makes
+  goes with the container.
+- **On any other cluster** (a run-owned scratch on a server, or an account on
+  another cluster) other runs and other tenants' roles live there, so the
+  target's names are never used: each role the plan, the base it builds or the
+  declarations name is mapped to a role the run creates
+  (`pbps_rehearsal_<n>_<token>`, `NOLOGIN`, no attribute; the engine's own
+  `pg_*` roles keep their names). The scratch account needs `CREATEROLE` there.
+
+One lowering and one comparison serve all three, with the names the placement
+gives: the plan's role, grant and row-security policy changes are lowered again
+from the model, run, and compared with the declarations under the same names
+like every other change; nothing is rewritten in text. A name inside a policy's
+`USING` is an expression and runs as written, which cannot fail a valid plan: a
+table with policies cannot declare rows, so nothing is read back through a
+policy. A role the plan names and the target no longer has is refused before a
+scratch is started, in the planner's words. The mapped roles are recorded before
+they are made, in what the release drops and, in a supplied database, in the
+run's claim (§9.3.2), so the release, or the next run that finds the run gone,
+drops them; a role that cannot be dropped is named.
+
+It is on by default. `rehearse: false` under an environment and
+`plan --no-rehearse` turn it off, and the plan is sealed `off`, never as
+rehearsed. With no entry selected the plan carries no record. `apply` only
+displays the record and never acquires a scratch. SQL Server keeps its present
+behaviour until it has a connected rehearsal.
+
+What it does not reproduce, stated rather than implied:
+
+- **Rows and data-dependent failures.** The scratch holds the managed schema
+  and the declared rows only, so a CHECK or UNIQUE added over rows the
+  declarations do not list, or a conversion of existing data, is not tried
+  (#1165's fixtures are that territory).
+- **Authorization, on a cluster others use without `CREATEROLE`.** Only an
+  account on another cluster that cannot make the run's roles: the plan's role,
+  grant and row-security policy changes are neither run nor compared, because a
+  grant or a policy naming a role the scratch lacks would fail a plan for a reason
+  that says nothing about it. The record says `not_rehearsed`, with the reason,
+  and `plan` (human and JSON), `explain` and `apply` print it beside the rest, so
+  a rehearsal that left a class out is never read as a full one. A project that
+  names no role has nothing to leave out. The confined account on the target's own
+  cluster is not in this case.
+- **A role name inside an expression.** On a cluster others use, a policy's
+  `USING` that compares with a role's name as a literal runs with the literal as
+  written, not as mapped.
+- **The engine's edition and build.** As above, a scratch validates syntax and
+  convergence; it is not qualified against the target.
+- **Declarations the resolver's externals fill cannot answer for.** A fill that
+  reads managed relations is refused with the switch named. A declared type is
+  not among them: it is created with the base and compared, and the fill never
+  sees it (DEC-2407.1).
+
+A target changed after planning is caught by the checksum at apply, as before.
 
 Three stances govern this preview rehearsal:
 
@@ -2262,6 +2358,15 @@ DEC-1674.1).**
       no other login role, and is not the target's login, whose sessions it
       could signal. An unconfined account there refuses, naming what to
       remove.
+    - **A rehearsal on the target's own cluster uses the target's real role
+      names** (§9.3.1), and so has two costs, which are accepted. While the run
+      lives, or after a kill until the next run cleans up, an operator's `DROP
+      ROLE` of a real role the plan grants fails, because the scratch
+      database's grants and policies depend on it (`role "x" cannot be dropped
+      because some objects depend on it`). And a real LOGIN role can `CONNECT` to
+      the scratch database, which PUBLIC may unless the operator revoked it and
+      which the run does not revoke, and read what it was granted there: only the
+      declared schema and rows.
     - **The account decides the layout.**
       - **Run-owned.** A login that is itself a superuser, on another
         cluster, gets:
@@ -2302,7 +2407,9 @@ DEC-1674.1).**
       by the session it keeps open for the whole run (`application_name`
       `pbps-<token>`, from the first packet) and by the name of everything
       it creates: `pbps_run_<token>` (the login), `pbps_scratch_<token>`,
-      `pbps_role_<n>_<token>`. Before it writes anything on scratch, every
+      `pbps_role_<n>_<token>` and the roles a connected rehearsal maps a
+      plan's roles to, `pbps_rehearsal_<n>_<token>` (§9.3.1, #2379). Before it
+      writes anything on scratch, every
       later run lists the leftovers of other tokens, and removes a token's
       only when that token has no session on the server, which every role
       can read and which is cluster-wide. A token it cannot prove gone
@@ -2318,7 +2425,10 @@ DEC-1674.1).**
       until its own is made, so two runs never clean one dead claim at once,
       and a release removes the claim as its last step. The claim's
       account defaults move with an allowed externals file's changes to them,
-      in that file's transaction.
+      in that file's transaction. The roles a rehearsal maps a plan's roles to belong to
+      the cluster, not to the database, so on a cluster others use the claim also
+      names them, before they are made, and the release and the run that finds
+      the claim dead drop them after the database is emptied.
       - A leftover that cannot be removed does not stop the run. It is a
         warning (a finding, `scratch.leftover`, in `--format json`) naming
         the resource, why, and the statement that removes it. A database
@@ -2435,7 +2545,10 @@ or registry. A plan the lightweight assessment answers in full opens nothing
 the resolver owns — no fingerprint key, Docker socket or scratch connection —
 and its connected summary reports `resolver_selection` with status
 `not_acquired` and `resolver_assessment` with `need: not_needed`, outside the
-saved plan and its checksum. A plan that requires the resolver reads the key
+saved plan and its checksum. (The connected rehearsal of 9.3.1 is a separate
+use of the same entry, on by default for PostgreSQL; `--no-rehearse` leaves a
+plan that needs no resolver opening nothing at all.) A plan that requires the
+resolver reads the key
 first, then runs it, and publishes its answer (DEC-1516.1):
 1. **The run ends.** Its scratch is released before anything else.
 2. **The ordinary checks run on the resolver's plan**, every connected pass

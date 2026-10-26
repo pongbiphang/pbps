@@ -37,6 +37,7 @@ pub use super::engine::{Standard, declared_standard};
 
 pub mod preview;
 pub mod recovery;
+pub mod rehearse;
 
 /// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run

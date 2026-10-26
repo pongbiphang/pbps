@@ -7008,6 +7008,7 @@ pub fn cmd_plan_db(
     staged: bool,
     json: bool,
     resolver_selection: Option<pbps_config::resolver::ResolverSelection>,
+    no_rehearse: bool,
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
@@ -7127,6 +7128,11 @@ pub fn cmd_plan_db(
         let (mut conn, mut entry) = checked_target?;
         let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
         let connected = runtime.block_on(async {
+        // The selected resolver entry's scratch, acquired at most once for the
+        // resolver and the rehearsal both (#2379).
+        let mut scratch = resolver_selection
+            .as_ref()
+            .map(|selection| crate::resolution::Entry::new(selection, project, target));
         dependencies = crate::engine::compare_dependencies(&mut conn, &loaded.dependencies).await?;
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
@@ -7409,6 +7415,10 @@ pub fn cmd_plan_db(
                 hints.module_deps.insert(name.clone(), dependencies.clone());
             }
         }
+        // The rehearsal rebuilds the base as the target holds it, so a kept
+        // module is ordered by the annotation it was written under, not by
+        // this revision's (see `rehearsal::connected::Plan::base_hints`).
+        let recorded_module_deps = entry.snapshot.module_deps.clone();
         // A rebuilt enum keeps its comment, which `CREATE TYPE` does not
         // copy: it is a fact about the target, read before the differ writes
         // the swap that carries it (DEC-1635.7).
@@ -7582,7 +7592,10 @@ pub fn cmd_plan_db(
                     target_identity: identity.as_deref(),
                 };
                 let asked = crate::resolution::named(&assessment);
-                match crate::resolution::resolve(&request).await {
+                match crate::resolution::resolve(
+                    &request,
+                    scratch.as_mut().expect("a required resolution selected an entry"),
+                ).await {
                     Ok(unsealed) => {
                         resolver_assessment =
                             Some(crate::resolution::ResolverAssessment::resolved(&assessment));
@@ -7594,10 +7607,24 @@ pub fn cmd_plan_db(
                         );
                         resolution = Some((selection.name.clone(), unsealed, asked));
                     }
-                    Err(crate::resolution::Refused::Finding(finding)) => {
-                        return Ok(Connected::Refused { finding, findings });
+                    Err(refused) => {
+                        // The container the resolver used is confirmed gone
+                        // before the refusal, as it was when the resolver
+                        // owned it alone.
+                        let released = scratch.as_mut().map(|entry| entry.finish());
+                        if let Some(released) = released
+                            && let Err(crate::resolution::Refused::Unanswerable(error)) =
+                                released.await
+                        {
+                            return Err(error);
+                        }
+                        match refused {
+                            crate::resolution::Refused::Finding(finding) => {
+                                return Ok(Connected::Refused { finding, findings });
+                            }
+                            crate::resolution::Refused::Unanswerable(error) => return Err(error),
+                        }
                     }
-                    Err(crate::resolution::Refused::Unanswerable(error)) => return Err(error),
                 }
             }
         }
@@ -8108,6 +8135,66 @@ pub fn cmd_plan_db(
         let declared_type_pins = pbps_pg::type_refs::declared::seal(&read_back, &recorded_ids, &declared, &resolved.ids);
         let domain_validation =
             crate::engine::check_domain_alterations(&mut conn, &cs, &recorded_ids).await?;
+        // The rehearsal, last: it runs the plan as it will be written, on the
+        // scratch the resolver used or would have used. SQL Server keeps
+        // today's behaviour until its own rehearsal lands (#2379).
+        let course = crate::rehearsal::connected::course(
+            conn.driver(),
+            scratch.is_some(),
+            crate::rehearsal::connected::switched_off(project, target.environment(), no_rehearse),
+        );
+        use crate::rehearsal::connected::Course;
+        let rehearsal = match (course, scratch.as_mut()) {
+            (Course::Off, _) => Some(pbps_model::Rehearsal::Off),
+            (Course::Rehearse, Some(entry)) => {
+                let ordered = cs.clone().ordered(plan_mode(staged), dialect.as_ref());
+                let lowered = crate::statements(&ordered, &dialect)?;
+                let mut base_hints = hints.clone();
+                base_hints.module_deps.extend(recorded_module_deps.clone());
+                // The same refusal the plan meets below, before a rehearsal
+                // can meet the statement instead.
+                if !staged {
+                    reject_non_transactional(&lowered)?;
+                }
+                let verdict = crate::rehearsal::connected::run(
+                    entry,
+                    &mut conn,
+                    target,
+                    &crate::rehearsal::connected::Plan {
+                        dialect: &dialect,
+                        base: base_side,
+                        desired: desired_side,
+                        declared: &loaded.schema,
+                        hints: &hints,
+                        base_hints: &base_hints,
+                        dependencies: &loaded.dependencies,
+                        ordered: &ordered,
+                        operations: &pbps_dialect::PlanPayload::operations(&ordered),
+                        statements: &lowered,
+                        staged,
+                    },
+                )
+                .await;
+                // Confirmed gone before the plan goes on or is refused.
+                let released = entry.finish().await;
+                let verdict = verdict?;
+                if let Err(crate::resolution::Refused::Unanswerable(error)) = released {
+                    return Err(error);
+                }
+                match verdict {
+                    crate::rehearsal::connected::Verdict::Sealed(record) => Some(record),
+                    crate::rehearsal::connected::Verdict::Refused(finding) => {
+                        return Ok(Connected::Refused { finding, findings });
+                    }
+                }
+            }
+            (Course::Rehearse | Course::Skip, _) => None,
+        };
+        if let Some(entry) = scratch.as_mut()
+            && let Err(crate::resolution::Refused::Unanswerable(error)) = entry.finish().await
+        {
+            return Err(error);
+        }
         Ok(Connected::Ordinary(Box::new((
             cs,
             // The zone this session started in: what every offset-less
@@ -8142,6 +8229,7 @@ pub fn cmd_plan_db(
             reviewed,
             resolver_assessment,
             resolution,
+            rehearsal,
         ))))
     })?;
         let (
@@ -8157,6 +8245,7 @@ pub fn cmd_plan_db(
             reviewed,
             resolver_assessment,
             resolution,
+            rehearsal,
         ) = match connected {
             Connected::Ordinary(planned) => *planned,
             Connected::Refused {
@@ -8233,6 +8322,7 @@ pub fn cmd_plan_db(
             cost: Some(cost),
             resolver_selection,
             resolver_assessment,
+            rehearsal: rehearsal.as_ref().map(crate::explain::rehearsal_detail),
         };
         if !json {
             print!("{}", crate::dependencies::render(&dependencies));
@@ -8253,9 +8343,13 @@ pub fn cmd_plan_db(
                 (&data.resolver_selection, &data.resolver_assessment)
             {
                 println!(
-                    "Resolver profile: {} ({:?}); not needed, so not acquired: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
+                    "Resolver profile: {} ({:?}); not needed for binding, so the resolver did not run: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
                     selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
                 );
+            }
+            if let Some(detail) = &data.rehearsal {
+                println!("Rehearsal: {}", crate::explain::rehearsal_line(detail));
+                print!("{}", crate::explain::rehearsal_render(detail));
             }
             print!("{}", crate::report::plan(&cs, &names));
             for check in &data.connected_checks {
@@ -8294,6 +8388,7 @@ pub fn cmd_plan_db(
             print!("{}", crate::pins::reviewed_sources(&plan.type_routines));
         }
         plan.trusted_roles = project.config.trusted_roles.clone();
+        plan.rehearsal = rehearsal;
         if let Some(resolution) = resolution {
             plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -8925,6 +9020,14 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     )
     .await?;
 
+    // Recorded when the plan was made and never repeated here: apply
+    // acquires no scratch (#2379).
+    if let Some(record) = &plan.rehearsal {
+        println!(
+            "Rehearsal, recorded in the plan: {}",
+            crate::explain::rehearsal_line(&crate::explain::rehearsal_detail(record))
+        );
+    }
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))

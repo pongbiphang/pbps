@@ -256,10 +256,9 @@ pub async fn drop_roles(
     conn: &mut impl ExecuteConnection,
     roles: &[pbps_model::RoleName],
 ) -> Vec<pbps_model::RoleName> {
-    let quoted = |role: &pbps_model::RoleName| format!("\"{}\"", role.raw().replace('"', "\"\""));
     let mut failed = Vec::new();
     for batch in roles.chunks(ROLE_BATCH) {
-        let all = batch.iter().map(quoted).collect::<Vec<_>>().join(", ");
+        let all = batch.iter().map(quoted_role).collect::<Vec<_>>().join(", ");
         if conn
             .execute(&format!("DROP ROLE IF EXISTS {all}"))
             .await
@@ -268,13 +267,53 @@ pub async fn drop_roles(
             continue;
         }
         for role in batch {
-            let statement = format!("DROP ROLE IF EXISTS {}", quoted(role));
+            let statement = format!("DROP ROLE IF EXISTS {}", quoted_role(role));
             if conn.execute(&statement).await.is_err() {
                 failed.push(role.clone());
             }
         }
     }
     failed
+}
+
+/// Whether the session's role may create roles: `SUPERUSER` or `CREATEROLE`.
+/// Asked before the run records the roles it means to create, since dropping a
+/// role takes the same attribute and a run that never could create them could
+/// not drop what it had recorded either.
+pub async fn may_create_roles(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
+    let rows = conn
+        .query(
+            "SELECT rolsuper OR rolcreaterole AS allowed \
+               FROM pg_catalog.pg_roles WHERE rolname = current_user",
+        )
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| row.try_get::<bool>("allowed"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(false))
+}
+
+/// Creates the roles a rehearsal maps a plan's roles to: a name and nothing
+/// else, so they hold no privilege the plan did not give them. Each is created
+/// on its own, so the first the account may not create stops the rest and the
+/// error says it was that one (`42501` when the account lacks `CREATEROLE`).
+pub async fn create_rehearsal_roles(
+    conn: &mut impl ExecuteConnection,
+    roles: &[pbps_model::RoleName],
+) -> Result<(), DbError> {
+    for role in roles {
+        conn.execute(&format!("CREATE ROLE {} NOLOGIN", quoted_role(role)))
+            .await?;
+    }
+    Ok(())
+}
+
+/// A role name as an identifier in a statement: the one place a run's role
+/// names are quoted, for creating them and for dropping them.
+fn quoted_role(role: &pbps_model::RoleName) -> String {
+    format!("\"{}\"", role.raw().replace('"', "\"\""))
 }
 
 /// Removes exactly the two run-owned objects. FORCE closes this run's own

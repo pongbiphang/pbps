@@ -60,8 +60,46 @@ pub async fn with_started<T>(
     }
 }
 
+/// A started container the caller keeps across several uses and removes
+/// itself: one container for a connected plan's resolver and its rehearsal
+/// (#2379). Removed by [`Held::remove`], which confirms it, or best effort by
+/// the container's own drop guard on any other way out.
+pub struct Held {
+    container: Container,
+}
+
+impl Held {
+    /// The image on the runner, the container started and accepting
+    /// connections.
+    pub async fn start(
+        driver: Driver,
+        image: &str,
+        pull: PullPolicy,
+    ) -> Result<Self, ProduceError> {
+        acquire(image, pull).await?;
+        let container = Container::start(driver, image).await?;
+        match container.ready(driver, READY).await {
+            Ok(()) => Ok(Self { container }),
+            Err(error) => match container.remove().await {
+                Ok(()) => Err(error),
+                Err(names) => Err(ProduceError::Cleanup(names)),
+            },
+        }
+    }
+
+    /// The superuser connection to the container's server.
+    pub fn connection(&self) -> &str {
+        &self.container.connection
+    }
+
+    /// Removes the container and confirms it gone.
+    pub async fn remove(self) -> Result<(), ProduceError> {
+        self.container.remove().await.map_err(ProduceError::Cleanup)
+    }
+}
+
 /// The planning read's cluster, read again on a fresh target connection.
-async fn bind_target(
+pub async fn bind_target(
     driver: Driver,
     target_connection: &str,
     planned_identity: &str,

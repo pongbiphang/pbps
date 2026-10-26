@@ -51,6 +51,7 @@ pub mod rehearsal;
 pub mod rename;
 pub mod resolver;
 pub mod role;
+pub mod role_mapping;
 pub mod schema;
 pub mod state;
 pub mod storage;
@@ -95,7 +96,7 @@ pub use rebuild_ops::{
     CopyTableRows, IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition,
     RebuildPartitionedTable, RebuildRelation,
 };
-pub use rehearsal::Rehearsal;
+pub use rehearsal::{AuthorizationRehearsal, Rehearsal};
 pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{

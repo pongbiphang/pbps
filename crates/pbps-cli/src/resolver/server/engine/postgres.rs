@@ -202,6 +202,48 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     created: Created,
     /// Whether this session holds the supplied database's lock (`recovery`).
     holds_lock: bool,
+    /// Where the scratch sits relative to the target's cluster: what decides how
+    /// a rehearsal names the plan's roles (`Naming`).
+    placement: Placement,
+}
+
+/// How a rehearsal names the roles a plan names, by where the scratch is
+/// (#2432). One strategy for each placement, so no rehearsal creates, or leaves
+/// on a cluster other runs use, a role it should not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::resolver::server) enum Naming {
+    /// The scratch is on the target's own cluster: the roles are the target's
+    /// real ones and are there. Nothing is created, recorded or asked of the
+    /// account, and the scratch database's own cleanup takes every grant and
+    /// policy that names them.
+    Existing,
+    /// The scratch is a cluster of this run's own (a container): the real
+    /// names, made for the run where the cluster lacks them.
+    Created,
+    /// A cluster other runs and other tenants use: names of the run's own, so
+    /// two runs never collide and no real role of the cluster's is touched.
+    Mapped,
+}
+
+impl Naming {
+    /// A container is a cluster of the run's own whichever way it is placed;
+    /// otherwise the account's cluster is the target's or another.
+    pub(in crate::resolver::server) fn of(
+        source: &pbps_model::resolver::ScratchSource,
+        placement: Placement,
+    ) -> Self {
+        match (source, placement) {
+            (pbps_model::resolver::ScratchSource::Docker { .. }, _) => Self::Created,
+            (pbps_model::resolver::ScratchSource::Server {}, Placement::SameCluster) => {
+                Self::Existing
+            }
+            // The target's own database is refused before a rehearsal gets here.
+            (
+                pbps_model::resolver::ScratchSource::Server {},
+                Placement::SeparateCluster | Placement::Target,
+            ) => Self::Mapped,
+        }
+    }
 }
 
 /// The scratch side, provisioned and qualified: the session the declarations
@@ -577,6 +619,77 @@ impl Scratch<'_> {
         )))
     }
 
+    /// How a rehearsal on this scratch names the plan's roles.
+    pub(super) fn naming(&self) -> Naming {
+        Naming::of(&self.provenance.scratch, self.placement)
+    }
+
+    /// Makes the roles a rehearsal needs under `naming`, for the run only.
+    /// `Existing` makes none. `Created` makes those the cluster lacks. `Mapped`
+    /// makes all, under names of the run's own. What is made is recorded first,
+    /// in what the release drops and, in a supplied database, in the claim a
+    /// later run finds the run dead by, so a failure or a kill part-way still
+    /// leaves it removable. `Ok(Err(why))` is an account that may not create
+    /// roles: not a failure of the run, but of what the rehearsal can say about
+    /// authorization.
+    pub(super) async fn rehearsal_roles(
+        &mut self,
+        admin: &mut Conn,
+        roles: &[pbps_model::RoleName],
+        naming: Naming,
+    ) -> Result<Result<(), String>, Error> {
+        let db = |what: &'static str| {
+            move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
+        };
+        let lacking: Vec<pbps_model::RoleName>;
+        let roles = match naming {
+            Naming::Existing => return Ok(Ok(())),
+            Naming::Mapped => roles,
+            // The bootstrap superuser, the engine's own roles and whatever the
+            // externals file made are there already, and are not the run's.
+            Naming::Created => {
+                lacking = pbps_pg::roles::missing_roles(admin, &roles.iter().collect())
+                    .await
+                    .map_err(db("the roles the scratch cluster has"))?;
+                &lacking
+            }
+        };
+        if roles.is_empty() {
+            return Ok(Ok(()));
+        }
+        pinned(admin, &self.backend).await?;
+        if !pbps_pg::resolver::may_create_roles(admin)
+            .await
+            .map_err(db("the scratch account's attributes"))?
+        {
+            return Ok(Err(
+                "the scratch account may not create roles: it has neither SUPERUSER nor \
+                 CREATEROLE"
+                    .into(),
+            ));
+        }
+        match &mut self.created {
+            Created::RunOwned { roles: made, .. } => made.extend(roles.iter().cloned()),
+            Created::Supplied { .. } => {
+                let names: Vec<_> = roles.iter().map(|role| role.raw().to_owned()).collect();
+                record::record_roles(admin, &names)
+                    .await
+                    .map_err(db("the scratch database's claim"))?;
+            }
+            Created::Nothing => return Err(Error::Scratch),
+        }
+        match pbps_pg::resolver::create_rehearsal_roles(admin, roles).await {
+            Ok(()) => Ok(Ok(())),
+            Err(error) if error.server_error_code().as_deref() == Some("42501") => {
+                Ok(Err(format!(
+                    "the scratch account may not create roles ({error}); it needs CREATEROLE, \
+                     or the superuser a run-owned scratch has"
+                )))
+            }
+            Err(error) => Err(db("the rehearsal's roles")(error)),
+        }
+    }
+
     /// Drops what the run created. `Err` names exactly what may remain.
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
         match std::mem::replace(&mut self.created, Created::Nothing) {
@@ -702,6 +815,28 @@ pub(in crate::resolver::server) async fn release_supplied(
         ),
         Err(error) => remaining.push(format!(
             "the scratch account's own defaults, unreadable after the run ({error})"
+        )),
+    }
+    // The roles a rehearsal made are the cluster's, not the database's, so
+    // emptying the database did not reach them; the claim names them, and the
+    // privileges they held went with the objects.
+    match record::read_claim(admin).await {
+        Ok(Some(Ok(claim))) => {
+            let roles: Vec<_> = claim
+                .roles
+                .iter()
+                .map(|role| role.as_str().into())
+                .collect();
+            remaining.extend(
+                pbps_pg::resolver::drop_roles(admin, &roles)
+                    .await
+                    .into_iter()
+                    .map(|role| format!("role {}", role.shown())),
+            );
+        }
+        Ok(None | Some(Err(_))) => {}
+        Err(error) => remaining.push(format!(
+            "the roles in the scratch database's claim, unreadable ({error})"
         )),
     }
     // The record goes last: until every step above has succeeded it lets a
@@ -1500,6 +1635,7 @@ pub(super) async fn scratch<'a>(
             token: tokens.scratch.clone(),
             created: Created::Nothing,
             holds_lock: false,
+            placement,
         },
     ))
 }
@@ -1983,6 +2119,44 @@ pub(super) async fn recapture(
     capture::recapture(target, current)
         .await
         .map(|(_, differences)| differences)
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::{Naming, Placement};
+    use pbps_model::resolver::ScratchSource;
+
+    /// One strategy for each placement: the target's own cluster has the roles,
+    /// a container is the run's own cluster, and any other cluster is shared.
+    #[test]
+    fn the_naming_follows_the_placement_of_the_scratch() {
+        let server = ScratchSource::Server {};
+        let docker = ScratchSource::Docker {
+            image: "postgres:18".into(),
+        };
+        assert_eq!(
+            Naming::of(&server, Placement::SameCluster),
+            Naming::Existing
+        );
+        assert_eq!(
+            Naming::of(&server, Placement::SeparateCluster),
+            Naming::Mapped
+        );
+        // A container keeps its real names however its cluster is placed.
+        for placement in [Placement::SeparateCluster, Placement::SameCluster] {
+            assert_eq!(Naming::of(&docker, placement), Naming::Created);
+        }
+        // Negative: a server on another cluster is never given the real names,
+        // which other runs and other tenants may hold.
+        assert_ne!(
+            Naming::of(&server, Placement::SeparateCluster),
+            Naming::Created
+        );
+        assert_ne!(
+            Naming::of(&server, Placement::SeparateCluster),
+            Naming::Existing
+        );
+    }
 }
 
 #[cfg(test)]

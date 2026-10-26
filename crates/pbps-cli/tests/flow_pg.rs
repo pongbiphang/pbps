@@ -1131,6 +1131,142 @@ fn old_server() -> String {
         .expect("PBPS_TEST_PG_OLD_DB is not set; see scripts/live-tests-pg.sh")
 }
 
+#[path = "support/rehearsal2379.rs"]
+mod rehearsal2379;
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_connected_plan_is_rehearsed_and_sealed_on_every_kind_of_scratch() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::converges(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn the_resolver_and_the_rehearsal_share_one_scratch() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::shares_one_scratch(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_statement_the_engine_rejects_is_refused_at_plan_time_by_the_rehearsal() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::refuses_a_statement_the_engine_rejects(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn both_rehearsal_switches_seal_a_plan_as_not_rehearsed() {
+    for kind in rehearsal2379::Kind::ALL {
+        rehearsal2379::off_switches_seal_off(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_plan_with_no_scratch_entry_selected_carries_no_rehearsal() {
+    rehearsal2379::no_entry_no_record(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_supplied_scratch_database_is_empty_after_every_use() {
+    rehearsal2379::supplied_database_is_empty_after_each_use(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_rehearsal_stages_the_entrys_externals_and_compares_them_with_the_target() {
+    rehearsal2379::stages_and_compares_externals(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn grants_and_policies_are_rehearsed_on_roles_made_for_the_run() {
+    for kind in rehearsal2379::Kind::FULL {
+        rehearsal2379::authorization_is_rehearsed(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_policy_the_engine_rejects_is_refused_at_plan_time_and_leaves_no_role() {
+    for kind in rehearsal2379::Kind::FULL {
+        rehearsal2379::a_wrong_policy_is_refused(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn an_account_that_cannot_create_roles_is_downgraded_and_the_record_says_so() {
+    rehearsal2379::an_account_without_createrole_downgrades_and_says_so(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_killed_rehearsal_has_its_roles_removed_by_the_next_run_and_a_live_ones_kept() {
+    for kind in [
+        rehearsal2379::Kind::Server,
+        rehearsal2379::Kind::SuppliedRoles,
+    ] {
+        rehearsal2379::a_killed_rehearsal_is_cleaned_up_by_the_next_run(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_killed_same_cluster_rehearsal_leaves_no_acl_policy_or_dependency_naming_the_real_role() {
+    rehearsal2379::a_killed_same_cluster_rehearsal_leaves_nothing_naming_the_real_role(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_policy_naming_a_role_in_text_on_a_forced_table_converges_on_every_placement() {
+    for kind in [
+        rehearsal2379::Kind::Server,
+        rehearsal2379::Kind::Supplied,
+        rehearsal2379::Kind::Docker,
+        rehearsal2379::Kind::SuppliedRoles,
+        rehearsal2379::Kind::SuppliedPlain,
+    ] {
+        rehearsal2379::a_policy_naming_a_role_in_text_converges_on_every_placement(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_container_is_given_only_the_roles_it_lacks() {
+    rehearsal2379::a_container_gets_only_the_roles_it_lacks(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide() {
+    rehearsal2379::concurrent_plans_do_not_collide(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_declared_domain_is_rehearsed_and_the_engines_spelling_of_its_check_is_printed() {
+    rehearsal2379::a_declared_domain_is_rehearsed(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_project_declaring_an_enum_is_rehearsed() {
+    rehearsal2379::a_declared_enum_is_rehearsed(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_kept_function_whose_dependency_annotation_is_dropped_is_rehearsed() {
+    rehearsal2379::a_kept_module_is_rebuilt_under_its_recorded_dependencies(&server());
+}
+
 #[test]
 #[ignore = "needs live postgres"]
 fn resolver_publishes_its_rechecked_plan_in_the_exact_order() {
