@@ -202,10 +202,13 @@ class FixtureRun:
                 signal.signal(sig, handler)
 
 
-def partition(names, count, identity, weights, pinned=False):
+def partition(names, count, identity, weights, pinned=False, *, round_robin=False):
     require(len(set(names)) == len(names), "duplicate name in --list output")
     groups = [[] for _ in range(count)]
-    if pinned:
+    if round_robin:
+        for index, name in enumerate(sorted(names)):
+            groups[index % count].append(name)
+    elif pinned:
         groups[0] = list(names)
     elif weights is not None:
         loads = [0.0] * count
@@ -336,6 +339,28 @@ def run_tests(command, assigned):
         r"0 ignored; 0 measured; [0-9]+ filtered out; finished in .+", summaries[0])
         and (code == 0) == (failed == 0))
     return reported, code, time.monotonic() - started, bool(valid)
+
+
+def ci_shard(value, args):
+    """Use CI's existing services; this path never owns fixture containers."""
+    index, count = selector(value)
+    cargo, flags, listing = libtest_args(args)
+    require(listing == ["--ignored"], "CI shards require the full --ignored list without filters")
+    real = shutil.which("cargo")
+    require(real is not None, "cargo is not installed")
+    enumeration = subprocess.run([real, *cargo, *listing, "--list", "--format=pretty", "--color=never"],
+                                 text=True, stdout=subprocess.PIPE)
+    require(enumeration.returncode == 0, "cargo --list failed")
+    names = listed_tests(enumeration.stdout)
+    require(names, "CI --ignored --list contains zero tests")
+    assigned = partition(names, count, "", None, round_robin=True)[index]
+    print(f"ci shard {index}/{count}: {len(assigned)}/{len(names)} tests", flush=True)
+    require(assigned, "CI shard has no assigned tests")
+    _, code, _, valid = run_tests(
+        [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
+         "--color=never", *assigned], assigned)
+    require(valid, "assigned tests or their libtest summary were not reported exactly once")
+    return code
 
 
 def cargo_proxy(args):
@@ -585,6 +610,9 @@ def drive(args):
 
 
 def main():
+    if sys.argv[1:2] == ["ci"]:
+        require(len(sys.argv) >= 4, "ci requires i/N and cargo test arguments")
+        return ci_shard(sys.argv[2], sys.argv[3:])
     # Internal entries let the shell runners retain their authoritative command
     # sequence. Unset shard mode never enters this driver or its cargo proxy.
     if sys.argv[1:2] == ["cargo"]:

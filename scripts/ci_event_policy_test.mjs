@@ -36,13 +36,13 @@ function value(input) {
   return new data.Dictionary(...Object.entries(input).map(([key, item]) => ({ key, value: value(item) })));
 }
 const always = { name: 'always', minArgs: 0, maxArgs: 0, call: () => new data.BooleanData(true) };
-function evaluate(template, github, needs = {}) {
+function evaluate(template, github, needs = {}, matrix = {}) {
   const parts = template.split(/(\$\{\{[\s\S]*?\}\})/).filter(Boolean);
   const results = parts.map(part => {
     if (!part.startsWith('${{')) return part;
     const tokens = new Lexer(part.slice(3, -2)).lex().tokens;
-    const expression = new Parser(tokens, ['github', 'needs'], [always]).parse();
-    return new Evaluator(expression, value({ github, needs }), new Map([['always', always]])).evaluate();
+    const expression = new Parser(tokens, ['github', 'needs', 'matrix'], [always]).parse();
+    return new Evaluator(expression, value({ github, needs, matrix }), new Map([['always', always]])).evaluate();
   });
   if (results.length === 1 && typeof results[0] !== 'string') return results[0];
   return new data.StringData(results.map(item => typeof item === 'string' ? item : item.coerceString()).join(''));
@@ -152,7 +152,7 @@ test('a pull request omits exactly the declared jobs, and every other event runs
   const declared = workflow.match(/^          PR_OMITTED: (.+)$/m);
   assert.ok(declared, 'the gate declares the jobs a pull request omits');
   const omitted = declared[1].trim().split(/\s+/);
-  assert.deepEqual([...omitted].sort(), ['live', 'live-pg', 'release-windows', 'resolver-mssql']);
+  assert.deepEqual([...omitted].sort(), ['live', 'live-pg', 'release-windows', 'resolver-mssql', 'viewer']);
   const condition = "${{ github.event_name != 'pull_request' }}";
   const blocks = [...workflow.split('jobs:\n')[1].matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|(?![\s\S]))/gm)];
   const names = blocks.map(match => match[1]);
@@ -293,4 +293,49 @@ test('existing PR heads can bootstrap newly introduced helpers without rebasing'
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
+});
+
+test('every flow share has the full-list CI entry and both servers and packages', () => {
+  const block = job('live-pg');
+  const suites = block.match(/^        suite: \[([^\]]+)\]$/m)[1].split(',').map(s => s.trim());
+  const steps = block.split(/^      - /m).slice(1);
+  const flow = steps.filter(step => /^run: python3 scripts\/live-shards\.py ci /m.test(step));
+  const installed = steps.find(step => step.startsWith('name: Install pg_partman on both servers'));
+  assert.ok(installed);
+  assert.match(installed, /job\.services\.postgres\.id.*:18/);
+  assert.match(installed, /job\.services\.postgres-old\.id.*:16/);
+  // The job context is available in step env, not job env (GitHub rejects the latter).
+  assert.doesNotMatch(block.split('    steps:\n')[0],
+    /^\s*PBPS_TEST_PG_(?:OLD_)?CONTAINER:/m);
+  const selectors = [];
+  for (const suite of suites) {
+    const selected = flow.filter(step => !falsy(evaluate(
+      '${{ ' + property(step, 'if') + ' }}', {}, {}, { suite })));
+    const isFlow = suite.startsWith('flow-');
+    assert.equal(selected.length, isFlow ? 1 : 0);
+    assert.equal(!falsy(evaluate('${{ ' + property(installed, 'if') + ' }}',
+      {}, {}, { suite })), isFlow);
+    for (const step of selected) {
+      const command = step.match(/^run: (.+)$/m)[1];
+      const match = command.match(/^python3 scripts\/live-shards\.py ci ([0-9]+)\/3 test -p pbps-cli --test flow_pg -- --ignored$/);
+      assert.ok(match, 'the entry enumerates the complete ignored list without name filters');
+      selectors.push(Number(match[1]));
+      assert.match(step, /^          PBPS_TEST_PG_CONTAINER: \$\{\{ job\.services\.postgres\.id \}\}$/m);
+      assert.match(step, /^          PBPS_TEST_PG_OLD_CONTAINER: \$\{\{ job\.services\.postgres-old\.id \}\}$/m);
+      assert.doesNotMatch(step, /continue-on-error/);
+    }
+  }
+  assert.deepEqual(selectors.sort(), [0, 1, 2], 'all three distinct shares execute');
+  assert.doesNotMatch(block, /cargo test -p pbps-cli --test flow_pg/);
+  assert.doesNotMatch(block, /scripts\/ui-browser\.py|pbps-ui-build/);
+});
+
+test('the viewer keeps the actual build and browser suite in its own required job', () => {
+  const block = job('viewer');
+  assert.match(block, /POSTGRES_DB: pbps_test/);
+  assert.match(block, /--health-cmd "pg_isready -h 127\.0\.0\.1/);
+  assert.match(block, /cargo build --locked -p pbps-cli --bin pbps --target-dir "\$RUNNER_TEMP\/pbps-ui-build"/);
+  assert.match(block, /PBPS_TEST_UI_BIN="\$RUNNER_TEMP\/pbps-ui-build\/debug\/pbps"/);
+  assert.match(block, /python3 scripts\/ui-browser\.py --install-deps/);
+  assert.match(job('gate'), /needs: \[[^\]]*\bviewer\b/);
 });

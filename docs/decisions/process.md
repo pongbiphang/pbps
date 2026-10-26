@@ -1531,3 +1531,22 @@ amends DEC-1838.1 for the first push of a branch.
   session, avoids starting two such issues at once.
 - **Conflict precheck.** A head that conflicts with `master` gets no PR run and
   is ejected by the queue, so a gate on it is wasted; it is rebased first.
+
+<a id="dec-2434-1"></a>
+
+**DEC-2434.1. CI partitions the full ignored flow_pg list into three sorted
+round-robin shares, and the viewer qualifies in its own job.** In merge-group
+run 40318808239, the 420 flow-rest cases consumed 1,992 seconds of execution;
+a slower runner and apt mirror later stretched that job past the queue's
+timeout. Each CI share now enumerates the full ignored list, assigns sorted
+positions modulo three, prints assigned/total counts, and runs exact names
+serially. This extends the existing partitioner and reuses its union and
+execution checks (DEC-2357.1), without starting or removing CI's service
+containers. Empty lists, empty assignments and incomplete results fail.
+Every share has the same old/current PostgreSQL services, pg_partman packages
+and container bindings, because any new case can land in any share. No weights
+or maintained case lists participate. The viewer keeps its existing build and
+browser runner, including OS dependency installation, in a separate job so
+mirror delays no longer extend flow_pg. It remains omitted from pull-request
+runs, as it was within live-pg; ci-gate requires it on every other event
+(DEC-1835.1). Actual shard durations are measured in the merge group.
