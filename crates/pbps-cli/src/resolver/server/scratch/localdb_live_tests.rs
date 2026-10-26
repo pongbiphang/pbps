@@ -178,8 +178,8 @@ async fn localdb2271_a_selector_run_reaches_reconstruction_and_leaves_both_insta
     );
     let outcome = refusal(&target, &selector).await;
     assert!(
-        matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2238")),
-        "the run reaches the reconstruction boundary it reaches on every other instance: {outcome}"
+        matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2143")),
+        "the run reaches the boundary it reaches on every other instance: {outcome}"
     );
     assert_eq!(inventory(&target).await, before_target);
     assert_eq!(inventory(&scratch_url).await, before_scratch);
@@ -229,7 +229,7 @@ async fn localdb2271_the_marker_separates_instances_and_same_instance_controls_h
     );
     assert!(policy.contains("same_instance: allow"), "{policy}");
     assert!(
-        matches!(allowed, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2238")),
+        matches!(allowed, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2143")),
         "{allowed}"
     );
 }
@@ -321,7 +321,7 @@ async fn localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifi
     // A new invocation discovers the instance again and qualifies it anew.
     let outcome = refusal(&target, &disposable).await;
     assert!(
-        matches!(outcome, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2238")),
+        matches!(outcome, ProduceError::Run(Error::Binding(ref why)) if why.contains("#2143")),
         "{outcome}"
     );
 }
