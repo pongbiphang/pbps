@@ -1225,6 +1225,12 @@ fn two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide() {
 
 #[test]
 #[ignore = "needs live postgres"]
+fn a_declared_domain_is_rehearsed_and_the_engines_spelling_of_its_check_is_printed() {
+    rehearsal2379::a_declared_domain_is_rehearsed(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
 fn a_project_declaring_a_managed_type_is_refused_with_the_switch_named() {
     rehearsal2379::managed_types_name_the_switch(&server());
 }

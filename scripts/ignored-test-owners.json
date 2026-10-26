@@ -821,6 +821,7 @@
         "an_account_that_cannot_create_roles_is_downgraded_and_the_record_says_so",
         "a_killed_rehearsal_has_its_roles_removed_by_the_next_run_and_a_live_ones_kept",
         "two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide",
+        "a_declared_domain_is_rehearsed_and_the_engines_spelling_of_its_check_is_printed",
         "a_project_declaring_a_managed_type_is_refused_with_the_switch_named",
         "resolver_plans_apply_with_their_sealed_checks",
         "a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved",

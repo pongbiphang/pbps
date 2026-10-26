@@ -75,6 +75,8 @@ pub struct Options<'a> {
     pub typed: bool,
     /// A row-security policy on `app.t` for `role`, with this `USING`.
     pub policy: Option<&'a str>,
+    /// A domain `app.short`, which `app.t.note` uses.
+    pub domain: bool,
     /// A volatile external function that a column default of `app.country` calls, so
     /// that the two declared rows the rehearsal's base inserts hold it open
     /// sixteen seconds, long enough to act on a run that is using its roles.
@@ -139,6 +141,16 @@ impl Fixture {
             std::fs::write(d.dir.join("externals.sql"), format!("{sql};\n")).unwrap();
         }
         write("app.v.view.yml", options.view.unwrap_or(VIEW));
+        if options.domain {
+            write(
+                "app.short.type.yml",
+                "domain: app.short\ntype: text\nchecks: {nonempty: \"VALUE <> ''\"}\n",
+            );
+            write(
+                "app.t.yml",
+                &TABLE.replace("  note: {type: text}\n", "  note: {type: app.short}\n"),
+            );
+        }
         if options.typed {
             write("app.mood.yml", "enum: app.mood\nvalues: [sad, ok]\n");
             write(
@@ -1253,6 +1265,32 @@ pub fn concurrent_plans_do_not_collide(server: &str) {
     assert!(one.rehearsal_roles().is_subset(&before));
     assert_eq!(one.record()["converged"]["authorization"], "rehearsed");
     assert_eq!(two.record()["converged"]["authorization"], "rehearsed");
+}
+
+/// A declared domain is created on the scratch with the rest of the base, and
+/// what the engine stored of its check is a respelling, printed and sealed, not
+/// a difference that fails the plan.
+pub fn a_declared_domain_is_rehearsed(server: &str) {
+    let f = Fixture::new(
+        server,
+        "rehearse-domain",
+        Kind::Server,
+        &Options {
+            domain: true,
+            ..Options::default()
+        },
+    );
+    f.revise_row();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{}", said(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Rehearsal: converged on scratch"), "{text}");
+    let spelt = spellings(&f.record()).join("\n");
+    assert!(
+        spelt.contains("domain app.short check nonempty: declared `VALUE <> ''`"),
+        "{spelt}"
+    );
+    assert!(text.contains("domain app.short check nonempty"), "{text}");
 }
 
 /// A project that declares a managed type cannot be rehearsed yet: the
