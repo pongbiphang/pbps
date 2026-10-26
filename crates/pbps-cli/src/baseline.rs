@@ -19,6 +19,7 @@
 //! actually going to be applied to an environment must be based on that
 //! environment's database as queried (Phase 3).
 
+pub(crate) mod ancestry;
 mod git_objects;
 
 use anyhow::Context as _;
@@ -158,7 +159,7 @@ fn refuse_unknown_revision(root: &Path, rev: &str) -> anyhow::Result<()> {
         let shallow = if git(root, &["rev-parse", "--is-shallow-repository"])
             .is_ok_and(|answer| answer.trim() == "true")
         {
-            "\nThis is a shallow clone; fetch the missing history. In CI, set `fetch-depth: 0`."
+            ancestry::SHALLOW_REMEDY
         } else {
             ""
         };
