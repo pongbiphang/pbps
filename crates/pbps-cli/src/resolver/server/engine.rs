@@ -10,6 +10,7 @@ use super::scratch::{Provenance, Provisioning, Tokens};
 use super::{BindingRequest, Error, ProduceError, ScopeRequest};
 use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::Kept;
 use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, DbError, Driver};
@@ -130,6 +131,49 @@ pub(super) async fn connect_scratch(
         postgres::keep(&mut admin).await?;
     }
     Ok(admin)
+}
+
+/// A container's keeper: its session in its own server, named by the run's
+/// token, and the mark that it connected (DEC-2410.3). The caller holds the
+/// session as long as the container lives.
+pub(super) async fn keep_and_mark(
+    driver: Driver,
+    connection: &str,
+    token: &str,
+) -> Result<Conn, DbError> {
+    let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{token}")).await?;
+    match driver {
+        Driver::Postgres => {
+            pbps_pg::resolver::scratch::keep(&mut conn).await?;
+            pbps_pg::resolver::recovery::mark_kept(&mut conn).await?;
+        }
+        Driver::Mssql => {
+            pbps_mssql::resolver::scratch::mark(&mut conn, token).await?;
+            pbps_mssql::resolver::scratch::mark_kept(&mut conn, token).await?;
+        }
+    }
+    Ok(conn)
+}
+
+/// What the server at `connection` shows of the keeper of `token`, read by a
+/// session of its own named for `own`; `None` when that session cannot see
+/// itself, which proves nothing about the keeper.
+pub(super) async fn keeper_seen(
+    driver: Driver,
+    connection: &str,
+    own: &str,
+    token: &str,
+) -> Result<Option<Kept>, DbError> {
+    match driver {
+        Driver::Postgres => {
+            let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{own}")).await?;
+            pbps_pg::resolver::recovery::keeper(&mut conn, own, token).await
+        }
+        Driver::Mssql => {
+            let mut conn = Conn::connect(driver, connection).await?;
+            pbps_mssql::resolver::scratch::keeper(&mut conn, own, token).await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

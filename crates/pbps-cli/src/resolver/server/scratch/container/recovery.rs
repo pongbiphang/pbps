@@ -30,8 +30,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use pbps_db::resolver::Kept;
 use pbps_db::{Conn, Driver};
 
+use super::super::super::engine;
 use super::super::recovery::{self, Adapter, Failed, Liveness, Resource};
 #[cfg(not(test))]
 use super::READY;
@@ -42,9 +44,6 @@ pub(super) const TOKEN: &str = "pbps.resolver.token";
 
 /// The label naming the engine the container runs, to read its sessions.
 pub(super) const ENGINE: &str = "pbps.resolver.engine";
-
-/// The persistent mark a keeper leaves in its server once it has connected.
-const KEPT: &str = "pbps-keeper";
 
 /// How old a running container with no keeper that never had one must be
 /// before it is taken as dead: the run's readiness deadline, and two minutes.
@@ -68,113 +67,28 @@ impl Keeper {
         connection: &str,
         token: &str,
     ) -> Result<Self, super::ProduceError> {
-        let fail = |why: String| {
-            super::ProduceError::Acquire(format!("the scratch container's keeper session: {why}"))
-        };
-        let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{token}"))
+        let conn = engine::keep_and_mark(driver, connection, token)
             .await
-            .map_err(|e| fail(e.to_string()))?;
-        match driver {
-            Driver::Postgres => {
-                pbps_pg::resolver::scratch::keep(&mut conn)
-                    .await
-                    .map_err(|e| fail(e.to_string()))?;
-                conn.execute(&format!("COMMENT ON DATABASE postgres IS '{KEPT}'"))
-                    .await
-            }
-            Driver::Mssql => {
-                pbps_mssql::resolver::scratch::mark(&mut conn, token)
-                    .await
-                    .map_err(|e| fail(e.to_string()))?;
-                conn.execute(&format!(
-                    "EXEC master.sys.sp_addextendedproperty @name = N'{KEPT}', @value = N'{token}';"
-                ))
-                .await
-            }
-        }
-        .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| {
+                super::ProduceError::Acquire(format!("the scratch container's keeper session: {e}"))
+            })?;
         Ok(Self { _conn: conn })
     }
 }
 
-/// What a candidate's server says of its keeper.
-struct Seen {
-    /// The keeper's session is there.
-    alive: bool,
-    /// It connected once.
-    ever: bool,
-}
-
 /// Reads the keeper of `token` from the server at `connection`, as this run
-/// (`own`) and through the reads the engine adapters make. `None` when the
-/// reader cannot see its own session, which proves nothing.
+/// (`own`). `None` when the reader cannot see its own session, which proves
+/// nothing.
 async fn look(
     driver: Driver,
     connection: &str,
     own: &str,
     token: &str,
-) -> Result<Option<Seen>, String> {
-    let read = async {
-        let db = |e: pbps_db::DbError| e.to_string();
-        match driver {
-            Driver::Postgres => {
-                let mut conn = Conn::connect_named(driver, connection, &format!("pbps-{own}"))
-                    .await
-                    .map_err(db)?;
-                let up = pbps_pg::resolver::recovery::alive(&mut conn, own, &[token.to_owned()])
-                    .await
-                    .map_err(db)?;
-                let marks = conn
-                    .query(
-                        "SELECT pg_catalog.shobj_description(oid, 'pg_database') AS comment \
-                           FROM pg_catalog.pg_database WHERE datname = 'postgres'",
-                    )
-                    .await
-                    .map_err(db)?;
-                let ever = marks
-                    .first()
-                    .is_some_and(|row| row.try_get::<&str>("comment").ok().flatten() == Some(KEPT));
-                Ok(up.map(|up| Seen {
-                    alive: up.contains(token),
-                    ever,
-                }))
-            }
-            Driver::Mssql => {
-                let mut conn = Conn::connect(driver, connection).await.map_err(db)?;
-                pbps_mssql::resolver::scratch::mark(&mut conn, own)
-                    .await
-                    .map_err(db)?;
-                // The marker table `mark` makes, read by name; a reader that
-                // cannot see its own proves nothing.
-                let up = conn
-                    .query(&format!(
-                        "SELECT CASE WHEN OBJECT_ID(N'tempdb..##pbps_{own}') IS NULL THEN 0 ELSE 1 \
-                         END AS own, CASE WHEN OBJECT_ID(N'tempdb..##pbps_{token}') IS NULL THEN 0 \
-                         ELSE 1 END AS keeper;"
-                    ))
-                    .await
-                    .map_err(db)?;
-                let up = up.first().and_then(|row| {
-                    (row.try_get::<i32>("own").ok().flatten() == Some(1))
-                        .then(|| row.try_get::<i32>("keeper").ok().flatten() == Some(1))
-                });
-                let marks = conn
-                    .query(&format!(
-                        "SELECT 1 AS there FROM master.sys.extended_properties WHERE class = 0 \
-                         AND name = N'{KEPT}'"
-                    ))
-                    .await
-                    .map_err(db)?;
-                Ok(up.map(|alive| Seen {
-                    alive,
-                    ever: !marks.is_empty(),
-                }))
-            }
-        }
-    };
-    tokio::time::timeout(PROBE, read)
+) -> Result<Option<Kept>, String> {
+    tokio::time::timeout(PROBE, engine::keeper_seen(driver, connection, own, token))
         .await
-        .unwrap_or_else(|_| Err("the server did not answer in time".into()))
+        .map_err(|_| "the server did not answer in time".to_owned())?
+        .map_err(|e| e.to_string())
 }
 
 /// Seconds since the epoch of an RFC 3339 time as the daemon prints it
@@ -220,7 +134,7 @@ struct State {
 /// container is on the daemon's clock, when that could be read.
 fn verdict(
     state: &State,
-    seen: Option<Result<Option<Seen>, String>>,
+    seen: Option<Result<Option<Kept>, String>>,
     age: Option<i64>,
 ) -> Liveness {
     let grace = GRACE.as_secs() as i64;
@@ -444,7 +358,7 @@ pub(in crate::resolver::server::scratch) async fn seen(
     look(driver, connection, own, token)
         .await
         .unwrap()
-        .map(|seen| (seen.alive, seen.ever))
+        .map(|kept| (kept.alive, kept.ever))
 }
 
 /// The sweep, with its report returned instead of printed.
@@ -497,6 +411,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_container_module_leaves_engine_sql_to_the_engine_seam() {
+        for (file, source) in [
+            ("recovery.rs", include_str!("recovery.rs")),
+            ("startup.rs", include_str!("startup.rs")),
+        ] {
+            for krate in ["pbps_pg", "pbps_mssql"] {
+                let call = format!("{krate}::");
+                assert!(!source.contains(&call), "{file} calls {krate}, not engine");
+            }
+        }
+    }
+
     fn state(status: &str) -> State {
         State {
             status: status.into(),
@@ -506,8 +433,8 @@ mod tests {
         }
     }
 
-    fn seen(alive: bool, ever: bool) -> Option<Result<Option<Seen>, String>> {
-        Some(Ok(Some(Seen { alive, ever })))
+    fn seen(alive: bool, ever: bool) -> Option<Result<Option<Kept>, String>> {
+        Some(Ok(Some(Kept { alive, ever })))
     }
 
     #[test]

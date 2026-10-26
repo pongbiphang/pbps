@@ -1,6 +1,7 @@
 //! SQL Server's scratch identity and acquisition checks (DEC-2236.1). The
 //! CLI holds connections and cleanup state; only this crate supplies SQL.
 
+use pbps_db::resolver::Kept;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
@@ -132,16 +133,58 @@ pub async fn mark(conn: &mut impl ExecuteConnection, nonce: &str) -> Result<Sess
 }
 
 pub async fn marked(conn: &mut impl QueryConnection, mark: &SessionMark) -> Result<bool, DbError> {
+    present(conn, &mark.name).await
+}
+
+async fn present(conn: &mut impl QueryConnection, name: &str) -> Result<bool, DbError> {
     let row = one(
         conn.query(&format!(
             "SELECT CONVERT(nvarchar(1), CASE WHEN OBJECT_ID({}) IS NULL THEN 0 ELSE 1 END) \
              AS seen;",
-            literal(&format!("tempdb..{}", mark.name))
+            literal(&format!("tempdb..{name}"))
         ))
         .await?,
         "the scratch marker",
     )?;
     Ok(text(&row, "seen")? == "1")
+}
+
+/// The name of a server-wide property a keeper leaves once it has connected
+/// (DEC-2410.3); it outlives the session.
+const KEPT: &str = "pbps-keeper";
+
+/// Leaves the mark of the keeper of `token`, whose session mark is already made.
+pub async fn mark_kept(conn: &mut impl ExecuteConnection, token: &str) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "EXEC master.sys.sp_addextendedproperty @name = {}, @value = {};",
+        literal(KEPT),
+        literal(token)
+    ))
+    .await
+}
+
+/// What the server shows of the keeper of `token`, read as `own`; `None` when
+/// this session cannot see its own marker, which proves nothing about the keeper.
+pub async fn keeper(
+    conn: &mut impl ExecuteConnection,
+    own: &str,
+    token: &str,
+) -> Result<Option<Kept>, DbError> {
+    let seen = mark(conn, own).await?;
+    if !marked(conn, &seen).await? {
+        return Ok(None);
+    }
+    let ever = conn
+        .query(&format!(
+            "SELECT 1 AS there FROM master.sys.extended_properties WHERE class = 0 \
+             AND name = {};",
+            literal(KEPT)
+        ))
+        .await?;
+    Ok(Some(Kept {
+        alive: present(conn, &format!("##pbps_{token}")).await?,
+        ever: !ever.is_empty(),
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

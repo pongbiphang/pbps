@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_db::resolver::is_run_token;
+use pbps_db::resolver::{Kept, is_run_token};
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 
@@ -118,6 +118,41 @@ pub async fn alive(
         sessions.insert(token);
     }
     Ok(own_seen.then_some(sessions))
+}
+
+/// The mark a keeper leaves once it has connected (DEC-2410.3): the comment on
+/// the `postgres` database of the server the run started, which outlives the
+/// session.
+const KEPT: &str = "pbps-keeper";
+
+/// Leaves the mark of a keeper that has connected.
+pub async fn mark_kept(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&format!("COMMENT ON DATABASE postgres IS '{KEPT}'"))
+        .await
+}
+
+/// What the server shows of the keeper of `token`, read as `own`; `None` when
+/// this session cannot see its own, which proves nothing about the keeper.
+pub async fn keeper(
+    conn: &mut impl QueryConnection,
+    own: &str,
+    token: &str,
+) -> Result<Option<Kept>, DbError> {
+    let Some(up) = alive(conn, own, &[token.to_owned()]).await? else {
+        return Ok(None);
+    };
+    let marks = conn
+        .query(
+            "SELECT pg_catalog.shobj_description(oid, 'pg_database') AS comment \
+               FROM pg_catalog.pg_database WHERE datname = 'postgres'",
+        )
+        .await?;
+    Ok(Some(Kept {
+        alive: up.contains(token),
+        ever: marks
+            .first()
+            .is_some_and(|row| row.try_get::<&str>("comment").ok().flatten() == Some(KEPT)),
+    }))
 }
 
 /// The advisory lock that serialises runs in one supplied database: `"pbps"`

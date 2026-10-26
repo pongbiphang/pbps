@@ -34,6 +34,15 @@ impl std::fmt::Debug for ScratchNames {
 #[error("scratch resource names must be run-generated pbps identifiers")]
 pub struct UnsupportedScratchName;
 
+/// What a server shows of a run's keeper session (#2410, DEC-2410.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    /// The keeper's session is there.
+    pub alive: bool,
+    /// It connected once.
+    pub ever: bool,
+}
+
 /// A run token: 32 lowercase hexadecimal digits.
 pub fn is_run_token(token: &str) -> bool {
     token.len() == 32
