@@ -5,6 +5,8 @@
 
 use super::super::container::{Keeper, seen, swept};
 use super::*;
+use crate::resolver::server::engine;
+use pbps_db::resolver::Kept;
 use std::process::Command;
 use std::time::Duration;
 
@@ -36,9 +38,10 @@ impl Drop for Made {
     }
 }
 
-#[tokio::test]
-#[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
-async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone() {
+/// Starts a SQL Server container the way a run does: named for its token,
+/// labelled with it and its engine, the password in its environment, one
+/// loopback port published. Returns its guard, its token and a connection.
+async fn start() -> (Made, String, String, String) {
     let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
     let token = format!("{:032x}", rand::random::<u128>());
     let name = format!("pbps-scratch-{token}");
@@ -81,6 +84,13 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     assert!(ready, "the container never accepted a connection");
+    (made, name, token, connection)
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
+async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once_when_it_is_gone() {
+    let (made, name, token, connection) = start().await;
     let token_of_run = format!("{:032x}", rand::random::<u128>());
     let keeper = Keeper::open(Driver::Mssql, &connection, &token)
         .await
@@ -127,4 +137,29 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
                 .any(|g| g.removed.iter().any(|r| r.names == [name.clone()])),
         "{dead:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
+async fn a_sql_server_keeper_that_connects_between_the_two_reads_is_alive_and_not_yet_kept() {
+    let (_made, _, run, connection) = start().await;
+    let (between, go) = engine::pause_between_reads(&run);
+    let reader = format!("{:032x}", rand::random::<u128>());
+    let (seen, keeper) = tokio::join!(
+        engine::keeper_seen(Driver::Mssql, &connection, &reader, &run),
+        async {
+            between.await.unwrap();
+            let keeper = Keeper::open(Driver::Mssql, &connection, &run)
+                .await
+                .unwrap();
+            go.send(()).unwrap();
+            keeper
+        }
+    );
+    let kept = Kept {
+        alive: true,
+        ever: false,
+    };
+    assert_eq!(seen.unwrap(), Some(kept));
+    drop(keeper);
 }

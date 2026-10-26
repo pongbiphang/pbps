@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_db::resolver::{Kept, is_run_token};
+use pbps_db::resolver::is_run_token;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 
@@ -131,28 +131,19 @@ pub async fn mark_kept(conn: &mut impl ExecuteConnection) -> Result<(), DbError>
         .await
 }
 
-/// What the server shows of the keeper of `token`, read as `own`; `None` when
-/// this session cannot see its own, which proves nothing about the keeper.
-pub async fn keeper(
-    conn: &mut impl QueryConnection,
-    own: &str,
-    token: &str,
-) -> Result<Option<Kept>, DbError> {
-    let Some(up) = alive(conn, own, &[token.to_owned()]).await? else {
-        return Ok(None);
-    };
+/// Whether a keeper has ever connected to this server. A reader reads this
+/// before it reads the session: the mark is written only once the session
+/// exists, so a mark read first can only be older than the session read after.
+pub async fn kept(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
     let marks = conn
         .query(
             "SELECT pg_catalog.shobj_description(oid, 'pg_database') AS comment \
                FROM pg_catalog.pg_database WHERE datname = 'postgres'",
         )
         .await?;
-    Ok(Some(Kept {
-        alive: up.contains(token),
-        ever: marks
-            .first()
-            .is_some_and(|row| row.try_get::<&str>("comment").ok().flatten() == Some(KEPT)),
-    }))
+    Ok(marks
+        .first()
+        .is_some_and(|row| row.try_get::<&str>("comment").ok().flatten() == Some(KEPT)))
 }
 
 /// The advisory lock that serialises runs in one supplied database: `"pbps"`

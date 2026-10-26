@@ -1,7 +1,6 @@
 //! SQL Server's scratch identity and acquisition checks (DEC-2236.1). The
 //! CLI holds connections and cleanup state; only this crate supplies SQL.
 
-use pbps_db::resolver::Kept;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
@@ -163,28 +162,24 @@ pub async fn mark_kept(conn: &mut impl ExecuteConnection, token: &str) -> Result
     .await
 }
 
-/// What the server shows of the keeper of `token`, read as `own`; `None` when
-/// this session cannot see its own marker, which proves nothing about the keeper.
-pub async fn keeper(
-    conn: &mut impl ExecuteConnection,
-    own: &str,
-    token: &str,
-) -> Result<Option<Kept>, DbError> {
-    let seen = mark(conn, own).await?;
-    if !marked(conn, &seen).await? {
-        return Ok(None);
-    }
-    let ever = conn
+/// Whether the session that made the marker for `nonce` (see [`mark`]) is still
+/// there.
+pub async fn marker_present(conn: &mut impl QueryConnection, nonce: &str) -> Result<bool, DbError> {
+    present(conn, &format!("##pbps_{nonce}")).await
+}
+
+/// Whether a keeper has ever connected to this server. A reader reads this
+/// before it reads the session: the mark is written only once the session
+/// exists, so a mark read first can only be older than the session read after.
+pub async fn kept(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
+    Ok(!conn
         .query(&format!(
             "SELECT 1 AS there FROM master.sys.extended_properties WHERE class = 0 \
              AND name = {};",
             literal(KEPT)
         ))
-        .await?;
-    Ok(Some(Kept {
-        alive: present(conn, &format!("##pbps_{token}")).await?,
-        ever: !ever.is_empty(),
-    }))
+        .await?
+        .is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

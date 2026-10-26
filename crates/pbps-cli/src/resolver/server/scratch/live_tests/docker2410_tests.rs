@@ -8,6 +8,8 @@
 
 use super::super::container::{Keeper, swept};
 use super::setting;
+use crate::resolver::server::engine;
+use pbps_db::resolver::Kept;
 use pbps_db::{Conn, Driver};
 use std::process::Command;
 use std::time::Duration;
@@ -152,6 +154,36 @@ async fn a_container_whose_keeper_connected_and_is_gone_is_removed_at_once() {
     );
     assert!(!still, "removed well inside the grace");
     assert_eq!(gone, 0, "with its volumes: {volumes:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn a_keeper_that_connects_between_the_two_reads_is_alive_and_not_yet_kept() {
+    let mut made = Made(Vec::new());
+    let run = token();
+    let (_, connection) = start(&mut made, &run).await;
+    // The reader stops between its reads while the run's keeper connects and
+    // marks the server: a keeper that is there and a mark that is not yet
+    // read, never a session that was missed and a mark that was seen.
+    let (between, go) = engine::pause_between_reads(&run);
+    let reader = token();
+    let (seen, keeper) = tokio::join!(
+        engine::keeper_seen(Driver::Postgres, &connection, &reader, &run),
+        async {
+            between.await.unwrap();
+            let keeper = Keeper::open(Driver::Postgres, &connection, &run)
+                .await
+                .unwrap();
+            go.send(()).unwrap();
+            keeper
+        }
+    );
+    let kept = Kept {
+        alive: true,
+        ever: false,
+    };
+    assert_eq!(seen.unwrap(), Some(kept));
+    drop(keeper);
 }
 
 #[tokio::test]
