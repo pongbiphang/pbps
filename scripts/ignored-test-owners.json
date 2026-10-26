@@ -667,6 +667,7 @@
         "managed_types::a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowing_allow",
         "managed_types::a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar",
         "managed_types::a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit",
+        "managed_types::an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it",
         "managed_types::an_enum_rebuild_rebuilds_the_domains_over_it_in_depth_order_and_says_why",
         "managed_types::a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql",
         "managed_types::a_domain_rebuild_carries_the_comment_to_the_replacement",

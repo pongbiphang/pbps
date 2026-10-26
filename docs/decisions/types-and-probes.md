@@ -3790,4 +3790,20 @@ through text for every reason, since an enum has no assignment cast to its
 replacement. An enum below carries no pair.
 `a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar` and
 `a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit`
-pin it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.
+pin it on 16 and 18.
+
+Round 4 of the PR. A replacement domain over a type the plan does not rebuild
+was created at operation ordinal 0, tied with the enum's first label statement
+and ordered by name, so a default naming a renamed label could run before the
+rename. It now takes the ordinal 3b's enum `Create` takes, the count of the
+label operations of the enum it uses, directly or through the domains between
+(rebuilt or not), so it follows every rename and addition; one over a rebuilt
+type keeps its place after that type's creation. The effects say the same: a
+domain's `Create` requires the type it is built on in its final incarnation,
+unless it is created over a replacement. The same-plan new-label check now
+reads a rebuilt domain's `Create` as it reads a new domain's, since a default
+or check naming a label added in the same transaction is refused by the
+engine. The domain's `Retype`, `Swap` and the restored defaults and checks are
+classes 9 and 13, after the label statements of class 7.
+`an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it` pins it
+on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.

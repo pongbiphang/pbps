@@ -385,6 +385,29 @@ mod effects_of_each_kind {
                     },
                 },
             ),
+            // A domain's replacement is created from its final declaration:
+            // the type it is built on stands in its final incarnation first.
+            (
+                "EnumRebuild",
+                Change::EnumRebuild {
+                    uid: uid(UidKind::Type, "new_domain"),
+                    name: "app.new_domain".parse().unwrap(),
+                    tmp: "app.pbps_rebuild_new_domain".parse().unwrap(),
+                    step: pbps_model::EnumRebuildStep::Create {
+                        definition: Box::new(ManagedType::Domain {
+                            base: "app.base".parse().unwrap(),
+                            not_null: false,
+                            default: None,
+                            checks: BTreeMap::new(),
+                            collation: None,
+                        }),
+                        removed: vec![],
+                        ordinal: 0,
+                        over: None,
+                        why: None,
+                    },
+                },
+            ),
             (
                 "EnumRebuild",
                 Change::EnumRebuild {

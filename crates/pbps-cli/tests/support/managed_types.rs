@@ -8085,3 +8085,79 @@ fn a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The array blocks the new check in place, so the domain is rebuilt;
+        // its default becomes the label the same plan renames `a` to, and the
+        // replacement must not be created before that label exists.
+        let sql = "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'c'); \
+                   CREATE DOMAIN app.d AS app.e DEFAULT 'c'; \
+                   CREATE TABLE app.t (id integer PRIMARY KEY, v app.d[], w app.d); \
+                   INSERT INTO app.t VALUES (1, ARRAY['a', 'c']::app.d[], 'a');";
+        let (own, d) = adopted(&server, "domain_label_order4b", sql);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, c]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: app.e\ndefault: \"'b'\"\nchecks:\n  keep: \"VALUE IS NOT NULL\"\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let path = d.dir.join("label-order.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let kinds = changes_of(&plan);
+        let at = |kind: &str| kinds.iter().position(|k| k == kind);
+        assert!(
+            at("RenameEnumValue")
+                .zip(at("EnumRebuild"))
+                .is_some_and(|(r, c)| r < c),
+            "{kinds:?}"
+        );
+        let create = plan
+            .changes
+            .changes
+            .iter()
+            .position(|p| {
+                matches!(
+                    &p.change,
+                    pbps_model::Change::EnumRebuild {
+                        step: pbps_model::EnumRebuildStep::Create { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("the replacement is created");
+        let rename = plan
+            .changes
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, pbps_model::Change::RenameEnumValue { .. }))
+            .expect("the label is renamed");
+        assert!(rename < create, "{kinds:?}");
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "rename", "constraint"],
+        ));
+        assert_eq!(type_ids(&d), uids);
+        assert_eq!(
+            text_of(db, "SELECT v::text FROM app.t WHERE id = 1"),
+            "{b,c}"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}

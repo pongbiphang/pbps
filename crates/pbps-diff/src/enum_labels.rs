@@ -1241,7 +1241,13 @@ pub(crate) fn unsafe_uses(
                         .is_some_and(|t| inherited(t).columns.values().any(|c| typed(&c.ty)))
                         && text(&check.expression)
                 }
-                Change::CreateType { definition, .. } => match definition.as_ref() {
+                // A rebuilt domain's replacement is created from its final
+                // declaration, as a new domain is (DEC-1635.9).
+                Change::CreateType { definition, .. }
+                | Change::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Create { definition, .. },
+                    ..
+                } => match definition.as_ref() {
                     ManagedType::Domain {
                         base,
                         default,

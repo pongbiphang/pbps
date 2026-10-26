@@ -107,6 +107,20 @@ pub(crate) fn plan(
         }
     }
 
+    // The label statements of each enum in the plan, as the count of its
+    // operations: a replacement domain is created after them, as 3b's enum
+    // `Create` is (it takes its place by the same operation ordinal), because
+    // its default or a check may name a label they rename or add.
+    let mut label_operations: BTreeMap<Uid, usize> = BTreeMap::new();
+    for change in enum_steps {
+        if let Change::AddEnumValue { uid, ordinal, .. }
+        | Change::RenameEnumValue { uid, ordinal, .. } = change
+        {
+            let seen = label_operations.entry(uid.clone()).or_default();
+            *seen = (*seen).max(ordinal + 1);
+        }
+    }
+
     // Retained domains: their names on both sides, definitions, and seeds.
     struct Domain<'a> {
         uid: &'a Uid,
@@ -141,6 +155,36 @@ pub(crate) fn plan(
         );
     }
 
+    // How many label operations precede a domain's creation: those of the enum
+    // it is built on, directly or through the domains between, whether or not
+    // those are rebuilt (one that is takes its own place after them).
+    let labels_before = |start: &ManagedType| -> usize {
+        let mut at = start;
+        for _ in 0..=desired.ids.types.len() {
+            let ManagedType::Domain { base: ty, .. } = at else {
+                return 0;
+            };
+            let Some(reference) = ty.type_ref() else {
+                return 0;
+            };
+            let TypeIdentity::Declared(uid) = resolver.resolve(TypeSide::Desired, reference) else {
+                return 0;
+            };
+            if let Some(operations) = label_operations.get(uid) {
+                return *operations;
+            }
+            let Some(next) = desired
+                .ids
+                .types
+                .get(uid)
+                .and_then(|name| desired.schema.types.get(name))
+            else {
+                return 0;
+            };
+            at = next;
+        }
+        0
+    };
     let normalized = |ty: &ColumnType| dialect.normalize_type(ty).unwrap_or_else(|_| ty.clone());
     let mut why: BTreeMap<Uid, Why> = BTreeMap::new();
     for d in domains.values() {
@@ -286,7 +330,7 @@ pub(crate) fn plan(
                     r.ordinal + 1,
                     r.depth + 1,
                 ),
-                None => (None, Vec::new(), 0, 1),
+                None => (None, Vec::new(), labels_before(d.new), 1),
             };
             let reason = &why[uid];
             // What the columns of this type undergo in their base type is a
@@ -1113,6 +1157,222 @@ mod tests {
         assert!(
             !changes.is_empty() && changes.values().all(Option::is_none),
             "{changes:?}"
+        );
+    }
+
+    /// A domain with a default, as the label renames leave the enum.
+    fn with_default(base: &str, default: &str, checks: &[(&str, &str)]) -> ManagedType {
+        let ManagedType::Domain {
+            base,
+            not_null,
+            checks,
+            collation,
+            ..
+        } = domain(base, None, checks)
+        else {
+            unreachable!()
+        };
+        ManagedType::Domain {
+            base,
+            not_null,
+            default: Some(default.into()),
+            checks,
+            collation,
+        }
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> Hints {
+        Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                pairs
+                    .iter()
+                    .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                    .collect(),
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// The plan's changes, by the order they will run in, as a kind and the
+    /// type each belongs to.
+    fn order_of(
+        old: &[(&str, ManagedType)],
+        new: &[(&str, ManagedType)],
+        hints: &Hints,
+    ) -> Result<Vec<String>, Vec<DiffError>> {
+        let (b, d) = (world(old), world(new));
+        crate::schema_diff::diff(
+            Side {
+                schema: &b.0,
+                ids: &b.1,
+            },
+            Side {
+                schema: &d.0,
+                ids: &d.1,
+            },
+            &Casts,
+            hints,
+        )
+        .map(|plan| {
+            plan.changes()
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::RenameEnumValue { uid, .. } => format!("rename {uid}"),
+                    Change::AddEnumValue { uid, .. } => format!("add {uid}"),
+                    Change::EnumRebuild {
+                        uid,
+                        step: EnumRebuildStep::Create { .. },
+                        ..
+                    } => format!("create {uid}"),
+                    _ => "other".to_owned(),
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_replacement_domain_is_created_after_the_label_changes_of_the_enum_it_uses() {
+        // An array holds `app.d`, which gains a check in the plan that renames
+        // the enum's labels, and its default becomes a renamed label: the
+        // replacement is created after every rename, one or two, directly or
+        // through a domain the plan leaves alone.
+        let mut hints = Hints::default();
+        hints.domain_array_holders.insert(uid(2));
+        let checked = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", with_default("app.e", default, checks)),
+            ]
+        };
+        let position = |order: &[String], what: &str| {
+            order
+                .iter()
+                .position(|o| o.starts_with(what))
+                .unwrap_or_else(|| panic!("{what}: {order:?}"))
+        };
+        for (old_labels, new_labels, moves, default) in [
+            (vec!["a", "c"], vec!["b", "c"], vec![("a", "b")], "'b'"),
+            (
+                vec!["a1", "a2", "c"],
+                vec!["b1", "b2", "c"],
+                vec![("a1", "b1"), ("a2", "b2")],
+                "'b2'",
+            ),
+        ] {
+            hints.enum_value_renames = renames(&moves).enum_value_renames;
+            let old = checked(&old_labels, "'c'", false);
+            let new = checked(&new_labels, default, true);
+            let order = order_of(&old, &new, &hints).expect("a valid plan");
+            assert_eq!(
+                order.iter().filter(|o| o.starts_with("rename")).count(),
+                moves.len(),
+                "{order:?}"
+            );
+            let last_rename = order.iter().rposition(|o| o.starts_with("rename")).unwrap();
+            assert!(
+                position(&order, "create") > last_rename,
+                "{moves:?}: {order:?}"
+            );
+        }
+        // Through a domain the plan does not rebuild: `app.d2` is built on
+        // `app.d`, which is built on the enum.
+        let chained = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", domain("app.e", None, &[])),
+                ("app.d2", with_default("app.d", default, checks)),
+            ]
+        };
+        let mut hints = renames(&[("a", "b")]);
+        hints.domain_array_holders.insert(uid(3));
+        let order = order_of(
+            &chained(&["a", "c"], "'c'", false),
+            &chained(&["b", "c"], "'b'", true),
+            &hints,
+        )
+        .expect("a valid plan");
+        assert!(
+            position(&order, "create") > position(&order, "rename"),
+            "{order:?}"
+        );
+        // Negative: with no label change the creation keeps its place, and
+        // the ordinal stays zero.
+        let plain = Hints {
+            domain_array_holders: [uid(2)].into(),
+            ..Default::default()
+        };
+        let out = run(
+            &checked(&["a", "c"], "'c'", false),
+            &checked(&["a", "c"], "'c'", true),
+            &plain,
+        );
+        assert_eq!(out.uids.get(&uid(2)), Some(&Why::Array));
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Create { ordinal: 0, .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_replacement_domain_waits_for_the_label_it_adds_and_the_plan_refuses_its_use() {
+        // The ordinal says after: one operation precedes it.
+        let mut hints = Hints::default();
+        hints.domain_array_holders.insert(uid(2));
+        let with = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", with_default("app.e", default, checks)),
+            ]
+        };
+        let out = run(
+            &with(&["a"], "'a'", false),
+            &with(&["a", "b"], "'a'", true),
+            &hints,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(
+            out.changes.iter().any(|c| matches!(
+                c,
+                Change::EnumRebuild {
+                    uid: u,
+                    step: EnumRebuildStep::Create { ordinal: 1, .. },
+                    ..
+                } if *u == uid(2)
+            )),
+            "{:?}",
+            out.changes
+        );
+        // A default that names the added label cannot run in the transaction
+        // that adds it (DEC-1635.6): refused, as for a new domain.
+        let errors = order_of(
+            &with(&["a"], "'a'", false),
+            &with(&["a", "b"], "'b'", true),
+            &hints,
+        )
+        .expect_err("the new label is used where it is added");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::EnumValueUse { .. })),
+            "{errors:?}"
+        );
+        // And one that does not name it is fine.
+        assert!(
+            order_of(
+                &with(&["a"], "'a'", false),
+                &with(&["a", "b"], "'a'", true),
+                &hints
+            )
+            .is_ok()
         );
     }
 }
