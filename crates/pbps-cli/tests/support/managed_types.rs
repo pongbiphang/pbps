@@ -5664,6 +5664,60 @@ fn a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_
     }
 }
 
+/// Slice 4a beside enum partition keys (DEC-2346.1): a table partitioned by an
+/// enum column holds the domain like any table. As a plain column it is
+/// tightened in place, the validation scanning the partitions; as an array
+/// the census names the parent, the engine refusing it there as anywhere.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_holder() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for holder in ["", ", x app.code[]"] {
+            let sql = format!(
+                "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'b'); \
+                 CREATE DOMAIN app.code AS text DEFAULT 'a' CONSTRAINT c1 CHECK (VALUE <> ''); \
+                 CREATE TABLE app.p (id integer NOT NULL, k app.e NOT NULL, v app.code{holder}, \
+                   PRIMARY KEY (id, k)) PARTITION BY LIST (k); \
+                 CREATE TABLE app.p_a PARTITION OF app.p FOR VALUES IN ('a'); \
+                 CREATE TABLE app.p_b PARTITION OF app.p FOR VALUES IN ('b'); \
+                 INSERT INTO app.p (id, k, v) VALUES (1, 'a', 'abc'), (2, 'b', 'xyz');"
+            );
+            let (own, d) = adopted(&server, "domain_enum_key4a", &sql);
+            let db = own.connection();
+            let path = d.dir.join("enum-key.plan.json");
+            write_code(
+                &d,
+                &code_domain(
+                    false,
+                    Some("'a'::text"),
+                    &[("c1", C1), ("c2", "VALUE <> 'x'")],
+                ),
+            );
+            if holder.is_empty() {
+                let plan = label_plan(&d, db, &path);
+                assert_eq!(halves(&plan), ["Tighten"], "{plan:?}");
+                succeeds(apply_allowing(&d, db, &path, &["constraint"]));
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                assert!(no_unvalidated_domain_check(db));
+                succeeds(d.run(&["verify", "--db", db]));
+            } else {
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0);
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(
+                    said.contains("domain app.code cannot take a new check or NOT NULL")
+                        && said.contains("app.p.x"),
+                    "{said}"
+                );
+                assert!(!path.exists());
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_base_type_or_collation_change_is_refused_by_name_and_points_at_the_rebuild() {

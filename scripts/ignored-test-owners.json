@@ -634,6 +634,7 @@
         "managed_types::a_staged_domain_tightening_is_one_step_and_a_resume_accepts_it",
         "managed_types::a_loosening_comes_before_the_columns_the_plan_adds_and_a_tightening_after",
         "managed_types::a_renamed_domain_is_altered_under_its_final_name",
+        "managed_types::a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_holder",
         "managed_types::a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied",
         "managed_types::a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename",
         "managed_types::external_references_do_not_borrow_a_dropped_types_declared_identity",
