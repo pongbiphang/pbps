@@ -635,8 +635,9 @@ assigning an xid to obtain identity defeats the NULL check.
 The driver prepares the original SQL through the extended protocol,
 preserves column metadata for empty results, and streams bounded evidence.
 Cells are NULL, bounded rendered text with an explicit truncation flag, or
-explicitly unrenderable binary types. Unsupported types remain violation
-evidence; no SQL rewriting or server output function is needed. Twenty rows
+explicitly unrenderable binary types. Types with server binary output but no
+client renderer remain violation evidence; types without server binary output
+are refused before execution under DEC-1165.3. No SQL rewriting is needed. Twenty rows
 and 64 KiB bound retained cell text, with metadata/cell slots additionally
 bounded by PostgreSQL's column limit. Individual wire rows and the driver's
 bounded receive buffers can exceed 64 KiB; the result is never collected in
@@ -658,3 +659,27 @@ with stable-identity, standalone COMMIT/ROLLBACK, replacement READ ONLY,
 leading READ WRITE (25001), extended multi-statement (42601), and 50 fresh
 read-only transactions on each. Live regressions exercise both builds and
 distinguish boundary refusal from invalid shape and from SQL error.
+
+<a id="dec-1165-3"></a>
+
+**DEC-1165.3. Refuse result types without server binary output before execution.**
+PostgreSQL 16.15 and 18.6 both return 42883, "no binary output function available
+for type aclitem", for non-NULL and NULL `aclitem` rows through the native
+extended-protocol driver. Zero rows otherwise pass, while an explicit `::text`
+cast works. tokio-postgres 0.7.18 always requests binary result fields; a client
+unrenderable marker cannot recover a row the server cannot send. Carrying a
+driver fork for these internal types costs more than it buys, and the simple
+protocol does not preserve the assertion boundary.
+
+After preparing the original statement, before executing it, the runner reads
+`pg_type.typsend` for every result type, recursively resolving domain bases and
+array elements. This runner query uses the same READ ONLY transaction and does
+not change the identity postcheck. Missing or unreadable capability is
+Unanswerable. A type lacking binary output makes the result InvalidResult,
+even for NULL or zero rows, naming the column and type with the remedy "cast it
+to text, e.g. `col::text`". The user statement never executes on that path; it
+is neither pass, SQL error nor violation. Native regressions qualify both
+builds, domain and array nesting, refusal before an expression can error, the
+cast passing, and unreadable catalog access. ADR-0019 §7 and SPEC §9.9 state
+this exception alongside the one-output-column rule. Types with server binary
+output but no client renderer still produce marked unrenderable evidence.

@@ -704,17 +704,16 @@ impl Conn {
         }
     }
 
-    /// Streams one extended-protocol query into bounded assertion evidence.
-    /// A truncated result closes the session; callers must discard it.
-    pub async fn query_bounded(
-        &mut self,
-        sql: &str,
-        timeout: std::time::Duration,
-    ) -> Result<query::QueryEvidence, DbError> {
+    /// Describes one statement without executing it, borrowing this connection
+    /// until the caller has checked its result types and consumed the query.
+    pub async fn prepare_query(&mut self, sql: &str) -> Result<query::PreparedQuery<'_>, DbError> {
         match self {
-            Conn::Postgres(c) => c.query_bounded(sql, timeout).await,
+            Conn::Postgres(conn) => {
+                let prepared = conn.prepare_query(sql).await?;
+                Ok(query::PreparedQuery { conn, prepared })
+            }
             Conn::Mssql(_) => Err(DbError::Refused(
-                "bounded assertion queries are implemented for PostgreSQL only".into(),
+                "prepared assertion queries are implemented for PostgreSQL only".into(),
             )),
         }
     }

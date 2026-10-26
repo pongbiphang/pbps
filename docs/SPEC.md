@@ -3423,9 +3423,18 @@ business-key lookup; they cannot enable IDENTITY_INSERT by acquiring ALTER.
 No user SQL runs with provisioning credentials or production connections.
 
 Each assertion file holds one query returning one tabular result set with at
-least one output column, of arbitrary types. A zero-column result is an invalid
+least one output column. A zero-column result is an invalid
 assertion whether it contains zero rows or any rows, distinct from pass and
-violation; the refusal points to `SELECT 1 ...` (DEC-1165.1). For a valid result
+violation; the refusal points to `SELECT 1 ...` (DEC-1165.1). PostgreSQL also
+refuses a described column whose type has no binary output, recursively
+checking domain bases and array elements through `pg_type.typsend` in the same
+READ ONLY transaction before executing the user statement. This is
+InvalidResult, naming the column/type with "cast it to text, e.g. `col::text`"
+as its remedy, even for NULL or zero rows. Nothing executes; it is never pass,
+SQL error or violation. An unreadable/missing lookup is Unanswerable. The
+measured failure is 42883 on both supported builds (DEC-1165.3); no driver fork
+or simple-query fallback is used. Other types without a client renderer
+produce marked unrenderable cells. For a valid result
 shape, zero rows is pass and any row (including NULL) is a violation. Evidence
 is bounded. Errors,
 missing/unreadable results and driver timeouts are never pass. PostgreSQL uses

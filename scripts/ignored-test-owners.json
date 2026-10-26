@@ -1900,6 +1900,7 @@
         "assertions1165::row_and_byte_limits_close_the_stream_without_collecting_the_result",
         "assertions1165::sql_errors_timeout_and_transport_loss_never_become_passes",
         "assertions1165::a_deadline_stops_the_assertion_backend_instead_of_leaving_it_running",
+        "assertions1165::types_without_binary_output_are_invalid_before_execution",
         "user_types_tests::a_read_that_fails_is_unreadable_and_never_absent",
         "user_types_tests::absent_shell_and_unusable_types_are_three_different_results",
         "managed_types_tests::managed_types_and_their_columns_survive_pull_recreation_and_repull",

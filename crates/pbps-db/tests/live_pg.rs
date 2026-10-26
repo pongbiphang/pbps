@@ -388,7 +388,10 @@ async fn a_bounded_query_timeout_is_an_error_and_discards_the_session1165() {
             .await
             .unwrap();
         let error = conn
-            .query_bounded("SELECT pg_sleep(30)", std::time::Duration::from_millis(100))
+            .prepare_query("SELECT pg_sleep(30)")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("driver timeout"), "{error:?}");
@@ -409,10 +412,10 @@ async fn bounded_query_metadata_and_nulls_survive_an_empty_or_truncated_stream11
             .await
             .unwrap();
         let empty = conn
-            .query_bounded(
-                "SELECT NULL::text AS name WHERE false",
-                std::time::Duration::from_secs(5),
-            )
+            .prepare_query("SELECT NULL::text AS name WHERE false")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_secs(5))
             .await
             .unwrap();
         assert!(empty.rows.is_empty());
@@ -420,10 +423,10 @@ async fn bounded_query_metadata_and_nulls_survive_an_empty_or_truncated_stream11
         assert_eq!(empty.columns[0].type_name, "pg_catalog.text");
         assert!(!empty.truncated);
         let rows = conn
-            .query_bounded(
-                "SELECT NULL::text FROM generate_series(1,1000000)",
-                std::time::Duration::from_secs(5),
-            )
+            .prepare_query("SELECT NULL::text FROM generate_series(1,1000000)")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(rows.rows.len(), 20);

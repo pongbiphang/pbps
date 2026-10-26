@@ -38,6 +38,17 @@ pub struct Conn {
     _driver: DriverTask,
 }
 
+pub(crate) struct PreparedQuery {
+    statement: tokio_postgres::Statement,
+    pub(crate) columns: Vec<crate::query::QueryColumn>,
+}
+
+impl PreparedQuery {
+    pub(crate) fn type_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.statement.columns().iter().map(|c| c.type_().oid())
+    }
+}
+
 // Abort also on cancellation: dropping a JoinHandle alone detaches the socket
 // task, which could otherwise keep a timed-out assertion running server-side.
 struct DriverTask(tokio::task::JoinHandle<()>);
@@ -523,12 +534,27 @@ impl Conn {
             .collect())
     }
 
-    pub(crate) async fn query_bounded(
+    pub(crate) async fn prepare_query(&mut self, sql: &str) -> Result<PreparedQuery, DbError> {
+        // Describe exactly the original statement, including zero-row metadata.
+        // The extended protocol refuses multiple statements with 42601.
+        let statement = self.client.prepare(sql).await?;
+        let columns = statement
+            .columns()
+            .iter()
+            .map(|c| crate::query::QueryColumn {
+                name: c.name().to_owned(),
+                type_name: format!("{}.{}", c.type_().schema(), c.type_().name()),
+            })
+            .collect();
+        Ok(PreparedQuery { statement, columns })
+    }
+
+    pub(crate) async fn query_prepared_bounded(
         &mut self,
-        sql: &str,
+        prepared: PreparedQuery,
         timeout: std::time::Duration,
     ) -> Result<crate::query::QueryEvidence, DbError> {
-        match tokio::time::timeout(timeout, self.read_bounded(sql)).await {
+        match tokio::time::timeout(timeout, self.read_bounded(prepared)).await {
             Ok(result) => result,
             Err(_) => {
                 self._driver.0.abort();
@@ -537,27 +563,20 @@ impl Conn {
         }
     }
 
-    async fn read_bounded(&mut self, sql: &str) -> Result<crate::query::QueryEvidence, DbError> {
-        use crate::query::{MAX_BYTES, MAX_ROWS, QueryColumn, QueryEvidence};
+    async fn read_bounded(
+        &mut self,
+        prepared: PreparedQuery,
+    ) -> Result<crate::query::QueryEvidence, DbError> {
+        use crate::query::{MAX_BYTES, MAX_ROWS, QueryEvidence};
         use futures_util::TryStreamExt;
-        // Parse exactly the original statement. Preparing also retains column
-        // metadata for zero rows, and refuses multiple statements with 42601.
-        let statement = self.client.prepare(sql).await?;
         let mut evidence = QueryEvidence {
-            columns: statement
-                .columns()
-                .iter()
-                .map(|c| QueryColumn {
-                    name: c.name().to_owned(),
-                    type_name: format!("{}.{}", c.type_().schema(), c.type_().name()),
-                })
-                .collect(),
+            columns: prepared.columns,
             rows: Vec::new(),
             truncated: false,
         };
         let stream = self
             .client
-            .query_raw(&statement, std::iter::empty::<&str>())
+            .query_raw(&prepared.statement, std::iter::empty::<&str>())
             .await?;
         let mut stream = std::pin::pin!(stream);
         let mut remaining = MAX_BYTES;

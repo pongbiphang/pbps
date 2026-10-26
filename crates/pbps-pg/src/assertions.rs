@@ -2,7 +2,10 @@
 //! The caller provisions SELECT-only grants; this runner additionally refuses
 //! elevated logins. Target assertions can use it without a scratch dependency.
 
-use pbps_db::{Conn, DbError, Driver, query::QueryEvidence};
+use pbps_db::{
+    Conn, DbError, Driver,
+    query::{PreparedQuery, QueryEvidence},
+};
 use std::time::Duration;
 
 /// Internal execution facts for the future CLI report, not a wire format.
@@ -10,7 +13,7 @@ use std::time::Duration;
 pub enum AssertionResult {
     Pass(QueryEvidence),
     Violation(QueryEvidence),
-    InvalidResult { message: &'static str },
+    InvalidResult { message: String },
     SqlError(DbError),
     BoundaryViolation,
     Unanswerable(DbError),
@@ -90,17 +93,22 @@ async fn run_inner(
         Ok(None) => return AssertionResult::BoundaryViolation,
         Err(error) => return AssertionResult::Unanswerable(error),
     };
-    let evidence = match conn
-        .query_bounded(
-            sql,
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        )
+    let mut prepared = match conn.prepare_query(sql).await {
+        Ok(prepared) => prepared,
+        Err(error) if is_sql_error(&error) => return AssertionResult::SqlError(error),
+        Err(error) => return AssertionResult::Unanswerable(error),
+    };
+    match binary_outputs(&mut prepared).await {
+        Ok(Some(message)) => return AssertionResult::InvalidResult { message },
+        Ok(None) => {}
+        Err(error) => return AssertionResult::Unanswerable(error),
+    }
+    let evidence = match prepared
+        .query_bounded(deadline.saturating_duration_since(tokio::time::Instant::now()))
         .await
     {
         Ok(evidence) => evidence,
-        Err(error) if is_sql_error(&error) => {
-            return AssertionResult::SqlError(error);
-        }
+        Err(error) if is_sql_error(&error) => return AssertionResult::SqlError(error),
         Err(error) => return AssertionResult::Unanswerable(error),
     };
     // A bounded stream was closed by the driver. Only completed streams can
@@ -118,13 +126,69 @@ async fn run_inner(
     // DEC-1165.1: zero columns cannot establish a tabular assertion result.
     if evidence.columns.is_empty() {
         AssertionResult::InvalidResult {
-            message: "an assertion must return at least one output column; use SELECT 1 ...",
+            message: "an assertion must return at least one output column; use SELECT 1 ...".into(),
         }
     } else if evidence.rows.is_empty() && !evidence.truncated {
         AssertionResult::Pass(evidence)
     } else {
         AssertionResult::Violation(evidence)
     }
+}
+
+// DEC-1165.3: the native driver requests binary results. Check the server's
+// capability before binding the user statement, even when it would return no rows.
+async fn binary_outputs(prepared: &mut PreparedQuery<'_>) -> Result<Option<String>, DbError> {
+    let ids: Vec<_> = prepared.type_ids().collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let roots = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let rows = prepared
+        .query(&format!(
+            "WITH RECURSIVE types(root, oid) AS ( \
+         SELECT id, id FROM pg_catalog.unnest(ARRAY[{roots}]::oid[]) AS id \
+         UNION \
+         SELECT types.root, child.oid FROM types \
+         JOIN pg_catalog.pg_type t ON t.oid = types.oid \
+         CROSS JOIN LATERAL (SELECT CASE WHEN t.typtype = 'd' THEN t.typbasetype \
+             WHEN t.typcategory = 'A' THEN t.typelem ELSE 0::oid END AS oid) child \
+         WHERE child.oid <> 0::oid) \
+         SELECT types.root::bigint AS root, t.typsend <> 0::oid AS sends \
+         FROM types LEFT JOIN pg_catalog.pg_type t ON t.oid = types.oid"
+        ))
+        .await?;
+    let mut capabilities = std::collections::BTreeMap::new();
+    for row in rows {
+        let (Some(root), Some(sends)) =
+            (row.try_get::<i64>("root")?, row.try_get::<bool>("sends")?)
+        else {
+            return Err(DbError::BadRow(
+                "unreadable assertion type binary output capability".into(),
+            ));
+        };
+        capabilities
+            .entry(root)
+            .and_modify(|value| *value &= sends)
+            .or_insert(sends);
+    }
+    for (id, column) in ids.iter().zip(prepared.columns()) {
+        match capabilities.get(&i64::from(*id)) {
+            Some(true) => {}
+            Some(false) => {
+                return Ok(Some(format!(
+                    "assertion column {:?} of type {} has no binary output; cast it to text, e.g. `col::text`",
+                    column.name, column.type_name,
+                )));
+            }
+            None => {
+                return Err(DbError::BadRow(format!(
+                    "missing binary output capability for {}",
+                    column.type_name
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 async fn prepare(conn: &mut Conn, deadline: tokio::time::Instant) -> Result<(), DbError> {

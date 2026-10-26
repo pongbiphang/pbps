@@ -528,3 +528,115 @@ async fn a_deadline_stops_the_assertion_backend_instead_of_leaving_it_running() 
         f.finish().await;
     }
 }
+
+#[tokio::test]
+#[ignore = "needs both pinned PostgreSQL fixtures"]
+async fn types_without_binary_output_are_invalid_before_execution() {
+    for server in servers() {
+        let mut f = Fixture::new(server, "binarysender").await;
+        f.admin
+            .execute(
+                "CREATE DOMAIN app.no_binary AS pg_catalog.aclitem; \
+            CREATE DOMAIN app.no_binary_array AS app.no_binary[]",
+            )
+            .await
+            .unwrap();
+        for (shape, sql, column, type_name) in [
+            (
+                "value",
+                "SELECT 'postgres=arwdDxt/postgres'::aclitem AS blocked",
+                "blocked",
+                "aclitem",
+            ),
+            (
+                "null",
+                "SELECT NULL::aclitem AS blocked",
+                "blocked",
+                "aclitem",
+            ),
+            (
+                "empty",
+                "SELECT NULL::aclitem AS blocked WHERE false",
+                "blocked",
+                "aclitem",
+            ),
+            (
+                "domain",
+                "SELECT NULL::app.no_binary AS domain_value",
+                "domain_value",
+                "aclitem",
+            ),
+            (
+                "array",
+                "SELECT ARRAY[NULL::aclitem] AS array_value",
+                "array_value",
+                "_aclitem",
+            ),
+            (
+                "array of domains",
+                "SELECT NULL::app.no_binary[] AS nested",
+                "nested",
+                "_no_binary",
+            ),
+            (
+                "domain over array of domains",
+                "SELECT NULL::app.no_binary_array AS nested",
+                "nested",
+                "_no_binary",
+            ),
+            // Division by zero would be a SQL error if binding/execution were reached.
+            (
+                "never executed",
+                "SELECT 1/0 AS other, NULL::aclitem AS blocked",
+                "blocked",
+                "aclitem",
+            ),
+        ] {
+            let result = f.run(sql).await;
+            println!("{shape}: {result:?}");
+            let AssertionResult::InvalidResult { message } = result else {
+                panic!("{shape}: {result:?}");
+            };
+            assert!(
+                message.contains(column) && message.contains(type_name),
+                "{shape}: {message}"
+            );
+            assert!(
+                message.contains("cast it to text, e.g. `col::text`"),
+                "{message}"
+            );
+        }
+        assert!(matches!(
+            f.run("SELECT NULL::aclitem::text WHERE false").await,
+            AssertionResult::Pass(_)
+        ));
+        assert!(matches!(
+            f.run("SELECT NULL::app.no_binary[]::text WHERE false")
+                .await,
+            AssertionResult::Pass(_)
+        ));
+        assert_eq!(
+            violation(
+                f.run("SELECT 'postgres=arwdDxt/postgres'::aclitem::text")
+                    .await
+            )
+            .rows[0][0],
+            EvidenceCell::Text {
+                value: "postgres=arwdDxt/postgres".into(),
+                truncated: false
+            }
+        );
+        // Catalog permissions are local to this disposable database. A failed
+        // runner lookup is not the user's SQL error and cannot establish pass.
+        f.admin
+            .execute("REVOKE SELECT ON pg_catalog.pg_type FROM PUBLIC")
+            .await
+            .unwrap();
+        let result = f.run("SELECT 1 WHERE false").await;
+        let AssertionResult::Unanswerable(error) = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(error.server_error_code().as_deref(), Some("42501"));
+        f.finish().await;
+    }
+}
