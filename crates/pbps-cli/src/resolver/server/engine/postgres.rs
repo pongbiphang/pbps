@@ -1173,13 +1173,12 @@ async fn run_externals(
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
         // type the script creates may be named `text`: for the session, not
         // the transaction, as what runs after the commit relies on it too.
+        reset_settings(session, "the externals file session").await?;
         if !checked {
-            // Kept: the claim's defaults move with them, in this transaction.
             return record::rebase(session)
                 .await
                 .map_err(read("the scratch database's claim"));
         }
-        reset_settings(session, "the externals file session").await?;
         let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;

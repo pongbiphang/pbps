@@ -1024,67 +1024,106 @@ async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recover
     // Under `outside_writes: allow` the externals file's change to the
     // login's own defaults is kept, so the claim's baseline moves with it.
     // Recovery that compared against the old baseline would call the kept
-    // default a failed cleanup and never remove the claim.
+    // default a failed cleanup and never remove the claim. The file's own
+    // `SET`s outlast it in the transaction, so the claim is rewritten under
+    // whatever role and path it left: a type named `text`, another role.
+    const SET: &str = "ALTER ROLE CURRENT_USER SET work_mem = '5MB';";
+    let cases = [
+        ("plain", SET.to_owned(), false),
+        (
+            "a type named text first on the path",
+            format!(
+                "CREATE SCHEMA ext; CREATE TYPE ext.text AS ENUM ('a'); {SET} SET search_path = ext, pg_catalog;"
+            ),
+            false,
+        ),
+        (
+            "another role and another path",
+            format!("{SET} SET ROLE ROLE_NAME; SET search_path = pg_catalog, pg_temp;"),
+            true,
+        ),
+    ];
     for server in SERVERS {
-        let mut fixture = Fixture::new(server);
-        let target_db = fixture.target().await;
-        let (login, scratch_db) = fixture.confined().await;
-        let go = |externals: Option<&'static str>| {
-            let (scratch, target) = (
-                fixture.as_login(&scratch_db, &login),
-                fixture.on(&target_db),
-            );
-            async move {
-                let inputs = Inputs::overload();
-                let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
-                let identity = sql::cluster_identity(&mut planning).await.unwrap();
-                super::super::produce(
-                    Driver::Postgres,
-                    &scratch,
-                    &target,
-                    &identity,
-                    &inputs.binding(),
-                    inputs.base(),
-                    inputs.desired(),
-                    &inputs.hints,
-                    &[],
-                    &ProjectKey::new(true).project,
-                    Some(super::ENVIRONMENT),
-                    &standard::Standard::default(),
-                    externals,
-                    &super::super::Provenance {
-                        entry: "scratch".into(),
-                        scratch: pbps_model::resolver::ScratchSource::Server {},
-                        outside_writes: pbps_model::resolver::OutsideWrites::Allowed,
-                        same_instance: pbps_model::resolver::SameInstance::NotApplicable,
-                    },
-                )
-                .await
+        for (case, externals, other_role) in &cases {
+            let mut fixture = Fixture::new(server);
+            let target_db = fixture.target().await;
+            let (login, scratch_db) = fixture.confined().await;
+            let mut externals = externals.clone();
+            if *other_role {
+                let role = fixture.role("g").await;
+                fixture
+                    .admin()
+                    .await
+                    .execute(&format!("GRANT {role} TO {}", login.0))
+                    .await
+                    .unwrap();
+                externals = externals.replace("ROLE_NAME", &role);
             }
-        };
-        engine::stop_after_cleanup(&scratch_db, true);
-        let stopped = go(Some("ALTER ROLE CURRENT_USER SET work_mem = '5MB';")).await;
-        engine::stop_after_cleanup(&scratch_db, false);
-        let between = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
-        let finished = go(None).await;
-        let after = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
-        let mut as_login = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-            .await
-            .unwrap();
-        let kept = sql::login_defaults(&mut as_login).await.unwrap();
-        fixture.drop().await;
-        assert!(
-            format!("{:?}", stopped.as_ref().err()).contains("stopped after the cleanup"),
-            "{server}: the run stopped where it was told to: {:?}",
-            stopped.err()
-        );
-        assert!(between, "{server}: the claim outlives the stopped cleanup");
-        assert!(finished.is_ok(), "{server}: {:?}", finished.err());
-        assert!(!after, "{server}: recovery removed the claim");
-        assert_eq!(
-            kept,
-            BTreeSet::from([(String::new(), "work_mem=5MB".to_owned())]),
-            "{server}: the kept default is unchanged"
-        );
+            let go = |externals: Option<String>| {
+                let (scratch, target) = (
+                    fixture.as_login(&scratch_db, &login),
+                    fixture.on(&target_db),
+                );
+                async move {
+                    let inputs = Inputs::overload();
+                    let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
+                    let identity = sql::cluster_identity(&mut planning).await.unwrap();
+                    super::super::produce(
+                        Driver::Postgres,
+                        &scratch,
+                        &target,
+                        &identity,
+                        &inputs.binding(),
+                        inputs.base(),
+                        inputs.desired(),
+                        &inputs.hints,
+                        &[],
+                        &ProjectKey::new(true).project,
+                        Some(super::ENVIRONMENT),
+                        &standard::Standard::default(),
+                        externals.as_deref(),
+                        &super::super::Provenance {
+                            entry: "scratch".into(),
+                            scratch: pbps_model::resolver::ScratchSource::Server {},
+                            outside_writes: pbps_model::resolver::OutsideWrites::Allowed,
+                            same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+                        },
+                    )
+                    .await
+                }
+            };
+            let kept = BTreeSet::from([(String::new(), "work_mem=5MB".to_owned())]);
+            engine::stop_after_cleanup(&scratch_db, true);
+            let stopped = go(Some(externals)).await;
+            engine::stop_after_cleanup(&scratch_db, false);
+            let mut as_login =
+                Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+                    .await
+                    .unwrap();
+            let claimed = match record::read_claim(&mut as_login).await.unwrap() {
+                Some(Ok(claim)) => Some(claim.defaults),
+                _ => None,
+            };
+            // The confined login allows one connection.
+            drop(as_login);
+            let finished = go(None).await;
+            let after = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
+            let mut as_login =
+                Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+                    .await
+                    .unwrap();
+            let left = sql::login_defaults(&mut as_login).await.unwrap();
+            drop(as_login);
+            fixture.drop().await;
+            let stop = format!("{:?}", stopped.as_ref().err());
+            assert!(
+                stop.contains("stopped after the cleanup") && !stop.contains("externals"),
+                "{server}, {case}: only the stop, not the externals file: {stop}"
+            );
+            assert_eq!(claimed, Some(kept.clone()), "{server}, {case}: the claim");
+            assert!(finished.is_ok(), "{server}, {case}: {:?}", finished.err());
+            assert!(!after, "{server}, {case}: recovery removed the claim");
+            assert_eq!(left, kept, "{server}, {case}: the kept default");
+        }
     }
 }

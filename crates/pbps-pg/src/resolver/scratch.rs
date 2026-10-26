@@ -12,9 +12,8 @@ use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
 
 /// What the keeper session sets so the engine notices a vanished client
-/// (#2410). They are `SET`s, which `RESET ALL` and `DISCARD ALL` clear, so a
-/// session that runs either sends them again; `application_name` is given at
-/// connection, where `DISCARD ALL` leaves it.
+/// (#2410). `RESET ALL` and `DISCARD ALL` clear them, so a session that runs
+/// either sends them again; `application_name` is set at connection instead.
 pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_interval = 10; \
      SET tcp_keepalives_count = 3; \
@@ -533,7 +532,7 @@ pub async fn login_defaults(
 ) -> Result<std::collections::BTreeSet<(String, String)>, DbError> {
     let rows = conn
         .query(
-            "SELECT coalesce(d.datname::text, '') AS database, e.entry AS entry \
+            "SELECT coalesce(d.datname::pg_catalog.text, '') AS database, e.entry AS entry \
                FROM pg_catalog.pg_db_role_setting s \
                LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
                CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS e(entry) \

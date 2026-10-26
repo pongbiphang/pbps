@@ -76,8 +76,7 @@ impl ScratchNames {
     }
 
     /// The names a run creates, each carrying its token: what ties a leftover
-    /// database to its login and roles, and to the session that proves the run
-    /// is gone (#2410).
+    /// to its login and to the session that proves the run gone (#2410).
     pub fn for_run(token: &str, password: String) -> Result<Self, UnsupportedScratchName> {
         if !is_run_token(token) {
             return Err(UnsupportedScratchName);

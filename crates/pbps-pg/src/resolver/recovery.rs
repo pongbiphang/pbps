@@ -147,9 +147,8 @@ async fn transaction<C: ExecuteConnection>(
     }
 }
 
-/// Takes the lock for the session: `false` when another run held it for the
-/// whole of [`LOCK_WAIT`]. `lock_timeout` is local to the transaction, so the
-/// session's settings are untouched.
+/// Takes the lock for the session: `false` when another run held it for all
+/// of [`LOCK_WAIT`]. The `lock_timeout` is the transaction's own.
 pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<bool, DbError> {
     match transaction(conn, async |conn| {
         conn.execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
@@ -235,8 +234,8 @@ async fn set_comment(conn: &mut impl ExecuteConnection, comment: &str) -> Result
 }
 
 /// Records the login's defaults as they now stand in the claim, in the
-/// caller's transaction, so both commit together (DEC-2410.1). The schema
-/// stays: a new one would show as the externals file's. No claim, no move.
+/// caller's transaction (DEC-2410.1). The schema stays: a new one would show
+/// as the externals file's. No claim, no move.
 pub async fn rebase(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
     let Some(Ok(mut claim)) = read_claim(conn).await? else {
         return Ok(());

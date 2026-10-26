@@ -4702,7 +4702,8 @@ decide the design, each measured on PostgreSQL 16 and 18.
   What the claim records is what the run found, and the one baseline the run
   later moves is the account's defaults, when `outside_writes: allow` keeps an
   externals file's change to them: the claim is rewritten in that file's own
-  transaction, so no commit holds the kept change with the old baseline, or
+  transaction, under the settings and empty path pbps pins again after the
+  file (its `SET`s and role do not apply), so no commit holds the kept change with the old baseline, or
   the reverse. The ACL is not moved: the release restores it whatever a file
   granted.
 - *Keeping is the safe error.* The sweep never forces: `DROP DATABASE`
