@@ -148,6 +148,29 @@ pub(crate) fn torn_down(dialect: &Mssql, base: &Schema, changes: &[Change]) -> B
     torn
 }
 
+/// The triggers the engine drops with the views in `torn`: measured on 17.0,
+/// `DROP VIEW` takes the view's `INSTEAD OF` triggers with it, and a
+/// `CREATE OR ALTER VIEW` that follows does not bring them back. They go as
+/// their own drop before the view and their own create after it, so the
+/// declaration is what stands afterwards (DEC-2329.1).
+pub(crate) fn with_attached_triggers(base: &Schema, torn: &mut BTreeSet<ModuleId>) {
+    let views: BTreeSet<_> = torn
+        .iter()
+        .filter(|id| {
+            base.modules
+                .get(*id)
+                .is_some_and(|m| m.kind == ModuleKind::View)
+        })
+        .filter_map(|id| id.referenced_name())
+        .collect();
+    torn.extend(
+        base.modules
+            .keys()
+            .filter(|id| id.attached_to().is_some_and(|on| views.contains(on)))
+            .cloned(),
+    );
+}
+
 /// [`torn_down`] for one change, with the modules bound to them.
 pub(crate) fn torn_down_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTreeSet<ModuleId> {
     let mut torn = blocked_by(dialect, base, change);

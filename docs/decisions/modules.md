@@ -2046,14 +2046,30 @@ the drop as it treats any other; a grant to a principal no declaration names
 does not, as for any drop and create. An in-place alter is still `CREATE OR
 ALTER` and keeps its grants.
 
+*What goes with the view.* Measured on 17.0.4075.5, `DROP VIEW` also drops the
+view's `INSTEAD OF` triggers (a `CREATE OR ALTER VIEW` after it does not bring
+them back), while a view's grant is the one `diff_roles` writes again. A
+trigger is not a name the view's body reads, so the lexical scan never finds
+it. `Mssql::schema_bound_teardown` therefore adds the declared triggers on a
+torn-down view (`binding::with_attached_triggers`), and the same loop turns
+them into a drop and a create: the drop before the view's, the create after
+it, by the order modules already have (a trigger after the object it is on).
+Without it the apply succeeded, the read-back found the managed trigger gone
+and the run was recorded as moved. A trigger on a view that stays standing is
+left alone. Extended properties and statistics are not managed on this
+dialect, so nothing else drops with a view that a declaration would restore.
+
 Pinned by `a_bound_view_is_dropped_before_and_created_after_a_retype_of_a_column_it_reads`,
 `a_bound_view_is_rebuilt_only_around_the_changes_the_engine_refuses`,
 `an_unbound_view_is_left_standing_beside_the_same_retype`,
 `a_bound_view_goes_before_the_drop_or_rename_of_its_table`,
 `a_view_bound_to_a_rebuilt_view_is_rebuilt_with_it` and
-`a_bound_view_is_rebuilt_around_an_in_place_alter_of_the_view_it_reads`
+`a_bound_view_is_rebuilt_around_an_in_place_alter_of_the_view_it_reads`,
+`a_trigger_on_a_rebuilt_view_is_dropped_before_it_and_created_after_it` and
+`a_trigger_edited_dropped_or_added_beside_a_rebuilt_view_is_planned_once`
 (`crates/pbps-mssql/tests/engine_effects.rs`); and the live
-`a_schema_bound_view_is_rebuilt_around_a_column_change` and
+`a_schema_bound_view_is_rebuilt_around_a_column_change`,
+`a_trigger_on_a_rebuilt_schema_bound_view_comes_back` and
 `the_catalogs_edges_refuse_what_the_engine_would`
 (`crates/pbps-cli/tests/flow.rs`).
 

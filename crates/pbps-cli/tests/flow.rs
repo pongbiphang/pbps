@@ -4209,6 +4209,112 @@ fn a_schema_bound_view_is_rebuilt_around_a_column_change() {
     assert_eq!(changes_in(&again), 0);
 }
 
+/// #2329: `DROP VIEW` takes the view's `INSTEAD OF` triggers with it, so the
+/// rebuild around a column change puts the declared trigger back: it stands
+/// after the apply, fires, and the view's grant survives. A trigger on a view
+/// the change leaves standing is not in the script.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB (see scripts/live-tests.sh)"]
+fn a_trigger_on_a_rebuilt_schema_bound_view_comes_back() {
+    let server = std::env::var("PBPS_TEST_DB").expect("PBPS_TEST_DB is not set");
+    let own = OwnDatabase::new(&server, "trigger2329");
+    for sql in [
+        "CREATE TABLE dbo.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, a varchar(10) NOT NULL, b int NULL);",
+        "CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT id, a FROM dbo.t;",
+        "CREATE VIEW dbo.v_b WITH SCHEMABINDING AS SELECT id, b FROM dbo.t;",
+        "CREATE TRIGGER dbo.trg_v ON dbo.v INSTEAD OF INSERT AS INSERT INTO dbo.t (id, a) SELECT id, a FROM inserted;",
+        "CREATE TRIGGER dbo.trg_v_b ON dbo.v_b INSTEAD OF INSERT AS INSERT INTO dbo.t (id, a, b) SELECT id, 'b', b FROM inserted;",
+        "CREATE ROLE r_reader;",
+        "GRANT SELECT ON dbo.v TO r_reader;",
+    ] {
+        on_server(own.connection(), sql);
+    }
+    let ok = |o: &Output| assert_eq!(code(o), 0, "{}{}", stdout(o), stderr(o));
+    let d = Demo::new("trigger2329");
+    ok(&d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(&d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    let table = d.dir.join("schema/dbo.t.yml");
+    let text = std::fs::read_to_string(&table).unwrap();
+    let wider = text.replacen("varchar(10)", "varchar(20)", 1);
+    assert_ne!(wider, text, "{text}");
+    std::fs::write(&table, wider).unwrap();
+    ok(&d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
+    };
+    assert!(
+        at("DROP TRIGGER [dbo].[trg_v];") < at("DROP VIEW [dbo].[v];"),
+        "{script}"
+    );
+    assert!(
+        at("CREATE OR ALTER VIEW [dbo].[v]") < at("CREATE OR ALTER TRIGGER [dbo].[trg_v]"),
+        "{script}"
+    );
+    assert!(
+        !script.contains("trg_v_b") && !script.contains("[v_b]"),
+        "{script}"
+    );
+    ok(&d.run(&[
+        "apply",
+        "--db",
+        own.connection(),
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &plan_checksum(&plan),
+        "--allow",
+        "destructive",
+    ]));
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT name FROM sys.triggers WHERE parent_id = OBJECT_ID(N'dbo.v')"
+        ),
+        "trg_v"
+    );
+    on_server(
+        own.connection(),
+        "INSERT INTO dbo.v (id, a) VALUES (1, 'fires');",
+    );
+    assert_eq!(
+        text_on_server(own.connection(), "SELECT a FROM dbo.t WHERE id = 1"),
+        "fires"
+    );
+    assert_eq!(
+        text_on_server(
+            own.connection(),
+            "SELECT permission_name FROM sys.database_permissions \
+             WHERE major_id = OBJECT_ID(N'dbo.v') AND state = 'G'"
+        ),
+        "SELECT"
+    );
+    let again = d.dir.join("again.json");
+    ok(&d.run(&[
+        "plan",
+        "--db",
+        own.connection(),
+        "--out",
+        again.to_str().unwrap(),
+    ]));
+    assert_eq!(changes_in(&again), 0);
+}
+
 /// #2329: an indexed view round trips with its indexes. `pull` writes them and
 /// the clustered one, `plan` is empty, an edit to one index restates the view
 /// and every index (`CREATE OR ALTER VIEW` drops them all), and a retype of a

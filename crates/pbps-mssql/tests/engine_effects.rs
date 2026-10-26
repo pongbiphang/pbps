@@ -1496,3 +1496,97 @@ fn a_views_indexes_are_compared_and_survive_a_rebuild() {
     );
     assert_eq!(steps(&same), Vec::<String>::new());
 }
+
+fn instead_of_trigger() -> (ModuleId, Module) {
+    (
+        ModuleId::Trigger {
+            on: pbps_model::ObjectName::new("dbo", "v"),
+            name: "trg".into(),
+        },
+        Module {
+            kind: ModuleKind::Trigger,
+            definition: "INSTEAD OF INSERT AS INSERT INTO dbo.t(id) SELECT id FROM inserted".into(),
+            description: None,
+            options: Default::default(),
+        },
+    )
+}
+
+/// The engine drops a view's triggers with it (measured on 17.0.4075.5), so a
+/// rebuild of the view that leaves the declared trigger unplanned loses it:
+/// the trigger comes down before the view and goes back after it.
+#[test]
+fn a_trigger_on_a_rebuilt_view_is_dropped_before_it_and_created_after_it() {
+    let view = view_of("SELECT id, a FROM dbo.t", true);
+    let (trigger_id, trigger) = instead_of_trigger();
+    let with_trigger = |a: &str| {
+        let mut s = with_views(a, &[("v", view.clone())]);
+        s.modules.insert(trigger_id.clone(), trigger.clone());
+        s
+    };
+    let plan = Diffed::new(&with_trigger("varchar(10)"), &with_trigger("varchar(20)"));
+    let order = steps(&plan);
+    let at = |step: &str| order.iter().position(|s| s == step).expect(step);
+    assert_eq!(order.len(), 5, "{order:?}");
+    assert!(at("drop dbo.v.trg") < at("drop dbo.v"), "{order:?}");
+    assert!(at("retype a") < at("create dbo.v"), "{order:?}");
+    assert!(at("create dbo.v") < at("create dbo.v.trg"), "{order:?}");
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+    // A view that is not torn down keeps its trigger where it stands, and a
+    // view without one plans no trigger step.
+    let unbound = view_of("SELECT id, a FROM dbo.t", false);
+    let with_unbound = |a: &str| {
+        let mut s = with_views(a, &[("v", unbound.clone())]);
+        s.modules.insert(trigger_id.clone(), trigger.clone());
+        s
+    };
+    let plan = Diffed::new(&with_unbound("varchar(10)"), &with_unbound("varchar(20)"));
+    assert_eq!(steps(&plan), ["retype a"]);
+}
+
+/// A trigger the same plan edits, drops or adds beside the rebuild is planned
+/// once: the edit is not an in-place alter on a view that is not there, and
+/// nothing is dropped or created twice.
+#[test]
+fn a_trigger_edited_dropped_or_added_beside_a_rebuilt_view_is_planned_once() {
+    let view = view_of("SELECT id, a FROM dbo.t", true);
+    let (trigger_id, trigger) = instead_of_trigger();
+    let schema = |a: &str, trigger: Option<Module>| {
+        let mut s = with_views(a, &[("v", view.clone())]);
+        if let Some(trigger) = trigger {
+            s.modules.insert(trigger_id.clone(), trigger);
+        }
+        s
+    };
+    let mut edited = trigger.clone();
+    edited.definition.push_str(" -- edited");
+    for (from, to, expected) in [
+        (
+            Some(trigger.clone()),
+            Some(edited),
+            vec![
+                "drop dbo.v.trg",
+                "drop dbo.v",
+                "retype a",
+                "create dbo.v",
+                "create dbo.v.trg",
+            ],
+        ),
+        (
+            Some(trigger.clone()),
+            None,
+            vec!["drop dbo.v.trg", "drop dbo.v", "retype a", "create dbo.v"],
+        ),
+        (
+            None,
+            Some(trigger),
+            vec!["drop dbo.v", "retype a", "create dbo.v", "create dbo.v.trg"],
+        ),
+    ] {
+        let plan = Diffed::new(&schema("varchar(10)", from), &schema("varchar(20)", to));
+        assert_eq!(steps(&plan), expected);
+        let own: Vec<usize> = (0..plan.changes.len()).collect();
+        assert_eq!(plan.verify(&own), []);
+    }
+}

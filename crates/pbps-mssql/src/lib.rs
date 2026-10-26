@@ -435,8 +435,9 @@ impl Dialect for Mssql {
         declared: &Schema,
         changes: &[Change],
     ) -> std::collections::BTreeSet<ModuleId> {
-        binding::torn_down(self, base, changes)
-            .into_iter()
+        let mut torn = binding::torn_down(self, base, changes);
+        binding::with_attached_triggers(base, &mut torn);
+        torn.into_iter()
             .filter(|id| base.modules.contains_key(id) && declared.modules.contains_key(id))
             .collect()
     }
