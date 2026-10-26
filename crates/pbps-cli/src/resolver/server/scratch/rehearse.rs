@@ -40,6 +40,9 @@ pub async fn with_session<T, E>(
     // dialect configures none, as for the resolver.
     let request = request(driver, base, desired, hints, &[]).map_err(ProduceError::Run)?;
     let standard = standard.into();
+    // Every connection of the run opens the one endpoint found here
+    // (DEC-2271.2), as for the resolver.
+    let scratch = &engine::endpoint(driver, scratch).await?;
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| {
@@ -47,11 +50,10 @@ pub async fn with_session<T, E>(
                 "the target could not be connected: {error}"
             )))
         })?;
-    let mut admin = Conn::connect(driver, scratch)
-        .await
-        .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
-    engine::reset_role(driver, &mut admin).await?;
+    // The token first: the scratch session carries it from its first packet,
+    // and a killed rehearsal is recovered by it (#2410).
     let tokens = Tokens::generate();
+    let mut admin = engine::connect_scratch(driver, scratch, &tokens).await?;
     let (provisioning, mut state) = engine::scratch(
         driver,
         &mut target,
