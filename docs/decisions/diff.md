@@ -8862,14 +8862,34 @@ A schedule has two kinds of edge. `Schedule::edge` states one the caller knows
 the engine needs. `Schedule::prefer` states a guess (`Source::Guess`): obeyed
 like any edge, and when steps wait on one another, `settle` drops the guesses
 whose two ends are in one strongly connected component and settles again, so the
-order stated, which here is the plan's, decides between the members. Each cycle
-lies in one component, so what is left of the cycles holds only stated edges, and
-a cycle of those is the named refusal. A guess in no cycle, or between
+order stated, which here is the plan's, decides between the members. That is two
+steps (round 4). First only the guesses that run against the order given go
+(`after` earlier than `before`): the order given is one the ordinary route proved
+valid, so every cycle has an edge against it, and a guess that runs with it, which
+is the real one when a name collides, stays. Only if steps still wait on one
+another does the second step drop the remaining guesses inside the components
+that are still cyclic. Each cycle lies in one component, so what is left of the
+cycles holds only stated edges, and a cycle of those is the named refusal. A guess in no cycle, or between
 components, is kept. Components, edges and ties are all in ascending order, so
 one input gives one order. The ordinary route never states a guess: its schedules
 and refusals are unchanged. `Dialect::scratch_text_edges_are_guesses` (false by
 default, true for PostgreSQL) is what makes scratch state its text-derived edges
 so; SQL Server states them as before.
+
+Which text an edge reads depends on the position a name occurs in (round 4).
+A column's type spelling is a type position, and a name there names a type, which
+is an enum, a domain, or the row type of a table or view (measured on 16 and 18:
+`x app.a` with `app.a` a table or view that is absent is `42704`, and present it
+is created). A built-in spelling such as `text` binds the engine's own type
+(`pg_catalog` comes first) whatever a view or table `app.text` is, so it names
+nothing a declaration made; `ColumnType::type_ref` is what tells them apart (a
+qualified spelling is `Some`). So scratch's guesses read the type spellings that
+are user-defined and the expressions, never a built-in spelling
+(`Types::Named`); the rule for early indexes reads expressions alone (an index
+is no type); a function is never named by a type spelling, so a function is
+matched in expressions only; the type rule reads the user-defined spellings, as
+it must. Where guesses are not read this way (the ordinary route, SQL Server)
+every spelling is read, as before.
 
 Which edge is which, by what it rests on:
 
@@ -8882,7 +8902,7 @@ Which edge is which, by what it rests on:
 | a partition's own default after its parent's | the declaration | stated |
 | a module after the modules its `depends_on:` names | the user | stated |
 | a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | the call the engine needs at creation (measured, DEC-1364.1); the provider is a function and the text an expression | stated |
-| a module, or a function named only in a type spelling or other declarative text, before a part whose text names it | a name in a text | guess |
+| a view, a trigger or a procedure before a part whose text, expression or user-defined type spelling, names it | a name in a text | guess |
 | a module after the table whose complete shape or first part its text names | a name in a text | guess |
 | a part that names a table after its shape | a name in a text | guess |
 | a module after the module its text calls | a name in a text | guess |
@@ -8929,6 +8949,13 @@ Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_order
 `a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it`,
 `a_routine_an_expression_calls_still_precedes_it_though_named_like_a_type`,
 `a_call_edge_is_stated_only_for_a_function_an_expression_calls`,
+`a_built_in_type_spelling_names_nothing_and_a_qualified_one_names_what_it_spells`,
+`a_function_is_not_named_by_a_type_spelling`,
+`an_index_is_not_named_by_a_type_spelling`,
+`a_view_named_like_a_builtin_type_follows_the_table_it_reads`,
+`a_view_named_like_a_called_function_still_follows_the_table_it_reads`,
+`a_cycle_gives_up_the_guesses_against_the_order_given_before_the_others`,
+`every_guess_in_a_cycle_goes_only_when_the_backward_ones_are_not_enough`,
 `routines_that_call_each_other_at_creation_fall_back_to_the_plans_order`, and the
 live `scratch_rules_compile_on_both_servers` and
 `scratch_refusals_name_what_is_missing`.

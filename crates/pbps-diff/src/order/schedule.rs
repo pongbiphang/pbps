@@ -409,8 +409,12 @@ impl Schedule {
         }
         let mut kept: Vec<&Constraint> = self.constraints.iter().collect();
         let mut emitted = kahn(n, &kept, self.tie);
-        if emitted.len() < n && drop_guesses(n, &mut kept) {
-            emitted = kahn(n, &kept, self.tie);
+        // Steps wait on one another: give up the guesses that run against the
+        // order given first, and the others only if that is not enough.
+        for backward_only in [true, false] {
+            if emitted.len() < n && drop_guesses(n, &mut kept, backward_only) {
+                emitted = kahn(n, &kept, self.tie);
+            }
         }
         if emitted.len() < n {
             // A component made only of annotations is planned today, in the
@@ -523,11 +527,16 @@ impl Schedule {
     }
 }
 
-/// Drops from `kept` every guess between two members of one strongly
-/// connected component, and says whether any was. Each cycle lies inside one
-/// component, so what is left of them holds no guess (DEC-2389.4); a guess
-/// between components, and outside any cycle, is kept.
-fn drop_guesses(n: usize, kept: &mut Vec<&Constraint>) -> bool {
+/// Drops from `kept` the guesses between two members of one strongly
+/// connected component, and says whether any was: those that run against the
+/// order given (`after` earlier than `before`) when `backward_only`, else all
+/// of them. The order given is one the ordinary route proved valid, and each
+/// cycle has an edge against it, so the first step is the least that can
+/// break a cycle that holds a guess against it and keeps the guesses that
+/// run with it. Each cycle lies inside one component, so after the second
+/// step what is left of them holds no guess (DEC-2389.4). A guess between
+/// components, and one in no cycle, is kept.
+fn drop_guesses(n: usize, kept: &mut Vec<&Constraint>, backward_only: bool) -> bool {
     let mut component = vec![usize::MAX; n];
     for (id, members) in components(n, kept).into_iter().enumerate() {
         if members.len() > 1 {
@@ -541,6 +550,7 @@ fn drop_guesses(n: usize, kept: &mut Vec<&Constraint>) -> bool {
         c.source != Source::Guess
             || component[c.before] == usize::MAX
             || component[c.before] != component[c.after]
+            || (backward_only && c.after > c.before)
     });
     kept.len() != before
 }

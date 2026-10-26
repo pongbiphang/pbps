@@ -390,6 +390,20 @@ async fn scratch_rules_compile_on_both_servers() {
             declared_type("app.value", domain_with("app.positive", None, None)),
         ],
         parameter_named_like_an_index(),
+        // Round 4: the view `app.text` that reads a table whose column is of
+        // type `text`, with the table held for its function (on 16).
+        vec![
+            create("t", held_table_with_text()),
+            view_named_like_the_type(),
+            function("f"),
+        ],
+        // A view named like the function a generation calls, and one named by
+        // a qualified type spelling.
+        vec![
+            create("t", held_table()),
+            module("app.f", ModuleKind::View, "SELECT * FROM app.t"),
+            function("f"),
+        ],
         // A type spelling is no call: the view `app.text` and a routine of
         // that name, reading the table whose column is of type `text`, follow
         // it (DEC-2389.4); a routine of the name that a generation or a default
@@ -1018,6 +1032,11 @@ fn the_fallback_gives_the_same_order_twice() {
     let inputs = [
         parameter_named_like_an_index(),
         vec![
+            create("t", held_table_with_text()),
+            view_named_like_the_type(),
+            function("f"),
+        ],
+        vec![
             create("t", held_table()),
             function("f"),
             sql("g", "h"),
@@ -1183,12 +1202,13 @@ fn a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it() {
             at(&order, "table app.t") < at(&order, "function app.text(integer)"),
             "{order:?}"
         );
-        // The match is still a guess, and one in no cycle orders: a routine of
-        // that name that reads nothing goes ahead of the table.
+        // A function is no type: where it is named by a type spelling alone it
+        // is no reference, so a routine of that name that reads nothing keeps
+        // its place after the table (round 4).
         let idle = routine("text", "sql", " SELECT $1 + 1 ");
         let order = self::order(&[create("t", text_typed()), idle], version);
         assert!(
-            at(&order, "function app.text(integer)") < at(&order, "table app.t"),
+            at(&order, "table app.t") < at(&order, "function app.text(integer)"),
             "{order:?}"
         );
     }
@@ -1282,10 +1302,149 @@ fn a_call_edge_is_stated_only_for_a_function_an_expression_calls() {
         call_edge(&called, ModuleKind::Procedure, "f"),
         Some(Source::Guess)
     );
-    // Only the type spelling `text` names the function, which nothing calls.
+    // Only the type spelling `text` names the function, which nothing calls,
+    // and a function is no type: no edge at all (round 4).
     let spelled = [create("t", text_typed()), function("text")];
+    assert_eq!(call_edge(&spelled, ModuleKind::Function, "text"), None);
+}
+
+/// A name is matched by the position it occurs in (DEC-2389.4). A built-in type
+/// spelling names nothing a declaration made, so `x text` makes no edge with a
+/// view `app.text`; a spelling qualified by its schema names a user-defined
+/// type, the row type of that view among them (measured on 16 and 18: absent,
+/// `42704`), and it does.
+#[test]
+fn a_built_in_type_spelling_names_nothing_and_a_qualified_one_names_what_it_spells() {
+    use pbps_diff::order::Source;
+    let builtin = [create("t", text_typed()), view_named_like_the_type()];
+    assert_eq!(call_edge(&builtin, ModuleKind::View, "text"), None);
+    // Negative: `app.t(x app.text)` needs the row type of the view.
+    let mut qualified = Table::default();
+    qualified
+        .columns
+        .insert("x".into(), Column::new("app.text".parse().unwrap()));
+    let reading = [
+        create("t", qualified),
+        module("app.text", ModuleKind::View, "SELECT 1 AS n"),
+    ];
     assert_eq!(
-        call_edge(&spelled, ModuleKind::Function, "text"),
+        call_edge(&reading, ModuleKind::View, "text"),
         Some(Source::Guess)
     );
+    for version in [None, Some(160_000), Some(180_000)] {
+        let order = self::order(&reading, version);
+        assert!(
+            at(&order, "view app.text") < at(&order, "table app.t"),
+            "{order:?}"
+        );
+    }
+}
+
+/// A function is no type, so a type spelling that is qualified, and so is read,
+/// still does not name it: the enum `app.f` of a column and the function
+/// `app.f(integer)` share a name and no edge.
+#[test]
+fn a_function_is_not_named_by_a_type_spelling() {
+    let mut typed = Table::default();
+    typed
+        .columns
+        .insert("x".into(), Column::new("app.f".parse().unwrap()));
+    let changes = [
+        create("t", typed),
+        declared_type("app.f", mood()),
+        function("f"),
+    ];
+    assert_eq!(call_edge(&changes, ModuleKind::Function, "f"), None);
+}
+
+/// `app.t(x text, g integer GENERATED ALWAYS AS (app.f(z)) STORED, z integer)`,
+/// a view `app.text` that reads it and an independent `app.f(integer)` (round
+/// 4, on 16): the type `text` names no view, and where a name does collide the
+/// guess against the order given goes first.
+fn held_table_with_text() -> Table {
+    let mut table = held_table();
+    table
+        .columns
+        .insert("x".into(), Column::new("text".parse().unwrap()));
+    table
+}
+
+#[test]
+fn a_view_named_like_a_builtin_type_follows_the_table_it_reads() {
+    let changes = [
+        create("t", held_table_with_text()),
+        view_named_like_the_type(),
+        function("f"),
+    ];
+    for version in [None, Some(160_000), Some(180_000)] {
+        let order = self::order(&changes, version);
+        assert!(
+            at(&order, "table app.t") < at(&order, "view app.text"),
+            "{version:?}: {order:?}"
+        );
+    }
+}
+
+/// A guess-only cycle whose forward guess is the real one: a view named like
+/// the function a generation calls (`app.f`) reads the table, which waits for
+/// that function. Nothing but the name collides, so no rule about positions
+/// removes the guess against the order, and the view keeps its place after the
+/// table only because that guess goes first (round 4).
+#[test]
+fn a_view_named_like_a_called_function_still_follows_the_table_it_reads() {
+    let changes = [
+        create("t", held_table()),
+        module("app.f", ModuleKind::View, "SELECT * FROM app.t"),
+        function("f"),
+    ];
+    for version in [None, Some(160_000), Some(180_000)] {
+        let order = self::order(&changes, version);
+        assert!(
+            at(&order, "table app.t") < at(&order, "view app.f"),
+            "{version:?}: {order:?}"
+        );
+    }
+}
+
+/// Whether the schedule scratch settles states a guess from a step of the table
+/// `from` to a step of the table `to`.
+fn guesses_between(changes: &[Change], from: &str, to: &str) -> bool {
+    let pg = crate::Postgres::new().with_server_version(180_000);
+    let plan = crate::resolver::reconstruct::fixture_plan(changes);
+    let ids = crate::resolver::reconstruct::fixture_ids(changes);
+    let prepared =
+        pbps_diff::order::scratch::prepare(&plan, &ids, &pbps_model::ModuleDeps::new(), &pg)
+            .unwrap();
+    let steps = &prepared.changes().changes;
+    let of = |at: usize, table: &str| steps[at].change.table().is_some_and(|t| t.name == table);
+    prepared.edges().iter().any(|c| {
+        c.source == pbps_diff::order::Source::Guess && of(c.before, from) && of(c.after, to)
+    })
+}
+
+/// The rule for indexes reads no type spelling: an index is no type. A table
+/// `u(x text)` does not follow an index of another table that is named `text`,
+/// where a table whose expression casts to that index (`'app.text'::regclass`)
+/// still does.
+#[test]
+fn an_index_is_not_named_by_a_type_spelling() {
+    let mut keeping = Table::default();
+    keeping.columns.insert("a".into(), int());
+    keeping
+        .indexes
+        .insert("text".into(), keyed("a", false, None));
+    let mut naming = Table::default();
+    let mut column = int();
+    column.value_source = ValueSource::Default("'app.text'::regclass::oid::int".into());
+    naming.columns.insert("n".into(), column);
+    assert!(!guesses_between(
+        &[create("t", keeping.clone()), create("u", text_typed())],
+        "t",
+        "u"
+    ));
+    assert!(guesses_between(
+        &[create("t", keeping), create("u", naming)],
+        "t",
+        "u"
+    ));
 }

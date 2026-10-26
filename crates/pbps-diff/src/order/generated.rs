@@ -233,7 +233,23 @@ fn change_texts<'a>(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
 ) -> Vec<std::borrow::Cow<'a, str>> {
-    read_texts(texts(change), dialect, scratch)
+    read_texts(
+        gather(change, reading_types(dialect, scratch)),
+        dialect,
+        scratch,
+    )
+}
+
+/// The type spellings scratch's guesses read: only those that name a
+/// user-defined type, since a built-in spelling such as `text` binds the
+/// engine's own type whatever a view or routine of that name is (DEC-2389.4).
+/// Every spelling where the edges are stated, as the ordinary route reads them.
+fn reading_types(dialect: &(impl Dialect + ?Sized), scratch: bool) -> Types {
+    if scratch && dialect.scratch_text_edges_are_guesses() {
+        Types::Named
+    } else {
+        Types::All
+    }
 }
 
 fn read_texts<'a>(
@@ -602,26 +618,53 @@ pub(super) fn expand_in(
     Ok(added)
 }
 
-fn texts(change: &Change) -> Vec<&str> {
-    gather(change, true)
-}
-
 /// The texts of `change` that are expressions: a default, a generated or
 /// computed expression, a check, an index expression or predicate, a policy.
-/// Not a type spelling, which names a type and calls nothing (DEC-2389.4).
+/// What names an index or a routine is read here and nowhere else a type
+/// spelling is (DEC-2389.4).
 fn expressions(change: &Change) -> Vec<&str> {
-    gather(change, false)
+    gather(change, Types::Omit)
 }
 
-fn gather(change: &Change, with_types: bool) -> Vec<&str> {
-    fn column(c: &pbps_model::Column, with_types: bool) -> Vec<&str> {
+/// Which type spellings a read of the texts of a change includes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Types {
+    /// None: only the expressions.
+    Omit,
+    /// Those that name a user-defined type ([`named`]).
+    Named,
+    /// Every one, as the ordinary route reads them.
+    All,
+}
+
+fn spelling(ty: &pbps_model::ColumnType, types: Types) -> Option<&str> {
+    match types {
+        Types::Omit => None,
+        Types::Named => named(ty),
+        Types::All => Some(ty.base.as_str()),
+    }
+}
+
+/// The spelling of `ty` where it names something a declaration made: a type
+/// qualified by its schema, which is an enum, a domain or the row type of a
+/// table or view (measured on 16 and 18: absent, `42704`). A built-in spelling
+/// such as `text` binds the engine's own type whatever a view or table of that
+/// name is, so it names nothing here.
+fn named(ty: &pbps_model::ColumnType) -> Option<&str> {
+    ty.type_ref()
+        .filter(|r| r.schema() != "pg_catalog")
+        .map(|_| ty.base.as_str())
+}
+
+/// The texts of `change`: its expressions and the type spellings `types` says.
+fn gather(change: &Change, types: Types) -> Vec<&str> {
+    fn column(c: &pbps_model::Column, types: Types) -> Vec<&str> {
         let expression = match &c.value_source {
             ValueSource::Default(t) => Some(t.as_str()),
             ValueSource::Generated(g) => Some(g.expression.as_str()),
             ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
         };
-        with_types
-            .then_some(c.ty.base.as_str())
+        spelling(&c.ty, types)
             .into_iter()
             .chain(expression)
             .collect()
@@ -638,15 +681,16 @@ fn gather(change: &Change, with_types: bool) -> Vec<&str> {
             | pbps_model::PartitionIndexDefinition::Unique(_) => Vec::new(),
         },
         Change::RebuildPartitionedTable(_) | Change::AnalyzeTableTree(_) => Vec::new(),
-        Change::CopyTableRows(c) if with_types => {
-            c.columns.iter().map(|p| p.cast.base.as_str()).collect()
-        }
-        Change::CopyTableRows(_) => Vec::new(),
+        Change::CopyTableRows(c) => c
+            .columns
+            .iter()
+            .filter_map(|p| spelling(&p.cast, types))
+            .collect(),
 
         Change::CreateTable { table, .. } => table
             .columns
             .values()
-            .flat_map(|c| column(c, with_types))
+            .flat_map(|c| column(c, types))
             .chain(table.computed.values().map(|c| c.expression.as_str()))
             .chain(table.checks.values().map(|c| c.expression.as_str()))
             .chain(
@@ -663,15 +707,17 @@ fn gather(change: &Change, with_types: bool) -> Vec<&str> {
                     .chain(ix.columns.iter().filter_map(|c| c.key.expression()))
             }))
             .collect(),
-        Change::AddColumn { column: c, .. } => column(c, with_types),
+        Change::AddColumn { column: c, .. } => column(c, types),
         Change::AddComputedColumn { computed, .. } => vec![&computed.expression],
         Change::AlterColumnExpression { to, .. } => vec![to],
         Change::AlterColumnDefault { to, .. } => to.as_deref().into_iter().collect(),
         Change::SetPartitionDefault { to, fallback, .. } => {
             to.as_deref().or(fallback.as_deref()).into_iter().collect()
         }
-        Change::AlterColumnType { from, to, .. } if with_types => vec![&from.base, &to.base],
-        Change::AlterColumnType { .. } => Vec::new(),
+        Change::AlterColumnType { from, to, .. } => [from, to]
+            .into_iter()
+            .filter_map(|t| spelling(t, types))
+            .collect(),
         Change::AddCheck { constraint, .. } => vec![&constraint.expression],
         Change::CreatePolicy { policy, .. } => policy
             .using
@@ -686,35 +732,31 @@ fn gather(change: &Change, with_types: bool) -> Vec<&str> {
             .chain(index.columns.iter().filter_map(|c| c.key.expression()))
             .collect(),
         Change::InsertRow {
-            defaults, types, ..
+            defaults,
+            types: row,
+            ..
         } => defaults
             .values()
             .map(String::as_str)
-            .chain(
-                types
-                    .values()
-                    .filter(|_| with_types)
-                    .map(|t| t.base.as_str()),
-            )
+            .chain(row.values().filter_map(|t| spelling(t, types)))
             .collect(),
         Change::UpdateRow {
-            types,
+            types: row,
             after_types,
             key_type,
             ..
         }
         | Change::DeleteRow {
-            types,
+            types: row,
             after_types,
             key_type,
             ..
-        } if with_types => types
+        } => row
             .values()
             .chain(after_types.values())
             .chain(key_type.iter())
-            .map(|t| t.base.as_str())
+            .filter_map(|t| spelling(t, types))
             .collect(),
-        Change::UpdateRow { .. } | Change::DeleteRow { .. } => Vec::new(),
         Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -937,7 +979,12 @@ pub(super) fn constraints_in(
                     && called.iter().any(|t| dialect.generation_calls(t, id))
                 {
                     edge(&mut out, *function, *i);
-                } else if read.iter().any(|t| dialect.generation_calls(t, id)) {
+                } else if (module.kind != ModuleKind::Function || !guessed)
+                    && read.iter().any(|t| dialect.generation_calls(t, id))
+                {
+                    // A view or table can be named as a type, a function
+                    // cannot: where guesses are read exactly, a function in
+                    // a type spelling is no reference at all.
                     guess(&mut out, *function, *i);
                 }
             }
@@ -1084,15 +1131,17 @@ fn is_judged(change: &Change) -> bool {
     }
 }
 
-/// What a domain's definition names: its base type, default and checks.
-fn domain_texts(definition: &pbps_model::ManagedType) -> Vec<&str> {
+/// What a domain's definition names: its default and checks, and the base type
+/// as `types` says.
+fn domain_texts(definition: &pbps_model::ManagedType, types: Types) -> Vec<&str> {
     match definition {
         pbps_model::ManagedType::Domain {
             base,
             default,
             checks,
             ..
-        } => std::iter::once(base.base.as_str())
+        } => spelling(base, types)
+            .into_iter()
             .chain(default.as_deref())
             .chain(checks.values().map(String::as_str))
             .collect(),
@@ -1142,36 +1191,41 @@ fn scratch_rules(
             edge(out, a, b);
         }
     };
-    let readers: Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> = cs
-        .changes
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let module = match &p.change {
-                Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
-                    Some(dialect.module_creation_text(module))
-                }
-                _ => None,
-            };
-            let domain = match &p.change {
-                Change::CreateType { definition, .. } => domain_texts(definition),
-                _ => Vec::new(),
-            };
-            let all = texts(&p.change)
-                .into_iter()
-                .chain(domain)
-                .map(std::borrow::Cow::Borrowed)
-                .chain(module)
-                .map(|text| reading(dialect, text))
-                .collect();
-            (i, all)
-        })
-        .collect();
+    // What each change reads, with the type spellings `types` says: a name in
+    // a type position names a type, so the type rule reads them and the rule
+    // for indexes, which are no type, does not (DEC-2389.4).
+    let readers = |types: Types| -> Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> {
+        cs.changes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let module = match &p.change {
+                    Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                        Some(dialect.module_creation_text(module))
+                    }
+                    _ => None,
+                };
+                let domain = match &p.change {
+                    Change::CreateType { definition, .. } => domain_texts(definition, types),
+                    _ => Vec::new(),
+                };
+                let all = gather(&p.change, types)
+                    .into_iter()
+                    .chain(domain)
+                    .map(std::borrow::Cow::Borrowed)
+                    .chain(module)
+                    .map(|text| reading(dialect, text))
+                    .collect();
+                (i, all)
+            })
+            .collect()
+    };
+    let type_readers = readers(reading_types(dialect, true));
     for (at, p) in cs.changes.iter().enumerate() {
         let Change::CreateType { name, .. } = &p.change else {
             continue;
         };
-        for (reader, texts) in &readers {
+        for (reader, texts) in &type_readers {
             if texts
                 .iter()
                 .any(|t| dialect.generation_may_call(t, name.name()))
@@ -1181,9 +1235,10 @@ fn scratch_rules(
         }
     }
     if dialect.indexes_share_namespace_with_tables() {
+        let name_readers = readers(if guessed { Types::Omit } else { Types::All });
         for (at, p) in cs.changes.iter().enumerate() {
             for name in early_index_names(&p.change) {
-                for (reader, texts) in &readers {
+                for (reader, texts) in &name_readers {
                     if texts.iter().any(|t| dialect.generation_may_call(t, name)) {
                         guess(out, at, *reader);
                     }
