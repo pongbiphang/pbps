@@ -8161,6 +8161,7 @@ pub fn cmd_plan_db(
                         declared: &loaded.schema,
                         hints: &hints,
                         dependencies: &loaded.dependencies,
+                        ordered: &ordered,
                         operations: &pbps_dialect::PlanPayload::operations(&ordered),
                         statements: &lowered,
                         staged,

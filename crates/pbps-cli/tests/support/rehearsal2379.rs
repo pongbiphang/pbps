@@ -7,6 +7,10 @@
 
 use super::resolver_publication::Confined;
 use super::*;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
+
+const LIMIT: Duration = Duration::from_secs(90);
 
 /// The environment variables the fixture's `pbps.yml` reads.
 const TARGET: &str = "PBPS_REH_TARGET";
@@ -21,14 +25,20 @@ pub enum Kind {
     Supplied,
     /// A container pbps starts and removes.
     Docker,
+    /// An account that may create roles, on a cluster of its own: the
+    /// supplied layout where the plan's roles can be mapped.
+    SuppliedRoles,
 }
 
 impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Server, Kind::Supplied, Kind::Docker];
 
+    /// The kinds whose scratch account may create roles.
+    pub const WITH_ROLES: [Kind; 3] = [Kind::Server, Kind::Docker, Kind::SuppliedRoles];
+
     fn layout(self) -> &'static str {
         match self {
-            Kind::Supplied => "supplied",
+            Kind::Supplied | Kind::SuppliedRoles => "supplied",
             Kind::Server | Kind::Docker => "run-owned",
         }
     }
@@ -36,7 +46,7 @@ impl Kind {
     fn phrase(self) -> &'static str {
         match self {
             Kind::Docker => "docker scratch",
-            Kind::Server | Kind::Supplied => "server scratch",
+            Kind::Server | Kind::Supplied | Kind::SuppliedRoles => "server scratch",
         }
     }
 }
@@ -63,6 +73,12 @@ pub struct Options<'a> {
     pub role: Option<&'a str>,
     /// The target holds a managed enum, which a table column uses.
     pub typed: bool,
+    /// A row-security policy on `app.t` for `role`, with this `USING`.
+    pub policy: Option<&'a str>,
+    /// A volatile external function that a column default of `app.country` calls, so
+    /// that the two declared rows the rehearsal's base inserts hold it open
+    /// sixteen seconds, long enough to act on a run that is using its roles.
+    pub slow: bool,
 }
 
 pub struct Fixture {
@@ -90,6 +106,19 @@ const FUNCTION: &str = "function: app.f(integer)\npublic_execute: true\n\ndefini
     (integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 + 1\n";
 
 const VIEW: &str = "view: app.v\ndefinition: SELECT id, app.f(id) AS next, amount FROM app.t\n";
+
+/// The external function that holds a statement calling it open for eight
+/// seconds a call. An external, because a table default that names a managed
+/// function is not ordered after it.
+const SLOW_EXTERNAL: &str = "CREATE SCHEMA ext; CREATE FUNCTION ext.slow() RETURNS integer \
+    LANGUAGE sql VOLATILE RETURN (SELECT 1 FROM pg_sleep(8))";
+
+fn table_with_policy(role: &str, using: &str) -> String {
+    format!(
+        "{TABLE}row_security: {{enabled: true, forced: false}}\nrow_policies:\n  mine:\n    \
+         command: all\n    restrictive: false\n    to: [{role}]\n    using: {using}\n"
+    )
+}
 
 impl Fixture {
     pub fn new(server: &str, slug: &str, kind: Kind, options: &Options<'_>) -> Self {
@@ -125,6 +154,19 @@ impl Fixture {
                 "role.yml",
                 &format!("role: {role}\ngrants:\n  schema::app: [usage]\n"),
             );
+            if let Some(using) = options.policy {
+                write("app.t.yml", &table_with_policy(role, using));
+            }
+        }
+        if options.slow {
+            write(
+                "app.country.yml",
+                &country("Taiwan").replace(
+                    "  label: {type: varchar(40), nullable: false}\n",
+                    "  label: {type: varchar(40), nullable: false}\n  \
+                     pause: {type: integer, nullable: true, default: \"ext.slow()\"}\n",
+                ),
+            );
         }
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -132,9 +174,13 @@ impl Fixture {
         if let Some(sql) = options.target_only {
             on_server(&connection, sql);
         }
-        let confined = (kind == Kind::Supplied).then(|| Confined::new(server));
         let scratch_server = std::env::var("PBPS_TEST_PG_SCRATCH_DB")
             .expect("PBPS_TEST_PG_SCRATCH_DB is not set; see scripts/live-tests-pg.sh");
+        let confined = match kind {
+            Kind::Supplied => Some(Confined::new(server)),
+            Kind::SuppliedRoles => Some(Confined::creating_roles(&scratch_server)),
+            Kind::Server | Kind::Docker => None,
+        };
         let fixture = Self {
             d,
             own,
@@ -163,7 +209,7 @@ impl Fixture {
                 "    kind: docker\n    image: '{}'\n    pull: never\n{externals}",
                 image()
             ),
-            Kind::Server | Kind::Supplied => {
+            Kind::Server | Kind::Supplied | Kind::SuppliedRoles => {
                 format!("    kind: server\n    url_env: {SCRATCH}\n{externals}")
             }
         };
@@ -187,11 +233,121 @@ impl Fixture {
         self.own.connection()
     }
 
+    /// A connection to the cluster the scratch is on, where it is a cluster
+    /// to ask: a container's is gone with it.
+    fn cluster(&self) -> Option<String> {
+        match self.kind {
+            Kind::Server | Kind::SuppliedRoles => Some(self.scratch_server.clone()),
+            Kind::Supplied => Some(self.own.connection().to_owned()),
+            Kind::Docker => None,
+        }
+    }
+
+    /// The roles on the scratch cluster that a rehearsal made.
+    fn rehearsal_roles(&self) -> BTreeSet<String> {
+        let Some(cluster) = self.cluster() else {
+            return BTreeSet::new();
+        };
+        text_of(
+            &cluster,
+            "SELECT coalesce(string_agg(rolname, ','), '') FROM pg_roles \
+             WHERE rolname LIKE 'pbps\\_rehearsal\\_%'",
+        )
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// Sessions of the run with `token` on the scratch cluster: its keeper,
+    /// and whatever it had open in its database. Until the server has seen
+    /// them go, a sweep is right to call the run alive.
+    fn sessions_of(&self, token: &str) -> i64 {
+        let database = match self.kind {
+            Kind::SuppliedRoles => {
+                let connection = &self.confined.as_ref().unwrap().connection;
+                connection
+                    .split_whitespace()
+                    .find_map(|word| word.strip_prefix("dbname="))
+                    .unwrap()
+                    .to_owned()
+            }
+            Kind::Server | Kind::Supplied | Kind::Docker => format!("pbps_scratch_{token}"),
+        };
+        scalar(
+            &self.cluster().unwrap(),
+            &format!(
+                "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() \
+                 AND (application_name = 'pbps-{token}' OR datname = '{database}')"
+            ),
+        )
+    }
+
+    /// Gives `role` a grant on `app.t` and changes its policy's `USING`: the
+    /// plan then carries a grant and a policy, which are what a rehearsal maps
+    /// the role for.
+    pub fn revise_authorization(&self, role: &str, using: &str) {
+        std::fs::write(
+            self.d.dir.join("schema/role.yml"),
+            format!("role: {role}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            self.d.dir.join("schema/app.t.yml"),
+            table_with_policy(role, using),
+        )
+        .unwrap();
+        succeeds(self.d.run(&["plan"]));
+        self.d.commit();
+    }
+
+    /// A plan, left running.
+    fn start(&self) -> std::process::Child {
+        self.built("plan", &[], true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// [`Self::until`] for a plan left running: one that ends first has said
+    /// why on its standard error, and that is what this panics with.
+    fn until_running(
+        &self,
+        run: &mut std::process::Child,
+        what: &str,
+        ready: impl Fn(&Self) -> bool,
+    ) {
+        let started = Instant::now();
+        while !ready(self) {
+            if let Some(status) = run.try_wait().unwrap() {
+                let mut said = String::new();
+                if let Some(mut stderr) = run.stderr.take() {
+                    std::io::Read::read_to_string(&mut stderr, &mut said).unwrap();
+                }
+                panic!("the plan ended ({status}) before {what}: {said}");
+            }
+            assert!(started.elapsed() < LIMIT, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits for `ready` to hold, or panics saying what it waited for.
+    fn until(&self, what: &str, ready: impl Fn(&Self) -> bool) {
+        let started = Instant::now();
+        while !ready(self) {
+            assert!(started.elapsed() < LIMIT, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// The scratch connection a command is given, if its kind has one.
     pub fn scratch(&self) -> Option<String> {
         match self.kind {
             Kind::Server => Some(self.scratch_server.clone()),
-            Kind::Supplied => Some(self.confined.as_ref().unwrap().connection.clone()),
+            Kind::Supplied | Kind::SuppliedRoles => {
+                Some(self.confined.as_ref().unwrap().connection.clone())
+            }
             Kind::Docker => None,
         }
     }
@@ -745,50 +901,347 @@ pub fn stages_and_compares_externals(server: &str) {
     assert_eq!(code(&off), 0, "{}", said(&off));
 }
 
-/// Roles and their grants are cluster-level: the scratch is shared, so they
-/// are neither created on it nor compared. A plan that grants to a role the
-/// scratch lacks still converges, and leaves the scratch cluster as it found it.
-pub fn leaves_roles_and_grants_out(server: &str) {
-    let role = format!("pbps_reh_r_{}", std::process::id());
-    let _roles = ClusterRoles {
-        server: server.to_owned(),
-        names: vec![role.clone()],
-    };
-    on_server(server, &format!("DROP ROLE IF EXISTS {role}"));
-    on_server(server, &format!("CREATE ROLE {role} NOLOGIN"));
+/// A role of this test on the target's cluster, which is dropped with it.
+struct TargetRole {
+    _guard: ClusterRoles,
+    name: String,
+}
+
+impl TargetRole {
+    fn new(server: &str, what: &str, kind: Kind) -> Self {
+        let name = format!(
+            "pbps_reh_{what}_{}_{}",
+            std::process::id(),
+            format!("{kind:?}").to_lowercase()
+        );
+        on_server(server, &format!("DROP ROLE IF EXISTS {name}"));
+        on_server(server, &format!("CREATE ROLE {name} NOLOGIN"));
+        Self {
+            _guard: ClusterRoles {
+                server: server.to_owned(),
+                names: vec![name.clone()],
+            },
+            name,
+        }
+    }
+}
+
+/// A project whose role holds a grant and a policy on the target, and whose
+/// next plan changes both.
+fn authorized(server: &str, what: &str, kind: Kind, slow: bool) -> (TargetRole, Fixture) {
+    let role = TargetRole::new(server, what, kind);
     let f = Fixture::new(
         server,
-        "rehearse-roles",
-        Kind::Server,
+        &format!("rehearse-{what}-{kind:?}").to_lowercase(),
+        kind,
         &Options {
-            role: Some(&role),
+            role: Some(&role.name),
+            policy: Some("id > 0"),
+            slow,
+            externals: slow.then_some(SLOW_EXTERNAL),
             ..Options::default()
         },
     );
-    std::fs::write(
-        f.d.dir.join("schema/role.yml"),
-        format!("role: {role}\ngrants:\n  schema::app: [usage]\n  app.t: [select]\n"),
-    )
-    .unwrap();
-    succeeds(f.d.run(&["plan"]));
-    f.d.commit();
+    (role, f)
+}
+
+/// Authorization is rehearsed, not left out: a plan that grants and changes a
+/// policy runs both on roles made for the run, converges, says so, and leaves
+/// neither the target's role nor the run's on the scratch cluster (#2379).
+pub fn authorization_is_rehearsed(server: &str, kind: Kind) {
+    let (role, f) = authorized(server, "ok", kind, false);
+    f.revise_authorization(&role.name, "id > 1");
+    let before = f.rehearsal_roles();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{kind:?}: {}", said(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("grant select on app.t"),
+        "{kind:?}: the plan grants: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Rehearsal: converged on scratch ({}, {})",
+            kind.phrase(),
+            kind.layout()
+        )),
+        "{kind:?}: {text}"
+    );
+    assert!(!text.contains("NOT rehearsed"), "{kind:?}: {text}");
+    assert_eq!(
+        f.record()["converged"]["authorization"],
+        "rehearsed",
+        "{kind:?}: {}",
+        f.record()
+    );
+    // `explain` and the JSON say the same from the file.
+    let explained = f.explain("text");
+    assert!(!stdout(&explained).contains("NOT rehearsed"));
+    let json: serde_json::Value = serde_json::from_slice(&f.explain("json").stdout).unwrap();
+    assert_eq!(
+        json["data"]["rehearsal"]["authorization"], "rehearsed",
+        "{json}"
+    );
+    // Nothing of either kind of role stays on the scratch cluster.
+    assert!(
+        f.rehearsal_roles().is_subset(&before),
+        "{kind:?}: {:?} left",
+        f.rehearsal_roles().difference(&before).collect::<Vec<_>>()
+    );
+    if let Some(cluster) = f.cluster()
+        && f.kind != Kind::Supplied
+    {
+        assert_eq!(
+            scalar(
+                &cluster,
+                &format!(
+                    "SELECT count(*) FROM pg_roles WHERE rolname = '{}'",
+                    role.name
+                )
+            ),
+            // Only the target's own cluster holds the target's role; a scratch
+            // on its own cluster never sees its name.
+            if cluster == server { 1 } else { 0 },
+            "{kind:?}"
+        );
+    }
+    // And the plan applies, as the rehearsal said it would.
+    let applied = f.apply("revoke,row-security");
+    assert_eq!(code(&applied), 0, "{kind:?}: {}", said(&applied));
+    assert_eq!(
+        scalar(
+            f.target(),
+            "SELECT count(*) FROM pg_policies WHERE tablename = 't' AND qual LIKE '%> 1%'"
+        ),
+        1,
+        "{kind:?}"
+    );
+}
+
+/// A policy whose `USING` the engine rejects is refused at plan time, naming
+/// the statement, and leaves no role behind; with the rehearsal off the same
+/// plan is written and fails only at apply.
+pub fn a_wrong_policy_is_refused(server: &str, kind: Kind) {
+    let (role, f) = authorized(server, "bad", kind, false);
+    f.revise_authorization(&role.name, "no_such_column > 0");
+    let before = f.rehearsal_roles();
+    let prior = "prior plan 2379";
+    std::fs::write(f.artifact(), prior).unwrap();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 2, "{kind:?}: {}", said(&out));
+    let text = said(&out);
+    assert!(text.contains("rejected statement"), "{kind:?}: {text}");
+    assert!(text.contains("CREATE POLICY"), "{kind:?}: {text}");
+    assert!(text.contains("no_such_column"), "{kind:?}: {text}");
+    assert!(text.contains("--no-rehearse"), "{kind:?}: {text}");
+    assert_eq!(std::fs::read_to_string(f.artifact()).unwrap(), prior);
+    assert!(
+        f.rehearsal_roles().is_subset(&before),
+        "{kind:?}: a refusal left {:?}",
+        f.rehearsal_roles().difference(&before).collect::<Vec<_>>()
+    );
+    // Negative: without the rehearsal the plan is written, and apply is where
+    // the engine refuses it.
+    let off = f.plan(&["--no-rehearse"]);
+    assert_eq!(code(&off), 0, "{kind:?}: {}", said(&off));
+    assert_eq!(f.record(), serde_json::json!("off"));
+    let applied = f.apply("revoke,row-security");
+    assert_ne!(code(&applied), 0, "{kind:?}: {}", said(&applied));
+    assert!(
+        said(&applied).contains("no_such_column"),
+        "{}",
+        said(&applied)
+    );
+}
+
+/// An account that may not create roles gets everything else rehearsed and a
+/// record that says authorization was not: in the plan's output, in `explain`,
+/// in the JSON and at `apply`. The error a rehearsal of authorization would
+/// have found is not found, and is not claimed to be.
+pub fn an_account_without_createrole_downgrades_and_says_so(server: &str) {
+    let kind = Kind::Supplied;
+    let (role, f) = authorized(server, "down", kind, false);
+    // A policy the engine would reject: it is what the downgrade does not see.
+    f.revise_authorization(&role.name, "no_such_column > 0");
+    let before = f.rehearsal_roles();
     let out = f.plan(&[]);
     assert_eq!(code(&out), 0, "{}", said(&out));
     let text = stdout(&out);
     assert!(
-        text.contains("grant select on app.t"),
-        "the plan grants: {text}"
+        text.contains("Rehearsal: converged on scratch (server scratch, supplied)"),
+        "{text}"
     );
-    assert!(f.record()["converged"].is_object(), "{}", f.record());
-    // Negative: nothing of the target's cluster reached the scratch cluster.
-    let scratch = f.scratch().unwrap();
+    assert!(text.contains("; authorization NOT rehearsed"), "{text}");
+    assert!(text.contains("Authorization was NOT rehearsed"), "{text}");
+    assert!(text.contains("may not create roles"), "{text}");
+    let record = f.record();
+    assert_eq!(
+        record["converged"]["authorization"]["not_rehearsed"]["reason"]
+            .as_str()
+            .map(|reason| reason.contains("may not create roles")),
+        Some(true),
+        "{record}"
+    );
+    let explained = f.explain("text");
+    assert!(
+        stdout(&explained).contains("authorization NOT rehearsed"),
+        "{}",
+        said(&explained)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&f.explain("json").stdout).unwrap();
+    assert_eq!(
+        json["data"]["rehearsal"]["authorization"], "not-rehearsed",
+        "{json}"
+    );
+    let applied = f.apply("revoke,row-security");
+    assert!(
+        stdout(&applied).contains("authorization NOT rehearsed"),
+        "apply shows it: {}",
+        said(&applied)
+    );
+    // The rest was rehearsed, and the cluster is as it was.
+    assert!(f.rehearsal_roles().is_subset(&before));
     assert_eq!(
         scalar(
-            &scratch,
-            &format!("SELECT count(*) FROM pg_roles WHERE rolname = '{role}'")
+            &f.confined.as_ref().unwrap().connection,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 'pbps_claim'"
         ),
-        0
+        0,
+        "the claim is gone"
     );
+    // Negative: a project that names no role has nothing to skip, so even
+    // this account's rehearsal is a full one.
+    let plain = Fixture::new(server, "rehearse-down2-supplied", kind, &Options::default());
+    plain.revise_row();
+    let ok = plain.plan(&[]);
+    assert_eq!(code(&ok), 0, "{}", said(&ok));
+    assert_eq!(
+        plain.record()["converged"]["authorization"],
+        "rehearsed",
+        "{}",
+        plain.record()
+    );
+}
+
+/// What the next run reports as removed, in its JSON findings.
+fn recovered(output: &Output) -> Vec<String> {
+    json_output_of(output)["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|finding| finding["id"] == "scratch.recovered")
+        .map(|finding| finding["message"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn json_output_of(output: &Output) -> serde_json::Value {
+    serde_json::from_str(&stdout(output))
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", said(output)))
+}
+
+/// The token a rehearsal's roles carry.
+fn token_of(roles: &BTreeSet<String>) -> String {
+    let tokens: BTreeSet<_> = roles
+        .iter()
+        .map(|name| name.rsplit('_').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(tokens.len(), 1, "one run's roles: {roles:?}");
+    tokens.into_iter().next().unwrap()
+}
+
+/// A rehearsal killed with SIGKILL leaves the roles it made, and the next run
+/// removes exactly them: those of a run that is gone, and not those of one that
+/// is still running (#2410, #2379).
+pub fn a_killed_rehearsal_is_cleaned_up_by_the_next_run(server: &str, kind: Kind) {
+    let (role, f) = authorized(server, "kill", kind, true);
+    f.revise_authorization(&role.name, "id > 1");
+    let before = f.rehearsal_roles();
+    let mut dead = f.start();
+    f.until_running(&mut dead, "the run's roles", |f| {
+        f.rehearsal_roles().difference(&before).next().is_some()
+    });
+    let left: BTreeSet<_> = f.rehearsal_roles().difference(&before).cloned().collect();
+    let token = token_of(&left);
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    assert!(left.is_subset(&f.rehearsal_roles()), "a kill leaves them");
+    // The server notices its client gone.
+    f.until("the dead run's session to end", |f| {
+        f.sessions_of(&token) == 0
+    });
+    // The next run removes them before it makes its own.
+    let mut next = f.start();
+    f.until_running(&mut next, "the dead run's roles to go", |f| {
+        left.is_disjoint(&f.rehearsal_roles())
+    });
+    f.until_running(&mut next, "the next run's roles", |f| {
+        f.rehearsal_roles().difference(&before).next().is_some()
+    });
+    let live: BTreeSet<_> = f.rehearsal_roles().difference(&before).cloned().collect();
+    assert!(live.is_disjoint(&left), "{live:?} {left:?}");
+    // While it runs, another run leaves its roles alone.
+    if kind == Kind::Server {
+        let (other_role, other) = authorized(server, "kill2", kind, false);
+        other.revise_authorization(&other_role.name, "id > 1");
+        let swept = other.plan(&["--format", "json"]);
+        assert_eq!(code(&swept), 0, "{}", said(&swept));
+        assert!(
+            live.is_subset(&f.rehearsal_roles()),
+            "a live run's roles stand"
+        );
+        let live_token = token_of(&live);
+        assert!(
+            recovered(&swept).iter().all(|m| !m.contains(&live_token)),
+            "{:?}",
+            recovered(&swept)
+        );
+    } else {
+        // One supplied database, one run at a time: the claim says who has it.
+        let refused = f.plan(&[]);
+        assert_ne!(code(&refused), 0, "{}", said(&refused));
+        assert!(
+            said(&refused).contains("still running"),
+            "{}",
+            said(&refused)
+        );
+        assert!(
+            live.is_subset(&f.rehearsal_roles()),
+            "a live run's roles stand"
+        );
+    }
+    let finished = next.wait().unwrap();
+    assert!(finished.success(), "the live run was not disturbed");
+    assert!(
+        f.rehearsal_roles().is_subset(&before),
+        "nothing is left: {:?}",
+        f.rehearsal_roles().difference(&before).collect::<Vec<_>>()
+    );
+}
+
+/// Two plans at once on one scratch cluster map the same role to roles of
+/// their own: the names do not collide, and both finish and clean up.
+pub fn concurrent_plans_do_not_collide(server: &str) {
+    let kind = Kind::Server;
+    let (role, one) = authorized(server, "one", kind, true);
+    one.revise_authorization(&role.name, "id > 1");
+    let (other, two) = authorized(server, "two", kind, true);
+    two.revise_authorization(&other.name, "id > 1");
+    let before = one.rehearsal_roles();
+    let mut first = one.start();
+    let mut second = two.start();
+    one.until_running(&mut first, "both runs' roles", |f| {
+        let now = f.rehearsal_roles();
+        let tokens: BTreeSet<_> = now
+            .difference(&before)
+            .map(|name| name.rsplit('_').next().unwrap().to_owned())
+            .collect();
+        tokens.len() == 2
+    });
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+    assert!(one.rehearsal_roles().is_subset(&before));
+    assert_eq!(one.record()["converged"]["authorization"], "rehearsed");
+    assert_eq!(two.record()["converged"]["authorization"], "rehearsed");
 }
 
 /// A project that declares a managed type cannot be rehearsed yet: the

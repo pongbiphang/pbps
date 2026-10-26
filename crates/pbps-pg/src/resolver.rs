@@ -277,6 +277,43 @@ pub async fn drop_roles(
     failed
 }
 
+/// Whether the session's role may create roles: `SUPERUSER` or `CREATEROLE`.
+/// Asked before the run records the roles it means to create, since dropping a
+/// role takes the same attribute and a run that never could create them could
+/// not drop what it had recorded either.
+pub async fn may_create_roles(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
+    let rows = conn
+        .query(
+            "SELECT rolsuper OR rolcreaterole AS allowed \
+               FROM pg_catalog.pg_roles WHERE rolname = current_user",
+        )
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| row.try_get::<bool>("allowed"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(false))
+}
+
+/// Creates the roles a rehearsal maps a plan's roles to: a name and nothing
+/// else, so they hold no privilege the plan did not give them. Each is created
+/// on its own, so the first the account may not create stops the rest and the
+/// error says it was that one (`42501` when the account lacks `CREATEROLE`).
+pub async fn create_rehearsal_roles(
+    conn: &mut impl ExecuteConnection,
+    roles: &[pbps_model::RoleName],
+) -> Result<(), DbError> {
+    for role in roles {
+        conn.execute(&format!(
+            "CREATE ROLE \"{}\" NOLOGIN",
+            role.raw().replace('"', "\"\"")
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
 /// Removes exactly the two run-owned objects. FORCE closes this run's own
 /// scratch sessions; it cannot reach anything the run did not create.
 pub async fn drop_scratch(

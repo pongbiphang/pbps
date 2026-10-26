@@ -1545,6 +1545,7 @@ fn a_converged_rehearsal_is_explained_with_and_without_spelling_differences() {
         },
         layout: ScratchLayout::RunOwned,
         spelling,
+        authorization: pbps_model::AuthorizationRehearsal::Rehearsed,
     };
     let (text, value) = explained(&rehearsed_plan(docker(vec![])));
     assert!(
@@ -1560,7 +1561,7 @@ fn a_converged_rehearsal_is_explained_with_and_without_spelling_differences() {
         value["data"]["rehearsal"],
         serde_json::json!({
             "outcome": "converged", "entry": "ci", "scratch": "docker",
-            "image": "postgres:18", "layout": "run-owned",
+            "image": "postgres:18", "layout": "run-owned", "authorization": "rehearsed",
         })
     );
 
@@ -1590,6 +1591,7 @@ fn a_converged_rehearsal_is_explained_with_and_without_spelling_differences() {
         scratch: ScratchSource::Server {},
         layout: ScratchLayout::Supplied,
         spelling: vec!["one".into()],
+        authorization: pbps_model::AuthorizationRehearsal::Rehearsed,
     };
     let (text, value) = explained(&rehearsed_plan(server));
     assert!(
@@ -1621,6 +1623,42 @@ fn an_off_rehearsal_is_never_read_as_rehearsed_and_absence_says_nothing() {
     assert!(value["data"].get("rehearsal").is_none(), "{value}");
 }
 
+/// A rehearsal that left authorization out is never shown as a full one: the
+/// plan's line, its own section and the JSON all say so, with the reason
+/// (#2379).
+#[test]
+fn a_rehearsal_that_skipped_authorization_says_so_wherever_it_is_shown() {
+    let skipped = pbps_model::Rehearsal::Converged {
+        entry: "shared".into(),
+        scratch: ScratchSource::Server {},
+        layout: ScratchLayout::Supplied,
+        spelling: vec![],
+        authorization: pbps_model::AuthorizationRehearsal::NotRehearsed {
+            reason: "the scratch account may not create roles".into(),
+        },
+    };
+    let (text, value) = explained(&rehearsed_plan(skipped));
+    assert!(
+        text.contains(
+            "rehearsal   converged on shared (server scratch, supplied); \
+             authorization NOT rehearsed\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "\nRehearsal\n  Authorization was NOT rehearsed: \
+             the scratch account may not create roles\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(value["data"]["rehearsal"]["authorization"], "not-rehearsed");
+    assert_eq!(
+        value["data"]["rehearsal"]["authorization_reason"],
+        "the scratch account may not create roles"
+    );
+}
+
 /// Negative: a file whose record the reader cannot read, or whose record
 /// names nothing, is refused rather than explained.
 #[test]
@@ -1630,9 +1668,10 @@ fn explain_refuses_a_rehearsal_record_it_cannot_read() {
         scratch: ScratchSource::Server {},
         layout: ScratchLayout::Supplied,
         spelling: vec![],
+        authorization: pbps_model::AuthorizationRehearsal::Rehearsed,
     }))
     .unwrap();
-    let edits: [(&str, Edit); 4] = [
+    let edits: [(&str, Edit); 6] = [
         ("an unknown outcome", |v| v["rehearsal"] = "failed".into()),
         ("no entry", |v| {
             v["rehearsal"]["converged"]
@@ -1645,6 +1684,16 @@ fn explain_refuses_a_rehearsal_record_it_cannot_read() {
         }),
         ("an empty entry", |v| {
             v["rehearsal"]["converged"]["entry"] = "".into()
+        }),
+        ("no word about authorization", |v| {
+            v["rehearsal"]["converged"]
+                .as_object_mut()
+                .unwrap()
+                .remove("authorization");
+        }),
+        ("authorization skipped for no reason", |v| {
+            v["rehearsal"]["converged"]["authorization"] =
+                serde_json::json!({"not_rehearsed": {"reason": ""}})
         }),
     ];
     for (what, edit) in edits {

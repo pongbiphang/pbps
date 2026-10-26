@@ -577,6 +577,56 @@ impl Scratch<'_> {
         )))
     }
 
+    /// Creates the roles a rehearsal maps a plan's roles to, for the run only.
+    /// They are recorded first, in what the release drops and, in a supplied
+    /// database, in the claim a later run finds the run dead by, so a failure
+    /// or a kill part-way still leaves them removable. `Ok(Err(why))` is an
+    /// account that may not create roles: not a failure of the run, but of what
+    /// the rehearsal can say about authorization.
+    pub(super) async fn rehearsal_roles(
+        &mut self,
+        admin: &mut Conn,
+        roles: &[pbps_model::RoleName],
+    ) -> Result<Result<(), String>, Error> {
+        if roles.is_empty() {
+            return Ok(Ok(()));
+        }
+        let db = |what: &'static str| {
+            move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
+        };
+        pinned(admin, &self.backend).await?;
+        if !pbps_pg::resolver::may_create_roles(admin)
+            .await
+            .map_err(db("the scratch account's attributes"))?
+        {
+            return Ok(Err(
+                "the scratch account may not create roles: it has neither SUPERUSER nor \
+                 CREATEROLE"
+                    .into(),
+            ));
+        }
+        match &mut self.created {
+            Created::RunOwned { roles: made, .. } => made.extend(roles.iter().cloned()),
+            Created::Supplied { .. } => {
+                let names: Vec<_> = roles.iter().map(|role| role.raw().to_owned()).collect();
+                record::record_roles(admin, &names)
+                    .await
+                    .map_err(db("the scratch database's claim"))?;
+            }
+            Created::Nothing => return Err(Error::Scratch),
+        }
+        match pbps_pg::resolver::create_rehearsal_roles(admin, roles).await {
+            Ok(()) => Ok(Ok(())),
+            Err(error) if error.server_error_code().as_deref() == Some("42501") => {
+                Ok(Err(format!(
+                    "the scratch account may not create roles ({error}); it needs CREATEROLE, \
+                     or the superuser a run-owned scratch has"
+                )))
+            }
+            Err(error) => Err(db("the rehearsal's roles")(error)),
+        }
+    }
+
     /// Drops what the run created. `Err` names exactly what may remain.
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
         match std::mem::replace(&mut self.created, Created::Nothing) {
@@ -702,6 +752,28 @@ pub(in crate::resolver::server) async fn release_supplied(
         ),
         Err(error) => remaining.push(format!(
             "the scratch account's own defaults, unreadable after the run ({error})"
+        )),
+    }
+    // The roles a rehearsal made are the cluster's, not the database's, so
+    // emptying the database did not reach them; the claim names them, and the
+    // privileges they held went with the objects.
+    match record::read_claim(admin).await {
+        Ok(Some(Ok(claim))) => {
+            let roles: Vec<_> = claim
+                .roles
+                .iter()
+                .map(|role| role.as_str().into())
+                .collect();
+            remaining.extend(
+                pbps_pg::resolver::drop_roles(admin, &roles)
+                    .await
+                    .into_iter()
+                    .map(|role| format!("role {}", role.shown())),
+            );
+        }
+        Ok(None | Some(Err(_))) => {}
+        Err(error) => remaining.push(format!(
+            "the roles in the scratch database's claim, unreadable ({error})"
         )),
     }
     // The record goes last: until every step above has succeeded it lets a

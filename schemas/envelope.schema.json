@@ -1016,6 +1016,19 @@
           "items": {
             "type": "string"
           }
+        },
+        "authorization": {
+          "description": "`rehearsed`: the plan's role, grant and row-security policy changes ran\non roles made for the run. `not-rehearsed`: they did not, and\n`authorization_reason` says why.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "authorization_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2775,6 +2788,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 62,
+  "x-pbps-schema-version": 63,
   "x-pbps-tool-version": "0.0.0"
 }

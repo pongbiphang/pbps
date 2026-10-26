@@ -14,13 +14,27 @@ use super::super::{BindingRequest, Error, ProduceError, engine};
 use super::{Provenance, Tokens};
 use crate::resolver::scope;
 use pbps_db::{Conn, Driver};
-use pbps_model::Hints;
 use pbps_model::resolver::ScratchLayout;
+use pbps_model::role_mapping::RoleMapping;
+use pbps_model::{Hints, RoleName};
+use std::collections::BTreeSet;
+
+/// The roles the plan names, as the run can have them.
+///
+/// A cluster's roles are shared, so the target's names are never created on the
+/// scratch: each role the plan names is mapped to one the run creates and
+/// removes, and the account that cannot create roles has no mapping at all.
+pub type Roles = Result<RoleMapping, String>;
 
 /// Runs `run` on a session of the scratch as the target's deployer, with the
 /// entry's externals staged and compared with the target, and releases the
 /// scratch whatever `run` returns. The layout the run used comes back beside
 /// the result: it is the run's own finding, as for the resolver.
+///
+/// `named` are the roles the plan, or the base it builds, names. The run
+/// creates a role of its own for each, recorded before it is made and removed
+/// with the scratch, and `run` is told which names they have; or, when the
+/// account may not create roles, why not.
 #[allow(clippy::too_many_arguments)]
 pub async fn with_session<T, E>(
     driver: Driver,
@@ -34,7 +48,8 @@ pub async fn with_session<T, E>(
     standard: impl Into<engine::Standard>,
     externals: Option<&str>,
     provenance: &Provenance,
-    run: impl AsyncFnOnce(&mut Conn) -> Result<T, E>,
+    named: &BTreeSet<RoleName>,
+    run: impl AsyncFnOnce(&mut Conn, Roles) -> Result<T, E>,
 ) -> Result<(ScratchLayout, Result<T, E>), ProduceError> {
     // The write path's extras are the dialect's, and the CLI's PostgreSQL
     // dialect configures none, as for the resolver.
@@ -131,13 +146,21 @@ pub async fn with_session<T, E>(
                 )
                 .await?;
         }
+        // The engine's own roles keep their names: they are the scratch's too.
+        let mapping = RoleMapping::generate(named, "pbps_rehearsal", &tokens.scratch, |role| {
+            role.raw().starts_with("pg_")
+        });
+        let roles = match state.rehearsal_roles(&mut admin, mapping.created()).await? {
+            Ok(()) => Ok(mapping),
+            Err(why) => Err(why),
+        };
         let layout = if prepared.supplied() {
             ScratchLayout::Supplied
         } else {
             ScratchLayout::RunOwned
         };
         let session = prepared.session(&mut admin);
-        Ok((layout, run(session).await))
+        Ok((layout, run(session, roles).await))
     }
     .await;
     let released = state.release(&mut admin).await;

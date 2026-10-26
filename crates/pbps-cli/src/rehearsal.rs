@@ -17,6 +17,7 @@ use anyhow::Context as _;
 
 use pbps_db::Conn;
 use pbps_dialect::{Dialect, Statement};
+use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Change, ChangeSet, IdsFile, Schema, SessionZone};
 
 /// The state the plan's statements run on top of.
@@ -37,6 +38,11 @@ pub enum Base<'a> {
         ids: &'a IdsFile,
         /// The session the target's statements ran in, and so the scratch's.
         execution: Execution<'a>,
+        /// The run's own names for the roles the plan and the base name,
+        /// when the statements were lowered with them. `None` is a scratch
+        /// that cannot hold roles: authorization is then neither run nor
+        /// compared (see [`is_authorization`]).
+        roles: Option<&'a RoleMapping>,
     },
 }
 
@@ -74,7 +80,19 @@ impl<'a> Base<'a> {
 
     /// Whether roles are part of what the scratch is compared on.
     fn compares_roles(&self) -> bool {
-        matches!(self, Base::Baseline { .. })
+        match self {
+            Base::Baseline { .. } => true,
+            Base::Target { roles, .. } => roles.is_some(),
+        }
+    }
+
+    /// The names the declarations' roles have on the scratch, when they are
+    /// not their own.
+    fn role_mapping(&self) -> Option<&'a RoleMapping> {
+        match self {
+            Base::Baseline { .. } => None,
+            Base::Target { roles, .. } => *roles,
+        }
     }
 
     fn execution(&self) -> Option<Execution<'a>> {
@@ -122,11 +140,11 @@ struct Words {
 }
 
 /// Changes about who may do what: the cluster's principals, the privileges
-/// they hold, and the row-security policies that name them. A scratch server
-/// is shared and a rehearsal may touch nothing that is not its own, so they
-/// are left out of both the base and the plan, and out of the comparison
-/// (SPEC §9.3.1): a role created on a shared cluster outlives the run, and a
-/// grant or a policy naming a role the target holds and the scratch does not
+/// they hold, and the row-security policies that name them. A rehearsal runs
+/// them under the run's own role names (`RoleMapping`); where the scratch
+/// account may not create those roles they are left out of both the base and
+/// the plan, and out of the comparison (SPEC §9.3.1), and the record says so:
+/// a grant or a policy naming a role the target holds and the scratch does not
 /// fails for a reason that says nothing about the plan.
 pub fn is_authorization(change: &Change) -> bool {
     matches!(
@@ -140,6 +158,16 @@ pub fn is_authorization(change: &Change) -> bool {
             | Change::DropPolicy { .. }
             | Change::SetRowSecurity { .. }
     )
+}
+
+/// Every statement of `lowered`, in order: a plan lowered with the run's own
+/// role names has nothing to leave out.
+pub fn all_statements(lowered: &crate::emission::LoweredPlan) -> Vec<Statement> {
+    lowered
+        .groups()
+        .iter()
+        .flat_map(|group| group.statements().iter().cloned())
+        .collect()
 }
 
 /// The statements of `lowered` that belong to a change about the database's
@@ -266,7 +294,7 @@ pub async fn rehearse_in(
     // Under the names the rehearsal database has: the base was built from the
     // *previous* revision, so a table or key column this plan renames is still
     // spelt the old way here too (DECISIONS 148).
-    let mut declared = if base.asks_spelling() {
+    let declared = if base.asks_spelling() {
         let mut unasked = Vec::new();
         let refused = crate::deploy::refuse_misspelt(
             conn,
@@ -284,23 +312,8 @@ pub async fn rehearse_in(
     } else {
         declared.clone()
     };
-    // The scratch holds no authorization (see `is_authorization`), so
-    // neither side of the comparison does: a role the declarations name is
-    // not a difference the plan failed to make.
-    let without_roles;
-    let declared_ids = if base.compares_roles() {
-        declared_ids
-    } else {
-        declared.roles.clear();
-        clear_row_security(&mut declared);
-        without_roles = {
-            let mut ids = declared_ids.clone();
-            ids.roles.clear();
-            ids
-        };
-        &without_roles
-    };
-    let declared = &declared;
+    let (declared, declared_ids) = compared_declarations(&base, declared, declared_ids);
+    let (declared, declared_ids) = (&declared, &declared_ids);
     let words = base.words();
 
     let build = base.statements();
@@ -426,6 +439,29 @@ pub async fn rehearse_in(
         spelling,
         externals_staged: false,
     })
+}
+
+/// The declarations as the scratch is compared with them. They are compared
+/// under the names the scratch's roles have: the run's own, where the plan was
+/// lowered with them. A scratch that cannot hold roles holds no authorization
+/// (see [`is_authorization`]), so neither side of the comparison does: a role
+/// the declarations name is not a difference the plan failed to make.
+fn compared_declarations(
+    base: &Base<'_>,
+    mut declared: Schema,
+    ids: &IdsFile,
+) -> (Schema, IdsFile) {
+    if let Some(mapping) = base.role_mapping() {
+        (mapping.schema(&declared), mapping.ids(ids))
+    } else if base.compares_roles() {
+        (declared, ids.clone())
+    } else {
+        declared.roles.clear();
+        clear_row_security(&mut declared);
+        let mut ids = ids.clone();
+        ids.roles.clear();
+        (declared, ids)
+    }
 }
 
 /// The engine refused one of the statements. Kept apart from the failures
@@ -673,6 +709,80 @@ mod tests {
             definition: definition.into(),
             options: Default::default(),
         }
+    }
+
+    fn declarations() -> (Schema, IdsFile) {
+        let mut schema = Schema::default();
+        schema
+            .roles
+            .insert("reader".into(), pbps_model::role::Role::default());
+        let mut table = pbps_model::schema::Table::default();
+        table.row_policies.insert(
+            "mine".into(),
+            pbps_model::schema::RowPolicy {
+                to: pbps_model::schema::PolicyRoles::Roles(["reader".into()].into()),
+                ..Default::default()
+            },
+        );
+        schema.tables.insert("app.t".parse().unwrap(), table);
+        let mut ids = IdsFile::default();
+        ids.roles.insert(
+            pbps_model::Uid::generate(pbps_model::uid::UidKind::Role),
+            "reader".into(),
+        );
+        (schema, ids)
+    }
+
+    fn target<'a>(
+        statements: &'a [Statement],
+        ids: &'a IdsFile,
+        roles: Option<&'a RoleMapping>,
+    ) -> Base<'a> {
+        Base::Target {
+            statements,
+            ids,
+            execution: Execution {
+                zone: Box::leak(Box::new(SessionZone::utc())),
+                transactional: true,
+            },
+            roles,
+        }
+    }
+
+    /// The scratch is compared with the declarations under its own role names
+    /// when the plan ran on them, with no roles at all when the account could
+    /// not make any, and as written for the git baseline.
+    #[test]
+    fn the_declarations_are_compared_under_the_names_the_scratch_has() {
+        let (schema, ids) = declarations();
+        let mapping = RoleMapping::generate(&schema.named_roles(), "run", "tok", |_| false);
+        let none: Vec<Statement> = Vec::new();
+
+        let (mapped, mapped_ids) =
+            compared_declarations(&target(&none, &ids, Some(&mapping)), schema.clone(), &ids);
+        assert!(mapped.roles.contains_key("run_0_tok"));
+        assert!(!mapped.roles.contains_key("reader"));
+        assert_eq!(
+            mapped.tables.values().next().unwrap().row_policies["mine"].to,
+            pbps_model::schema::PolicyRoles::Roles(["run_0_tok".into()].into())
+        );
+        assert_eq!(mapped_ids.roles.values().next().unwrap().raw(), "run_0_tok");
+
+        // Without a mapping a connected rehearsal compares none: the roles and
+        // the policies that name them are left out of both sides.
+        let (cut, cut_ids) =
+            compared_declarations(&target(&none, &ids, None), schema.clone(), &ids);
+        assert!(cut.roles.is_empty() && cut_ids.roles.is_empty());
+        assert!(cut.tables.values().all(|t| t.row_policies.is_empty()));
+
+        // Negative: the baseline compares what it was given, untouched.
+        let baseline = Base::Baseline {
+            statements: &none,
+            ids: &ids,
+        };
+        let (same, same_ids) = compared_declarations(&baseline, schema.clone(), &ids);
+        assert_eq!(same, schema);
+        assert_eq!(same_ids, ids);
     }
 
     /// A body that still differs after the plan has run is the emitter or the

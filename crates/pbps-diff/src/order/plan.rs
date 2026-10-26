@@ -458,6 +458,28 @@ impl<D: ?Sized> OrderedPlan<D> {
     pub fn origins(&self) -> &[pbps_model::operation::Origin] {
         &self.origins
     }
+
+    /// The same plan, in the same order, with every role it names under the
+    /// name `mapping` gives it. Nothing else changes, so it grants nothing the
+    /// plan did not: a rehearsal lowers it to run the roles' grants and policies
+    /// on roles made for the run (#2379). The ordering proof is made again for
+    /// the renamed changes from the same edges, since it commits to their text.
+    pub fn under_role_names(
+        &self,
+        mapping: &pbps_model::role_mapping::RoleMapping,
+    ) -> Result<Self, pbps_model::resolver::OrderError> {
+        let changes = mapping.changes(&self.changes);
+        let proof = OrderingProof::new(&changes, self.proof.edges().clone())?;
+        Ok(Self {
+            identities: self.identities.clone(),
+            changes,
+            origins: self.origins.clone(),
+            proof,
+            mode: self.mode,
+            dialect: self.dialect,
+            brand: std::marker::PhantomData,
+        })
+    }
 }
 
 impl<D: ?Sized> PlanPayload for OrderedPlan<D> {
@@ -533,6 +555,54 @@ mod tests {
         assert_ne!(&draft, ordered.changes());
         assert_eq!(ordered.proof().edges().len(), 1);
     }
+    /// A rehearsal lowers an ordered plan again under the run's role names:
+    /// the roles are renamed, the order, the origins and the mode are what they
+    /// were, and the ordering proof holds for the renamed changes. The plan it
+    /// was made from is untouched.
+    #[test]
+    fn an_ordered_plan_can_be_renamed_in_its_roles_and_in_nothing_else() {
+        let dialect = pbps_dialect::MinimalDialect;
+        let create = |name: &str| {
+            PlannedChange::new(Change::CreateRole {
+                uid: "r_aaaaaa".parse().unwrap(),
+                name: name.into(),
+            })
+        };
+        let mut schedule = Schedule::new(2);
+        schedule.edge(1, 0, Source::Effect, OrderReason::Structural);
+        let ordered = schedule
+            .settle(propose(ChangeSet {
+                changes: vec![create("before"), create("after")],
+            }))
+            .unwrap()
+            .into_planning();
+        let plan = OrderedPlan::new(ordered, PlanMode::Staged, &dialect);
+        let mapping = pbps_model::role_mapping::RoleMapping::generate(
+            &[pbps_model::RoleName::from("after")],
+            "run",
+            "tok",
+            |_| false,
+        );
+        let renamed = plan.under_role_names(&mapping).unwrap();
+        let roles = |plan: &OrderedPlan<pbps_dialect::MinimalDialect>| {
+            plan.changes()
+                .changes
+                .iter()
+                .map(|c| c.change.subject())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roles(&renamed), ["role run_0_tok", "role before"]);
+        assert_eq!(renamed.origins(), plan.origins());
+        assert_eq!(renamed.mode(), PlanMode::Staged);
+        assert_eq!(renamed.proof().edges(), plan.proof().edges());
+        renamed.proof().validate(renamed.changes()).unwrap();
+        // Negative: the proof commits to the text, so the old one does not
+        // vouch for the renamed changes, and the original keeps its own.
+        assert!(plan.proof().validate(renamed.changes()).is_err());
+        assert_eq!(roles(&plan), ["role after", "role before"]);
+        plan.proof().validate(plan.changes()).unwrap();
+    }
+
     #[test]
     fn successive_settlements_preserve_sources_without_unioning_constraints() {
         use pbps_model::operation::Origin;

@@ -272,6 +272,19 @@ impl Scratch<'_> {
         }
     }
 
+    /// See `postgres::Scratch::rehearsal_roles`. SQL Server has no connected
+    /// rehearsal yet.
+    pub(super) async fn rehearsal_roles(
+        &mut self,
+        admin: &mut Conn,
+        roles: &[pbps_model::RoleName],
+    ) -> Result<Result<(), String>, Error> {
+        match self {
+            Self::Postgres(scratch) => scratch.rehearsal_roles(admin, roles).await,
+            Self::Mssql(_) => Err(unsupported()),
+        }
+    }
+
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
         match self {
             Self::Postgres(scratch) => scratch.release(admin).await,

@@ -6,15 +6,19 @@
 //! rehearsal needs no second configuration. It is acquired through the
 //! resolver's own layers (separation from the target, layout by account,
 //! emptiness, externals, owned cleanup) and the externals it stages are
-//! compared with the target as the resolver compares them. What it does not
-//! reproduce is authorization: see [`super::is_authorization`].
+//! compared with the target as the resolver compares them. Authorization is
+//! rehearsed under role names of the run's own (`RoleMapping`), or, where the
+//! scratch account cannot create roles, not at all and the record says so: see
+//! [`super::is_authorization`].
 
-use super::{Base, Execution, Rejected, local_statements, lower_from_empty, rehearse_in};
+use super::{
+    Base, Execution, Rejected, all_statements, local_statements, lower_from_empty, rehearse_in,
+};
 use crate::resolution::{Entry, Refused};
-use pbps_cli::resolver::server::scratch::rehearse::with_session;
+use pbps_cli::resolver::server::scratch::rehearse::{Roles, with_session};
 use pbps_cli::resolver::server::{Error, ProduceError};
 use pbps_db::Conn;
-use pbps_model::{Hints, IdsFile, Schema, Text};
+use pbps_model::{AuthorizationRehearsal, Hints, IdsFile, Schema, Text};
 
 /// What a connected plan does about its rehearsal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,10 +72,26 @@ pub struct Plan<'a, D> {
     pub declared: &'a Schema,
     pub hints: &'a Hints,
     pub dependencies: &'a pbps_model::dependency::Dependencies,
+    /// The plan as ordered, which lowers again under the run's role names.
+    pub ordered: &'a pbps_diff::order::OrderedPlan<D>,
     /// The ordered plan's operations, and the statements they lowered to.
     pub operations: &'a pbps_model::operation::Operations,
     pub statements: &'a crate::emission::LoweredPlan,
     pub staged: bool,
+}
+
+impl<D> Plan<'_, D> {
+    /// Every role the plan, the base it builds on and the declarations it is
+    /// compared with name.
+    fn named_roles(&self) -> std::collections::BTreeSet<pbps_model::RoleName> {
+        let mut named = self.base.schema.named_roles();
+        named.extend(self.desired.schema.named_roles());
+        named.extend(self.declared.named_roles());
+        for planned in &self.ordered.changes().changes {
+            named.extend(planned.change.named_roles());
+        }
+        named
+    }
 }
 
 /// Runs the rehearsal on the entry's scratch, which is released before this
@@ -94,10 +114,7 @@ pub async fn run<D: crate::emission::Engine>(
         Err(Refused::Unanswerable(error)) => return Err(error),
     };
     let dialect: &dyn pbps_dialect::Dialect = plan.dialect.as_ref();
-    let (built, built_from) =
-        lower_from_empty(plan.dialect, plan.base.schema, plan.base.ids, plan.hints)?;
-    let base_statements = local_statements(&built, &built_from);
-    let plan_statements = local_statements(plan.statements, plan.operations);
+    let named = plan.named_roles();
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
     let bootstrap = pbps_diff::diff(
@@ -142,24 +159,26 @@ pub async fn run<D: crate::emission::Engine>(
         &open.standard,
         open.externals.as_deref(),
         &open.provenance,
-        async |session| {
-            rehearse_in(
+        &named,
+        async |session, roles| {
+            let lowered = lowered(plan, roles)?;
+            let findings = rehearse_in(
                 session,
-                Base::Target {
-                    statements: &base_statements,
-                    ids: plan.base.ids,
-                    execution: Execution {
+                lowered.base(
+                    plan.base.ids,
+                    Execution {
                         zone: &zone,
                         transactional: !plan.staged,
                     },
-                },
-                &plan_statements,
+                ),
+                &lowered.plan,
                 plan.declared,
                 plan.desired.ids,
                 dialect,
                 plan.hints,
             )
-            .await
+            .await?;
+            Ok((findings, lowered.authorization))
         },
     )
     .await;
@@ -175,12 +194,78 @@ pub async fn run<D: crate::emission::Engine>(
     )
 }
 
+/// The statements a rehearsal runs, and what they say about authorization.
+struct Lowered {
+    base: Vec<pbps_dialect::Statement>,
+    plan: Vec<pbps_dialect::Statement>,
+    /// The run's role names, where the statements were lowered with them.
+    mapping: Option<pbps_model::role_mapping::RoleMapping>,
+    authorization: AuthorizationRehearsal,
+}
+
+impl Lowered {
+    /// The base the rehearsal of these statements runs on: compared with roles
+    /// exactly when the statements were lowered with the run's.
+    fn base<'a>(&'a self, ids: &'a IdsFile, execution: Execution<'a>) -> Base<'a> {
+        Base::Target {
+            statements: &self.base,
+            ids,
+            execution,
+            roles: self.mapping.as_ref(),
+        }
+    }
+}
+
+/// Lowers the base and the plan for the roles the scratch can have. With the
+/// run's own role names the statements are the whole model's, the roles'
+/// grants and policies included, lowered as everything else is. Without them
+/// the plan the caller lowered is cut down to the objects of the database.
+fn lowered<D: crate::emission::Engine>(
+    plan: &Plan<'_, D>,
+    roles: Roles,
+) -> anyhow::Result<Lowered> {
+    match roles {
+        Ok(mapping) => {
+            let (built, _) = lower_from_empty(
+                plan.dialect,
+                &mapping.schema(plan.base.schema),
+                &mapping.ids(plan.base.ids),
+                plan.hints,
+            )?;
+            let ordered = plan.ordered.under_role_names(&mapping).map_err(|error| {
+                anyhow::anyhow!("the plan cannot be ordered under the run's role names: {error}")
+            })?;
+            let statements = crate::statements(&ordered, plan.dialect)?;
+            Ok(Lowered {
+                base: all_statements(&built),
+                plan: all_statements(&statements),
+                mapping: Some(mapping),
+                authorization: AuthorizationRehearsal::Rehearsed,
+            })
+        }
+        Err(why) => {
+            let (built, built_from) =
+                lower_from_empty(plan.dialect, plan.base.schema, plan.base.ids, plan.hints)?;
+            Ok(Lowered {
+                base: local_statements(&built, &built_from),
+                plan: local_statements(plan.statements, plan.operations),
+                mapping: None,
+                authorization: AuthorizationRehearsal::NotRehearsed {
+                    reason: Text::from(format!(
+                        "this plan's role, grant and row-security policy changes were not run: {why}"
+                    )),
+                },
+            })
+        }
+    }
+}
+
 /// What the rehearsal found, as the plan's verdict.
 fn verdict(
     entry: &str,
     scratch: &pbps_model::resolver::ScratchSource,
     layout: pbps_model::resolver::ScratchLayout,
-    found: anyhow::Result<super::Findings>,
+    found: anyhow::Result<(super::Findings, AuthorizationRehearsal)>,
 ) -> anyhow::Result<Verdict> {
     match found {
         Err(error) => match error.downcast_ref::<Rejected>() {
@@ -190,9 +275,9 @@ fn verdict(
                      `--no-rehearse` if the scratch is the one at fault",
                 ),
             )),
-            None => Err(error.context("the rehearsal could not read the scratch back")),
+            None => Err(error.context("the rehearsal could not be completed")),
         },
-        Ok(findings) if !findings.converged() => Ok(Verdict::Refused(
+        Ok((findings, _)) if !findings.converged() => Ok(Verdict::Refused(
             crate::output::Finding::error(
                 "rehearsal.structural",
                 format!(
@@ -203,7 +288,7 @@ fn verdict(
             )
             .remedy("fix the declarations or the plan; nothing was written"),
         )),
-        Ok(findings) => Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged {
+        Ok((findings, authorization)) => Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged {
             entry: Text::from(entry),
             scratch: scratch.clone(),
             layout,
@@ -212,6 +297,7 @@ fn verdict(
                 .iter()
                 .map(|line| Text::from(line.as_str()))
                 .collect(),
+            authorization,
         })),
     }
 }
@@ -270,7 +356,7 @@ mod tests {
             "ci",
             &pbps_model::resolver::ScratchSource::Server {},
             pbps_model::resolver::ScratchLayout::Supplied,
-            found,
+            found.map(|findings| (findings, AuthorizationRehearsal::Rehearsed)),
         )
     }
 
@@ -310,6 +396,63 @@ mod tests {
             panic!("an exact match is sealed");
         };
         assert!(spelling.is_empty());
+    }
+
+    /// What the rehearsal says about authorization is sealed as it was, and
+    /// does not soften a refusal: a downgraded rehearsal that left a structural
+    /// difference refuses like any other.
+    #[test]
+    fn the_record_says_whether_authorization_ran_and_a_downgrade_still_refuses() {
+        let skipped = AuthorizationRehearsal::NotRehearsed {
+            reason: "no CREATEROLE".into(),
+        };
+        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. })) = verdict(
+            "ci",
+            &pbps_model::resolver::ScratchSource::Server {},
+            pbps_model::resolver::ScratchLayout::Supplied,
+            Ok((findings(&[], &[]), skipped.clone())),
+        ) else {
+            panic!("a downgraded rehearsal that converged is sealed");
+        };
+        assert_eq!(authorization, skipped);
+        let Ok(Verdict::Sealed(pbps_model::Rehearsal::Converged { authorization, .. })) =
+            judged(Ok(findings(&[], &[])))
+        else {
+            panic!("a full rehearsal is sealed");
+        };
+        assert_eq!(authorization, AuthorizationRehearsal::Rehearsed);
+        // Negative: skipping a class is not a reason to pass a plan that does
+        // not converge.
+        let Ok(Verdict::Refused(finding)) = verdict(
+            "ci",
+            &pbps_model::resolver::ScratchSource::Server {},
+            pbps_model::resolver::ScratchLayout::Supplied,
+            Ok((findings(&["table app.t is declared"], &[]), skipped)),
+        ) else {
+            panic!("a structural difference refuses a downgraded rehearsal too");
+        };
+        assert_eq!(finding.id, "rehearsal.structural");
+    }
+
+    /// Roles are part of what the scratch is compared on exactly when the
+    /// statements were lowered with the run's own names for them.
+    #[test]
+    fn roles_are_compared_exactly_when_the_statements_carry_the_runs_names() {
+        let zone = pbps_model::SessionZone::utc();
+        let execution = Execution {
+            zone: &zone,
+            transactional: true,
+        };
+        let ids = IdsFile::default();
+        let lowered = |mapping| Lowered {
+            base: Vec::new(),
+            plan: Vec::new(),
+            mapping,
+            authorization: AuthorizationRehearsal::Rehearsed,
+        };
+        let mapped = lowered(Some(pbps_model::role_mapping::RoleMapping::default()));
+        assert!(mapped.base(&ids, execution).compares_roles());
+        assert!(!lowered(None).base(&ids, execution).compares_roles());
     }
 
     /// Only the engine refusing a statement refuses the plan. A scratch that

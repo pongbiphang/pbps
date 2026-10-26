@@ -1185,9 +1185,42 @@ fn a_rehearsal_stages_the_entrys_externals_and_compares_them_with_the_target() {
 }
 
 #[test]
+#[ignore = "needs live postgres and docker"]
+fn grants_and_policies_are_rehearsed_on_roles_made_for_the_run() {
+    for kind in rehearsal2379::Kind::WITH_ROLES {
+        rehearsal2379::authorization_is_rehearsed(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_policy_the_engine_rejects_is_refused_at_plan_time_and_leaves_no_role() {
+    for kind in rehearsal2379::Kind::WITH_ROLES {
+        rehearsal2379::a_wrong_policy_is_refused(&server(), kind);
+    }
+}
+
+#[test]
 #[ignore = "needs live postgres"]
-fn a_rehearsal_creates_no_role_on_the_scratch_cluster() {
-    rehearsal2379::leaves_roles_and_grants_out(&server());
+fn an_account_that_cannot_create_roles_is_downgraded_and_the_record_says_so() {
+    rehearsal2379::an_account_without_createrole_downgrades_and_says_so(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_killed_rehearsal_has_its_roles_removed_by_the_next_run_and_a_live_ones_kept() {
+    for kind in [
+        rehearsal2379::Kind::Server,
+        rehearsal2379::Kind::SuppliedRoles,
+    ] {
+        rehearsal2379::a_killed_rehearsal_is_cleaned_up_by_the_next_run(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide() {
+    rehearsal2379::concurrent_plans_do_not_collide(&server());
 }
 
 #[test]
