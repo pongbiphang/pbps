@@ -471,6 +471,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }
     }
 

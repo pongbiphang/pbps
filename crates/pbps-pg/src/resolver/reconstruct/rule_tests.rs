@@ -56,6 +56,7 @@ fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }),
     }
 }
