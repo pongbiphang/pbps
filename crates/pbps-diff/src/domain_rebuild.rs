@@ -17,7 +17,7 @@
 //! - a check or NOT NULL is added while an array of it is a column, which the
 //!   engine refuses in place (the connected planner names such domains).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Dialect, TypeChangeRisk};
 use pbps_model::{
@@ -110,7 +110,6 @@ pub(crate) fn plan(
     struct Domain<'a> {
         uid: &'a Uid,
         name: &'a TypeRef,
-        was: &'a TypeRef,
         old: ManagedType,
         new: &'a ManagedType,
     }
@@ -135,7 +134,6 @@ pub(crate) fn plan(
             Domain {
                 uid,
                 name,
-                was,
                 old: comparable,
                 new,
             },
@@ -245,10 +243,14 @@ pub(crate) fn plan(
     }
 
     // Rebuild each in base-depth order.
+    // Each pass plans the domains whose base is planned: a chain of any depth
+    // takes one pass per level, so the bound is the number of domains.
     let mut pending: Vec<&Uid> = why.keys().collect();
-    let mut guard = 0;
-    while !pending.is_empty() && guard < 64 {
-        guard += 1;
+    let mut failed: BTreeSet<&Uid> = BTreeSet::new();
+    for _ in 0..=why.len() {
+        if pending.is_empty() {
+            break;
+        }
         let mut next = Vec::new();
         for uid in pending {
             let d = &domains[uid];
@@ -263,6 +265,12 @@ pub(crate) fn plan(
             });
             let under = match on {
                 Some(on) if rebuilt.contains_key(on) => Some(&rebuilt[on]),
+                // Built on a domain this plan refuses: its own refusal says
+                // all there is to say.
+                Some(on) if failed.contains(on) => {
+                    failed.insert(uid);
+                    continue;
+                }
                 Some(on) if why.contains_key(on) => {
                     // Built on a domain not planned yet: wait for it.
                     next.push(uid);
@@ -301,7 +309,7 @@ pub(crate) fn plan(
                 base,
                 desired,
                 hints,
-                (d.uid, d.was),
+                (d.uid, d.name),
                 Replacement {
                     definition: d.new.clone(),
                     removed: removed.clone(),
@@ -327,10 +335,21 @@ pub(crate) fn plan(
                     }
                     out.changes.extend(steps);
                 }
-                Err(reason) => out.errors.push(refusal(d.name, reason)),
+                // Includes a domain renamed in the plan that rebuilds it: the
+                // steps would run under the old name beside the rename.
+                Err(reason) => {
+                    failed.insert(uid);
+                    out.errors.push(refusal(d.name, reason));
+                }
             }
         }
         pending = next;
+    }
+    for uid in pending {
+        out.errors.push(refusal(
+            domains[uid].name,
+            "its base could not be ordered before it",
+        ));
     }
     out.uids = why;
     out
@@ -643,5 +662,145 @@ mod tests {
             ("app.d", domain("text", None, &[])),
         ];
         assert!(run(&old, &looser, &hints).uids.is_empty());
+    }
+
+    /// `n` domains, each over the one before and the first over `app.e`. The
+    /// deepest is named last and listed (so given its uid) first: a swap order
+    /// that fell back to names would drop each base under the domain over it,
+    /// and a planner that took one pass per 64 levels, in uid order, would
+    /// need a pass for each level.
+    fn chain(n: usize, labels: &[&str]) -> Vec<(String, ManagedType)> {
+        let mut types = vec![("app.e".to_owned(), enumeration(labels))];
+        for depth in (1..=n).rev() {
+            let on = if depth == 1 {
+                "app.e".to_owned()
+            } else {
+                format!("app.d{:03}", depth - 1)
+            };
+            types.push((format!("app.d{depth:03}"), domain(&on, None, &[])));
+        }
+        types
+    }
+
+    fn world_owned(types: &[(String, ManagedType)]) -> (Schema, IdsFile) {
+        let (mut schema, mut ids) = world(&[]);
+        for (n, (name, definition)) in types.iter().enumerate() {
+            ids.types.insert(uid(n as u32 + 1), name.parse().unwrap());
+            schema
+                .types
+                .insert(name.parse().unwrap(), definition.clone());
+        }
+        (schema, ids)
+    }
+
+    /// The swaps of a whole plan, by the depth each carries, in plan order.
+    fn swap_depths(
+        types_old: &[(String, ManagedType)],
+        types_new: &[(String, ManagedType)],
+    ) -> Vec<usize> {
+        let (b, d) = (world_owned(types_old), world_owned(types_new));
+        let plan = crate::schema_diff::diff(
+            Side {
+                schema: &b.0,
+                ids: &b.1,
+            },
+            Side {
+                schema: &d.0,
+                ids: &d.1,
+            },
+            &Casts,
+            &Hints::default(),
+        )
+        .expect("a valid rebuild plans");
+        plan.changes()
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::EnumRebuild {
+                    step: EnumRebuildStep::Swap { depth, .. },
+                    ..
+                } => Some(*depth),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn swaps_run_deepest_first_at_any_depth_and_a_shallow_chain_keeps_its_order() {
+        // Past ten levels, where a one-digit rank gave two depths one value
+        // and the names decided: the old base was dropped under its domain.
+        for n in [3, 11, 12, 70] {
+            let depths = swap_depths(&chain(n, &["a", "b"]), &chain(n, &["b"]));
+            let want: Vec<usize> = (0..=n).rev().filter(|d| *d > 0).chain([0]).collect();
+            assert_eq!(depths.len(), n + 1, "{n}: {depths:?}");
+            // Every domain's swap before the enum's (depth 0), each deeper
+            // one before the one it is built on.
+            assert_eq!(depths, want, "{n}");
+        }
+    }
+
+    #[test]
+    fn a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_with_no_steps() {
+        let old = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("varchar(20)", None, &[])),
+        ];
+        // Rename and base change: refused.
+        let renamed = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d_new", domain("text", None, &[])),
+        ];
+        let out = run(&old, &renamed, &Hints::default());
+        assert!(out.changes.is_empty(), "{:?}", out.changes);
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            said.contains("app.d_new") && said.contains("renamed or moved in this plan"),
+            "{said}"
+        );
+        // Rename alone and rebuild alone are not.
+        let only_renamed = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d_new", domain("varchar(20)", None, &[])),
+        ];
+        let out = run(&old, &only_renamed, &Hints::default());
+        assert!(out.errors.is_empty() && out.uids.is_empty() && out.changes.is_empty());
+        let only_rebuilt = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("text", None, &[])),
+        ];
+        let out = run(&old, &only_rebuilt, &Hints::default());
+        assert!(out.errors.is_empty() && out.uids.len() == 1);
+        // A domain over a rebuilt enum is rebuilt for that alone, and renamed
+        // beside it is refused like any other; the one beside it is not.
+        let over = |name: &'static str| {
+            vec![
+                ("app.e", enumeration(&["a", "b"])),
+                (name, domain("app.e", None, &[])),
+            ]
+        };
+        let mut shrunk = over("app.d_new");
+        shrunk[0].1 = enumeration(&["b"]);
+        let out = run(&over("app.d"), &shrunk, &Hints::default());
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(said.contains("renamed or moved in this plan"), "{said}");
+        assert!(out.changes.iter().all(|c| match c {
+            Change::EnumRebuild { uid: u, .. } => *u != uid(2),
+            _ => true,
+        }));
+        let mut kept = over("app.d");
+        kept[0].1 = enumeration(&["b"]);
+        assert!(
+            run(&over("app.d"), &kept, &Hints::default())
+                .errors
+                .is_empty()
+        );
     }
 }

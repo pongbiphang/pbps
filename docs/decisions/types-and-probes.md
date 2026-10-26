@@ -3747,6 +3747,19 @@ Tests: `a_domains_base_or_collation_change_is_rebuilt_under_its_uid_with_its_col
 `a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql`,
 `a_domain_rebuild_carries_the_comment_to_the_replacement`,
 `a_tightening_is_rebuilt_for_an_array_of_the_domain_and_refused_for_a_composite`
-and `a_domain_beside_an_enum_partition_key_is_tightened_or_rebuilt_like_any_other_holder`
+`a_domain_beside_an_enum_partition_key_is_tightened_or_rebuilt_like_any_other_holder`,
+`a_chain_of_eleven_domains_over_a_rebuilt_enum_is_swapped_deepest_first` and
+`a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_before_any_sql`
 on 16 and 18, with unit tests in the model, differ, emitter, preflight, census
-and report. This supersedes the base and collation refusals of DEC-1635.8.
+and report.
+
+Round 1 of the PR. The swaps sort by `Swap.depth` reversed at a fixed width
+(`usize::MAX - depth`, twenty digits), not by a one-digit complement that gave
+every depth past nine the same value and left the order to the names; the
+create order (`Create.ordinal`) and the drop order (`DropType` rank) are plain
+integers and never had a cap. The planning passes over a chain are bounded by
+the number of domains, not by 64, and a domain whose base could not be ordered
+is reported instead of dropped. A domain renamed in the plan that rebuilds it is
+refused by name (the rename guard compares the desired name, as the enum's
+does), also when it is rebuilt only because its base is: rename it in one plan,
+then change it in the next. This supersedes the base and collation refusals of DEC-1635.8.

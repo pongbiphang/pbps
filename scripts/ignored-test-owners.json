@@ -667,6 +667,8 @@
         "managed_types::an_enum_rebuild_rebuilds_the_domains_over_it_in_depth_order_and_says_why",
         "managed_types::a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql",
         "managed_types::a_domain_rebuild_carries_the_comment_to_the_replacement",
+        "managed_types::a_chain_of_eleven_domains_over_a_rebuilt_enum_is_swapped_deepest_first",
+        "managed_types::a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_before_any_sql",
         "managed_types::a_standing_not_valid_domain_check_is_equal_to_its_declaration_and_warned_about",
         "managed_types::a_layout_only_edit_of_a_domain_check_stays_a_difference",
         "managed_types::a_domain_check_altered_by_hand_between_plan_and_apply_is_refused_as_drift",

@@ -312,7 +312,7 @@ pub(crate) fn rebuild_type(
     };
     if resolver.name(TypeSide::Base, uid) != Some(name) {
         return Err(format!(
-            "the type is renamed or moved in this plan; do that in a plan of its own, then change its {}",
+            "the type is renamed or moved in this plan, and a rebuild under a new name is not planned (DEC-1635.9); rename it in one plan, then change its {} in the next",
             if is_domain { "definition" } else { "labels" }
         ));
     }

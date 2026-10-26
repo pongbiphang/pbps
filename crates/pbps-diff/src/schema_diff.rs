@@ -7706,7 +7706,8 @@ fn rebuild_subject(change: &Change) -> String {
     };
     match step {
         Step::Retype { .. } => format!("0 {}", change.subject()),
-        Step::Swap { depth, .. } => format!("1 {} {}", 9 - (*depth).min(9), change.subject()),
+        // Fixed width, reversed: a deeper swap sorts first at any depth.
+        Step::Swap { depth, .. } => format!("1 {:020} {}", usize::MAX - *depth, change.subject()),
         Step::Create { .. } => change.subject(),
     }
 }

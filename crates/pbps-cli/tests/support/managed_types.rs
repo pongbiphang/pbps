@@ -7767,3 +7767,139 @@ fn a_domain_rebuild_carries_the_comment_to_the_replacement() {
         assert!(label_plan(&d, db, &path).changes.is_empty());
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_chain_of_eleven_domains_over_a_rebuilt_enum_is_swapped_deepest_first() {
+    const DEPTH: usize = 11;
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The deepest domain sorts last by name, so a swap order that falls
+        // back to names would drop each base under the domain over it.
+        let name = |depth: usize| format!("app.d{depth:02}");
+        let mut sql = String::from("CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'b', 'c');");
+        for depth in 1..=DEPTH {
+            let on = if depth == 1 {
+                "app.e".to_owned()
+            } else {
+                name(depth - 1)
+            };
+            sql.push_str(&format!("CREATE DOMAIN {} AS {on};", name(depth)));
+        }
+        sql.push_str(&format!(
+            "CREATE TABLE app.t (id integer PRIMARY KEY, v {}); INSERT INTO app.t VALUES (1, 'b');",
+            name(DEPTH)
+        ));
+        let (own, d) = adopted(&server, "domain_chain4b", &sql);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [b, c]\n",
+        )
+        .unwrap();
+        let path = d.dir.join("chain.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let swaps: Vec<usize> = plan
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                let pbps_model::Change::EnumRebuild {
+                    step: pbps_model::EnumRebuildStep::Swap { depth, .. },
+                    ..
+                } = &p.change
+                else {
+                    return None;
+                };
+                Some(*depth)
+            })
+            .collect();
+        let want: Vec<usize> = (1..=DEPTH).rev().chain([0]).collect();
+        assert_eq!(swaps, want, "{swaps:?}");
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert_eq!(type_ids(&d), uids, "every uid unchanged");
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_type WHERE typtype = 'd' AND typnamespace = 'app'::regnamespace"
+            ),
+            DEPTH as i64
+        );
+        assert_eq!(
+            scalar(db, "SELECT count(*) FROM app.t WHERE v::text = 'b'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_before_any_sql() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // A base change, and the enum under a domain losing a label, each
+        // beside the domain's own rename.
+        for derived in [false, true] {
+            let sql = if derived {
+                "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a','b'); \
+                 CREATE DOMAIN app.dm AS app.e; \
+                 CREATE TABLE app.t (id integer PRIMARY KEY, v app.dm); INSERT INTO app.t VALUES (1, 'b');"
+            } else {
+                "CREATE SCHEMA app; CREATE DOMAIN app.dm AS varchar(20); \
+                 CREATE TABLE app.t (id integer PRIMARY KEY, v app.dm); INSERT INTO app.t VALUES (1, 'b');"
+            };
+            let (own, d) = adopted(&server, "domain_rename_rebuild4b", sql);
+            let db = own.connection();
+            std::fs::remove_file(d.dir.join("schema/app.dm.type.yml")).unwrap();
+            if derived {
+                std::fs::write(
+                    d.dir.join("schema/app.e.type.yml"),
+                    "enum: app.e\nvalues: [b]\n",
+                )
+                .unwrap();
+            }
+            let base = if derived { "app.e" } else { "text" };
+            std::fs::write(
+                d.dir.join("schema/app.dm2.type.yml"),
+                format!("domain: app.dm2\nrenamed_from: app.dm\ntype: {base}\n"),
+            )
+            .unwrap();
+            d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  v: {type: app.dm2}\nprimary_key: [id]\n");
+            // The differ refuses it while the identity file is made, so there
+            // is no plan to approve and nothing to run.
+            let path = d.dir.join("renamed.plan.json");
+            let out = d.run(&["plan"]);
+            assert_ne!(code(&out), 0, "{derived}");
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                said.contains("app.dm2")
+                    && said.contains("renamed or moved in this plan")
+                    && said.contains("rename it in one plan"),
+                "{derived}: {said}"
+            );
+            assert!(!path.exists(), "{derived}");
+            // Nothing ran: the old domain stands, no replacement exists.
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_type WHERE typname IN ('dm') AND typtype = 'd'"
+                ),
+                1
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_type WHERE typname LIKE 'pbps_rebuild%'"
+                ),
+                0
+            );
+        }
+    }
+}
