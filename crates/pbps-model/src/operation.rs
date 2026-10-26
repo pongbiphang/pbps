@@ -655,6 +655,7 @@ impl Operation {
                 ..
             } => column(column_uid),
             Change::AddEnumValue { uid, .. }
+            | Change::AlterDomain { uid, .. }
             | Change::RenameEnumValue { uid, .. }
             | Change::EnumRebuild { uid, .. }
             | Change::CreateType { uid, .. }
@@ -894,6 +895,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             // Renames move an address, and the rest rewrite the instance that
             // stands: neither starts or ends one.
             Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::RenameType { .. }

@@ -67,6 +67,243 @@ mod rebuild;
 mod declared_type_emission_tests {
     use super::*;
 
+    fn domain_for_alteration(
+        not_null: bool,
+        default: Option<&str>,
+        checks: &[(&str, &str)],
+    ) -> pbps_model::ManagedType {
+        pbps_model::ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    fn altering(
+        from: pbps_model::ManagedType,
+        to: pbps_model::ManagedType,
+        half: pbps_model::DomainHalf,
+    ) -> Vec<Statement> {
+        let change = Change::AlterDomain {
+            uid: "y_000001".parse().unwrap(),
+            name: pbps_model::TypeRef::new("app", "co\"de").unwrap(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        Postgres::new()
+            .fixture_emit(&change, Default::default())
+            .unwrap()
+    }
+
+    /// DEC-1635.8: the statements derive from `(from, to, half)` alone. A
+    /// tightening never adds a check plainly, which would evaluate it over
+    /// every row inside the `ALTER`: it adds `NOT VALID`, and the validation
+    /// is the tail the executor runs after the vet.
+    #[test]
+    fn alter_domain_sql_derives_each_half_from_the_two_definitions_alone() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let from = domain_for_alteration(
+            true,
+            Some("'a'"),
+            &[
+                ("keep", "VALUE <> ''"),
+                ("gone", "VALUE <> 'x'"),
+                ("edit", "length(VALUE) < 5"),
+            ],
+        );
+        let to = domain_for_alteration(
+            false,
+            Some("'b'"),
+            &[
+                ("keep", "VALUE <> ''"),
+                ("edit", "length(VALUE) < 9"),
+                ("new", "VALUE <> 'it''s'"),
+            ],
+        );
+        // A verbatim expression is set on lines of its own, so that a trailing
+        // comment cannot swallow what follows it.
+        let flat = |sql: &str| {
+            sql.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("( ", "(")
+                .replace(" )", ")")
+                .replace(" ;", ";")
+        };
+        let loosen = altering(from.clone(), to.clone(), Loosen);
+        assert_eq!(loosen.len(), 1);
+        let sql = &flat(&loosen[0].sql);
+        for expected in [
+            "ALTER DOMAIN \"app\".\"co\"\"de\" DROP CONSTRAINT \"edit\";",
+            "ALTER DOMAIN \"app\".\"co\"\"de\" DROP CONSTRAINT \"gone\";",
+            "ALTER DOMAIN \"app\".\"co\"\"de\" DROP NOT NULL;",
+            "ALTER DOMAIN \"app\".\"co\"\"de\" SET DEFAULT 'b';",
+        ] {
+            assert!(sql.contains(expected), "{expected}: {sql}");
+        }
+        assert!(
+            !sql.contains("keep") && !sql.contains("ADD") && !sql.contains("VALIDATE"),
+            "{sql}"
+        );
+        let metadata = loosen[0].declared_type.as_ref().unwrap();
+        assert!(metadata.altered && metadata.after_vet.is_none());
+        // The re-read after it is held to what the half leaves: the checks
+        // the declaration still holds as they are, and `to`'s default.
+        assert_eq!(
+            metadata.definition,
+            Some(domain_for_alteration(
+                false,
+                Some("'b'"),
+                &[("keep", "VALUE <> ''")]
+            ))
+        );
+
+        let tighten = altering(from, to.clone(), Tighten);
+        assert_eq!(tighten.len(), 1);
+        let sql = &flat(&tighten[0].sql);
+        for expected in [
+            "ADD CONSTRAINT \"edit\" CHECK (length(VALUE) < 9) NOT VALID;",
+            "ADD CONSTRAINT \"new\" CHECK (VALUE <> 'it''s') NOT VALID;",
+        ] {
+            assert!(sql.contains(expected), "{expected}: {sql}");
+        }
+        assert!(
+            !sql.contains("SET NOT NULL") && !sql.contains("VALIDATE"),
+            "{sql}"
+        );
+        assert_eq!(
+            sql.matches("ADD CONSTRAINT").count(),
+            sql.matches("NOT VALID").count()
+        );
+        let metadata = tighten[0].declared_type.as_ref().unwrap();
+        assert_eq!(metadata.definition, Some(to));
+        let tail = metadata.after_vet.as_ref().unwrap();
+        assert!(
+            tail.contains("VALIDATE CONSTRAINT \"edit\";")
+                && tail.contains("VALIDATE CONSTRAINT \"new\";")
+                && !tail.contains("ADD"),
+            "{tail}"
+        );
+    }
+
+    /// The script a reviewer approves shows the validation the apply runs
+    /// after the vet, where it runs (DEC-1635.8): after its `ADD … NOT VALID`,
+    /// with a line saying the bound code is vetted there; a loosening and a
+    /// `SET NOT NULL` alone run no validation and show none. A staged plan's
+    /// listing is rendered the same way.
+    #[test]
+    fn the_rendered_script_shows_the_validation_after_the_not_valid_add() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let pg = Postgres::new();
+        let render = |from: pbps_model::ManagedType,
+                      to: pbps_model::ManagedType,
+                      half,
+                      mode: pbps_model::PlanMode| {
+            let planned = pbps_model::PlannedChange::new(Change::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: pbps_model::TypeRef::new("app", "code").unwrap(),
+                from: Box::new(from),
+                to: Box::new(to),
+                half,
+            });
+            let ordered = pbps_diff::order::singleton(planned, mode, &pg);
+            let lowered = pbps_dialect::lower::lower_all(
+                &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
+                &pg,
+            )
+            .unwrap();
+            pbps_dialect::render_script(&lowered, &pg, &pbps_model::SessionZone::utc())
+        };
+        let plain = domain_for_alteration(false, None, &[("old", "VALUE <> ''")]);
+        let checked = domain_for_alteration(
+            false,
+            None,
+            &[("old", "VALUE <> ''"), ("new", "length(VALUE) < 9")],
+        );
+        for mode in [
+            pbps_model::PlanMode::Transactional,
+            pbps_model::PlanMode::Staged,
+        ] {
+            let script = render(plain.clone(), checked.clone(), Tighten, mode);
+            let add = script.find("ADD CONSTRAINT \"new\"").expect(&script);
+            let note = script
+                .find("-- pbps vets the bound code of this declaration at this point")
+                .expect(&script);
+            let validate = script.find("VALIDATE CONSTRAINT \"new\"").expect(&script);
+            assert!(add < note && note < validate, "{mode:?}: {script}");
+            assert_eq!(script.matches("VALIDATE CONSTRAINT").count(), 1, "{script}");
+            // Negatives: a loosening, and `SET NOT NULL` alone, validate nothing.
+            let loosen = render(checked.clone(), plain.clone(), Loosen, mode);
+            assert!(
+                loosen.contains("DROP CONSTRAINT")
+                    && !loosen.contains("VALIDATE")
+                    && !loosen.contains("pbps vets"),
+                "{loosen}"
+            );
+            let not_null = render(
+                plain.clone(),
+                domain_for_alteration(true, None, &[("old", "VALUE <> ''")]),
+                Tighten,
+                mode,
+            );
+            assert!(
+                not_null.contains("SET NOT NULL")
+                    && !not_null.contains("VALIDATE")
+                    && !not_null.contains("pbps vets"),
+                "{not_null}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tightening_sets_not_null_before_the_checks_and_validates_only_checks() {
+        use pbps_model::DomainHalf::Tighten;
+        let from = domain_for_alteration(false, None, &[]);
+        let to = domain_for_alteration(true, None, &[("c", "VALUE <> ''")]);
+        let statements = altering(from.clone(), to, Tighten);
+        let sql = &statements[0].sql;
+        assert!(
+            sql.find("SET NOT NULL").unwrap() < sql.find("ADD CONSTRAINT").unwrap(),
+            "{sql}"
+        );
+        // NOT NULL alone runs no code, so it has nothing to vet or validate.
+        let only = altering(from, domain_for_alteration(true, None, &[]), Tighten);
+        assert!(only[0].sql.contains("SET NOT NULL"));
+        assert!(only[0].declared_type.as_ref().unwrap().after_vet.is_none());
+    }
+
+    /// Negatives: a half with nothing to say emits nothing, and only a domain
+    /// is altered in place.
+    #[test]
+    fn a_half_with_no_statement_emits_none_and_a_non_domain_is_refused() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let one = domain_for_alteration(false, None, &[("c", "VALUE <> ''")]);
+        let more =
+            domain_for_alteration(false, None, &[("c", "VALUE <> ''"), ("d", "VALUE <> 'x'")]);
+        assert!(altering(one.clone(), more.clone(), Loosen).is_empty());
+        assert!(altering(more, one.clone(), Tighten).is_empty());
+        let change = Change::AlterDomain {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            from: Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["a".into()],
+            }),
+            to: Box::new(one),
+            half: Loosen,
+        };
+        assert!(
+            Postgres::new()
+                .fixture_emit(&change, Default::default())
+                .is_err()
+        );
+    }
+
     #[test]
     fn label_sql_quotes_values_and_certifies_each_intermediate_definition() {
         let uid = "y_000001".parse().unwrap();
@@ -3345,6 +3582,83 @@ pub(crate) fn emit_staged(pg: &Postgres, change: &Change, strategy: Strategy) ->
     staged_attach(change).unwrap_or_else(|| emit(pg, change, strategy))
 }
 
+/// One half of an in-place domain alteration, from `(from, to, half)` alone
+/// (DEC-1635.8). `Loosen` drops the checks that went, drops NOT NULL and sets
+/// or drops the default. `Tighten` sets NOT NULL and adds the checks `NOT
+/// VALID`: that binds their expressions and evaluates no row, so the vet that
+/// follows the statement reads the bound code before anything runs it, and
+/// only then `VALIDATE` scans (measured on 16 and 18: a plain `ADD CONSTRAINT`
+/// calls the expression on every existing row inside the `ALTER`).
+fn alter_domain(
+    pg: &Postgres,
+    uid: &pbps_model::Uid,
+    name: &pbps_model::TypeRef,
+    (from, to): (&pbps_model::ManagedType, &pbps_model::ManagedType),
+    half: pbps_model::DomainHalf,
+) -> Sql {
+    let Some(delta) = pbps_model::DomainDelta::of(from, to) else {
+        return Err(invalid(format!(
+            "type {} is altered in place, and only a domain is",
+            name.shown()
+        )));
+    };
+    let domain = qualified(&TableName::new(name.schema(), name.name()))?;
+    let alter = |clause: String| format!("ALTER DOMAIN {domain} {clause};");
+    let mut commands = Vec::new();
+    let mut validate = Vec::new();
+    let definition = match half {
+        pbps_model::DomainHalf::Loosen => {
+            for check in &delta.drop_checks {
+                commands.push(alter(format!("DROP CONSTRAINT {}", quote(check.raw())?)));
+            }
+            if delta.drop_not_null {
+                commands.push(alter("DROP NOT NULL".to_owned()));
+            }
+            match delta.default {
+                Some(Some(text)) => {
+                    commands.push(alter(format!("SET DEFAULT {}", verbatim(text))));
+                }
+                Some(None) => commands.push(alter("DROP DEFAULT".to_owned())),
+                None => {}
+            }
+            pbps_model::DomainDelta::loosened(from, to).unwrap_or_else(|| to.clone())
+        }
+        pbps_model::DomainHalf::Tighten => {
+            if delta.set_not_null {
+                commands.push(alter("SET NOT NULL".to_owned()));
+            }
+            for (check, text) in &delta.add_checks {
+                commands.push(alter(format!(
+                    "ADD CONSTRAINT {} CHECK ({}) NOT VALID",
+                    quote(check.raw())?,
+                    verbatim(text)
+                )));
+                validate.push(alter(format!(
+                    "VALIDATE CONSTRAINT {}",
+                    quote(check.raw())?
+                )));
+            }
+            to.clone()
+        }
+    };
+    if commands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut statement = scoped(pg, name.schema(), &commands.join("\n"))?;
+    statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+        uid: uid.clone(),
+        name: name.clone(),
+        definition: Some(definition),
+        altered: true,
+        after_vet: if validate.is_empty() {
+            None
+        } else {
+            Some(scoped(pg, name.schema(), &validate.join("\n"))?.sql)
+        },
+    });
+    Ok(vec![statement])
+}
+
 fn add_key_sql(table: &TableName, clause: &str, only: bool) -> Result<String, DialectError> {
     Ok(format!(
         "ALTER TABLE {}{} ADD {clause};",
@@ -3403,9 +3717,18 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: Some((**definition).clone()),
+                altered: false,
+                after_vet: None,
             });
             Ok(vec![statement])
         }
+        Change::AlterDomain {
+            uid,
+            name,
+            from,
+            to,
+            half,
+        } => alter_domain(pg, uid, name, (from, to), *half),
         Change::RenameEnumValue {
             uid,
             name,
@@ -3429,6 +3752,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: Some((**definition).clone()),
+                altered: false,
+                after_vet: None,
             });
             Ok(vec![statement])
         }
@@ -3496,6 +3821,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: Some((**definition).clone()),
+                altered: false,
+                after_vet: None,
             });
             Ok(vec![statement])
         }
@@ -3522,6 +3849,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 uid: uid.clone(),
                 name: name.clone(),
                 definition: None,
+                altered: false,
+                after_vet: None,
             });
             Ok(vec![statement])
         }
@@ -3556,6 +3885,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     uid: uid.clone(),
                     name: at.clone(),
                     definition: Some((**definition).clone()),
+                    altered: false,
+                    after_vet: None,
                 });
                 out.push(statement);
             }
@@ -3574,6 +3905,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     uid: uid.clone(),
                     name: to.clone(),
                     definition: Some((**definition).clone()),
+                    altered: false,
+                    after_vet: None,
                 });
                 out.push(statement);
             }
@@ -4705,6 +5038,8 @@ fn emit_enum_rebuild(
                 uid: uid.clone(),
                 name: at.clone(),
                 definition: Some(definition.clone()),
+                altered: false,
+                after_vet: None,
             });
             statement
         };

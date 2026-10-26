@@ -122,6 +122,7 @@ pub(crate) fn blocked_by(dialect: &Mssql, base: &Schema, change: &Change) -> BTr
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::CreateType { .. }
+        | Change::AlterDomain { .. }
         | Change::DropType { .. }
         | Change::RenameType { .. }
         | Change::CreateRole { .. }

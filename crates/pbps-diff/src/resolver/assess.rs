@@ -267,6 +267,7 @@ Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTab
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::CreateType { .. }
         | Change::DropType { .. }

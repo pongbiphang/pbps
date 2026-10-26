@@ -255,6 +255,17 @@ pub enum Change {
         ordinal: usize,
         definition: Box<crate::ManagedType>,
     },
+    /// One half of an in-place domain alteration (DEC-1635.8). The statements
+    /// derive from `(from, to, half)` alone: `Loosen` drops what the
+    /// declaration no longer holds and sets the default, `Tighten` adds what
+    /// it newly holds and validates it.
+    AlterDomain {
+        uid: Uid,
+        name: crate::TypeRef,
+        from: Box<crate::ManagedType>,
+        to: Box<crate::ManagedType>,
+        half: crate::DomainHalf,
+    },
     /// A label removal or reorder, done by rebuilding the enum under the same
     /// uid (DEC-1635.7). `name` is the live name, `tmp` the replacement's.
     EnumRebuild {
@@ -1405,6 +1416,7 @@ impl Change {
         // rendering it here would change identity comparisons (DEC-2084.1).
         match self {
             Change::AddEnumValue { name, .. }
+            | Change::AlterDomain { name, .. }
             | Change::RenameEnumValue { name, .. }
             | Change::EnumRebuild { name, .. }
             | Change::CreateType { name, .. }
@@ -1516,6 +1528,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1621,6 +1634,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1747,6 +1761,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1856,6 +1871,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1991,6 +2007,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2069,6 +2086,7 @@ impl Change {
             | Change::CreateModule { .. }
             | Change::AlterModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2167,6 +2185,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2199,6 +2218,7 @@ impl Change {
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
             Change::PublicExecution { .. } => (None, None),
             Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2313,6 +2333,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2435,6 +2456,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2520,6 +2542,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2673,6 +2696,7 @@ impl Change {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2710,6 +2734,7 @@ impl Change {
                 vec![(from, Presence::Absent), (to, Presence::Present)]
             }
             Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2825,6 +2850,7 @@ impl Change {
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2889,6 +2915,7 @@ impl Change {
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -2992,6 +3019,29 @@ Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => {},
             Change::EnumRebuild { .. } => {
                 r.insert(RiskClass::TypeRebuild);
             }
+            // The loosening statements carry no class, as `DropCheck` does
+            // (DECISIONS 486). A check added or changed validates every row
+            // of every table using the domain, as `AddCheck` does, and NOT NULL
+            // reads their NULLs (DEC-1635.8).
+            Change::AlterDomain {
+                from,
+                to,
+                half: crate::DomainHalf::Tighten,
+                ..
+            } => {
+                if let Some(delta) = crate::DomainDelta::of(from, to) {
+                    if !delta.add_checks.is_empty() {
+                        r.insert(RiskClass::Constraint);
+                    }
+                    if delta.set_not_null {
+                        r.insert(RiskClass::NotNull);
+                    }
+                }
+            }
+            Change::AlterDomain {
+                half: crate::DomainHalf::Loosen,
+                ..
+            } => {}
             Change::AlterColumnNullability {
                 to_nullable: false, ..
             }

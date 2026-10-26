@@ -96,6 +96,7 @@ fn reference_uses<'a>(
                 types.extend(key_type.iter().map(|ty| (TypeSide::Desired, ty)));
             }
             Change::AddEnumValue { definition, .. }
+            | Change::AlterDomain { to: definition, .. }
             | Change::RenameEnumValue { definition, .. }
             | Change::CreateType { definition, .. }
             | Change::RenameType { definition, .. } => {
@@ -195,6 +196,7 @@ pub fn managed_names(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeR
     for planned in &changes.changes {
         match &planned.change {
             Change::AddEnumValue { name, .. }
+            | Change::AlterDomain { name, .. }
             | Change::RenameEnumValue { name, .. }
             | Change::EnumRebuild { name, .. }
             | Change::CreateType { name, .. }

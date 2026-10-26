@@ -953,6 +953,25 @@ pub(crate) fn unsafe_uses(
                     }
                     ManagedType::Enum { .. } => false,
                 },
+                // Only what the half introduces: the default `Loosen` sets and
+                // the checks `Tighten` adds or changes. A dropped or untouched
+                // expression is no use of the new label (DEC-1635.8).
+                Change::AlterDomain { from, to, half, .. } => {
+                    match (to.as_ref(), pbps_model::DomainDelta::of(from, to)) {
+                        (ManagedType::Domain { base, .. }, Some(delta)) => {
+                            typed(base)
+                                && match half {
+                                    pbps_model::DomainHalf::Loosen => {
+                                        delta.default.flatten().is_some_and(text)
+                                    }
+                                    pbps_model::DomainHalf::Tighten => {
+                                        delta.add_checks.iter().any(|(_, s)| text(s))
+                                    }
+                                }
+                        }
+                        _ => false,
+                    }
+                }
                 Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
                     let lexicon = dialect.lexicon();
                     let deferred = matches!(
@@ -1008,6 +1027,7 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 .map(|b| (p.uid.clone(), b.definition.clone()))
         })
         .collect();
+    let anchors = definitions.clone();
     let mut replacements: BTreeMap<Uid, ManagedType> = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
@@ -1015,6 +1035,67 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 uid, definition, ..
             } => {
                 definitions.insert(uid.clone(), (**definition).clone());
+            }
+            // The statements derive from `(from, to, half)` alone, so the
+            // payload is held to what the approved before-definition and the
+            // sealed final definition say (DEC-1635.8): the sealed one is
+            // `to`, `from` has the before-definition's NOT NULL, collation,
+            // check names and default presence (its texts are the differ's
+            // own, the catalog's before-definition being another spelling of
+            // them), and the half has a statement to run.
+            Change::AlterDomain {
+                uid,
+                name,
+                from,
+                to,
+                half,
+            } => {
+                if !pins
+                    .iter()
+                    .any(|p| &p.uid == uid && &p.name == name && p.definition == **to)
+                {
+                    return false;
+                }
+                let (
+                    Some(ManagedType::Domain {
+                        not_null,
+                        default,
+                        checks,
+                        collation,
+                        ..
+                    }),
+                    ManagedType::Domain {
+                        not_null: from_not_null,
+                        default: from_default,
+                        checks: from_checks,
+                        collation: from_collation,
+                        ..
+                    },
+                ) = (anchors.get(uid), from.as_ref())
+                else {
+                    return false;
+                };
+                if not_null != from_not_null
+                    || default.is_some() != from_default.is_some()
+                    || collation != from_collation
+                    || !checks.keys().eq(from_checks.keys())
+                {
+                    return false;
+                }
+                let Some(delta) = pbps_model::DomainDelta::of(from, to) else {
+                    return false;
+                };
+                let left = match half {
+                    pbps_model::DomainHalf::Loosen if delta.loosens() => {
+                        pbps_model::DomainDelta::loosened(from, to)
+                    }
+                    pbps_model::DomainHalf::Tighten if delta.tightens() => Some((**to).clone()),
+                    pbps_model::DomainHalf::Loosen | pbps_model::DomainHalf::Tighten => None,
+                };
+                let Some(left) = left else {
+                    return false;
+                };
+                definitions.insert(uid.clone(), left);
             }
             Change::AddEnumValue {
                 uid,
@@ -1897,6 +1978,118 @@ mod tests {
         }
     }
 
+    fn code(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
+        ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    /// A saved plan's domain alterations replay against the approved
+    /// before-definition and the sealed final one: the payload cannot say a
+    /// different difference, and each half has a statement to run.
+    #[test]
+    fn a_saved_domain_alteration_replays_against_its_pins_and_cannot_certify_itself() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let uid: Uid = "y_000002".parse().unwrap();
+        let name: TypeRef = "app.d".parse().unwrap();
+        let before = code(false, Some("'a'"), &[("c1", "x")]);
+        let to = code(true, Some("'b'"), &[("c1", "y"), ("c2", "z")]);
+        let pin = DeclaredTypePin {
+            uid: uid.clone(),
+            name: name.clone(),
+            definition: to.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: name.clone(),
+                definition: before.clone(),
+            }),
+        };
+        let step = |from: &ManagedType, to: &ManagedType, half| {
+            PlannedChange::new(Change::AlterDomain {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: Box::new(from.clone()),
+                to: Box::new(to.clone()),
+                half,
+            })
+        };
+        let plan = |steps: Vec<PlannedChange>| ChangeSet { changes: steps };
+        let whole = || vec![step(&before, &to, Loosen), step(&before, &to, Tighten)];
+        assert!(valid_steps(&plan(whole()), std::slice::from_ref(&pin)));
+        // Either half alone replays when it has something to do.
+        assert!(valid_steps(
+            &plan(whole()[..1].to_vec()),
+            std::slice::from_ref(&pin)
+        ));
+        // Negatives: each of these would make the emitter write other
+        // statements than the approved definitions call for.
+        let lie = code(true, Some("'b'"), &[("c1", "y"), ("c2", "other")]);
+        assert!(!valid_steps(
+            &plan(vec![step(&before, &lie, Loosen)]),
+            std::slice::from_ref(&pin)
+        ));
+        let fewer = code(false, Some("'a'"), &[]);
+        assert!(!valid_steps(
+            &plan(vec![step(&fewer, &to, Loosen), step(&fewer, &to, Tighten)]),
+            std::slice::from_ref(&pin)
+        ));
+        // NOT NULL, the default's presence, or the collation said otherwise
+        // than the before-definition has them.
+        for other in [
+            code(true, Some("'a'"), &[("c1", "x")]),
+            code(false, None, &[("c1", "x")]),
+        ] {
+            assert!(!valid_steps(
+                &plan(vec![step(&other, &to, Loosen)]),
+                std::slice::from_ref(&pin)
+            ));
+        }
+        // The texts of the checks are the differ's own spelling of the
+        // before-definition's, and are not compared with them.
+        let respelled = code(false, Some("'a'"), &[("c1", "(x)")]);
+        assert!(valid_steps(
+            &plan(vec![step(&respelled, &to, Loosen)]),
+            std::slice::from_ref(&pin)
+        ));
+        // A half with nothing to do: this declaration adds nothing.
+        let narrower = DeclaredTypePin {
+            definition: code(false, None, &[]),
+            ..pin.clone()
+        };
+        let nothing = code(false, None, &[]);
+        assert!(!valid_steps(
+            &plan(vec![step(&before, &nothing, Tighten)]),
+            std::slice::from_ref(&narrower)
+        ));
+        // No pin, another name, no before-definition, or an enum: refused.
+        assert!(!valid_steps(&plan(whole()), &[]));
+        let other_name = DeclaredTypePin {
+            name: "app.other".parse().unwrap(),
+            ..pin.clone()
+        };
+        assert!(!valid_steps(&plan(whole()), &[other_name]));
+        let created = DeclaredTypePin {
+            before: None,
+            ..pin.clone()
+        };
+        assert!(!valid_steps(&plan(whole()), &[created]));
+        let enum_pin = DeclaredTypePin {
+            definition: enumeration(&["a"]),
+            before: Some(DeclaredTypeBefore {
+                name: "app.d".parse().unwrap(),
+                definition: enumeration(&["a"]),
+            }),
+            ..pin
+        };
+        assert!(!valid_steps(&plan(whole()), &[enum_pin]));
+    }
+
     #[test]
     fn domain_owned_defaults_and_checks_refuse_new_labels_but_accept_existing_ones() {
         for base in ["app.e", "app.e[]"] {
@@ -1946,6 +2139,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Slice 3a's refusal reaches an in-place domain alteration, for what each
+    /// half introduces and nothing else (DEC-1635.8).
+    #[test]
+    fn an_altered_domain_refuses_a_new_label_in_what_its_halves_introduce() {
+        use pbps_model::{DomainDelta, DomainHalf};
+
+        let domain =
+            |base: &str, default: Option<&str>, checks: &[(&str, &str)]| ManagedType::Domain {
+                base: base.parse().unwrap(),
+                not_null: false,
+                default: default.map(str::to_owned),
+                checks: checks
+                    .iter()
+                    .map(|(n, t)| ((*n).into(), (*t).to_owned()))
+                    .collect(),
+                collation: None,
+            };
+        let none = domain("app.e", None, &[]);
+        let with_default = |v: &str| domain("app.e", Some(&format!("'{v}'::app.e")), &[]);
+        let with_check =
+            |v: &str| domain("app.e", None, &[("c", &format!("VALUE <> '{v}'::app.e"))]);
+        // (from, to, refused when it names the new label)
+        let cases: [(ManagedType, ManagedType, bool); 6] = [
+            // A default set, a check added, a check changed.
+            (none.clone(), with_default("new"), true),
+            (none.clone(), with_check("new"), true),
+            (with_check("old"), with_check("new"), true),
+            // A check dropped, one left alone, a default dropped.
+            (with_check("new"), none.clone(), false),
+            (
+                with_check("new"),
+                domain(
+                    "app.e",
+                    None,
+                    &[("c", "VALUE <> 'new'::app.e"), ("d", "true")],
+                ),
+                false,
+            ),
+            (with_default("new"), none.clone(), false),
+        ];
+        for (n, (from, to, refused)) in cases.iter().enumerate() {
+            for half in [DomainHalf::Loosen, DomainHalf::Tighten] {
+                let delta = DomainDelta::of(from, to).unwrap();
+                let has = match half {
+                    DomainHalf::Loosen => delta.loosens(),
+                    DomainHalf::Tighten => delta.tightens(),
+                };
+                if !has {
+                    continue;
+                }
+                let (mut steps, errors, schema, ids) = planned(&["old"], &["old", "new"], &[]);
+                assert!(errors.is_empty());
+                steps.changes.push(PlannedChange::new(Change::AlterDomain {
+                    uid: "y_000002".parse().unwrap(),
+                    name: "app.d".parse().unwrap(),
+                    from: Box::new(from.clone()),
+                    to: Box::new(to.clone()),
+                    half,
+                }));
+                let errors = unsafe_uses(
+                    &steps,
+                    Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    &pbps_dialect::MinimalDialect,
+                );
+                // The default is `Loosen`'s, a check `Tighten`'s.
+                let introduces = *refused
+                    && match half {
+                        DomainHalf::Loosen => delta.default.flatten().is_some(),
+                        DomainHalf::Tighten => !delta.add_checks.is_empty(),
+                    };
+                assert_eq!(
+                    !errors.is_empty(),
+                    introduces,
+                    "case {n} {half:?}: {errors:?}"
+                );
+            }
+        }
+        // The same edits with an existing label.
+        for to in [with_default("old"), with_check("old")] {
+            for half in [DomainHalf::Loosen, DomainHalf::Tighten] {
+                let (mut steps, _, schema, ids) = planned(&["old"], &["old", "new"], &[]);
+                steps.changes.push(PlannedChange::new(Change::AlterDomain {
+                    uid: "y_000002".parse().unwrap(),
+                    name: "app.d".parse().unwrap(),
+                    from: Box::new(none.clone()),
+                    to: Box::new(to.clone()),
+                    half,
+                }));
+                let errors = unsafe_uses(
+                    &steps,
+                    Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    &pbps_dialect::MinimalDialect,
+                );
+                assert!(errors.is_empty(), "{half:?}: {errors:?}");
+            }
+        }
+        // A domain over a different enum does not use this enum's new label.
+        let (mut steps, _, schema, ids) = planned(&["old"], &["old", "new"], &[]);
+        steps.changes.push(PlannedChange::new(Change::AlterDomain {
+            uid: "y_000002".parse().unwrap(),
+            name: "app.d".parse().unwrap(),
+            from: Box::new(domain("app.other", None, &[])),
+            to: Box::new(domain("app.other", Some("'new'::app.other"), &[])),
+            half: DomainHalf::Loosen,
+        }));
+        let errors = unsafe_uses(
+            &steps,
+            Side {
+                schema: &schema,
+                ids: &ids,
+            },
+            &pbps_dialect::MinimalDialect,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }
 

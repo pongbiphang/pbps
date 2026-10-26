@@ -76,6 +76,24 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             None,
         );
     }
+    // Both halves of a domain alteration name a type and no table.
+    for half in [
+        pbps_model::DomainHalf::Loosen,
+        pbps_model::DomainHalf::Tighten,
+    ] {
+        pin(
+            Change::AlterDomain {
+                uid: type_uid.clone(),
+                name: type_name.clone(),
+                from: definition.clone(),
+                to: definition.clone(),
+                half,
+            },
+            vec![],
+            vec![],
+            None,
+        );
+    }
     pin(
         Change::RenameEnumValue {
             uid: type_uid.clone(),

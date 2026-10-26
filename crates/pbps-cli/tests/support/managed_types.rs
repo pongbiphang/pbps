@@ -71,21 +71,15 @@ fn domain_expression_records_converge_without_masking_layout_changes_or_live_dri
         );
         succeeds(d.run(&["verify", "--db", db]));
 
-        // Equivalent SQL with different authored layout remains a slice-4 difference.
+        // Equivalent SQL with different authored layout remains a difference:
+        // the check is dropped and added again, in place (DEC-1635.8).
         std::fs::write(
             &choice,
             choice_yaml.replace("VALUE IN ('a','b')", "VALUE  IN ( 'a', 'b' )"),
         )
         .unwrap();
         d.commit();
-        let changed = d.run(&["plan", "--db", db]);
-        assert_ne!(code(&changed), 0);
-        assert!(
-            stderr(&changed).contains("app.choice")
-                && stderr(&changed).contains("domain checks changed"),
-            "{}",
-            stderr(&changed)
-        );
+        assert_eq!(halves(&plan()), ["Loosen", "Tighten"]);
         // Restore the source declaration before the separate offline rename
         // preview, which compares git declarations rather than target state.
         std::fs::write(&choice, choice_yaml).unwrap();
@@ -842,10 +836,11 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         let mood = pbps_load::load_type_str(&mood_path, &mood_text).unwrap();
         let phone = pbps_load::load_type_str(&phone_path, &phone_text).unwrap();
         let mut variants = Vec::new();
-        // Enum label changes are executable (DEC-1635.6, DEC-1635.7); only the
-        // domain attributes below still refuse.
+        // Enum label changes are executable (DEC-1635.6, DEC-1635.7) and so
+        // are a domain's NOT NULL, default and checks (DEC-1635.8); only the
+        // base type and the collation below still refuse.
         let _ = &mood;
-        for field in 0..8 {
+        for field in [0, 7] {
             let mut changed = phone.definition.clone();
             let ManagedType::Domain {
                 base,
@@ -879,7 +874,7 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
             assert_ne!(code(&out), 0, "{}", stdout(&out));
             let message = stderr(&out);
             assert!(
-                message.contains(&name.shown().to_string()) && message.contains("slice 3"),
+                message.contains(&name.shown().to_string()) && message.contains("slice 4b"),
                 "{message}"
             );
             assert!(!plan_path.exists());
@@ -5343,6 +5338,875 @@ fn a_declared_enum_bound_is_asked_of_the_rows_in_the_labels_they_hold() {
                 assert!(label_plan(&d, db, &path).changes.is_empty());
                 succeeds(d.run(&["verify", "--db", db]));
             }
+        }
+    }
+}
+
+// ---- #1635 slice 4a: a declared domain changes in place ----
+
+/// The domain `app.code`, as a declaration file writes it.
+fn code_domain(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> String {
+    let mut yaml = String::from("domain: app.code\ntype: text\n");
+    if not_null {
+        yaml.push_str("not_null: true\n");
+    }
+    if let Some(default) = default {
+        yaml.push_str(&format!(
+            "default: {}\n",
+            serde_json::to_string(default).unwrap()
+        ));
+    }
+    if !checks.is_empty() {
+        yaml.push_str("checks:\n");
+        for (name, text) in checks {
+            yaml.push_str(&format!(
+                "  {name}: {}\n",
+                serde_json::to_string(text).unwrap()
+            ));
+        }
+    }
+    yaml
+}
+
+/// The check `c1` of [`CODE_SQL`] in the engine's spelling, which an adopted
+/// domain is compared by until it is applied from a declaration.
+const C1: &str = "(VALUE <> ''::text)";
+
+const CODE_SQL: &str = "CREATE SCHEMA app;
+CREATE DOMAIN app.code AS text DEFAULT 'a' CONSTRAINT c1 CHECK (VALUE <> '');
+CREATE TABLE app.t (id integer PRIMARY KEY, v app.code);
+INSERT INTO app.t VALUES (1, 'abc'), (2, 'xyz');";
+
+/// The halves of a plan's domain alterations, in plan order: `Loosen` and
+/// `Tighten`, and any other change by its name.
+#[allow(clippy::wildcard_enum_match_arm)] // Any other change is named by its variant.
+fn halves(plan: &pbps_model::SavedPlan) -> Vec<String> {
+    plan.changes
+        .changes
+        .iter()
+        .map(|p| match &p.change {
+            pbps_model::Change::AlterDomain { half, .. } => format!("{half:?}"),
+            other => format!("{other:?}")
+                .split([' ', '{', '('])
+                .next()
+                .unwrap()
+                .to_owned(),
+        })
+        .collect()
+}
+
+fn write_code(d: &Demo, yaml: &str) {
+    std::fs::write(d.dir.join("schema/app.code.type.yml"), yaml).unwrap();
+    d.commit();
+}
+
+fn apply_allowing(
+    d: &Demo,
+    db: &str,
+    path: &std::path::Path,
+    allow: &[&str],
+) -> std::process::Output {
+    let checksum = plan_checksum(path);
+    let mut args = vec![
+        "apply",
+        "--db",
+        db,
+        "--plan",
+        path.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+    ];
+    for class in allow {
+        args.extend(["--allow", class]);
+    }
+    d.run(&args)
+}
+
+/// No domain check stands `NOT VALID`: pbps leaves none behind.
+fn no_unvalidated_domain_check(db: &str) -> bool {
+    scalar(
+        db,
+        "SELECT count(*) FROM pg_constraint WHERE contypid <> 0 AND NOT convalidated",
+    ) == 0
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domain_alterations_converge_in_place_keep_the_uid_and_record_the_authored_text() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_alter4a", CODE_SQL);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        let authored = "VALUE <>  '' AND length(VALUE) < 9";
+        let path = d.dir.join("domain.plan.json");
+        // (what is declared, the halves it plans, the classes it needs)
+        let steps: Vec<(String, Vec<&str>, Vec<&str>)> = vec![
+            // A changed check is a drop and an add under its name.
+            (
+                code_domain(false, Some("'a'"), &[("c1", authored)]),
+                vec!["Loosen", "Tighten"],
+                vec!["constraint"],
+            ),
+            (
+                code_domain(
+                    false,
+                    Some("'a'"),
+                    &[("c1", authored), ("c2", "VALUE <> 'x'")],
+                ),
+                vec!["Tighten"],
+                vec!["constraint"],
+            ),
+            (
+                code_domain(false, Some("'a'"), &[("c1", authored)]),
+                vec!["Loosen"],
+                vec![],
+            ),
+            (
+                code_domain(false, Some("'b'"), &[("c1", authored)]),
+                vec!["Loosen"],
+                vec![],
+            ),
+            (
+                code_domain(false, None, &[("c1", authored)]),
+                vec!["Loosen"],
+                vec![],
+            ),
+            (
+                code_domain(true, None, &[("c1", authored)]),
+                vec!["Tighten"],
+                vec!["not-null"],
+            ),
+            (
+                code_domain(false, None, &[("c1", authored)]),
+                vec!["Loosen"],
+                vec![],
+            ),
+        ];
+        for (yaml, expected, allow) in steps {
+            write_code(&d, &yaml);
+            let plan = label_plan(&d, db, &path);
+            assert_eq!(halves(&plan), expected, "{yaml}\n{plan:?}");
+            succeeds(apply_allowing(&d, db, &path, &allow));
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "{yaml}");
+            assert!(no_unvalidated_domain_check(db));
+            assert_eq!(type_ids(&d), uids, "the uid never changes");
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+        // The text recorded for the next plan is the authored spelling, the
+        // double space included, and not the engine's.
+        let snapshot = latest_snapshot(db);
+        let recorded = snapshot
+            .declared
+            .types
+            .get(&"app.code".parse().unwrap())
+            .expect("the domain's record");
+        let ManagedType::Domain { checks, .. } = recorded else {
+            panic!("{recorded:?}")
+        };
+        let c1: pbps_model::ObjectLocalName = "c1".into();
+        assert_eq!(checks.get(&c1).map(String::as_str), Some(authored));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 2);
+    }
+}
+
+/// The engine's own answer, kept: the plan is valid and the apply is refused
+/// where the rows are, with nothing changed (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_tightening_over_a_violating_row_rolls_the_apply_back_and_keeps_the_old_check() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_violate4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("violate.plan.json");
+        write_code(
+            &d,
+            &code_domain(false, Some("'a'"), &[("c1", "length(VALUE) < 3")]),
+        );
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(halves(&plan), ["Loosen", "Tighten"]);
+        let before = latest_snapshot(db);
+        let out = apply_allowing(&d, db, &path, &["constraint"]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("violate the new constraint") && said.contains("table \"t\""),
+            "{said}"
+        );
+        // Whole: the old check stands, validated, and no new one.
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE contypid = 'app.code'::regtype AND conname = 'c1'"
+            ),
+            "CHECK ((VALUE <> ''::text))"
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint WHERE contypid = 'app.code'::regtype"
+            ),
+            1
+        );
+        assert!(no_unvalidated_domain_check(db));
+        assert_eq!(latest_snapshot(db).declared, before.declared);
+        // The plan stands as it was: the rows are the author's to fix.
+        assert_eq!(halves(&label_plan(&d, db, &path)), ["Loosen", "Tighten"]);
+    }
+}
+
+const PROBE_SQL: &str = "CREATE SCHEMA app;
+CREATE SEQUENCE app.probe_seq;
+CREATE FUNCTION app.probe(text) RETURNS boolean LANGUAGE sql
+  AS $$ SELECT nextval('app.probe_seq') > 0 $$;
+CREATE DOMAIN app.code AS text;
+CREATE TABLE app.t (id integer PRIMARY KEY, v app.code);
+INSERT INTO app.t VALUES (1, 'a'), (2, 'b');";
+
+/// The pinned negative: a check that calls a function of the project is
+/// refused by the apply's gate, and the function never ran. Added plain, the
+/// check is evaluated over every row inside the `ALTER`, before anything can
+/// vet it; added `NOT VALID` it is bound and evaluated nowhere until the vet
+/// has read it (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_check_calling_a_project_function_is_vetted_before_it_runs_and_leaves_nothing() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_probe4a", PROBE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("probe.plan.json");
+        let probed = |db: &str| {
+            scalar(
+                db,
+                "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM app.probe_seq",
+            )
+        };
+        assert_eq!(probed(db), 0);
+        write_code(
+            &d,
+            &code_domain(false, None, &[("probe_it", "app.probe(VALUE)")]),
+        );
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(halves(&plan), ["Tighten"]);
+        let out = apply_allowing(&d, db, &path, &["constraint"]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(said.contains("app.probe"), "{said}");
+        // Nothing left behind, and the function never ran.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint WHERE contypid = 'app.code'::regtype"
+            ),
+            0
+        );
+        assert_eq!(probed(db), 0, "the check ran before it was vetted: {said}");
+    }
+}
+
+/// Refused where the plan is made, naming the column and the engine's reason,
+/// for each container that holds the domain (DEC-1635.8). A domain nothing
+/// holds that way tightens, and so does one a plan loosens beside.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_a_column() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (holder, column) in [
+            ("x app.code[]", "t.x"),
+            ("x app.pair", "t.x"),
+            ("x app.pair[]", "t.x"),
+        ] {
+            let sql = format!(
+                "{CODE_SQL} CREATE TYPE app.pair AS (a app.code, b integer); ALTER TABLE app.t ADD COLUMN {holder};"
+            );
+            let (own, d) = adopted(&server, "domain_holders4a", &sql);
+            let db = own.connection();
+            let path = d.dir.join("holders.plan.json");
+            // A loosening is not the engine's concern.
+            write_code(&d, &code_domain(false, None, &[("c1", C1)]));
+            let loosen = label_plan(&d, db, &path);
+            assert_eq!(halves(&loosen), ["Loosen"], "{holder}");
+            std::fs::remove_file(&path).unwrap();
+            // A tightening is.
+            write_code(
+                &d,
+                &code_domain(false, None, &[("c1", C1), ("c2", "VALUE <> 'x'")]),
+            );
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{holder}");
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                said.contains("domain app.code cannot take a new check or NOT NULL")
+                    && said.contains(&format!("app.{column}"))
+                    && said.contains("cannot alter type \"code\" because column")
+                    && said.contains("slice 4b"),
+                "{holder}: {said}"
+            );
+            assert!(!path.exists());
+            // NOT NULL is refused alike.
+            write_code(&d, &code_domain(true, None, &[("c1", C1)]));
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{holder}");
+            assert!(!path.exists());
+        }
+    }
+}
+
+/// Slice 4a beside enum partition keys (DEC-2346.1): a table partitioned by an
+/// enum column holds the domain like any table. As a plain column it is
+/// tightened in place, the validation scanning the partitions; as an array
+/// the census names the parent, the engine refusing it there as anywhere.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_holder() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for holder in ["", ", x app.code[]"] {
+            let sql = format!(
+                "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'b'); \
+                 CREATE DOMAIN app.code AS text DEFAULT 'a' CONSTRAINT c1 CHECK (VALUE <> ''); \
+                 CREATE TABLE app.p (id integer NOT NULL, k app.e NOT NULL, v app.code{holder}, \
+                   PRIMARY KEY (id, k)) PARTITION BY LIST (k); \
+                 CREATE TABLE app.p_a PARTITION OF app.p FOR VALUES IN ('a'); \
+                 CREATE TABLE app.p_b PARTITION OF app.p FOR VALUES IN ('b'); \
+                 INSERT INTO app.p (id, k, v) VALUES (1, 'a', 'abc'), (2, 'b', 'xyz');"
+            );
+            let (own, d) = adopted(&server, "domain_enum_key4a", &sql);
+            let db = own.connection();
+            let path = d.dir.join("enum-key.plan.json");
+            write_code(
+                &d,
+                &code_domain(
+                    false,
+                    Some("'a'::text"),
+                    &[("c1", C1), ("c2", "VALUE <> 'x'")],
+                ),
+            );
+            if holder.is_empty() {
+                let plan = label_plan(&d, db, &path);
+                assert_eq!(halves(&plan), ["Tighten"], "{plan:?}");
+                succeeds(apply_allowing(&d, db, &path, &["constraint"]));
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                assert!(no_unvalidated_domain_check(db));
+                succeeds(d.run(&["verify", "--db", db]));
+            } else {
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0);
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(
+                    said.contains("domain app.code cannot take a new check or NOT NULL")
+                        && said.contains("app.p.x"),
+                    "{said}"
+                );
+                assert!(!path.exists());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_base_type_or_collation_change_is_refused_by_name_and_points_at_the_rebuild() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_base4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("base.plan.json");
+        for yaml in [
+            "domain: app.code\ntype: varchar(20)\ndefault: \"'a'\"\nchecks:\n  c1: \"VALUE <> ''\"\n",
+            "domain: app.code\ntype: text\ncollation: pg_catalog.\"C\"\ndefault: \"'a'\"\nchecks:\n  c1: \"VALUE <> ''\"\n",
+        ] {
+            write_code(&d, yaml);
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{yaml}");
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                said.contains("app.code")
+                    && said.contains("rebuilding it (#1635 slice 4b)")
+                    && !said.contains("require slice 4,"),
+                "{said}"
+            );
+            assert!(!path.exists());
+        }
+    }
+}
+
+/// A standing `NOT VALID` check compares equal to its declaration: the plan
+/// is empty, and says what the engine has not confirmed (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_standing_not_valid_domain_check_is_equal_to_its_declaration_and_warned_about() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = format!(
+            "{CODE_SQL} ALTER DOMAIN app.code ADD CONSTRAINT c2 CHECK (length(VALUE) < 9) NOT VALID;"
+        );
+        let (own, d) = adopted(&server, "domain_not_valid4a", &sql);
+        let db = own.connection();
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint WHERE contypid = 'app.code'::regtype AND NOT convalidated"
+            ),
+            1
+        );
+        let out = succeeds(d.run(&["plan", "--db", db, "--format", "json"]));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == "plan.domain-check-not-valid")
+            .unwrap_or_else(|| panic!("{report}"));
+        assert_eq!(finding["severity"], "warning", "{finding}");
+        let text = finding.to_string();
+        assert!(
+            text.contains("`c2`")
+                && text.contains("app.code")
+                && text.contains(
+                    "ALTER DOMAIN \\\"app\\\".\\\"code\\\" VALIDATE CONSTRAINT \\\"c2\\\""
+                ),
+            "{text}"
+        );
+        // Otherwise empty: the check is the declaration's.
+        let path = d.dir.join("not-valid.plan.json");
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        // The remedy is by hand, and silences the warning.
+        on_server(db, "ALTER DOMAIN app.code VALIDATE CONSTRAINT c2");
+        let out = succeeds(d.run(&["plan", "--db", db, "--format", "json"]));
+        assert!(!stdout(&out).contains("plan.domain-check-not-valid"));
+    }
+}
+
+/// A layout-only edit of a check is a difference, as DEC-1635.4 requires: the
+/// text recorded is the text applied.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_layout_only_edit_of_a_domain_check_stays_a_difference() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_layout4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("layout.plan.json");
+        write_code(
+            &d,
+            &code_domain(false, Some("'a'"), &[("c1", "VALUE  <>  ''")]),
+        );
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(halves(&plan), ["Loosen", "Tighten"]);
+        succeeds(apply_allowing(&d, db, &path, &["constraint"]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+/// A check altered by hand between the plan and the apply is drift, refused
+/// before any statement (DEC-1635.4's before-definition).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_check_altered_by_hand_between_plan_and_apply_is_refused_as_drift() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_drift4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("drift.plan.json");
+        write_code(
+            &d,
+            &code_domain(false, Some("'a'"), &[("c1", "length(VALUE) < 9")]),
+        );
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(halves(&plan), ["Loosen", "Tighten"]);
+        on_server(
+            db,
+            "ALTER DOMAIN app.code DROP CONSTRAINT c1; \
+             ALTER DOMAIN app.code ADD CONSTRAINT c1 CHECK (VALUE <> 'zz')",
+        );
+        let out = apply_allowing(&d, db, &path, &["constraint"]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("is no longer the database this plan was computed against"),
+            "{said}"
+        );
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE contypid = 'app.code'::regtype AND conname = 'c1'"
+            ),
+            "CHECK ((VALUE <> 'zz'::text))"
+        );
+    }
+}
+
+/// The tightening is one statement, and so one staged step: the checks are
+/// added `NOT VALID`, vetted and validated inside the transaction of that
+/// step, and a resume past it finds the domain as the step left it
+/// (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+// The process-loss harness that interrupts after the checkpoint is Linux-only.
+#[cfg(target_os = "linux")]
+fn a_staged_domain_tightening_is_one_step_and_a_resume_accepts_it() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_staged4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("staged-domain.plan.json");
+        write_code(
+            &d,
+            &code_domain(
+                false,
+                Some("'a'::text"),
+                &[("c1", C1), ("c2", "length(VALUE) < 9")],
+            ),
+        );
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(halves(&plan), ["Tighten"]);
+        let checksum = plan_checksum(&path);
+        let mut args = vec![
+            "apply",
+            "--db",
+            db,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &checksum,
+            "--staged",
+            "--allow",
+            "constraint",
+        ];
+        let _checkpoint = super::abrupt_recovery::interrupt_after_type_checkpoint(db, &d, &args);
+        // The step committed whole: added, vetted, and validated.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint \
+                 WHERE contypid = 'app.code'::regtype AND conname = 'c2' AND convalidated"
+            ),
+            1
+        );
+        args.push("--resume");
+        succeeds(d.run(&args));
+        succeeds(d.run(&["verify", "--db", db]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert!(no_unvalidated_domain_check(db));
+    }
+}
+
+/// A loosening goes in before the plan's other writes and a tightening after
+/// them: the column this plan adds takes a default the old check refused, so
+/// the check has to be gone first (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_loosening_comes_before_the_columns_the_plan_adds_and_a_tightening_after() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app;
+            CREATE DOMAIN app.code AS text CONSTRAINT short CHECK (length(VALUE) < 5);
+            CREATE TABLE app.t (id integer PRIMARY KEY, v app.code);
+            INSERT INTO app.t VALUES (1, 'abc');";
+        let (own, d) = adopted(&server, "domain_order4a", sql);
+        let db = own.connection();
+        let path = d.dir.join("order.plan.json");
+        // The new column's default is longer than the old check allows.
+        let table = |extra: &str| {
+            d.table(&format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  v: {{type: app.code}}\n{extra}primary_key: [id]\n"
+            ));
+        };
+        write_code(
+            &d,
+            &code_domain(false, None, &[("short", "length(VALUE) < 9")]),
+        );
+        table("  w: {type: app.code, default: \"'abcdefg'\"}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = label_plan(&d, db, &path);
+        let kinds = halves(&plan);
+        let at = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+        assert!(
+            at("Loosen") < at("AddColumn") && at("AddColumn") < at("Tighten"),
+            "{kinds:?}"
+        );
+        succeeds(apply_allowing(&d, db, &path, &["constraint"]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert_eq!(text_of(db, "SELECT w FROM app.t WHERE id = 1"), "abcdefg");
+    }
+}
+
+/// The alteration names the domain by the spelling the plan leaves it: the
+/// rename runs first, and both halves find it there (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_renamed_domain_is_altered_under_its_final_name() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_renamed4a", CODE_SQL);
+        let db = own.connection();
+        let path = d.dir.join("renamed.plan.json");
+        let uids = type_ids(&d);
+        std::fs::remove_file(d.dir.join("schema/app.code.type.yml")).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.codes.type.yml"),
+            "domain: app.codes\nrenamed_from: app.code\ntype: text\nnot_null: true\ndefault: \"'a'::text\"\nchecks:\n  c1: \"length(VALUE) < 9\"\n",
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  v: {type: app.codes}\nprimary_key: [id]\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = label_plan(&d, db, &path);
+        let kinds = halves(&plan);
+        assert_eq!(kinds, ["RenameType", "Loosen", "Tighten"], "{kinds:?}");
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["constraint", "not-null", "rename"],
+        ));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert_eq!(
+            scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'code'"),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint \
+                 WHERE contypid = 'app.codes'::regtype AND conname = 'c1' AND convalidated"
+            ),
+            1
+        );
+        assert_eq!(
+            type_ids(&d).as_object().unwrap().len(),
+            uids.as_object().unwrap().len()
+        );
+        assert!(no_unvalidated_domain_check(db));
+    }
+}
+
+/// A domain over an enum, as a plan that adds a label meets it: the default or
+/// check the alteration introduces names the label (DEC-1635.8).
+/// The domain is renamed, a label of its base enum is renamed, and a default
+/// using the new label is set, in one plan: the domain's rename has run when
+/// the label's does, and the alteration is still ahead (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_renamed_domain_over_a_renamed_label_takes_the_default_that_uses_it() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(
+            &server,
+            "domain_rename_label4a",
+            "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'keep'); \
+             CREATE DOMAIN app.d AS app.e DEFAULT 'a' CONSTRAINT c CHECK (VALUE <> 'keep'); \
+             CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);",
+        );
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, keep]\n",
+        )
+        .unwrap();
+        std::fs::remove_file(d.dir.join("schema/app.d.type.yml")).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dd.type.yml"),
+            "domain: app.dd\nrenamed_from: app.d\ntype: app.e\ndefault: \"'b'\"\nchecks:\n  c: \"(VALUE <> 'keep'::app.e)\"\n",
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  m: {type: app.dd}\nprimary_key: [id]\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("rename-label.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let kinds = halves(&plan);
+        assert!(
+            kinds.contains(&"RenameType".to_owned())
+                && kinds.contains(&"RenameEnumValue".to_owned())
+                && kinds.contains(&"Loosen".to_owned()),
+            "{kinds:?}"
+        );
+        succeeds(apply_allowing(&d, db, &path, &["rename"]));
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE oid = 'app.dd'::regtype"
+            ),
+            "'b'::app.e"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert!(no_unvalidated_domain_check(db));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // (what the database holds, what is declared, the classes the split needs)
+        let cases: [(&str, &str, &[&str]); 3] = [
+            ("", "domain: app.d\ntype: app.e\ndefault: \"'new'\"\n", &[]),
+            (
+                "",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'new'\"\n",
+                &["constraint"],
+            ),
+            (
+                " CONSTRAINT c CHECK (VALUE <> 'old')",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'new'\"\n",
+                &["constraint"],
+            ),
+        ];
+        for (n, (held, declared, allow)) in cases.into_iter().enumerate() {
+            let (own, d) = adopted(
+                &server,
+                "domain_label4a",
+                &format!(
+                    "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old'); \
+                     CREATE DOMAIN app.d AS app.e{held}; \
+                     CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);"
+                ),
+            );
+            let db = own.connection();
+            let enum_file = d.dir.join("schema/app.e.type.yml");
+            let domain_file = d.dir.join("schema/app.d.type.yml");
+            let pulled = std::fs::read_to_string(&domain_file).unwrap();
+            std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+            std::fs::write(&domain_file, declared).unwrap();
+            d.commit();
+            let path = d.dir.join("domain-label.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "case {n}");
+            assert!(
+                stderr(&out).contains("app.d")
+                    && stderr(&out).contains("new")
+                    && stderr(&out).contains("apply the label first, then the rest"),
+                "case {n}: {}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+            let labels = "SELECT count(*)::bigint FROM pg_enum \
+                          WHERE enumtypid = 'app.e'::regtype AND enumlabel = 'new'";
+            assert_eq!(scalar(db, labels), 0, "refused before any SQL");
+
+            // The two-plan split: the label first, then the domain.
+            std::fs::write(&domain_file, &pulled).unwrap();
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            assert_eq!(halves(&plan), ["AddEnumValue"], "case {n}");
+            succeeds(apply_allowing(&d, db, &path, &[]));
+            assert_eq!(scalar(db, labels), 1);
+            std::fs::write(&domain_file, declared).unwrap();
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            assert!(!halves(&plan).is_empty(), "case {n}");
+            succeeds(apply_allowing(&d, db, &path, allow));
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "case {n}");
+            assert!(no_unvalidated_domain_check(db));
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+/// A label renamed in the same plan is usable by the alteration only once the
+/// rename has run: the half that sets a default or adds a check follows it.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // (what the database holds, what is declared, the classes it needs)
+        let cases: [(&str, &str, &[&str]); 3] = [
+            (
+                " DEFAULT 'a'",
+                "domain: app.d\ntype: app.e\ndefault: \"'b'\"\n",
+                &["rename"],
+            ),
+            (
+                "",
+                "domain: app.d\ntype: app.e\ndefault: \"'b'\"\n",
+                &["rename"],
+            ),
+            (
+                " CONSTRAINT c CHECK (VALUE <> 'a')",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'b'\"\n",
+                &["rename", "constraint"],
+            ),
+        ];
+        for (n, (held, declared, allow)) in cases.into_iter().enumerate() {
+            let (own, d) = adopted(
+                &server,
+                "domain_rename4a",
+                &format!(
+                    "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'keep'); \
+                     CREATE DOMAIN app.d AS app.e{held}; \
+                     CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);"
+                ),
+            );
+            let db = own.connection();
+            std::fs::write(
+                d.dir.join("schema/app.e.type.yml"),
+                "enum: app.e\nvalues: [{name: b, renamed_from: a}, keep]\n",
+            )
+            .unwrap();
+            std::fs::write(d.dir.join("schema/app.d.type.yml"), declared).unwrap();
+            d.commit();
+            let path = d.dir.join("domain-rename.plan.json");
+            let plan = label_plan(&d, db, &path);
+            let kinds = halves(&plan);
+            let rename = kinds.iter().position(|k| k == "RenameEnumValue").unwrap();
+            // The half that introduces the label is the last of the two.
+            let after = kinds
+                .iter()
+                .rposition(|k| k == "Loosen" || k == "Tighten")
+                .unwrap();
+            assert!(rename < after, "case {n}: {kinds:?}");
+            succeeds(apply_allowing(&d, db, &path, allow));
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "case {n}");
+            assert!(no_unvalidated_domain_check(db));
         }
     }
 }

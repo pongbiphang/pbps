@@ -888,9 +888,23 @@ the label-use check can arise; #2346 tracks admitting them. A partition key may
 be a declared enum (DEC-2346.1): its bounds are declared labels, a bound naming
 a label added in the same plan is refused as above, a label rename carries the
 bounds that name it, and a removal or reorder of its labels is refused by name.
-Arrays also remain refused under `data:`. Domain
-check/default/NOT NULL changes require slice 4. Base and collation changes
-remain unsupported and refuse by name.
+Arrays also remain refused under `data:`.
+
+A declared domain's checks, default and NOT NULL change in place under its uid
+(DEC-1635.8), in two halves. The loosening, ordered with the plan's check drops,
+drops the checks the declaration removed or changed and NOT NULL, and sets or
+drops the default. The tightening, ordered with its check adds and after the
+plan's rows, sets NOT NULL and adds each check `NOT VALID`; apply then vets the
+bound code, and only then validates, which scans every table that uses the
+domain. A changed check is a drop and an add under its name, and so is a check
+whose text only differs in layout. The plan names the tables the validation
+scans, and the added checks need `--allow constraint`, NOT NULL `--allow
+not-null`. A tightening is refused by name, before any SQL, while an array or a
+composite of the domain is a column, because PostgreSQL refuses it there over
+any table. A standing `NOT VALID` domain check equals its declaration and is
+reported as `plan.domain-check-not-valid`, with `ALTER DOMAIN … VALIDATE
+CONSTRAINT` as the remedy for a person to run. Base and collation changes
+refuse by name and wait for the domain rebuild (slice 4b).
 
 Applied domain default and named CHECK texts are retained in the declaration
 record, as table expressions are (decisions 207/208, DEC-1635.4). After the

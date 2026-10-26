@@ -148,6 +148,7 @@ pub fn before_changes(desired: &IdsFile, changes: &ChangeSet) -> IdsFile {
                 base.types.remove(uid);
             }
             Change::AddEnumValue { uid, name, .. }
+            | Change::AlterDomain { uid, name, .. }
             | Change::RenameEnumValue { uid, name, .. }
             | Change::EnumRebuild { uid, name, .. } => {
                 // The label operation certifies an existing holder even when
@@ -177,6 +178,7 @@ pub fn after_changes(base: &IdsFile, changes: &ChangeSet) -> IdsFile {
                 desired.types.remove(uid);
             }
             Change::AddEnumValue { uid, name, .. }
+            | Change::AlterDomain { uid, name, .. }
             | Change::RenameEnumValue { uid, name, .. }
             | Change::EnumRebuild { uid, name, .. }
             | Change::CreateType { uid, name, .. }

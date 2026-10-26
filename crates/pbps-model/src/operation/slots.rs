@@ -580,6 +580,7 @@ pub fn names(
         }
         // A module rebuilt in place keeps its name; the rest take none.
         Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::AlterModule { .. }

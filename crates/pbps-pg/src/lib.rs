@@ -64,6 +64,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     reserved: types::is_reserved,
     unicode_identifiers: true,
 };
+pub mod domain_alter;
 pub mod estimate;
 pub mod generated;
 pub mod impact;

@@ -744,7 +744,9 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         Change::CreateType { name, .. } => (Exact(Surface::Type(name.clone())), false, true),
         Change::DropType { name, .. } => (Exact(Surface::Type(name.clone())), true, false),
         Change::RenameType { from, .. } => (Exact(Surface::Type(from.clone())), true, true),
-        Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
+        Change::AddEnumValue { name, .. }
+        | Change::AlterDomain { name, .. }
+        | Change::RenameEnumValue { name, .. } => {
             (Exact(Surface::Type(name.clone())), true, true)
         }
         Change::EnumRebuild {
@@ -881,6 +883,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
             Change::CreateType { name: n, .. }
             | Change::DropType { name: n, .. }
             | Change::AddEnumValue { name: n, .. }
+            | Change::AlterDomain { name: n, .. }
             | Change::RenameEnumValue { name: n, .. } => n == name,
             Change::EnumRebuild {
                 name: n,

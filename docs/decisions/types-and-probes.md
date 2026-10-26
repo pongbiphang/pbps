@@ -2823,8 +2823,8 @@ Bootstrap records authored text; pull/baseline adopt the engine's text without
 claiming it was authored. `Declared::overlay` restores only expressions still
 present in the verified read-back before type differences are computed. It
 does not restore missing defaults/checks or overwrite base, collation, NOT NULL
-or names. Layout-only declaration edits remain differences (and domain edits
-still refuse until slice 4). The checksum compares unmodified catalog readings
+or names. Layout-only declaration edits remain differences (domain edits are
+DEC-1635.8's). The checksum compares unmodified catalog readings
 before overlay, so real CHECK/default drift cannot be hidden by provenance.
 State 31 adds this record to state 30; older readable states have no domain
 record and fall back to engine text, with no migration.
@@ -2898,8 +2898,10 @@ A DropType and CreateType of different uids at one name produce the advisory
 plan output. Human output uses stderr; JSON carries it in the findings envelope.
 It names the type and both uids, explains that identity history does not carry
 over, and suggests keeping the original declaration file and uid, editing its
-definition there, and using renamed_from for a rename. It also explains that
-in-place definition changes remain refused until #1635 slices 3 and 4.
+definition there, and using renamed_from for a rename. It also explains what
+changes in place under a kept uid: enum labels (#1635 slice 3) and a domain's
+NOT NULL, default and checks (slice 4a, DEC-1635.8); a domain's base type and
+collation wait for the rebuild (slice 4b).
 Rename alone, drop alone and create alone produce no replacement warning.
 This never supplies identity intent (SPEC 14.3).
 
@@ -3393,3 +3395,110 @@ DEC-1523.1 and nothing else of it.
   exist: dmood = unknown`) and a cast to its base type creates a CHECK that
   does not imply the bound. DEC-2126.1's held-name rule is unchanged, and an
   empty key is the single `ATTACH`, so no plan format changes.
+<a id="dec-1635-8"></a>
+
+**DEC-1635.8. Slice 4a alters a declared domain's checks, default and NOT NULL in place, in two halves.**
+A retained domain whose declaration differs plans one `Change::AlterDomain
+{ uid, name, from, to, half }` per half that has a statement, and the emitter
+derives every statement from `(from, to, half)` alone. A changed check is a drop
+and an add under its name, as a table's is, and a check whose text differs only
+in layout is changed too: the text recorded is the text applied (DEC-1635.4).
+No `renamed_from` is added for checks. Maintainer decisions of 2026-10-24: a
+tightening uses `ADD … NOT VALID`, the vet, then `VALIDATE`; a standing `NOT
+VALID` check compares equal; the base type and collation wait for 4b.
+
+- **Loosen**, ordered as `DropCheck` (class 2, after the type's rename):
+  `DROP CONSTRAINT` for each check removed or changed, `DROP NOT NULL`, and
+  `SET DEFAULT` or `DROP DEFAULT`. The default is here and not with the
+  tightening because it has to be in force before the plan's inserts that omit
+  the column. It carries no risk class, as `DropCheck` carries none (DECISIONS
+  486).
+- **Tighten**, ordered as `AddCheck` (class 13, after the plan's rows): `SET NOT
+  NULL`, then `ADD CONSTRAINT … NOT VALID` for each check added or changed, one
+  statement. Measured on 16 and 18: a plain `ADD CONSTRAINT` calls the check
+  over every existing row inside the `ALTER`, as the deployer, so the vet could
+  only follow code that had already run; `NOT VALID` binds the expression and
+  evaluates nothing. The statement's `DeclaredTypeStatement` carries the final
+  definition and `after_vet`, the `VALIDATE CONSTRAINT` of each added check,
+  which the vet runs in the same transaction after it has read the bound code
+  with the built-in-only decoder (DEC-1635.4). A check that calls a function of
+  the project is refused there, the function never run, and nothing is left
+  behind. In a staged apply the half is one statement and so one step: it adds,
+  vets and validates in that step's transaction, and a resume past it finds the
+  domain as the step left it. A tightening is `constraint` for an added or
+  changed check and `not-null` for NOT NULL; the plan lists, as a connected
+  check, the tables whose rows the validation scans under a lock held to
+  commit.
+- **Evidence.** The sealed final definition is the pin, and the half's
+  statement states what stands after it: the re-read compares the base,
+  collation, NOT NULL and check names exactly and the default and check texts by
+  presence (DEC-1635.4). An executed alteration replaces the baseline's catalog
+  text as the thing the live domain is held to; before any statement the
+  baseline still is. A saved plan's alterations replay against the approved
+  before-definition and the sealed one, so a payload cannot say another
+  difference or a half with nothing to do. `Declared.types` records `to`, as
+  creation does. A rename of the domain in the same plan carries the definition
+  before the alteration.
+- **Refused by name.** A tightening while an array or a composite of the domain
+  (or of a domain built on it) is a column of a table: PostgreSQL answers
+  `cannot alter type "d" because column "t.x" uses it`, over an empty table too,
+  at `ADD` and at `VALIDATE`; `NOT VALID` alone passes. The census is read from
+  the catalog at plan time and again inside the apply's transaction before the
+  first statement, so a column that appeared in between is refused too. A
+  composite that no column uses does not block (measured). A base type or
+  collation change is refused, with a pointer to the domain rebuild (slice 4b),
+  and so is a domain whose identity is not recorded. A domain the plan rebuilds
+  gets no `AlterDomain`: its replacement is created from the final declaration.
+- **A standing `NOT VALID` check** compares equal to its declaration, as the
+  model holds no validation (DECISIONS 251). `plan --db` reports it as
+  `plan.domain-check-not-valid`, a warning, naming the check and the statement
+  a person runs: `ALTER DOMAIN … VALIDATE CONSTRAINT …`.
+- **Not done.** A domain an external composite holds as an attribute is planned,
+  and the apply refuses it as `the referenced type … changed since planning`:
+  the composite's pin digests its attributes' domains, and the alteration
+  changes that digest between the plan and the statements. Plan format 55.
+
+Labels of the enum a domain is built on (round 2 of the PR). The same-plan
+new-label check (slice 3a) reads what each half introduces: the default
+`Loosen` sets and each check `Tighten` adds or changes, by the lexical test
+that reads a created domain's; what a half drops or leaves is no use of the
+label. A default naming a label the plan renames must run after the rename, so
+a `Loosen` that sets a default is ordered in class 7 after every label change
+(the one that drops a default or only drops checks stays in class 2), and the
+apply's per-statement check holds a domain the plan has yet to alter to its
+structure once an enum statement has run, since the engine then spells the
+renamed label in the unaltered default and checks. That holds for a domain
+the plan has *yet to alter*, whatever renames of it have run: the domain's own
+rename changes only its name, which the uid resolves, so it does not end the
+allowance. A domain's `RenameType` therefore requires nothing of the incarnation
+of the enum it is built on (only its creation does), which let the order
+effects contradict the plan's own order for a domain renamed beside a rename of
+its base enum's label.
+
+What a reviewer approves shows the validation. `render_script` (the one
+renderer under `plan --sql`, a bootstrap script and a staged listing) prints a
+statement's post-vet SQL (`after_vet`) after the statement and before the
+next, behind a line saying that pbps vets the bound code at that point; the
+executor keeps its order and runs it, not the text. The tail is derived from
+the change (`from`, `to`, `half`), which the plan checksum covers through the
+change payload (the checksum is over the saved plan, not over the rendered
+script), so the validation shown is the one the checksum approves. A loosening
+and a `SET NOT NULL` alone have no tail and show none. Tests:
+`a_statements_post_vet_sql_is_rendered_after_it_and_before_the_next` and
+`the_rendered_script_shows_the_validation_after_the_not_valid_add`.
+
+Tests: `a_renamed_domain_is_still_one_the_plan_has_yet_to_alter` and
+`a_renamed_domain_over_a_renamed_label_takes_the_default_that_uses_it` (the
+domain's rename, the label's rename and the default in one plan),
+`an_altered_domain_refuses_a_new_label_in_what_its_halves_introduce`,
+`a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied`,
+`a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename`, and
+`domain_alterations_converge_in_place_keep_the_uid_and_record_the_authored_text`,
+`a_tightening_over_a_violating_row_rolls_the_apply_back_and_keeps_the_old_check`,
+`a_check_calling_a_project_function_is_vetted_before_it_runs_and_leaves_nothing`
+(the pinned negative: emitted as a plain `ADD CONSTRAINT`, it fails because the
+function ran), `a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_a_column`,
+`a_staged_domain_tightening_is_one_step_and_a_resume_accepts_it` and
+`a_loosening_comes_before_the_columns_the_plan_adds_and_a_tightening_after` pin
+it on 16 and 18, with unit tests for the delta, the emitter, the sort, the
+replay and the per-statement checks.

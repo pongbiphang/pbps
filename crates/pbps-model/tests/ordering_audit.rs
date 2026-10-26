@@ -330,6 +330,30 @@ mod effects_of_each_kind {
                     }),
                 },
             ),
+            // Both halves state the same effects; the row says which class
+            // each one takes.
+            (
+                "AlterDomain",
+                Change::AlterDomain {
+                    uid: uid(UidKind::Type, "base"),
+                    name: "app.base".parse().unwrap(),
+                    from: Box::new(ManagedType::Domain {
+                        base: "text".parse().unwrap(),
+                        not_null: false,
+                        default: None,
+                        checks: Default::default(),
+                        collation: None,
+                    }),
+                    to: Box::new(ManagedType::Domain {
+                        base: "text".parse().unwrap(),
+                        not_null: true,
+                        default: None,
+                        checks: Default::default(),
+                        collation: None,
+                    }),
+                    half: DomainHalf::Tighten,
+                },
+            ),
             (
                 "RenameEnumValue",
                 Change::RenameEnumValue {

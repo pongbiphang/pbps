@@ -1801,6 +1801,54 @@ pub struct ConnectedCheck {
     pub message: String,
 }
 
+/// What a tightened domain validates, and a refusal where the engine would
+/// refuse (DEC-1635.8). `None` when no domain in the plan gains a check or
+/// NOT NULL, so a plan without one reports nothing new.
+pub async fn check_domain_alterations(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    stored: &pbps_model::IdsFile,
+) -> anyhow::Result<Option<ConnectedCheck>> {
+    if conn.driver() != Driver::Postgres
+        || !changes.changes.iter().any(|p| {
+            matches!(
+                p.change,
+                pbps_model::Change::AlterDomain {
+                    half: pbps_model::DomainHalf::Tighten,
+                    ..
+                }
+            )
+        })
+    {
+        return Ok(None);
+    }
+    let tightened = pbps_pg::domain_alter::census(conn, changes, stored)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let message = tightened
+        .scans
+        .iter()
+        .map(|(domain, tables)| {
+            if tables.is_empty() {
+                format!("{} validates no table (no column uses it)", domain.shown())
+            } else {
+                format!(
+                    "{} validates every row of {} under a lock held to commit",
+                    domain.shown(),
+                    tables.join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(ConnectedCheck {
+        name: "domain-validation",
+        engine: "PostgreSQL",
+        status: "listed",
+        message,
+    }))
+}
+
 /// Predict existing table/column/key DROP dependencies in the caller's transaction.
 /// The other engine's rename reader does not answer this question (issue 254).
 pub async fn check_drop_blockers(

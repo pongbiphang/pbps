@@ -362,6 +362,9 @@ impl Declared {
                 | Change::BuildPartitionedIndex(_)
                 | Change::CopyTableRows(_)
                 | Change::AnalyzeTableTree(_) => {}
+                Change::AlterDomain { name, to, .. } => {
+                    self.types.insert(name.clone(), (**to).clone());
+                }
                 Change::AddEnumValue {
                     name, definition, ..
                 }

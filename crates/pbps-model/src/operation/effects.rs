@@ -393,7 +393,9 @@ impl Cx<'_> {
     #[allow(clippy::wildcard_enum_match_arm)]
     fn type_inputs(&mut self) {
         match self.op.change() {
-            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+            // A rename names the domain and not what it is built on, so only
+            // a creation needs its base standing in its final incarnation.
+            Change::CreateType { definition, .. } => {
                 if let crate::ManagedType::Domain { base, .. } = definition.as_ref() {
                     self.type_input(base);
                 }
@@ -624,6 +626,14 @@ impl Cx<'_> {
                 let key = ObjectKey::Type(Recorded(uid.clone()));
                 self.exists(key.clone());
                 self.rewrites(Resource::Object(key, Incarnation::Final));
+            }
+            // Both halves alter a domain that stands and write no instance of
+            // it: a column typed by the domain needs the domain, not a
+            // finished one, so the halves are ordered by their class, a
+            // loosening before the plan's rows and a tightening after them
+            // (DEC-1635.8).
+            Change::AlterDomain { uid, .. } => {
+                self.exists(ObjectKey::Type(Recorded(uid.clone())));
             }
 
             Change::CreateTable {
