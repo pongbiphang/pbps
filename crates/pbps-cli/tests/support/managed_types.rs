@@ -6766,3 +6766,133 @@ fn rows_taken_over_under_a_renamed_key_are_found_by_the_label_they_hold() {
         assert!(label_plan(&d, db, &path).changes.is_empty());
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_label_rename_under_ensure_rows_applies_and_resumes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for resumed in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_rows_staged2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-rows-staged2346");
+            // The declared rows do not include the renamed label as a key,
+            // so the plan is the rename alone: one logical change.
+            enum_rows(
+                &d,
+                "[sad, ok, happy]",
+                "ensure",
+                "    ok: {next: sad}\n    happy: {next: sad}\n",
+            );
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let path = d.dir.join("staged-rows.plan.json");
+            on_server(db, "INSERT INTO app.moods(m, next) VALUES ('sad', 'ok')");
+
+            enum_rows(
+                &d,
+                "[{name: blue, renamed_from: sad}, ok, happy]",
+                "ensure",
+                "    ok: {next: blue}\n    happy: {next: blue}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]));
+            let plan: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(changes_of(&plan), ["RenameEnumValue"], "{plan:?}");
+            let checksum = plan_checksum(&path);
+            let mut args = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--staged",
+                "--allow",
+                "rename",
+            ];
+            if resumed {
+                // The rename is durable and its checkpoint is not the end of
+                // the run: resume from it.
+                let _checkpoint =
+                    super::abrupt_recovery::interrupt_after_type_checkpoint(db, &d, &args);
+                args.push("--resume");
+            }
+            succeeds(d.run(&args));
+            succeeds(d.run(&["verify", "--db", db]));
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE m = 'blue'"),
+                1
+            );
+            assert_eq!(
+                text_of(db, "SELECT next::text FROM app.moods WHERE m = 'ok'"),
+                "blue"
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+/// Measured: a rename of the label an `ensure` table's row is keyed by also
+/// replaces the table's recorded key set, a second logical change, so the
+/// plan is not a staged one; the row is renamed by the transactional apply,
+/// which the rename test above covers.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_staged_key2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-staged-key2346");
+        enum_rows(
+            &d,
+            "[sad, ok]",
+            "ensure",
+            "    sad: {next: ok}\n    ok: {next: sad}\n",
+        );
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        enum_rows(
+            &d,
+            "[{name: blue, renamed_from: sad}, ok]",
+            "ensure",
+            "    blue: {next: ok}\n    ok: {next: blue}\n",
+        );
+        d.commit();
+        let path = d.dir.join("staged-key.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("--staged applies one logical change, and this plan has 2"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}

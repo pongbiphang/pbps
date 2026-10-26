@@ -3553,6 +3553,15 @@ Maintainer, 2026-10-24: the second of two PRs, after the partition keys
   (`read_before_the_renames`, from `renamed_from`). An `ensure` table whose
   recorded key set is replaced records it as a `SetEnsureKeys`, which is
   bookkeeping and not a row change.
+- **Every apply asks the held keys, staged or not** (`held_before_the_plan`):
+  the transactional baseline, the staged baseline of a fresh run and of a
+  resume, and the checkpoint read name the declared keys and the labels they
+  held before the plan's renames, so a row is found whichever side of the
+  rename statement the read falls on. The rename of the label an `ensure`
+  table's row is keyed by also replaces the table's recorded key set
+  (`SetEnsureKeys`), a second logical change, so such a plan is not a staged
+  one (measured); a staged plan can rename a label that rows hold in a
+  cell, or that no declared row names, and those apply and resume.
 - **Slice 3b needs nothing**: a rebuild converts a column of the enum, a key
   among them, through `col::text::tmp`, and its row probe counts the live
   rows that hold a label the plan removes, a declared row of an `exact` table
@@ -3577,7 +3586,9 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `a_label_rename_under_rows_plans_no_row_change_and_finds_the_renamed_key`,
 `a_cell_that_is_not_a_declared_label_or_uses_a_new_one_is_refused_and_the_split_applies`,
 `rows_taken_over_under_a_renamed_key_are_found_by_the_label_they_hold`,
-`a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows` and
+`a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows`,
+`a_staged_label_rename_under_ensure_rows_applies_and_resumes`,
+`a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key` and
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.

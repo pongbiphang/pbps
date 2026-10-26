@@ -3819,6 +3819,27 @@ fn scopes_at(plan: &pbps_model::SavedPlan, live_ids: &IdsFile) -> DataScopes {
     scopes_under(&plan.data, &plan.ids, live_ids)
 }
 
+/// `scopes` with the keys of the tables an enum keys also named by the labels
+/// they hold before this plan's label renames (DEC-2346.2). The engine renames
+/// a label in the rows that hold it, so a read taken before the rename finds
+/// the row only under the label it still has, and one taken after finds it
+/// under the new one; the baseline of every apply, staged or not, asks both.
+/// `schema` and `ids` are the observed side's, whose type references resolve
+/// against the plan's.
+fn held_before_the_plan(
+    plan: &pbps_model::SavedPlan,
+    schema: &Schema,
+    ids: &IdsFile,
+    scopes: &DataScopes,
+) -> DataScopes {
+    pbps_diff::enum_labels::scopes_before_the_plan(
+        scopes,
+        schema,
+        (&TypeResolver::new(ids, &plan.ids), TypeSide::Base),
+        &pbps_diff::enum_labels::label_renames(plan.changes.changes.iter().map(|p| &p.change)),
+    )
+}
+
 /// The declared schema with its tables keyed by the names `live_ids` gives
 /// their uids — the names the database has before this plan runs — so that
 /// a scope, a row reference or a row spelling looked up by the live name
@@ -8874,14 +8895,11 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     let planned_scopes = scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids);
     // The database holds the labels it has now, which a rename of this plan
     // changes: the baseline is read under both (DEC-2346.2).
-    let held_scopes = pbps_diff::enum_labels::scopes_before_the_plan(
-        &planned_scopes,
+    let held_scopes = held_before_the_plan(
+        plan,
         &entry.snapshot.schema,
-        (
-            &TypeResolver::new(&entry.snapshot.ids, &plan.ids),
-            TypeSide::Base,
-        ),
-        &pbps_diff::enum_labels::label_renames(plan.changes.changes.iter().map(|p| &p.change)),
+        &entry.snapshot.ids,
+        &planned_scopes,
     );
     let (scoped, mut before, unrevocable) = baseline_state(
         conn,
@@ -9405,7 +9423,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             project.config.unmanaged,
             &entry.snapshot.schema.data_scopes(),
             &entry.snapshot.schema,
-            &scopes_at(plan, at_checkpoint),
+            &held_before_the_plan(
+                plan,
+                &entry.snapshot.schema,
+                at_checkpoint,
+                &scopes_at(plan, at_checkpoint),
+            ),
         )
         .await?;
 
@@ -9508,7 +9531,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 &scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids),
             ),
             &entry.snapshot.schema,
-            &scopes_at(plan, &recorded_ids),
+            &held_before_the_plan(
+                plan,
+                &entry.snapshot.schema,
+                &entry.snapshot.ids,
+                &scopes_at(plan, &recorded_ids),
+            ),
         )
         .await?;
         retain_managed_roles(&mut watching, &plan.ids, dialect);
@@ -9852,7 +9880,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &live_ids),
             pbps_config::Unmanaged::Ignore,
-            &scopes_at(plan, &live_ids),
+            &held_before_the_plan(
+                plan,
+                &entry.snapshot.schema,
+                &entry.snapshot.ids,
+                &scopes_at(plan, &live_ids),
+            ),
             &Schema::default(),
             crate::engine::Read::Snapshot,
         )
@@ -24077,5 +24110,108 @@ mod local_name_key_tests {
             ),
             ["  view app.plain — carried into the new name, keeps working"]
         );
+    }
+}
+
+#[cfg(test)]
+mod held_before_the_plan_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, Column, DataMode, DataScope, ManagedType, PlannedChange};
+
+    fn mood(uid: &str) -> (IdsFile, Schema) {
+        let ids = IdsFile {
+            types: [(uid.parse().unwrap(), "app.mood".parse().unwrap())].into(),
+            ..Default::default()
+        };
+        let mut table = pbps_model::Table::default();
+        table
+            .columns
+            .insert("m".into(), Column::new("app.mood".parse().unwrap()));
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["m".into()],
+            storage_parameters: Default::default(),
+        });
+        let mut schema = Schema::default();
+        schema.types.insert(
+            "app.mood".parse().unwrap(),
+            ManagedType::Enum {
+                values: vec!["sad".into(), "ok".into()],
+            },
+        );
+        schema.tables.insert("app.moods".parse().unwrap(), table);
+        (ids, schema)
+    }
+
+    fn plan(ids: &IdsFile, renames: &[(&str, &str, &str)]) -> pbps_model::SavedPlan {
+        pbps_model::SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            "postgres",
+            "2026-10-26T00:00:00Z",
+            pbps_model::PlanBaseline {
+                description: "test".into(),
+                checksum: String::new(),
+                database_collation: None,
+                time_zone: None,
+            },
+            ChangeSet {
+                changes: renames
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, (uid, from, to))| {
+                        PlannedChange::new(Change::RenameEnumValue {
+                            uid: uid.parse().unwrap(),
+                            name: "app.mood".parse().unwrap(),
+                            from: (*from).into(),
+                            to: (*to).into(),
+                            ordinal,
+                            definition: Box::new(ManagedType::Enum {
+                                values: vec![(*to).into()],
+                            }),
+                        })
+                    })
+                    .collect(),
+            },
+            ids.clone(),
+        )
+    }
+
+    fn keys(scopes: &DataScopes) -> Vec<String> {
+        scopes[&"app.moods".parse::<TableName>().unwrap()]
+            .keys
+            .iter()
+            .map(|k| k.as_str().to_owned())
+            .collect()
+    }
+
+    /// DEC-2346.2: a staged baseline, like the transactional one, asks the
+    /// rows for the label they still hold when the plan renames it, and for
+    /// nothing else.
+    #[test]
+    fn the_baseline_asks_for_the_label_a_key_holds_before_the_plans_rename() {
+        let (ids, schema) = mood("y_000001");
+        let scopes: DataScopes = [(
+            "app.moods".parse().unwrap(),
+            DataScope {
+                mode: DataMode::Ensure,
+                keys: ["blue".into(), "ok".into()].into(),
+            },
+        )]
+        .into();
+        let held = |renames: &[(&str, &str, &str)]| {
+            keys(&held_before_the_plan(
+                &plan(&ids, renames),
+                &schema,
+                &ids,
+                &scopes,
+            ))
+        };
+        assert_eq!(held(&[("y_000001", "sad", "blue")]), ["blue", "ok", "sad"]);
+        // No rename: unchanged. The rename of another enum: unchanged.
+        assert_eq!(held(&[]), ["blue", "ok"]);
+        assert_eq!(held(&[("y_000009", "sad", "blue")]), ["blue", "ok"]);
+        // A rename of a label no key holds adds the label it came from, which
+        // no row holds either: a read that finds nothing.
+        assert_eq!(held(&[("y_000001", "gone", "ok")]), ["blue", "gone", "ok"]);
     }
 }
