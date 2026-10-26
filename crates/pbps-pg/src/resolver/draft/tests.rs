@@ -1213,3 +1213,31 @@ fn an_array_is_managed_through_its_declared_element_only() {
     assert!(!declared_type(&facts, &5, declares));
     assert!(!declared_type(&facts, &6, declares));
 }
+
+/// A name the engine has to quote (a keyword, a capital, a quote of its own)
+/// is compared as the name it is: the catalog gives the parts, and no spelling
+/// is built from them (#2407 review).
+#[test]
+fn a_declared_type_whose_name_needs_quotes_is_recognised_as_it_is_named() {
+    let mut facts = Facts::default();
+    let ty = |kind, schema: &str, name: &str, element| Type {
+        kind,
+        schema: schema.into(),
+        name: name.into(),
+        element,
+        ..Type::default()
+    };
+    facts.types.insert(1, ty('d', "app", "select", 0));
+    facts.types.insert(2, ty('b', "app", "_select", 1));
+    facts.types.insert(3, ty('e', "select", "Mood", 0));
+    facts.types.insert(4, ty('b', "select", "_Mood", 3));
+    facts.types.insert(5, ty('d', "app", "select2", 0));
+    facts.types.insert(6, ty('d', "app", "Select", 0));
+    let declares = |s: &str, n: &str| (s, n) == ("app", "select") || (s, n) == ("select", "Mood");
+    for oid in [1, 2, 3, 4] {
+        assert!(declared_type(&facts, &oid, declares), "{oid}");
+    }
+    for oid in [5, 6] {
+        assert!(!declared_type(&facts, &oid, declares), "{oid}");
+    }
+}

@@ -133,26 +133,18 @@ impl Managed {
     }
 
     /// [`Self::declares_type`] for a type as `pg_identify_object_as_address`
-    /// spells it: one qualified name, quoted only where it needs it, and
-    /// `[]` after an array type.
+    /// spells it: one qualified name the engine quoted with its own rule, and
+    /// `[]` after an array type. The parts are read back and compared as
+    /// names, so the engine decides what needs quotes, not this code.
     pub fn declares_type_spelled(&self, spelled: &str) -> bool {
         let spelled = spelled.strip_suffix("[]").unwrap_or(spelled);
-        let plain = |ident: &str| {
-            ident.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
-                && ident
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+        let Some(parts) = quoted_parts(spelled) else {
+            return false;
         };
-        let quoted = |ident: &str| {
-            if plain(ident) {
-                ident.to_owned()
-            } else {
-                format!("\"{}\"", ident.replace('"', "\"\""))
-            }
+        let [schema, name] = parts.as_slice() else {
+            return false;
         };
-        self.types
-            .iter()
-            .any(|(schema, name)| format!("{}.{}", quoted(schema), quoted(name)) == spelled)
+        self.declares_type(schema, name)
     }
 
     /// Whether a relation of this name is managed: a table, a view, or a
@@ -224,6 +216,40 @@ impl Managed {
             | CandidateClass::OperatorFamily
             | CandidateClass::Cast
             | CandidateClass::Extension => false,
+        }
+    }
+}
+
+/// The identifiers of a dotted name as the engine's `quote_ident` wrote them:
+/// a bare one as is, a quoted one without its quotes and with `""` read as
+/// `"`. `None` where the text is no such list. A dot inside quotes is part of
+/// its identifier.
+fn quoted_parts(spelled: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = spelled.chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next()? {
+                    '"' if chars.next_if_eq(&'"').is_some() => part.push('"'),
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| *c != '.' && *c != '"') {
+                part.push(c);
+            }
+        }
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') => {}
+            Some(_) => return None,
         }
     }
 }
@@ -977,6 +1003,63 @@ mod tests {
             &["id"],
             vec![id("pg_class", &["pg_catalog", "pg_class"], Vec::new())]
         )));
+    }
+
+    fn declaring(types: &[(&str, &str)]) -> Managed {
+        Managed {
+            types: types
+                .iter()
+                .map(|(schema, name)| ((*schema).to_owned(), (*name).to_owned()))
+                .collect(),
+            ..Managed::default()
+        }
+    }
+
+    /// The engine quotes a keyword, a capital and a character that is no plain
+    /// identifier; the name it returns is read back as parts, so a declared
+    /// type of any of these is recognised, alone or as an array, and a name
+    /// that merely looks alike is not (#2407 review).
+    #[test]
+    fn a_declared_types_quoted_spelling_is_read_back_as_names() {
+        let managed = declaring(&[
+            ("app", "select"),
+            ("app", "Mood"),
+            ("select", "mood"),
+            ("app", "odd\"na.me"),
+            ("app", "plain"),
+        ]);
+        for spelled in [
+            "app.\"select\"",
+            "app.\"select\"[]",
+            "app.\"Mood\"",
+            "app.\"Mood\"[]",
+            "\"select\".mood",
+            "\"select\".mood[]",
+            "app.\"odd\"\"na.me\"",
+            "app.\"odd\"\"na.me\"[]",
+            "app.plain",
+            "app.plain[]",
+        ] {
+            assert!(managed.declares_type_spelled(spelled), "{spelled}");
+        }
+        for spelled in [
+            "app.\"select2\"",
+            "app.\"Select\"",
+            "app.\"SELECT\"[]",
+            "app.mood",
+            "app.\"plain\"x",
+            "app.\"select",
+            "app.\"select\"[]x",
+            "\"other\".mood",
+            "app..plain",
+            "plain",
+            "a.app.plain",
+            "",
+        ] {
+            assert!(!managed.declares_type_spelled(spelled), "{spelled}");
+        }
+        assert_eq!(quoted_parts("\"a.b\".\"c\"\"d\"").unwrap(), ["a.b", "c\"d"]);
+        assert!(quoted_parts("a.\"\"").is_none());
     }
 
     /// A declared enum or domain is a managed type: held by its name, named

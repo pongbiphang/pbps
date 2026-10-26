@@ -1089,21 +1089,49 @@ mod tests {
                 definition: String::new(),
             },
         );
-        schema.types.insert(
-            "app.wrapped".parse().unwrap(),
-            pbps_model::ManagedType::Domain {
-                base: "text".parse().unwrap(),
-                not_null: false,
-                default: None,
-                checks: Default::default(),
-                collation: None,
-            },
-        );
+        for declared in [
+            "app.wrapped",
+            "app.select",
+            "app.\"Wrapped\"",
+            "select.wrapped",
+        ] {
+            schema.types.insert(
+                declared.parse().unwrap(),
+                pbps_model::ManagedType::Domain {
+                    base: "text".parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                },
+            );
+        }
         let managed = crate::resolver::capture::Managed::from_schema(&schema);
         let none = ManagedRoutines::default();
-        assert!(chains(&[through("app.wrapped")], &managed, &managed, &none).is_empty());
-        let chain = chains(&[through("ext.wrapped")], &managed, &managed, &none);
-        assert_eq!(chain.len(), 1, "{chain:?}");
+        // As the engine spells them: a keyword or a capital is quoted, an
+        // array type carries `[]`.
+        for declared in [
+            "app.wrapped",
+            "app.\"select\"",
+            "app.\"Wrapped\"",
+            "\"select\".wrapped",
+            "app.\"select\"[]",
+            "app.\"Wrapped\"[]",
+        ] {
+            assert!(
+                chains(&[through(declared)], &managed, &managed, &none).is_empty(),
+                "{declared}"
+            );
+        }
+        for undeclared in [
+            "ext.wrapped",
+            "app.\"select2\"",
+            "app.\"Select\"",
+            "app.\"wrapped2\"[]",
+        ] {
+            let chain = chains(&[through(undeclared)], &managed, &managed, &none);
+            assert_eq!(chain.len(), 1, "{undeclared}: {chain:?}");
+        }
     }
 
     #[test]

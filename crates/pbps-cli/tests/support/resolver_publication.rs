@@ -1754,6 +1754,15 @@ pub fn declared_types(server: &str) {
             true,
         ),
         ("rebuilt", Some(enum_file), "app.mood", Some("mood"), true),
+        // A domain whose name is a keyword: the engine quotes it wherever it
+        // spells it, and the resolver reads that back as the declared name.
+        (
+            "keyword",
+            Some(("app.select.type.yml", "domain: app.select\ntype: text\n")),
+            "app.\"select\"",
+            Some("select"),
+            false,
+        ),
     ];
     for (name, type_file, column_type, made, existing) in variants {
         let revised = match name {
@@ -1800,7 +1809,11 @@ pub fn declared_types(server: &str) {
                 if column_type == "text" || column_type == "ext.kind" {
                     "view: app.uv\ndefinition: SELECT id, m FROM app.u\n".to_owned()
                 } else {
-                    let constant = if column_type == "app.short" { "'x'" } else { "'ok'" };
+                    let constant = if column_type == "app.short" || name == "keyword" {
+                        "'x'"
+                    } else {
+                        "'ok'"
+                    };
                     format!(
                         "view: app.uv\ndefinition: SELECT id, m, {constant}::{column_type} AS k FROM app.u\n"
                     )
