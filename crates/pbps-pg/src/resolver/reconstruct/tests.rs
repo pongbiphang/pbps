@@ -99,44 +99,56 @@ fn bootstrap() -> Vec<Change> {
     ]
 }
 
-/// A table is created bare; its keys and its indexes without a predicate
-/// follow every table, the modules follow them in the differ's order, and
-/// each expression, predicated index and trigger comes last, when every
-/// routine it can name exists. A grant changes no binding and is not
-/// reproduced.
+/// A table is created with what holds no expression, its plain indexes
+/// among that. Each default and check waits for the routines it can name,
+/// an index that holds a predicate for every module, and a trigger for its
+/// function (DEC-2389.1). A grant changes no binding and is not reproduced.
 #[test]
-fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
+fn expressions_wait_for_the_routines_they_name_and_expression_indexes_for_every_module() {
     let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
-    let phases: Vec<_> = reconstruction
+    let order: Vec<_> = reconstruction
         .steps
         .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
+        .map(|step| step.declaration.as_str())
         .collect();
-    assert_eq!(
-        phases,
-        [
-            (Phase::Tables, "table app.t"),
-            (Phase::Keys, "table app.t"),
-            (Phase::Keys, "index plain on app.t"),
-            (Phase::Modules, "function app.f(integer)"),
-            (Phase::Modules, "view app.v"),
-            (Phase::Expressions, "the default of app.t.c"),
-            (Phase::Expressions, "check ck on app.t"),
-            (Phase::Expressions, "index ix on app.t"),
-            (Phase::Expressions, "trigger app.t.audit"),
-        ]
+    let at = |declaration: &str| {
+        order
+            .iter()
+            .position(|d| *d == declaration)
+            .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
+    };
+    assert_eq!(order[0], "table app.t", "{order:?}");
+    for named in [
+        "the default of app.t.c",
+        "check ck on app.t",
+        "index ix on app.t",
+    ] {
+        assert!(at("function app.f(integer)") < at(named), "{order:?}");
+    }
+    assert!(
+        at("view app.v") < at("index ix on app.t")
+            && at("function app.f(integer)") < at("index ix on app.t"),
+        "an index that holds a predicate follows every module: {order:?}"
+    );
+    // Negative: what holds nothing back keeps the order the plan gives, so
+    // a default does not wait for a view it does not name.
+    assert!(at("the default of app.t.c") < at("view app.v"), "{order:?}");
+    assert!(
+        at("trigger app.t.audit") < at("index ix on app.t"),
+        "{order:?}"
     );
     let table = reconstruction.steps[0].statements.join("\n");
-    for expression in ["DEFAULT", "CHECK", "CREATE INDEX", "REFERENCES"] {
+    for expression in ["DEFAULT", "CHECK", "REFERENCES", "WHERE"] {
         assert!(!table.contains(expression), "{expression} in {table}");
     }
+    assert!(table.contains("CREATE INDEX \"plain\""), "{table}");
     let rest = reconstruction.steps[1..]
         .iter()
         .flat_map(|step| &step.statements)
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
-    for expression in ["DEFAULT", "CHECK", "CREATE INDEX", "REFERENCES"] {
+    for expression in ["DEFAULT", "CHECK", "REFERENCES", "WHERE"] {
         assert!(
             rest.contains(expression),
             "{expression} missing from {rest}"
@@ -176,13 +188,13 @@ fn scratch_table_parts_lower_with_their_source_and_after_change_spelling() {
         reconstruction
             .steps
             .iter()
-            .map(|step| (step.phase, step.declaration.as_str()))
+            .map(|step| step.declaration.as_str())
             .collect::<Vec<_>>(),
         [
-            (Phase::Tables, "table app.t"),
-            (Phase::Expressions, "the default of app.t.c"),
-            (Phase::Expressions, "check ck on app.t"),
-            (Phase::Expressions, "index ix on app.t"),
+            "table app.t",
+            "the default of app.t.c",
+            "check ck on app.t",
+            "index ix on app.t",
         ]
     );
     assert_eq!(
@@ -351,15 +363,15 @@ fn a_split_foreign_key_follows_every_table() {
     let phases: Vec<_> = reconstruction
         .steps
         .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
+        .map(|step| step.declaration.as_str())
         .collect();
     assert_eq!(
         phases,
         [
-            (Phase::Tables, "table app.c"),
-            (Phase::Tables, "table app.p"),
-            (Phase::Keys, "table app.c"),
-            (Phase::Modules, "function app.f()"),
+            "table app.c",
+            "table app.p",
+            "table app.c",
+            "function app.f()",
         ]
     );
     assert!(
@@ -502,12 +514,12 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
     let order: Vec<_> = reconstruction
         .steps
         .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
+        .map(|step| step.declaration.as_str())
         .collect();
     let at = |declaration: &str| {
         order
             .iter()
-            .position(|(_, d)| *d == declaration)
+            .position(|d| *d == declaration)
             .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
     };
     assert!(
@@ -515,21 +527,28 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
             && at("function app.f(integer)") < at("column app.n.g"),
         "{order:?}"
     );
-    assert!(at("table app.n") < at("index n_ix on app.n"), "{order:?}");
+    // Its plain index is made with the table, a relation of its name.
+    assert!(
+        reconstruction.steps[at("table app.n")].names.contains(&(
+            Nameable::Index,
+            "app".into(),
+            "n_ix".into()
+        )),
+        "{order:?}"
+    );
     assert!(at("table app.n") < at("view app.v"), "{order:?}");
     assert!(at("table app.n") < at("view app.w"), "{order:?}");
-    let key = order
-        .iter()
-        .rposition(|(_, d)| *d == "table app.plain")
-        .unwrap();
+    let key = order.iter().rposition(|d| *d == "table app.plain").unwrap();
     assert!(
         at("column app.n.g") < key,
         "the key waits for the target's columns: {order:?}"
     );
 
-    assert_eq!(
-        order[at("table app.plain")],
-        (Phase::Tables, "table app.plain")
+    // Negative: a table nothing generates in or holds back keeps its place,
+    // ahead of the function and of what reads the table that waits.
+    assert!(
+        at("table app.plain") < at("function app.f(integer)"),
+        "{order:?}"
     );
     let why = build_reconstruction(&crate::Postgres::new(), &bootstrap(&schema(true)))
         .unwrap_err()
@@ -628,23 +647,24 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     let order: Vec<_> = reconstruction
         .steps
         .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
+        .map(|step| step.declaration.as_str())
         .collect();
     let at = |declaration: &str| {
         order
             .iter()
-            .position(|(_, d)| *d == declaration)
+            .position(|d| *d == declaration)
             .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
     };
-    for table in ["app.ev", "app.ev_new", "app.ev_plain"] {
-        let declaration = format!("table {table}");
-        assert_eq!(order[at(&declaration)].0, Phase::Tables, "{order:?}");
-    }
     for partition in ["app.ev_new", "app.ev_plain"] {
         let own = format!("the default of {partition}.v");
-        assert_eq!(order[at(&own)].0, Phase::Expressions, "{order:?}");
+        assert!(at(&format!("table {partition}")) < at(&own), "{order:?}");
         assert!(at("the default of app.ev.v") < at(&own), "{order:?}");
-        assert!(at("function app.f(integer)") < at(&own), "{order:?}");
+        // Only the default that calls the function waits for it.
+        assert_eq!(
+            at("function app.f(integer)") < at(&own),
+            partition == "app.ev_new",
+            "{order:?}"
+        );
         // Negative: the table step itself no longer carries it.
         let sql = reconstruction.steps[at(&format!("table {partition}"))]
             .statements
@@ -703,23 +723,24 @@ fn an_index_replica_identity_is_set_after_its_index() {
         moves_at_most: None,
     }];
     let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
-    let phases: Vec<_> = reconstruction
-        .steps
-        .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
-        .collect();
-    assert_eq!(
-        phases,
-        [
-            (Phase::Tables, "table app.t"),
-            (Phase::Keys, "index t_id on app.t"),
-            (Phase::Keys, "replica identity of app.t"),
-        ]
+    // Nothing in it holds an expression, so it is one step, and its own
+    // statements put the identity after the index it names.
+    let [step] = reconstruction.steps.as_slice() else {
+        panic!("{:?}", reconstruction.steps);
+    };
+    assert_eq!(step.declaration, "table app.t");
+    let at = |needle: &str| {
+        step.statements
+            .iter()
+            .position(|sql| sql.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} missing from {:?}", step.statements))
+    };
+    assert!(
+        at("CREATE UNIQUE INDEX") < at("REPLICA IDENTITY USING INDEX"),
+        "{:?}",
+        step.statements
     );
-    let table = reconstruction.steps[0].statements.join("\n");
-    assert!(!table.contains("REPLICA IDENTITY"), "{table}");
-    let last = reconstruction.steps[2].statements.join("\n");
-    assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
+    assert!(!step.statements[at("CREATE TABLE")].contains("REPLICA IDENTITY"));
 }
 
 /// Two tables calling different functions expose their prefixes before
@@ -1092,7 +1113,7 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
     );
 }
 
-fn build_reconstruction(
+pub(super) fn build_reconstruction(
     pg: &crate::Postgres,
     changes: &[pbps_model::Change],
 ) -> Result<Reconstruction, crate::resolver::reconstruct::ReconstructError> {
@@ -1326,7 +1347,7 @@ fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
             name: "later".into(),
         },
     ];
-    let reason = crate::emit::emit(&pg, &changes[0], Strategy::default())
+    let reason = crate::emit::emit(&pg, &changes[0], pbps_model::Strategy::default())
         .unwrap_err()
         .to_string();
     let actual =

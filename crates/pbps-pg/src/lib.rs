@@ -1228,6 +1228,24 @@ impl Dialect for Postgres {
             functions,
             needs_complete_shape,
             self.server_version_num,
+            false,
+        )
+    }
+
+    fn scratch_table_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        generated::parts(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            self.server_version_num,
+            true,
         )
     }
 

@@ -3,14 +3,15 @@
 //!
 //! The statements are the emitter's own: a fresh bootstrap of the declared
 //! schema, so what scratch binds is what these declarations bind when they are
-//! created. This module supplies constraints; the scheduler owns their order.
-//! The ordinary plan order puts
-//! tables, with their defaults, checks and indexes, ahead of every module
-//! (`order_key` in pbps-diff), and an expression calling a managed function
-//! then either fails or binds whatever else of that name exists already —
-//! the very answer this analysis must not get wrong. So a table is created
-//! bare, the modules follow, and the expressions come last, when everything
-//! they can name exists.
+//! created. This module supplies one part per change and nothing else; the
+//! scheduler owns their order (DEC-2389.1). The ordinary plan order puts
+//! tables, with their defaults, checks and indexes, ahead of every module,
+//! and an expression calling a managed function then either fails or binds
+//! whatever else of that name exists already — the very answer this analysis
+//! must not get wrong. So a table is created with what holds no expression,
+//! and each default, check, key and index that does is a part of its own,
+//! ordered after the routines its text names (and an index that holds an
+//! expression after every module).
 //!
 //! Between modules the emitter's order stands: the name scan that already
 //! orders a plan's modules (`creation_order_with`). A scan can miss a
@@ -29,8 +30,9 @@
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
+use pbps_diff::order::scratch::Part;
 use pbps_model::ValueSource;
-use pbps_model::{Change, ModuleId, ModuleKind, Strategy};
+use pbps_model::{Change, ModuleId, ModuleKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Why the desired namespace could not be built on scratch. A named limit,
@@ -61,23 +63,11 @@ pub enum ReconstructError {
     #[error("the scratch server cannot use the target's time zone {zone:?}: {reason}")]
     Zone { zone: String, reason: String },
     #[error(
-        "{0} has a generated column calling a declared function that itself needs the table; \
-         no order compiles both"
+        "scratch cannot order the declarations: {0}. A generated column calling a declared \
+         function that itself needs the table leaves no order that compiles both"
     )]
     Cycle(String),
 }
-
-/// An unsplittable table whose generation still calls a declared function
-/// after the shared expansion (DEC-1503.1): a suffix partition key or a read
-/// of a later column, without a known expression-replacement capability.
-#[derive(Clone)]
-struct Late {
-    table: pbps_model::TableName,
-    steps: std::ops::Range<usize>,
-    generated: Vec<String>,
-}
-
-use pbps_diff::order::scratch::Phase;
 
 /// What kind of object a step makes nameable, and so which bindings it
 /// could have taken over had it existed earlier.
@@ -120,8 +110,6 @@ pub type Named = (Nameable, String, String);
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Metadata {
-    phase: Phase,
-    operation: usize,
     table_part: Option<pbps_model::TableName>,
     /// What an error names: the declaration, never the statement text.
     declaration: String,
@@ -155,27 +143,6 @@ impl std::ops::Deref for Step {
     }
 }
 impl std::ops::DerefMut for Step {
-    fn deref_mut(&mut self) -> &mut Metadata {
-        &mut self.metadata
-    }
-}
-
-/// SQL-free lowering input. Lexical observations are finite answers from a
-/// private emitter probe, never a retained executable statement collection.
-#[derive(Debug, Clone)]
-pub struct Blueprint {
-    metadata: Metadata,
-    change: pbps_model::PlannedChange,
-    calls: BTreeSet<String>,
-    tables: BTreeSet<pbps_model::TableName>,
-}
-impl std::ops::Deref for Blueprint {
-    type Target = Metadata;
-    fn deref(&self) -> &Metadata {
-        &self.metadata
-    }
-}
-impl std::ops::DerefMut for Blueprint {
     fn deref_mut(&mut self) -> &mut Metadata {
         &mut self.metadata
     }
@@ -222,15 +189,15 @@ impl Reconstruction {
         let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
         let expanded = prepared.changes();
-        #[cfg(test)]
-        let edges = prepared.edges().to_vec();
         let mut steps = Vec::new();
-        let mut late = Vec::new();
-        let mut functions: Vec<(usize, String)> = Vec::new();
-        let mut foreign = BTreeSet::new();
         for (operation, planned) in expanded.changes.iter().enumerate() {
             let change = &planned.change;
-            let first_step = steps.len();
+            let is_part = pbps_diff::order::generated::is_part(planned);
+            let make = |declaration: &str,
+                        names: Vec<(Nameable, String, String)>,
+                        module: Option<ModuleId>| {
+                part(dialect, operation, planned, declaration, names, module)
+            };
             match change {
                 Change::RebuildPartitionedTable(_)
                 | Change::BuildPartitionedIndex(_)
@@ -248,122 +215,40 @@ impl Reconstruction {
                     column,
                     ..
                 } => {
-                    let mut added = step(
-                        dialect,
-                        Phase::Modules,
+                    let mut added = make(
                         &format!("column {}", table.column(name).shown()),
-                        change,
                         Vec::new(),
                         None,
                     )?;
                     if matches!(column.value_source, ValueSource::Generated(_)) {
-                        added.generated.push(name.clone());
+                        added.metadata.generated.push(name.clone());
                     }
-                    added.table_part = Some(table.clone());
+                    added.metadata.table_part = Some(table.clone());
                     steps.push(added);
                 }
                 Change::AlterColumnExpression { column, .. } => {
-                    let mut installed = step(
-                        dialect,
-                        Phase::Modules,
+                    let mut installed = make(
                         &format!("generation of {}", column.shown()),
-                        change,
                         Vec::new(),
                         None,
                     )?;
-                    installed.generated.push(column.name.clone());
-                    installed.table_part = Some(column.table.clone());
+                    installed.metadata.generated.push(column.name.clone());
+                    installed.metadata.table_part = Some(column.table.clone());
                     steps.push(installed);
-                }
-                Change::AddIndex { table, name, .. }
-                    if pbps_diff::order::generated::is_part(planned) =>
-                {
-                    steps.push(step(
-                        dialect,
-                        Phase::Modules,
-                        &format!("index {name} on {}", table.shown(), name = name.shown(),),
-                        change,
-                        vec![(Nameable::Index, table.schema.clone(), name.raw().to_owned())],
-                        None,
-                    )?);
-                }
-                Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::AddCheck { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::AlterColumnDefault { .. }
-                    if pbps_diff::order::generated::is_part(planned) =>
-                {
-                    steps.push(step(
-                        dialect,
-                        Phase::Modules,
-                        &pbps_model::escape::Escaped(&change.subject()).to_string(),
-                        change,
-                        Vec::new(),
-                        None,
-                    )?);
                 }
                 // A bootstrap starts from nothing, so no partition is made
                 // beside a standing DEFAULT (#1547).
-                Change::CreateTable {
-                    uid, name, table, ..
-                } => {
-                    let first = steps.len();
-                    let generated: Vec<String> = table
-                        .columns
-                        .values()
-                        .filter_map(|c| {
-                            (match &c.value_source {
-                                ValueSource::Generated(value) => Some(value),
-                                ValueSource::None
-                                | ValueSource::Default(_)
-                                | ValueSource::Identity(_)
-                                | ValueSource::Sequence(_) => None,
-                            })
-                            .map(|g| g.expression.clone())
-                        })
-                        .collect();
-                    let mut bare = (**table).clone();
-                    let checks = std::mem::take(&mut bare.checks);
-                    let indexes = std::mem::take(&mut bare.indexes);
-                    let keys = std::mem::take(&mut bare.foreign_keys);
-                    // An identity on one of those indexes waits for it, as
-                    // in the resolver's own split (#1467 review).
-                    let identity = matches!(
-                        bare.replica_identity,
-                        Some(pbps_model::ReplicaIdentity::Index(_))
-                    )
-                    .then(|| bare.replica_identity.take())
-                    .flatten();
-                    let mut defaults = Vec::new();
-                    for (column, spec) in &mut bare.columns {
-                        match &mut spec.value_source {
-                            ValueSource::Default(default) => {
-                                defaults.push((column.clone(), std::mem::take(default)));
-                                spec.value_source = ValueSource::None;
-                            }
-                            // A `serial` stays with its table, as an identity
-                            // does: its sequence is created with it (#1631).
-                            ValueSource::None
-                            | ValueSource::Identity(_)
-                            | ValueSource::Sequence(_)
-                            | ValueSource::Generated(_) => {}
-                        }
-                    }
-                    // A partition's own default too (#1578). Its parent's,
-                    // set in this same phase and earlier since the parent is
-                    // created first, reaches every partition (measured on 16
-                    // and 18), so the partition's own must come after it.
-                    for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns)
-                    {
-                        if let Some(default) = own.default.take() {
-                            defaults.push((column.clone(), default));
-                        }
-                    }
-                    let declaration = format!("table {name}", name = name.shown());
+                Change::CreateTable { name, table, .. } => {
+                    // The indexes it keeps are made with it: a relation each.
+                    let mut names = relation(&name.schema, &name.name);
+                    names.extend(table.indexes.keys().map(|index| {
+                        (Nameable::Index, name.schema.clone(), index.raw().to_owned())
+                    }));
+                    let mut created =
+                        make(&format!("table {name}", name = name.shown()), names, None)?;
                     // Binding checks belong to the real expression's step,
                     // never to a temporary typed-NULL placeholder.
-                    let generated_columns: Vec<pbps_model::ColumnName> = bare
+                    created.metadata.generated = table
                         .columns
                         .iter()
                         .filter(|(column, spec)| {
@@ -376,131 +261,59 @@ impl Reconstruction {
                         })
                         .map(|(column, _)| column.clone())
                         .collect();
-                    steps.push(step(
-                        dialect,
-                        Phase::Tables,
-                        &declaration,
-                        &Change::CreateTable {
-                            uid: uid.clone(),
-                            name: name.clone(),
-                            table: Box::new(bare),
-                            beside_default: None,
-                            moves_at_most: None,
-                        },
-                        relation(&name.schema, &name.name),
+                    steps.push(created);
+                }
+                // An index is a relation: it can shadow a name a module
+                // bound, so its name joins the order check (#1042).
+                Change::AddIndex { table, name, .. } if is_part => {
+                    steps.push(make(
+                        &format!("index {name} on {}", table.shown(), name = name.shown()),
+                        vec![(Nameable::Index, table.schema.clone(), name.raw().to_owned())],
                         None,
                     )?);
-                    if let Some(step) = steps.last_mut() {
-                        step.generated = generated_columns;
-                    }
-                    for (key, constraint) in keys {
-                        foreign.insert(steps.len());
-                        steps.push(step(
-                            dialect,
-                            Phase::Keys,
-                            &declaration,
-                            &Change::AddForeignKey {
-                                table: name.clone(),
-                                name: key,
-                                constraint: Box::new(constraint),
-                            },
-                            Vec::new(),
-                            None,
-                        )?);
-                    }
-                    for (column, default) in defaults {
-                        steps.push(step(
-                            dialect,
-                            Phase::Expressions,
-                            &format!(
-                                "the default of {name}.{column}",
-                                name = name.shown(),
-                                column = column.shown(),
-                            ),
-                            &Change::AlterColumnDefault {
-                                uid: uid.clone(),
-                                column: pbps_model::ColumnRef::new(name.clone(), column),
-                                from: None,
-                                to: Some(default),
-                            },
-                            Vec::new(),
-                            None,
-                        )?);
-                    }
-                    for (check, constraint) in checks {
-                        steps.push(step(
-                            dialect,
-                            Phase::Expressions,
-                            &format!(
-                                "check {check} on {name}",
-                                name = name.shown(),
-                                check = check.shown(),
-                            ),
-                            &Change::AddCheck {
-                                table: name.clone(),
-                                name: check,
-                                constraint,
-                            },
-                            Vec::new(),
-                            None,
-                        )?);
-                    }
-                    for (index, spec) in indexes {
-                        // An index is a relation: it can shadow a name a
-                        // module bound, so its name joins the order check.
-                        // Its key columns are plain names, so without a
-                        // predicate it needs only its table and exists
-                        // before any module, which can then name it through
-                        // an OID-alias constant and be refused by the
-                        // capture for that constant rather than fail to
-                        // compile (#1042). A predicate or an expression key
-                        // can call a module (DEC-1169.2).
-                        let phase = if spec.holds_expression() {
-                            Phase::Expressions
-                        } else {
-                            Phase::Keys
-                        };
-                        steps.push(step(
-                            dialect,
-                            phase,
-                            &format!(
-                                "index {index} on {name}",
-                                name = name.shown(),
-                                index = index.shown(),
-                            ),
-                            &Change::AddIndex {
-                                table: name.clone(),
-                                name: index.clone(),
-                                index: Box::new(spec),
-                                clustered: false,
-                            },
-                            vec![(Nameable::Index, name.schema.clone(), index.into_raw())],
-                            None,
-                        )?);
-                    }
-                    // Over plain NOT NULL columns, so with the indexes of
-                    // `Keys` and after them.
-                    if identity.is_some() {
-                        steps.push(step(
-                            dialect,
-                            Phase::Keys,
-                            &format!("replica identity of {name}", name = name.shown()),
-                            &Change::SetReplicaIdentity {
-                                uid: uid.clone(),
-                                table: name.clone(),
-                                to: identity,
-                            },
-                            Vec::new(),
-                            None,
-                        )?);
-                    }
-                    if !generated.is_empty() {
-                        late.push(Late {
-                            table: name.clone(),
-                            steps: first..steps.len(),
-                            generated,
-                        });
-                    }
+                }
+                Change::AddCheck { table, name, .. } if is_part => {
+                    steps.push(make(
+                        &format!(
+                            "check {check} on {table}",
+                            check = name.shown(),
+                            table = table.shown()
+                        ),
+                        Vec::new(),
+                        None,
+                    )?);
+                }
+                Change::AlterColumnDefault { column, .. } if is_part => {
+                    steps.push(make(
+                        &format!("the default of {}", column.shown()),
+                        Vec::new(),
+                        None,
+                    )?);
+                }
+                Change::SetReplicaIdentity { table, .. } if is_part => {
+                    steps.push(make(
+                        &format!("replica identity of {table}", table = table.shown()),
+                        Vec::new(),
+                        None,
+                    )?);
+                }
+                Change::SetPrimaryKey { .. } | Change::AddUnique { .. } if is_part => {
+                    steps.push(make(
+                        &pbps_model::escape::Escaped(&change.subject()).to_string(),
+                        Vec::new(),
+                        None,
+                    )?);
+                }
+                // The differ splits every new table's foreign keys out of its
+                // CREATE, so a bootstrap of related tables carries them as
+                // their own changes, and so does the split of a table that
+                // has them inline.
+                Change::AddForeignKey { table, .. } => {
+                    steps.push(make(
+                        &format!("table {table}", table = table.shown()),
+                        Vec::new(),
+                        None,
+                    )?);
                 }
                 // A declared enum or domain is created before every table and
                 // module that names it. A bootstrap holds only creations of
@@ -521,9 +334,9 @@ impl Reconstruction {
                 }
                 Change::CreateModule { id, module } => {
                     // A trigger is named by nothing and names its function
-                    // with an exact signature, so it waits for everything.
-                    let (phase, names, compiled) = if module.kind == ModuleKind::Trigger {
-                        (Phase::Expressions, Vec::new(), None)
+                    // with an exact signature.
+                    let (names, compiled) = if module.kind == ModuleKind::Trigger {
+                        (Vec::new(), None)
                     } else {
                         let names = if matches!(id, ModuleId::Routine(_)) {
                             vec![(
@@ -534,33 +347,12 @@ impl Reconstruction {
                         } else {
                             relation(id.schema(), id.name())
                         };
-                        (Phase::Modules, names, Some(id.clone()))
+                        (names, Some(id.clone()))
                     };
-                    if module.kind == ModuleKind::Function {
-                        functions.push((steps.len(), id.name().to_owned()));
-                    }
-                    steps.push(step(
-                        dialect,
-                        phase,
+                    steps.push(make(
                         &format!("{} {id}", module.kind, id = id.shown()),
-                        change,
                         names,
                         compiled,
-                    )?);
-                }
-                // The differ splits every new table's foreign keys out of its
-                // CREATE, so a bootstrap of related tables carries them as
-                // their own changes. A key names only tables and their keys,
-                // so it follows every table, as a key kept inline does.
-                Change::AddForeignKey { table, .. } => {
-                    foreign.insert(steps.len());
-                    steps.push(step(
-                        dialect,
-                        Phase::Keys,
-                        &format!("table {table}", table = table.shown()),
-                        change,
-                        Vec::new(),
-                        None,
                     )?);
                 }
                 // Policies create no nameable object, and their predicates
@@ -626,87 +418,10 @@ impl Reconstruction {
                     ));
                 }
             }
-            for made in &mut steps[first_step..] {
-                made.operation = operation;
-                if pbps_diff::order::generated::is_part(planned)
-                    && !matches!(change, Change::CreateTable { .. })
-                {
-                    made.phase = Phase::Modules;
-                }
-            }
         }
-        // The same lexical questions as the previous SQL-based scan, with
-        // only their answers retained until the complete blueprint is ordered.
-        let names: BTreeSet<_> = steps
-            .iter()
-            .flat_map(|s| s.names.iter().map(|(_, _, n)| n.clone()))
-            .chain(late.iter().map(|t| t.table.name.clone()))
-            .collect();
-        let tables: BTreeSet<_> = late.iter().map(|t| t.table.clone()).collect();
-        for part in &mut steps {
-            part.observe(dialect, &names, &tables);
-        }
-        #[cfg(test)]
-        let expected = function_oracle::after_their_functions(
-            steps.iter().map(|part| part.reference(dialect)).collect(),
-            late.clone(),
-            &functions,
-            &foreign,
-        )
-        .map(|mut steps| {
-            steps.sort_by_key(|step| step.phase);
-            steps
-        });
-        #[cfg(test)]
-        let expected_final = expected.clone().and_then(|steps| {
-            let mut schedule = pbps_diff::order::Schedule::new(steps.len());
-            for edge in &edges {
-                let before = steps.iter().rposition(|s| s.operation == edge.before);
-                let after = steps.iter().position(|s| s.operation == edge.after);
-                if let (Some(before), Some(after)) = (before, after) {
-                    schedule.edge(before, after, edge.source, edge.reason);
-                }
-            }
-            function_oracle::settle_steps(steps, &schedule, expanded)
-        });
-        let parts = steps
-            .into_iter()
-            .map(|part| pbps_diff::order::scratch::Part {
-                operation: part.operation,
-                slot: 0,
-                change: part.change.clone(),
-                phase: part.phase,
-                declaration: part.declaration.clone(),
-                names: part.names.iter().map(|(_, _, name)| name.clone()).collect(),
-                calls: part.calls.clone(),
-                tables: part.tables.clone(),
-                metadata: part,
-            })
-            .collect();
-        let late = late
-            .into_iter()
-            .map(|table| pbps_diff::order::scratch::HeldTable {
-                table: table.table,
-                steps: table.steps,
-                generated: table.generated,
-            })
-            .collect();
-        let input = ScratchBlueprint(pbps_diff::order::scratch::Input::new(
-            prepared, parts, late, functions, foreign,
-        ));
+        let input = ScratchBlueprint(pbps_diff::order::scratch::Input::new(prepared, steps));
         let ordered =
-            pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle);
-        #[cfg(test)]
-        assert_eq!(
-            ordered.as_ref().map(|plan| plan
-                .first()
-                .iter()
-                .map(|p| p.metadata.reference(dialect))
-                .collect::<Vec<_>>()),
-            expected.as_ref().cloned(),
-            "scratch statements and every Step field must match the frozen hold and phase sort"
-        );
-        let ordered = ordered?;
+            pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle)?;
         let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter(dialect.clone()))
             .expect("the identical private probes already validated these lowering parts");
         let steps = ordered
@@ -716,18 +431,12 @@ impl Reconstruction {
             .map(|(part, group)| {
                 let _ = group;
                 Step {
-                    metadata: part.metadata.metadata.clone(),
+                    metadata: part.metadata.clone(),
                     #[cfg(test)]
                     statements: group.statements().iter().map(|s| s.sql.clone()).collect(),
                 }
             })
             .collect::<Vec<_>>();
-        #[cfg(test)]
-        assert_eq!(
-            steps,
-            expected_final.expect("the successful scratch route has an oracle result"),
-            "the final scratch SQL and every Step field match both frozen settlements"
-        );
 
         Ok(Self {
             steps,
@@ -1133,10 +842,6 @@ async fn routines(
         .collect()
 }
 
-#[cfg(test)]
-#[path = "reconstruct/function_oracle.rs"]
-mod function_oracle;
-
 fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
     vec![(Nameable::Relation, schema.to_owned(), name.to_owned())]
 }
@@ -1180,26 +885,26 @@ async fn array_type(
     }
 }
 
-fn step(
+/// One operation as a part, validated where it is made, so a declaration the
+/// emitter cannot write is refused by name before anything is ordered.
+fn part(
     dialect: &crate::Postgres,
-    phase: Phase,
+    operation: usize,
+    planned: &pbps_model::PlannedChange,
     declaration: &str,
-    change: &Change,
     names: Vec<(Nameable, String, String)>,
     module: Option<ModuleId>,
-) -> Result<Blueprint, ReconstructError> {
-    // Preserve the original refusal priority: validate each part at its old
-    // construction point, but retain no SQL until both ordering stages finish.
-    crate::emit::emit(dialect, change, Strategy::default()).map_err(|error| {
+) -> Result<Part<Metadata>, ReconstructError> {
+    crate::emit::emit(dialect, &planned.change, planned.strategy).map_err(|error| {
         ReconstructError::Emit {
             declaration: declaration.to_owned(),
             reason: error.to_string(),
         }
     })?;
-    Ok(Blueprint {
+    Ok(Part {
+        operation,
+        change: planned.clone(),
         metadata: Metadata {
-            phase,
-            operation: 0,
             table_part: None,
             declaration: declaration.to_owned(),
             names,
@@ -1207,52 +912,7 @@ fn step(
             module,
             created: None,
         },
-        change: pbps_model::PlannedChange::new(change.clone()),
-        calls: BTreeSet::new(),
-        tables: BTreeSet::new(),
     })
-}
-
-impl Blueprint {
-    fn observe(
-        &mut self,
-        dialect: &crate::Postgres,
-        names: &BTreeSet<String>,
-        tables: &BTreeSet<pbps_model::TableName>,
-    ) {
-        let statements = crate::emit::emit(dialect, &self.change.change, self.change.strategy)
-            .expect("this part's private validation probe already succeeded");
-        self.calls = names
-            .iter()
-            .filter(|name| {
-                statements
-                    .iter()
-                    .any(|s| crate::generated::may_call(&s.sql, name))
-            })
-            .cloned()
-            .collect();
-        self.tables = tables
-            .iter()
-            .filter(|table| {
-                statements
-                    .iter()
-                    .any(|s| crate::generated::names_table(&s.sql, table))
-            })
-            .cloned()
-            .collect();
-    }
-
-    #[cfg(test)]
-    fn reference(&self, dialect: &crate::Postgres) -> Step {
-        Step {
-            metadata: self.metadata.clone(),
-            statements: crate::emit::emit(dialect, &self.change.change, self.change.strategy)
-                .unwrap()
-                .into_iter()
-                .map(|s| s.sql)
-                .collect(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1293,6 +953,8 @@ pub(crate) fn fixture_ids(bootstrap: &[Change]) -> pbps_model::IdsFile {
 #[cfg(test)]
 mod function_tests;
 #[cfg(test)]
+mod rule_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
@@ -1324,19 +986,16 @@ mod name_tests {
 ///
 /// ```compile_fail
 /// fn forge(pg: &pbps_pg::Postgres,
-///          input: pbps_diff::order::scratch::Input<pbps_pg::resolver::reconstruct::Blueprint>) {
+///          input: pbps_diff::order::scratch::Input<pbps_pg::resolver::reconstruct::Metadata>) {
 ///     pbps_diff::order::scratch::settle(pg, input).unwrap();
 /// }
 /// ```
-pub struct ScratchBlueprint(pbps_diff::order::scratch::Input<Blueprint>);
+pub struct ScratchBlueprint(pbps_diff::order::scratch::Input<Metadata>);
 impl pbps_diff::order::scratch::Engine for crate::Postgres {
     type Input = ScratchBlueprint;
-    type Metadata = Blueprint;
-    fn blueprint(&self, input: Self::Input) -> pbps_diff::order::scratch::Input<Blueprint> {
+    type Metadata = Metadata;
+    fn blueprint(&self, input: Self::Input) -> pbps_diff::order::scratch::Input<Metadata> {
         input.0
-    }
-    fn phase(metadata: &mut Blueprint, phase: Phase) {
-        metadata.metadata.phase = phase;
     }
 }
 #[derive(Debug, Clone)]

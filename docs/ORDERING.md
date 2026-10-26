@@ -23,9 +23,10 @@ each existing settlement records its own edges, without a constraint union.
 `OrderedPlan` has a private constructor and no public downgrade or generic
 empty-schedule finalizer (DEC-1959.5).
 
-Scratch settles an engine-owned, SQL-free blueprint before lowering.
-Function/phase compatibility and
-generated constraints retain their separate settlements. The real engine's
+Scratch settles an engine-owned, SQL-free blueprint before lowering: every
+new table is split into the parts the engine creates one at a time, and one
+schedule orders them by the generated constraints and the scratch rules, with
+no phase and no retained hold (DEC-2389.1). The real engine's
 opaque associated input prevents a caller-defined engine from manufacturing
 its scratch result. LoweredPlan keeps immutable operation groups, source IDs
 and statements and is branded by the emitter, so a mock emitter cannot supply
@@ -630,6 +631,9 @@ and the expression-bearing changes that need a function.
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
 | Function created → a new table's generated column calling it | content, over-approximated | shared creation parts keep the prefix before the function, then add the suffix in declaration order; a suffix partition key or a generation reading a later column instead uses SET EXPRESSION on connected PostgreSQL 17+, retaining the whole-table hold otherwise | ✓ DEC-1503.1 |
+| Index created → a change whose text names it by an OID-alias literal | content, over-approximated | scratch only, where indexes share the namespace of tables: the table's own step, a unique constraint, a primary key or a part holds no expression, and the reader follows it (`42P01` otherwise) | ✓ DEC-2389.1 |
+| Parent's default set → a partition's own default on that column | value | scratch only: the parts of the two defaults, and of every ancestor's | ✓ DEC-2389.1 |
+| Module or generated expression → an index that holds an expression or a predicate | position | scratch only: the index follows every one, so each counts it among the names made resolvable after it | ✓ DEC-2389.1 |
 
 ### Something removed before what it blocks
 

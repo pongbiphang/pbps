@@ -2576,6 +2576,23 @@ pub trait Dialect {
         Ok(None)
     }
 
+    /// [`Dialect::generated_table_parts`] for the resolver's scratch
+    /// reconstruction (DEC-2389.1), which compiles the whole declared
+    /// namespace in an order the constraints derive, so every new table is
+    /// split into the parts the engine creates one at a time: the bare
+    /// table, then each key, default, check and index as a part of its own.
+    /// The default is the ordinary split, so an engine that does not
+    /// override it reconstructs as before.
+    fn scratch_table_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        self.generated_table_parts(change, ids, functions, needs_complete_shape)
+    }
+
     /// A creation-time reference, including OID-alias string literals on
     /// engines that bind them. This is a lexical constraint, not a parser.
     fn generation_may_call(&self, text: &str, name: &str) -> bool {

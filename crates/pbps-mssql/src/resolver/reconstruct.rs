@@ -16,10 +16,8 @@
 //! one has therefore no order that compiles and reproduces the positions,
 //! and refuses by name ([`ReconstructError::Cycle`]), with the remedy.
 //!
-//! Every part is in one phase, so the route's phase pass only keeps the order
-//! the plan gives, which is the schedule's tie-break (the constraints
-//! `settle` then applies are a fresh schedule over that order): a constraint
-//! moves a part later and nothing else does.
+//! The order is the plan's, which is the schedule's tie-break, and a
+//! constraint moves a part later and nothing else does.
 //!
 //! Roles, grants and rows are not reproduced. None changes what a name
 //! binds to, and the plan's schema grants, the only kind it carries, are
@@ -27,7 +25,7 @@
 
 use super::capture::{ObjectIdentity, class, object};
 use crate::Mssql;
-use pbps_diff::order::scratch::{Input, Part, Phase};
+use pbps_diff::order::scratch::{Input, Part};
 use pbps_model::{Change, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,8 +75,6 @@ impl pbps_diff::order::scratch::Engine for Mssql {
     fn blueprint(&self, input: Self::Input) -> Input<Metadata> {
         input.0
     }
-    // Phases only chain parts in input order, and this route runs none.
-    fn phase(_: &mut Metadata, _: Phase) {}
 }
 
 #[derive(Debug, Clone)]
@@ -120,13 +116,7 @@ fn part(
     })?;
     Ok(Part {
         operation,
-        slot: 0,
         change: planned.clone(),
-        phase: Phase::Tables,
-        declaration: declaration.clone(),
-        names: Vec::new(),
-        calls: BTreeSet::new(),
-        tables: BTreeSet::new(),
         metadata: Metadata {
             declaration,
             created,
@@ -229,13 +219,7 @@ impl Reconstruction {
                 }
             }
         }
-        let input = ScratchBlueprint(Input::new(
-            prepared,
-            steps,
-            Vec::new(),
-            Vec::new(),
-            BTreeSet::new(),
-        ));
+        let input = ScratchBlueprint(Input::new(prepared, steps));
         let ordered =
             pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle)?;
         let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter)

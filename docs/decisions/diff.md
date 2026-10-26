@@ -7856,6 +7856,9 @@ the existing column/row/partition/literal/declared-dependency negatives, and
 `callable_columns_precede_their_readers_and_real_cycles_are_refused_on_both_servers`
 on the pinned PostgreSQL 16 and 18 fixtures.
 
+*Amended by [DEC-2389.1](#dec-2389-1): PostgreSQL's scratch route has no
+phases and no retained hold. Its parts are ordered by constraints alone.*
+
 
 <a id="dec-1959-4"></a>
 
@@ -8638,3 +8641,86 @@ The shared callee matcher refines both `Final` and baseline `BeforeRewrite`
 requirements; view matching remains lexical (#2143). No rank, wire format or
 release verifier is added. The module-only SQL Server regression measures
 accent, width and case sensitivity, the reversed verifier order and 3729.
+<a id="dec-2389-1"></a>
+
+**DEC-2389.1. PostgreSQL's scratch route orders its parts by constraints
+alone; each rule that is not a dependency is named and measured.** The
+resolver's scratch route split a new table itself and put each piece in one of
+four phases (tables, keys, modules, expressions), chained the phases, and held
+a table whose generation calls a function after that function. It is now the
+route SQL Server takes (DEC-1503.1, DEC-1959.6): `Dialect::scratch_table_parts`
+splits every new table into the parts the engine creates one at a time, and
+one `Schedule` settles the constraints `generated::constraints_in` states over
+them, each between the two operations it names, with the order the plan gives
+as its tie-break. `Phase`, the function hold, `HeldTable` and `Engine::phase`
+are gone, and a cycle is `Schedule`'s named refusal. SQL Server and the
+ordinary route are byte for byte what they were.
+
+What the table keeps with it is what holds no expression: its columns, key,
+unique constraints and plain indexes (a relation each, so a name of the table's
+step), and an identity on one of those. What holds an expression is a part of
+its own: a foreign key, a default, a check, an index with a predicate or an
+expression key, and a partition's own default. A table the engine cannot split
+(a generation reading a later column or keyed by a suffix column, before
+PostgreSQL 17) is one part, held by the function it calls and holding what
+reads it, as before.
+
+Rules the schedule states beyond what a text names, measured on PostgreSQL
+16.15 and 18.6 (the answers are the same on both):
+
+- **An index precedes the reader that names it** (#1042). `'app.ix'::regclass`
+  in a view, a SQL function body or a default is `42P01` while the index is
+  absent, and not an error in a PL/pgSQL body, which is not read until it runs.
+  The names are those of an index that holds no expression, a unique
+  constraint and a primary key, taken from the table's own step or a part.
+  Kept as a rule because the reader names the index, not its table. In an
+  engine whose indexes do not share the namespace of tables there is none.
+- **A partition's own default follows its parent's, and its ancestors'.** The
+  parent's `SET DEFAULT` after the partition's own replaces it (the partition
+  shows the parent's default), and before it does not. Kept because the two
+  defaults share no text.
+- **An index that holds an expression or a predicate follows every module and
+  every generated expression.** The engine needs only the routines it calls
+  (`42883` without them; an unrelated module after it is no error). Kept
+  because what the resolver judges, a module or a generated expression, counts
+  the names made resolvable after it (`later_names`), and an index made after
+  it is a name it could not have bound; the schedule alone would put the
+  index before a module the plan places later.
+
+Rules of the phases that no constraint reproduces, each measured and dropped:
+
+- *Every table before every module.* A module waits for the table it names
+  (and a table row type it casts to), as it does for a function; one that
+  names none keeps the plan's order. Compiled on both servers, none of
+  the 1,200 compiles (600 generated schemas on each) succeeded before and fails
+  now.
+- *Foreign keys after the modules for a held table; keys before modules
+  otherwise.* A key names only tables, so it follows the complete shape of the
+  two it joins (`42P01`, `42830` and `42703` otherwise) and nothing else.
+- *Every default and check after every module.* Each waits for the routine its
+  text names; an unrelated module after it is no error.
+- *Triggers last.* A trigger needs its function and its table; defaults,
+  checks and indexes are no error before or after it.
+- *A replica identity after the index it names* is kept, as it was: inline in
+  the table's statements, or by the constraint between the index and the part.
+- *The chain of peers within a phase* is the plan's order.
+
+`later_names` is a check on what the engine bound, not a constraint, and does
+not change; neither does the identity read back after a routine or a relation
+compiles. What changes is the order it is asked about: a module can lose a
+name of a module the plan places before it, a table's generated expression
+the plain index of an earlier table (made with that table now), and any
+module gains the names of the indexes that hold an expression. A module that
+names a plain index of a held table by literal now compiles; it failed with
+`42P01` (five of 1,200 compiles).
+
+PostgreSQL does not give `generation_column_names`, so `wait_for` and
+`Dialect::generation_column_key` are not reached and two quoted columns that
+differ in case are never merged; a dialect that gives them owns that key.
+
+Pinned by `a_reader_naming_an_index_follows_the_table_that_keeps_it`,
+`an_index_that_holds_a_predicate_follows_every_module_and_generation`,
+`a_partitions_own_default_follows_its_parents_when_the_parents_waits`,
+`multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds`,
+and the live `scratch_rules_compile_on_both_servers` and
+`held_tables_and_readers_compile_with_their_keys_on_both_servers`.

@@ -210,13 +210,27 @@ pub fn is_part(p: &PlannedChange) -> bool {
         .is_some_and(|origin| origin.rule == RULE)
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 pub fn parts(
     planned: &PlannedChange,
     ids: &IdsFile,
     changes: &[PlannedChange],
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
+) -> Result<Option<Vec<PlannedChange>>, String> {
+    parts_in(planned, ids, changes, deps, dialect, false)
+}
+
+/// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
+/// engine splits every new table, not only one whose generation needs a
+/// planned function (DEC-2389.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn parts_in(
+    planned: &PlannedChange,
+    ids: &IdsFile,
+    changes: &[PlannedChange],
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
@@ -254,10 +268,12 @@ pub fn parts(
     } else {
         false
     };
-    let Some(parts) = dialect
-        .generated_table_parts(&planned.change, ids, &functions, table_reader)
-        .map_err(|e| e.to_string())?
-    else {
+    let split = if scratch {
+        dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
+    } else {
+        dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
+    };
+    let Some(parts) = split.map_err(|e| e.to_string())? else {
         return Ok(None);
     };
     Ok(Some(
@@ -471,14 +487,27 @@ pub fn expand(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<usize, String> {
+    expand_in(plan, ids, deps, dialect, false)
+}
+
+/// [`expand`], splitting as the scratch reconstruction does when `scratch`.
+pub(super) fn expand_in(
+    plan: &mut super::PlanningPlan,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Result<usize, String> {
     let mut expanded = Vec::new();
     let mut origins = Vec::new();
     let mut added = 0;
     for (p, origin) in plan.changes.iter().zip(&plan.origins) {
-        match parts(p, ids, &plan.changes, deps, dialect)? {
+        match parts_in(p, ids, &plan.changes, deps, dialect, scratch)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
+                    // A table that scratch leaves whole is still one part.
+                    pbps_model::operation::Source::Change(_) if parts.len() == 1 => origin.clone(),
                     pbps_model::operation::Source::Change(at) => {
                         pbps_model::operation::Origin::SplitPart(at)
                     }
@@ -675,12 +704,25 @@ fn wait_for(
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 pub fn constraints(
     cs: &ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
+) -> Vec<Constraint> {
+    constraints_in(cs, declared, deps, dialect, false)
+}
+
+/// [`constraints`], and when `scratch` the rules only the resolver's scratch
+/// reconstruction has (DEC-2389.1), over parts that every new table was split
+/// into.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(super) fn constraints_in(
+    cs: &ChangeSet,
+    declared: &Schema,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
 ) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
@@ -855,6 +897,9 @@ pub fn constraints(
             }
         }
     }
+    if scratch {
+        scratch_rules(cs, declared, dialect, &mut out);
+    }
     if out.constraints().is_empty() {
         return Vec::new();
     }
@@ -864,6 +909,136 @@ pub fn constraints(
         edge(&mut out, provider, consumer);
     }
     out.constraints().iter().cloned().collect()
+}
+
+/// The indexes a change creates and keeps nameable before any module, by
+/// name: an index that holds no expression, a unique constraint and a primary
+/// key are each a relation of that name where indexes share the namespace of
+/// tables, and a new table brings the ones it keeps inline.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn early_index_names(change: &Change) -> Vec<&str> {
+    match change {
+        Change::AddIndex { name, index, .. } if !index.holds_expression() => vec![name.raw()],
+        Change::AddUnique { name, .. } => vec![name.raw()],
+        Change::SetPrimaryKey { to: Some(key), .. } => key.name.iter().map(|n| n.raw()).collect(),
+        Change::CreateTable { table, .. } => table
+            .primary_key
+            .iter()
+            .flat_map(|key| key.name.iter())
+            .map(|n| n.raw())
+            .chain(table.unique.keys().map(|n| n.raw()))
+            .chain(
+                table
+                    .indexes
+                    .iter()
+                    .filter(|(_, index)| !index.holds_expression())
+                    .map(|(name, _)| name.raw()),
+            )
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the resolver judges what this change binds against the names made
+/// resolvable after it: a module, and a generated expression, wherever the
+/// engine installs it.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn is_judged(change: &Change) -> bool {
+    match change {
+        Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::AlterColumnExpression { .. } => true,
+        Change::AddColumn { column, .. } => {
+            matches!(column.value_source, ValueSource::Generated(_))
+        }
+        Change::CreateTable { table, .. } => table
+            .columns
+            .values()
+            .any(|c| matches!(c.value_source, ValueSource::Generated(_))),
+        _ => false,
+    }
+}
+
+/// What the resolver's scratch reconstruction orders beyond the lexical and
+/// structural constraints above, each measured on PostgreSQL 16 and 18
+/// (DEC-2389.1), in an engine whose indexes share the namespace of tables:
+///
+/// - an index is a relation that a reader may name by an OID-alias literal
+///   (`'app.ix'::regclass`), and the engine refuses the reader while the
+///   index does not exist (SQLSTATE 42P01): an index that holds no
+///   expression precedes every change whose text names it;
+/// - an index that holds an expression or a predicate follows every module
+///   and generated expression, and the modules it may call are what the
+///   engine needs before it (SQLSTATE 42883 without them): what is judged
+///   then counts the index among the names made resolvable after it;
+/// - a partition's own default follows the default its parent sets on the
+///   same column, because the parent's `SET DEFAULT` reaches every partition
+///   and replaces the partition's own.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn scratch_rules(
+    cs: &ChangeSet,
+    declared: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+    out: &mut Schedule,
+) {
+    let edge = |out: &mut Schedule, a, b| {
+        if a != b {
+            out.edge(a, b, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    if dialect.indexes_share_namespace_with_tables() {
+        let readers: Vec<(usize, Vec<&str>)> =
+            cs.changes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let module = match &p.change {
+                        Change::CreateModule { module, .. }
+                        | Change::AlterModule { module, .. } => Some(module.definition.as_str()),
+                        _ => None,
+                    };
+                    (i, texts(&p.change).into_iter().chain(module).collect())
+                })
+                .collect();
+        for (at, p) in cs.changes.iter().enumerate() {
+            for name in early_index_names(&p.change) {
+                for (reader, texts) in &readers {
+                    if texts.iter().any(|t| dialect.generation_may_call(t, name)) {
+                        edge(out, at, *reader);
+                    }
+                }
+            }
+            if matches!(&p.change, Change::AddIndex { index, .. } if index.holds_expression()) {
+                for (judged, q) in cs.changes.iter().enumerate() {
+                    if is_judged(&q.change) {
+                        edge(out, judged, at);
+                    }
+                }
+            }
+        }
+    }
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::AlterColumnDefault { column, .. } = &p.change else {
+            continue;
+        };
+        let mut table = &column.table;
+        let mut seen = BTreeSet::new();
+        while let Some(of) = declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            && seen.insert(table)
+        {
+            for (parent, q) in cs.changes.iter().enumerate() {
+                if matches!(&q.change, Change::AlterColumnDefault { column: c, .. }
+                    if c.table == of.parent && c.name == column.name)
+                {
+                    edge(out, parent, at);
+                }
+            }
+            table = &of.parent;
+        }
+    }
 }
 
 /// The generated schedule consumes and returns only an owned intermediate.
