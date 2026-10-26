@@ -88,6 +88,14 @@ impl ScratchNames {
         )
     }
 
+    /// The names of the reference database a SQL Server run reads a fresh
+    /// database's options from (#2410): carries the token like the rest, and
+    /// reuses the run's login name, which a reference never creates.
+    pub fn for_reference(token: &str, password: String) -> Result<Self, UnsupportedScratchName> {
+        let run = Self::for_run(token, password.clone())?;
+        Self::new(format!("pbps_reference_{token}"), run.login, password)
+    }
+
     pub fn database(&self) -> &str {
         &self.database
     }
@@ -243,6 +251,8 @@ mod tests {
         // The database and the login are linked by the token alone: that is
         // what lets a later run remove the one it finds beside the other.
         assert!(names.database().ends_with(&names.login()[9..]));
+        let reference = ScratchNames::for_reference(token, "0".repeat(32)).unwrap();
+        assert_eq!(reference.database(), format!("pbps_reference_{token}"));
         for bad in [
             "",
             "0123456789abcdef",

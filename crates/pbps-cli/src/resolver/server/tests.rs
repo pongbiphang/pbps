@@ -1,14 +1,21 @@
 use super::*;
 
 #[test]
-fn generated_scratch_names_are_unique_and_never_collide_with_each_other() {
-    let first = generated_names().unwrap();
-    let second = generated_names().unwrap();
-    assert!(first.database().starts_with("pbps_scratch_"));
-    assert!(first.login().starts_with("pbps_run_"));
+fn a_runs_names_carry_its_token_and_two_runs_never_share_one() {
+    let token = |n: u128| format!("{n:032x}");
+    let (a, b) = (token(1), token(2));
+    let first = names_for(&a).unwrap();
+    let second = names_for(&b).unwrap();
+    assert_eq!(first.database(), format!("pbps_scratch_{a}"));
+    assert_eq!(first.login(), format!("pbps_run_{a}"));
+    assert_eq!(
+        names_for_reference(&a).unwrap().database(),
+        format!("pbps_reference_{a}")
+    );
     assert_ne!(first.database(), second.database());
     assert_ne!(first.login(), second.login());
     assert_ne!(first.password(), second.password());
+    assert!(names_for("short").is_err());
 }
 
 #[tokio::test]

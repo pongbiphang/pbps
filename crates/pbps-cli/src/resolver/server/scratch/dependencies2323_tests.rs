@@ -10,15 +10,15 @@ use pbps_mssql::resolver::{
 };
 
 #[derive(Clone)]
-struct Case {
-    target: String,
-    target_admin: String,
-    other: String,
-    other_name: String,
-    scratch_server: String,
+pub(super) struct Case {
+    pub(super) target: String,
+    pub(super) target_admin: String,
+    pub(super) other: String,
+    pub(super) other_name: String,
+    pub(super) scratch_server: String,
 }
 
-async fn fixture<F, Fut>(kind: DependencyKind, unreadable: bool, check: F)
+pub(super) async fn fixture<F, Fut>(kind: DependencyKind, unreadable: bool, check: F)
 where
     F: FnOnce(Case) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -95,7 +95,7 @@ where
     assert!(remaining.is_empty(), "fixture required companion recovery");
 }
 
-fn declarations(database: &str, kind: DependencyKind) -> Dependencies {
+pub(super) fn declarations(database: &str, kind: DependencyKind) -> Dependencies {
     [(
         format!("{database}.dbo.dep2323").parse().unwrap(),
         Dependency {

@@ -82,7 +82,7 @@ impl Adapter for Server<'_> {
         Server::liveness(self, tokens).await
     }
 
-    async fn remove(&mut self, resource: &Resource) -> Result<(), Failed> {
+    async fn remove(&mut self, _: &str, resource: &Resource) -> Result<(), Failed> {
         self.pin().await?;
         match resource.kind {
             // Without FORCE: a session still connected refuses the drop.
@@ -150,7 +150,7 @@ impl Adapter for Claimed<'_> {
         self.server.liveness(tokens).await
     }
 
-    async fn remove(&mut self, _: &Resource) -> Result<(), Failed> {
+    async fn remove(&mut self, _: &str, _: &Resource) -> Result<(), Failed> {
         release_supplied(
             self.server.admin,
             self.server.backend,

@@ -91,24 +91,17 @@ struct ProducerOutcome {
     surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
 }
 
-/// The names of a run-owned PostgreSQL scratch, each carrying `token` (#2410).
+/// The names of a run-owned scratch, each carrying `token` (#2410): what ties
+/// a leftover database to its login, and to the run's marker or session.
 pub(crate) fn names_for(token: &str) -> Result<ScratchNames, Error> {
     ScratchNames::for_run(token, format!("{:032x}", rand::random::<u128>()))
         .map_err(|_| Error::Scratch)
 }
 
-pub(crate) fn generated_names() -> Result<ScratchNames, Error> {
-    let suffix = || format!("{:032x}", rand::random::<u128>());
-    ScratchNames::new(
-        format!("pbps_scratch_{}", suffix()),
-        format!("pbps_run_{}", suffix()),
-        format!(
-            "{:032x}{:032x}",
-            rand::random::<u128>(),
-            rand::random::<u128>()
-        ),
-    )
-    .map_err(|_| Error::Scratch)
+/// The names of a SQL Server run's reference database, carrying `token`.
+pub(crate) fn names_for_reference(token: &str) -> Result<ScratchNames, Error> {
+    ScratchNames::for_reference(token, format!("{:032x}", rand::random::<u128>()))
+        .map_err(|_| Error::Scratch)
 }
 
 #[cfg(test)]
