@@ -8,6 +8,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// The tree mode of a submodule entry.
 pub(crate) const SUBMODULE: &str = "160000";
+/// The tree mode of a symbolic link.
+pub(crate) const SYMLINK: &str = "120000";
 
 struct Entry {
     mode: String,

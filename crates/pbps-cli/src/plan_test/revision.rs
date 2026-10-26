@@ -240,10 +240,16 @@ pub(super) fn read_commit(root: &Path, commit: &CommitId) -> Result<Raw, Vec<Pro
             // is called: `plan` reads what is checked out under it, and a
             // commit that only records its id cannot, so it must not read as
             // a directory with fewer declarations.
+            //
+            // A symlink is wanted whatever it is called for the same reason:
+            // the working-tree loader follows a link to a directory, git does
+            // not, and a link named `views` would otherwise vanish from the
+            // listing. `tree_entries` refuses it.
             |entry, mode| {
                 entry.ends_with(".yml")
                     || entry.ends_with(".yaml")
                     || mode == git_objects::SUBMODULE
+                    || mode == git_objects::SYMLINK
             },
             &prefix,
         )
@@ -410,6 +416,13 @@ pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
         Ok(files) => files
             .iter()
             .filter_map(|path| match regular(path) {
+                // The name is the declaration's key. Two names that differ
+                // only in bytes no UTF-8 string holds would collapse to one
+                // key once shown lossily, and one declaration would vanish.
+                Ok(Some(_)) if path.to_str().is_none() => {
+                    problems.push(Problem::NotUtf8 { path: shown(path) });
+                    None
+                }
                 Ok(Some(bytes)) => Some((shown(path), bytes)),
                 Ok(None) => {
                     problems.push(Problem::Unreadable {

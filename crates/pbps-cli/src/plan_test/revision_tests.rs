@@ -990,3 +990,45 @@ fn a_submodule_is_refused_wherever_it_stands_among_the_inputs_never_read_as_noth
         repo.git(&["reset", "-q", "--hard", &c2.to_string()]);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_a_directory_is_refused_whatever_it_is_called() {
+    let (repo, c1, _) = standard();
+    std::fs::create_dir_all(repo.project.join("schema/real")).unwrap();
+    repo.write(
+        "schema/real/extra.yml",
+        "table: app.extra\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\n",
+    );
+    std::os::unix::fs::symlink("real", repo.project.join("schema/views")).unwrap();
+    let linked = repo.commit("a link to a directory of declarations");
+    repo.manifest(&linked, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &linked).iter().any(
+            |p| matches!(p, RevisionProblem::NotRegular { path, .. } if path == "schema/views")
+        ),
+        "{found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn working_declarations_whose_names_are_not_utf8_are_refused_not_merged_by_lossy_display() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let (repo, _, _) = standard();
+    let name = std::ffi::OsStr::from_bytes(b"\xff.yml");
+    std::fs::write(repo.project.join("schema").join(name), "table: app.x\n").unwrap();
+    std::fs::write(repo.project.join("schema/\u{fffd}.yml"), "table: app.y\n").unwrap();
+    let found = refused(repo.validate());
+    assert!(
+        found.iter().any(|r| matches!(
+            r,
+            Refusal::At {
+                revision: Revision::Working,
+                problem: RevisionProblem::NotUtf8 { .. }
+            }
+        )),
+        "{found:?}"
+    );
+}

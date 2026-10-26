@@ -731,8 +731,11 @@ disagree about what git said.
 Config, declarations and the identity file of a commit are read through one
 tree listing and one `cat-file --batch` (the baseline reader), hashed as raw
 bytes and loaded from those same bytes. An entry git has no record of is
-absent, which is not empty; one it cannot read, a symlink or a submodule is a
-refusal. `baseline::ids_from` reads any failed `git show` as an empty identity
+absent, which is not empty; one it cannot read is a refusal, and so is any
+symlink or submodule below the declarations directory whatever it is called,
+because the working-tree loader follows a link to a directory and git does not,
+and a submodule's files are not in the commit. A working-tree declaration whose
+name is not UTF-8 is refused too: the name is the declaration's key. `baseline::ids_from` reads any failed `git show` as an empty identity
 file (#1814) and is not used here, nor fixed here. A commit with no `pbps.yml`
 is refused, not read as a project that did not exist yet, because the manifest's
 dialect must match each revision's own configuration. A working tree takes the
