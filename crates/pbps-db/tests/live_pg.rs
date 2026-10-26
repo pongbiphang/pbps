@@ -377,3 +377,64 @@ async fn a_session_is_named_for_this_process_unless_the_string_names_it() {
     let own = application_name(&format!("{} application_name=ops-dashboard", conn_str())).await;
     assert_eq!(own, "ops-dashboard");
 }
+
+/// Driver timeout is an error, independently of the engine's overall deadline.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn a_bounded_query_timeout_is_an_error_and_discards_the_session1165() {
+    for key in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let connection = std::env::var(key).expect("both pinned fixtures");
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        let error = conn
+            .prepare_query("SELECT pg_sleep(30)")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("driver timeout"), "{error:?}");
+        assert!(
+            conn.query("SELECT 1").await.is_err(),
+            "timed-out session reused"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+async fn bounded_query_metadata_and_nulls_survive_an_empty_or_truncated_stream1165() {
+    use pbps_db::query::EvidenceCell;
+    for key in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let connection = std::env::var(key).expect("both pinned fixtures");
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        let empty = conn
+            .prepare_query("SELECT NULL::text AS name WHERE false")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.columns[0].name, "name");
+        assert_eq!(empty.columns[0].type_name, "pg_catalog.text");
+        assert!(!empty.truncated);
+        let rows = conn
+            .prepare_query("SELECT NULL::text FROM generate_series(1,1000000)")
+            .await
+            .unwrap()
+            .query_bounded(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 20);
+        assert!(rows.truncated);
+        assert!(rows.rows.iter().all(|row| row == &[EvidenceCell::Null]));
+        assert!(
+            conn.query("SELECT 1").await.is_err(),
+            "unfinished stream reused"
+        );
+    }
+}

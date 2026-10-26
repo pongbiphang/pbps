@@ -12,9 +12,11 @@ repository.workspace = true
 pbps-diff.workspace = true
 pbps-model.workspace = true
 pbps-dialect.workspace = true
-# Promoted from a dev-dependency by introspection (Phase 5 step 3): `catalog`
-# holds a connection, and it is the only file in this crate that does.
+# Connected engine operations use the shared connection seam; driver types
+# remain private in pbps-db.
 pbps-db.workspace = true
+# The assertion deadline includes connection setup and transaction postchecks.
+tokio.workspace = true
 # The ledger writes one snapshot per row as JSON (Phase 5 step 8); the shape is
 # `pbps_model::StateSnapshot`'s, and this is what serializes it.
 serde.workspace = true

@@ -395,17 +395,34 @@ on arbitrary sequences. Neither engine's fixtures may reset allocators by DDL.
 ## 7. Assertion contract, shared with target planning
 
 An assertion entry names one UTF-8 SQL file containing **one query** in the
-selected dialect. It must return exactly one tabular result set with arbitrary
-columns. Zero rows is pass. Any returned row is a violation, including a row of
-NULLs, an empty string, `false`, or `COUNT(*) = 0`. There is no truthy scalar
+selected dialect. It must return exactly one tabular result set with **at least
+one output column**. A zero-column result is an invalid
+assertion, whether it contains zero rows or any rows; it is neither pass nor
+violation. Refuse it with the remedy `SELECT 1 ...` (DEC-1165.1). With a valid
+result shape, zero rows is pass. Any returned row is a violation, including a
+row of NULLs, an empty string, `false`, or `COUNT(*) = 0`. There is no truthy scalar
 interpretation, expected-failure flag or per-file pass convention. An empty
 file, a command without a row result or multiple result sets is invalid.
+
+On PostgreSQL, after preparing/describing the original statement and before
+executing it, the runner reads each result type's `pg_catalog.pg_type.typsend`
+in the same READ ONLY transaction. Resolve domains to their base types and
+arrays to their element types recursively. If any type in that chain lacks
+binary output, the assertion is **InvalidResult**, even for NULL or zero rows;
+name the column and its type and say "cast it to text, e.g. `col::text`".
+Nothing executes, so this is neither pass, SQL error nor violation. An
+unreadable or missing capability is **Unanswerable**. PostgreSQL 16.15 and 18.6
+both raised 42883 for binary `aclitem` output; the native driver always requests
+binary results. Refuse this described shape rather than fork the driver or use
+the simple protocol (DEC-1165.3). Other types without a client text renderer
+remain marked unrenderable cells and their rows still establish violations.
 
 The engine/driver must complete the query and result stream successfully to
 report an empty result. Capture up to 20 evidence rows and 64 KiB per assertion,
 with per-value truncation recorded; preserve column names/types and NULL as
-JSON null. On reaching the evidence bound, a violation is already known: cancel
-and drain or close within the deadline, record that more rows may exist, and
+JSON null. For a valid result shape, reaching the evidence bound establishes a
+violation: cancel and drain or close within the deadline, record that more rows
+may exist, and
 never run another query on an uncertain connection. Cancellation/read failure
 remains visible; a timeout or unreadable stream cannot be recast as pass.
 Zero-row success always requires the complete stream and boundary verification.

@@ -38,6 +38,7 @@ pub mod impact;
 pub mod ledger;
 mod mssql;
 mod postgres;
+pub mod query;
 // Cross-crate test support is opt-in because cfg(test) does not reach a
 // dependency. Neither this API nor its driver hooks exists in normal builds.
 #[cfg(feature = "test-request-count")]
@@ -716,6 +717,20 @@ impl Conn {
         match self {
             Conn::Mssql(c) => Ok(c.query(sql).await?.into_iter().map(Row::Mssql).collect()),
             Conn::Postgres(c) => Ok(c.query(sql).await?.into_iter().map(Row::Postgres).collect()),
+        }
+    }
+
+    /// Describes one statement without executing it, borrowing this connection
+    /// until the caller has checked its result types and consumed the query.
+    pub async fn prepare_query(&mut self, sql: &str) -> Result<query::PreparedQuery<'_>, DbError> {
+        match self {
+            Conn::Postgres(conn) => {
+                let prepared = conn.prepare_query(sql).await?;
+                Ok(query::PreparedQuery { conn, prepared })
+            }
+            Conn::Mssql(_) => Err(DbError::Refused(
+                "prepared assertion queries are implemented for PostgreSQL only".into(),
+            )),
         }
     }
 
