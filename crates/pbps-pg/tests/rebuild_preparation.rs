@@ -210,7 +210,8 @@ fn part(p: &Prepared, purpose: Purpose) -> &Change {
 fn preparation_keeps_typed_parts_reserved_uids_and_readonly_target_state() {
     let f = Fixture::new();
     let p = f.prepare().unwrap();
-    assert!(p.target().rebuilds.is_empty());
+    // Approval already installed the replacements, so the target is the files.
+    assert_eq!(p.target().rebuilds, f.recorded.rebuilds);
     assert_eq!(f.recorded.rebuilds.len(), 1);
     assert_eq!(p.target().tables, f.root.intent.replacement.tables);
     assert!(
@@ -370,3 +371,70 @@ fn partial_unreadable_unmanaged_and_published_facts_are_named_before_callback() 
 
 #[path = "support/rebuild_execution.rs"]
 mod execution;
+
+/// The copy reads the column an approval paired, not the column that happens
+/// to carry the same name: a column renamed after the approval keeps its rows,
+/// and a column the approval never paired is the one filled with NULL.
+#[test]
+fn a_column_renamed_after_the_approval_is_copied_from_the_column_it_continues() {
+    let mut f = Fixture::new();
+    let table = f.root.table.clone();
+    let ctx = pbps_diff::Context {
+        operator: "maintainer".into(),
+        today: "2026-10-24".into(),
+    };
+    let parent = f.desired.tables.get_mut(&table).unwrap();
+    let column = parent.columns.shift_remove("payload").unwrap();
+    parent.columns.insert("body".into(), column);
+    let renamed = pbps_diff::resolve(
+        &f.desired,
+        &f.recorded,
+        &[Intent::RenameColumn {
+            table: table.clone(),
+            from: "payload".into(),
+            to: "body".into(),
+        }],
+        &ctx,
+    )
+    .unwrap()
+    .ids;
+    let pg = pbps_pg::Postgres::new();
+    f.recorded = pbps_diff::rebuild::record(
+        side(&f.base, &f.ids),
+        &f.desired,
+        &renamed,
+        &table,
+        10,
+        &"widen key".parse().unwrap(),
+        &ctx,
+        &pg,
+    )
+    .unwrap();
+    f.root = pbps_diff::rebuild::qualify(
+        side(&f.base, &f.ids),
+        side(&f.desired, &f.recorded),
+        &table,
+        &pg,
+    )
+    .unwrap();
+    let p = f.prepare().unwrap();
+    let Change::CopyTableRows(copy) = part(&p, Purpose::Copy) else {
+        panic!("copy")
+    };
+    let body = copy
+        .columns
+        .iter()
+        .find(|c| c.target.name.raw() == "body")
+        .unwrap();
+    assert_eq!(
+        body.source.as_ref().map(|s| s.column.clone()),
+        Some(table.column("payload")),
+        "the renamed column still reads the source's own"
+    );
+    let added = copy
+        .columns
+        .iter()
+        .find(|c| c.target.name.raw() == "added")
+        .unwrap();
+    assert!(added.source.is_none(), "an unpaired column has no source");
+}

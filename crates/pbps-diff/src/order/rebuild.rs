@@ -178,6 +178,14 @@ pub fn prepare(
     dialect: &dyn Dialect,
     recipes: &mut Recipes<'_>,
 ) -> Result<Prepared, String> {
+    // The copy of a chain of approvals composes their conversions and
+    // honours every link's cap; lowering it is a later change (DEC-2298.12).
+    if !input.root.earlier.is_empty() {
+        return Err(format!(
+            "{}: a rebuild composed over several approved links cannot be prepared yet",
+            input.root.table.shown()
+        ));
+    }
     if dialect.name() != "postgres" || input.mode != PlanMode::Transactional {
         return Err(format!(
             "{}: rebuild requires PostgreSQL transactional mode",
@@ -361,11 +369,19 @@ pub fn prepare(
         .columns
         .iter()
         .map(|(name, c)| CopyColumn {
-            source: r.before[&r.table].columns.get(name).map(|was| CopySource {
-                column: r.table.column(name),
-                ty: was.ty.clone(),
-                collation: was.collation.clone(),
-            }),
+            // The column this one continues, by the approval's pairing and not
+            // by name: a column renamed since keeps its rows.
+            source: r
+                .intent
+                .source_column(&r.table.column(name))
+                .and_then(|was| {
+                    let declared = r.before[&r.table].columns.get(&was.name)?;
+                    Some(CopySource {
+                        column: was.clone(),
+                        ty: declared.ty.clone(),
+                        collation: declared.collation.clone(),
+                    })
+                }),
             target: parent.name.column(name),
             cast: c.ty.clone(),
             collation: c.collation.clone(),
@@ -409,9 +425,10 @@ pub fn prepare(
             );
         }
     }
+    let view_ids = crate::rebuild::logical_view(input.desired.ids, r);
     let sources = super::deployment::Sources {
         before: input.before,
-        after: input.desired.ids,
+        after: &view_ids,
     };
     let logical = rule.out.logical.clone();
     let view = sources.project(&logical)?;

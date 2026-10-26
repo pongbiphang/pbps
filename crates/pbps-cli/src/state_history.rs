@@ -254,13 +254,6 @@ fn historical_ids(
         .chain(ids.roles.keys())
         .chain(ids.types.keys())
         .chain(ids.tombstones.keys())
-        .chain(ids.rebuilds.values().flat_map(|rebuild| {
-            rebuild
-                .replacement
-                .tables
-                .keys()
-                .chain(rebuild.replacement.columns.keys())
-        }))
         .cloned()
         .collect();
     missing_by_name(&mut ids.tables, &other.tables, &mut taken);
@@ -506,6 +499,38 @@ fn export(
              Re-run with --force to replace them.",
         ));
     }
+    // Declarations do not carry the identity history, so the project's own
+    // identity file says which rewrites were approved after this entry. An
+    // absent file approved none; one that cannot be read cannot say, and a
+    // later plan refusal would not undo what the export wrote.
+    match crate::read_ids_opt(project) {
+        Ok(Some(current)) => {
+            if let Some(table) =
+                pbps_diff::rebuild::rebuilt_since(&entry.snapshot.ids, &current).first()
+            {
+                return Err(Refusal::new(
+                    "state.export-predates-rebuild",
+                    format!(
+                        "Entry #{} holds {} from before its approved rebuild; restoring it would \
+                         need a reverse rebuild, which pbps does not plan. Nothing was written.",
+                        entry.id,
+                        table.shown()
+                    ),
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(Refusal::new(
+                "state.export-ids-unreadable",
+                format!(
+                    "Entry #{} cannot be exported: the identity file cannot be read, so it is \
+                     unknown whether a rebuild was approved since: {e:#}. Nothing was written.",
+                    entry.id
+                ),
+            ));
+        }
+    }
     let schema = entry.snapshot.declared.overlay(&entry.snapshot.schema);
     let (stage, copies, files, removed, mut findings) = (|| -> anyhow::Result<_> {
         let stage = adopt::Stage::new("state-export")?;
@@ -612,6 +637,9 @@ fn export(
 
 #[cfg(test)]
 mod tests {
+    /// A readable identity file in a layout the tool never writes, so a test
+    /// can tell that the export left it byte for byte as it was.
+    const KEPT_IDS: &str = "{\n    \"version\":   1\n}\n";
     use super::*;
     use clap::Parser as _;
 
@@ -646,7 +674,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("custom.yml");
         std::fs::write(&old, "keep these bytes").unwrap();
-        std::fs::write(project.ids_file(), "keep identity bytes").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let dialect = crate::dialect(&project).unwrap();
         let error = crate::publication::tests::with_fault(&[("write", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
@@ -657,7 +685,7 @@ mod tests {
         assert_eq!(std::fs::read(&old).unwrap(), b"keep these bytes");
         assert_eq!(
             std::fs::read(project.ids_file()).unwrap(),
-            b"keep identity bytes"
+            KEPT_IDS.as_bytes()
         );
         let (data, findings) = crate::publication::tests::with_fault(&[("cleanup", 0)], || {
             export(&project, &entry, true, dialect.as_ref())
@@ -677,7 +705,7 @@ mod tests {
         assert!(json.contains("state.export-backup") && json.contains("were published"));
         assert_eq!(
             std::fs::read(project.ids_file()).unwrap(),
-            b"keep identity bytes"
+            KEPT_IDS.as_bytes()
         );
     }
 
@@ -741,12 +769,120 @@ mod tests {
     }
 
     #[test]
+    fn state_history_export_refuses_an_entry_from_before_an_approved_rebuild() {
+        let (_stage, project, mut entry) = fixture("history-predates-rebuild");
+        let dialect = crate::dialect(&project).unwrap();
+        let table: pbps_model::TableName = "dbo.product".parse().unwrap();
+        let (source, replacement) = (
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.product", 1),
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.product", 2),
+        );
+        // The files approved a rebuild of the table after this entry was recorded.
+        let mut current = pbps_model::IdsFile::default();
+        current.tables.insert(replacement.clone(), table.clone());
+        current.tombstones.insert(
+            source.clone(),
+            pbps_model::Tombstone {
+                was: "dbo.product".into(),
+                dropped_at: "2026-10-24".into(),
+                reason: "maintenance".into(),
+                operator: "o".into(),
+            },
+        );
+        current.rebuilds.insert(
+            source.clone(),
+            pbps_model::Rebuild {
+                source: pbps_model::RebuildIdentities {
+                    tables: [(source.clone(), table.clone())].into(),
+                    columns: Default::default(),
+                },
+                replacement: pbps_model::RebuildIdentities {
+                    tables: [(replacement.clone(), table.clone())].into(),
+                    columns: Default::default(),
+                },
+                replacement_root: replacement.clone(),
+                continues: [(replacement.clone(), source.clone())].into(),
+                target_checksum: "1".repeat(64),
+                max_rows: 5,
+                allowed_at: "2026-10-24".into(),
+                reason: "maintenance".parse().unwrap(),
+                operator: "o".into(),
+                types: Default::default(),
+            },
+        );
+        current.validate().unwrap();
+        std::fs::write(
+            project.ids_file(),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+        // An entry that still holds the source is refused by name, writing nothing.
+        entry.snapshot.ids.tables.insert(source, table);
+        let error = export(&project, &entry, true, dialect.as_ref())
+            .err()
+            .unwrap();
+        assert_eq!(error.id, "state.export-predates-rebuild");
+        assert!(error.message.contains("dbo.product") && error.message.contains("reverse rebuild"));
+        assert!(!project.schema_dir().exists());
+        // One recorded after it holds the replacement and exports as usual.
+        entry.snapshot.ids.tables.clear();
+        entry
+            .snapshot
+            .ids
+            .tables
+            .insert(replacement, "dbo.product".parse().unwrap());
+        assert!(export(&project, &entry, true, dialect.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn state_history_export_reads_the_identity_file_as_absent_unreadable_or_clean() {
+        let dialect_of = |p: &crate::Project| crate::dialect(p).unwrap();
+        // Absent: no rewrite was approved, so the export proceeds.
+        let (_stage, project, entry) = fixture("history-ids-absent");
+        assert!(!project.ids_file().exists());
+        assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
+        // Readable and without a rebuild: proceeds.
+        let (_stage, project, entry) = fixture("history-ids-clean");
+        std::fs::write(
+            project.ids_file(),
+            serde_json::to_string_pretty(&pbps_model::IdsFile::default()).unwrap(),
+        )
+        .unwrap();
+        assert!(export(&project, &entry, true, dialect_of(&project).as_ref()).is_ok());
+        // Present but malformed, inconsistent or empty: refused by name before
+        // anything is written, the file left as it was.
+        let orphan = r#"{"version":1,"columns":{"c_aaaaaa":{"table":"dbo.gone","name":"id"}}}"#;
+        for (label, bytes) in [
+            ("malformed", "{ not json\n"),
+            ("empty", ""),
+            ("inconsistent", orphan),
+        ] {
+            let (_stage, project, entry) = fixture(&format!("history-ids-{label}"));
+            std::fs::write(project.ids_file(), bytes).unwrap();
+            let error = export(&project, &entry, true, dialect_of(&project).as_ref())
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the export was allowed"));
+            assert_eq!(error.id, "state.export-ids-unreadable", "{label}");
+            assert!(
+                error.message.contains("schema.ids.json") || error.message.contains("identity"),
+                "{label}: {}",
+                error.message
+            );
+            assert!(
+                !project.schema_dir().exists(),
+                "{label}: wrote declarations"
+            );
+            assert_eq!(std::fs::read_to_string(project.ids_file()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn state_history_overwrite_refusal_preserves_existing_declarations_and_ids() {
         let (_stage, project, entry) = fixture("history-overwrite");
         std::fs::create_dir(project.schema_dir()).unwrap();
         let path = project.schema_dir().join("custom.yml");
         std::fs::write(&path, "keep these exact bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "identity intent, unchanged\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let dialect = crate::dialect(&project).unwrap();
         let error = export(&project, &entry, false, dialect.as_ref())
             .err()
@@ -758,7 +894,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity intent, unchanged\n"
+            KEPT_IDS
         );
         // Force changes declaration files, but neither parses nor writes ids.
         let (data, _) = export(&project, &entry, true, dialect.as_ref())
@@ -771,7 +907,7 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity intent, unchanged\n"
+            KEPT_IDS
         );
     }
 
@@ -787,7 +923,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let file = project.schema_dir().join("keep.yml");
         std::fs::write(&file, "do not touch\n").unwrap();
-        std::fs::write(project.ids_file(), "original identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let error = export(
             &project,
             &entry,
@@ -802,7 +938,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(file).unwrap(), "do not touch\n");
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "original identity bytes\n"
+            KEPT_IDS
         );
     }
 
@@ -816,7 +952,7 @@ mod tests {
         .unwrap();
         let project = Project::discover(stage.path()).unwrap();
         std::fs::create_dir(project.schema_dir()).unwrap();
-        std::fs::write(project.ids_file(), "identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let error = export(
             &project,
             &entry,
@@ -829,7 +965,7 @@ mod tests {
         assert!(error.message.contains("aliases protected project input"));
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity bytes\n"
+            KEPT_IDS
         );
     }
 
@@ -906,7 +1042,7 @@ mod tests {
                 output.clone()
             };
             std::fs::write(&old, "keep old declaration\n").unwrap();
-            std::fs::write(project.ids_file(), "keep identity bytes\n").unwrap();
+            std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
             std::fs::create_dir(&directory).unwrap();
             let notes = directory.join("notes.txt");
             std::fs::write(&notes, "keep non-declaration\n").unwrap();
@@ -979,7 +1115,7 @@ mod tests {
         std::fs::create_dir(project.schema_dir()).unwrap();
         let old = project.schema_dir().join("sales.country.yml");
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "original identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let roles = project.schema_dir().join("roles");
         std::os::unix::fs::symlink("missing-roles", &roles).unwrap();
         let before = (
@@ -1185,15 +1321,36 @@ mod tests {
                 ("y_bbbbbb".parse().unwrap(), "dbo.missing".parse().unwrap()),
             ]
             .into(),
-            tombstones: [(
-                "c_cccccc".parse().unwrap(),
-                pbps_model::Tombstone {
-                    was: "dbo.product.retired".into(),
-                    dropped_at: "2026-10-22".into(),
-                    reason: "selected snapshot retirement".into(),
-                    operator: "selected".into(),
-                },
-            )]
+            tombstones: [
+                (
+                    "c_cccccc".parse().unwrap(),
+                    pbps_model::Tombstone {
+                        was: "dbo.product.retired".into(),
+                        dropped_at: "2026-10-22".into(),
+                        reason: "selected snapshot retirement".into(),
+                        operator: "selected".into(),
+                    },
+                ),
+                // The rebuild's sources, retired when it was approved.
+                (
+                    "t_dddddd".parse().unwrap(),
+                    pbps_model::Tombstone {
+                        was: table.raw().to_string(),
+                        dropped_at: "2026-10-24".into(),
+                        reason: "selected snapshot rebuild".into(),
+                        operator: "selected".into(),
+                    },
+                ),
+                (
+                    "c_dddddd".parse().unwrap(),
+                    pbps_model::Tombstone {
+                        was: table.column("code").raw().to_string(),
+                        dropped_at: "2026-10-24".into(),
+                        reason: "selected snapshot rebuild".into(),
+                        operator: "selected".into(),
+                    },
+                ),
+            ]
             .into(),
             moves: [
                 ("t_aaaaaa".parse().unwrap(), move_permission.clone()),
@@ -1201,21 +1358,28 @@ mod tests {
             ]
             .into(),
             rebuilds: [(
-                "t_aaaaaa".parse().unwrap(),
+                "t_dddddd".parse().unwrap(),
                 pbps_model::Rebuild {
                     source: pbps_model::RebuildIdentities {
-                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
-                        columns: [("c_aaaaaa".parse().unwrap(), table.column("code"))].into(),
-                    },
-                    replacement: pbps_model::RebuildIdentities {
                         tables: [("t_dddddd".parse().unwrap(), table.clone())].into(),
                         columns: [("c_dddddd".parse().unwrap(), table.column("code"))].into(),
                     },
+                    replacement: pbps_model::RebuildIdentities {
+                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+                        columns: [("c_aaaaaa".parse().unwrap(), table.column("code"))].into(),
+                    },
+                    replacement_root: "t_aaaaaa".parse().unwrap(),
+                    continues: [
+                        ("t_aaaaaa".parse().unwrap(), "t_dddddd".parse().unwrap()),
+                        ("c_aaaaaa".parse().unwrap(), "c_dddddd".parse().unwrap()),
+                    ]
+                    .into(),
                     target_checksum: "1".repeat(64),
                     max_rows: 17,
                     allowed_at: "2026-10-24".into(),
                     reason: "selected snapshot rebuild".parse().unwrap(),
                     operator: "selected".into(),
+                    types: Default::default(),
                 },
             )]
             .into(),
@@ -1280,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn state_history_completion_reserves_both_records_rebuild_replacement_uids() {
+    fn state_history_completion_never_derives_a_uid_either_record_holds_or_retired() {
         let (_stage, _project, entry) = fixture("history-rebuild-reservations");
         let mut schema = entry.snapshot.schema;
         let table = schema.tables.keys().next().unwrap().clone();
@@ -1299,40 +1463,63 @@ mod tests {
             &table.column("code").raw().to_string(),
             0,
         );
+        let stone = |was: String| pbps_model::Tombstone {
+            was,
+            dropped_at: "2026-10-24".into(),
+            reason: "retired by the rebuild".into(),
+            operator: "selected".into(),
+        };
+        // The rebuild's sources are retired in the selected record, so their
+        // uids are as taken as any live one.
         let selected = pbps_model::IdsFile {
             version: pbps_model::ids::CURRENT_VERSION,
             tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
             columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
             roles: BTreeMap::new(),
             types: BTreeMap::new(),
-            tombstones: BTreeMap::new(),
+            tombstones: [
+                (table_collision.clone(), stone(table.raw().to_string())),
+                (
+                    column_collision.clone(),
+                    stone(table.column("source").raw().to_string()),
+                ),
+            ]
+            .into(),
             moves: BTreeMap::new(),
             conversions: BTreeMap::new(),
             rebuilds: [(
-                "t_aaaaaa".parse().unwrap(),
+                table_collision.clone(),
                 pbps_model::Rebuild {
                     source: pbps_model::RebuildIdentities {
-                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
-                        columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
-                    },
-                    replacement: pbps_model::RebuildIdentities {
                         tables: [(table_collision.clone(), table.clone())].into(),
                         columns: [(column_collision.clone(), table.column("source"))].into(),
                     },
+                    replacement: pbps_model::RebuildIdentities {
+                        tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+                        columns: [("c_aaaaaa".parse().unwrap(), table.column("source"))].into(),
+                    },
+                    replacement_root: "t_aaaaaa".parse().unwrap(),
+                    continues: [
+                        ("t_aaaaaa".parse().unwrap(), table_collision.clone()),
+                        ("c_aaaaaa".parse().unwrap(), column_collision.clone()),
+                    ]
+                    .into(),
                     target_checksum: "1".repeat(64),
                     max_rows: 7,
                     allowed_at: "2026-10-24".into(),
-                    reason: "reserve future identities".parse().unwrap(),
+                    reason: "reserve past identities".parse().unwrap(),
                     operator: "selected".into(),
+                    types: Default::default(),
                 },
             )]
             .into(),
         };
         selected.clone().validated().unwrap();
         let original = selected.clone();
-        // Explicit counterpart UIDs cannot become live while reserved here.
+        // The other record names the same uids as live ones; they stay retired here.
         let mut other = selected.clone();
         other.rebuilds.clear();
+        other.tombstones.clear();
         other.tables.insert(table_collision.clone(), added.clone());
         other
             .columns
@@ -1340,13 +1527,15 @@ mod tests {
         other.clone().validated().unwrap();
         let completed = historical_ids(&schema, &selected, &other);
         assert_eq!(completed.rebuilds, selected.rebuilds);
+        assert_eq!(completed.tombstones, selected.tombstones);
         assert_ne!(completed.table_uid(&added), Some(&table_collision));
         assert_ne!(
             completed.column_uid(&table.column("code")),
             Some(&column_collision)
         );
         completed.validated().unwrap();
-        // Derivation also reserves replacements present only on the other side.
+        // Derivation also avoids uids retired only on the other side, and a
+        // borrowed name never brings the other side's lineage with it.
         let empty = pbps_model::IdsFile::default();
         let completed = historical_ids(&schema, &empty, &selected);
         assert_ne!(completed.table_uid(&added), Some(&table_collision));
@@ -1424,7 +1613,7 @@ mod tests {
             .schema_dir()
             .join(std::ffi::OsStr::from_bytes(b"stale-\xff.yml"));
         std::fs::write(&old, "old declaration bytes\n").unwrap();
-        std::fs::write(project.ids_file(), "identity bytes\n").unwrap();
+        std::fs::write(project.ids_file(), KEPT_IDS).unwrap();
         let (data, findings) = export(
             &project,
             &entry,
@@ -1452,7 +1641,7 @@ mod tests {
         assert_eq!(loaded.schema, entry.snapshot.schema);
         assert_eq!(
             std::fs::read_to_string(project.ids_file()).unwrap(),
-            "identity bytes\n"
+            KEPT_IDS
         );
     }
 

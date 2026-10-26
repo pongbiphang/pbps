@@ -8,7 +8,7 @@ mod fixture;
 fn rebuild_addresses_keep_source_and_reserved_owners_distinct() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     for (identities, spelling, prefix) in [
         (&root.intent.source, Spelling::Base, "old_"),
@@ -66,7 +66,7 @@ fn rebuild_addresses_refuse_stale_foreign_duplicate_and_occupied_bindings() {
     let (root, base, desired, addresses) = fixture::approval();
     let attempt = |root: &RebuildPartitionedTable, a: &[IntermediateAddress]| {
         PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-            .with_rebuild_addresses(root, &base, a)
+            .with_rebuild_addresses(root, &desired, a)
             .err()
             .unwrap()
             .to_string()
@@ -89,7 +89,7 @@ fn rebuild_addresses_refuse_stale_foreign_duplicate_and_occupied_bindings() {
 fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let schema = Schema::default();
     let before = Snapshot {
@@ -168,7 +168,7 @@ fn rebuild_copy_and_analyze_have_step_local_effects_and_no_name_claims() {
 fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
     let (root, base, desired, addresses) = fixture::approval();
     let owners = PlanOwners::new(PlanNames::of(&[], &base).unwrap(), &base, &desired)
-        .with_rebuild_addresses(&root, &base, &addresses)
+        .with_rebuild_addresses(&root, &desired, &addresses)
         .unwrap();
     let before_schema = Schema {
         tables: root.before,
@@ -242,4 +242,60 @@ fn explicit_index_recipes_own_all_clones_and_refuse_ambiguous_owners() {
         key.name = None;
     }
     assert!(recipe.validate().is_err());
+}
+
+#[test]
+fn a_composed_rebuilds_base_spelling_is_what_the_environment_holds() {
+    let (mut root, _, desired, _) = fixture::approval();
+    // An older link whose replacement is this link's source: the environment
+    // still holds the older source.
+    let fresh = |kind| Uid::generate(kind);
+    let older_source = RebuildIdentities {
+        tables: root
+            .intent
+            .source
+            .tables
+            .values()
+            .map(|n| (fresh(UidKind::Table), n.clone()))
+            .collect(),
+        columns: root
+            .intent
+            .source
+            .columns
+            .values()
+            .map(|c| (fresh(UidKind::Column), c.clone()))
+            .collect(),
+    };
+    let mut older = root.intent.clone();
+    older.source = older_source.clone();
+    older.replacement = root.intent.source.clone();
+    older.types = Default::default();
+    root.earlier.push(older);
+    assert_eq!(root.source(), &older_source);
+    let held = older_source.as_ids();
+    let addresses: Vec<_> = older_source
+        .tables
+        .iter()
+        .map(|(uid, name)| IntermediateAddress {
+            uid: uid.clone(),
+            address: TableName::new("app", format!("old_{}", name.name)),
+        })
+        .collect();
+    let owners = PlanOwners::new(PlanNames::of(&[], &held).unwrap(), &held, &desired)
+        .with_rebuild_addresses(&root, &desired, &addresses)
+        .unwrap();
+    for (uid, name) in &older_source.tables {
+        assert_eq!(&owners.table(name, Spelling::Base).unwrap(), uid);
+    }
+    // The ids of the link the files record are not what this environment holds.
+    let intermediate = root.intent.source.as_ids();
+    assert!(
+        PlanOwners::new(
+            PlanNames::of(&[], &intermediate).unwrap(),
+            &intermediate,
+            &desired
+        )
+        .with_rebuild_addresses(&root, &desired, &[])
+        .is_err()
+    );
 }

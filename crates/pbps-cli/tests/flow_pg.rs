@@ -105,7 +105,7 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
     )
     .unwrap();
     d.commit();
-    check("approved source lineage or desired fingerprint does not match");
+    check("re-approve it with `pbps rebuild-table app.p --max-rows 20 --reason <why>`");
     std::fs::write(path, &canonical).unwrap();
     d.commit();
     check("recorded intent is valid; table rebuild execution is not available yet");
@@ -177,15 +177,24 @@ fn check_rebuild_additions(
     let recorded = std::fs::read(&ids_path).unwrap();
     let approved: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
     approved.validate().unwrap();
-    assert_eq!(approved.tables, before.tables);
-    assert_eq!(approved.columns, before.columns);
+    // Approval switched every member: the sources are retired and the
+    // replacements, added members included, are live.
+    assert!(
+        before
+            .tables
+            .keys()
+            .chain(before.columns.keys())
+            .all(|uid| approved.tombstones.contains_key(uid)
+                && !approved.tables.contains_key(uid)
+                && !approved.columns.contains_key(uid))
+    );
     let replacement = &approved.rebuilds.values().next().unwrap().replacement;
     let leaf: pbps_model::TableName = "app.p2".parse().unwrap();
     let extra: pbps_model::ColumnRef = "app.p.extra".parse().unwrap();
     assert_eq!(replacement.tables.values().any(|n| n == &leaf), partition);
     assert_eq!(replacement.columns.values().any(|n| n == &extra), column);
-    assert!(approved.table_uid(&leaf).is_none());
-    assert!(approved.column_uid(&extra).is_none());
+    assert_eq!(approved.table_uid(&leaf).is_some(), partition);
+    assert_eq!(approved.column_uid(&extra).is_some(), column);
     d.commit();
     let check = || {
         let mut plans = vec![vec!["plan", "--no-dev", "--since", source.trim()]];
@@ -206,20 +215,6 @@ fn check_rebuild_additions(
         }
     };
     check();
-    // Snapshot and baseline project existing live identities; neither may
-    // adopt a future replacement member just because it is now declared.
-    if let Some(connection) = connection {
-        for args in [
-            vec!["snapshot", "--db", connection, "--force"],
-            vec!["baseline", "--db", connection, "--reason", "adopt source"],
-        ] {
-            succeeds(d.run(&args));
-            let snapshot = latest_snapshot(connection);
-            snapshot.ids.validate().unwrap();
-            assert_eq!(snapshot.ids, approved);
-            check();
-        }
-    }
 }
 
 fn check_offline_rebuild_additions(column: bool, partition: bool) {
@@ -231,22 +226,22 @@ fn check_offline_rebuild_additions(column: bool, partition: bool) {
 }
 
 #[test]
-fn added_parent_columns_record_and_plan_with_reserved_rebuild_identities() {
+fn added_parent_columns_record_and_plan_with_switched_rebuild_identities() {
     check_offline_rebuild_additions(true, false);
 }
 
 #[test]
-fn added_partitions_record_and_plan_with_reserved_rebuild_identities() {
+fn added_partitions_record_and_plan_with_switched_rebuild_identities() {
     check_offline_rebuild_additions(false, true);
 }
 
 #[test]
-fn added_partitions_and_columns_record_and_plan_with_reserved_rebuild_identities() {
+fn added_partitions_and_columns_record_and_plan_with_switched_rebuild_identities() {
     check_offline_rebuild_additions(true, true);
 }
 
 #[test]
-fn every_recorded_member_change_reaches_pending_rebuild_offline() {
+fn every_recorded_member_change_reaches_the_rebuild_refusal_offline() {
     rebuild_members::check(None);
 }
 
@@ -297,6 +292,16 @@ fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
     d.table(before);
     succeeds(d.run(&["plan", "--no-dev"]));
     d.commit();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
     d.table(&before.replace("partition_by: [k]", "partition_by: [bucket]"));
     let path = d.dir.join("schema.ids.json");
     let original = std::fs::read(&path).unwrap();
@@ -336,7 +341,9 @@ fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
     assert!(stdout(&out).contains("blocking rewrite"));
     let recorded = std::fs::read(&path).unwrap();
     let ids: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
-    let intent = &ids.rebuilds[ids.table_uid(&"app.p".parse().unwrap()).unwrap()];
+    let (_, intent) = ids
+        .rebuild_into(ids.table_uid(&"app.p".parse().unwrap()).unwrap())
+        .unwrap();
     assert_eq!(intent.operator, operator);
     assert_eq!(intent.reason.as_ref(), " maintenance window ");
     assert_eq!(intent.max_rows, 20);
@@ -352,9 +359,13 @@ fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
         .unwrap();
     assert!(committed.status.success());
     assert_eq!(committed.stdout, recorded);
-    let plan = d.run(&["plan", "--no-dev"]);
+    // The committed approval is the baseline now: a database that holds it has
+    // nothing to rebuild. One that still holds the source is refused.
+    succeeds(d.run(&["plan", "--no-dev"]));
+    let plan = d.run(&["plan", "--no-dev", "--since", source.trim()]);
     assert_ne!(code(&plan), 0);
     assert!(format!("{}{}", stdout(&plan), stderr(&plan)).contains("blocking rewrite"));
+    assert_eq!(std::fs::read(&path).unwrap(), recorded);
     std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
     assert!(stderr(&d.run(&args)).contains("only supported for PostgreSQL"));
     assert_eq!(std::fs::read(&path).unwrap(), recorded);
@@ -436,126 +447,269 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
 }
 
 #[test]
-fn pending_rebuild_intents_refuse_without_poisoning_the_identity_file() {
+fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the_file() {
     let d = Demo::new("rebuild2298-intents");
     let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
-    let declaration = d.dir.join("schema/app.t.yml");
     d.table(parent);
-    let other = d.dir.join("schema/other.yml");
-    std::fs::write(
-        &other,
-        "table: app.other\ncolumns:\n  id: {type: integer}\n",
-    )
-    .unwrap();
     succeeds(d.run(&["plan", "--no-dev"]));
     d.commit();
+    let path = d.dir.join("schema.ids.json");
+    let source_bytes = std::fs::read(&path).unwrap();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
     let desired = parent.replace("partition_by: [k]", "partition_by: [bucket]");
     d.table(&desired);
-    succeeds(d.run(&[
+    let approve = [
         "rebuild-table",
         "app.p",
         "--max-rows",
         "20",
         "--reason",
         "maintenance",
-    ]));
-    let path = d.dir.join("schema.ids.json");
-    let before = std::fs::read(&path).unwrap();
-    let ids: pbps_model::IdsFile = serde_json::from_slice(&before).unwrap();
-    let root = ids.table_uid(&"app.p".parse().unwrap()).unwrap();
-    let cases = [
-        (
-            vec!["rename-table", "app.p", "app.q"],
-            Some(desired.replace("table: app.p", "table: app.q")),
-            "app.p",
-        ),
-        (
-            vec!["rename-table", "app.p1", "app.p2"],
-            Some(desired.replace("p1:", "p2:")),
-            "app.p1",
-        ),
-        (
-            vec!["drop-table", "app.p", "--reason", "retired"],
-            None,
-            "app.p",
-        ),
-        (
-            vec!["drop-table", "app.p1", "--reason", "retired"],
-            Some(desired.split("partitions:").next().unwrap().to_owned()),
-            "app.p1",
-        ),
-        (
-            vec!["rename", "app.p.k", "old_k"],
-            Some(desired.replace("  k:", "  old_k:")),
-            "app.p.k",
-        ),
-        (
-            vec!["drop", "app.p.k", "--reason", "retired"],
-            Some(desired.replace("  k: {type: integer}\n", "")),
-            "app.p.k",
-        ),
-        (
-            vec!["move-rows", "app.p1", "--max-rows", "1", "--reason", "move"],
-            Some(desired.clone()),
-            "app.p1",
-        ),
-        (
-            vec![
-                "intent",
-                "--rename-table",
-                "app.p1",
-                "app.p2",
-                "--rename",
-                "app.p.k",
-                "old_k",
-            ],
-            Some(desired.replace("p1:", "p2:").replace("  k:", "  old_k:")),
-            "app.p.k",
-        ),
     ];
-    for (args, content, object) in cases {
-        if let Some(content) = content {
-            std::fs::write(&declaration, content).unwrap();
-        } else {
-            std::fs::remove_file(&declaration).unwrap();
-        }
-        let out = d.run(&args);
-        assert_ne!(code(&out), 0, "{args:?}: {}{}", stdout(&out), stderr(&out));
-        for fragment in [
-            object,
-            "pending rebuild of app.p",
-            "rebuilds",
-            "withdraw",
-            "commit",
-            &root.to_string(),
-        ] {
-            assert!(
-                stderr(&out).contains(fragment),
-                "{args:?}: {}",
-                stderr(&out)
-            );
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        d.table(&desired);
-    }
-    // A mutation outside the source is still allowed and leaves readable IDs.
-    std::fs::write(
-        &other,
-        "table: app.other2\ncolumns:\n  id: {type: integer}\n",
+    succeeds(d.run(&approve));
+    let approved_bytes = std::fs::read(&path).unwrap();
+    let approved: pbps_model::IdsFile = serde_json::from_slice(&approved_bytes).unwrap();
+    let leaf: pbps_model::TableName = "app.p1".parse().unwrap();
+    let leaf_uid = approved.table_uid(&leaf).unwrap().clone();
+    // No pending state freezes the approved members: a rename is an ordinary
+    // intent on the replacement and keeps its uid.
+    d.table(&desired.replace("p1:", "p2:"));
+    succeeds(d.run(&["rename-table", "app.p1", "app.p2"]));
+    let renamed: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    renamed.validate().unwrap();
+    assert_eq!(
+        renamed.table_uid(&"app.p2".parse().unwrap()),
+        Some(&leaf_uid)
+    );
+    // The declarations moved on after the approval: refused by name, with the
+    // command that re-approves.
+    let stale = d.run(&["plan", "--no-dev", "--since", source.trim()]);
+    assert_ne!(code(&stale), 0);
+    assert!(
+        stderr(&stale).contains("re-approve it with `pbps rebuild-table app.p --max-rows 20"),
+        "{}",
+        stderr(&stale)
+    );
+    succeeds(d.run(&approve));
+    let plan = d.run(&["plan", "--no-dev", "--since", source.trim()]);
+    assert!(
+        stderr(&plan).contains("execution is not available yet"),
+        "{}",
+        stderr(&plan)
+    );
+    // `--withdraw` takes neither a cap nor a reason, and edits only the file.
+    let both = d.run(&["rebuild-table", "app.p", "--withdraw", "--max-rows", "1"]);
+    assert_ne!(code(&both), 0);
+    assert_eq!(code(&d.run(&["rebuild-table", "app.p", "--withdraw"])), 0);
+    let withdrawn: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(withdrawn.rebuilds.is_empty() && withdrawn.tombstones.is_empty());
+    // The file is what it was before the approval, whatever happened since.
+    let original: pbps_model::IdsFile = serde_json::from_slice(&source_bytes).unwrap();
+    assert_eq!(
+        (&withdrawn.tables, &withdrawn.columns),
+        (&original.tables, &original.columns)
+    );
+    // Nothing is left to withdraw, and the refusal changes nothing.
+    let before = std::fs::read(&path).unwrap();
+    let again = d.run(&["rebuild-table", "app.p", "--withdraw"]);
+    assert_ne!(code(&again), 0);
+    assert!(
+        stderr(&again).contains("no rebuild is recorded"),
+        "{}",
+        stderr(&again)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn renaming_the_replacement_after_the_approval_can_be_reapproved_and_withdrawn() {
+    let d = Demo::new("rebuild2298-rename");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let path = d.dir.join("schema.ids.json");
+    let original: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
     )
     .unwrap();
-    succeeds(d.run(&["rename-table", "app.other", "app.other2"]));
-    let mut ids: pbps_model::IdsFile =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    ids.validate().unwrap();
-    // Like moves, permission is withdrawn by a reviewed git edit, not a new
-    // flag supplying a different identity decision.
-    ids.rebuilds.remove(root);
-    std::fs::write(&path, serde_json::to_vec_pretty(&ids).unwrap()).unwrap();
+    let source = source.trim();
+    let desired = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&desired);
+    let approve = |table: &str| {
+        d.run(&[
+            "rebuild-table",
+            table,
+            "--max-rows",
+            "20",
+            "--reason",
+            "maintenance",
+        ])
+    };
+    succeeds(approve("app.p"));
     d.commit();
-    d.table(&desired.replace("table: app.p", "table: app.q"));
+    // The ordinary rename of the live replacement, after the approval.
+    d.table(&desired.replace("table: app.p\n", "table: app.q\n"));
     succeeds(d.run(&["rename-table", "app.p", "app.q"]));
-    succeeds(d.run(&["validate"]));
+    let stale = d.run(&["plan", "--no-dev", "--since", source]);
+    assert!(
+        stderr(&stale).contains("re-approve it with `pbps rebuild-table app.q --max-rows 20"),
+        "{}",
+        stderr(&stale)
+    );
+    // The command the plan printed works, and keeps the source it was cut from.
+    let before: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let refreshed = approve("app.q");
+    assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
+    let after: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    after.validate().unwrap();
+    let (key, old) = before.rebuilds.iter().next().unwrap();
+    assert_eq!(after.rebuilds[key].source, old.source);
+    assert_eq!(after.rebuilds[key].continues, old.continues);
+    // The environment at the source is told of the rename, not asked to re-approve.
+    let plan = d.run(&["plan", "--no-dev", "--since", source]);
+    assert!(
+        stderr(&plan).contains("renamed after the approval")
+            && !stderr(&plan).contains("re-approve"),
+        "{}",
+        stderr(&plan)
+    );
+    // Withdrawn under the name the file has now, the sources are back.
+    assert_eq!(code(&d.run(&["rebuild-table", "app.q", "--withdraw"])), 0);
+    let withdrawn: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(withdrawn.rebuilds.is_empty() && withdrawn.tombstones.is_empty());
+    assert_eq!(
+        (&withdrawn.tables, &withdrawn.columns),
+        (&original.tables, &original.columns)
+    );
+}
+
+#[test]
+fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() {
+    let d = Demo::new("rebuild2298-chain");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    let rev = || {
+        String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&d.dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let source = rev();
+    let approve = |cap: &str| {
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            cap,
+            "--reason",
+            "maintenance",
+        ]));
+        d.commit();
+    };
+    let second = parent.replace("partition_by: [k]", "partition_by: [bucket]");
+    d.table(&second);
+    approve("20");
+    let middle = rev();
+    d.table(&second.replace("bucket: {type: integer}", "bucket: {type: bigint}"));
+    approve("30");
+    // The files hold the last link; an environment at the first source is
+    // rebuilt once, to it.
+    let behind = d.run(&["plan", "--no-dev", "--since", &source]);
+    assert_ne!(code(&behind), 0);
+    assert!(
+        stderr(&behind).contains("composed over 2 approved links"),
+        "{}",
+        stderr(&behind)
+    );
+    assert!(stderr(&behind).contains("execution is not available yet"));
+    // One at the middle link is a single rebuild; one at the last has nothing to do.
+    let current = d.run(&["plan", "--no-dev", "--since", &middle]);
+    assert_ne!(code(&current), 0);
+    assert!(
+        !stderr(&current).contains("composed"),
+        "{}",
+        stderr(&current)
+    );
+    assert!(stderr(&current).contains("execution is not available yet"));
+    succeeds(d.run(&["plan", "--no-dev"]));
+}
+
+#[test]
+fn a_chain_that_returns_to_the_first_key_still_plans_as_one_composed_rebuild() {
+    let d = Demo::new("rebuild2298-there-and-back");
+    let parent = "table: app.p\ncolumns:\n  k: {type: integer}\n  bucket: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+    d.table(parent);
+    succeeds(d.run(&["plan", "--no-dev"]));
+    d.commit();
+    let source = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&d.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let source = source.trim();
+    let approve = |cap: &str| {
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            cap,
+            "--reason",
+            "maintenance",
+        ]));
+        d.commit();
+    };
+    d.table(&parent.replace("partition_by: [k]", "partition_by: [bucket]"));
+    approve("20");
+    // Back to the first key: the declarations are the first revision's again.
+    d.table(parent);
+    approve("30");
+    let behind = d.run(&["plan", "--no-dev", "--since", source]);
+    assert_ne!(code(&behind), 0);
+    assert!(
+        stderr(&behind).contains("composed over 2 approved links")
+            && stderr(&behind).contains("execution is not available yet"),
+        "{}",
+        stderr(&behind)
+    );
+    succeeds(d.run(&["plan", "--no-dev"]));
 }
 
 #[path = "support/row_security_roundtrip.rs"]

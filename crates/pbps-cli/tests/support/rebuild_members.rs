@@ -72,9 +72,17 @@ pub(super) fn check(connection: Option<&str>) {
         let recorded = std::fs::read(&ids_path).unwrap();
         let approved: pbps_model::IdsFile = serde_json::from_slice(&recorded).unwrap();
         approved.validate().unwrap();
-        assert_eq!(approved.tables, source_ids.tables, "{}", case.name);
-        assert_eq!(approved.columns, source_ids.columns, "{}", case.name);
-        assert_eq!(approved.tombstones, source_ids.tombstones, "{}", case.name);
+        // Approval switched the tree: every source uid is retired and none of
+        // them is live, while the replacements are.
+        for uid in source_ids.tables.keys().chain(source_ids.columns.keys()) {
+            assert!(approved.tombstones.contains_key(uid), "{}", case.name);
+            assert!(
+                !approved.tables.contains_key(uid) && !approved.columns.contains_key(uid),
+                "{}",
+                case.name
+            );
+        }
+        approved.check_held_by(&case.desired).unwrap();
         d.commit();
         let check = || {
             let mut plans = vec![vec!["plan", "--no-dev", "--since", source.trim()]];
@@ -96,19 +104,6 @@ pub(super) fn check(connection: Option<&str>) {
             }
         };
         check();
-        if let Some(connection) = connection {
-            for args in [
-                vec!["snapshot", "--db", connection, "--force"],
-                vec!["baseline", "--db", connection, "--reason", "retain source"],
-            ] {
-                let out = d.run(&args);
-                assert_eq!(code(&out), 0, "{}: {args:?}: {}", case.name, stderr(&out));
-                let snapshot = latest_snapshot(connection);
-                snapshot.ids.validate().unwrap();
-                assert_eq!(snapshot.ids, approved, "{}: {args:?}", case.name);
-                check();
-            }
-        }
     }
 }
 

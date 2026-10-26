@@ -21,6 +21,8 @@
           "c_bbbbbb": "app.p.k"
         }
       },
+      "replacement_root": "t_bbbbbb",
+      "continues": {"t_bbbbbb": "t_aaaaaa", "c_bbbbbb": "c_aaaaaa"},
       "target_checksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "max_rows": 10,
       "allowed_at": "2026-10-24",

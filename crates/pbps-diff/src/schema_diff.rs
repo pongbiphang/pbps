@@ -759,40 +759,14 @@ pub(crate) fn diff_partial_rebuilding(
     read_back: Option<&Schema>,
 ) -> Diffed {
     let mut changes = Vec::new();
-    // Pending identities must never degrade to ordinary DROP/CREATE. PR1
-    // qualifies the logical payload but deliberately grants no execution.
-    if !declared.ids.rebuilds.is_empty() {
-        let errors = declared
-            .ids
-            .rebuilds
-            .iter()
-            .map(|(uid, intent)| {
-                let Some(table) = declared
-                    .ids
-                    .tables
-                    .get(uid)
-                    .or_else(|| intent.source.tables.get(uid))
-                    .cloned()
-                else {
-                    return DiffError::RebuildIdentity { uid: uid.clone() };
-                };
-                let why = if dialect.name() != "postgres" {
-                    "this engine does not support table rebuilds".to_owned()
-                } else {
-                    match crate::rebuild::qualify(base, declared, &table, dialect) {
-                        Ok(_) => {
-                            "recorded intent is valid; table rebuild execution is not available yet"
-                                .to_owned()
-                        }
-                        Err(error) => error.why,
-                    }
-                };
-                DiffError::RebuildTable { table, why }
-            })
-            .collect();
+    // An approved rewrite must never degrade to an ordinary DROP/CREATE: what
+    // each lineage record means depends on what this environment holds. PR4a
+    // qualifies the rewrite but deliberately grants no execution (DEC-2298.12).
+    let lineage = crate::rebuild::lineage_errors(base, declared, dialect);
+    if !lineage.is_empty() {
         return Diffed {
             changes: ChangeSet::default(),
-            errors,
+            errors: lineage,
         };
     }
     let mut errs: Vec<DiffError> =

@@ -1149,3 +1149,81 @@ moving its holder to a backup name or dropping it. Table renames alone do not
 rename their indexes. Effects, shared slots and settle own every edge; there
 is no additional pass, rank or tie-break. This decision does not enable
 rebuild lowering, certification, admission or execution.
+
+<a id="dec-2298-12"></a>
+
+**DEC-2298.12. Approving a rebuild switches the identities; a lineage record keeps the history.**
+This supersedes the pending-only rules of DEC-2298.1 and DEC-2298.2 (maintainer
+decision, 2026-10-24). `pbps rebuild-table` writes, in one edit of
+`schema.ids.json`, the replacement UIDs of the table and its owned columns as
+live entries, the source UIDs as tombstones carrying the approval's reason,
+operator and date, and one `rebuilds` record keyed by the source parent. The
+record keeps `source -> replacement`, the target checksum, `max_rows`, reason,
+operator and date, and stays after the rewrite runs: it is what lets an
+environment that still holds the source learn what to rebuild. There is no
+pending state, so the covered-UID freeze and the union of source and
+replacement membership are gone and later identity intents on the table are
+ordinary ones. The file is whole only while every source UID is a tombstone and
+every replacement UID is live or retired; anything else (half a withdrawal, a
+lost replacement) is refused by name and never read as "nothing to rebuild".
+The two ends are related by identity and never by equal names: the record keeps
+the replacement parent and, for each replacement column that carries a source
+column on, the source UID it continues (`replacement_root`, `continues`, paired
+by name at the approval, the one moment that is evidence of it). A rename of
+either end afterwards leaves the pairing alone, a re-approval keeps it, and a
+member the approval never paired is an addition. A current approval cannot yet
+rebuild into another name, so a plan from an environment holding the source is
+refused by name when the replacement parent was renamed since; a stale one is
+refused with the re-approval command first.
+
+A plan reads each record against what the environment's baseline holds of it:
+the replacement parent means nothing to rebuild; the source parent means the
+record supplies the rebuild, provided its target checksum still matches the
+declarations, otherwise the plan is refused with the re-approval command
+(re-approval keeps the source and rewrites the rest against the declarations,
+and needs identity resolved first); neither means a new environment, which
+creates the replacement directly. Parts of both, or a parent without its
+members, are refused. A chain `B -> N -> M` is a record per link, and an
+environment holding an older link is qualified for **one composed rebuild** to
+the latest link against today's declarations, not for each link in turn: the
+earlier links' declarations no longer exist to be applied, and walking an
+environment through them would copy every row several times. Only the latest
+link's checksum must match the declarations, and the endpoints are held to the
+shape of one rewrite without a net key change (each link met that rule at its
+approval, and `A -> B -> A` ends where it began). Every link's `max_rows` applies,
+so the strictest is the cap of the one copy. Columns compose along the lineage
+UIDs (inside a link along the pairing the approval recorded, between links by
+UID, so a rename in between is followed), and their conversions compose as nested casts
+through the types each approval kept in the record's `types`; ordinary edits
+between two approvals fold into the next cast. A column born along the chain
+has nothing to read in the environment. The plan presents the composed rebuild
+for review, the qualified root carries the earlier links, and preparing it for
+execution is refused until the composed copy is lowered. Stopping at an
+intermediate link means deploying the revision that approved it. An
+environment holding parts of two links, or a chain whose records the
+identities around them contradict, is refused. A second key change against a
+committed approval starts the next link; a repeated call is a re-approval.
+
+`--withdraw` is the offline inverse: it restores the source UIDs and drops the
+tombstones, the replacements and the record. It undoes the newest link of a
+chain, since the live table is the newest link's replacement, and refuses when
+a replacement was dropped since or when the sources' names are taken. An environment whose ledger holds the replacement while the
+files no longer record the rewrite (withdrawn afterwards, or an older revision,
+including a `revert` target) is refused by name: the baseline's own record
+proves the rewrite was applied, and neither a drop and create nor a reverse
+rebuild is planned. A deliberate drop of the replacement, which tombstones it,
+is an ordinary drop. A saved plan carries the record like any identity entry
+and is admitted only when it validates. The record's `types` and a root's
+`earlier` are omitted when empty, so no existing byte changes and plan and
+state versions stay; a file written under the pending rules fails validation
+by name. Execution stays refused until the complete
+route ships (DEC-2298.1).
+
+A recorded conversion (#2331) is keyed by a column's UID, and approval retires
+the source columns' UIDs. So an approval, including a chain's next link, is
+refused by name while a conversion is recorded for a column it retires: apply
+the conversion first, or delete its entry. The same file is unreadable by name
+if a merge brings the two together, and `--withdraw` takes the conversions of
+the replacement columns it removes, as it takes the replacements' moves.
+Carrying a conversion into the replacement and applying it in the copy is
+deferred to lowering the copy (PR4b).

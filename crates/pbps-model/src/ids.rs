@@ -50,7 +50,9 @@ pub enum IdsError {
     #[error("a move is recorded for {uid}, but no live table entry has that uid")]
     OrphanMove { uid: Uid },
 
-    #[error("the rebuild recorded for {uid} has inconsistent source or replacement identities")]
+    #[error(
+        "the rebuild recorded for {uid} does not match the identities around it: its sources must be tombstones and its replacements live or retired"
+    )]
     InvalidRebuild { uid: Uid },
 
     #[error("a conversion is recorded for {uid}, but no live column entry has that uid")]
@@ -108,8 +110,10 @@ pub struct IdsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub moves: BTreeMap<Uid, Move>,
 
-    /// Pending blocking rewrites, keyed by the source parent's uid. Reserved
-    /// identities become live only through the future order expansion.
+    /// The lineage of approved blocking rewrites, keyed by the source parent's
+    /// uid (DEC-2298.12). Approval has already made the replacement identities
+    /// live and the source ones tombstones; a record is what lets an
+    /// environment that still holds the source plan the rewrite.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rebuilds: BTreeMap<Uid, crate::Rebuild>,
 
@@ -269,19 +273,21 @@ impl IdsFile {
             .retain(|_, column| !tables.contains(&column.table));
         let live = kept.tables.clone();
         kept.moves.retain(|uid, _| live.contains_key(uid));
-        let columns = &kept.columns;
+        let (columns, tombstones) = (&kept.columns, &kept.tombstones);
         kept.conversions.retain(|uid, _| columns.contains_key(uid));
+        // A lineage whose replacement parts were removed is no longer whole;
+        // like a partial record anywhere, it goes with them (DEC-2298.12).
         kept.rebuilds.retain(|_, rebuild| {
             rebuild
-                .source
+                .replacement
                 .tables
-                .iter()
-                .all(|(uid, name)| live.get(uid) == Some(name))
+                .keys()
+                .all(|uid| live.contains_key(uid) || tombstones.contains_key(uid))
                 && rebuild
-                    .source
+                    .replacement
                     .columns
-                    .iter()
-                    .all(|(uid, column)| columns.get(uid) == Some(column))
+                    .keys()
+                    .all(|uid| columns.contains_key(uid) || tombstones.contains_key(uid))
         });
         kept
     }
@@ -335,9 +341,14 @@ impl IdsFile {
             || self.roles.contains_key(uid)
             || self.types.contains_key(uid)
             || self.tombstones.contains_key(uid)
-            || self.rebuilds.values().any(|r| {
-                r.replacement.tables.contains_key(uid) || r.replacement.columns.contains_key(uid)
-            })
+    }
+
+    /// The lineage record that produced the table with this uid, with the uid
+    /// of the source parent it is keyed by.
+    pub fn rebuild_into(&self, replacement_root: &Uid) -> Option<(&Uid, &crate::Rebuild)> {
+        self.rebuilds
+            .iter()
+            .find(|(_, rebuild)| &rebuild.replacement_root == replacement_root)
     }
 
     /// Moves a table, and the columns under it, to a new name.
@@ -485,11 +496,20 @@ impl IdsFile {
                 return Err(IdsError::InvalidConversion { uid: uid.clone() });
             }
         }
+        // Approval installed the replacements and retired the sources, so a
+        // record is whole only while every source identity is a tombstone and
+        // every replacement identity is live or retired. Anything else is a
+        // half-withdrawn or hand-edited file, which must not read as "nothing
+        // to rebuild" (DEC-2298.12).
         let mut reserved = BTreeSet::new();
         for (uid, rebuild) in &self.rebuilds {
             let source = rebuild.source.as_ids();
             let target = rebuild.replacement.as_ids();
-            let root = source.tables.get(uid);
+            let held = |u: &Uid| {
+                self.tables.contains_key(u)
+                    || self.columns.contains_key(u)
+                    || self.tombstones.contains_key(u)
+            };
             if rebuild.max_rows == 0
                 || rebuild.target_checksum.len() != 64
                 || !rebuild
@@ -498,20 +518,21 @@ impl IdsFile {
                     .all(|b| b.is_ascii_hexdigit())
                 || source.validate().is_err()
                 || target.validate().is_err()
-                || root.is_none()
-                || root.is_some_and(|name| target.table_uid(name).is_none())
+                || rebuild.source_root() != Some(uid)
+                || !rebuild.continues_are_whole()
+                || rebuild
+                    .types
+                    .keys()
+                    .any(|u| !rebuild.replacement.columns.contains_key(u))
                 || source
                     .tables
-                    .iter()
-                    .any(|(u, n)| self.tables.get(u) != Some(n))
-                || source
-                    .columns
-                    .iter()
-                    .any(|(u, n)| self.columns.get(u) != Some(n))
+                    .keys()
+                    .chain(source.columns.keys())
+                    .any(|u| !self.tombstones.contains_key(u))
                 || target.tables.keys().chain(target.columns.keys()).any(|u| {
-                    self.tables.contains_key(u)
-                        || self.columns.contains_key(u)
-                        || self.tombstones.contains_key(u)
+                    !held(u)
+                        || source.tables.contains_key(u)
+                        || source.columns.contains_key(u)
                         || !reserved.insert(u.clone())
                 })
             {
