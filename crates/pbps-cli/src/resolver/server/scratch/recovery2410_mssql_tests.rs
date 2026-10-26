@@ -677,6 +677,145 @@ async fn a_release_that_cannot_remove_a_companion_keeps_the_record_that_names_it
     .await;
 }
 
+#[test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+fn a_release_that_cannot_drop_the_reference_database_keeps_the_record_that_finds_it() {
+    // A whole run's acquisition in one debug future does not fit the test
+    // thread's stack, so it has a thread of its own.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(reference_held())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn reference_held() {
+    let (target_server, scratch) = (server("PBPS_TEST_DB"), server("PBPS_TEST_MSSQL_SCRATCH_DB"));
+    let mut target = connection(&target_server).await;
+    let identity = sql::cluster_identity(&mut target).await.unwrap();
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let bootstrap =
+        pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default()).unwrap();
+    let dependencies = Default::default();
+    let binding = BindingRequest {
+        bootstrap: &bootstrap,
+        base: &schema,
+        desired: &schema,
+        dependencies: &dependencies,
+    };
+    let request = super::super::super::ScopeRequest {
+        schemas: vec!["dbo".into()],
+        ..Default::default()
+    };
+    let tokens = super::super::Tokens::generate();
+    let token = tokens.scratch.clone();
+    let (database, reference, login) = (
+        format!("pbps_scratch_{token}"),
+        format!("pbps_reference_{token}"),
+        format!("pbps_run_{token}"),
+    );
+    let before = inventory(&scratch).await;
+    // The reference database exists already, with a session in it: the run
+    // cannot create it, and its release cannot drop it.
+    connection(&scratch)
+        .await
+        .execute(&format!("CREATE DATABASE [{reference}];"))
+        .await
+        .unwrap();
+    let held = connection(&on(&scratch, &reference)).await;
+    let p = provenance();
+    let mut admin = connection(&scratch).await;
+    let (provisioning, mut state) = Box::pin(super::super::engine::scratch(
+        Driver::Mssql,
+        &mut target,
+        &mut admin,
+        &tokens,
+        &identity,
+        &scratch,
+        &request,
+        &Standard::Mssql,
+        None,
+        &p,
+    ))
+    .await
+    .unwrap();
+    let (catalog, authorization) = crate::resolver::scope::read_target(
+        &mut target,
+        Driver::Mssql,
+        &request.schemas,
+        &[],
+        &request.schemas,
+        &[],
+    )
+    .await
+    .unwrap();
+    let prepared = Box::pin(state.prepare(
+        provisioning,
+        &mut admin,
+        &mut target,
+        &catalog,
+        &authorization,
+        &request.schemas,
+        &binding,
+        &[],
+    ))
+    .await;
+    let released = Box::pin(state.release(&mut admin)).await;
+    let left = inventory(&scratch).await;
+    let kept = (
+        left.0.contains(&reference),
+        left.0.contains(&database),
+        left.1.contains(&login),
+    );
+    // The session ends, and so does the run: the next run finds all three.
+    drop(held);
+    drop(state);
+    drop(admin);
+    drop(target);
+    let mut watcher = connection(&scratch).await;
+    gone(&mut watcher, &token).await;
+    run(&scratch).await;
+    let after = inventory(&scratch).await;
+    scrub(
+        &scratch,
+        &[reference.clone(), database.clone()],
+        std::slice::from_ref(&login),
+    )
+    .await;
+    assert!(prepared.is_err(), "the run cannot make its reference");
+    let failed = released.expect_err("the reference cannot be dropped");
+    assert!(
+        failed
+            .iter()
+            .any(|f| f.contains(&format!("reference database {reference}"))),
+        "{failed:?}"
+    );
+    assert!(
+        failed
+            .iter()
+            .any(|f| f.contains("kept: they record the reference database")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        kept,
+        (true, true, true),
+        "the reference, the database and the login: the login is the record"
+    );
+    assert_eq!(after, before, "the next run removed all three");
+}
+
 /// A run with a dependency, taken to the end of `prepare` and then dropped
 /// with no release: its sessions close, nothing else is done. Returns its
 /// token, the companions its scratch database recorded, and the run that

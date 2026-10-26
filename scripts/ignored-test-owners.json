@@ -2351,6 +2351,7 @@
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_run_dropped_while_using_its_scratch_leaves_a_marker_named_by_its_token_and_is_recovered",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_a_run_created_is_recorded_marked_and_removed_by_the_next_run",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_release_that_cannot_remove_a_companion_keeps_the_record_that_names_it",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_release_that_cannot_drop_the_reference_database_keeps_the_record_that_finds_it",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_run_killed_after_its_sandbox_is_cleaned_by_the_next_run",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_database_a_live_run_holds_is_refused_and_left_alone",
         "resolver::server::scratch::mssql_live_tests::recovery2410::objects_with_no_sandbox_are_still_refused_and_never_cleaned",

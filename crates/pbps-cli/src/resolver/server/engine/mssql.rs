@@ -863,6 +863,12 @@ impl Scratch<'_> {
                     }
                     return Err(resources);
                 }
+                // The record names the reference too: a token is found by its
+                // login, so a reference left with no record is never retried.
+                let mut left = Vec::new();
+                if keep_record {
+                    left.push("companion databases");
+                }
                 if let Some(reference) = reference
                     && let Err(error) = resolver::drop_reference(admin, &reference).await
                 {
@@ -870,13 +876,14 @@ impl Scratch<'_> {
                         "reference database {} ({error})",
                         reference.database()
                     ));
+                    left.push("reference database");
                 }
-                if keep_record {
+                if !left.is_empty() {
                     failed.push(format!(
-                        "database {} and login {}, kept: they record the companion databases \
-                         left",
+                        "database {} and login {}, kept: they record the {} left",
                         names.database(),
-                        names.login()
+                        names.login(),
+                        left.join(" and the ")
                     ));
                 } else if let Err(error) =
                     record::drop_database(admin, names.database(), true).await
