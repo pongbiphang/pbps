@@ -7969,3 +7969,119 @@ fn a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowi
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // Three short elements whose text is longer than the new limit: the
+        // elements fit, the array's text does not mean anything to a length
+        // check (DEC-1635.9, round 3).
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS varchar(20); \
+                   CREATE DOMAIN app.d2 AS app.d[]; \
+                   CREATE TABLE app.t (id integer PRIMARY KEY, v app.d2); \
+                   INSERT INTO app.t VALUES (1, ARRAY['abc', 'def', 'ghi']::app.d[]);";
+        let (own, d) = adopted(&server, "domain_array_link4b", sql);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(10)\n",
+        )
+        .unwrap();
+        let path = d.dir.join("array-link.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert!(changes_of(&plan).iter().all(|k| k == "EnumRebuild"));
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::Narrowing)),
+            "the narrowing is still gated: {plan:?}"
+        );
+        let refused = apply_allowing(&d, db, &path, &["type-rebuild"]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("narrowing"),
+            "{}",
+            stderr(&refused)
+        );
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert_eq!(type_ids(&d), uids);
+        assert_eq!(
+            text_of(db, "SELECT v::text FROM app.t WHERE id = 1"),
+            "{abc,def,ghi}"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS varchar(20); \
+                   CREATE DOMAIN app.d2 AS app.d; \
+                   CREATE TABLE app.t (id integer PRIMARY KEY, v app.d2); \
+                   INSERT INTO app.t VALUES (1, 'short'), (2, 'abcdefghijklmnop');";
+        let (own, d) = adopted(&server, "domain_collation_narrow4b", sql);
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(10)\n",
+        )
+        .unwrap();
+        // The derived domain also gains a collation: its reason is that, and
+        // its columns still undergo the root's narrowing.
+        std::fs::write(
+            d.dir.join("schema/app.d2.type.yml"),
+            "domain: app.d2\ntype: app.d\ncollation: pg_catalog.\"C\"\n",
+        )
+        .unwrap();
+        let path = d.dir.join("collation-narrow.plan.json");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("app.t.v") && said.contains("cannot become character varying(10)"),
+            "{said}"
+        );
+        assert!(!path.exists());
+        on_server(db, "UPDATE app.t SET v = 'fits' WHERE id = 2");
+        let plan = label_plan(&d, db, &path);
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::Narrowing)),
+            "{plan:?}"
+        );
+        let refused = apply_allowing(&d, db, &path, &["type-rebuild"]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("narrowing"),
+            "{}",
+            stderr(&refused)
+        );
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}

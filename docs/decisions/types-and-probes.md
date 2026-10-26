@@ -3774,4 +3774,20 @@ A derived domain over a base the engine cannot convert is refused with the root
 (#2331): the root is never planned, so nothing under it is. A collation change
 carries no base pair on either path, as before.
 `a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowing_allow`
-pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.
+pins it on 16 and 18.
+
+Round 3 of the PR: one rule for both gaps. The base change a column undergoes
+is derived from the chain under its type, not from why the type is rebuilt: a
+domain takes its own base's pair if its base changed, else the pair it
+inherits from the type it is built on, whatever its reason (a collation change
+and an array fallback as much as the plain derivation). A link that is an
+array of the type below it makes the pair one of arrays
+(`varchar(20)[]` to `varchar(10)[]`), through any number of links; the dialect
+keeps the element's risk, and preflight reports such a column's elements
+unchecked, by the mechanism a direct array column already has, instead of
+length-checking the array's text as a scalar. Over a rebuilt type the values go
+through text for every reason, since an enum has no assignment cast to its
+replacement. An enum below carries no pair.
+`a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar` and
+`a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit`
+pin it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.

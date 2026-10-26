@@ -289,14 +289,23 @@ pub(crate) fn plan(
                 None => (None, Vec::new(), 0, 1),
             };
             let reason = &why[uid];
-            let (conversion, base_change) = match reason {
-                // The columns of a domain built on a rebuilt one undergo the
-                // change of the root's base, through every level between: the
-                // narrowing is reported and gated for them too.
-                Why::Derived(_) => (
-                    RetypeConversion::Text,
-                    under.and_then(|r| r.effective.clone()),
-                ),
+            // What the columns of this type undergo in their base type is a
+            // fact about the chain under it, not about why this type is
+            // rebuilt: its own base's change if that is what changed, else the
+            // one it inherits from the type it is built on, whatever the
+            // reason (a collation change, an array fallback, or only that the
+            // base is rebuilt). An array link makes the columns' values
+            // arrays of the narrowed base, and says so in the pair's shape,
+            // which is how a direct array column is told apart (DEC-1635.9).
+            let inherited = under
+                .and_then(|r| r.effective.clone())
+                .map(|(from, to)| match d.new {
+                    ManagedType::Domain { base: ty, .. } if ty.is_array() => {
+                        (from.into_array(), to.into_array())
+                    }
+                    ManagedType::Domain { .. } | ManagedType::Enum { .. } => (from, to),
+                });
+            let base_change = match reason {
                 Why::Base => {
                     let (
                         ManagedType::Domain { base: from, .. },
@@ -305,12 +314,17 @@ pub(crate) fn plan(
                     else {
                         continue;
                     };
-                    (
-                        RetypeConversion::Assign,
-                        Some((normalized(from), normalized(to))),
-                    )
+                    Some((normalized(from), normalized(to)))
                 }
-                Why::Collation | Why::Array => (RetypeConversion::Assign, None),
+                Why::Derived(_) | Why::Collation | Why::Array => inherited,
+            };
+            // Over a rebuilt type the values go through text, whatever the
+            // reason: an enum has no assignment cast to its replacement, and a
+            // domain's is the same text.
+            let conversion = if under.is_some() {
+                RetypeConversion::Text
+            } else {
+                RetypeConversion::Assign
             };
             let effective_change = base_change.clone();
             match rebuild_type(
@@ -973,5 +987,132 @@ mod tests {
         assert_eq!(out.uids.len(), 2);
         assert_eq!(base_changes(&out)["v"], None);
         assert_eq!(base_changes(&out)["w"], None);
+    }
+
+    #[test]
+    fn the_base_change_of_a_column_follows_the_chain_under_its_type_whatever_the_reason() {
+        let on = |base: &str| domain(base, None, &[]);
+        let collated = |base: &str| domain(base, Some("pg_catalog.\"C\""), &[]);
+        let pair = |from: &str, to: &str| Some((from.to_owned(), to.to_owned()));
+        let world_of = |root: &str, d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(root)),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        // The same shapes before and after, but for the root's base and the
+        // collation the second domain gains.
+        let run_pair = |old_root: &str,
+                        new_root: &str,
+                        old_d2: ManagedType,
+                        d2: ManagedType,
+                        d3: ManagedType| {
+            let out = run(
+                &world_of(old_root, old_d2, d3.clone()),
+                &world_of(new_root, d2, d3),
+                &Hints::default(),
+            );
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            out
+        };
+        // A collation change together with an inherited narrowing: the
+        // collating domain and the one under it both carry the pair.
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d"),
+            collated("app.d"),
+            on("app.d2"),
+        );
+        assert_eq!(out.uids.get(&uid(3)), Some(&Why::Collation));
+        let changes = base_changes(&out);
+        let p = pair("varchar(20)", "varchar(10)");
+        assert_eq!(
+            (
+                changes["v"].clone(),
+                changes["w"].clone(),
+                changes["x"].clone()
+            ),
+            (p.clone(), p.clone(), p.clone()),
+            "{changes:?}"
+        );
+        // Over a rebuilt type the values go through text, for the collation
+        // reason too.
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Text, .. },
+                ..
+            } if column.name.raw() == "w"
+        )));
+        // An array link: the columns' values are arrays of the narrowed base,
+        // which the pair's shape says (no scalar probe; the direct array
+        // case's note).
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2"),
+        );
+        let changes = base_changes(&out);
+        let arrays = pair("varchar(20)[]", "varchar(10)[]");
+        assert_eq!(changes["v"], p, "the root's own column stays scalar");
+        assert_eq!(changes["w"], arrays, "{changes:?}");
+        // Through a second link, still arrays, and a link above an array keeps
+        // them so.
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2[]"),
+        );
+        let changes = base_changes(&out);
+        assert_eq!(changes["w"], arrays, "{changes:?}");
+        assert_eq!(changes["x"], arrays, "{changes:?}");
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d"),
+            on("app.d"),
+            on("app.d2[]"),
+        );
+        let changes = base_changes(&out);
+        assert_eq!(changes["w"], p);
+        assert_eq!(changes["x"], arrays, "{changes:?}");
+        // A widening is carried as well, with the same shape (the dialect says
+        // it is no narrowing).
+        let out = run_pair(
+            "varchar(20)",
+            "text",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2"),
+        );
+        assert_eq!(
+            base_changes(&out)["w"],
+            pair("varchar(20)[]", "text[]"),
+            "{:?}",
+            base_changes(&out)
+        );
+        // Below an enum there is no base change, array link or collation or
+        // not.
+        let over_enum = |d: ManagedType, d2: ManagedType, labels: &[&str]| {
+            vec![("app.e", enumeration(labels)), ("app.d", d), ("app.d2", d2)]
+        };
+        let out = run(
+            &over_enum(on("app.e"), on("app.d[]"), &["a", "b"]),
+            &over_enum(collated("app.e"), on("app.d[]"), &["b"]),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let changes = base_changes(&out);
+        assert!(
+            !changes.is_empty() && changes.values().all(Option::is_none),
+            "{changes:?}"
+        );
     }
 }

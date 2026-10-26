@@ -3272,7 +3272,9 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // before the apply vets it (DEC-1635.4), and the engine decides
             // them at the retype. An array's elements are not counted.
             if let Some((from, to)) = base_change.as_deref() {
-                if *array {
+                // The same for a column whose values are arrays of the base
+                // through a domain built on an array of it.
+                if *array || from.is_array() || to.is_array() {
                     unchecked.push(Unchecked::for_change(
                         change,
                         "the elements of an array are not checked against a narrower base",
@@ -5880,6 +5882,20 @@ mod tests {
             preflight(&set(vec![derived("varchar(20)", "text")]))
                 .probes
                 .is_empty()
+        );
+        // Through an array link the values are arrays of the base: no scalar
+        // probe, and the elements are reported unchecked as for a direct
+        // array column.
+        let through_array = retype_with(
+            false,
+            "varchar(20)[]",
+            "varchar(10)[]",
+            pbps_model::RetypeConversion::Text,
+        );
+        let report = preflight(&set(vec![through_array]));
+        assert!(
+            report.probes.is_empty() && !report.unchecked.is_empty(),
+            "{report:#?}"
         );
     }
 
