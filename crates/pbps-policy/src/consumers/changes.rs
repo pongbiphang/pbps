@@ -3,7 +3,10 @@ use super::{
     Side,
     binding::{Entry, Target},
 };
-use pbps_model::{Change, ChangeSet, ColumnRef, PlannedChange, RiskClass, Uid, ValueSource};
+use pbps_model::{
+    Change, ChangeSet, ColumnRef, DomainDelta, DomainHalf, PlannedChange, RiskClass, Uid,
+    ValueSource,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
@@ -132,6 +135,95 @@ pub(super) fn classify(
         }
         Change::RenameType { from, to, .. } => {
             (uses_type(entry, from, sides) || uses_type(entry, to, sides)).then_some(U)
+        }
+        Change::AlterDomain {
+            name,
+            from,
+            to,
+            half,
+            ..
+        } => {
+            let delta = DomainDelta::of(from, to)?;
+            sides.iter().find_map(|side| {
+                side.schema.tables.iter().find_map(|(owner, shape)| {
+                    let table = side.ids.table_uid(owner);
+                    shape
+                        .columns
+                        .keys()
+                        .chain(
+                            shape
+                                .partition_of
+                                .as_ref()
+                                .and_then(|of| side.schema.tables.get(&of.parent))
+                                .into_iter()
+                                .flat_map(|parent| parent.columns.keys()),
+                        )
+                        .find_map(|name_at| {
+                            let at = owner.column(name_at.clone());
+                            let (source, spec) = side.column(&at)?;
+                            if spec.ty.type_ref() != Some(name) {
+                                return None;
+                            }
+                            let uid = side.ids.column_uid(&source)?;
+                            let mut effects = Vec::new();
+                            if *half == DomainHalf::Tighten {
+                                for (name, text) in &delta.add_checks {
+                                    effects.push(Change::AddCheck {
+                                        table: owner.clone(),
+                                        name: (*name).clone(),
+                                        constraint: pbps_model::CheckConstraint {
+                                            expression: (*text).into(),
+                                        },
+                                    });
+                                }
+                            }
+                            if spec.nullable
+                                && match half {
+                                    DomainHalf::Loosen => delta.drop_not_null,
+                                    DomainHalf::Tighten => delta.set_not_null,
+                                }
+                            {
+                                effects.push(Change::AlterColumnNullability {
+                                    uid: uid.clone(),
+                                    column: at.clone(),
+                                    ty: spec.ty.clone(),
+                                    to_nullable: *half == DomainHalf::Loosen,
+                                    collation: spec.collation.clone(),
+                                    through_external_partitions: false,
+                                });
+                            }
+                            if *half == DomainHalf::Loosen
+                                && delta.default.is_some()
+                                && matches!(spec.value_source, ValueSource::None)
+                            {
+                                let pbps_model::ManagedType::Domain { default, .. } = from.as_ref()
+                                else {
+                                    return None;
+                                };
+                                effects.push(Change::AlterColumnDefault {
+                                    uid: uid.clone(),
+                                    column: at,
+                                    from: default.clone(),
+                                    to: delta.default.flatten().map(str::to_owned),
+                                });
+                            }
+                            // Reuse the ordinary paths, but ask the differ about
+                            // the original domain, never a same-named table part.
+                            // The outer finding likewise keeps the domain name.
+                            effects.into_iter().find_map(|effect| {
+                                classify(
+                                    &PlannedChange::new(effect),
+                                    entry,
+                                    table,
+                                    written,
+                                    cs,
+                                    sides,
+                                    &|_, table| unchanged(&p.change, table),
+                                )
+                            })
+                        })
+                })
+            })
         }
         Change::EnumRebuild { step, .. } => match step {
             pbps_model::EnumRebuildStep::Retype {

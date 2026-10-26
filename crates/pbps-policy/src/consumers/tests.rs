@@ -1122,3 +1122,317 @@ fn ordinary_columns_require_uids_even_when_partitions_can_inherit_them() {
         Bindings::resolve(&consumers("app.t.old", false), &sides, &Clone::clone).unwrap_err();
     assert!(errors[0].contains("has no resolved identity"), "{errors:?}");
 }
+
+fn domain(not_null: bool, default: Option<&str>, check: Option<&str>) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: ColumnType::simple("integer"),
+        not_null,
+        default: default.map(str::to_owned),
+        checks: check
+            .into_iter()
+            .map(|text| ("ck".into(), text.into()))
+            .collect(),
+        collation: None,
+    }
+}
+
+#[test]
+fn domain_deltas_follow_the_same_column_and_constraint_paths() {
+    use pbps_model::DomainHalf::{Loosen, Tighten};
+    let empty = domain(false, None, None);
+    let checked = domain(false, None, Some("VALUE > 0"));
+    // Literal expected cells are (reader, writer); they are not a second
+    // interpretation of DomainDelta or of the ordinary classifier.
+    for (label, from, to, half, expected) in [
+        (
+            "check added",
+            empty.clone(),
+            checked.clone(),
+            Tighten,
+            [0, 1],
+        ),
+        (
+            "check replaced",
+            checked.clone(),
+            domain(false, None, Some("VALUE > 1")),
+            Tighten,
+            [0, 1],
+        ),
+        (
+            "replacement drop half",
+            checked.clone(),
+            domain(false, None, Some("VALUE > 1")),
+            Loosen,
+            [0, 0],
+        ),
+        ("check removed", checked, empty.clone(), Loosen, [0, 0]),
+        (
+            "NOT NULL tightened",
+            empty.clone(),
+            domain(true, None, None),
+            Tighten,
+            [0, 1],
+        ),
+        (
+            "nullability loosened",
+            domain(true, None, None),
+            empty.clone(),
+            Loosen,
+            [1, 0],
+        ),
+        (
+            "DEFAULT added",
+            empty.clone(),
+            domain(false, Some("1"), None),
+            Loosen,
+            [0, 1],
+        ),
+        (
+            "DEFAULT replaced",
+            domain(false, Some("1"), None),
+            domain(false, Some("2"), None),
+            Loosen,
+            [0, 1],
+        ),
+        (
+            "DEFAULT removed",
+            domain(false, Some("1"), None),
+            empty,
+            Loosen,
+            [0, 1],
+        ),
+    ] {
+        let changed: pbps_model::TypeRef = "app.domain".parse().unwrap();
+        for ty in [
+            ColumnType::reference(changed.clone()),
+            ColumnType::reference("app.other".parse().unwrap()),
+            ColumnType::simple("integer"),
+        ] {
+            let matches = ty.type_ref() == Some(&changed);
+            let mut before = schema();
+            before
+                .tables
+                .get_mut(&name())
+                .unwrap()
+                .columns
+                .get_mut("old")
+                .unwrap()
+                .ty = ty;
+            before.types.insert(changed.clone(), from.clone());
+            let mut after = before.clone();
+            after.types.insert(changed.clone(), to.clone());
+            let change = Change::AlterDomain {
+                uid: uid("y_aaaaaa"),
+                name: changed.clone(),
+                from: Box::new(from.clone()),
+                to: Box::new(to.clone()),
+                half,
+            };
+            for (writes, count) in [false, true].into_iter().zip(expected) {
+                let f = findings(
+                    &before,
+                    &after,
+                    &ids(),
+                    &ids(),
+                    &consumers("app.t.old", writes),
+                    vec![change.clone()],
+                );
+                assert_eq!(
+                    f.len(),
+                    if matches { count } else { 0 },
+                    "{label}, writes={writes}, matches={matches}: {f:?}"
+                );
+                for (_, f) in f {
+                    assert_eq!(f.id, "consumer.unproven");
+                    assert!(
+                        f.message.contains("alter domain") && f.message.contains("app.domain"),
+                        "{}",
+                        f.message
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn domain_translation_keeps_overrides_supplied_columns_and_the_shared_restoration_answer() {
+    use pbps_model::DomainHalf::{Loosen, Tighten};
+    let changed: pbps_model::TypeRef = "app.domain".parse().unwrap();
+    for (from, to, half) in [
+        (domain(false, None, None), domain(true, None, None), Tighten),
+        (domain(true, None, None), domain(false, None, None), Loosen),
+        (
+            domain(false, Some("1"), None),
+            domain(false, Some("2"), None),
+            Loosen,
+        ),
+    ] {
+        let mut before = schema();
+        let col = before
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("old")
+            .unwrap();
+        col.ty = ColumnType::reference(changed.clone());
+        // A column's own NOT NULL and DEFAULT keep their effective meaning.
+        col.nullable = false;
+        col.value_source = ValueSource::Default("3".into());
+        before.types.insert(changed.clone(), from.clone());
+        let mut after = before.clone();
+        after.types.insert(changed.clone(), to.clone());
+        let change = Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: changed.clone(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        for writes in [false, true] {
+            assert!(
+                findings(
+                    &before,
+                    &after,
+                    &ids(),
+                    &ids(),
+                    &consumers("app.t.old", writes),
+                    vec![change.clone()]
+                )
+                .is_empty()
+            );
+        }
+    }
+    for (from, to, half) in [
+        (
+            domain(false, Some("1"), None),
+            domain(false, Some("2"), None),
+            Loosen,
+        ),
+        (
+            domain(false, None, None),
+            domain(false, None, Some("VALUE > 0")),
+            Tighten,
+        ),
+    ] {
+        let mut before = schema();
+        before
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("old")
+            .unwrap()
+            .ty = ColumnType::reference(changed.clone());
+        let change = Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: changed.clone(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        assert!(
+            findings_with_restoration(
+                &before,
+                &before,
+                &ids(),
+                &ids(),
+                &consumers("app.t.old", true),
+                vec![change],
+                true
+            )
+            .is_empty()
+        );
+    }
+    let before = schema();
+    let mut after = before.clone();
+    let mut new = ids();
+    let mut spec = Column::new(ColumnType::reference(changed.clone()));
+    spec.value_source = ValueSource::Default("1".into());
+    after
+        .tables
+        .get_mut(&name())
+        .unwrap()
+        .columns
+        .insert("added".into(), spec.clone());
+    new.columns.insert(uid("c_bbbbbb"), name().column("added"));
+    let changes = vec![
+        Change::AddColumn {
+            uid: uid("c_bbbbbb"),
+            table: name(),
+            name: "added".into(),
+            column: Box::new(spec),
+        },
+        Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: changed,
+            from: Box::new(domain(false, None, None)),
+            to: Box::new(domain(true, None, None)),
+            half: Tighten,
+        },
+    ];
+    assert!(
+        findings(
+            &before,
+            &after,
+            &ids(),
+            &new,
+            &consumers("app.t", true),
+            changes
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn domain_checks_reach_sibling_writers_and_usage_on_either_side() {
+    let changed: pbps_model::TypeRef = "app.domain".parse().unwrap();
+    let from = domain(false, None, None);
+    let to = domain(false, None, Some("VALUE > 0"));
+    for matching_side in [0, 1] {
+        let mut sides = [schema(), schema()];
+        let mut i = ids();
+        i.columns.insert(uid("c_bbbbbb"), name().column("other"));
+        for (index, schema) in sides.iter_mut().enumerate() {
+            schema.tables.get_mut(&name()).unwrap().columns.insert(
+                "other".into(),
+                Column::new(if index == matching_side {
+                    ColumnType::reference(changed.clone())
+                } else {
+                    ColumnType::simple("integer")
+                }),
+            );
+        }
+        let change = Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: changed.clone(),
+            from: Box::new(from.clone()),
+            to: Box::new(to.clone()),
+            half: pbps_model::DomainHalf::Tighten,
+        };
+        assert_eq!(
+            findings(
+                &sides[0],
+                &sides[1],
+                &i,
+                &i,
+                &consumers("app.t.old", true),
+                vec![change.clone()]
+            )
+            .len(),
+            1
+        );
+        assert!(
+            findings(
+                &sides[0],
+                &sides[1],
+                &i,
+                &i,
+                &consumers("app.t.old", false),
+                vec![change]
+            )
+            .is_empty()
+        );
+    }
+}
