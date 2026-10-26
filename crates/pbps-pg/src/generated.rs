@@ -157,32 +157,149 @@ pub fn may_call(expression: &str, name: &str) -> bool {
 /// string's contents as one literal, which holds those as data. So the body
 /// is returned as code, its own literals then literals of the text.
 ///
-/// A PL/pgSQL body does resolve the type of a variable it declares, a
-/// table's or a view's row type (`r app.v%ROWTYPE`). That is not told apart
-/// from a call by a lexical scan, and is left to the order the plan already
-/// has, which the differ's own scan of the same body gave it.
+/// A PL/pgSQL body keeps what [`declared_types`] reads, the one place its
+/// body is resolved at creation.
 pub(crate) fn creation_text(module: &pbps_model::Module) -> std::borrow::Cow<'_, str> {
     use pbps_model::ModuleKind;
     let definition = module.definition.as_str();
     if matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure)
         && let Some(body) = crate::LEXICON.routine_body(definition)
+        && let Some(contents) = crate::LEXICON
+            .string_literals(&definition[body.clone()])
+            .into_iter()
+            .next()
     {
-        let language = crate::LEXICON.routine_language(definition);
-        let contents = match language.as_deref() {
-            Some("plpgsql") => Some(" ".repeat(body.len())),
-            Some("sql") => crate::LEXICON
-                .string_literals(&definition[body.clone()])
-                .into_iter()
-                .next(),
+        let resolved = match crate::LEXICON.routine_language(definition).as_deref() {
+            Some("plpgsql") => Some(declared_types(&contents)),
+            Some("sql") => Some(contents),
             _ => None,
         };
-        if let Some(contents) = contents {
+        if let Some(resolved) = resolved {
             let mut text = definition.to_owned();
-            text.replace_range(body, &contents);
+            text.replace_range(body, &format!(" {resolved} "));
             return std::borrow::Cow::Owned(text);
         }
     }
     std::borrow::Cow::Borrowed(definition)
+}
+
+/// What a PL/pgSQL body resolves when the routine is created: the types its
+/// `DECLARE` sections name (`r app.v%ROWTYPE`, `x app.t.c%TYPE`, an array, a
+/// collation) and the types of a cursor's parameters, in every block.
+/// Measured on 16.15 and 18.6 with every object absent (`42704`, `42P01`);
+/// a default, a cursor's query, an `ALIAS` and every statement are created
+/// without their objects, and a variable's name is nobody's reference, so
+/// each is left out. The text is the kept spans, in order.
+fn declared_types(body: &str) -> String {
+    let code = crate::LEXICON.header(body);
+    let tokens = tokens(&code);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        at += 1;
+        if !is(&tokens[at - 1], "declare") {
+            continue;
+        }
+        // Declarations end at their `;`, the section at the `BEGIN` after it.
+        while at < tokens.len() && !is(&tokens[at], "begin") {
+            let end = tokens[at..]
+                .iter()
+                .position(|token| token.1 == ";")
+                .map_or(tokens.len(), |n| at + n);
+            if let [_name, rest @ ..] = &tokens[at..end] {
+                spans.extend(declaration_types(rest));
+            }
+            at = end + 1;
+        }
+    }
+    spans
+        .iter()
+        .map(|span| &code[span.clone()])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A token of a code text: its start and its text. A name, a quoted name or
+/// one other character.
+type Token<'a> = (usize, &'a str);
+
+fn is(token: &Token<'_>, word: &str) -> bool {
+    token.1.eq_ignore_ascii_case(word)
+}
+
+/// The spans of a declaration, after its variable's name, that are resolved:
+/// a variable's type up to its default, a cursor's parameter types.
+fn declaration_types(rest: &[Token<'_>]) -> Vec<std::ops::Range<usize>> {
+    let scroll = rest.iter().take_while(|t| is(t, "no") || is(t, "scroll"));
+    let cursor = scroll.count();
+    if rest.first().is_some_and(|first| is(first, "alias")) {
+        Vec::new()
+    } else if rest.get(cursor).is_some_and(|t| is(t, "cursor")) {
+        cursor_parameter_types(&rest[cursor + 1..])
+    } else {
+        let end = rest
+            .iter()
+            .position(|t| t.1 == ":" || t.1 == "=" || is(t, "default"))
+            .unwrap_or(rest.len());
+        span(&rest[..end]).into_iter().collect()
+    }
+}
+
+fn tokens(code: &str) -> Vec<Token<'_>> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let mut out = Vec::new();
+    let mut chars = code.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        let mut end = start + c.len_utf8();
+        if c == '"' {
+            // To the closing quote, a doubled one inside the name.
+            while let Some((i, quote)) = chars.next() {
+                end = i + quote.len_utf8();
+                if quote == '"' && chars.next_if(|(_, next)| *next == '"').is_none() {
+                    break;
+                }
+            }
+        } else if word(c) {
+            while let Some((i, next)) = chars.next_if(|(_, next)| word(*next)) {
+                end = i + next.len_utf8();
+            }
+        } else if c.is_whitespace() {
+            continue;
+        }
+        out.push((start, &code[start..end]));
+    }
+    out
+}
+
+/// The text from the first of `tokens` to the end of the last.
+fn span(tokens: &[Token<'_>]) -> Option<std::ops::Range<usize>> {
+    let (start, _) = tokens.first()?;
+    let (at, last) = tokens.last()?;
+    Some(*start..at + last.len())
+}
+
+/// The types in the `(name type, …)` a cursor declaration opens with.
+fn cursor_parameter_types(tokens: &[Token<'_>]) -> Vec<std::ops::Range<usize>> {
+    let [(_, "("), inside @ ..] = tokens else {
+        return Vec::new();
+    };
+    let (mut depth, mut start) = (0usize, 0usize);
+    let mut spans = Vec::new();
+    for (at, (_, text)) in inside.iter().enumerate() {
+        match *text {
+            "(" => depth += 1,
+            ")" if depth > 0 => depth -= 1,
+            ")" | "," if depth == 0 => {
+                spans.extend(inside[start..at].get(1..).and_then(span));
+                start = at + 1;
+                if *text == ")" {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 mod parts;
@@ -357,7 +474,7 @@ mod tests {
         }
     }
 
-    /// A PL/pgSQL body resolves nothing at creation (measured on 16 and 18),
+    /// A PL/pgSQL body resolves no call at creation (measured on 16 and 18),
     /// so a name only it holds is no creation-time reference, and the header,
     /// whose defaults and types are resolved, still is (DEC-2389.2).
     #[test]
@@ -375,7 +492,6 @@ mod tests {
             );
             let m = module(kind, &definition);
             let text = super::creation_text(&m);
-            assert_eq!(text.len(), definition.len());
             assert!(may_call(&text, "h"), "{language}: the header's default");
             assert!(!may_call(&text, "g"), "{language}: the body's call");
         }
@@ -386,6 +502,119 @@ mod tests {
         );
         let text = super::creation_text(&after);
         assert!(may_call(&text, "s") && !may_call(&text, "g"));
+    }
+
+    /// PL/pgSQL bodies over `v`, and whether the engine resolves `v` when it
+    /// creates the routine (measured on 16 and 18, every object absent): the
+    /// type of a variable, however spelled, in any block, and of a cursor's
+    /// parameter are; a default, a cursor's query, an alias, a statement and a
+    /// variable's name are not.
+    fn bodies() -> Vec<(bool, String)> {
+        let mut out = Vec::new();
+        for declare in [
+            "r app.v%ROWTYPE;",
+            "r app.v;",
+            "r app.v[];",
+            "r app.v ARRAY;",
+            "x app.v.c%TYPE;",
+            "x CONSTANT app.v := NULL;",
+            "x app.v NOT NULL DEFAULT NULL;",
+            "x text COLLATE app.v;",
+            "x \"v\";",
+            "x\n  app.v;",
+            "c CURSOR (p integer, q app.v) FOR SELECT 1;",
+            "c NO SCROLL CURSOR (p numeric(10, 2), q app.v) FOR SELECT 1;",
+            // What lexes around the type: a string, a quoted name, comments.
+            "x text := $q$ ; DECLARE $q$; r app.v;",
+            "x text := E'a\\';DECLARE'; r app.v;",
+            "\"a;b\" integer; r app.v;",
+            "r /* ; */ app.v -- ;\n;",
+        ] {
+            out.push((
+                true,
+                format!(" DECLARE a integer; {declare} BEGIN RETURN 1; END "),
+            ));
+            out.push((
+                true,
+                format!(" BEGIN BEGIN DECLARE {declare} BEGIN NULL; END; RETURN 1; END; END "),
+            ));
+            out.push((
+                true,
+                format!(" <<l>> DECLARE {declare} BEGIN RETURN 1; END "),
+            ));
+        }
+        for (declare, body) in [
+            ("x integer := app.v(1);", ""),
+            ("x integer := (SELECT count(*) FROM app.v);", ""),
+            ("x text := 'DECLARE app.v;';", ""),
+            ("x text DEFAULT 'a;' || app.v;", ""),
+            ("c CURSOR FOR SELECT * FROM app.v;", ""),
+            ("c CURSOR (p integer) FOR SELECT p FROM app.v;", ""),
+            ("a ALIAS FOR $1;", ""),
+            ("v integer;", ""),
+            ("-- r app.v;\n x integer;", ""),
+            ("x integer;", "PERFORM app.v(); SELECT * FROM app.v INTO x;"),
+            ("x integer;", "EXECUTE 'DECLARE r app.v; BEGIN NULL; END';"),
+            ("x integer;", "/* DECLARE r app.v; */ x := 1;"),
+            ("x text := $q$ DECLARE r app.v; BEGIN $q$;", ""),
+            ("\"v\" integer;", ""),
+            (
+                "x integer;",
+                "BEGIN BEGIN NULL; END; DECLARE y integer := app.v(1); BEGIN NULL; END; END;",
+            ),
+        ] {
+            out.push((
+                false,
+                format!(" DECLARE {declare} BEGIN {body} RETURN 1; END "),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn a_plpgsql_body_keeps_the_types_it_declares_and_nothing_else() {
+        for (resolved, body) in bodies() {
+            let definition = format!("(integer) RETURNS integer LANGUAGE plpgsql AS $${body}$$");
+            let m = module(pbps_model::ModuleKind::Function, &definition);
+            assert_eq!(may_call(&super::creation_text(&m), "v"), resolved, "{body}");
+        }
+    }
+
+    /// The table above against the engine itself, which is where it comes from.
+    #[tokio::test]
+    #[ignore = "requires the pinned PostgreSQL servers"]
+    async fn the_bodies_that_resolve_a_name_are_refused_by_the_engine_without_it() {
+        use pbps_db::{Conn, Driver};
+        for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+            let server = std::env::var(variable).expect("both PostgreSQL endpoints are required");
+            let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+            let database = format!("pbps_s2389_declared_{}", std::process::id());
+            admin
+                .execute(&format!("CREATE DATABASE {database} TEMPLATE template0"))
+                .await
+                .unwrap();
+            let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}"))
+                .await
+                .unwrap();
+            conn.execute("CREATE SCHEMA app").await.unwrap();
+            let mut wrong = Vec::new();
+            for (resolved, body) in bodies() {
+                let created = conn
+                    .execute(&format!(
+                        "CREATE OR REPLACE FUNCTION app.f(integer) RETURNS integer \
+                         LANGUAGE plpgsql AS $${body}$$"
+                    ))
+                    .await;
+                if created.is_err() != resolved {
+                    wrong.push(format!("{body}: {created:?}"));
+                }
+            }
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            assert!(wrong.is_empty(), "{variable}: {wrong:#?}");
+        }
     }
 
     /// Negatives: whatever the engine resolves at creation keeps what it

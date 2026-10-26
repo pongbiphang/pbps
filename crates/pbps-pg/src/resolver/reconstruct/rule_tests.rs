@@ -334,6 +334,15 @@ async fn scratch_rules_compile_on_both_servers() {
         vec![create("t", defaulted()), sql("f", "g"), plpgsql("g", "f")],
         literal_readers().to_vec(),
         header_readers(),
+        // A declared type is resolved at creation and a body or default is not.
+        delayed_view(declaring(
+            "r app.v%ROWTYPE; c CURSOR (p app.v) FOR SELECT 1;",
+            "DECLARE x app.v.g%TYPE; BEGIN NULL; END;",
+        )),
+        delayed_view(declaring(
+            "x int := (SELECT count(*) FROM app.v); c CURSOR FOR SELECT * FROM app.v;",
+            "RETURN (SELECT count(*) FROM app.v)::int;",
+        )),
         // A late body names the table, and an index of it, that waits for it.
         vec![
             create("t", held_table()),
@@ -574,6 +583,74 @@ fn a_sql_body_naming_an_index_and_a_table_by_literal_follows_both() {
         at(&lazy, "function app.f(integer)") < at(&lazy, "table app.t"),
         "{lazy:?}"
     );
+}
+
+/// A PL/pgSQL routine over `declare` (its `DECLARE` section) and `body`.
+fn declaring(declare: &str, body: &str) -> Change {
+    routine(
+        "r",
+        "plpgsql",
+        &format!(" DECLARE {declare} BEGIN {body} RETURN 1; END "),
+    )
+}
+
+/// The table is held back by the function its generated column calls, and the
+/// view reads that column, so it waits for the function too; the routine is
+/// planned before that function. `r` follows `v` exactly when its text names it.
+fn delayed_view(routine: Change) -> Vec<Change> {
+    let view = module("app.v", ModuleKind::View, "SELECT g FROM app.t");
+    vec![create("t", held_table()), view, routine, function("f")]
+}
+
+/// What a PL/pgSQL routine declares is resolved when it is created, unlike its
+/// body (measured on 16.15 and 18.6, every object absent): the type of a
+/// variable (`app.v`, `app.v%ROWTYPE`, `app.v.g%TYPE`, an array of it, in a
+/// nested block too) and of a cursor's parameter are `42704`/`42P01`.
+#[test]
+fn a_declared_type_in_a_late_routine_follows_what_it_names() {
+    let nested = ("", "DECLARE x app.v%ROWTYPE; BEGIN NULL; END;");
+    let declared = [
+        ("r app.v%ROWTYPE;", ""),
+        ("r app.v;", ""),
+        ("r app.v[];", ""),
+        ("x app.v.g%TYPE;", ""),
+        ("x CONSTANT app.v := NULL;", ""),
+        ("c CURSOR (p app.v) FOR SELECT 1;", ""),
+        nested,
+    ];
+    for version in [None, Some(160_000)] {
+        for (declare, body) in declared {
+            let order = order(&delayed_view(declaring(declare, body)), version);
+            assert!(
+                at(&order, "view app.v") < at(&order, "function app.r(integer)"),
+                "{declare} {body} on {version:?}: {order:?}"
+            );
+        }
+    }
+}
+
+/// Negative: what a routine only runs stays late, the declaration's defaults,
+/// a cursor's query and a variable's name included (measured: created with
+/// every object absent), so the routine keeps its place before the view.
+#[test]
+fn a_late_body_naming_a_view_does_not_follow_it() {
+    let late = [
+        ("", "RETURN (SELECT count(*) FROM app.v)::int;"),
+        ("x int := (SELECT count(*) FROM app.v);", ""),
+        ("c CURSOR FOR SELECT * FROM app.v;", ""),
+        ("v int := 1;", ""),
+        ("x text := 'a'::app.v;", ""),
+        ("a ALIAS FOR $1;", "PERFORM app.v;"),
+    ];
+    for version in [None, Some(160_000)] {
+        for (declare, body) in late {
+            let order = order(&delayed_view(declaring(declare, body)), version);
+            assert!(
+                at(&order, "function app.r(integer)") < at(&order, "view app.v"),
+                "{declare} {body} on {version:?}: {order:?}"
+            );
+        }
+    }
 }
 
 /// A PL/pgSQL body that names an index resolves it only when it runs

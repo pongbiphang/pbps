@@ -8734,7 +8734,7 @@ and the live `scratch_rules_compile_on_both_servers` and
 <a id="dec-2389-2"></a>
 
 **DEC-2389.2. The scratch route orders a module by what the engine resolves
-when it creates it.** Part of #2389, draft round 1. Splitting every new table
+when it creates it.** Part of #2389, draft rounds 1 and 2. Splitting every new table
 (DEC-2389.1) makes `generated::constraints_in` non-empty for every plan, so the
 module dependencies it adds (a function moved past a held table must not pass a
 module it calls) now reached plans that never had a generated column. They read
@@ -8751,20 +8751,21 @@ variable has a default calling it. Refused with `42883`, `42P01` or `42704`
 while it is absent: a `LANGUAGE sql` body (string, `BEGIN ATOMIC`, `RETURN`),
 including a literal inside it (`'app.ix'::regclass`); a view; a trigger; and,
 in any language, the header (a parameter default, `RETURNS`, `SUPPORT`). A
-PL/pgSQL body does resolve the type of a variable it declares, a table's or a
-view's row type; a lexical scan does not tell that from a call.
+PL/pgSQL body does resolve what its `DECLARE` sections name (round 2): the type
+of a variable (`r app.v%ROWTYPE`, `app.v`, `app.t.c%TYPE`, an array of it, a
+`COLLATE`), in any block, and the parameter types of a cursor (`42704`,
+`42P01`; `42601` on 16 for an absent `%TYPE`). Created while absent: a
+variable's default, a cursor's query, an `ALIAS`, every statement. No other
+language is created in the pinned images (`plperl` and the like are `42704`).
 
 In scratch the text of a module that orders it is `Dialect::module_creation_text`
 (the whole definition by default). PostgreSQL answers the definition with a
-PL/pgSQL body blanked, and with a `LANGUAGE sql` string body returned as code,
-so that the literals in it are the text's literals and its OID-alias literals
-count. It is read by the module dependencies, by the modules that read a table,
-the choice of a table to hold, and the rule that an index precedes the reader
-naming it. Declared dependencies are unchanged. The ordinary route reads the
-whole definition, as it did. The declaration of a variable's type in a PL/pgSQL
-body is left to the order the plan has, which the differ's own scan of the body
-gave it; a view and a routine that name one another that way are not refused
-here but fail in the engine.
+PL/pgSQL body reduced to the types its declarations name, and with a
+`LANGUAGE sql` string body returned as code, so that the literals in it are the
+text's literals and its OID-alias literals count. It is read by the module
+dependencies, by the modules that read a table, the choice of a table to hold,
+and the rule that an index precedes the reader naming it. Declared dependencies are unchanged. The ordinary route reads the
+whole definition, as it did.
 
 A cycle of routines resolved at creation (two `LANGUAGE sql` bodies calling
 each other: neither is creatable in any order, measured) remains
