@@ -78,9 +78,11 @@ pub(super) fn read(
         // Retain the existing Git reader's text decoding. Only paths, which
         // select objects, must not silently change spelling through replacement.
         |path, mode, bytes| {
+            // Said as the listing said it before submodules were passed on:
+            // which directory at which revision could not be read.
             anyhow::ensure!(
                 mode != SUBMODULE,
-                "declaration `{path}` is a Git commit, not a blob"
+                "cannot read `{rel}` at `{rev}`: declaration `{path}` is a Git commit, not a blob"
             );
             consume(path, &String::from_utf8_lossy(bytes))
         },
@@ -454,7 +456,7 @@ mod tests {
         git(&["commit", "-q", "-m", "yaml-named submodule"]);
         let refused = read(&dir, "HEAD", "schema", |_, _| Ok(())).unwrap_err();
         assert!(
-            format!("{refused:#}").contains("is a Git commit, not a blob"),
+            format!("{refused:#}").contains("cannot read `schema` at `HEAD`: declaration `schema/vendored.yml` is a Git commit, not a blob"),
             "{refused:#}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
