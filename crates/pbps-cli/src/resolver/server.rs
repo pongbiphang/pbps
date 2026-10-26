@@ -91,6 +91,12 @@ struct ProducerOutcome {
     surfaces: Vec<pbps_model::resolver::SurfaceResolution>,
 }
 
+/// The names of a run-owned PostgreSQL scratch, each carrying `token` (#2410).
+pub(crate) fn names_for(token: &str) -> Result<ScratchNames, Error> {
+    ScratchNames::for_run(token, format!("{:032x}", rand::random::<u128>()))
+        .map_err(|_| Error::Scratch)
+}
+
 pub(crate) fn generated_names() -> Result<ScratchNames, Error> {
     let suffix = || format!("{:032x}", rand::random::<u128>());
     ScratchNames::new(

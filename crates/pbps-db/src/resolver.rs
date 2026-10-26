@@ -34,6 +34,14 @@ impl std::fmt::Debug for ScratchNames {
 #[error("scratch resource names must be run-generated pbps identifiers")]
 pub struct UnsupportedScratchName;
 
+/// A run token: 32 lowercase hexadecimal digits.
+pub fn is_run_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl ScratchNames {
     /// Accepts only the generated shape: an ASCII lowercase `pbps_` name of
     /// bounded length and a hexadecimal credential. Quoting then cannot be
@@ -65,6 +73,19 @@ impl ScratchNames {
             login,
             password,
         })
+    }
+
+    /// The names a run creates, each carrying its token: what ties a leftover
+    /// to its login and to the session that proves the run gone (#2410).
+    pub fn for_run(token: &str, password: String) -> Result<Self, UnsupportedScratchName> {
+        if !is_run_token(token) {
+            return Err(UnsupportedScratchName);
+        }
+        Self::new(
+            format!("pbps_scratch_{token}"),
+            format!("pbps_run_{token}"),
+            password,
+        )
     }
 
     pub fn database(&self) -> &str {
@@ -210,6 +231,26 @@ mod tests {
             "private-input-handling",
         ] {
             assert!(!discovery.qualification.contains_key(removed), "{removed}");
+        }
+    }
+
+    #[test]
+    fn a_run_names_every_resource_with_its_token_and_nothing_else_is_a_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let names = ScratchNames::for_run(token, "0".repeat(32)).unwrap();
+        assert_eq!(names.database(), format!("pbps_scratch_{token}"));
+        assert_eq!(names.login(), format!("pbps_run_{token}"));
+        // The database and the login are linked by the token alone: that is
+        // what lets a later run remove the one it finds beside the other.
+        assert!(names.database().ends_with(&names.login()[9..]));
+        for bad in [
+            "",
+            "0123456789abcdef",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert!(ScratchNames::for_run(bad, "0".repeat(32)).is_err(), "{bad}");
         }
     }
 

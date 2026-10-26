@@ -36,6 +36,7 @@ use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, Scratc
 pub use super::engine::{Standard, declared_standard};
 
 pub mod preview;
+pub mod recovery;
 
 /// One run of the resolver for a connected plan. `scratch`
 /// is the connection string the selected resolver's `url_env` holds. The run
@@ -128,11 +129,10 @@ pub async fn produce_unsealed(
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| unusable(format!("the target could not be connected: {error}")))?;
-    let mut admin = Conn::connect(driver, scratch)
-        .await
-        .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
-    engine::reset_role(driver, &mut admin).await?;
+    // Before the scratch session connects, which carries it from its first
+    // packet (#2410).
     let tokens = Tokens::generate();
+    let mut admin = engine::connect_scratch(driver, scratch, &tokens).await?;
     let (provisioning, state) = engine::scratch(
         driver,
         &mut target,
@@ -210,13 +210,16 @@ fn unusable(reason: impl Into<String>) -> ProduceError {
 
 /// The run's two session tokens: run-generated, so a token found in
 /// `pg_stat_activity` is this run's session and no other.
+///
+/// `scratch` is also the run's token (#2410): its keeper session and every
+/// resource it creates carry it.
 pub(super) struct Tokens {
     pub(super) target: String,
     pub(super) scratch: String,
 }
 
 impl Tokens {
-    fn generate() -> Self {
+    pub(super) fn generate() -> Self {
         let token = || format!("{:032x}", rand::random::<u128>());
         Self {
             target: token(),

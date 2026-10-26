@@ -329,7 +329,9 @@ write outside the scratch database; `pbps resolver externals` drafts that file
 from the target for review (#1778, DEC-1778.1), and every run fills what the
 file lacks from the target (DEC-1778.2). Before any scratch write the resolver
 proves its scratch is not the target and, on the target's cluster, that its
-account is confined; then it runs the shared compatibility qualification. Its
+account is confined; then, on PostgreSQL, it removes what a run killed earlier
+left behind once that run's session is provably gone (#2410, DEC-2410.1; SQL
+Server and Docker follow), and runs the shared compatibility qualification. Its
 plan is published after the ordinary connected checks and a fresh recheck of
 the target, with the target's cluster identity and the accepted limitations
 sealed in its evidence (#1516, DEC-1516.1). `explain` shows that evidence

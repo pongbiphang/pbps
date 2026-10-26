@@ -18,6 +18,11 @@ use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
 pub(super) mod mssql;
 mod postgres;
+#[cfg(test)]
+pub(super) use postgres::{
+    for_tests::{externals_for_test, reset_for_test, stop_after_cleanup, sweep_cluster_on},
+    release_run_owned,
+};
 
 // These are logical planning records, not a raw engine capture or a verifier.
 pub(super) use pbps_pg::resolver::capture::BindingRecord;
@@ -108,11 +113,22 @@ pub(super) async fn endpoint(driver: Driver, connection: &str) -> Result<String,
     }
 }
 
-pub(super) async fn reset_role(driver: Driver, admin: &mut Conn) -> Result<(), ProduceError> {
-    match driver {
-        Driver::Postgres => postgres::reset_role(admin).await,
-        Driver::Mssql => Ok(()),
+/// The scratch session that stays open for the whole run: named by the run's
+/// token from its first packet, acting as itself, and told to let the server
+/// notice if its client vanishes (#2410).
+pub(super) async fn connect_scratch(
+    driver: Driver,
+    scratch: &str,
+    tokens: &Tokens,
+) -> Result<Conn, ProduceError> {
+    let mut admin = Conn::connect_named(driver, scratch, &format!("pbps-{}", tokens.scratch))
+        .await
+        .map_err(|error| ProduceError::Acquire(format!("the scratch server: {error}")))?;
+    if driver == Driver::Postgres {
+        postgres::reset_role(&mut admin).await?;
+        postgres::keep(&mut admin).await?;
     }
+    Ok(admin)
 }
 
 #[allow(clippy::too_many_arguments)]

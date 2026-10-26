@@ -670,6 +670,21 @@ impl Conn {
         }
     }
 
+    /// [`Conn::connect`] naming the session `application_name` from its first
+    /// packet. SQL Server marks its sessions with a temporary table instead.
+    pub async fn connect_named(
+        driver: Driver,
+        connection_string: &str,
+        application_name: &str,
+    ) -> Result<Self, DbError> {
+        match driver {
+            Driver::Mssql => Self::connect(driver, connection_string).await,
+            Driver::Postgres => Ok(Conn::Postgres(Box::new(
+                postgres::Conn::connect_named(connection_string, application_name).await?,
+            ))),
+        }
+    }
+
     /// [`Conn::connect`] to another database on the server the string names,
     /// as another login when one is given. PostgreSQL only: the resolver
     /// that needs it has no SQL Server adapter (#1672).

@@ -6158,3 +6158,5 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
         assert_eq!(before, after, "no target write or ledger recording");
     }
 }
+
+mod recovery2410_tests;

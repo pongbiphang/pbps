@@ -4365,7 +4365,8 @@ were staged and not compared with any target. Preview results remain outside
 deployment qualification. Interrupt and termination signals unwind the workload
 and await the shared release; acquisition finishes recording its obligations
 before cooperative cancellation can release them. Abrupt process death still
-cannot run supplied-database cleanup. Docker readiness diagnostics are shared
+cannot run supplied-database cleanup (*amended by [DEC-2410.1](#dec-2410-1) for
+PostgreSQL: the next run does*). Docker readiness diagnostics are shared
 with the resolver so consolidating acquisition retains preview's measured
 startup refusals and password redaction.
 
@@ -4663,3 +4664,65 @@ silent flags are as written, the dedicated user's privileges and so the layout
 chosen, SSPI over the pipe, every instance
 restart timing, and which of the shared suites' cases pass on LocalDB. Nothing
 in this entry was run on Windows by the machine that wrote it.
+<a id="dec-2410-1"></a>
+
+**DEC-2410.1. A later run removes what a killed run left, proving the owner
+gone from a session that carries the run's token (#2410).** Three facts
+decide the design, each measured on PostgreSQL 16 and 18.
+
+- *The proof is a session, not a lock or a lease.* An advisory lock is private
+  to one database, so it reads free for a run whose session sits in another
+  database of the cluster (held in one, `pg_try_advisory_lock` returned true
+  in another). A lease needs a clock and declares a stalled live run dead.
+  `pg_stat_activity` is cluster-wide and every role sees every session's
+  `application_name` (not its `backend_start`, `state` or query), so the
+  identity is a token in the name, and no clock is read. A reader that cannot
+  see its own session proves nothing, and keeps everything.
+- *The name is the record.* Every run-owned resource carries the token, so
+  there is no moment at which one exists without it and the listing needs no
+  catalog write. The login is made first and dropped last, so a token with no
+  login is not an unfinished run and what carries it is not touched; the
+  names the earlier version generated (independent suffixes) are not
+  recognised. A supplied database has no cluster-level names, so its record is
+  a schema made first and holding the state the release restores
+  (`pbps_claim`); the creation is atomic with its comment and is the
+  arbitration between two runs. Without a claim, objects are not pbps's.
+- *One recoverer at a time, and the record goes last.* Two runs can read the
+  same dead claim; the one that cleans second would empty what the first,
+  now live, made. A run therefore takes a session-level advisory lock in the
+  supplied database before it reads the claim, and holds it until its own
+  claim is made (released explicitly after it and on every error before it;
+  a session that ends releases it anyway). An advisory lock is private to its
+  database, which is why liveness does not use one and why this does. The
+  cleanup's `DROP OWNED` would take the claim with the rest, and with it the
+  ACL snapshot, before the ACL is restored; the claim is put back in the
+  cleanup's own transaction and dropped by the release as its last step, so a
+  kill anywhere in between leaves a claim the next run finishes from. A
+  release that fails leaves it for the same reason.
+  What the claim records is what the run found, and the one baseline the run
+  later moves is the account's defaults, when `outside_writes: allow` keeps an
+  externals file's change to them: the claim is rewritten in that file's own
+  transaction, under the settings and empty path pbps pins again after the
+  file (its `SET`s and role do not apply), so no commit holds the kept change with the old baseline, or
+  the reverse. The ACL is not moved: the release restores it whatever a file
+  granted.
+- *Keeping is the safe error.* The sweep never forces: `DROP DATABASE`
+  refuses while a session is connected (`being accessed by other users`), so
+  a wrong decision still cannot close a live run's connection. A removal that
+  fails keeps the rest of that run's resources and its record, and is a
+  warning naming the resource and the statement that removes it, never a
+  refusal of the run that found it. The only refusals are the ones that
+  already existed (a supplied database that is not empty), now naming a live
+  claim when that is why.
+
+The keeper is the scratch admin session. Its name is a startup parameter,
+which `DISCARD ALL` leaves (it takes a `SET` name); its four keepalive
+settings are `SET`s, which `RESET ALL` and `DISCARD ALL` take, so the two
+places that run one send them again. They bound what a vanished client costs:
+a killed client's idle session left the server in under 100 ms; one inside a
+long statement was not noticed at all without the check interval and in
+under 0.5 s with it; a cut network was not noticed in 25 s by default and in
+about 6 s with keepalives of 3/2/2. The values chosen, 30/10/3 and 10 s, are
+measured in the PR (see its body). SQL Server (its `##pbps` marker table is
+the same proof already) and docker (a container, and a window before the
+first connection that has no sound answer) follow in #2410.

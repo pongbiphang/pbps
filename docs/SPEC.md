@@ -2070,7 +2070,8 @@ cleanup removes only run-owned resources. Unconfirmed cleanup fails by name.
 A container uses a per-run password and a host-chosen loopback port, and is
 removed with its anonymous volumes. SIGINT and SIGTERM release acquired
 resources on Unix; Windows handles Ctrl-C. Abrupt process death cannot run
-database cleanup.
+database cleanup; on PostgreSQL the next run removes what it left (§9.3.2,
+DEC-2410.1).
 
 The preview has no target. Any account, including `sa`, is accepted without a
 production-separation or confined-account requirement. The report explicitly
@@ -2231,6 +2232,40 @@ DEC-1674.1).**
         difference it cannot put back refuses the run, or fails the
         release, named. The database's own ACL is kept as the run found it
         instead. The run-owned database gets the same declared state.
+    - **A killed run's leftovers are recovered** (PostgreSQL;
+      DEC-2410.1). A run that ends removes what it made; one that is killed
+      cannot, and used to leave it for good. Every run has a token, carried
+      by the session it keeps open for the whole run (`application_name`
+      `pbps-<token>`, from the first packet) and by the name of everything
+      it creates: `pbps_run_<token>` (the login), `pbps_scratch_<token>`,
+      `pbps_role_<n>_<token>`. Before it writes anything on scratch, every
+      later run lists the leftovers of other tokens, and removes a token's
+      only when that token has no session on the server, which every role
+      can read and which is cluster-wide. A token it cannot prove gone
+      stays. The run-owned login is the record: made first, dropped last,
+      and a database or role whose token has no login is not a run's and is
+      never touched. A supplied run records itself in the first object it
+      creates, the schema `pbps_claim`, whose comment holds the token and the
+      state its release restores; creating it settles which of two runs that
+      start together has the database. A claim whose run is gone is cleaned
+      as a release cleans; a claim whose run is alive refuses the new run,
+      naming it; a non-empty database with no claim is never touched. A run
+      holds an advisory lock in that database from before it reads the claim
+      until its own is made, so two runs never clean one dead claim at once,
+      and a release removes the claim as its last step. The claim's
+      account defaults move with an allowed externals file's changes to them,
+      in that file's transaction.
+      - A leftover that cannot be removed does not stop the run. It is a
+        warning (a finding, `scratch.leftover`, in `--format json`) naming
+        the resource, why, and the statement that removes it. A database
+        the server still shows a session on is kept, because the removal
+        never forces: the next run removes it.
+      - Death is noticed at once for an idle session; a vanished host's
+        within about a minute (`tcp_keepalives_idle 30`, `interval 10`,
+        `count 3`), and a client killed inside a long statement within
+        `client_connection_check_interval` (10 s). Until then the run reads
+        as alive, which only keeps its resources.
+      - SQL Server and `kind: docker` are not yet recovered.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be

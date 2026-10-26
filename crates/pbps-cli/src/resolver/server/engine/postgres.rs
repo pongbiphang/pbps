@@ -13,10 +13,49 @@ use pbps_db::{Conn, Driver};
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::OutsideWrites;
 use pbps_pg::resolver::capture::{self, Managed, Paths, RecordedOwnership, StageError, Staged};
+use pbps_pg::resolver::recovery as record;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod recovery;
+
+/// Entry points and stop points for the tests that drive a release or a
+/// sweep without a run around it.
+#[cfg(test)]
+pub(super) mod for_tests {
+    pub(in crate::resolver::server) use super::recovery::for_tests::sweep_cluster_on;
+    use super::*;
+
+    /// Databases whose supplied release stops after the cleanup commit and
+    /// before the privileges are put back, as a kill between the two would.
+    static STOPPED_AFTER_CLEANUP: std::sync::Mutex<BTreeSet<String>> =
+        std::sync::Mutex::new(BTreeSet::new());
+
+    pub(in crate::resolver::server) fn stop_after_cleanup(database: &str, stop: bool) {
+        let mut stopped = STOPPED_AFTER_CLEANUP.lock().unwrap();
+        if stop {
+            stopped.insert(database.to_owned());
+        } else {
+            stopped.remove(database);
+        }
+    }
+
+    pub(super) fn stopped_after_cleanup(database: &str) -> bool {
+        STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
+    }
+
+    pub(in crate::resolver::server) async fn reset_for_test(session: &mut Conn) {
+        reset_settings(session, "the test").await.unwrap();
+    }
+
+    pub(in crate::resolver::server) async fn externals_for_test(session: &mut Conn) {
+        run_externals(session, "SELECT 1", OutsideWrites::Refused)
+            .await
+            .unwrap();
+    }
+}
 
 /// Where the scratch session is relative to the target's. Each session marks
 /// itself, and the scratch session looks for both marks: one it can see is a
@@ -158,7 +197,11 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     /// next is read.
     externals: Option<&'a str>,
     provenance: &'a Provenance,
+    /// The run's token: in every name it creates and on its keeper (#2410).
+    token: String,
     created: Created,
+    /// Whether this session holds the supplied database's lock (`recovery`).
+    holds_lock: bool,
 }
 
 /// The scratch side, provisioned and qualified: the session the declarations
@@ -208,10 +251,9 @@ impl Scratch<'_> {
         };
         let recipe = scope::recipe(driver, target_catalog)
             .map_err(|error| Error::Scope(error.to_string()))?;
-        let names = super::super::generated_names()?;
+        let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
-        let token = login[login.len().saturating_sub(16)..].to_owned();
-        let map = scope::Principals::generate(authorization, &request.planned, &login, &token);
+        let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
         // Recorded before anything is created, so a failure part-way still
         // drops what was made.
         self.created = Created::RunOwned {
@@ -380,6 +422,24 @@ impl Scratch<'_> {
         };
         let map =
             scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
+        // The first object the run creates here, and its record: a run killed
+        // after it is found and cleaned by the next one (`recovery`, #2410).
+        let claimed = record::claim(
+            admin,
+            &record::Claim::new(&self.token, defaults.clone(), acl.clone()),
+        )
+        .await;
+        self.unlock_database(admin).await;
+        claimed.map_err(|error| match error {
+            record::ClaimError::Taken => Error::Unusable(
+                "another run claimed the scratch database first; wait for it to finish, or \
+                 use another scratch database"
+                    .into(),
+            ),
+            record::ClaimError::Db(error) => {
+                Error::Read(format!("the scratch database's claim: {error}"))
+            }
+        })?;
         // Every write, the cleanup included, goes through the connection the
         // checks were made on. Another connection from the same string need
         // not reach the same server: a name may resolve to several hosts or a
@@ -522,20 +582,7 @@ impl Scratch<'_> {
         match std::mem::replace(&mut self.created, Created::Nothing) {
             Created::Nothing => Ok(()),
             Created::RunOwned { names, roles } => {
-                let mut remaining = Vec::new();
-                if pbps_pg::resolver::drop_scratch(admin, &names)
-                    .await
-                    .is_err()
-                {
-                    remaining.push(format!("database {}", names.database()));
-                    remaining.push(format!("role {}", names.login()));
-                }
-                remaining.extend(
-                    pbps_pg::resolver::drop_roles(admin, &roles)
-                        .await
-                        .into_iter()
-                        .map(|role| format!("role {}", role.shown())),
-                );
+                let remaining = release_run_owned(admin, &names, &roles).await;
                 if remaining.is_empty() {
                     Ok(())
                 } else {
@@ -561,6 +608,36 @@ impl Scratch<'_> {
     }
 }
 
+/// Drops a run-owned run's database, roles and login, in that order, and names
+/// what is left. The login is the record: it stays while anything else does.
+pub(in crate::resolver::server) async fn release_run_owned(
+    admin: &mut Conn,
+    names: &ScratchNames,
+    roles: &[pbps_model::RoleName],
+) -> Vec<String> {
+    let mut remaining = Vec::new();
+    if pbps_pg::resolver::drop_database(admin, names.database(), true)
+        .await
+        .is_err()
+    {
+        remaining.push(format!("database {}", names.database()));
+    }
+    remaining.extend(
+        pbps_pg::resolver::drop_roles(admin, roles)
+            .await
+            .into_iter()
+            .map(|role| format!("role {}", role.shown())),
+    );
+    if !remaining.is_empty()
+        || pbps_pg::resolver::drop_login(admin, names.login())
+            .await
+            .is_err()
+    {
+        remaining.push(format!("role {}", names.login()));
+    }
+    remaining
+}
+
 /// Empties the supplied database and puts it back into its standard state,
 /// on the checked connection, never a new one, and only on the checked
 /// backend: see `Run::supplied`. `Err` names exactly what may remain.
@@ -572,7 +649,12 @@ pub(in crate::resolver::server) async fn release_supplied(
     defaults: &BTreeSet<(String, String)>,
     acl: &BTreeSet<standard::Entry>,
 ) -> Result<(), Vec<String>> {
-    let mut remaining = match sql::drop_owned(admin, backend).await {
+    let cleaned = sql::drop_owned(admin, backend).await;
+    #[cfg(test)]
+    if for_tests::stopped_after_cleanup(database) {
+        return Err(vec!["stopped after the cleanup, as a kill would".into()]);
+    }
+    let mut remaining = match cleaned {
         Ok((_, 0)) => Ok(()),
         // Owned by another role a definition switched to, which
         // `DROP OWNED BY SESSION_USER` does not reach; never an
@@ -621,6 +703,13 @@ pub(in crate::resolver::server) async fn release_supplied(
         Err(error) => remaining.push(format!(
             "the scratch account's own defaults, unreadable after the run ({error})"
         )),
+    }
+    // The record goes last: until every step above has succeeded it lets a
+    // later run finish them (DEC-2410.1).
+    if remaining.is_empty()
+        && let Err(error) = record::remove(admin).await
+    {
+        remaining.push(format!("the scratch database's claim ({error})"));
     }
     if remaining.is_empty() {
         Ok(())
@@ -919,6 +1008,8 @@ async fn reset_settings(session: &mut Conn, which: &str) -> Result<(), Error> {
             .await
             .map_err(|error| Error::Read(format!("{which}'s settings: {error}")))?;
     }
+    // `RESET ALL` took the keeper's settings too (`sql::keep`).
+    keep_alive(session).await?;
     Ok(())
 }
 
@@ -1082,10 +1173,12 @@ async fn run_externals(
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
         // type the script creates may be named `text`: for the session, not
         // the transaction, as what runs after the commit relies on it too.
-        if !checked {
-            return Ok(());
-        }
         reset_settings(session, "the externals file session").await?;
+        if !checked {
+            return record::rebase(session)
+                .await
+                .map_err(read("the scratch database's claim"));
+        }
         let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
@@ -1128,6 +1221,8 @@ async fn run_externals(
         .execute("SET search_path = ''")
         .await
         .map_err(read("the externals file session's path"))?;
+    // The discard took the keeper's settings too (`sql::keep`).
+    keep_alive(session).await?;
     Ok(())
 }
 
@@ -1402,7 +1497,9 @@ pub(super) async fn scratch<'a>(
             standard,
             externals,
             provenance,
+            token: tokens.scratch.clone(),
             created: Created::Nothing,
+            holds_lock: false,
         },
     ))
 }
@@ -1423,12 +1520,20 @@ impl Scratch<'_> {
     ) -> Result<Prepared, Error> {
         match provisioning {
             Provisioning::RunOwned => {
+                self.sweep_cluster(admin).await;
                 self.run_owned(admin, target_catalog, authorization, scope_schemas, fill)
                     .await
             }
             Provisioning::Supplied => {
-                self.supplied(admin, authorization, scope_schemas, fill)
-                    .await
+                let prepared = async {
+                    self.recover_supplied(admin).await?;
+                    self.supplied(admin, authorization, scope_schemas, fill)
+                        .await
+                }
+                .await;
+                // Released after the claim; this covers an error before it.
+                self.unlock_database(admin).await;
+                prepared
             }
         }
     }
@@ -1836,6 +1941,20 @@ impl Binding {
         pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
             .map_err(|error| Error::Binding(error.to_string()))
     }
+}
+
+/// Sends the keeper's settings again after a `RESET ALL` or `DISCARD ALL`.
+async fn keep_alive(session: &mut Conn) -> Result<(), Error> {
+    sql::keep(session)
+        .await
+        .map_err(|error| Error::Read(format!("the session's keepalive settings: {error}")))
+}
+
+/// Makes the scratch session the run's keeper (#2410).
+pub(super) async fn keep(admin: &mut Conn) -> Result<(), ProduceError> {
+    sql::keep(admin)
+        .await
+        .map_err(|error| unusable(format!("the scratch session's keepalive settings: {error}")))
 }
 
 pub(super) async fn reset_role(admin: &mut Conn) -> Result<(), ProduceError> {

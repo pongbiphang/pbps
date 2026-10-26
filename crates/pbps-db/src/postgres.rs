@@ -238,6 +238,17 @@ impl Conn {
         Self::connect_as(connection_string, cfg!(target_os = "linux")).await
     }
 
+    /// [`connect`] with `application_name` as a startup parameter, which
+    /// `DISCARD ALL` does not clear (#2410). The string's own name loses.
+    pub(crate) async fn connect_named(
+        connection_string: &str,
+        application_name: &str,
+    ) -> Result<Self, DbError> {
+        let (mut config, defaulted) = Self::parse(connection_string)?;
+        config.application_name(application_name);
+        Self::connect_config(config, cfg!(target_os = "linux"), defaulted).await
+    }
+
     /// [`connect`]'s body, taking the platform as a parameter rather than
     /// reading `cfg!(target_os = "linux")` itself.
     ///

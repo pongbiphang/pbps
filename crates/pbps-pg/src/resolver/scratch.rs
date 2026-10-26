@@ -11,6 +11,19 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
 
+/// What the keeper session sets so the engine notices a vanished client
+/// (#2410). `RESET ALL` and `DISCARD ALL` clear them, so a session that runs
+/// either sends them again; `application_name` is set at connection instead.
+pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
+     SET tcp_keepalives_interval = 10; \
+     SET tcp_keepalives_count = 3; \
+     SET client_connection_check_interval = '10s'";
+
+/// Applies [`KEEPER_SETTINGS`], in one round trip.
+pub async fn keep(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(KEEPER_SETTINGS).await
+}
+
 /// The first OID a database assigns after initdb. Everything below it was
 /// created by initdb itself, in every database alike; anything at or above it
 /// was created afterwards, in this database or in the template it was cloned
@@ -519,7 +532,7 @@ pub async fn login_defaults(
 ) -> Result<std::collections::BTreeSet<(String, String)>, DbError> {
     let rows = conn
         .query(
-            "SELECT coalesce(d.datname::text, '') AS database, e.entry AS entry \
+            "SELECT coalesce(d.datname::pg_catalog.text, '') AS database, e.entry AS entry \
                FROM pg_catalog.pg_db_role_setting s \
                LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase \
                CROSS JOIN LATERAL pg_catalog.unnest(s.setconfig) AS e(entry) \
@@ -605,12 +618,31 @@ pub async fn owns_database(conn: &mut impl QueryConnection) -> Result<bool, DbEr
 pub async fn foreign_objects(
     conn: &mut impl QueryConnection,
 ) -> Result<(Vec<String>, usize), DbError> {
+    objects(conn, false).await
+}
+
+/// [`foreign_objects`], leaving out the claim schema when `beside_claim`: the
+/// record a release keeps until its last step is not what the cleanup left.
+async fn objects(
+    conn: &mut impl QueryConnection,
+    beside_claim: bool,
+) -> Result<(Vec<String>, usize), DbError> {
     let union = user_objects();
+    let except = if beside_claim {
+        format!(
+            "WHERE NOT (f.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass \
+                    AND f.objid IN (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                                     WHERE n.nspname = '{}'))",
+            super::recovery::CLAIM
+        )
+    } else {
+        String::new()
+    };
     let rows = conn
         .query(&format!(
             "SELECT pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS object, \
                     pg_catalog.count(*) OVER ()::text AS total \
-               FROM ({union}) f ORDER BY 1 LIMIT {NAMED}"
+               FROM ({union}) f {except} ORDER BY 1 LIMIT {NAMED}"
         ))
         .await?;
     let total = match rows.first() {
@@ -895,9 +927,24 @@ pub async fn drop_owned(
             "the connection now reaches another backend than the one the run checked".into(),
         ));
     }
+    // The claim is the run's record, removed last by the release: it goes
+    // through the cleanup and comes back before the commit (DEC-2410.1).
+    let claim = match super::recovery::comment(conn).await {
+        Ok(claim) => claim.flatten(),
+        Err(error) => {
+            conn.execute("ROLLBACK").await?;
+            return Err(error);
+        }
+    };
     conn.execute("DROP OWNED BY SESSION_USER").await?;
+    if let Some(comment) = &claim
+        && let Err(error) = super::recovery::create(conn, comment).await
+    {
+        conn.execute("ROLLBACK").await?;
+        return Err(error);
+    }
     conn.execute("COMMIT").await?;
-    foreign_objects(conn).await
+    objects(conn, claim.is_some()).await
 }
 
 #[cfg(test)]

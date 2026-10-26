@@ -43,7 +43,7 @@ const PUBLIC_GRANTEE: &str = "PUBLIC";
 
 /// One entry of an ACL, as `aclexplode` reads it with the defaults filled
 /// in: equal ACLs compare equal however they are spelled.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// A role name, or `PUBLIC`.
     pub grantee: String,
