@@ -61,6 +61,7 @@ fn module(kind: ModuleKind, module: &str, definition: &str) -> Change {
             kind,
             definition: definition.into(),
             description: None,
+            options: Default::default(),
         }),
     }
 }
@@ -792,6 +793,7 @@ fn function_in(schema: &str, function_name: &str, definition: &str) -> Change {
             kind: ModuleKind::Function,
             definition: definition.into(),
             description: None,
+            options: Default::default(),
         }),
     }
 }
@@ -1075,6 +1077,7 @@ fn ordinary_planning_still_refuses_a_computed_column_over_a_function_the_plan_cr
             kind: ModuleKind::Function,
             definition: FUNCTION.into(),
             description: None,
+            options: Default::default(),
         },
     );
     let empty = pbps_model::Schema::default();

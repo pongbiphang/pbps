@@ -799,6 +799,7 @@ fn the_managed_scope_names_the_roots_of_both_sides_and_nothing_else() {
             Module {
                 kind: ModuleKind::View,
                 description: None,
+                options: Default::default(),
                 definition: "SELECT 1 AS a".into(),
             },
         );

@@ -38179,6 +38179,7 @@ async fn catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments(
         schema.tables.insert(TableName::new("c", "t"), Default::default());
         schema.modules.insert(pbps_model::ModuleId::Named(TableName::new("c", "reader")), pbps_model::Module {
             kind: pbps_model::ModuleKind::View, definition: String::new(), description: None,
+            options: Default::default(),
         });
         let links = externals::links(&mut db.conn).await?;
         let managed = Managed::from_schema(&schema);
