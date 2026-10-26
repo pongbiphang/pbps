@@ -6917,7 +6917,7 @@ pub fn cmd_plan_db(
         // Target provenance must be checked before a stale local mapping can
         // obscure the deletions it would plan (DEC-2397.1).
         let runtime = db::runtime()?;
-        let (mut conn, mut entry, checkout_findings) = runtime.block_on(async {
+        let checked_target = runtime.block_on(async {
             let mut conn = db::connect(target).await?;
             let Some(entry) = crate::engine::latest(&mut conn).await? else {
                 bail!(
@@ -6942,7 +6942,15 @@ pub fn cmd_plan_db(
                     .into_iter()
                     .collect();
             Ok::<_, anyhow::Error>((conn, entry, findings))
-        })?;
+        });
+        // A failed target read cannot produce a plan, but must not replace the
+        // established local identity refusals with an environment failure
+        // (SPEC 9.8). Retain the error until those checks finish; it is never
+        // missing evidence that would permit planning to continue.
+        let (checked_target, checkout_findings) = match checked_target {
+            Ok((conn, entry, findings)) => (Ok((conn, entry)), findings),
+            Err(error) => (Err(error), Vec::new()),
+        };
         if !json {
             eprint!("{}", crate::output::human(&checkout_findings));
         }
@@ -7013,6 +7021,7 @@ pub fn cmd_plan_db(
             bail!("{message}");
         }
 
+        let (mut conn, mut entry) = checked_target?;
         let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
         let connected = runtime.block_on(async {
         dependencies = crate::engine::compare_dependencies(&mut conn, &loaded.dependencies).await?;
