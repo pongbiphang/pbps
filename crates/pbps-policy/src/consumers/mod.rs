@@ -5,7 +5,7 @@ mod changes;
 
 use crate::{Context, Policies, evaluate::Live};
 pub use binding::Bindings;
-use pbps_model::{ChangeSet, Finding, IdsFile, Module, ModuleId, Schema, Uid};
+use pbps_model::{ChangeSet, Finding, IdsFile, ModuleId, Schema, Uid};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type Consumers = BTreeMap<String, Consumer>;
@@ -152,7 +152,7 @@ pub fn plan(
     sides: &[Side<'_>; 2],
     policies: &Policies,
     ctx: &Context,
-    unchanged: &dyn Fn(&Module, &Module) -> bool,
+    unchanged: &dyn Fn(&pbps_model::Change, Option<&Uid>) -> bool,
 ) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
     let written = written_tables(bound, sides);

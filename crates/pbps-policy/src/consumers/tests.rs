@@ -47,10 +47,12 @@ fn context() -> Context {
         deprecated_types: &[],
     }
 }
-fn unchanged(before: &Module, after: &Module) -> bool {
-    (before.kind, &before.options, &before.definition)
-        == (after.kind, &after.options, &after.definition)
+// Policy unit cases supply the differ's answer; CLI tests exercise its real
+// canonicalization. Do not reimplement restoration equivalence in this crate.
+fn unchanged(_: &Change, _: Option<&Uid>) -> bool {
+    false
 }
+
 fn findings(
     before: &Schema,
     after: &Schema,
@@ -58,6 +60,17 @@ fn findings(
     new: &IdsFile,
     consumers: &Consumers,
     changes: Vec<Change>,
+) -> Vec<(usize, Finding)> {
+    findings_with_restoration(before, after, old, new, consumers, changes, false)
+}
+fn findings_with_restoration(
+    before: &Schema,
+    after: &Schema,
+    old: &IdsFile,
+    new: &IdsFile,
+    consumers: &Consumers,
+    changes: Vec<Change>,
+    restored: bool,
 ) -> Vec<(usize, Finding)> {
     let sides = [
         Side {
@@ -78,7 +91,7 @@ fn findings(
         &sides,
         &Policies::default(),
         &context(),
-        &unchanged,
+        &|_, _| restored,
     )
 }
 
@@ -310,7 +323,7 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
     let mut described = s.clone();
     described.modules.get_mut(&m).unwrap().description = Some("consumer report".into());
     assert!(
-        findings(
+        findings_with_restoration(
             &s,
             &described,
             &ids(),
@@ -322,7 +335,8 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
                     id: m.clone(),
                     module: Box::new(module.clone())
                 }
-            ]
+            ],
+            true,
         )
         .is_empty()
     );
@@ -546,7 +560,18 @@ fn unchanged_constraint_restorations_do_not_accuse_existing_writers() {
             expression: "((old)>(0))".into(),
         },
     };
-    assert!(findings(&s, &s, &i, &i, &consumers("app.t", true), vec![restore]).is_empty());
+    assert!(
+        findings_with_restoration(
+            &s,
+            &s,
+            &i,
+            &i,
+            &consumers("app.t", true),
+            vec![restore],
+            true
+        )
+        .is_empty()
+    );
 }
 
 #[test]
@@ -764,13 +789,14 @@ fn written_tables_include_the_whole_partition_tree_by_uid() {
             );
             assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));
             assert!(
-                findings(
+                findings_with_restoration(
                     &after,
                     &after,
                     &i,
                     &i,
                     &consumers(entry, true),
-                    vec![change.clone()]
+                    vec![change.clone()],
+                    true,
                 )
                 .is_empty(),
                 "an unchanged inherited constraint restoration is compatible"

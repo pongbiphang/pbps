@@ -2172,10 +2172,7 @@ pub fn attach_policy_findings<S: Clone>(
         &sides,
         &policies,
         &ctx,
-        &|before, after| {
-            pbps_diff::schema_diff::module_delta(before, after, dialect)
-                == pbps_diff::schema_diff::ModuleDelta::Unchanged
-        },
+        &pbps_diff::schema_diff::restoration_comparison(before, after, dialect),
     ));
     for (_, finding) in &findings {
         out.push(policy_finding(finding));
@@ -2191,6 +2188,308 @@ mod consumer_contract_tests {
         Change, ChangeSet, IdsFile, Module, ModuleKind, ModuleOptions, PlannedChange, Schema,
     };
     use pbps_policy::consumers::{Bindings, Consumer, Consumers, Side};
+
+    #[test]
+    fn restored_parts_share_the_differs_decisions_for_each_dialect() {
+        use pbps_model::{
+            CheckConstraint, Column, ColumnType, ComputedColumn, ForeignKey, Index, IndexColumn,
+            IndexKey, Part, PrimaryKey, ReferentialAction, Table, TableName, Uid, UniqueConstraint,
+        };
+        let table: TableName = "app.t".parse().unwrap();
+        let parent: TableName = "app.parent".parse().unwrap();
+        let renamed: TableName = "app.renamed".parse().unwrap();
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let reference: Uid = "t_bbbbbb".parse().unwrap();
+        let key = || IndexColumn {
+            key: IndexKey::Column("old".into()),
+            descending: false,
+            opclass: None,
+        };
+        let ctx = pbps_policy::Context {
+            now: 0,
+            max_rows: 1000,
+            connected: false,
+            only: None,
+            deprecated_types: &[],
+        };
+        for kind in [
+            Part::Computed,
+            Part::PrimaryKey,
+            Part::Unique,
+            Part::Check,
+            Part::ForeignKey,
+            Part::Index,
+        ] {
+            let mut shape = Table::default();
+            for column in ["old", "other"] {
+                let mut spec = Column::new(ColumnType::simple("integer"));
+                spec.nullable = false;
+                shape.columns.insert(column.into(), spec);
+            }
+            match kind {
+                Part::Computed => {
+                    shape.computed.insert(
+                        "derived".into(),
+                        ComputedColumn {
+                            expression: "old + 1".into(),
+                            persisted: true,
+                            not_null: true,
+                        },
+                    );
+                }
+                Part::PrimaryKey => {
+                    shape.primary_key = Some(PrimaryKey {
+                        name: Some("PK__generated".into()),
+                        columns: vec!["old".into()],
+                        storage_parameters: Default::default(),
+                    })
+                }
+                Part::Unique => {
+                    shape.unique.insert(
+                        "uq".into(),
+                        UniqueConstraint {
+                            columns: vec!["old".into()],
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }
+                Part::Check => {
+                    shape.checks.insert(
+                        "ck".into(),
+                        CheckConstraint {
+                            expression: "old > 0".into(),
+                        },
+                    );
+                }
+                Part::ForeignKey => {
+                    shape.foreign_keys.insert(
+                        "fk".into(),
+                        ForeignKey {
+                            columns: vec!["old".into()],
+                            references_table: parent.clone(),
+                            references_columns: vec!["old".into()],
+                            on_delete: Default::default(),
+                            on_update: Default::default(),
+                        },
+                    );
+                }
+                Part::Index => {
+                    shape.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: vec![key()],
+                            include: vec![],
+                            unique: true,
+                            filter: None,
+                            method: Default::default(),
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }
+                Part::Policy => unreachable!(),
+            }
+            let mut referenced = Table {
+                columns: shape.columns.clone(),
+                ..Default::default()
+            };
+            referenced.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["old".into()],
+                storage_parameters: Default::default(),
+            });
+            let before = Schema {
+                tables: [(table.clone(), shape.clone()), (parent.clone(), referenced)].into(),
+                ..Default::default()
+            };
+            let old = IdsFile {
+                tables: [
+                    (owner.clone(), table.clone()),
+                    (reference.clone(), parent.clone()),
+                ]
+                .into(),
+                columns: [
+                    ("c_aaaaaa".parse().unwrap(), table.column("old")),
+                    ("c_bbbbbb".parse().unwrap(), table.column("other")),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let mut canonical = before.clone();
+            let mut new = old.clone();
+            let after = canonical.tables.get_mut(&table).unwrap();
+            match kind {
+                // The catalog infers NOT NULL; its absence in YAML is not a change.
+                Part::Computed => after.computed.get_mut("derived").unwrap().not_null = false,
+                // The declaration leaves a generated constraint name to the engine.
+                Part::PrimaryKey => after.primary_key.as_mut().unwrap().name = None,
+                // Parameter-only edits keep the same unique restriction.
+                Part::Unique => {
+                    after
+                        .unique
+                        .get_mut("uq")
+                        .unwrap()
+                        .storage_parameters
+                        .insert("fillfactor".into(), "80".into());
+                }
+                Part::Index => {
+                    after
+                        .indexes
+                        .get_mut("ix")
+                        .unwrap()
+                        .storage_parameters
+                        .insert("fillfactor".into(), "80".into());
+                }
+                // Rename remapping belongs to the differ, including referenced UIDs.
+                Part::ForeignKey => {
+                    after.foreign_keys.get_mut("fk").unwrap().references_table = renamed.clone();
+                    let shape = canonical.tables.remove(&parent).unwrap();
+                    canonical.tables.insert(renamed.clone(), shape);
+                    new.tables.insert(reference.clone(), renamed.clone());
+                }
+                Part::Check => {}
+                Part::Policy => unreachable!(),
+            }
+            for changed in [false, true] {
+                let mut desired = canonical.clone();
+                let after = desired.tables.get_mut(&table).unwrap();
+                if changed {
+                    match kind {
+                        Part::Computed => {
+                            after.computed.get_mut("derived").unwrap().expression =
+                                "other + 1".into()
+                        }
+                        Part::PrimaryKey => {
+                            after.primary_key.as_mut().unwrap().columns = vec!["other".into()]
+                        }
+                        Part::Unique => {
+                            after.unique.get_mut("uq").unwrap().columns = vec!["other".into()]
+                        }
+                        Part::Check => {
+                            after.checks.get_mut("ck").unwrap().expression = "old > 10".into()
+                        }
+                        Part::ForeignKey => {
+                            after.foreign_keys.get_mut("fk").unwrap().on_delete =
+                                ReferentialAction::Cascade
+                        }
+                        Part::Index => {
+                            after.indexes.get_mut("ix").unwrap().columns[0].key =
+                                IndexKey::Column("other".into())
+                        }
+                        Part::Policy => unreachable!(),
+                    }
+                }
+                let restoration = match kind {
+                    Part::Computed => Change::DropComputedColumn {
+                        table: table.clone(),
+                        name: "derived".into(),
+                        computed: shape.computed["derived"].clone(),
+                    },
+                    Part::PrimaryKey => Change::SetPrimaryKey {
+                        table: table.clone(),
+                        from: None,
+                        to: after.primary_key.clone(),
+                        nonclustered: !after.primary_key_is_clustered(),
+                    },
+                    Part::Unique => Change::AddUnique {
+                        table: table.clone(),
+                        name: "uq".into(),
+                        constraint: after.unique["uq"].clone(),
+                        clustered: after.unique_is_clustered("uq"),
+                    },
+                    // The physical rebuild can carry the engine's expression spelling.
+                    Part::Check => Change::AddCheck {
+                        table: table.clone(),
+                        name: "ck".into(),
+                        constraint: CheckConstraint {
+                            expression: if changed { "old > 10" } else { "((old)>(0))" }.into(),
+                        },
+                    },
+                    Part::ForeignKey => Change::AddForeignKey {
+                        table: table.clone(),
+                        name: "fk".into(),
+                        constraint: Box::new(after.foreign_keys["fk"].clone()),
+                    },
+                    Part::Index => Change::AddIndex {
+                        table: table.clone(),
+                        name: "ix".into(),
+                        index: Box::new(after.indexes["ix"].clone()),
+                        clustered: after.index_is_clustered("ix"),
+                    },
+                    Part::Policy => unreachable!(),
+                };
+                let mut changes = vec![PlannedChange::new(restoration)];
+                if kind == Part::Computed {
+                    changes.push(PlannedChange::new(Change::AddComputedColumn {
+                        table: table.clone(),
+                        name: "derived".into(),
+                        computed: after.computed["derived"].clone(),
+                    }));
+                }
+                let cs = ChangeSet { changes };
+                let consumers: Consumers = [(
+                    "report".into(),
+                    Consumer {
+                        uses: if kind == Part::Computed {
+                            vec!["app.t.derived".into()]
+                        } else {
+                            vec![]
+                        },
+                        writes: if kind != Part::Computed {
+                            vec!["app.t".into()]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                )]
+                .into();
+                let sides = [
+                    Side {
+                        schema: &before,
+                        ids: &old,
+                    },
+                    Side {
+                        schema: &desired,
+                        ids: &new,
+                    },
+                ];
+                let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
+                for engine in [DialectName::Mssql, DialectName::Postgres] {
+                    let dialect = dialect_for(engine);
+                    let compare = pbps_diff::schema_diff::restoration_comparison(
+                        pbps_diff::Side {
+                            schema: &before,
+                            ids: &old,
+                        },
+                        pbps_diff::Side {
+                            schema: &desired,
+                            ids: &new,
+                        },
+                        dialect.as_ref(),
+                    );
+                    let findings = pbps_policy::consumers::plan(
+                        &cs,
+                        &bound,
+                        &sides,
+                        &pbps_policy::Policies::default(),
+                        &ctx,
+                        &compare,
+                    );
+                    assert_eq!(
+                        findings.is_empty(),
+                        !changed,
+                        "{kind:?}, changed={changed}, {engine:?}: {findings:?}"
+                    );
+                    assert!(findings.iter().all(|(_, f)| f.id == "consumer.unproven"
+                        && f.severity == pbps_model::Severity::Error));
+                    assert!(
+                        !compare(&cs.changes[0].change, None),
+                        "a table part without its owner cannot be unchanged"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn restored_modules_use_the_differs_equivalence_for_each_dialect() {
@@ -2282,10 +2581,17 @@ mod consumer_contract_tests {
                     &sides,
                     &pbps_policy::Policies::default(),
                     &ctx,
-                    &|before, after| {
-                        pbps_diff::schema_diff::module_delta(before, after, dialect.as_ref())
-                            == pbps_diff::schema_diff::ModuleDelta::Unchanged
-                    },
+                    &pbps_diff::schema_diff::restoration_comparison(
+                        pbps_diff::Side {
+                            schema: &before,
+                            ids: &ids,
+                        },
+                        pbps_diff::Side {
+                            schema: &after,
+                            ids: &ids,
+                        },
+                        dialect.as_ref(),
+                    ),
                 );
                 assert_eq!(
                     findings.is_empty(),

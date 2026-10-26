@@ -3,9 +3,7 @@ use super::{
     Side,
     binding::{Entry, Target},
 };
-use pbps_model::{
-    Change, ChangeSet, ColumnRef, Module, PlannedChange, RiskClass, Uid, ValueSource,
-};
+use pbps_model::{Change, ChangeSet, ColumnRef, PlannedChange, RiskClass, Uid, ValueSource};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
@@ -80,7 +78,7 @@ pub(super) fn classify(
     written: Option<&BTreeSet<Uid>>,
     cs: &ChangeSet,
     sides: &[Side<'_>],
-    unchanged: &dyn Fn(&Module, &Module) -> bool,
+    unchanged: &dyn Fn(&Change, Option<&Uid>) -> bool,
 ) -> Option<Class> {
     use Class::{Breaking as B, Unproven as U};
     let hit = table.is_some() && table == entry.table();
@@ -119,15 +117,6 @@ pub(super) fn classify(
         }
     };
     let write = |yes| (entry.writes && yes).then_some(U);
-    let unchanged_module = |id| {
-        sides
-            .first()
-            .and_then(|s| s.schema.modules.get(id))
-            .zip(sides.last().and_then(|s| s.schema.modules.get(id)))
-            .is_some_and(|(before, after)| unchanged(before, after))
-    };
-    let before = sides.first().and_then(|s| s.table(table));
-    let after = sides.last().and_then(|s| s.table(table));
     match &p.change {
         Change::RebuildPartitionedTable(_) => hit.then_some(U),
         Change::BuildPartitionedIndex(index) => {
@@ -136,7 +125,7 @@ pub(super) fn classify(
                 pbps_model::PartitionIndexDefinition::PrimaryKey(_)
                 | pbps_model::PartitionIndexDefinition::Unique(_) => true,
             };
-            write(write_hit && unique)
+            write(write_hit && unique && !unchanged(&p.change, table))
         }
         Change::RenameEnumValue { name, .. } | Change::DropType { name, .. } => {
             uses_type(entry, name, sides).then_some(U)
@@ -196,26 +185,19 @@ pub(super) fn classify(
                 && (p.risks.contains(&RiskClass::Numbering)
                     || p.risks.contains(&RiskClass::Rename)),
         ),
-        Change::DropComputedColumn { table, name, .. } => {
+        Change::DropComputedColumn {
+            table: owner, name, ..
+        } => {
             if !named(name) || entry.writes {
                 return None;
             }
-            match sides
-                .last()
-                .and_then(|s| s.ids.tables.get(entry.table()?))
-                .and_then(|t| sides.last()?.schema.tables.get(t))
-                .and_then(|t| t.computed.get(name))
-            {
-                Some(final_column)
-                    if before.and_then(|t| t.computed.get(name)) == Some(final_column) =>
-                {
-                    None
-                }
-                Some(_) => Some(U),
-                None => {
-                    let restored = cs.changes.iter().any(|p| matches!(&p.change, Change::AddColumn { table: t, name: n, .. } if t == table && n == name));
-                    Some(if restored { U } else { B })
-                }
+            if unchanged(&p.change, table) {
+                None
+            } else {
+                let restored = sides.last().and_then(|s| s.table(table))
+                    .is_some_and(|t| t.computed.contains_key(name))
+                    || cs.changes.iter().any(|p| matches!(&p.change, Change::AddColumn { table: t, name: n, .. } if t == owner && n == name));
+                Some(if restored { U } else { B })
             }
         }
         Change::SetPartitionDefault { table, column, .. } => {
@@ -229,54 +211,35 @@ pub(super) fn classify(
         } => (nullability(named(column), !not_null)
             && !supplied_new(&table.column(column.clone()), cs, sides))
         .then_some(U),
-        // A dependent restoration can carry the engine's spelling. Compare
-        // the logical before/after declarations, never that physical payload.
-        Change::SetPrimaryKey { to, .. } => write(
-            write_hit
-                && to.is_some()
-                && before.and_then(|t| t.primary_key.as_ref())
-                    != after.and_then(|t| t.primary_key.as_ref()),
-        ),
-        Change::AddUnique { name, .. } => write(
-            write_hit
-                && before.and_then(|t| t.unique.get(name))
-                    != after.and_then(|t| t.unique.get(name)),
-        ),
-        Change::AddCheck { name, .. } => write(
-            write_hit
-                && before.and_then(|t| t.checks.get(name))
-                    != after.and_then(|t| t.checks.get(name)),
-        ),
-        Change::AddForeignKey {
-            name, constraint, ..
-        } => {
-            let unchanged = before.and_then(|t| t.foreign_keys.get(name))
-                == after.and_then(|t| t.foreign_keys.get(name));
-            write(
-                !unchanged
-                    && (write_hit
-                        || sides.iter().any(|s| {
-                            s.ids
-                                .table_uid(&constraint.references_table)
-                                .is_some_and(|uid| written.is_some_and(|set| set.contains(uid)))
-                        })),
-            )
+        // Restoration equivalence belongs to the differ, including generated
+        // names, inferred attributes, rename remapping and parameter-only edits.
+        Change::SetPrimaryKey { to, .. } => {
+            write(write_hit && to.is_some() && !unchanged(&p.change, table))
         }
-        Change::AddIndex { name, index, .. } => write(
-            write_hit
-                && index.unique
-                && before.and_then(|t| t.indexes.get(name))
-                    != after.and_then(|t| t.indexes.get(name)),
+        Change::AddUnique { .. } | Change::AddCheck { .. } => {
+            write(write_hit && !unchanged(&p.change, table))
+        }
+        Change::AddForeignKey { constraint, .. } => write(
+            !unchanged(&p.change, table)
+                && (write_hit
+                    || sides.iter().any(|s| {
+                        s.ids
+                            .table_uid(&constraint.references_table)
+                            .is_some_and(|uid| written.is_some_and(|set| set.contains(uid)))
+                    })),
         ),
+        Change::AddIndex { index, .. } => {
+            write(write_hit && index.unique && !unchanged(&p.change, table))
+        }
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => (entry.target
             == Target::Module(id.clone())
-            && !unchanged_module(id)
+            && !unchanged(&p.change, table)
             && sides
                 .first()
                 .is_some_and(|s| s.schema.modules.contains_key(id)))
         .then_some(U),
         Change::DropModule { id, .. } => {
-            if entry.target != Target::Module(id.clone()) || unchanged_module(id) {
+            if entry.target != Target::Module(id.clone()) || unchanged(&p.change, table) {
                 None
             } else {
                 Some(

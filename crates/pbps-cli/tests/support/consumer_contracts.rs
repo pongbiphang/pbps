@@ -319,6 +319,44 @@ pub(super) fn live(server: &str, pg: bool) {
         "destructive,not-null",
     ]));
     ok(d.run(&["verify", "--db", connection]));
+    {
+        let own = OwnDatabase::new(server, "consumer_key2398");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("consumer-unnamed-key");
+        let declared = "table: app.t\ncolumns:\n  old: {type: integer, nullable: false}\n  other: {type: integer, nullable: false}\nprimary_key: [old]\n";
+        d.table(declared);
+        ok(d.run(&["plan"]));
+        d.commit();
+        ok(d.run(&["bootstrap", "--db", connection]));
+        config(&d, "consumers:\n  writer: {writes: [app.t]}\n");
+        let wider = declared.replace("old: {type: integer", "old: {type: bigint");
+        d.table(&wider);
+        let plan = d.dir.join("unnamed-key.json");
+        ok(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        if !pg {
+            assert!(
+                std::fs::read_to_string(&plan)
+                    .unwrap()
+                    .contains("set_primary_key"),
+                "the generated SQL Server key must be physically restored"
+            );
+        }
+        ok(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--allow",
+            "destructive,constraint",
+        ]));
+        ok(d.run(&["verify", "--db", connection]));
+        d.table(&wider.replace("primary_key: [old]", "primary_key: [other]"));
+        refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    }
     if pg {
         let own = OwnDatabase::new(server, "consumer_partitions2398");
         let connection = own.connection();
