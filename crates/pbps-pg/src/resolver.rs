@@ -256,10 +256,9 @@ pub async fn drop_roles(
     conn: &mut impl ExecuteConnection,
     roles: &[pbps_model::RoleName],
 ) -> Vec<pbps_model::RoleName> {
-    let quoted = |role: &pbps_model::RoleName| format!("\"{}\"", role.raw().replace('"', "\"\""));
     let mut failed = Vec::new();
     for batch in roles.chunks(ROLE_BATCH) {
-        let all = batch.iter().map(quoted).collect::<Vec<_>>().join(", ");
+        let all = batch.iter().map(quoted_role).collect::<Vec<_>>().join(", ");
         if conn
             .execute(&format!("DROP ROLE IF EXISTS {all}"))
             .await
@@ -268,7 +267,7 @@ pub async fn drop_roles(
             continue;
         }
         for role in batch {
-            let statement = format!("DROP ROLE IF EXISTS {}", quoted(role));
+            let statement = format!("DROP ROLE IF EXISTS {}", quoted_role(role));
             if conn.execute(&statement).await.is_err() {
                 failed.push(role.clone());
             }
@@ -305,13 +304,16 @@ pub async fn create_rehearsal_roles(
     roles: &[pbps_model::RoleName],
 ) -> Result<(), DbError> {
     for role in roles {
-        conn.execute(&format!(
-            "CREATE ROLE \"{}\" NOLOGIN",
-            role.raw().replace('"', "\"\"")
-        ))
-        .await?;
+        conn.execute(&format!("CREATE ROLE {} NOLOGIN", quoted_role(role)))
+            .await?;
     }
     Ok(())
+}
+
+/// A role name as an identifier in a statement: the one place a run's role
+/// names are quoted, for creating them and for dropping them.
+fn quoted_role(role: &pbps_model::RoleName) -> String {
+    format!("\"{}\"", role.raw().replace('"', "\"\""))
 }
 
 /// Removes exactly the two run-owned objects. FORCE closes this run's own
