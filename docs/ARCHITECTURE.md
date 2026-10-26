@@ -9,7 +9,8 @@ See [SPEC §11](SPEC.md#11-architecture) for the overall design and
 ```text
 pbps-model     Domain model. Dialect-agnostic, span-free, serializes to JSON:
                the ids file, the state snapshot, the saved plan, the drift report
-pbps-config    Project configuration (pbps.yml): paths, environments, hooks
+pbps-config    Project configuration (pbps.yml): paths, environments, hooks; and the
+               text-only `pbps test` manifest (no filesystem, no git)
 pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
 pbps-diff      model <-> ids comparison -> immutable PlanningPlan. Produces no SQL. Also owns
                the managed-set scope and observed identity

@@ -28,6 +28,15 @@ mod output;
 mod partitions;
 mod paths;
 mod pins;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        unused_imports,
+        reason = "#1165 PR D wires the `test` command"
+    )
+)]
+mod plan_test;
 mod prompt;
 mod publication;
 mod reason_input;
