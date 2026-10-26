@@ -237,11 +237,18 @@ impl Adapter for Sandboxed<'_, '_> {
     }
 
     async fn remove(&mut self, token: &str, _: &Resource) -> Result<(), Failed> {
+        let sandbox = format!("pbps_sandbox_{token}");
+        // A run killed between creating its user and adding it to `db_owner`
+        // never acted as it, and the sandboxed cleanup would refuse a user
+        // that does not own the database. Such a user is dropped from the
+        // owner's side alone.
+        self.scratch.entered = record::sandbox_owns(self.admin, &sandbox)
+            .await
+            .map_err(|error| format!("sandbox user {sandbox}'s role: {error}"))?;
         self.scratch.created = Created::Supplied {
             database: self.database.clone(),
-            sandbox: format!("pbps_sandbox_{token}"),
+            sandbox,
         };
-        self.scratch.entered = true;
         self.scratch
             .release_scratch(self.admin, false)
             .await

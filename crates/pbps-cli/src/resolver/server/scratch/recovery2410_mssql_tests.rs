@@ -1048,6 +1048,17 @@ impl Supplied {
         }
     }
 
+    /// The sandbox user of a run killed before it was added to `db_owner`.
+    async fn leave_unowned_sandbox(&self, token: &str) {
+        connection(&self.admin)
+            .await
+            .execute(&format!(
+                "CREATE USER [pbps_sandbox_{token}] WITHOUT LOGIN;"
+            ))
+            .await
+            .unwrap();
+    }
+
     async fn names(&self) -> Vec<String> {
         sql::inventory::read(&mut connection(&self.admin).await, None)
             .await
@@ -1085,6 +1096,26 @@ async fn a_supplied_run_killed_after_its_sandbox_is_cleaned_by_the_next_run() {
         assert_eq!(collected.groups[0].token, dead);
         assert!(collected.groups[0].kept.is_empty(), "{objects}");
     }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_supplied_run_killed_before_its_sandbox_owned_the_database_is_cleaned_by_the_next_run() {
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let supplied = Supplied::new(&scratch).await;
+    let dead = token();
+    supplied.leave_unowned_sandbox(&dead).await;
+    let seen = supplied.names().await;
+    recovery::take();
+    run(&supplied.connection).await;
+    let collected = recovery::take();
+    let left = supplied.names().await;
+    supplied.drop().await;
+    assert!(!seen.is_empty(), "the leftover is there to find");
+    assert_eq!(left, Vec::<String>::new(), "the database is empty again");
+    assert_eq!(collected.groups.len(), 1, "{collected:?}");
+    assert_eq!(collected.groups[0].token, dead);
+    assert!(collected.groups[0].kept.is_empty(), "{collected:?}");
 }
 
 #[tokio::test]

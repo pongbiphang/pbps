@@ -218,6 +218,25 @@ pub async fn sandboxes(conn: &mut impl QueryConnection, own: &str) -> Result<Vec
     Ok(tokens)
 }
 
+/// Whether the sandbox user `name` of the current database is a member of
+/// `db_owner`. A run creates the user and then adds it to the role, so a run
+/// killed in between leaves a user it never acted as, which therefore owns
+/// nothing to clean up as itself.
+pub async fn sandbox_owns(conn: &mut impl QueryConnection, name: &str) -> Result<bool, DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT CONVERT(int, ISNULL(IS_ROLEMEMBER(N'db_owner', {}), 0)) AS owns;",
+            literal(name)
+        ))
+        .await?;
+    Ok(rows
+        .first()
+        .map(|row| row.try_get::<i32>("owns"))
+        .transpose()?
+        .flatten()
+        == Some(1))
+}
+
 /// Records, in the run's scratch database and before it exists, the `index`th
 /// companion database the run creates.
 pub async fn record_companion(
