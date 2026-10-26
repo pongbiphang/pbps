@@ -368,10 +368,15 @@ impl Scratch<'_> {
                     // Recorded before it exists, and marked once it does: a
                     // companion carries the dependency's own name, so the
                     // record is what lets a later run find it (`recovery`).
+                    record::record_companion(
+                        admin,
+                        names.database(),
+                        self.recorded.len(),
+                        &database,
+                    )
+                    .await
+                    .map_err(read)?;
                     self.recorded.push(database.clone());
-                    record::record_companions(admin, names.database(), &self.recorded)
-                        .await
-                        .map_err(read)?;
                     let companion = sql::companion::Companion::create(admin, &database)
                         .await
                         .map_err(read)?;

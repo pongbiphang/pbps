@@ -1350,8 +1350,8 @@ async fn properties(
         "SELECT e.class,e.name,e.minor_id,SCHEMA_NAME(o.schema_id) AS schema_name,o.name AS \
          object_name, COL_NAME(e.major_id,e.minor_id) AS column_name,SCHEMA_NAME(e.major_id) \
          AS property_schema FROM sys.extended_properties e LEFT JOIN sys.objects o ON \
-         e.class=1 AND o.object_id=e.major_id WHERE NOT (e.class=0 AND e.name IN \
-         (N'pbps_run',N'pbps_companions'));",
+         e.class=1 AND o.object_id=e.major_id WHERE NOT (e.class=0 AND (e.name = N'pbps_run' \
+         OR e.name LIKE N'pbps[_]companion[_]%'));",
     )
     .await?
     {

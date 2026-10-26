@@ -2342,6 +2342,7 @@
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_file_requires_explicit_allow",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::empty_file_still_requires_same_instance_allow",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::target_database_is_always_refused",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_record_longer_than_one_property_holds_is_read_back_in_order",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_run_killed_at_any_stage_is_removed_by_the_next_run",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_the_run_did_not_mark_is_kept_with_its_run",
         "resolver::server::scratch::mssql_live_tests::recovery2410::a_live_runs_resources_are_never_touched_by_another_runs_sweep",

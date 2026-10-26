@@ -110,7 +110,7 @@ async fn leave_inner(scratch: &str, token: &str, stage: Stage) -> Vec<String> {
         | Stage::CompanionUnmarked
         | Stage::CompanionOfAnother => {
             let companion = companion_of(token);
-            record::record_companions(&mut admin, &database, std::slice::from_ref(&companion))
+            record::record_companion(&mut admin, &database, 0, &companion)
                 .await
                 .unwrap();
             if stage != Stage::CompanionRecorded {
@@ -243,6 +243,35 @@ async fn scrub_inner(scratch: &str, databases: &[String], logins: &[String]) {
     for login in logins {
         let _ = record::drop_login(&mut admin, login).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_companion_record_longer_than_one_property_holds_is_read_back_in_order() {
+    // 64 names of the longest identifier are about 16 kB as one value, past the
+    // 7,500 bytes one extended property holds; the record is one property per
+    // companion, and twelve or more of them prove the order is numeric.
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let database = format!("pbps_scratch_{}", token());
+    let mut admin = connection(&scratch).await;
+    admin
+        .execute(&format!("CREATE DATABASE [{database}];"))
+        .await
+        .unwrap();
+    let names: Vec<String> = (0..64)
+        .map(|n| format!("{n:0>3}{}", "c".repeat(125)))
+        .collect();
+    let mut recorded = Ok(());
+    for (index, name) in names.iter().enumerate() {
+        recorded = record::record_companion(&mut admin, &database, index, name).await;
+        if recorded.is_err() {
+            break;
+        }
+    }
+    let read = record::recorded_companions(&mut admin, &database).await;
+    scrub(&scratch, std::slice::from_ref(&database), &[]).await;
+    recorded.expect("every companion is recorded");
+    assert_eq!(read.unwrap(), names);
 }
 
 #[tokio::test]

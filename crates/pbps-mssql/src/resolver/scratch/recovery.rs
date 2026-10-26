@@ -18,14 +18,16 @@
 //! - **A companion database is the exception.** It must carry the
 //!   dependency's own name for cross-database references to resolve, so it
 //!   cannot carry the token, and a leftover one would refuse every later run
-//!   that needs the name. Its record is a property of the run's scratch
-//!   database, written before the companion exists, and the companion is
-//!   marked with its owner once it does. A database named in the record that
+//!   that needs the name. Its record is one property of the run's scratch
+//!   database per companion, written before the companion exists, and the
+//!   companion is marked with its owner once it does. One property each, not
+//!   one list: a property value holds at most 7,500 bytes, and a list of long
+//!   names would outgrow it and refuse a valid run. A database named in the record that
 //!   does not carry the run's mark is not provably the run's and is kept.
 //!
 //! The scratch database's own properties are part of what the emptiness check
-//! reads, so the check ignores these two names ([`RUN_PROPERTY`],
-//! [`COMPANIONS_PROPERTY`]).
+//! reads, so the check ignores [`RUN_PROPERTY`] and every
+//! [`COMPANION_PREFIX`] property.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,9 +42,10 @@ pub const TOKEN_LEN: usize = 32;
 /// The database-level property on a companion that names the run that made it.
 pub const RUN_PROPERTY: &str = "pbps_run";
 
-/// The database-level property on a run's scratch database that lists the
-/// companion databases the run is about to create or has created.
-pub const COMPANIONS_PROPERTY: &str = "pbps_companions";
+/// The prefix of the database-level properties on a run's scratch database
+/// that name, one each, the companion databases the run is about to create or
+/// has created: `pbps_companion_<n>`, numbered in creation order.
+pub const COMPANION_PREFIX: &str = "pbps_companion_";
 
 fn is_token(token: &str) -> bool {
     token.len() == TOKEN_LEN
@@ -215,20 +218,19 @@ pub async fn sandboxes(conn: &mut impl QueryConnection, own: &str) -> Result<Vec
     Ok(tokens)
 }
 
-/// Records, in the run's scratch database and before any of them exists, the
-/// companion databases the run creates.
-pub async fn record_companions(
+/// Records, in the run's scratch database and before it exists, the `index`th
+/// companion database the run creates.
+pub async fn record_companion(
     conn: &mut impl ExecuteConnection,
     scratch: &str,
-    names: &[String],
+    index: usize,
+    name: &str,
 ) -> Result<(), DbError> {
-    let json = serde_json::to_string(names).map_err(|e| DbError::BadRow(e.to_string()))?;
-    let (db, property, value) = (ident(scratch), literal(COMPANIONS_PROPERTY), literal(&json));
     conn.execute(&format!(
-        "IF EXISTS (SELECT 1 FROM {db}.sys.extended_properties WHERE class = 0 AND name = \
-         {property}) EXEC {db}.sys.sp_updateextendedproperty @name = {property}, @value = \
-         {value}; ELSE EXEC {db}.sys.sp_addextendedproperty @name = {property}, @value = \
-         {value};"
+        "EXEC {}.sys.sp_addextendedproperty @name = {}, @value = {};",
+        ident(scratch),
+        literal(&format!("{COMPANION_PREFIX}{index}")),
+        literal(name)
     ))
     .await
 }
@@ -256,16 +258,13 @@ pub async fn recorded_companions(
     let rows = conn
         .query(&format!(
             "SELECT CONVERT(nvarchar(max), value) AS value FROM {}.sys.extended_properties \
-              WHERE class = 0 AND name = {};",
+              WHERE class = 0 AND name LIKE N'pbps[_]companion[_]%' \
+              ORDER BY TRY_CONVERT(int, SUBSTRING(name, {}, 10));",
             ident(scratch),
-            literal(COMPANIONS_PROPERTY)
+            COMPANION_PREFIX.len() + 1
         ))
         .await?;
-    let Some(row) = rows.first() else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_str(&text(row, "value")?)
-        .map_err(|e| DbError::BadRow(format!("the companion record is not a list of names: {e}")))
+    rows.iter().map(|row| text(row, "value")).collect()
 }
 
 /// Whose a database is: not there, marked by `token` or another, or unmarked.
