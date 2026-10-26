@@ -513,7 +513,46 @@ fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusal
         "{found:?}"
     );
 
+    // A version this tool cannot read is not a wrong file: it cannot be judged.
     repo.write("schema.ids.json", "{\"version\": 99}");
+    let newer = repo.commit("newer format");
+    repo.manifest(&newer, &[("f", &c1)], None);
+    let found = refused(repo.validate());
+    assert!(
+        at(&found, &newer)
+            .iter()
+            .any(|p| matches!(p, RevisionProblem::IdsUnsupportedVersion { found: 99, .. })),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|r| matches!(
+            r,
+            Refusal::At {
+                problem: RevisionProblem::IdsUnsupportedVersion { .. },
+                ..
+            }
+        ) && r.outcome() == Outcome::Unanswerable),
+        "{found:?}"
+    );
+
+    // Two tables claiming one name: this tool wrote a file it cannot have.
+    std::fs::remove_file(repo.project.join("schema.ids.json")).unwrap();
+    repo.refresh_ids();
+    let mut ids: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo.project.join("schema.ids.json")).unwrap(),
+    )
+    .unwrap();
+    let tables = ids["tables"].as_object_mut().unwrap();
+    let (uid, name) = tables
+        .iter()
+        .next()
+        .map(|(u, n)| (u.clone(), n.clone()))
+        .unwrap();
+    let mut other = uid.clone();
+    let last = other.pop().unwrap();
+    other.push(if last == '0' { '1' } else { '0' });
+    tables.insert(other, name);
+    repo.write("schema.ids.json", serde_json::to_string(&ids).unwrap());
     let inconsistent = repo.commit("inconsistent");
     repo.manifest(&inconsistent, &[("f", &c1)], None);
     let found = refused(repo.validate());
@@ -1031,4 +1070,34 @@ fn working_declarations_whose_names_are_not_utf8_are_refused_not_merged_by_lossy
         )),
         "{found:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_working_path_through_a_symlink_keeps_the_spelling_that_reached_the_file() {
+    let (repo, _, _) = standard();
+    // `alias/..` is `schema`, because `alias` is `schema/nested`: collapsing
+    // the `..` lexically would record the project root instead.
+    std::fs::create_dir_all(repo.project.join("schema/nested")).unwrap();
+    std::os::unix::fs::symlink("schema/nested", repo.project.join("alias")).unwrap();
+    repo.write("pbps.yml", "dialect: postgres\nschema_dir: alias/..\n");
+    let inputs = repo.validate().unwrap();
+    let working: Vec<_> = inputs
+        .identity
+        .files
+        .iter()
+        .filter(|f| f.revision == Revision::Working && f.role == Role::Declaration)
+        .map(|f| f.path.clone())
+        .collect();
+    assert!(
+        working.iter().all(|p| p.starts_with("alias/../")),
+        "{working:?}"
+    );
+    for path in &working {
+        assert!(
+            repo.project.join(path).is_file(),
+            "{path} must name the file read"
+        );
+    }
+    inputs.reverify().unwrap();
 }

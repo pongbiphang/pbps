@@ -21,6 +21,7 @@ use pbps_config::test_manifest::CommitId;
 use pbps_config::{Config, DialectName};
 use pbps_model::IdsFile;
 use pbps_model::escape::Escaped;
+use pbps_model::ids::IdsError;
 use sha2::{Digest as _, Sha256};
 
 use super::{ConsumedFile, Revision, Role};
@@ -75,6 +76,15 @@ pub(crate) enum Problem {
         Escaped(reason)
     )]
     IdsInconsistent { path: String, reason: String },
+    #[error(
+        "identity file `{}` is version {found}, and this tool reads version {supported}",
+        Escaped(path)
+    )]
+    IdsUnsupportedVersion {
+        path: String,
+        found: u32,
+        supported: u32,
+    },
     #[error(
         "identity intent is missing ({} decision(s)); record it with the ordinary commands \
          (`pbps plan` lists them) and commit the result",
@@ -336,25 +346,22 @@ pub(super) fn git_objects_tree_exists(
 /// Reads the inputs of the working tree at `root` (canonical): the files
 /// `plan` reads, in the bytes they have now.
 pub(super) fn read_working(root: &Path) -> Result<Raw, Vec<Problem>> {
+    // The path as it was traversed, relative to the root. Collapsing `..`
+    // lexically would be wrong after a symlink: `alias/..` is the parent of
+    // what `alias` points at, not the root, so the recorded name must keep
+    // the spelling the kernel resolved to read the file.
     let shown = |path: &Path| {
-        let normal = |p: &Path| {
-            let mut parts: Vec<String> = Vec::new();
-            for component in p.components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        parts.pop();
-                    }
-                    std::path::Component::Normal(part) => {
-                        parts.push(part.to_string_lossy().into_owned());
-                    }
-                    std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-                    | std::path::Component::CurDir => {}
-                }
-            }
-            parts.join("/")
-        };
-        relative(&normal(root), &normal(path))
+        path.strip_prefix(root).map_or_else(
+            |_| path.display().to_string(),
+            |inside| {
+                inside
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            },
+        )
     };
     let regular = |path: &Path| -> Result<Option<Vec<u8>>, Problem> {
         let named = shown(path);
@@ -534,6 +541,15 @@ pub(super) fn assemble(
                     }]
                 })?;
             ids.validate().map_err(|e| {
+                // A version this tool cannot read says nothing about whether
+                // the file is wrong, so it is not reported as inconsistent.
+                if let IdsError::UnsupportedVersion { found, supported } = e {
+                    return vec![Problem::IdsUnsupportedVersion {
+                        path: path.clone(),
+                        found,
+                        supported,
+                    }];
+                }
                 vec![Problem::IdsInconsistent {
                     path: path.clone(),
                     reason: e.to_string(),

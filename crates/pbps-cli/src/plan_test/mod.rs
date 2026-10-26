@@ -196,7 +196,8 @@ impl Refusal {
             | Refusal::Changed { .. }
             | Refusal::HeadMoved { .. }
             | Refusal::At {
-                problem: RevisionProblem::Unreadable { .. },
+                problem:
+                    RevisionProblem::Unreadable { .. } | RevisionProblem::IdsUnsupportedVersion { .. },
                 ..
             }
             | Refusal::Git {
