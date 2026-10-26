@@ -1362,6 +1362,26 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
 | **A disappearance and an addition in the same table** | **Yes** | Rename or drop+add; indistinguishable |
 | A range partition beside a DEFAULT that holds rows of its range | **Yes** (to apply: a bound and a reason) | Moving the rows is a delete and an insert, and whether the environment tolerates that is not in the catalog (6.5) |
 
+Before resolving identities, connected `plan --db` / `plan --env` checks a
+checkout that would remove a managed table, column or role against the target's
+deployed Git commit (DEC-2397.1). HEAD must contain that commit as an ancestor,
+including equality. The inventory is removal from management: PostgreSQL role
+removal is included even though its principal remains and its grants are
+revoked. Recorded drop intent does not bypass this check. Refusals list every
+removal by name in deterministic order, without truncation, and instruct the
+author to merge or rebase onto the deployed commit. A missing commit requires
+fetching history first; shallow clones get the `fetch-depth: 0` remedy. Git
+read failures refuse with a repair remedy, rather than pretending no evidence
+exists. Additions, modifications and identity-preserving renames are unaffected.
+
+The commit evidence is the newest non-failed ledger row at or before the latest
+snapshot read by the planner. Failed attempts name the attempted checkout and
+must not replace deployed provenance. A selected row with NULL `git_sha`, no
+retained non-failed row, or a planning project without Git keeps the existing
+planning behavior with an explicit human/JSON note. It does not search older
+rows for a non-NULL SHA and does not infer per-object provenance. Connected
+planning still changes neither declarations nor identities on disk.
+
 ### 7.2 Risk classes
 
 | Class | Trigger | Risk |
@@ -1420,6 +1440,10 @@ pbps apply --db $ENV --plan plan.json --checksum $APPROVED_PLAN_SHA256 --allow r
 
 `apply` first verifies that the database's current checksum still equals the
 baseline the plan was computed against, and aborts otherwise — the drift check.
+The checkout-ancestry check belongs to planning only (DEC-2397.2): applying an
+approved saved plan requires no Git checkout. A target that advances after
+planning is covered by this existing checksum check under the deployment lock,
+not by consulting the applying host's history.
 
 On PostgreSQL the plan also records the target's session time zone, the one a
 fresh session of the deploying connection gets (server, database, role,

@@ -297,6 +297,16 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
     }
 }
 
+pub async fn deployed_revision(
+    conn: &mut Conn,
+    observed_id: i64,
+) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
+    match conn.driver() {
+        Driver::Mssql => pbps_mssql::state::deployed_revision(conn, observed_id).await,
+        Driver::Postgres => pbps_pg::state::deployed_revision(conn, observed_id).await,
+    }
+}
+
 pub async fn entry(
     conn: &mut Conn,
     id: Option<i64>,

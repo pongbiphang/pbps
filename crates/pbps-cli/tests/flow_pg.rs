@@ -35840,3 +35840,22 @@ fn a_resolved_plan_builds_declared_enums_and_domains_on_scratch() {
         resolver_publication::declared_types(&std::env::var(variable).unwrap());
     }
 }
+
+#[path = "support/stale_checkout.rs"]
+mod stale_checkout;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn stale_checkouts_cannot_remove_target_managed_objects() {
+    for server in [server(), old_server()] {
+        stale_checkout::acceptance(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn failed_attempts_do_not_replace_deployed_commit_evidence() {
+    for server in [server(), old_server()] {
+        stale_checkout::failed_attempt(&server, true);
+    }
+}

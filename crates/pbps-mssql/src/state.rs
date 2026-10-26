@@ -474,6 +474,26 @@ pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError>
     rows.first().map(entry_from_row).transpose()
 }
 
+/// Commit evidence at or before the snapshot the caller already observed.
+/// Reading projected metadata avoids decoding an obsolete historical snapshot.
+pub async fn deployed_revision(
+    conn: &mut Conn,
+    observed_id: i64,
+) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
+    let rows = conn.query_with(
+        "SELECT TOP (1) id, git_sha FROM dbo.__pbps_state WHERE id <= @P1 AND kind <> N'failed' ORDER BY id DESC",
+        &[observed_id.into()],
+    ).await?;
+    rows.first()
+        .map(|row| {
+            Ok(pbps_db::ledger::StateRevision {
+                id: get(row, "id")?,
+                git_sha: opt::<&str>(row, "git_sha")?.map(pbps_model::Text::from),
+            })
+        })
+        .transpose()
+}
+
 /// A selected historical entry, or the newest when no id is supplied.
 /// This is a read: it never creates or migrates the ledger.
 pub async fn entry(

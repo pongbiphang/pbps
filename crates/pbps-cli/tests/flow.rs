@@ -23730,3 +23730,18 @@ mod message_boundaries;
 fn step5_connected_drift_and_ledger_refusals_show_each_name_once() {
     message_boundaries::drift_and_ledger(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[path = "support/stale_checkout.rs"]
+mod stale_checkout;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn stale_checkouts_cannot_remove_target_managed_objects() {
+    stale_checkout::acceptance(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn failed_attempts_do_not_replace_deployed_commit_evidence() {
+    stale_checkout::failed_attempt(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}

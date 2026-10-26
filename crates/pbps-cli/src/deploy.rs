@@ -32,6 +32,7 @@ use pbps_model::{
 
 use crate::db::{self, Target};
 
+mod checkout;
 mod guard;
 
 /// A scoped live state, plus the declared modules the read could not express.
@@ -6973,6 +6974,61 @@ pub fn cmd_plan_db(
         let ids = crate::read_ids(project)?;
         refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
         let created_at = crate::now();
+        // Keep the runtime alive for this connection across identity resolution.
+        // Target provenance must be checked before a stale local mapping can
+        // obscure the deletions it would plan (DEC-2397.1).
+        let runtime = db::runtime()?;
+        let checked_target = runtime.block_on(async {
+            let mut conn = db::connect(target).await?;
+            let Some(entry) = crate::engine::latest(&mut conn).await? else {
+                bail!(
+                    "`{}` has a ledger but no entries; there is nothing to plan against.\n\
+                     Record one with `pbps baseline --reason ...`.",
+                    pbps_model::escape::Escaped(&target.label)
+                );
+            };
+            refuse_mid_deployment(&entry, &target.label)?;
+            let revision = if entry.snapshot.kind == StateKind::Failed {
+                crate::engine::deployed_revision(&mut conn, entry.id).await?
+            } else {
+                Some(pbps_db::ledger::StateRevision {
+                    id: entry.id,
+                    git_sha: entry.snapshot.git_sha.clone(),
+                })
+            };
+            let removals =
+                checkout::inventory(&entry.snapshot, &ids, &loaded.schema, &loaded.intents);
+            let findings: Vec<_> =
+                checkout::assess(project.root(), &target.label, revision.as_ref(), &removals)?
+                    .into_iter()
+                    .collect();
+            Ok::<_, anyhow::Error>((conn, entry, findings))
+        });
+        // A failed target read cannot produce a plan, but must not replace the
+        // established local identity refusals with an environment failure
+        // (SPEC 9.8). Retain the error until those checks finish; it is never
+        // missing evidence that would permit planning to continue.
+        let (checked_target, checkout_findings) = match checked_target {
+            Ok((conn, entry, findings)) => (Ok((conn, entry)), findings),
+            Err(error) => (Err(error), Vec::new()),
+        };
+        if !json {
+            eprint!("{}", crate::output::human(&checkout_findings));
+        }
+        if checkout_findings
+            .iter()
+            .any(|f| f.severity == crate::output::Severity::Error)
+        {
+            let report = crate::output::Report::plain("plan", checkout_findings);
+            return if json {
+                report.emit_json()
+            } else {
+                report.outcome()
+            };
+        }
+        if json {
+            carried.clone_from(&checkout_findings);
+        }
 
         let mut resolved = match pbps_diff::resolve_with_annotations(
             &loaded.schema,
@@ -6986,7 +7042,11 @@ pub fn cmd_plan_db(
                 if json {
                     return crate::output::Report::plain(
                         "plan",
-                        crate::report::blocker_findings(&blockers),
+                        checkout_findings
+                            .iter()
+                            .cloned()
+                            .chain(crate::report::blocker_findings(&blockers))
+                            .collect(),
                     )
                     .emit_json();
                 }
@@ -7009,20 +7069,22 @@ pub fn cmd_plan_db(
             if json {
                 return crate::output::Report::plain(
                     "plan",
-                    vec![
-                        crate::output::Finding::error("identity.stale", message)
+                    checkout_findings
+                        .iter()
+                        .cloned()
+                        .chain([crate::output::Finding::error("identity.stale", message)
                             .at(project.ids_file(), None)
-                            .remedy("pbps plan"),
-                    ],
+                            .remedy("pbps plan")])
+                        .collect(),
                 )
                 .emit_json();
             }
             bail!("{message}");
         }
 
+        let (mut conn, mut entry) = checked_target?;
         let mut dependencies = pbps_model::dependency::unexamined(&loaded.dependencies);
-        let connected = db::runtime()?.block_on(async {
-        let mut conn = db::connect(target).await?;
+        let connected = runtime.block_on(async {
         dependencies = crate::engine::compare_dependencies(&mut conn, &loaded.dependencies).await?;
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
@@ -7036,16 +7098,8 @@ pub fn cmd_plan_db(
             &mut conn, &initial_types, &project.config.trusted_roles,
             project.config.pin_type_routines, false,
         ).await?.is_empty();
-        let mut findings = Vec::new();
+        let mut findings = checkout_findings;
 
-        let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
-            bail!(
-                "`{}` has a ledger but no entries; there is nothing to plan against.\n\
-                 Record one with `pbps baseline --reason ...`.",
-                pbps_model::escape::Escaped(&target.label)
-            );
-        };
-        refuse_mid_deployment(&entry, &target.label)?;
         let role_renames =
             crate::engine::external_role_renames(&mut conn, &entry.snapshot.ids, &resolved.ids)
                 .await?
