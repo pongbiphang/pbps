@@ -750,6 +750,67 @@ pub fn forwarded_rows(
     Some(forwarded)
 }
 
+/// The renames of the enum a table's single-column primary key is over, if
+/// it is a scalar column of an enum the plan renames labels of.
+fn key_renames<'a>(
+    table: &pbps_model::Table,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &'a LabelRenames<'_>,
+) -> Option<&'a Vec<(usize, &'a str, &'a str)>> {
+    let column = table
+        .primary_key
+        .as_ref()
+        .and_then(|pk| match pk.columns.as_slice() {
+            [only] => table.columns.get(only),
+            _ => None,
+        })
+        .filter(|c| !c.ty.is_array())?;
+    match resolver.resolve(side, column.ty.type_ref()?) {
+        TypeIdentity::Declared(uid) => renames.get(uid),
+        TypeIdentity::ExternalOrUnrecorded(_) => None,
+    }
+}
+
+/// The observed rows of a keyed `ensure` table, kept to those the plan still
+/// manages once its renames have run (DEC-2346.2): the baseline is read under
+/// the widened scope, and a chain (`b→c`, `a→b`) over a table that declares
+/// only `b` reads the rows `a` and `b`, which the plan leaves as `b` and
+/// `c`. The closing read asks for `b` alone, so `c` is not managed and must not
+/// be compared as if it were. A row is kept when its key, carried forward
+/// through the renames, is in the scope. The rows themselves stay as read; the
+/// comparison carries them. `exact` tables read every row and are left alone,
+/// as is any table whose key is not over a renamed enum.
+pub fn trim_to_the_final_scope(
+    schema: &mut Schema,
+    scopes: &pbps_model::DataScopes,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &LabelRenames<'_>,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    for (name, table) in &mut schema.tables {
+        let Some(scope) = scopes
+            .get(name)
+            .filter(|s| s.mode == pbps_model::DataMode::Ensure)
+        else {
+            continue;
+        };
+        let Some(pairs) = key_renames(table, (resolver, side), renames) else {
+            continue;
+        };
+        if let Some(data) = &mut table.data {
+            data.rows.retain(|key, _| {
+                scope.keys.contains(&pbps_model::RowKey(carried_label(
+                    pairs,
+                    key.as_str(),
+                    Carry::Forward,
+                )))
+            });
+        }
+    }
+}
+
 /// The scopes of the tables keyed by an enum, widened with the labels their
 /// keys have before the plan's renames (DEC-2346.2): a declared key is a label
 /// the plan leaves, and the database holds the label it has now, so a read by
@@ -767,28 +828,10 @@ pub fn scopes_before_the_plan(
         return out;
     }
     for (name, scope) in &mut out {
-        let Some(table) = schema.tables.get(name) else {
-            continue;
-        };
-        let Some(column) = table
-            .primary_key
-            .as_ref()
-            .and_then(|pk| match pk.columns.as_slice() {
-                [only] => table.columns.get(only),
-                _ => None,
-            })
-            .filter(|c| !c.ty.is_array())
-        else {
-            continue;
-        };
-        let Some(pairs) =
-            column
-                .ty
-                .type_ref()
-                .and_then(|reference| match resolver.resolve(side, reference) {
-                    TypeIdentity::Declared(uid) => renames.get(uid),
-                    TypeIdentity::ExternalOrUnrecorded(_) => None,
-                })
+        let Some(pairs) = schema
+            .tables
+            .get(name)
+            .and_then(|table| key_renames(table, (resolver, side), renames))
         else {
             continue;
         };
@@ -2763,6 +2806,73 @@ mod tests {
         .into();
         read_before_the_renames(&mut none, &schema, &Hints::default());
         assert_eq!(none[&name].known().len(), 1);
+    }
+
+    /// DEC-2346.2: the baseline of an `ensure` table is read under the widened
+    /// scope and then kept to the rows the plan still manages: a chain
+    /// (`b→c`, `a→b`) over a table that declares only `b` reads `a` and `b`,
+    /// and `b` is left as `c`, which the closing read does not ask for.
+    #[test]
+    fn the_baseline_is_kept_to_the_rows_the_plan_still_manages() {
+        let (mut schema, ids) = world(&["a", "b", "c"]);
+        lookup(&mut schema);
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let rows = |keys: &[&str]| pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: keys.iter().map(|k| ((*k).into(), row(&[]))).collect(),
+        };
+        schema.tables.get_mut(&name).unwrap().data = Some(rows(&["a", "b", "z"]));
+        let scopes = |mode, keys: &[&str]| -> pbps_model::DataScopes {
+            [(
+                name.clone(),
+                pbps_model::DataScope {
+                    mode,
+                    keys: keys.iter().map(|k| (*k).into()).collect(),
+                },
+            )]
+            .into()
+        };
+        let resolver = TypeResolver::new(&ids, &ids);
+        let kept = |scope: &pbps_model::DataScopes, changes: &[Change]| -> Vec<String> {
+            let mut state = schema.clone();
+            trim_to_the_final_scope(
+                &mut state,
+                scope,
+                (&resolver, TypeSide::Base),
+                &label_renames(changes),
+            );
+            state.tables[&name]
+                .data
+                .as_ref()
+                .unwrap()
+                .rows
+                .keys()
+                .map(|k| k.as_str().to_owned())
+                .collect()
+        };
+        let chain = [rename("b", "c", 0), rename("a", "b", 1)];
+        // Only `b` is declared: the row `a` becomes `b` and is managed, the row
+        // `b` becomes `c` and is not, and `z` is outside the widened read.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b"]), &chain),
+            ["a"]
+        );
+        // Both declared: both rows are managed.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b", "c"]), &chain),
+            ["a", "b"]
+        );
+        // Negatives: no rename leaves the rows; an `exact` table reads every
+        // row and keeps them; a table with no scope keeps them.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b"]), &[]),
+            ["a", "b", "z"]
+        );
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Exact, &["b"]), &chain),
+            ["a", "b", "z"]
+        );
+        assert_eq!(kept(&Default::default(), &chain), ["a", "b", "z"]);
     }
 }
 

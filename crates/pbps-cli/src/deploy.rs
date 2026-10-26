@@ -3826,6 +3826,23 @@ fn scopes_at(plan: &pbps_model::SavedPlan, live_ids: &IdsFile) -> DataScopes {
 /// under the new one; the baseline of every apply, staged or not, asks both.
 /// `schema` and `ids` are the observed side's, whose type references resolve
 /// against the plan's.
+/// The state read under the widened scope, kept to the rows the plan still
+/// manages once its renames have run (DEC-2346.2): see
+/// [`pbps_diff::enum_labels::trim_to_the_final_scope`].
+fn trim_to_the_planned_scope(
+    plan: &pbps_model::SavedPlan,
+    ids: &IdsFile,
+    scopes: &DataScopes,
+    state: &mut Schema,
+) {
+    pbps_diff::enum_labels::trim_to_the_final_scope(
+        state,
+        scopes,
+        (&TypeResolver::new(ids, &plan.ids), TypeSide::Base),
+        &pbps_diff::enum_labels::label_renames(plan.changes.changes.iter().map(|p| &p.change)),
+    );
+}
+
 fn held_before_the_plan(
     plan: &pbps_model::SavedPlan,
     schema: &Schema,
@@ -8913,6 +8930,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     )
     .await?;
     retain_managed_roles(&mut before, &plan.ids, dialect);
+    trim_to_the_planned_scope(plan, &entry.snapshot.ids, &planned_scopes, &mut before);
 
     // The drift check, and the whole reason a coarse `--allow` is safe: this
     // plan is only valid against the environment it was computed against, down
@@ -9414,7 +9432,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         // The state the checkpoints to come are measured against comes out of
         // *this* read — the one the comparison below validates — and not out
         // of a second one taken after these checks (DECISIONS 174).
-        let (scoped, watching, unrevocable) = staged_baseline(
+        let (scoped, mut watching, unrevocable) = staged_baseline(
             conn,
             at_checkpoint,
             &after_modules,
@@ -9432,6 +9450,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         )
         .await?;
 
+        trim_to_the_planned_scope(
+            plan,
+            at_checkpoint,
+            &scopes_at(plan, at_checkpoint),
+            &mut watching,
+        );
         let live = pbps_model::state_checksum(&scoped.schema, at_checkpoint);
         let checkpoint = pbps_model::state_checksum(&entry.snapshot.schema, at_checkpoint);
         if live != checkpoint {
@@ -9540,6 +9564,12 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
         )
         .await?;
         retain_managed_roles(&mut watching, &plan.ids, dialect);
+        trim_to_the_planned_scope(
+            plan,
+            &entry.snapshot.ids,
+            &scopes_at(plan, &recorded_ids),
+            &mut watching,
+        );
 
         let live = pbps_model::state_checksum(&scoped.schema, &recorded_ids);
         if live != plan.baseline.checksum {
@@ -9880,12 +9910,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
             &modules_after(&entry.snapshot, &plan.changes, Settled::SoFar),
             &externals_under(&externals, &live_ids),
             pbps_config::Unmanaged::Ignore,
-            &held_before_the_plan(
-                plan,
-                &entry.snapshot.schema,
-                &entry.snapshot.ids,
-                &scopes_at(plan, &live_ids),
-            ),
+            // The plan's own scope, not the widened one: what a statement
+            // leaves is read under the keys the plan leaves, as the closing
+            // read is, so a row the renames leave unmanaged is not compared
+            // (DEC-2346.2).
+            &scopes_at(plan, &live_ids),
             &Schema::default(),
             crate::engine::Read::Snapshot,
         )
@@ -24213,5 +24242,83 @@ mod held_before_the_plan_tests {
         // A rename of a label no key holds adds the label it came from, which
         // no row holds either: a read that finds nothing.
         assert_eq!(held(&[("y_000001", "gone", "ok")]), ["blue", "gone", "ok"]);
+    }
+    /// The guard's side of the chain: the baseline trimmed to the rows the plan
+    /// still manages is carried through the renames and meets the closing
+    /// read (DEC-2346.2).
+    #[test]
+    fn a_chain_of_renames_over_a_narrow_ensure_table_moves_no_row() {
+        let (ids, _) = mood("y_000001");
+        let table = |labels: &[&str], keys: &[&str]| {
+            let mut schema = Schema::default();
+            schema.types.insert(
+                "app.mood".parse().unwrap(),
+                ManagedType::Enum {
+                    values: labels.iter().map(|l| (*l).to_owned()).collect(),
+                },
+            );
+            let mut t = pbps_model::Table::default();
+            t.columns
+                .insert("m".into(), Column::new("app.mood".parse().unwrap()));
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["m".into()],
+                storage_parameters: Default::default(),
+            });
+            t.data = Some(pbps_model::TableData {
+                mode: DataMode::Ensure,
+                rows: keys
+                    .iter()
+                    .map(|k| ((*k).into(), pbps_model::Row::default()))
+                    .collect(),
+            });
+            schema.tables.insert("app.moods".parse().unwrap(), t);
+            schema
+        };
+        let chain = |ids: &IdsFile| {
+            let mut changes = plan(ids, &[("y_000001", "b", "c"), ("y_000001", "a", "b")]).changes;
+            for (step, labels) in changes.changes.iter_mut().zip([["a", "c"], ["b", "c"]]) {
+                if let Change::RenameEnumValue { definition, .. } = &mut step.change {
+                    **definition = ManagedType::Enum {
+                        values: labels.iter().map(|l| (*l).to_owned()).collect(),
+                    };
+                }
+            }
+            changes
+        };
+        let check = |changes: &ChangeSet, before: &Schema, after: &Schema| {
+            let mut ids = guard::fixture_ids(changes, before);
+            ids.types = mood("y_000001").0.types;
+            let plan = guard::Plan { changes, ids: &ids };
+            refuse_pinned_movement(
+                &pbps_pg::Postgres::new(),
+                guard::Read::transactional(plan),
+                before,
+                after,
+                "prod",
+            )
+        };
+        let changes = chain(&ids);
+        // The baseline kept to the managed row `a`, which the plan leaves as
+        // `b`; the unmanaged `c` is not in the closing read.
+        let before = table(&["a", "b"], &["a"]);
+        check(&changes, &before, &table(&["b", "c"], &["b"])).unwrap();
+        // A real deletion of the declared row is still refused.
+        let error = check(&changes, &before, &table(&["b", "c"], &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("app.moods"), "{error}");
+        // The unmanaged row `c` read into the baseline (not trimmed) is the
+        // finding's refusal: it is not in the closing read.
+        let untrimmed = table(&["a", "b"], &["a", "b"]);
+        let error = check(&changes, &untrimmed, &table(&["b", "c"], &["b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("app.moods"), "{error}");
+        // No rename: a deletion is refused as ever.
+        let none = ChangeSet::default();
+        let same = table(&["a", "b"], &["b"]);
+        check(&none, &same, &table(&["a", "b"], &["b"])).unwrap();
+        assert!(check(&none, &same, &table(&["a", "b"], &[])).is_err());
     }
 }

@@ -6896,3 +6896,59 @@ fn a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_chain2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-chain2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        enum_rows(
+            &d,
+            "[a, b, keep]",
+            "ensure",
+            "    a: {note: first}\n    b: {note: second}\n",
+        );
+        let path = connected_artifact(&d, db, false);
+        succeeds(approved_apply(&d, db, &path, &[]));
+        // `b` becomes `c` and `a` becomes `b`; only `b` stays declared, so the
+        // row that was `b` is `c` and no longer managed. It still exists.
+        enum_rows(
+            &d,
+            "[{name: b, renamed_from: a}, {name: c, renamed_from: b}, keep]",
+            "ensure",
+            "    b: {note: first}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let renamed = label_plan(&d, db, &path);
+        let kinds = changes_of(&renamed);
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "RenameEnumValue").count(),
+            2,
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "InsertRow" || k == "DeleteRow"),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+        assert_eq!(
+            text_of(db, "SELECT note FROM app.moods WHERE m = 'b'"),
+            "first"
+        );
+        assert_eq!(
+            text_of(db, "SELECT note FROM app.moods WHERE m = 'c'"),
+            "second"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}

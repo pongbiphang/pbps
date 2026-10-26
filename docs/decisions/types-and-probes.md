@@ -3562,6 +3562,17 @@ Maintainer, 2026-10-24: the second of two PRs, after the partition keys
   (`SetEnsureKeys`), a second logical change, so such a plan is not a staged
   one (measured); a staged plan can rename a label that rows hold in a
   cell, or that no declared row names, and those apply and resume.
+- **The widened baseline is trimmed to what the plan still manages**
+  (`trim_to_the_final_scope`): the baseline of an `ensure` table is read under
+  the declared keys and the labels they held, and a chain (`b→c`, `a→b`) over
+  a table that declares only `b` reads the rows `a` and `b`, which the plan
+  leaves as `b` and `c`. The closing read asks for `b` alone, so `c` still
+  exists but is not managed, and the baseline keeps a row only when its key,
+  carried forward through the renames, is a key of the plan's scope; the
+  rows keep their labels and the comparison carries them. The per-step reads
+  of a staged run ask the plan's own keys, as the closing read does, since
+  a widened one would read an unmanaged row that a swap of labels leaves
+  under a held name.
 - **Slice 3b needs nothing**: a rebuild converts a column of the enum, a key
   among them, through `col::text::tmp`, and its row probe counts the live
   rows that hold a label the plan removes, a declared row of an `exact` table
@@ -3588,7 +3599,8 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `rows_taken_over_under_a_renamed_key_are_found_by_the_label_they_hold`,
 `a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows`,
 `a_staged_label_rename_under_ensure_rows_applies_and_resumes`,
-`a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key` and
+`a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key`,
+`a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table` and
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.
