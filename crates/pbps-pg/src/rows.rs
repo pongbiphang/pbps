@@ -1452,6 +1452,12 @@ pub fn bound_spelling_queries(
             let Some(spec) = parent.columns.get(column) else {
                 continue;
             };
+            // A declared enum's bound is one of its labels, which has one
+            // spelling and is judged by validation; asking the engine would
+            // need a type this plan may not have created yet (DEC-2346.1).
+            if crate::declared_enum_labels(&spec.ty, &schema.types).is_some() {
+                continue;
+            }
             let values = declared(i);
             if values.is_empty() {
                 continue;
@@ -1530,6 +1536,11 @@ pub fn list_collision_queries(
         let Some(spec) = table.columns.get(column) else {
             continue;
         };
+        // Two labels are one only when they are the same text, which
+        // validation already compares (DEC-2346.1).
+        if crate::declared_enum_labels(&spec.ty, &schema.types).is_some() {
+            continue;
+        }
         let entries: Vec<(TableName, String)> = schema
             .tables
             .iter()

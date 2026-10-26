@@ -1241,9 +1241,17 @@ pub(crate) fn diff_partial_rebuilding(
                                 .schema
                                 .tables
                                 .get(&of.parent)
-                                .and_then(|parent| parent.partition_by.as_ref())
-                                .map(|by| by.columns.clone())
+                                .and_then(|parent| {
+                                    let by = parent.partition_by.as_ref()?;
+                                    by.columns
+                                        .iter()
+                                        .map(|c| {
+                                            Some((c.clone(), parent.columns.get(c)?.ty.clone()))
+                                        })
+                                        .collect::<Option<Vec<_>>>()
+                                })
                                 .unwrap_or_default(),
+                            &declared.schema.types,
                         ),
                         shape: Box::new(declared_table.clone()),
                     });
@@ -4694,6 +4702,7 @@ fn refuse_partition_changes(
             .get(name)
             .is_some_and(|t| t.partition_by.is_some() || t.partition_of.is_some())
     };
+    let label_renames = crate::enum_labels::label_renames(changes);
     let mut refused: BTreeMap<TableName, Vec<String>> = BTreeMap::new();
     // The tables this plan attaches under each parent or detaches from it.
     let mut moving: BTreeMap<TableName, Vec<TableName>> = BTreeMap::new();
@@ -4785,7 +4794,17 @@ fn refuse_partition_changes(
                         } else {
                             of.parent.clone()
                         },
-                        of.bound.clone(),
+                        // The base's labels, as the plan's renames leave them
+                        // (DEC-2346.1).
+                        match base.schema.tables.get(&of.parent) {
+                            Some(parent) if forward => crate::enum_labels::forwarded_bound(
+                                &of.bound,
+                                parent,
+                                (&TypeResolver::new(base.ids, declared.ids), TypeSide::Base),
+                                &label_renames,
+                            ),
+                            _ => of.bound.clone(),
+                        },
                     )
                 })
             };
@@ -11603,6 +11622,124 @@ mod tests {
             "{:?}",
             kinds(&planned)
         );
+    }
+
+    /// The engine renames a label where a partition bound holds it (measured
+    /// on 16 and 18), so a bound that follows a label rename is no change of
+    /// the partitioning, whichever strategy bounds it (DEC-2346.1).
+    #[test]
+    fn a_bound_that_follows_a_label_rename_is_not_a_change_of_partitioning() {
+        use pbps_model::{BoundDatum, ListDatum, PartitionBound, PartitionBy, PartitionOf};
+        let mood = |labels: &[&str]| pbps_model::ManagedType::Enum {
+            values: labels.iter().map(|l| (*l).to_owned()).collect(),
+        };
+        let list = |label: &str| PartitionBound::List {
+            values: [ListDatum::Value(label.into())].into(),
+        };
+        let range = |from: &str, to: &str| PartitionBound::Range {
+            from: vec![BoundDatum::Value(from.into())],
+            to: vec![BoundDatum::Value(to.into())],
+        };
+        for strategy in [
+            pbps_model::PartitionStrategy::List,
+            pbps_model::PartitionStrategy::Range,
+        ] {
+            let bound = |at: &str| match strategy {
+                pbps_model::PartitionStrategy::List => list(at),
+                pbps_model::PartitionStrategy::Range | pbps_model::PartitionStrategy::Hash => {
+                    range(at, "z")
+                }
+            };
+            let mut parent = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("m", Column::new(ty("app.mood")).not_null()),
+            ]);
+            parent.partition_by = Some(PartitionBy {
+                external: false,
+                columns: vec!["m".into()],
+                strategy,
+            });
+            let tree = |labels: &[&str], at: &str| {
+                let mut schema = schema_of("app.ev", parent.clone());
+                schema
+                    .types
+                    .insert("app.mood".parse().unwrap(), mood(labels));
+                schema.tables.insert(
+                    "app.ev_one".parse().unwrap(),
+                    Table {
+                        partition_of: Some(PartitionOf {
+                            parent: "app.ev".parse().unwrap(),
+                            bound: bound(at),
+                            columns: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+                schema
+            };
+            let plan = |base: &Schema, declared: &Schema, renames: &[(&str, &str)]| {
+                let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let hints = Hints {
+                    enum_value_renames: [(
+                        "app.mood".parse().unwrap(),
+                        renames
+                            .iter()
+                            .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                            .collect(),
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                diff(
+                    Side {
+                        schema: base,
+                        ids: &base_ids,
+                    },
+                    Side {
+                        schema: declared,
+                        ids: &declared_ids,
+                    },
+                    &MinimalDialect,
+                    &hints,
+                )
+            };
+            let base = tree(&["sad", "ok"], "sad");
+            // The rename carries the bound: the plan is the rename alone.
+            let renamed = plan(&base, &tree(&["blue", "ok"], "blue"), &[("sad", "blue")])
+                .expect("the bound follows the label");
+            assert!(
+                matches!(
+                    renamed
+                        .changes
+                        .iter()
+                        .map(|p| &p.change)
+                        .collect::<Vec<_>>()[..],
+                    [Change::RenameEnumValue { .. }]
+                ),
+                "{:?}",
+                renamed.changes
+            );
+            // Negative: the label is renamed and the bound names another.
+            let moved = plan(&base, &tree(&["blue", "ok"], "ok"), &[("sad", "blue")])
+                .expect_err("a bound that did not follow is a change");
+            // Negative: the same bound as before, with no rename behind it.
+            let changed = plan(&base, &tree(&["sad", "ok"], "ok"), &[])
+                .expect_err("a changed bound is a change");
+            for errors in [moved, changed] {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })
+                            && e.to_string().contains("change its partitioning")),
+                    "{errors:?}"
+                );
+            }
+        }
     }
 
     /// The move a human allowed reaches the create that moves (#1788): its

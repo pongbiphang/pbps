@@ -2379,7 +2379,7 @@ fn declaration_problems_with_sources(
     // single declaration can.
     for (name, table) in tables {
         let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
-        for e in dialect.validate_table_sources(name, table, sources) {
+        for e in dialect.validate_table_in_schema(name, table, sources, schema) {
             out.push((
                 "dialect.rejected",
                 format!("{name}: {e}", name = name.shown()),

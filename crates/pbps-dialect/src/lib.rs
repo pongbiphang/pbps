@@ -3246,16 +3246,34 @@ pub trait Dialect {
         found
     }
 
+    /// As [`Dialect::validate_table_sources`], for a table of `schema`, whose
+    /// declared types a check can then look a reference up in (DEC-2346.1). A
+    /// dialect with no check that needs them keeps the default.
+    fn validate_table_in_schema(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
+        self.validate_table_sources(name, table, sources)
+    }
+
     /// The key carried as proof that an attach can use its staged scan CHECK.
     /// An empty key keeps the ordinary ATTACH, including when observed names
-    /// prevent that optimization (DEC-2126.1). The choice travels in the plan,
-    /// so apply and resume never choose another statement sequence.
+    /// prevent that optimization (DEC-2126.1), or when the dialect cannot
+    /// spell a CHECK over the key columns' types that implies the bound
+    /// (DEC-2346.1). `key` is the parent's key columns with their types, in
+    /// key order, and `types` the schema's declared types. The choice travels
+    /// in the plan, so apply and resume never choose another statement
+    /// sequence.
     fn attach_scan_key(
         &self,
         _uid: &pbps_model::Uid,
-        key: &[pbps_model::ColumnName],
+        key: &[(pbps_model::ColumnName, pbps_model::ColumnType)],
+        _types: &BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
     ) -> Vec<pbps_model::ColumnName> {
-        key.to_vec()
+        key.iter().map(|(column, _)| column.clone()).collect()
     }
 
     /// Checks what a partition declares of its own against its parent's
@@ -4984,6 +5002,44 @@ mod tests {
         assert_eq!(
             d.type_change_risk(&ty("bigint"), &ty("nvarchar(10)")),
             TypeChangeRisk::Incompatible
+        );
+    }
+
+    /// A dialect with no check that needs the declared types answers the
+    /// schema-aware question as the plain one, and carries the whole key
+    /// (DEC-2346.1); SQL Server overrides neither.
+    #[test]
+    fn the_defaults_of_the_schema_aware_hooks_are_the_plain_ones() {
+        let d = MinimalDialect;
+        let table = Table::default();
+        let name: TableName = "app.t".parse().unwrap();
+        let schema = Schema {
+            types: [(
+                "app.e".parse().unwrap(),
+                pbps_model::ManagedType::Enum {
+                    values: vec!["a".into()],
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.validate_table_in_schema(&name, &table, Default::default(), &schema),
+            d.validate_table_sources(&name, &table, Default::default())
+        );
+        let key = vec![
+            ("a".into(), ty("app.e")),
+            ("b".into(), ty("text[]")),
+            ("c".into(), ty("app.d")),
+        ];
+        let columns: Vec<pbps_model::ColumnName> = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(
+            d.attach_scan_key(&"t_aaaaaa".parse().unwrap(), &key, &schema.types),
+            columns
+        );
+        assert!(
+            d.attach_scan_key(&"t_aaaaaa".parse().unwrap(), &[], &schema.types)
+                .is_empty()
         );
     }
 
