@@ -572,6 +572,7 @@
         "managed_types::enum_rebuild_applies_with_a_default_check_and_index_the_same_plan_changes",
         "managed_types::enum_rebuild_applies_beside_a_table_and_column_rename_over_a_default_and_check",
         "managed_types::enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order",
+        "managed_types::enum_rebuild_partition_check_is_judged_by_the_new_label_order",
         "managed_types::enum_rebuild_drops_a_column_and_its_parts_in_the_plan_that_removes_a_label",
         "managed_types::enum_rebuild_drops_a_table_holding_the_enum_in_the_plan_that_removes_a_label",
         "managed_types::enum_rebuild_rebuilds_a_view_over_a_partitions_column_and_refuses_one_it_cannot",

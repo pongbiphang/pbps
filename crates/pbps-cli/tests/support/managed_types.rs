@@ -4447,6 +4447,84 @@ fn enum_rebuild_adds_an_order_sensitive_check_judged_by_the_new_label_order() {
     }
 }
 
+/// `app.parent` as the partition test pulls it, with a check of the
+/// partition's own under its entry in the parent's file (DEC-1577.1).
+fn partition_check(d: &Demo, expression: &str) {
+    std::fs::write(
+        d.dir.join("schema/app.parent.yml"),
+        format!(
+            "table: app.parent\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+             m: {{type: app.mood, nullable: false}}\npartition_by: [id]\npartitions:\n  \
+             child:\n    from: ['1']\n    to: ['2']\n    checks:\n      m_low: {expression}\n"
+        ),
+    )
+    .unwrap();
+    d.commit();
+}
+
+/// The rebuild retypes the parent's column and the engine recurses that into
+/// every partition, so a check added on a *partition* in the same plan is judged
+/// under the new label order too, and the plan-time probe, which carries the
+/// partition map the apply carries, does not refuse it against the old one
+/// (#2406).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_partition_check_is_judged_by_the_new_label_order() {
+    const PARTITIONED: &str = "CREATE SCHEMA app;
+        CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+        CREATE TABLE app.parent (id int NOT NULL, m app.mood NOT NULL) PARTITION BY RANGE (id);
+        CREATE TABLE app.child PARTITION OF app.parent FOR VALUES FROM (1) TO (2);";
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // `happy` is above `ok` today and below it once the rebuild has run.
+        let (own, d) = adopted(
+            &server,
+            "rebuild_partition_check1635",
+            &format!("{PARTITIONED} INSERT INTO app.parent VALUES (1,'happy');"),
+        );
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        partition_check(&d, "m <= 'ok'::app.mood");
+        let path = d.dir.join("partition-check.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert_eq!(rebuild_steps(&plan), 3, "{:#?}", plan.changes);
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert!(mood_is(db, &["happy", "ok"]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_constraint \
+                 WHERE conname = 'm_low' AND conrelid = 'app.child'::regclass"
+            ),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+
+        // A partition check the stored data really violates under the new
+        // order is still refused: the plan-time probe stands aside for a
+        // retyped column, so the engine refuses it at apply, the transaction
+        // rolls back and the old type stands.
+        let (own, d) = adopted(
+            &server,
+            "rebuild_partition_check_bad1635",
+            &format!("{PARTITIONED} INSERT INTO app.parent VALUES (1,'ok');"),
+        );
+        let db = own.connection();
+        declare_mood(&d, "[happy, ok]");
+        partition_check(&d, "m <= 'happy'::app.mood");
+        let path = d.dir.join("partition-check-bad.plan.json");
+        label_plan(&d, db, &path);
+        let out = apply_rebuild(&d, db, &path, &[]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(text.contains("m_low"), "{text}");
+        assert!(mood_is(db, &["sad", "ok", "happy"]), "{text}");
+        assert!(no_replacement_left(db));
+    }
+}
+
 /// A column the plan drops, with intent, no longer holds the old type when the
 /// swap runs (classes 5 and 6 come before the create and the swap), so it is
 /// neither retyped nor refused as a blocker, and the default, check and index
