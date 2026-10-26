@@ -179,6 +179,25 @@ fn keepers(name: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the server holds the mark that a keeper connected, which the keeper
+/// writes after its session is there.
+fn marked(name: &str) -> bool {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            name,
+            "psql",
+            "-U",
+            "postgres",
+            "-Atc",
+            "SELECT pg_catalog.shobj_description(oid, 'pg_database') = 'pbps-keeper' \
+               FROM pg_catalog.pg_database WHERE datname = 'postgres'",
+        ])
+        .output()
+        .expect("docker");
+    String::from_utf8_lossy(&out.stdout).trim() == "t"
+}
+
 fn sleeping(name: &str, marker: &str) -> bool {
     let out = Command::new("docker")
         .args([
@@ -250,7 +269,11 @@ pub fn after_the_connection(server: &str) {
     until("the run's container", || !containers_of(pid).is_empty());
     let name = containers_of(pid).remove(0);
     let _left = Leftovers(vec![name.clone()]);
-    until("the keeper's session", || keepers(&name) > 0);
+    // The mark is written after the session is there, and a kill in between
+    // leaves a keeper that never connected, which the next run keeps.
+    until("the keeper's session and its mark", || {
+        keepers(&name) > 0 && marked(&name)
+    });
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(exists(&name), "a killed run leaves its container");
