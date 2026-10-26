@@ -73,27 +73,38 @@ pub(crate) fn order(
     mut distance: impl FnMut(&CommitId, &CommitId) -> Result<u64, GitProblem>,
 ) -> Result<ReplayChain, Vec<ChainProblem>> {
     let mut problems = Vec::new();
-    // Each ordered pair is asked of git once, and a failed answer is reported
-    // once however many times the pair comes up.
-    let mut known = std::collections::BTreeMap::<(CommitId, CommitId), Option<bool>>::new();
-    let mut ask = |a: &CommitId, b: &CommitId, problems: &mut Vec<ChainProblem>| {
-        *known.entry((a.clone(), b.clone())).or_insert_with(|| {
-            ancestor(a, b)
-                .map_err(|problem| {
-                    problems.push(ChainProblem::Unknown {
-                        ancestor: a.clone(),
-                        descendant: b.clone(),
-                        problem,
-                    });
-                })
-                .ok()
-        })
+    // Each ordered pair is asked of git once. A failed answer is reported once
+    // however many times the pair comes up, and only if it settled nothing.
+    let mut known =
+        std::collections::BTreeMap::<(CommitId, CommitId), Result<bool, GitProblem>>::new();
+    let mut ask = |a: &CommitId, b: &CommitId| -> Result<bool, GitProblem> {
+        known
+            .entry((a.clone(), b.clone()))
+            .or_insert_with(|| ancestor(a, b))
+            .clone()
     };
-    if ask(base, tip, &mut problems) == Some(false) {
-        problems.push(ChainProblem::BaseNotBehindCandidate {
+    let mut reported = BTreeSet::<(CommitId, CommitId)>::new();
+    let mut unknown = |problems: &mut Vec<ChainProblem>,
+                       a: &CommitId,
+                       b: &CommitId,
+                       answer: Result<bool, GitProblem>| {
+        if let Err(problem) = answer
+            && reported.insert((a.clone(), b.clone()))
+        {
+            problems.push(ChainProblem::Unknown {
+                ancestor: a.clone(),
+                descendant: b.clone(),
+                problem,
+            });
+        }
+    };
+    match ask(base, tip) {
+        Ok(false) => problems.push(ChainProblem::BaseNotBehindCandidate {
             base: base.clone(),
             tip: tip.clone(),
-        });
+        }),
+        Ok(true) => {}
+        Err(problem) => unknown(&mut problems, base, tip, Err(problem)),
     }
 
     let distinct: Vec<&CommitId> = pins
@@ -108,24 +119,29 @@ pub(crate) fn order(
     let mut comparable = true;
     for (i, a) in distinct.iter().enumerate() {
         for (j, b) in distinct.iter().enumerate().skip(i + 1) {
-            let Some(forward) = ask(a, b, &mut problems) else {
-                comparable = false;
-                continue;
-            };
-            if forward {
+            // One direction proving ancestry settles the pair. A shallow
+            // clone answers `Incomplete` for a pair it cannot walk in one
+            // direction and yet walks in the other, so the first failure
+            // must not hide the second question.
+            let forward = ask(a, b);
+            if forward == Ok(true) {
                 behind[j] += 1;
                 continue;
             }
-            match ask(b, a, &mut problems) {
-                Some(true) => behind[i] += 1,
-                Some(false) => {
-                    comparable = false;
-                    problems.push(ChainProblem::Incomparable {
-                        a: (*a).clone(),
-                        b: (*b).clone(),
-                    });
-                }
-                None => comparable = false,
+            let reverse = ask(b, a);
+            if reverse == Ok(true) {
+                behind[i] += 1;
+                continue;
+            }
+            comparable = false;
+            if forward == Ok(false) && reverse == Ok(false) {
+                problems.push(ChainProblem::Incomparable {
+                    a: (*a).clone(),
+                    b: (*b).clone(),
+                });
+            } else {
+                unknown(&mut problems, a, b, forward);
+                unknown(&mut problems, b, a, reverse);
             }
         }
     }

@@ -397,3 +397,45 @@ fn a_commit_candidate_is_not_bound_to_head_after_it_is_resolved() {
     repo.commit("another");
     history.reverify().unwrap();
 }
+
+/// A gone alternate object store leaves git unable to say "no such commit":
+/// `rev-parse --quiet` still exits 1 for a full id, with the complaint on
+/// stderr, and exits 0 for `HEAD` with the same complaint.
+#[test]
+fn a_failing_object_store_is_unreadable_not_a_missing_commit() {
+    let (repo, _, c2) = standard();
+    let alternates = repo.dir.join(".git/objects/info/alternates");
+    std::fs::write(&alternates, "/nonexistent-pbps-objects\n").unwrap();
+    let ghost = "ab".repeat(20);
+    repo.manifest(&c2, &[], Some(&ghost));
+    let found = refused(repo.validate());
+    let candidate = found
+        .iter()
+        .find(|r| matches!(r, Refusal::Git { what, .. } if what.contains(&ghost)))
+        .unwrap_or_else(|| panic!("{found:?}"));
+    assert!(
+        matches!(
+            candidate,
+            Refusal::Git {
+                problem: GitProblem::Unreadable(_),
+                ..
+            }
+        ),
+        "{candidate:?}"
+    );
+    assert_eq!(candidate.outcome(), Outcome::Unanswerable);
+    // The same complaint beside a successful answer is not an ambiguity.
+    repo.manifest(&c2, &[], None);
+    let found = refused(repo.validate());
+    assert!(
+        found.iter().any(|r| matches!(r, Refusal::Git { what, problem: GitProblem::Unreadable(_) } if what.starts_with("HEAD"))),
+        "{found:?}"
+    );
+    assert!(!found.iter().any(|r| matches!(
+        r,
+        Refusal::Git {
+            problem: GitProblem::Ambiguous(_),
+            ..
+        }
+    )));
+}

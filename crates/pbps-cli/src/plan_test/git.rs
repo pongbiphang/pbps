@@ -73,22 +73,35 @@ pub(super) fn resolve_commit(root: &Path, spec: &str) -> Result<CommitId, GitPro
     let unreadable = |e: std::io::Error| GitProblem::Unreadable(e.to_string());
     let out = run(false).map_err(unreadable)?;
     if out.status.success() {
-        let warning = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        if !warning.is_empty() {
-            return Err(GitProblem::Ambiguous(warning));
+        let noise = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if !noise.is_empty() {
+            // An ambiguity warning and a failing object store both exit 0 with
+            // stderr text. Only the first says the name may mean something
+            // else; the second says git may not have seen every object.
+            return Err(if noise.to_ascii_lowercase().contains("ambiguous") {
+                GitProblem::Ambiguous(noise)
+            } else {
+                GitProblem::Unreadable(noise)
+            });
         }
         let text = String::from_utf8_lossy(&out.stdout);
         return CommitId::parse(text.trim())
             .ok_or_else(|| GitProblem::Unreadable(format!("git answered `{}`", text.trim())));
     }
-    // Not found exits 1 quietly; anything else is git failing to look.
+    // Not found exits 1 and says nothing; anything else, or an exit 1 that
+    // complains of the object store (an alternate that is gone), is git failing
+    // to look and must not read as "no such commit".
     let probe = run(true).map_err(unreadable)?;
-    if probe.status.code() == Some(1) {
+    let said = String::from_utf8_lossy(&probe.stderr).trim().to_owned();
+    if probe.status.code() == Some(1) && said.is_empty() {
         return Err(GitProblem::Missing { shallow });
     }
-    Err(GitProblem::Unreadable(
-        String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-    ))
+    let said = if said.is_empty() {
+        String::from_utf8_lossy(&out.stderr).trim().to_owned()
+    } else {
+        said
+    };
+    Err(GitProblem::Unreadable(said))
 }
 
 /// Whether `ancestor` is an ancestor of, or the same commit as, `descendant`.

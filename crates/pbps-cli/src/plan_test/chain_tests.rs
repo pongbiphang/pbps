@@ -228,3 +228,59 @@ fn every_problem_is_returned_and_each_pair_is_asked_once() {
         "a pair was asked twice: {asked:?}"
     );
 }
+
+/// A shallow clone cannot always walk a pair in the direction it is first
+/// asked: it answers `Incomplete` there and proves the other direction. Which
+/// direction comes first depends on how the two ids sort, so both ids are
+/// tried in both roles.
+#[test]
+fn a_pair_one_direction_proves_is_ordered_whichever_way_the_ids_sort() {
+    for (older, newer) in [(1, 2), (2, 1)] {
+        let graph = Graph::new(&[(newer, older)]);
+        let chain = order(
+            &id(newer),
+            &[id(older)],
+            &id(newer),
+            |a, b| {
+                if graph.ancestor(a, b) == Ok(true) {
+                    Ok(true)
+                } else if graph.ancestor(b, a) == Ok(true) {
+                    // The walk that would answer "no" is the one a shallow
+                    // boundary refuses to vouch for.
+                    Err(GitProblem::Incomplete)
+                } else {
+                    Ok(false)
+                }
+            },
+            |_, _| Ok(1),
+        )
+        .unwrap_or_else(|problems| panic!("{older} before {newer}: {problems:?}"));
+        let order: Vec<_> = chain.groups.iter().map(|g| g.commit.clone()).collect();
+        assert_eq!(order, [id(older), id(newer)]);
+    }
+}
+
+#[test]
+fn a_pair_neither_direction_can_answer_is_unknown_once_per_direction_and_never_incomparable() {
+    let found = order(
+        &id(2),
+        &[id(1)],
+        &id(2),
+        |a, b| {
+            if (a, b) == (&id(1), &id(2)) || (a, b) == (&id(2), &id(1)) {
+                Err(GitProblem::Incomplete)
+            } else {
+                Ok(true)
+            }
+        },
+        |_, _| Ok(1),
+    )
+    .unwrap_err();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|p| matches!(p, ChainProblem::Unknown { .. })),
+        "{found:?}"
+    );
+}
