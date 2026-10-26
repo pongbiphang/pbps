@@ -19,6 +19,8 @@ import time
 import unittest
 from unittest import mock
 
+import ignored_test_inventory as inventory
+
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("live_shards", ROOT / "scripts/live-shards.py")
@@ -1119,6 +1121,22 @@ elif command[0] != 'sleep':
             calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
             return result, calls
 
+    def test_postgresql_binary_invocations_exclude_sql_server_cases_and_keep_postgresql(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        result, calls = self.local_pg_script("initializing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        key = ("pbps-cli", "bin", "pbps")
+        cases = (
+            ("engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused", False),
+            ("deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under", True),
+        )
+        for runner, commands in (("CI", job_commands(workflow, "live-pg")), ("local", calls)):
+            selections = [inventory.cargo_selection(command) for command in commands]
+            for name, expected in cases:
+                with self.subTest(runner=runner, case=name):
+                    self.assertEqual(any(inventory.selects(selection, key, name)
+                                         for selection in selections), expected)
+
     def test_driver_error_regressions_run_in_their_engine_jobs(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         for job, target in (("live", "live_mssql"), ("live-pg", "live_pg")):
@@ -1187,7 +1205,7 @@ elif command[0] != 'sleep':
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-pg", "--lib", "--", "--ignored", "--test-threads=1"],
             ["cargo", "test", "-p", "pbps-db", "--test", "live_pg", "--", "--ignored"],
             ["python3", "scripts/live-transport.py", "pg"],
-            ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1"],
+            ["cargo", "test", "-p", "pbps-cli", "--bin", "pbps", "--", "--ignored", "--test-threads=1", "--skip", "engine::mssql_live_tests"],
             ["cargo", "test", "--profile", "live-test", "-p", "pbps-cli", "--lib", "--", "--ignored", "--test-threads=1", "resolver::server::scratch::live_tests"],
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])

@@ -23297,6 +23297,93 @@ fn binding_releases_preserve_independent_connected_computed_releases() {
     binding_releases::check_independent_connected_release();
 }
 
+/// A caller gaining a binding is reordered using the connected comparison, not
+/// merely rejected by the final observer (#2221). Sensitive names stay apart.
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn collated_callees_are_scheduled_before_new_bindings_and_apply() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    for (slug, collation, same) in [
+        ("callee2221_ai", "Latin1_General_100_CI_AI", true),
+        ("callee2221_as", "Latin1_General_100_CI_AS", false),
+    ] {
+        let own = OwnDatabase::collated(&server, slug, collation);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(slug);
+        let success = |out: Output| assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        let write = |file: &str, name: &str, body: &str| {
+            d.module(file, &format!("function: app.{name}\ndefinition: |-\n  (@x int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {body} END\n"));
+        };
+        write("callee.yml", "café", "@x");
+        write("caller.yml", "a", "@x");
+        if !same {
+            write("distinct.yml", "cafe", "@x");
+        }
+        success(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        success(d.run(&["bootstrap", "--db", connection]));
+        write("callee.yml", "café", "@x + 1");
+        write("caller.yml", "a", "app.cafe(@x)");
+        let preview = d.dir.join("preview.sql");
+        success(d.run(&["plan", "--no-dev", "--sql", preview.to_str().unwrap()]));
+        let script = std::fs::read_to_string(preview).unwrap();
+        if same {
+            assert!(
+                script.find("FUNCTION [app].[a]").unwrap()
+                    < script.find("FUNCTION [app].[café]").unwrap(),
+                "the positive regression must start caller-first: {script}"
+            );
+        }
+        d.commit();
+        let path = d.dir.join("collated-plan.json");
+        success(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let at = |name: &str| {
+            saved
+                .changes
+                .changes
+                .iter()
+                .position(|p| p.change.subject() == name)
+                .unwrap()
+        };
+        if same {
+            assert!(at("app.café") < at("app.a"), "{:?}", saved.changes);
+        }
+        let allowed = saved
+            .changes
+            .gated_risks()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        success(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            path.to_str().unwrap(),
+            "--checksum",
+            &saved.wire_fingerprint(),
+            "--allow",
+            &allowed,
+        ]));
+        on_server(
+            connection,
+            &format!(
+                "IF app.[café](2) <> 3 OR app.a(2) <> {} THROW 51000, 'wrong collated caller result', 1;",
+                if same { 3 } else { 2 }
+            ),
+        );
+        success(d.run(&["verify", "--db", connection]));
+        success(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
+        let next: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(next.changes.is_empty(), "{:?}", next.changes);
+    }
+}
+
 #[path = "support/abrupt_recovery.rs"]
 mod abrupt_recovery;
 
