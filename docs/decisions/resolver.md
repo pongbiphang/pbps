@@ -4808,47 +4808,99 @@ indexes, a view over a function, and declared rows all lower from empty and
 compile in one pass, so the scratch route's reconstruction ordering is not
 needed for the base.
 
-*Authorization, by run-scoped role mapping (the maintainer's option C).* A
-cluster's roles are shared, so the target's names are never created on the
-scratch (two plans at once would collide, and the roles would outlive the run),
-and a grant or policy naming a role the scratch lacks would fail a plan for a
-reason that says nothing about it. Leaving authorization out, as the first draft
-did, is therefore not an answer either: a wrong grant or policy would pass the
-rehearsal and fail at apply. Each role the plan, the base or the declarations
-name maps to `pbps_rehearsal_<n>_<token>` (`RoleMapping`, in `pbps-model`, the
-engine-neutral half that PR 3 reuses beside SQL Server's `PrincipalMap`; the
-engine's own `pg_*` roles keep their names). The mapping is applied to the
-model and the plan is lowered again: the base's schema and identity file, the
-declarations and the ordered plan (`OrderedPlan::under_role_names`, the one way
-to rename an already ordered plan, which renames roles and nothing else and
-makes the ordering proof again). Role, grant and row-security policy changes
-therefore run and are compared like every other change, with nothing excluded on
-the mapped path. A name inside a policy's `USING` is an expression and is not
-mapped; it runs as written.
+*Authorization, by role naming that follows the scratch's placement (the
+maintainer's option C, then G in #2432).* A role is a cluster object. Leaving
+authorization out, as the first draft did, is not an answer: a wrong grant or
+policy would pass the rehearsal and fail at apply. What a name means depends on
+whose cluster the scratch is, so there is one naming for each placement
+(`Naming`, decided from the scratch's `Placement` and its source, in one
+function):
 
-*Ownership.* The mapped roles are the run's resources, recorded before they are
-made. A run-owned run adds them to the roles its release drops after the
-database, so the login, the record, outlives them and a failed drop names the
-role left. A supplied run adds them to its claim (`Claim::roles`, omitted when
-none, so no claim changes shape for a run without them), because the claim is
-what a later run finds the run dead by and the role is the cluster's: the
-release drops them after emptying the database, which revoked what they were
+- **The target's own cluster** (a supplied, confined account): `Existing`. The
+  roles are the target's real ones and are there, `plan` having refused any it
+  lacks. The run uses their names and creates, records and asks nothing: not
+  even `CREATEROLE`, which this layout forbids the account. Every grant, default
+  privilege and policy lives in the scratch database, so the `DROP OWNED` that
+  empties it takes them, after a kill too, by the claim. Measured on 16.15 and
+  18.6 as the confined account: `GRANT` to a role it is not a member of,
+  `GRANT USAGE`, `ALTER DEFAULT PRIVILEGES` (with and without a schema), `CREATE
+  POLICY ... TO` with `current_user` and a literal role name in the `USING`, and
+  `REVOKE` all succeed; `pg_authid`, `pg_auth_members` and `pg_db_role_setting`
+  are unchanged; after the cleanup no ACL, policy or default ACL names the role
+  and the shared catalog's dependencies on it are what they were. Two costs,
+  accepted and written in SPEC 9.3.2: while the run lives, or after a kill until
+  the next run cleans up, `DROP ROLE` of a real role the plan grants fails with
+  `role "x" cannot be dropped because some objects depend on it` (the shared
+  catalog `pg_shdepend` names the role); and a LOGIN role can `CONNECT` to the
+  scratch database (PUBLIC holds it unless the operator revoked it, and the run
+  does not revoke it) and read what it was granted, which is the declared schema
+  and rows. No `REVOKE CONNECT` is added.
+- **A container**: `Created`. It is a cluster of this run's own, never shared or
+  reused (a fresh name, password and loopback port for each `Container::start`,
+  held by one plan's `Entry`). The real names are made, but only those the
+  cluster lacks: the bootstrap superuser `postgres`, the engine's `pg_*` roles
+  and a role the externals file made already exist, and creating them fails
+  (`role "x" already exists`). What is made is recorded in
+  `Created::RunOwned.roles`, which the release drops after the database.
+- **A cluster other runs and other tenants use** (a run-owned `kind: server`, or
+  an account on another cluster): `Mapped`, the run-scoped mapping of the first
+  version of this entry. Real names collide between runs (`role "x" already
+  exists`), a grant to a real name another tenant owns succeeds silently, and a
+  superuser's release would drop a tenant's role. Each role the plan, the base or
+  the declarations name maps to `pbps_rehearsal_<n>_<token>` (`RoleMapping`, in
+  `pbps-model`, the engine-neutral half that PR 3 reuses beside SQL Server's
+  `PrincipalMap`; the engine's own `pg_*` roles keep their names).
+
+All three share one lowering and one comparison: the mapping is applied to the
+model, with `RoleMapping::unchanged` the identity where the names are real, and
+the plan is lowered again at the one place it needs to be
+(`OrderedPlan::under_role_names`, which renames roles and nothing else and makes
+the ordering proof again; the maintainer kept it over renaming at emit time).
+Role, grant and row-security policy changes therefore run and are compared like
+every other change. A name inside a policy's `USING` is an expression: on the
+mapped placement it is not mapped and runs as written. That cannot fail a valid
+plan, measured: a table with policies cannot declare rows, so nothing is read
+back through a policy, and `FORCE ROW LEVEL SECURITY` with `pg_has_role(
+current_user, 'x', 'member')` converges on every placement. (Run directly as the
+table's owner, the same text fails with `role "x" does not exist`; a test pins
+that nothing in the rehearsal reaches it.)
+
+*The planner's check, again.* The planner refuses a declared role and a policy
+recipient the target lacks. A role dropped since is refused before a scratch is
+started, in the planner's own words and with its `CREATE ROLE`
+(`pbps_pg::roles::missing_roles` and `refuse_missing_cluster_roles`), because a
+scratch given the target's names must not make a role the target lacks: the
+rehearsal would pass a plan that fails at apply. The resolver's capture does not
+list the plan's roles (it holds the deployer's role closure and the in-scope
+schemas' owners and grantees), so it cannot be asked.
+
+*Ownership of mapped roles.* The mapped roles are the run's resources, recorded
+before they are made. A run-owned run adds them to the roles its release drops
+after the database, so the login, the record, outlives them and a failed drop
+names the role left. A supplied run adds them to its claim (`Claim::roles`,
+omitted when none, so no claim changes shape for a run without them), because
+the claim is what a later run finds the run dead by and the role is the cluster's:
+the release drops them after emptying the database, which revoked what they were
 granted, and the claim goes last. The run-owned sweep already recognises
 `pbps_rehearsal_<n>_<token>` by its token (DEC-2410.1). Measured with a real
 SIGKILL on a run-owned scratch and on a supplied account holding `CREATEROLE`:
 a killed rehearsal leaves its roles, and the next run removes exactly them, once
 the server has seen the dead run's sessions go, while a live run's roles stand.
+On the target's own cluster a kill leaves no role, and the claim it leaves is
+cleaned by the next run: no ACL, policy or default ACL names the real role
+afterwards.
 
-*Downgrade.* The scratch account needs `SUPERUSER` or `CREATEROLE`, asked before
-anything is recorded (dropping a role takes the same attribute, so a recording
-made by an account that could never create the role could never be released). A
-run-owned scratch has a superuser. The account the target's own cluster demands
-is confined and has neither, so there authorization is not rehearsed, and that
-is the rule on that layout and not an exception: the rest of the rehearsal runs,
-the plan is not refused, and the record says `not_rehearsed` with the reason. A
-project that names no role has nothing to leave out and is recorded as
+*Downgrade.* Only the mapped placement needs the scratch account to make roles:
+`SUPERUSER` or `CREATEROLE`, asked before anything is recorded (dropping a role
+takes the same attribute, so a recording made by an account that could never
+create the role could never be released). A run-owned scratch has a superuser.
+An account on another cluster without `CREATEROLE` gets the rest of the
+rehearsal, the plan is not refused, and the record says `not_rehearsed` with the
+reason. A project that names no role has nothing to leave out and is recorded as
 rehearsed. Authorization errors the downgrade cannot see are not claimed: the
-record says it did not look.
+record says it did not look. The confined account on the target's own cluster,
+which the first version of this entry downgraded as the rule of that layout, is
+no longer downgraded.
 
 *The authorization field.* `Converged` carries `authorization`: `rehearsed`, or
 `not_rehearsed { reason }`. The field is required, not defaulted: a record that

@@ -2182,9 +2182,9 @@ about to write, whether or not the resolver was needed (#2379, DEC-2379.2):
 
 1. The target's current managed model, with its declared rows, is lowered from
    empty by the emitter, as `bootstrap` lowers it, and created on the scratch.
-   Every role the plan, that base or the declarations name is first mapped to a
-   role made for the run (below), so the roles' grants and the row-security
-   policies are part of what is created.
+   The roles the plan, that base or the declarations name are named as the
+   scratch's placement decides (below), so the roles' grants and the
+   row-security policies are part of what is created.
 2. The plan's statements run in order, as `apply` runs them: the dialect's
    session pins and the target's time zone, in one transaction unless the plan
    is staged.
@@ -2204,23 +2204,37 @@ rehearsal needs no fingerprint key and reaches no compatibility verdict: it
 validates syntax and convergence on the scratch's build, never that build's
 behaviour.
 
-**Roles.** A cluster's roles are shared by every database on it, so the
-target's role names are never created on a scratch: two plans at once would
-collide, and the roles would outlive the run. Each role the plan, the base it
-builds or the declarations name is mapped to a role the run creates
-(`pbps_rehearsal_<n>_<token>`, `NOLOGIN`, no attribute; the engine's own `pg_*`
-roles keep their names). The mapping applies to the model, not to SQL text: the
-plan's role, grant and row-security policy changes are lowered again with the
-mapped names, run, and compared with the declarations under the same names like
-every other change. A name inside a policy's `USING` expression is an
-expression and is not mapped. The roles are recorded before they are made, in
-what the release drops, and, in a supplied database, in the run's claim (§9.3.2),
-so the release, or the next run that finds the run gone, drops them; a role
-that cannot be dropped is named. The scratch account needs `CREATEROLE`; a
-run-owned scratch has a superuser. The account that must be confined on the
-target's own cluster has none (§9.3.2), so there authorization is **not
-rehearsed**: the rest is, the plan is not refused for it, and its record says so
-(below).
+**Roles.** A role is a cluster object, so what its name means depends on whose
+cluster the scratch is. One naming for each placement (#2432):
+
+- **On the target's own cluster** (the confined account of §9.3.2) the roles are
+  the target's, they are there, and the planner has refused any it lacks. The
+  rehearsal uses their real names, makes and records nothing, and does not ask
+  the account for `CREATEROLE`, which that layout forbids it. The grants,
+  default privileges and policies are in the scratch database, so emptying it
+  takes them.
+- **In a container**, a cluster of the run's own, the real names are made,
+  but only those the cluster lacks: the bootstrap superuser, the engine's `pg_*`
+  roles and a role the externals file made are not the run's. What the run makes
+  goes with the container.
+- **On any other cluster** (a run-owned scratch on a server, or an account on
+  another cluster) other runs and other tenants' roles live there, so the
+  target's names are never used: each role the plan, the base it builds or the
+  declarations name is mapped to a role the run creates
+  (`pbps_rehearsal_<n>_<token>`, `NOLOGIN`, no attribute; the engine's own
+  `pg_*` roles keep their names). The scratch account needs `CREATEROLE` there.
+
+One lowering and one comparison serve all three, with the names the placement
+gives: the plan's role, grant and row-security policy changes are lowered again
+from the model, run, and compared with the declarations under the same names
+like every other change; nothing is rewritten in text. A name inside a policy's
+`USING` is an expression and runs as written, which cannot fail a valid plan: a
+table with policies cannot declare rows, so nothing is read back through a
+policy. A role the plan names and the target no longer has is refused before a
+scratch is started, in the planner's words. The mapped roles are recorded before
+they are made, in what the release drops and, in a supplied database, in the
+run's claim (§9.3.2), so the release, or the next run that finds the run gone,
+drops them; a role that cannot be dropped is named.
 
 It is on by default. `rehearse: false` under an environment and
 `plan --no-rehearse` turn it off, and the plan is sealed `off`, never as
@@ -2234,15 +2248,18 @@ What it does not reproduce, stated rather than implied:
   and the declared rows only, so a CHECK or UNIQUE added over rows the
   declarations do not list, or a conversion of existing data, is not tried
   (#1165's fixtures are that territory).
-- **Authorization, where the scratch account cannot create roles.** The
-  plan's role, grant and row-security policy changes are neither run nor
-  compared, because a grant or a policy naming a role the scratch lacks would
-  fail a plan for a reason that says nothing about it. The record says
-  `not_rehearsed`, with the reason, and `plan` (human and JSON), `explain` and
-  `apply` print it beside the rest, so a rehearsal that left a class out is never
-  read as a full one. A project that names no role has nothing to leave out.
-- **A role name inside an expression.** A policy's `USING` that compares with a
-  role's name as a literal runs with the literal as written, not as mapped.
+- **Authorization, on a cluster others use without `CREATEROLE`.** Only an
+  account on another cluster that cannot make the run's roles: the plan's role,
+  grant and row-security policy changes are neither run nor compared, because a
+  grant or a policy naming a role the scratch lacks would fail a plan for a reason
+  that says nothing about it. The record says `not_rehearsed`, with the reason,
+  and `plan` (human and JSON), `explain` and `apply` print it beside the rest, so
+  a rehearsal that left a class out is never read as a full one. A project that
+  names no role has nothing to leave out. The confined account on the target's own
+  cluster is not in this case.
+- **A role name inside an expression.** On a cluster others use, a policy's
+  `USING` that compares with a role's name as a literal runs with the literal as
+  written, not as mapped.
 - **The engine's edition and build.** As above, a scratch validates syntax and
   convergence; it is not qualified against the target.
 - **Declarations the resolver's externals fill cannot answer for.** A managed
@@ -2340,6 +2357,15 @@ DEC-1674.1).**
       no other login role, and is not the target's login, whose sessions it
       could signal. An unconfined account there refuses, naming what to
       remove.
+    - **A rehearsal on the target's own cluster uses the target's real role
+      names** (§9.3.1), and so has two costs, which are accepted. While the run
+      lives, or after a kill until the next run cleans up, an operator's `DROP
+      ROLE` of a real role the plan grants fails, because the scratch
+      database's grants and policies depend on it (`role "x" cannot be dropped
+      because some objects depend on it`). And a real LOGIN role can `CONNECT` to
+      the scratch database, which PUBLIC may unless the operator revoked it and
+      which the run does not revoke, and read what it was granted there: only the
+      declared schema and rows.
     - **The account decides the layout.**
       - **Run-owned.** A login that is itself a superuser, on another
         cluster, gets:
@@ -2398,10 +2424,10 @@ DEC-1674.1).**
       until its own is made, so two runs never clean one dead claim at once,
       and a release removes the claim as its last step. The claim's
       account defaults move with an allowed externals file's changes to them,
-      in that file's transaction. A rehearsal's roles belong to the cluster, not
-      to the database, so the claim also names them, before they are made, and
-      the release and the run that finds the claim dead drop them after the
-      database is emptied.
+      in that file's transaction. The roles a rehearsal maps a plan's roles to belong to
+      the cluster, not to the database, so on a cluster others use the claim also
+      names them, before they are made, and the release and the run that finds
+      the claim dead drop them after the database is emptied.
       - A leftover that cannot be removed does not stop the run. It is a
         warning (a finding, `scratch.leftover`, in `--format json`) naming
         the resource, why, and the statement that removes it. A database

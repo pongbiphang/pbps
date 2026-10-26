@@ -14,9 +14,10 @@ before the baseline without comparison to any target. This remains a preview.
 A connected PostgreSQL plan with a scratch entry selected is rehearsed on that
 entry by default and sealed with the outcome (#2379, DEC-2379.2);
 `rehearse: false` and `plan --no-rehearse` turn it off. Its role, grant and
-row-security policy changes run on roles made for the run; where the scratch
-account cannot create roles they are skipped, and the record says so. SQL
-Server's connected rehearsal follows #2376.
+row-security policy changes run under the target's real role names on the
+target's own cluster and in a container, and on roles made for the run on a
+cluster others use, where an account that cannot create roles skips them and
+the record says so. SQL Server's connected rehearsal follows #2376.
 
 SQL Server projects may declare cross-database table/view shapes with
 `dependency:` files (#2322, SPEC §4.9). Connected planning compares readable
