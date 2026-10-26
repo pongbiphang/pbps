@@ -1253,6 +1253,10 @@ impl Dialect for Postgres {
         generated::may_call(text, name)
     }
 
+    fn module_creation_text<'a>(&self, module: &'a pbps_model::Module) -> Cow<'a, str> {
+        generated::creation_text(module)
+    }
+
     fn generation_names_table(&self, text: &str, table: &TableName) -> bool {
         generated::names_table(text, table)
     }

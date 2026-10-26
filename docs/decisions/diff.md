@@ -8724,3 +8724,65 @@ Pinned by `a_reader_naming_an_index_follows_the_table_that_keeps_it`,
 `multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds`,
 and the live `scratch_rules_compile_on_both_servers` and
 `held_tables_and_readers_compile_with_their_keys_on_both_servers`.
+
+
+<a id="dec-2389-2"></a>
+
+**DEC-2389.2. The scratch route orders a module by what the engine resolves
+when it creates it.** Part of #2389, draft round 1. Splitting every new table
+(DEC-2389.1) makes `generated::constraints_in` non-empty for every plan, so the
+module dependencies it adds (a function moved past a held table must not pass a
+module it calls) now reached plans that never had a generated column. They read
+the whole definition, a PL/pgSQL body included, and two PL/pgSQL routines that
+call each other by name closed a cycle between them that the engine does not
+have: the declaration reconstructed before, and a table with a plain default
+beside the two refused it.
+
+Measured on PostgreSQL 16.15 and 18.6, which agree, with
+`check_function_bodies = on` (pinned by the transaction framing). Created while
+a routine, table or index the body names is absent: a PL/pgSQL body that calls,
+performs, selects from or names by literal or `REINDEX`, and whose declared
+variable has a default calling it. Refused with `42883`, `42P01` or `42704`
+while it is absent: a `LANGUAGE sql` body (string, `BEGIN ATOMIC`, `RETURN`),
+including a literal inside it (`'app.ix'::regclass`); a view; a trigger; and,
+in any language, the header (a parameter default, `RETURNS`, `SUPPORT`). A
+PL/pgSQL body does resolve the type of a variable it declares, a table's or a
+view's row type; a lexical scan does not tell that from a call.
+
+In scratch the text of a module that orders it is `Dialect::module_creation_text`
+(the whole definition by default). PostgreSQL answers the definition with a
+PL/pgSQL body blanked, and with a `LANGUAGE sql` string body returned as code,
+so that the literals in it are the text's literals and its OID-alias literals
+count. It is read by the module dependencies, by the modules that read a table,
+the choice of a table to hold, and the rule that an index precedes the reader
+naming it. Declared dependencies are unchanged. The ordinary route reads the
+whole definition, as it did. The declaration of a variable's type in a PL/pgSQL
+body is left to the order the plan has, which the differ's own scan of the body
+gave it; a view and a routine that name one another that way are not refused
+here but fail in the engine.
+
+A cycle of routines resolved at creation (two `LANGUAGE sql` bodies calling
+each other: neither is creatable in any order, measured) remains
+`Schedule`'s named refusal, and its message no longer speaks of a generated
+column only.
+
+A sweep for the same shape found one edge the first commit missed: the index
+rule did not see an OID-alias literal inside a `LANGUAGE sql` string body, whose
+literal was one string to the scan, so the function could precede the table and
+fail with `42P01` where the phases made it follow. It is read as code now.
+
+Compared with the previous head on 600 generated schemas on each server (1,200
+compiles): no regression, and the same five that compile now. Statement
+multisets and the names made resolvable after each step are unchanged; the
+order of 582 cases differs where a module no longer waits on a body that only
+runs later. Declarations that compile now and were refused in both routes: a
+held table whose function reads it from a PL/pgSQL body, and two PL/pgSQL
+routines calling each other beside a generated column.
+
+Pinned by `routines_that_call_each_other_late_are_no_cycle`,
+`routines_that_call_each_other_at_creation_stay_a_named_cycle`,
+`a_late_routine_still_follows_what_its_header_names`,
+`a_late_body_reading_a_table_does_not_follow_it`,
+`a_late_body_naming_an_index_does_not_follow_the_table_keeping_it`,
+`a_sql_body_naming_an_index_and_a_table_by_literal_follows_both`, the
+`creation_text` tests, and the live `scratch_rules_compile_on_both_servers`.

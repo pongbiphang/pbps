@@ -182,19 +182,38 @@ fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
         .collect()
 }
 
+/// What a module's text names for the order. In `scratch` that is the text the
+/// engine resolves when it creates the module (DEC-2389.2): two routines whose
+/// bodies call each other are created in either order, and an edge for a call
+/// the engine makes later would close a cycle between them that is no order's
+/// fault. Otherwise the whole definition, as the ordinary route has it.
+fn named_text<'a>(
+    module: &'a Module,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> std::borrow::Cow<'a, str> {
+    if scratch {
+        dialect.module_creation_text(module)
+    } else {
+        std::borrow::Cow::Borrowed(module.definition.as_str())
+    }
+}
+
 /// Keep selection and settlement on exactly the same relation, including
 /// declared dependencies and the existing same-name exclusions (DEC-1503.5).
 fn module_dependencies(
     modules: &[ModuleStep<'_>],
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
 ) -> Vec<(usize, usize)> {
     let mut edges = Vec::new();
     for (i, id, module) in modules {
+        let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
             if i != j
                 && id.name() != provider.name()
-                && (dialect.generation_may_call(&module.definition, provider.name())
+                && (dialect.generation_may_call(&text, provider.name())
                     || deps.get(*id).is_some_and(|needs| needs.contains(*provider)))
             {
                 edges.push((*j, *i));
@@ -237,7 +256,7 @@ fn parts_in(
     // settlement uses rather than predicting a different call graph here.
     let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
         let modules = modules(changes);
-        let edges = module_dependencies(&modules, deps, dialect);
+        let edges = module_dependencies(&modules, deps, dialect, scratch);
         let mut pending: Vec<_> = modules
             .iter()
             .filter(|(_, id, module)| {
@@ -261,9 +280,10 @@ fn parts_in(
             }
         }
         modules.iter().any(|(i, _, module)| {
+            let text = named_text(module, dialect, scratch);
             reached.contains(i)
-                && dialect.generation_names_table(&module.definition, name)
-                && !dialect.generation_table_name_only(&module.definition, name)
+                && dialect.generation_names_table(&text, name)
+                && !dialect.generation_table_name_only(&text, name)
         })
     } else {
         false
@@ -886,10 +906,11 @@ pub(super) fn constraints_in(
             }
         }
         for (i, _, module) in &modules {
-            if dialect.generation_names_table(&module.definition, name) {
+            let text = named_text(module, dialect, scratch);
+            if dialect.generation_names_table(&text, name) {
                 // Called readers already chose a full-shape placeholder or
                 // the whole-table hold; every consumer sees that full shape.
-                if let Some(columns) = reads(dialect, &[module.definition.as_str()], name) {
+                if let Some(columns) = reads(dialect, &[&text], name) {
                     wait_for(dialect, &mut out, first, &own, &columns, *i);
                 } else {
                     edge(&mut out, if whole { first } else { complete }, *i);
@@ -905,7 +926,7 @@ pub(super) fn constraints_in(
     }
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
-    for (provider, consumer) in module_dependencies(&modules, deps, dialect) {
+    for (provider, consumer) in module_dependencies(&modules, deps, dialect, scratch) {
         edge(&mut out, provider, consumer);
     }
     out.constraints().iter().cloned().collect()
@@ -987,19 +1008,27 @@ fn scratch_rules(
         }
     };
     if dialect.indexes_share_namespace_with_tables() {
-        let readers: Vec<(usize, Vec<&str>)> =
-            cs.changes
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let module = match &p.change {
-                        Change::CreateModule { module, .. }
-                        | Change::AlterModule { module, .. } => Some(module.definition.as_str()),
-                        _ => None,
-                    };
-                    (i, texts(&p.change).into_iter().chain(module).collect())
-                })
-                .collect();
+        let readers: Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> = cs
+            .changes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let module = match &p.change {
+                    Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                        Some(dialect.module_creation_text(module))
+                    }
+                    _ => None,
+                };
+                (
+                    i,
+                    texts(&p.change)
+                        .into_iter()
+                        .map(std::borrow::Cow::Borrowed)
+                        .chain(module)
+                        .collect(),
+                )
+            })
+            .collect();
         for (at, p) in cs.changes.iter().enumerate() {
             for name in early_index_names(&p.change) {
                 for (reader, texts) in &readers {

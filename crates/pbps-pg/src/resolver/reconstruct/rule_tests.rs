@@ -240,7 +240,9 @@ fn a_replica_identity_follows_the_late_index_it_names() {
 }
 
 /// The fixtures above compile on 16 and 18, in the order the schedule
-/// gives, and a partition keeps the default of its own.
+/// gives, and a partition keeps the default of its own. A routine that is
+/// resolved when it is created follows what it names, and one that is not
+/// does not wait for it.
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn scratch_rules_compile_on_both_servers() {
@@ -267,6 +269,26 @@ async fn scratch_rules_compile_on_both_servers() {
         ],
         partitions("app.f(1)", "7").to_vec(),
         vec![create("t", identity_table()), function("f")],
+        // Routines resolved late call one another: no order is needed between
+        // them, and where one is resolved at creation only that one follows.
+        vec![
+            create("t", defaulted()),
+            plpgsql("f", "g"),
+            plpgsql("g", "f"),
+        ],
+        vec![create("t", defaulted()), sql("f", "g"), plpgsql("g", "f")],
+        literal_readers().to_vec(),
+        header_readers(),
+        // A late body names the table, and an index of it, that waits for it.
+        vec![
+            create("t", held_table()),
+            routine(
+                "f",
+                "plpgsql",
+                " BEGIN REINDEX INDEX app.t_ix; \
+                  RETURN (SELECT count(*) FROM app.t)::int; END ",
+            ),
+        ],
     ];
     for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
         let server = std::env::var(variable).expect("both PostgreSQL endpoints are required");
@@ -319,4 +341,199 @@ async fn scratch_rules_compile_on_both_servers() {
             );
         }
     }
+}
+
+/// A routine over `body`, in `language`, named `name(integer)`.
+fn routine(name: &str, language: &str, body: &str) -> Change {
+    module(
+        &format!("app.{name}(integer)"),
+        ModuleKind::Function,
+        &format!("(integer) RETURNS integer LANGUAGE {language} IMMUTABLE AS $${body}$$"),
+    )
+}
+
+fn plpgsql(name: &str, callee: &str) -> Change {
+    routine(
+        name,
+        "plpgsql",
+        &format!(" BEGIN RETURN app.{callee}($1); END "),
+    )
+}
+
+fn sql(name: &str, callee: &str) -> Change {
+    routine(name, "sql", &format!(" SELECT app.{callee}($1) "))
+}
+
+/// A table whose plain default calls `app.f`.
+pub(super) fn defaulted() -> Table {
+    let mut table = Table::default();
+    let mut column = int();
+    column.value_source = ValueSource::Default("app.f(1)".into());
+    table.columns.insert("a".into(), column);
+    table
+}
+
+/// Two PL/pgSQL routines that call each other are created in either order
+/// (measured on 16 and 18: the body is parsed and resolves nothing), so a
+/// table whose default calls one must not make them wait on one another.
+#[test]
+fn routines_that_call_each_other_late_are_no_cycle() {
+    let changes = [
+        create("t", defaulted()),
+        plpgsql("f", "g"),
+        plpgsql("g", "f"),
+    ];
+    for version in [None, Some(160_000)] {
+        let order = order(&changes, version);
+        assert_eq!(order.len(), 4, "{order:?}");
+        // What the engine does need still holds: the default calls `f`.
+        assert!(
+            at(&order, "function app.f(integer)") < at(&order, "the default of app.t.a"),
+            "{order:?}"
+        );
+    }
+}
+
+/// Negative: bodies the engine resolves at creation (`LANGUAGE sql`, measured
+/// the same with a string body, `BEGIN ATOMIC` and `RETURN`) that call each
+/// other leave no order, and stay the schedule's named refusal.
+#[test]
+fn routines_that_call_each_other_at_creation_stay_a_named_cycle() {
+    let pg = crate::Postgres::new();
+    let refused = |changes: &[Change]| match super::tests::build_reconstruction(&pg, changes) {
+        Err(ReconstructError::Cycle(message)) => message,
+        other => panic!("expected a cycle, got {:?}", other.map(|r| r.steps.len())),
+    };
+    let message = refused(&[create("t", defaulted()), sql("f", "g"), sql("g", "f")]);
+    assert!(
+        message.contains("app.f(integer)") && message.contains("app.g(integer)"),
+        "{message}"
+    );
+    // Only one side resolves at creation: no cycle, and that side follows.
+    let order = order(
+        &[create("t", defaulted()), sql("f", "g"), plpgsql("g", "f")],
+        None,
+    );
+    assert!(
+        at(&order, "function app.g(integer)") < at(&order, "function app.f(integer)"),
+        "{order:?}"
+    );
+}
+
+pub(super) fn header_readers() -> Vec<Change> {
+    let header = module(
+        "app.f(integer)",
+        ModuleKind::Function,
+        "(i integer DEFAULT app.g(1)) RETURNS integer LANGUAGE plpgsql \
+         AS $$ BEGIN RETURN app.g(i); END $$",
+    );
+    vec![create("t", defaulted()), header, plpgsql("g", "f")]
+}
+
+/// The header of a PL/pgSQL routine is resolved when it is created (a
+/// parameter default calling an absent function is `42883`), unlike its body.
+#[test]
+fn a_late_routine_still_follows_what_its_header_names() {
+    // `g` calls `f` only in its body, so `f` may keep waiting for `g`.
+    let order = order(&header_readers(), None);
+    assert!(
+        at(&order, "function app.g(integer)") < at(&order, "function app.f(integer)"),
+        "{order:?}"
+    );
+}
+
+/// The same holds for a table: a PL/pgSQL body that reads the table of a
+/// generated column the routine itself computes is created before the table
+/// (measured: the body resolves nothing), where a `LANGUAGE sql` body that
+/// reads it leaves no order, which stays the schedule's named refusal.
+#[test]
+fn a_late_body_reading_a_table_does_not_follow_it() {
+    let table = held_table();
+    let reader = |language: &str, body: &str| routine("f", language, body);
+    let pg = crate::Postgres::new();
+    for version in [None, Some(160_000)] {
+        let changes = [
+            create("t", table.clone()),
+            reader(
+                "plpgsql",
+                " BEGIN RETURN (SELECT count(*) FROM app.t)::int; END ",
+            ),
+        ];
+        let order = order(&changes, version);
+        // The generated column, or on a server that cannot set an expression
+        // later the whole table, is the last step of the table.
+        let last = order.iter().rposition(|d| d.contains("app.t")).unwrap();
+        assert!(at(&order, "function app.f(integer)") < last, "{order:?}");
+        let pg = version.map_or_else(|| pg.clone(), |v| pg.clone().with_server_version(v));
+        let changes = [
+            create("t", table.clone()),
+            reader("sql", " SELECT count(*)::int FROM app.t "),
+        ];
+        assert!(
+            matches!(
+                super::tests::build_reconstruction(&pg, &changes),
+                Err(ReconstructError::Cycle(_))
+            ),
+            "{version:?}"
+        );
+    }
+}
+
+/// A `LANGUAGE sql` body is code to the engine, so the table and the index
+/// its own literals name (`'app.t_ix'::regclass`) must exist when it is created
+/// (measured: 42P01 on 16 and 18), though the whole body is one string. The
+/// routine is declared first here, and follows both.
+pub(super) fn literal_readers() -> [Change; 3] {
+    let mut table = Table::default();
+    table.columns.insert("a".into(), int());
+    table.indexes.insert("t_ix".into(), index(None));
+    let reader = routine(
+        "f",
+        "sql",
+        " SELECT 'app.t_ix'::regclass::oid::int + 'app.u'::regclass::oid::int ",
+    );
+    let mut other = Table::default();
+    other.columns.insert("a".into(), int());
+    [reader, create("t", table), create("u", other)]
+}
+
+#[test]
+fn a_sql_body_naming_an_index_and_a_table_by_literal_follows_both() {
+    let eager = order(&literal_readers(), None);
+    for named in ["table app.t", "table app.u"] {
+        assert!(
+            at(&eager, named) < at(&eager, "function app.f(integer)"),
+            "{eager:?}"
+        );
+    }
+    // Negative: the same body in PL/pgSQL names them late, so the plan's own
+    // order stands.
+    let [_, t, u] = literal_readers();
+    let late = routine(
+        "f",
+        "plpgsql",
+        " BEGIN RETURN 'app.t_ix'::regclass::oid::int + 'app.u'::regclass::oid::int; END ",
+    );
+    let lazy = order(&[late, t, u], None);
+    assert!(
+        at(&lazy, "function app.f(integer)") < at(&lazy, "table app.t"),
+        "{lazy:?}"
+    );
+}
+
+/// A PL/pgSQL body that names an index resolves it only when it runs
+/// (measured), so it does not follow the table that keeps the index,
+/// which here waits for the routine its generated column calls. A body
+/// resolved at creation does (`a_reader_naming_an_index_follows_the_table_that_keeps_it`).
+#[test]
+fn a_late_body_naming_an_index_does_not_follow_the_table_keeping_it() {
+    let body = " BEGIN REINDEX INDEX app.t_ix; RETURN 1; END ";
+    let order = order(
+        &[create("t", held_table()), routine("f", "plpgsql", body)],
+        Some(160_000),
+    );
+    assert!(
+        at(&order, "function app.f(integer)") < at(&order, "table app.t"),
+        "{order:?}"
+    );
 }

@@ -63,8 +63,9 @@ pub enum ReconstructError {
     #[error("the scratch server cannot use the target's time zone {zone:?}: {reason}")]
     Zone { zone: String, reason: String },
     #[error(
-        "scratch cannot order the declarations: {0}. A generated column calling a declared \
-         function that itself needs the table leaves no order that compiles both"
+        "scratch cannot order the declarations: {0}. Each of them names another when the \
+         engine creates it (a generated column calling a function that reads the table, \
+         routines resolved at creation calling one another), so no order compiles them"
     )]
     Cycle(String),
 }

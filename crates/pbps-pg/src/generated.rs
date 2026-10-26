@@ -143,6 +143,48 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
+/// The text of `module` the engine resolves when it creates it (DEC-2389.2).
+/// Measured on 16.15 and 18.6 with `check_function_bodies = on`, which the
+/// transaction framing pins: a view, a trigger, a `LANGUAGE sql` body and a
+/// SQL-standard body (`BEGIN ATOMIC`, `RETURN`) are refused while anything
+/// they name is absent, and a PL/pgSQL body is created though every routine,
+/// table and index it calls, reads or names by a literal is absent. What a
+/// PL/pgSQL routine's header names (argument and return types, defaults,
+/// `SUPPORT`) is resolved all the same, so that text stays.
+///
+/// A `LANGUAGE sql` body is a string, but code to the engine: the literals
+/// inside it (`'app.ix'::regclass`) are bound too, and the scans read a
+/// string's contents as one literal, which holds those as data. So the body
+/// is returned as code, its own literals then literals of the text.
+///
+/// A PL/pgSQL body does resolve the type of a variable it declares, a
+/// table's or a view's row type (`r app.v%ROWTYPE`). That is not told apart
+/// from a call by a lexical scan, and is left to the order the plan already
+/// has, which the differ's own scan of the same body gave it.
+pub(crate) fn creation_text(module: &pbps_model::Module) -> std::borrow::Cow<'_, str> {
+    use pbps_model::ModuleKind;
+    let definition = module.definition.as_str();
+    if matches!(module.kind, ModuleKind::Function | ModuleKind::Procedure)
+        && let Some(body) = crate::LEXICON.routine_body(definition)
+    {
+        let language = crate::LEXICON.routine_language(definition);
+        let contents = match language.as_deref() {
+            Some("plpgsql") => Some(" ".repeat(body.len())),
+            Some("sql") => crate::LEXICON
+                .string_literals(&definition[body.clone()])
+                .into_iter()
+                .next(),
+            _ => None,
+        };
+        if let Some(contents) = contents {
+            let mut text = definition.to_owned();
+            text.replace_range(body, &contents);
+            return std::borrow::Cow::Owned(text);
+        }
+    }
+    std::borrow::Cow::Borrowed(definition)
+}
+
 mod parts;
 pub(crate) use parts::parts;
 
@@ -305,5 +347,113 @@ mod tests {
         assert!(!may_read("U&\"\\0062\" * 2", "a"));
         // Inside a literal it is data again.
         assert!(!may_read("b || 'U&\"x\"'", "a"));
+    }
+
+    fn module(kind: pbps_model::ModuleKind, definition: &str) -> pbps_model::Module {
+        pbps_model::Module {
+            kind,
+            description: None,
+            definition: definition.into(),
+        }
+    }
+
+    /// A PL/pgSQL body resolves nothing at creation (measured on 16 and 18),
+    /// so a name only it holds is no creation-time reference, and the header,
+    /// whose defaults and types are resolved, still is (DEC-2389.2).
+    #[test]
+    fn a_plpgsql_body_is_no_creation_time_reference_and_its_header_is() {
+        use pbps_model::ModuleKind::{Function, Procedure};
+        for (kind, language) in [
+            (Function, "plpgsql"),
+            (Function, "PLPGSQL"),
+            (Function, "\"plpgsql\""),
+            (Function, "'plpgsql'"),
+            (Procedure, "plpgsql"),
+        ] {
+            let definition = format!(
+                "(i integer DEFAULT app.h(1)) LANGUAGE {language} AS $$ BEGIN PERFORM app.g(i); END $$"
+            );
+            let m = module(kind, &definition);
+            let text = super::creation_text(&m);
+            assert_eq!(text.len(), definition.len());
+            assert!(may_call(&text, "h"), "{language}: the header's default");
+            assert!(!may_call(&text, "g"), "{language}: the body's call");
+        }
+        // The clauses after the body are header too.
+        let after = module(
+            Function,
+            "(i integer) RETURNS integer AS $$ BEGIN RETURN app.g(i); END $$ LANGUAGE plpgsql SUPPORT app.s",
+        );
+        let text = super::creation_text(&after);
+        assert!(may_call(&text, "s") && !may_call(&text, "g"));
+    }
+
+    /// Negatives: whatever the engine resolves at creation keeps what it
+    /// names, in code and in an OID-alias literal alike (measured: a view, a
+    /// trigger, a `LANGUAGE sql` body of any spelling). A word in a header, a
+    /// body or a comment is no language clause.
+    #[test]
+    fn what_the_engine_resolves_at_creation_is_still_named() {
+        use pbps_model::ModuleKind::{Function, Procedure, Trigger, View};
+        for (kind, definition) in [
+            (
+                Function,
+                "(i integer) RETURNS integer LANGUAGE sql AS $$ SELECT app.g(i), 'app.ix'::regclass $$",
+            ),
+            (
+                Function,
+                "(i integer) RETURNS integer LANGUAGE sql AS 'SELECT app.g(i), ''app.ix''::regclass'",
+            ),
+            (
+                Function,
+                "(i integer) RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT app.g(i), 'app.ix'::regclass; END",
+            ),
+            (
+                Function,
+                "(i integer) RETURNS integer RETURN app.g(i) + 'app.ix'::regclass::oid::int",
+            ),
+            (
+                Procedure,
+                "(i integer) LANGUAGE sql AS $$ CALL app.g(i); SELECT 'app.ix'::regclass $$",
+            ),
+            (View, "SELECT app.g(1) AS x, 'app.ix'::regclass AS o"),
+            (
+                Trigger,
+                "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.g() -- 'app.ix'",
+            ),
+            // `language` as a parameter name, and in a comment and a body.
+            (
+                Function,
+                "(language text) RETURNS integer LANGUAGE sql AS $$ SELECT app.g(1), 'app.ix'::regclass /* LANGUAGE plpgsql */ $$",
+            ),
+            (
+                Function,
+                "(i integer) RETURNS integer AS $$ SELECT app.g(i), 'app.ix'::regclass -- LANGUAGE plpgsql\n $$ LANGUAGE sql",
+            ),
+        ] {
+            let m = module(kind, definition);
+            let text = super::creation_text(&m);
+            assert!(may_call(&text, "g"), "{definition}");
+            if kind != Trigger {
+                assert!(may_call(&text, "ix"), "{definition}");
+            }
+        }
+        // A view, a trigger and a SQL-standard body are the text itself.
+        for (kind, definition) in [
+            (View, "SELECT 1 AS x"),
+            (
+                Trigger,
+                "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.g()",
+            ),
+            (
+                Function,
+                "(i integer) RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT i; END",
+            ),
+        ] {
+            let m = module(kind, definition);
+            assert!(
+                matches!(super::creation_text(&m), std::borrow::Cow::Borrowed(text) if text == definition)
+            );
+        }
     }
 }

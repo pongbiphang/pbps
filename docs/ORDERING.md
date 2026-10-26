@@ -634,6 +634,7 @@ and the expression-bearing changes that need a function.
 | Index created → a change whose text names it by an OID-alias literal | content, over-approximated | scratch only, where indexes share the namespace of tables: the table's own step, a unique constraint, a primary key or a part holds no expression, and the reader follows it (`42P01` otherwise) | ✓ DEC-2389.1 |
 | Parent's default set → a partition's own default on that column | value | scratch only: the parts of the two defaults, and of every ancestor's | ✓ DEC-2389.1 |
 | Module or generated expression → an index that holds an expression or a predicate | position | scratch only: the index follows every one, so each counts it among the names made resolvable after it | ✓ DEC-2389.1 |
+| Module → module, table or index its text names | content, over-approximated | scratch only: read through the text the engine resolves at creation (`module_creation_text`): a PL/pgSQL body is no reference, a `LANGUAGE sql` body, view, trigger and every header are | ✓ DEC-2389.2 |
 
 ### Something removed before what it blocks
 
