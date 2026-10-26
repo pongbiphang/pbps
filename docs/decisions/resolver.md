@@ -4726,3 +4726,47 @@ about 6 s with keepalives of 3/2/2. The values chosen, 30/10/3 and 10 s, are
 measured in the PR (see its body). SQL Server (its `##pbps` marker table is
 the same proof already) and docker (a container, and a window before the
 first connection that has no sound answer) follow in #2410.
+
+<a id="dec-2410-2"></a>
+
+**DEC-2410.2. SQL Server recovers a killed run by the marker table it already
+makes, and records its companion databases in a property (#2410).** The
+design of DEC-2410.1 holds, and three facts about the engine decide the rest,
+each measured on SQL Server 2025.
+
+- *The proof is the marker table.* `##pbps_<token>` is created on the
+  session the run keeps open, before anything else, so the token that names
+  the run's resources is the token of the marker (a test reads both from one
+  run). A global temporary table is visible to a login with no privilege and
+  is gone 285 ms after its session was killed; without `VIEW SERVER STATE` the
+  session views show a login only its own session, so they are not used. A
+  vanished client was noticed after 36 s by default, and the instance needs no
+  tuning. As on PostgreSQL, a reader that cannot see its own marker proves
+  nothing.
+- *The sweep never forces.* A `DROP DATABASE` on a database with a session
+  connected is refused (error 3702), so a wrong decision still cannot close a
+  live run's connection; the release of a run's own database keeps
+  `SINGLE_USER WITH ROLLBACK IMMEDIATE`, which only the owner may use. A
+  database or login another login owns is refused (3701, 15174) and is named
+  with its `DROP`.
+- *A companion cannot carry the token.* It has the dependency's own name, so
+  that cross-database references resolve, and a leftover one refuses every
+  later run that needs the name. The scratch database holds the record, a
+  database-level extended property written before each companion is created,
+  and the companion is marked with the run once it exists; the emptiness
+  check leaves both properties out, since they are the run's own. The record
+  lives in the scratch database, so the release removes companions first and
+  keeps the scratch database and the login while one is left. A database
+  named in the record that does not carry the run's mark is not provably the
+  run's and stays, with everything that names it.
+
+The supplied layout is cleaned through the dead run's sandbox user: the
+release already empties a database as that user, and the sweep runs it with
+the user it finds. A sandbox whose run is alive refuses the new run, naming
+it; objects with no sandbox user are not pbps's and are refused as before.
+The sweep runs once the placement is known and before the first write, from
+the end of the scratch constructors, not from `acquire`: the cleanup is the
+deepest call in the run and belongs near its top. Two runs that start
+together on one supplied database are not arbitrated as PostgreSQL's claim
+does; each sees the other's sandbox only after it has made its own.
+

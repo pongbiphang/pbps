@@ -2315,7 +2315,24 @@ DEC-1674.1).**
         `count 3`), and a client killed inside a long statement within
         `client_connection_check_interval` (10 s). Until then the run reads
         as alive, which only keeps its resources.
-      - SQL Server and `kind: docker` are not yet recovered.
+      - **SQL Server** recovers the same way, with its own pieces
+        (DEC-2410.2). The proof is the `##pbps_<token>` marker table the
+        run's session keeps (visible to a login with no privilege, gone with
+        its session or an instance restart). The run-owned login
+        `pbps_run_<token>`, the databases `pbps_scratch_<token>` and
+        `pbps_reference_<token>` and the sandbox user
+        `pbps_sandbox_<token>` carry the token. A companion database must
+        carry the dependency's own name, so the run's scratch database
+        records it in a database property before it is created and marks the
+        companion with the run once it is; a database of that name the run
+        did not mark is kept, with the run's login, since nothing says whose
+        it is. A run removes a dead run's companions, reference database,
+        scratch database and login, in that order, and the first failure
+        keeps the rest. A database or login another login owns is named with
+        the `DROP` that removes it. A supplied database is cleaned through the
+        dead run's sandbox user, as a release cleans it, and refused while
+        that run is alive.
+      - `kind: docker` is not yet recovered.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be
