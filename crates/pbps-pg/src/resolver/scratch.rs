@@ -622,12 +622,31 @@ pub async fn owns_database(conn: &mut impl QueryConnection) -> Result<bool, DbEr
 pub async fn foreign_objects(
     conn: &mut impl QueryConnection,
 ) -> Result<(Vec<String>, usize), DbError> {
+    objects(conn, false).await
+}
+
+/// [`foreign_objects`], leaving out the claim schema when `beside_claim`: the
+/// record a release keeps until its last step is not what the cleanup left.
+async fn objects(
+    conn: &mut impl QueryConnection,
+    beside_claim: bool,
+) -> Result<(Vec<String>, usize), DbError> {
     let union = user_objects();
+    let except = if beside_claim {
+        format!(
+            "WHERE NOT (f.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass \
+                    AND f.objid IN (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                                     WHERE n.nspname = '{}'))",
+            super::recovery::CLAIM
+        )
+    } else {
+        String::new()
+    };
     let rows = conn
         .query(&format!(
             "SELECT pg_catalog.pg_describe_object(f.classid, f.objid, 0) AS object, \
                     pg_catalog.count(*) OVER ()::text AS total \
-               FROM ({union}) f ORDER BY 1 LIMIT {NAMED}"
+               FROM ({union}) f {except} ORDER BY 1 LIMIT {NAMED}"
         ))
         .await?;
     let total = match rows.first() {
@@ -912,9 +931,25 @@ pub async fn drop_owned(
             "the connection now reaches another backend than the one the run checked".into(),
         ));
     }
+    // The claim is the run's record, and the release removes it last
+    // (`recovery::remove`): it goes through the cleanup and comes back in
+    // the same transaction, so no commit shows the database without it.
+    let claim = match super::recovery::comment(conn).await {
+        Ok(claim) => claim,
+        Err(error) => {
+            conn.execute("ROLLBACK").await?;
+            return Err(error);
+        }
+    };
     conn.execute("DROP OWNED BY SESSION_USER").await?;
+    if let Some(comment) = &claim
+        && let Err(error) = super::recovery::keep(conn, comment).await
+    {
+        conn.execute("ROLLBACK").await?;
+        return Err(error);
+    }
     conn.execute("COMMIT").await?;
-    foreign_objects(conn).await
+    objects(conn, claim.is_some()).await
 }
 
 #[cfg(test)]

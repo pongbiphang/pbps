@@ -23,6 +23,27 @@ mod recovery;
 #[cfg(test)]
 pub(in crate::resolver::server) use recovery::sweep_cluster_on;
 
+/// Databases whose supplied release stops after the cleanup commit and before
+/// the privileges are put back, as a kill between the two would.
+#[cfg(test)]
+static STOPPED_AFTER_CLEANUP: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+#[cfg(test)]
+pub(in crate::resolver::server) fn stop_after_cleanup(database: &str, stop: bool) {
+    let mut stopped = STOPPED_AFTER_CLEANUP.lock().unwrap();
+    if stop {
+        stopped.insert(database.to_owned());
+    } else {
+        stopped.remove(database);
+    }
+}
+
+#[cfg(test)]
+fn stopped_after_cleanup(database: &str) -> bool {
+    STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
+}
+
 /// The two places a session's settings are reset, for the test that the
 /// keeper's survive them.
 #[cfg(test)]
@@ -641,7 +662,14 @@ pub(in crate::resolver::server) async fn release_supplied(
     defaults: &BTreeSet<(String, String)>,
     acl: &BTreeSet<standard::Entry>,
 ) -> Result<(), Vec<String>> {
-    let mut remaining = match sql::drop_owned(admin, backend).await {
+    let cleaned = sql::drop_owned(admin, backend).await;
+    #[cfg(test)]
+    if stopped_after_cleanup(database) {
+        return Err(vec![format!(
+            "stopped after the cleanup of database {database}, as a kill would"
+        )]);
+    }
+    let mut remaining = match cleaned {
         Ok((_, 0)) => Ok(()),
         // Owned by another role a definition switched to, which
         // `DROP OWNED BY SESSION_USER` does not reach; never an
@@ -690,6 +718,16 @@ pub(in crate::resolver::server) async fn release_supplied(
         Err(error) => remaining.push(format!(
             "the scratch account's own defaults, unreadable after the run ({error})"
         )),
+    }
+    // The record goes last: until every step above has succeeded it is what
+    // lets a later run finish them, with the state it holds. A release that
+    // stops anywhere above leaves it.
+    if remaining.is_empty()
+        && let Err(error) = record::remove(admin).await
+    {
+        remaining.push(format!(
+            "the scratch database's claim, which records what the run found ({error})"
+        ));
     }
     if remaining.is_empty() {
         Ok(())

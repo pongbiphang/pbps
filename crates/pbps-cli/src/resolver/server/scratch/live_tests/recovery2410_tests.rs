@@ -748,6 +748,84 @@ async fn two_runs_that_start_together_cannot_both_claim_the_database() {
     }
 }
 
+/// Whether `grantee` may create in `database`, read by the superuser.
+async fn can_create(fixture: &Fixture, grantee: &str, database: &str) -> bool {
+    fixture
+        .admin()
+        .await
+        .query(&format!(
+            "SELECT has_database_privilege('{grantee}', '{database}', 'CREATE') AS can"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<bool>("can")
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn a_cleanup_stopped_before_the_privileges_are_put_back_is_finished_by_the_next_run() {
+    // The claim holds the privileges the run found. A kill between the
+    // cleanup's commit and the restore must leave it, or the next run cannot
+    // put them back and the change stays for good.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let grantee = fixture.role("g").await;
+        let dead = token();
+        let mut conn = leave_claimed(&fixture, &scratch_db, &login, &dead).await;
+        conn.execute("CREATE SCHEMA left_over").await.unwrap();
+        conn.execute(&format!(
+            "GRANT CREATE ON DATABASE {scratch_db} TO {grantee}"
+        ))
+        .await
+        .unwrap();
+        drop(conn);
+        let go = || async {
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &Inputs::overload(),
+                &ProjectKey::new(true),
+            )
+            .await
+        };
+        engine::stop_after_cleanup(&scratch_db, true);
+        let stopped = go().await;
+        engine::stop_after_cleanup(&scratch_db, false);
+        let between = (
+            schema_exists(&fixture, &scratch_db, record::CLAIM).await,
+            can_create(&fixture, &grantee, &scratch_db).await,
+        );
+        recovery::take();
+        let finished = go().await;
+        let collected = recovery::take();
+        let after = (
+            schema_exists(&fixture, &scratch_db, record::CLAIM).await,
+            can_create(&fixture, &grantee, &scratch_db).await,
+        );
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert!(stopped.is_err(), "{server}: the stopped run reports it");
+        assert_eq!(
+            between,
+            (true, true),
+            "{server}: the claim outlives the cleanup, so the privileges can still be restored"
+        );
+        assert!(finished.is_ok(), "{server}: {:?}", finished.err());
+        assert_eq!(
+            after,
+            (false, false),
+            "{server}: the next run restored the privileges and removed the claim last"
+        );
+        assert_eq!(left.1, 0, "{server}: {left:?}");
+        assert_eq!(collected.groups.len(), 1, "{server}: {collected:?}");
+        assert_eq!(collected.groups[0].token, dead, "{server}");
+    }
+}
+
 /// How long a test waits for something it expects to happen.
 const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 

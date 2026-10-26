@@ -35,7 +35,10 @@
 //! Cleaning a dead claim is not covered by that: two runs can read the same
 //! one, and the second's cleanup would empty the first's objects. The
 //! database lock ([`lock`]) is held from before the claim is read to the
-//! moment the run's own is made.
+//! moment the run's own is made. And the claim is the last thing a release
+//! removes ([`remove`]): the cleanup's `DROP OWNED` puts it back ([`keep`]),
+//! so a kill before the privileges are restored leaves the snapshot to
+//! restore them from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -254,20 +257,7 @@ pub async fn claim(conn: &mut impl ExecuteConnection, claim: &Claim) -> Result<(
     let json =
         serde_json::to_string(claim).map_err(|e| ClaimError::Db(DbError::BadRow(e.to_string())))?;
     conn.execute("BEGIN").await.map_err(ClaimError::Db)?;
-    let made = async {
-        // The literal below doubles quotes and nothing else, which is whole
-        // only while backslashes are literal.
-        conn.execute("SET LOCAL standard_conforming_strings = on")
-            .await?;
-        conn.execute(&format!("CREATE SCHEMA {CLAIM}")).await?;
-        conn.execute(&format!(
-            "COMMENT ON SCHEMA {CLAIM} IS '{}'",
-            json.replace('\'', "''")
-        ))
-        .await
-    }
-    .await;
-    match made {
+    match create(conn, &json).await {
         Ok(()) => conn.execute("COMMIT").await.map_err(ClaimError::Db),
         Err(error) => {
             let _ = conn.execute("ROLLBACK").await;
@@ -278,6 +268,51 @@ pub async fn claim(conn: &mut impl ExecuteConnection, claim: &Claim) -> Result<(
             }
         }
     }
+}
+
+/// The claim schema and its comment, inside the transaction the caller
+/// opened.
+async fn create(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), DbError> {
+    // The literal below doubles quotes and nothing else, which is whole only
+    // while backslashes are literal.
+    conn.execute("SET LOCAL standard_conforming_strings = on")
+        .await?;
+    conn.execute(&format!("CREATE SCHEMA {CLAIM}")).await?;
+    conn.execute(&format!(
+        "COMMENT ON SCHEMA {CLAIM} IS '{}'",
+        comment.replace('\'', "''")
+    ))
+    .await
+}
+
+/// The text of the claim's comment, `None` when there is no claim or it has
+/// none. Read inside the cleanup's transaction, so [`keep`] can put the same
+/// claim back.
+pub async fn comment(conn: &mut impl QueryConnection) -> Result<Option<String>, DbError> {
+    let rows = conn
+        .query(&format!(
+            "SELECT pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment \
+               FROM pg_catalog.pg_namespace n WHERE n.nspname = '{CLAIM}'"
+        ))
+        .await?;
+    Ok(match rows.first() {
+        Some(row) => row.try_get::<&str>("comment")?.map(str::to_owned),
+        None => None,
+    })
+}
+
+/// Puts back a claim the cleanup's `DROP OWNED` took with everything else,
+/// in the same transaction, so no moment shows a database without it: the
+/// run's record stays until its last step has succeeded ([`remove`]).
+pub async fn keep(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), DbError> {
+    create(conn, comment).await
+}
+
+/// Removes the claim: the last thing a release does, once every other step
+/// has succeeded.
+pub async fn remove(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {CLAIM}"))
+        .await
 }
 
 /// The claim in this database: `None` when there is none, `Err` with why when

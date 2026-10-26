@@ -650,7 +650,9 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
 use postgres::compile_failed;
 
 #[cfg(test)]
-pub(super) use postgres::{generation_version, reconstruction, release_supplied};
+pub(super) use postgres::{
+    generation_version, reconstruction, release_supplied, stop_after_cleanup,
+};
 
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.
