@@ -47,6 +47,16 @@ impl RoleMapping {
         Self { to_run, created }
     }
 
+    /// Every role under its own name. A rehearsal on a cluster that is its
+    /// own, or whose roles are the target's, needs no other names; `created`
+    /// is then the names the run has to make, which may be none.
+    pub fn unchanged(created: impl IntoIterator<Item = RoleName>) -> Self {
+        Self {
+            to_run: BTreeMap::new(),
+            created: created.into_iter().collect(),
+        }
+    }
+
     /// The names the run creates, in the order they are numbered.
     pub fn created(&self) -> &[RoleName] {
         &self.created

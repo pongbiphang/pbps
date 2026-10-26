@@ -259,6 +259,7 @@
         "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
+        "rehearsal::connected::tests::a_role_the_target_lost_since_planning_is_refused_in_the_planners_words",
         "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
         "resolution::tests::every_resolver_kind_demands_the_cluster_identity_grant"
       ]
@@ -820,6 +821,9 @@
         "a_policy_the_engine_rejects_is_refused_at_plan_time_and_leaves_no_role",
         "an_account_that_cannot_create_roles_is_downgraded_and_the_record_says_so",
         "a_killed_rehearsal_has_its_roles_removed_by_the_next_run_and_a_live_ones_kept",
+        "a_killed_same_cluster_rehearsal_leaves_no_acl_policy_or_dependency_naming_the_real_role",
+        "a_policy_naming_a_role_in_text_on_a_forced_table_converges_on_every_placement",
+        "a_container_is_given_only_the_roles_it_lacks",
         "two_plans_at_once_map_the_same_role_to_roles_that_do_not_collide",
         "a_declared_domain_is_rehearsed_and_the_engines_spelling_of_its_check_is_printed",
         "a_project_declaring_a_managed_type_is_refused_with_the_switch_named",

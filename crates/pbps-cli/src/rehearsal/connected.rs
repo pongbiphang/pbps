@@ -94,6 +94,18 @@ impl<D> Plan<'_, D> {
     }
 }
 
+/// Refuses, in the planner's words and with the `CREATE ROLE` it prints, a role
+/// the plan names and the target's cluster no longer has: a scratch given the
+/// target's names must not make a role the target lacks, or the rehearsal would
+/// pass a plan that fails at apply.
+async fn refuse_absent_roles(
+    conn: &mut Conn,
+    named: &std::collections::BTreeSet<pbps_model::RoleName>,
+) -> anyhow::Result<()> {
+    let absent = pbps_pg::roles::missing_roles(conn, &named.iter().collect()).await?;
+    crate::engine::refuse_missing_cluster_roles(conn.driver(), &absent)
+}
+
 /// Runs the rehearsal on the entry's scratch, which is released before this
 /// returns.
 pub async fn run<D: crate::emission::Engine>(
@@ -115,6 +127,9 @@ pub async fn run<D: crate::emission::Engine>(
     };
     let dialect: &dyn pbps_dialect::Dialect = plan.dialect.as_ref();
     let named = plan.named_roles();
+    // The planner refused every role it could see the target lack. A role dropped
+    // since is refused in its words, before a scratch is started for it.
+    refuse_absent_roles(conn, &named).await?;
     // The questions the resolver's fill asks of the bindings, asked of the
     // declarations from nothing as the resolver asks them.
     let bootstrap = pbps_diff::diff(
@@ -396,6 +411,50 @@ mod tests {
             panic!("an exact match is sealed");
         };
         assert!(spelling.is_empty());
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(f)
+    }
+
+    /// A role the plan names and the cluster lacks is refused with the planner's
+    /// text and the statement that makes it; roles the cluster has are not.
+    #[test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+    fn a_role_the_target_lost_since_planning_is_refused_in_the_planners_words() {
+        block_on(async {
+            let url = std::env::var("PBPS_TEST_PG_DB").expect("PBPS_TEST_PG_DB");
+            let mut conn = Conn::connect(Driver::Postgres, &url)
+                .await
+                .expect("connect to the live PostgreSQL");
+            let gone = format!("pbps_absent_{}", std::process::id());
+            let named = std::collections::BTreeSet::from([
+                pbps_model::RoleName::from("postgres"),
+                pbps_model::RoleName::from(gone.as_str()),
+            ]);
+            let refusal = refuse_absent_roles(&mut conn, &named)
+                .await
+                .expect_err("a role the cluster lacks");
+            let text = refusal.to_string();
+            assert!(
+                text.contains(&format!(
+                    "role `{gone}` is declared here and the cluster does not have it"
+                )),
+                "{text}"
+            );
+            assert!(text.contains(&format!("CREATE ROLE \"{gone}\";")), "{text}");
+            assert!(!text.contains("`postgres`"), "{text}");
+            // Negative: every role present, nothing to refuse.
+            let present =
+                std::collections::BTreeSet::from([pbps_model::RoleName::from("postgres")]);
+            refuse_absent_roles(&mut conn, &present)
+                .await
+                .expect("roles the cluster has");
+        });
     }
 
     /// What the rehearsal says about authorization is sealed as it was, and

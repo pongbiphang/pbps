@@ -28,17 +28,27 @@ pub enum Kind {
     /// An account that may create roles, on a cluster of its own: the
     /// supplied layout where the plan's roles can be mapped.
     SuppliedRoles,
+    /// An account that may not, on a cluster other runs use: the one placement
+    /// where authorization is not rehearsed.
+    SuppliedPlain,
 }
 
 impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Server, Kind::Supplied, Kind::Docker];
 
-    /// The kinds whose scratch account may create roles.
-    pub const WITH_ROLES: [Kind; 3] = [Kind::Server, Kind::Docker, Kind::SuppliedRoles];
+    /// The kinds whose authorization is rehearsed: the target's own cluster
+    /// (the roles are there), a container (made under their names), and a
+    /// cluster of others' where the account can make a mapped role for each.
+    pub const FULL: [Kind; 4] = [
+        Kind::Server,
+        Kind::Supplied,
+        Kind::Docker,
+        Kind::SuppliedRoles,
+    ];
 
     fn layout(self) -> &'static str {
         match self {
-            Kind::Supplied | Kind::SuppliedRoles => "supplied",
+            Kind::Supplied | Kind::SuppliedRoles | Kind::SuppliedPlain => "supplied",
             Kind::Server | Kind::Docker => "run-owned",
         }
     }
@@ -46,7 +56,9 @@ impl Kind {
     fn phrase(self) -> &'static str {
         match self {
             Kind::Docker => "docker scratch",
-            Kind::Server | Kind::Supplied | Kind::SuppliedRoles => "server scratch",
+            Kind::Server | Kind::Supplied | Kind::SuppliedRoles | Kind::SuppliedPlain => {
+                "server scratch"
+            }
         }
     }
 }
@@ -77,6 +89,12 @@ pub struct Options<'a> {
     pub policy: Option<&'a str>,
     /// A domain `app.short`, which `app.t.note` uses.
     pub domain: bool,
+    /// The entry lets its externals file write outside the scratch database
+    /// (`outside_writes: allow`), as one that makes a role must.
+    pub outside_writes: bool,
+    /// `app.t` forces row security under a policy whose `USING` names this role
+    /// as text: `pg_has_role(current_user, '<role>', 'member') IS NOT NULL`.
+    pub forced_literal: Option<&'a str>,
     /// A volatile external function that a column default of `app.country` calls, so
     /// that the two declared rows the rehearsal's base inserts hold it open
     /// sixteen seconds, long enough to act on a run that is using its roles.
@@ -141,6 +159,18 @@ impl Fixture {
             std::fs::write(d.dir.join("externals.sql"), format!("{sql};\n")).unwrap();
         }
         write("app.v.view.yml", options.view.unwrap_or(VIEW));
+        if let Some(role) = options.forced_literal {
+            // A table with a policy cannot declare rows, so nothing is read back
+            // through it; the policy is still created and compared.
+            write(
+                "app.t.yml",
+                &format!(
+                    "{TABLE}row_security: {{enabled: true, forced: true}}\nrow_policies:\n  lit:\n    \
+                     command: all\n    restrictive: false\n    using: \"pg_has_role(current_user, \
+                     '{role}', 'member') IS NOT NULL\"\n"
+                ),
+            );
+        }
         if options.domain {
             write(
                 "app.short.type.yml",
@@ -191,6 +221,7 @@ impl Fixture {
         let confined = match kind {
             Kind::Supplied => Some(Confined::new(server)),
             Kind::SuppliedRoles => Some(Confined::creating_roles(&scratch_server)),
+            Kind::SuppliedPlain => Some(Confined::new(&scratch_server)),
             Kind::Server | Kind::Docker => None,
         };
         let fixture = Self {
@@ -211,17 +242,19 @@ impl Fixture {
     }
 
     fn configure(&self, options: &Options<'_>) {
-        let externals = if options.externals.is_some() {
-            "    externals: externals.sql\n"
-        } else {
-            ""
-        };
+        let mut externals = String::new();
+        if options.externals.is_some() {
+            externals.push_str("    externals: externals.sql\n");
+        }
+        if options.outside_writes {
+            externals.push_str("    outside_writes: allow\n");
+        }
         let entry = match self.kind {
             Kind::Docker => format!(
                 "    kind: docker\n    image: '{}'\n    pull: never\n{externals}",
                 image()
             ),
-            Kind::Server | Kind::Supplied | Kind::SuppliedRoles => {
+            Kind::Server | Kind::Supplied | Kind::SuppliedRoles | Kind::SuppliedPlain => {
                 format!("    kind: server\n    url_env: {SCRATCH}\n{externals}")
             }
         };
@@ -249,7 +282,9 @@ impl Fixture {
     /// to ask: a container's is gone with it.
     fn cluster(&self) -> Option<String> {
         match self.kind {
-            Kind::Server | Kind::SuppliedRoles => Some(self.scratch_server.clone()),
+            Kind::Server | Kind::SuppliedRoles | Kind::SuppliedPlain => {
+                Some(self.scratch_server.clone())
+            }
             Kind::Supplied => Some(self.own.connection().to_owned()),
             Kind::Docker => None,
         }
@@ -271,20 +306,65 @@ impl Fixture {
         .collect()
     }
 
+    /// The supplied account's own database.
+    fn confined_database(&self) -> String {
+        self.confined
+            .as_ref()
+            .unwrap()
+            .connection
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("dbname="))
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Every role on the scratch cluster, whoever made it.
+    fn all_roles(&self) -> BTreeSet<String> {
+        text_of(
+            &self.cluster().unwrap(),
+            "SELECT coalesce(string_agg(rolname, ','), '') FROM pg_roles",
+        )
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// What names `role` in the supplied account's database and in the shared
+    /// catalog: ACL entries, policies, default ACLs, and the dependencies that
+    /// keep the role from being dropped. All zero once the run has cleaned up.
+    fn traces_of(&self, role: &str) -> (i64, i64) {
+        let database = with_dbname(&self.cluster().unwrap(), &self.confined_database());
+        let acl = scalar(
+            &database,
+            &format!(
+                "SELECT (SELECT count(*) FROM pg_class WHERE relacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_namespace WHERE nspacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_proc WHERE proacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_type WHERE typacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_attribute WHERE attacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_default_acl WHERE defaclacl::text ~ '{role}') \
+                 + (SELECT count(*) FROM pg_policy) \
+                 + (SELECT count(*) FROM pg_default_acl)"
+            ),
+        );
+        let shared = scalar(
+            &self.cluster().unwrap(),
+            &format!(
+                "SELECT count(*) FROM pg_shdepend WHERE refobjid = \
+                 (SELECT oid FROM pg_roles WHERE rolname = '{role}')"
+            ),
+        );
+        (acl, shared)
+    }
+
     /// Sessions of the run with `token` on the scratch cluster: its keeper,
     /// and whatever it had open in its database. Until the server has seen
     /// them go, a sweep is right to call the run alive.
     fn sessions_of(&self, token: &str) -> i64 {
         let database = match self.kind {
-            Kind::SuppliedRoles => {
-                let connection = &self.confined.as_ref().unwrap().connection;
-                connection
-                    .split_whitespace()
-                    .find_map(|word| word.strip_prefix("dbname="))
-                    .unwrap()
-                    .to_owned()
-            }
-            Kind::Server | Kind::Supplied | Kind::Docker => format!("pbps_scratch_{token}"),
+            Kind::Supplied | Kind::SuppliedRoles | Kind::SuppliedPlain => self.confined_database(),
+            Kind::Server | Kind::Docker => format!("pbps_scratch_{token}"),
         };
         scalar(
             &self.cluster().unwrap(),
@@ -357,7 +437,7 @@ impl Fixture {
     pub fn scratch(&self) -> Option<String> {
         match self.kind {
             Kind::Server => Some(self.scratch_server.clone()),
-            Kind::Supplied | Kind::SuppliedRoles => {
+            Kind::Supplied | Kind::SuppliedRoles | Kind::SuppliedPlain => {
                 Some(self.confined.as_ref().unwrap().connection.clone())
             }
             Kind::Docker => None,
@@ -975,6 +1055,10 @@ pub fn authorization_is_rehearsed(server: &str, kind: Kind) {
     let (role, f) = authorized(server, "ok", kind, false);
     f.revise_authorization(&role.name, "id > 1");
     let before = f.rehearsal_roles();
+    let (roles_before, traces_before) = (
+        f.cluster().map(|_| f.all_roles()),
+        (kind == Kind::Supplied).then(|| f.traces_of(&role.name)),
+    );
     let out = f.plan(&[]);
     assert_eq!(code(&out), 0, "{kind:?}: {}", said(&out));
     let text = stdout(&out);
@@ -1011,9 +1095,7 @@ pub fn authorization_is_rehearsed(server: &str, kind: Kind) {
         "{kind:?}: {:?} left",
         f.rehearsal_roles().difference(&before).collect::<Vec<_>>()
     );
-    if let Some(cluster) = f.cluster()
-        && f.kind != Kind::Supplied
-    {
+    if let Some(cluster) = f.cluster() {
         assert_eq!(
             scalar(
                 &cluster,
@@ -1023,9 +1105,19 @@ pub fn authorization_is_rehearsed(server: &str, kind: Kind) {
                 )
             ),
             // Only the target's own cluster holds the target's role; a scratch
-            // on its own cluster never sees its name.
-            if cluster == server { 1 } else { 0 },
+            // on a cluster of its own, or others', never gets its name.
+            i64::from(kind == Kind::Supplied),
             "{kind:?}"
+        );
+    }
+    // On the target's own cluster the roles are there and the run makes none: not
+    // one role is added or dropped, and what the run granted them is gone.
+    if kind == Kind::Supplied {
+        assert_eq!(Some(f.all_roles()), roles_before, "{kind:?}: no role made");
+        assert_eq!(
+            Some(f.traces_of(&role.name)),
+            traces_before,
+            "{kind:?}: no ACL, policy or dependency names the role afterwards"
         );
     }
     // And the plan applies, as the rehearsal said it would.
@@ -1082,7 +1174,7 @@ pub fn a_wrong_policy_is_refused(server: &str, kind: Kind) {
 /// in the JSON and at `apply`. The error a rehearsal of authorization would
 /// have found is not found, and is not claimed to be.
 pub fn an_account_without_createrole_downgrades_and_says_so(server: &str) {
-    let kind = Kind::Supplied;
+    let kind = Kind::SuppliedPlain;
     let (role, f) = authorized(server, "down", kind, false);
     // A policy the engine would reject: it is what the downgrade does not see.
     f.revise_authorization(&role.name, "no_such_column > 0");
@@ -1132,8 +1224,19 @@ pub fn an_account_without_createrole_downgrades_and_says_so(server: &str) {
         0,
         "the claim is gone"
     );
-    // Negative: a project that names no role has nothing to skip, so even
-    // this account's rehearsal is a full one.
+    // Negative: the same account on the target's own cluster is not downgraded
+    // (the roles are there, so nothing has to be made), and a project that names
+    // no role has nothing to skip.
+    let (_role, same) = authorized(server, "down3", Kind::Supplied, false);
+    same.revise_authorization(&_role.name, "id > 1");
+    let full = same.plan(&[]);
+    assert_eq!(code(&full), 0, "{}", said(&full));
+    assert_eq!(
+        same.record()["converged"]["authorization"],
+        "rehearsed",
+        "{}",
+        same.record()
+    );
     let plain = Fixture::new(server, "rehearse-down2-supplied", kind, &Options::default());
     plain.revise_row();
     let ok = plain.plan(&[]);
@@ -1238,6 +1341,158 @@ pub fn a_killed_rehearsal_is_cleaned_up_by_the_next_run(server: &str, kind: Kind
         f.rehearsal_roles().is_subset(&before),
         "nothing is left: {:?}",
         f.rehearsal_roles().difference(&before).collect::<Vec<_>>()
+    );
+}
+
+/// A rehearsal on the target's own cluster uses the real role names and makes
+/// none, so a kill leaves no role to remove, only what it granted the real one in
+/// the supplied database. The next run cleans that by the claim, and afterwards no
+/// ACL, policy or default ACL names the role and the shared catalog's
+/// dependencies on it are what they were before the run (#2432).
+pub fn a_killed_same_cluster_rehearsal_leaves_nothing_naming_the_real_role(server: &str) {
+    let kind = Kind::Supplied;
+    let (role, f) = authorized(server, "killsame", kind, true);
+    f.revise_authorization(&role.name, "id > 1");
+    let before = f.traces_of(&role.name);
+    let roles = f.all_roles();
+    let database = f.confined_database();
+    let in_database = |sql: &str| scalar(&with_dbname(&f.cluster().unwrap(), &database), sql);
+    let mut dead = f.start();
+    // Inside the rehearsal: the base is building the declared rows, and the call
+    // that holds it open is sleeping.
+    f.until_running(&mut dead, "the rehearsal's rows", |f| {
+        scalar(
+            &f.cluster().unwrap(),
+            &format!(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = '{database}' \
+                 AND wait_event = 'PgSleep'"
+            ),
+        ) > 0
+    });
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    // The run is dead and its claim is what says so.
+    assert_eq!(
+        in_database("SELECT count(*) FROM pg_namespace WHERE nspname = 'pbps_claim'"),
+        1,
+        "the dead run left its claim"
+    );
+    f.until("the dead run's sessions to end", |f| {
+        scalar(
+            &f.cluster().unwrap(),
+            &format!(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = '{database}' \
+                 AND pid <> pg_backend_pid()"
+            ),
+        ) == 0
+    });
+    // A run makes no role here, so a kill leaves none.
+    assert_eq!(f.all_roles(), roles, "no role was made");
+    let next = f.plan(&["--format", "json"]);
+    assert_eq!(code(&next), 0, "{}", said(&next));
+    assert_eq!(
+        in_database("SELECT count(*) FROM pg_namespace WHERE nspname = 'pbps_claim'"),
+        0,
+        "the next run cleaned the claim"
+    );
+    assert_eq!(
+        f.traces_of(&role.name),
+        before,
+        "no ACL, policy or default ACL names the real role, and its dependencies are as they were"
+    );
+    assert_eq!(f.all_roles(), roles);
+    assert_eq!(f.record()["converged"]["authorization"], "rehearsed");
+}
+
+/// A policy whose `USING` names a role as text, on a table that forces row
+/// security, converges on every placement, though the text runs as written and
+/// on a cluster others use the role is not there under that name. Nothing reads
+/// through the policy: a table with policies cannot declare rows, so the rehearsal
+/// reads none of it back, and the policy is created and compared as declared.
+/// (Run directly, as the table's owner, the same text fails with `role "x" does
+/// not exist`: that is what the rehearsal would meet if it read rows through it,
+/// and why this case is pinned.)
+pub fn a_policy_naming_a_role_in_text_converges_on_every_placement(server: &str, kind: Kind) {
+    let role = TargetRole::new(server, "lit", kind);
+    let f = Fixture::new(
+        server,
+        &format!("rehearse-literal-{kind:?}").to_lowercase(),
+        kind,
+        &Options {
+            forced_literal: Some(&role.name),
+            ..Options::default()
+        },
+    );
+    f.revise_row();
+    let before = f.rehearsal_roles();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{kind:?}: {}", said(&out));
+    let record = f.record();
+    assert!(record["converged"].is_object(), "{kind:?}: {record}");
+    // The text names a role no declaration or policy recipient does, so even the
+    // account that cannot make a mapped role has none to skip.
+    assert_eq!(
+        record["converged"]["authorization"], "rehearsed",
+        "{kind:?}: {record}"
+    );
+    assert!(
+        f.rehearsal_roles().is_subset(&before),
+        "{kind:?}: nothing is left"
+    );
+}
+
+/// A container is the run's own cluster, so the plan's roles are made there under
+/// their names, but only those it lacks: the bootstrap superuser, the engine's
+/// `pg_*` roles and a role the externals file made are there already, and
+/// creating them again would fail a valid plan (#2432).
+pub fn a_container_gets_only_the_roles_it_lacks(server: &str) {
+    let kind = Kind::Docker;
+    let ours = TargetRole::new(server, "skip", kind);
+    let made = format!("pbps_reh_ext_{}", std::process::id());
+    on_server(server, &format!("DROP ROLE IF EXISTS {made}"));
+    on_server(server, &format!("CREATE ROLE {made} NOLOGIN"));
+    let _made = ClusterRoles {
+        server: server.to_owned(),
+        names: vec![made.clone()],
+    };
+    // The externals file makes `made` in the container (and finds it on the target).
+    let external = format!(
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{made}') \
+         THEN CREATE ROLE {made} NOLOGIN; END IF; END $$"
+    );
+    let f = Fixture::new(
+        server,
+        "rehearse-skip-docker",
+        kind,
+        &Options {
+            role: Some(&ours.name),
+            policy: Some("id > 0"),
+            externals: Some(&external),
+            outside_writes: true,
+            ..Options::default()
+        },
+    );
+    // A policy for the bootstrap superuser, an engine role, a role the file made
+    // and one only the run makes: only the last is the run's to create.
+    std::fs::write(
+        f.d.dir.join("schema/app.t.yml"),
+        format!(
+            "{}row_security: {{enabled: true, forced: false}}\nrow_policies:\n  mine:\n    \
+             command: all\n    restrictive: false\n    to: [postgres, pg_monitor, {made}, {}]\n    \
+             using: id > 1\n",
+            TABLE, ours.name
+        ),
+    )
+    .unwrap();
+    succeeds(f.d.run(&["plan"]));
+    f.d.commit();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{}", said(&out));
+    assert_eq!(
+        f.record()["converged"]["authorization"],
+        "rehearsed",
+        "{}",
+        f.record()
     );
 }
 

@@ -19,11 +19,10 @@ use pbps_model::role_mapping::RoleMapping;
 use pbps_model::{Hints, RoleName};
 use std::collections::BTreeSet;
 
-/// The roles the plan names, as the run can have them.
-///
-/// A cluster's roles are shared, so the target's names are never created on the
-/// scratch: each role the plan names is mapped to one the run creates and
-/// removes, and the account that cannot create roles has no mapping at all.
+/// The roles the plan names, as the run can have them: under their own names
+/// where the scratch is the target's cluster or a cluster of the run's own, and
+/// under names of the run's own on a cluster other runs use (`Naming`). `Err`
+/// is why a rehearsal there cannot run the plan's authorization, and says so.
 pub type Roles = Result<RoleMapping, String>;
 
 /// Runs `run` on a session of the scratch as the target's deployer, with the
@@ -31,10 +30,12 @@ pub type Roles = Result<RoleMapping, String>;
 /// scratch whatever `run` returns. The layout the run used comes back beside
 /// the result: it is the run's own finding, as for the resolver.
 ///
-/// `named` are the roles the plan, or the base it builds, names. The run
-/// creates a role of its own for each, recorded before it is made and removed
-/// with the scratch, and `run` is told which names they have; or, when the
-/// account may not create roles, why not.
+/// `named` are the roles the plan, or the base it builds, names. How they are
+/// named on this scratch is its placement's (`Naming`): the target's own cluster
+/// already has them; a container gets those it lacks, under their names; a
+/// cluster others use gets a role of the run's own for each. What the run makes
+/// is recorded before it is made and removed with the scratch, and `run` is told
+/// which names the roles have; or, when it cannot rehearse them, why not.
 #[allow(clippy::too_many_arguments)]
 pub async fn with_session<T, E>(
     driver: Driver,
@@ -146,14 +147,7 @@ pub async fn with_session<T, E>(
                 )
                 .await?;
         }
-        // The engine's own roles keep their names: they are the scratch's too.
-        let mapping = RoleMapping::generate(named, "pbps_rehearsal", &tokens.scratch, |role| {
-            role.raw().starts_with("pg_")
-        });
-        let roles = match state.rehearsal_roles(&mut admin, mapping.created()).await? {
-            Ok(()) => Ok(mapping),
-            Err(why) => Err(why),
-        };
+        let roles = roles(&mut state, &mut admin, named, &tokens).await?;
         let layout = if prepared.supplied() {
             ScratchLayout::Supplied
         } else {
@@ -170,4 +164,36 @@ pub async fn with_session<T, E>(
         (Err(refused), Ok(())) => Err(ProduceError::Run(refused)),
         (Ok(done), Ok(())) => Ok(done),
     }
+}
+
+/// The roles of the run, by the naming its placement decides. Here and in the
+/// one place the plan is lowered again (`OrderedPlan::under_role_names`) is all
+/// the code that tells the three apart.
+async fn roles(
+    state: &mut engine::Scratch<'_>,
+    admin: &mut Conn,
+    named: &BTreeSet<RoleName>,
+    tokens: &Tokens,
+) -> Result<Roles, Error> {
+    // The engine's own roles keep their names: they are the scratch's too.
+    let own = |role: &RoleName| role.raw().starts_with("pg_");
+    let naming = state.naming()?;
+    let mapping = match naming {
+        engine::Naming::Existing => RoleMapping::default(),
+        engine::Naming::Created => {
+            RoleMapping::unchanged(named.iter().filter(|role| !own(role)).cloned())
+        }
+        engine::Naming::Mapped => {
+            RoleMapping::generate(named, "pbps_rehearsal", &tokens.scratch, own)
+        }
+    };
+    Ok(
+        match state
+            .rehearsal_roles(admin, mapping.created(), naming)
+            .await?
+        {
+            Ok(()) => Ok(mapping),
+            Err(why) => Err(why),
+        },
+    )
 }

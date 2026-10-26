@@ -186,3 +186,34 @@ fn a_change_names_only_the_runs_roles_afterwards() {
     };
     assert_eq!(map.changes(&plain), plain);
 }
+
+/// A mapping that changes nothing leaves every name, schema, identity and
+/// change as it was, and still says which names the run has to make.
+#[test]
+fn an_unchanged_mapping_is_the_identity_and_lists_what_to_make() {
+    let map = RoleMapping::unchanged([name("reader"), name("writer")]);
+    assert_eq!(map.name(&name("reader")).raw(), "reader");
+    assert_eq!(
+        map.created().iter().map(RoleName::raw).collect::<Vec<_>>(),
+        ["reader", "writer"]
+    );
+    let mut schema = Schema::default();
+    schema.roles.insert(name("reader"), Role::default());
+    let mut t = Table::default();
+    t.row_policies.insert("p".into(), policy(&["reader"]));
+    schema.tables.insert(table(), t);
+    assert_eq!(map.schema(&schema), schema);
+    let mut ids = IdsFile::default();
+    ids.roles
+        .insert(Uid::generate(UidKind::Role), name("reader"));
+    assert_eq!(map.ids(&ids), ids);
+    let changes = ChangeSet {
+        changes: vec![planned(Change::CreateRole {
+            uid: Uid::generate(UidKind::Role),
+            name: name("reader"),
+        })],
+    };
+    assert_eq!(map.changes(&changes), changes);
+    // Negative: the default mapping makes nothing.
+    assert!(RoleMapping::default().created().is_empty());
+}

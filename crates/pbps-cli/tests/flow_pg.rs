@@ -1187,7 +1187,7 @@ fn a_rehearsal_stages_the_entrys_externals_and_compares_them_with_the_target() {
 #[test]
 #[ignore = "needs live postgres and docker"]
 fn grants_and_policies_are_rehearsed_on_roles_made_for_the_run() {
-    for kind in rehearsal2379::Kind::WITH_ROLES {
+    for kind in rehearsal2379::Kind::FULL {
         rehearsal2379::authorization_is_rehearsed(&server(), kind);
     }
 }
@@ -1195,7 +1195,7 @@ fn grants_and_policies_are_rehearsed_on_roles_made_for_the_run() {
 #[test]
 #[ignore = "needs live postgres and docker"]
 fn a_policy_the_engine_rejects_is_refused_at_plan_time_and_leaves_no_role() {
-    for kind in rehearsal2379::Kind::WITH_ROLES {
+    for kind in rehearsal2379::Kind::FULL {
         rehearsal2379::a_wrong_policy_is_refused(&server(), kind);
     }
 }
@@ -1215,6 +1215,32 @@ fn a_killed_rehearsal_has_its_roles_removed_by_the_next_run_and_a_live_ones_kept
     ] {
         rehearsal2379::a_killed_rehearsal_is_cleaned_up_by_the_next_run(&server(), kind);
     }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_killed_same_cluster_rehearsal_leaves_no_acl_policy_or_dependency_naming_the_real_role() {
+    rehearsal2379::a_killed_same_cluster_rehearsal_leaves_nothing_naming_the_real_role(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_policy_naming_a_role_in_text_on_a_forced_table_converges_on_every_placement() {
+    for kind in [
+        rehearsal2379::Kind::Server,
+        rehearsal2379::Kind::Supplied,
+        rehearsal2379::Kind::Docker,
+        rehearsal2379::Kind::SuppliedRoles,
+        rehearsal2379::Kind::SuppliedPlain,
+    ] {
+        rehearsal2379::a_policy_naming_a_role_in_text_converges_on_every_placement(&server(), kind);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_container_is_given_only_the_roles_it_lacks() {
+    rehearsal2379::a_container_gets_only_the_roles_it_lacks(&server());
 }
 
 #[test]

@@ -18,6 +18,7 @@ use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
 pub(super) mod mssql;
 mod postgres;
+pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
     for_tests::{externals_for_test, reset_for_test, stop_after_cleanup, sweep_cluster_on},
@@ -272,15 +273,24 @@ impl Scratch<'_> {
         }
     }
 
-    /// See `postgres::Scratch::rehearsal_roles`. SQL Server has no connected
-    /// rehearsal yet.
+    /// See `postgres::Scratch::naming`. SQL Server has no connected rehearsal
+    /// yet.
+    pub(super) fn naming(&self) -> Result<Naming, Error> {
+        match self {
+            Self::Postgres(scratch) => Ok(scratch.naming()),
+            Self::Mssql(_) => Err(unsupported()),
+        }
+    }
+
+    /// See `postgres::Scratch::rehearsal_roles`.
     pub(super) async fn rehearsal_roles(
         &mut self,
         admin: &mut Conn,
         roles: &[pbps_model::RoleName],
+        naming: Naming,
     ) -> Result<Result<(), String>, Error> {
         match self {
-            Self::Postgres(scratch) => scratch.rehearsal_roles(admin, roles).await,
+            Self::Postgres(scratch) => scratch.rehearsal_roles(admin, roles, naming).await,
             Self::Mssql(_) => Err(unsupported()),
         }
     }
