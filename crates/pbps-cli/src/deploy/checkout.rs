@@ -43,8 +43,9 @@ fn removals(
             Some((from.clone(), to.clone()))
         }),
     );
+    let local_index = local.index();
     for column in names.columns.values_mut() {
-        if let Some(uid) = local.table_uid(&column.table)
+        if let Some(uid) = local_index.table_uid(&column.table)
             && let Some(to) = names.tables.get(uid)
         {
             column.table = to.clone();
