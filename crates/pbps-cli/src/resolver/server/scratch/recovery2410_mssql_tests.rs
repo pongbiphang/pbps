@@ -230,6 +230,31 @@ async fn gone_inner(admin: &mut Conn, token: &str) {
     panic!("the instance still shows the marker of {token}");
 }
 
+fn logged_out<'a>(admin: &'a mut Conn, login: &'a str) -> Boxed<'a, ()> {
+    Box::pin(logged_out_inner(admin, login))
+}
+
+/// Drops a test's login once its sessions have ended. A dropped connection's
+/// session ends asynchronously, and `DROP LOGIN` refuses a login that is still
+/// logged in (15434), so the wait is for the engine, not for the client.
+async fn logged_out_inner(admin: &mut Conn, login: &str) {
+    let open = format!(
+        "SELECT CONVERT(int, COUNT(*)) AS open_sessions FROM sys.dm_exec_sessions \
+         WHERE login_name = N'{login}';"
+    );
+    for _ in 0..200 {
+        let rows = admin.query(&open).await.unwrap();
+        if rows[0].try_get::<i32>("open_sessions").unwrap() == Some(0) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    admin
+        .execute(&format!("DROP LOGIN [{login}];"))
+        .await
+        .unwrap();
+}
+
 fn scrub<'a>(scratch: &'a str, databases: &'a [String], logins: &'a [String]) -> Boxed<'a, ()> {
     Box::pin(scrub_inner(scratch, databases, logins))
 }
@@ -1032,11 +1057,7 @@ impl Supplied {
 
     async fn drop(self) {
         drop_database(&self.server, &self.name).await;
-        connection(&self.server)
-            .await
-            .execute(&format!("DROP LOGIN [{}];", self.login))
-            .await
-            .unwrap();
+        logged_out(&mut connection(&self.server).await, &self.login).await;
     }
 }
 
@@ -1176,10 +1197,7 @@ async fn the_marker_is_seen_by_a_login_with_no_privilege_and_goes_with_its_sessi
     mine.execute("SELECT 1;").await.unwrap();
     drop(mine);
     drop(low);
-    admin
-        .execute(&format!("DROP LOGIN [{login}];"))
-        .await
-        .unwrap();
+    logged_out(&mut admin, &login).await;
     assert!(seen.is_none(), "no marker of its own: nothing proved");
     assert!(blind.is_none());
     assert!(up.unwrap().contains(&live), "visible with no privilege");
