@@ -232,6 +232,7 @@ fn surface(surface: &Surface) -> String {
             name = name.shown(),
         ),
         Surface::Module(module) => format!("module {module}", module = module.shown()),
+        Surface::Type(name) => format!("type {name}", name = name.shown()),
     }
 }
 

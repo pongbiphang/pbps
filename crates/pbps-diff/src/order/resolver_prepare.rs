@@ -164,7 +164,9 @@ pub(crate) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> S
             table: from.resolved_in(table, to),
             name: name.clone(),
         },
-        Surface::Namespace(_) | Surface::Module(_) => surface.clone(),
+        // Neither is renamed by a binding rebuild, and a type owns catalog
+        // records but resolves no binding of its own (#2407).
+        Surface::Namespace(_) | Surface::Module(_) | Surface::Type(_) => surface.clone(),
     }
 }
 
@@ -539,7 +541,7 @@ pub(crate) fn changes(
                 ]
             }
             Surface::Module(_) => continue, // Already handled with all restore obligations by diff_rebuilding.
-            Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) => {
+            Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Type(_) => {
                 return Err(Error::Unsupported(surface.clone()));
             }
         };

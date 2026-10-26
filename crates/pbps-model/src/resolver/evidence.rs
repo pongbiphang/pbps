@@ -163,8 +163,8 @@ pub enum BindingCoverage {
 /// The evidence format this build writes and reads. 3 adds the target's
 /// cluster identity and the accepted limitations to the qualification
 /// (#1516, #1700); 4, the resolver entry and scratch layout to the runtime
-/// (#1517).
-pub const EVIDENCE_VERSION: u32 = 5;
+/// (#1517); 6, the declared type as a surface of its own (#2407).
+pub const EVIDENCE_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

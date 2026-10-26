@@ -291,6 +291,7 @@ fn resolver_creation_risks_follow_the_settled_parts_and_seal_that_order() {
                 | Surface::Namespace(_)
                 | Surface::Table(_)
                 | Surface::Column(_)
+                | Surface::Type(_)
                 | Surface::Index { .. } => vec![],
             };
             SurfaceResolution {

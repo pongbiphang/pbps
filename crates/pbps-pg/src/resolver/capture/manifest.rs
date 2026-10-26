@@ -598,5 +598,7 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod guard_tests;
+#[cfg(test)]
+mod type_ownership_tests;
 #[cfg(all(test, unix))]
 mod view_ownership_tests;

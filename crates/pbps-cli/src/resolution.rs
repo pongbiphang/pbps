@@ -151,6 +151,7 @@ fn describe(surface: &pbps_model::resolver::Surface) -> String {
         Surface::Namespace(schema) => format!("schema {schema}"),
         Surface::Table(table) => table.shown().to_string(),
         Surface::Column(column) => column.shown().to_string(),
+        Surface::Type(name) => format!("type {name}", name = name.shown()),
     }
 }
 

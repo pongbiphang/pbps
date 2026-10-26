@@ -2599,7 +2599,8 @@ review (#1778, DEC-1778.1).**
   collations, NOT NULLs (named on 18), keys, unique indexes, owned and
   identity sequences, and their own options; views and materialized views
   as shape views of their output columns; enums, domains and composite
-  types; extensions with their version; standalone sequences. What only
+  types, except those the project declares, which it owns; extensions with their
+  version; standalone sequences. What only
   guards a table (foreign keys, CHECKs, defaults, triggers, policies,
   plain indexes) and a view's query are not compared, so it leaves them
   out. Each schema it writes into is created `IF NOT EXISTS`, and objects

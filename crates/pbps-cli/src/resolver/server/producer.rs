@@ -23,6 +23,7 @@ pub(super) fn request(
     for schema in [base.schema, desired.schema] {
         schemas.extend(schema.tables.keys().map(|name| name.schema.clone()));
         schemas.extend(schema.modules.keys().map(|id| id.schema().to_owned()));
+        schemas.extend(schema.types.keys().map(|name| name.schema().to_owned()));
     }
     schemas.extend(planned.iter().map(|grant| grant.schema.clone()));
     Ok(ScopeRequest {

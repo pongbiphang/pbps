@@ -92,6 +92,9 @@ pub async fn draft(
             .get(&key.1)
             .is_some_and(|relation| managed.relation(&relation.schema, &relation.name)),
         "pg_proc" => routines.contains(&key.1),
+        "pg_type" => declared_type(&facts, &key.1, |schema, name| {
+            managed.declares_type(schema, name)
+        }),
         _ => false,
     };
     Ok(compose(&facts, &is_managed, schemas))
@@ -226,6 +229,11 @@ struct Sequence {
 struct Type {
     kind: char,
     qualified: String,
+    /// The schema and name unquoted, to ask whether the project declares it,
+    /// and the element type of an array type (0 for any other).
+    schema: String,
+    name: String,
+    element: u32,
     relation: u32,
     base: String,
     /// The base's declared array dimensions, which `format_type` does not
@@ -420,6 +428,9 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
             Type {
                 kind: character(&row, "kind")?.unwrap_or(' '),
                 qualified: text(&row, "qualified")?,
+                schema: text(&row, "schema")?,
+                name: text(&row, "name")?,
+                element: number(&row, "element")?,
                 relation: number(&row, "relation")?,
                 base: optional(&row, "base")?.unwrap_or_default(),
                 dimensions: signed(&row, "dimensions")?,
@@ -574,6 +585,7 @@ SELECT s.seqrelid::text AS oid, \
 const TYPES: &str = "\
 SELECT t.oid::text AS oid, t.typtype::text AS kind, \
        pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(t.typname) AS qualified, \
+       n.nspname::text AS schema, t.typname::text AS name, t.typelem::text AS element, \
        t.typrelid::text AS relation, \
        CASE WHEN t.typtype = 'd' THEN pg_catalog.format_type(t.typbasetype, t.typtypmod) END \
          AS base, \
@@ -1022,6 +1034,18 @@ impl Fill {
     }
 }
 
+/// Whether the type with this OID is one the project declares, or the array
+/// type of one: an enum or a domain, never a relation's row type (#2407).
+fn declared_type(facts: &Facts, oid: &u32, declares: impl Fn(&str, &str) -> bool) -> bool {
+    facts.types.get(oid).is_some_and(|ty| {
+        (matches!(ty.kind, 'e' | 'd') && declares(&ty.schema, &ty.name))
+            || (ty.element != 0
+                && facts.types.get(&ty.element).is_some_and(|element| {
+                    matches!(element.kind, 'e' | 'd') && declares(&element.schema, &element.name)
+                }))
+    })
+}
+
 /// What fill stages for the managed set of `desired` and `base`, read from
 /// the connected target: the objects a draft stages without `--schema`.
 /// A declared routine's signature is looked up on the write path with
@@ -1061,6 +1085,9 @@ pub async fn fill(
                 .any(|managed| managed.relation(&relation.schema, &relation.name))
         }),
         "pg_proc" => routines.contains(&key.1),
+        "pg_type" => declared_type(&facts, &key.1, |schema, name| {
+            managed.iter().any(|m| m.declares_type(schema, name))
+        }),
         _ => false,
     };
     Ok(survey_fill(&facts, &is_managed))

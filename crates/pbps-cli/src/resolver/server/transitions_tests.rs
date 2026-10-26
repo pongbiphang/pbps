@@ -2184,3 +2184,186 @@ fn a_generated_placeholder_created_in_the_plan_has_no_opening_inventory() {
     *from = "0".into();
     assert!(derive(&wrong).is_err());
 }
+
+/// A declared type is one surface of its own (#2407): its creation installs
+/// the records it owns, its drop removes the opening ones, a label operation
+/// replaces them in place, and a rename carries the opening spelling's
+/// inventory to the final one. Another type's records and a type the
+/// desired schema no longer declares are not claimed.
+#[test]
+fn a_declared_types_transition_inventories_the_records_it_owns() {
+    use pbps_db::resolver::capture::ObjectIdentity;
+    use pbps_model::{ManagedType, PlannedChange, TypeRef};
+    use pbps_pg::resolver::capture::BindingRecord;
+
+    let mood: TypeRef = "app.mood".parse().unwrap();
+    let old: TypeRef = "app.old".parse().unwrap();
+    let other: TypeRef = "app.other".parse().unwrap();
+    let definition = || ManagedType::Enum {
+        values: vec!["a".into()],
+    };
+    let record = |name: &str, owner: &TypeRef| {
+        let object = ObjectIdentity {
+            class: "pg_type".into(),
+            name: vec!["app".into(), name.into()],
+            signature: vec![],
+        };
+        (
+            object.clone(),
+            BindingRecord {
+                object,
+                ownership: ObjectOwnership::Surface(Surface::Type(owner.clone())),
+                bindings: vec![],
+            },
+        )
+    };
+    let schema_with = |names: &[&TypeRef]| {
+        let mut schema = Schema::default();
+        for name in names {
+            schema.types.insert((*name).clone(), definition());
+        }
+        schema
+    };
+    let derive = |changes: Vec<Change>,
+                  base: &Schema,
+                  desired: &Schema,
+                  opening: &[BindingRecord],
+                  compiled: &[BindingRecord]| {
+        let base_ids = ids(base, &IdsFile::default());
+        // A drop needs a recorded reason to be resolved; the desired side
+        // here only needs to lack the type.
+        let mut kept = base_ids.clone();
+        kept.types
+            .retain(|_, name| desired.types.contains_key(name));
+        let desired_ids = ids(desired, &kept);
+        super::transitions::derive(
+            &ChangeSet {
+                changes: changes.into_iter().map(PlannedChange::new).collect(),
+            },
+            pbps_diff::Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            pbps_diff::Side {
+                schema: desired,
+                ids: &desired_ids,
+            },
+            opening,
+            compiled,
+        )
+        .unwrap()
+    };
+    let uid = pbps_model::Uid::generate(pbps_model::UidKind::Type);
+    let (mood_row, mood_record) = record("mood", &mood);
+    let (_, other_record) = record("other", &other);
+
+    // Created: the compiled records of the type, and not another's.
+    let created = derive(
+        vec![Change::CreateType {
+            uid: uid.clone(),
+            name: mood.clone(),
+            definition: Box::new(definition()),
+        }],
+        &Schema::default(),
+        &schema_with(&[&mood]),
+        &[],
+        &[mood_record.clone(), other_record.clone()],
+    );
+    let [transition] = created.as_slice() else {
+        panic!("{created:?}");
+    };
+    assert_eq!(transition.surface, Surface::Type(mood.clone()));
+    assert!(transition.before.is_empty());
+    assert_eq!(transition.after, BTreeSet::from([mood_row.clone()]));
+
+    // Dropped: the opening records, and nothing is installed.
+    let dropped = derive(
+        vec![Change::DropType {
+            uid: uid.clone(),
+            name: mood.clone(),
+            definition: Box::new(definition()),
+        }],
+        &schema_with(&[&mood]),
+        &Schema::default(),
+        &[mood_record.clone(), other_record.clone()],
+        &[],
+    );
+    let [transition] = dropped.as_slice() else {
+        panic!("{dropped:?}");
+    };
+    assert_eq!(transition.before, BTreeSet::from([mood_row.clone()]));
+    assert!(transition.after.is_empty());
+
+    // A label operation replaces the records in place.
+    let altered = derive(
+        vec![Change::AddEnumValue {
+            uid: uid.clone(),
+            name: mood.clone(),
+            value: "b".into(),
+            placement: None,
+            ordinal: 0,
+            definition: Box::new(definition()),
+        }],
+        &schema_with(&[&mood]),
+        &schema_with(&[&mood]),
+        std::slice::from_ref(&mood_record),
+        std::slice::from_ref(&mood_record),
+    );
+    let [transition] = altered.as_slice() else {
+        panic!("{altered:?}");
+    };
+    assert_eq!(transition.before, BTreeSet::from([mood_row.clone()]));
+    assert_eq!(transition.after, BTreeSet::from([mood_row.clone()]));
+    // Negative: a type the desired schema does not declare is not installed.
+    let undeclared = derive(
+        vec![Change::AddEnumValue {
+            uid,
+            name: mood.clone(),
+            value: "b".into(),
+            placement: None,
+            ordinal: 0,
+            definition: Box::new(definition()),
+        }],
+        &schema_with(&[&mood]),
+        &Schema::default(),
+        std::slice::from_ref(&mood_record),
+        std::slice::from_ref(&mood_record),
+    );
+    assert!(undeclared[0].after.is_empty(), "{undeclared:?}");
+
+    // A rename: the opening spelling's records go, the final one's arrive.
+    let (old_row, old_record) = record("old", &old);
+    let base = schema_with(&[&old]);
+    let base_ids = ids(&base, &IdsFile::default());
+    let renamed_uid = base_ids.type_uid(&old).unwrap().clone();
+    let mut desired_ids = base_ids.clone();
+    desired_ids.types.insert(renamed_uid.clone(), mood.clone());
+    let desired = schema_with(&[&mood]);
+    let renamed = super::transitions::derive(
+        &ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameType {
+                uid: renamed_uid,
+                from: old.clone(),
+                to: mood.clone(),
+                definition: Box::new(definition()),
+            })],
+        },
+        pbps_diff::Side {
+            schema: &base,
+            ids: &base_ids,
+        },
+        pbps_diff::Side {
+            schema: &desired,
+            ids: &desired_ids,
+        },
+        &[old_record, other_record.clone()],
+        &[mood_record],
+    )
+    .unwrap();
+    let [transition] = renamed.as_slice() else {
+        panic!("{renamed:?}");
+    };
+    assert_eq!(transition.surface, Surface::Type(mood.clone()));
+    assert_eq!(transition.before, BTreeSet::from([old_row]));
+    assert_eq!(transition.after, BTreeSet::from([mood_row]));
+}

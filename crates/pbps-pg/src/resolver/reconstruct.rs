@@ -502,6 +502,23 @@ impl Reconstruction {
                         });
                     }
                 }
+                // A declared enum or domain is created before every table and
+                // module that names it. A bootstrap holds only creations of
+                // them, so the label operations and the drops stay refused.
+                Change::CreateType { name, .. } => {
+                    steps.push(step(
+                        dialect,
+                        Phase::Types,
+                        &format!("type {name}", name = name.shown()),
+                        change,
+                        vec![(
+                            Nameable::Type,
+                            name.schema().to_owned(),
+                            name.name().to_owned(),
+                        )],
+                        None,
+                    )?);
+                }
                 Change::CreateModule { id, module } => {
                     // A trigger is named by nothing and names its function
                     // with an exact signature, so it waits for everything.
@@ -565,7 +582,6 @@ impl Reconstruction {
                 Change::AddEnumValue { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
-                | Change::CreateType { .. }
                 | Change::DropType { .. }
                 | Change::RenameType { .. }
                 | Change::DropTable { .. }

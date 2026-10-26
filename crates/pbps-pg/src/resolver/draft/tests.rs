@@ -1,4 +1,5 @@
 use super::*;
+use crate::resolver::capture::Managed;
 
 /// A target built by hand: what [`read`] would hand [`compose`].
 #[derive(Default)]
@@ -1088,4 +1089,155 @@ fn catalog_prose_foreign_and_transitive_draft_findings_show_names_without_changi
         ["function a\n()", r"function a\n()"],
         "raw order differs from shown order"
     );
+}
+
+/// A managed table with a column of `ext.e` (and of its array), whose enum is
+/// `declared` or not. The type is declared by the project when `declared`.
+fn reading_an_enum(declared: bool) -> Draft {
+    let mut target = Target::default();
+    let enum_type = target.object("pg_type", 20400, "ext", "type ext.e");
+    target.facts.types.insert(
+        20400,
+        Type {
+            kind: 'e',
+            qualified: "ext.e".into(),
+            schema: "ext".into(),
+            name: "e".into(),
+            ..Type::default()
+        },
+    );
+    target.facts.labels.insert(20400, vec!["'a'".into()]);
+    let array = target.object("pg_type", 20401, "ext", "type ext.e[]");
+    target.facts.types.insert(
+        20401,
+        Type {
+            kind: 'b',
+            qualified: "ext._e".into(),
+            schema: "ext".into(),
+            name: "_e".into(),
+            element: 20400,
+            ..Type::default()
+        },
+    );
+    target.depend(&array, &enum_type, 'i', true);
+    let table = target.relation(20410, 'r', "app", "t", &[("m", "ext.e")]);
+    target.depend(&table, &enum_type, 'n', true);
+    target.managed(&table);
+    let mut managed = Managed::from_schema(&pbps_model::Schema::default());
+    if declared {
+        let mut schema = pbps_model::Schema::default();
+        schema.types.insert(
+            "ext.e".parse().unwrap(),
+            pbps_model::ManagedType::Enum { values: vec![] },
+        );
+        managed = Managed::from_schema(&schema);
+    }
+    for key in [enum_type, array] {
+        if declared_type(&target.facts, &key.1, |s, n| managed.declares_type(s, n)) {
+            target.managed(&key);
+        }
+    }
+    target.draft(&[])
+}
+
+/// A declared enum, and its array type, belong to the project: the draft
+/// stages neither. An enum nobody declares is an external object, drafted as
+/// it was (#2407).
+#[test]
+fn a_declared_type_is_managed_and_an_undeclared_one_is_staged_as_external() {
+    let external = reading_an_enum(false);
+    assert!(
+        external.sql.contains("CREATE TYPE ext.e AS ENUM ('a');"),
+        "{}",
+        external.sql
+    );
+    let declared = reading_an_enum(true);
+    assert!(
+        !declared.sql.contains("CREATE TYPE ext.e"),
+        "{}",
+        declared.sql
+    );
+}
+
+/// What the managed set says of a type: declared enums and domains, spelled
+/// as the engine addresses them, and no other.
+#[test]
+fn only_a_declared_types_spelling_is_managed() {
+    let mut schema = pbps_model::Schema::default();
+    for name in ["app.mood", "app.\"Mixed Case\""] {
+        schema.types.insert(
+            name.parse().unwrap(),
+            pbps_model::ManagedType::Enum { values: vec![] },
+        );
+    }
+    let managed = Managed::from_schema(&schema);
+    assert!(managed.declares_type("app", "mood"));
+    assert!(managed.declares_type_spelled("app.mood"));
+    assert!(managed.declares_type_spelled("app.mood[]"));
+    assert!(managed.declares_type_spelled("app.\"Mixed Case\""));
+    // Negative: another type, another schema, a table of that name.
+    assert!(!managed.declares_type("app", "other"));
+    assert!(!managed.declares_type_spelled("app.other"));
+    assert!(!managed.declares_type_spelled("ext.mood"));
+    assert!(!managed.declares_type_spelled("mood"));
+    let mut tables = pbps_model::Schema::default();
+    tables
+        .tables
+        .insert("app.mood".parse().unwrap(), pbps_model::Table::default());
+    assert!(!Managed::from_schema(&tables).declares_type("app", "mood"));
+}
+
+/// An array type is managed through its element, a row type through nothing
+/// here, and a type the facts do not hold not at all.
+#[test]
+fn an_array_is_managed_through_its_declared_element_only() {
+    let mut facts = Facts::default();
+    let ty = |kind, name: &str, element| Type {
+        kind,
+        schema: "app".into(),
+        name: name.into(),
+        element,
+        ..Type::default()
+    };
+    facts.types.insert(1, ty('e', "mood", 0));
+    facts.types.insert(2, ty('b', "_mood", 1));
+    facts.types.insert(3, ty('b', "_other", 4));
+    facts.types.insert(4, ty('e', "other", 0));
+    facts.types.insert(5, ty('c', "mood", 0));
+    let declares = |s: &str, n: &str| s == "app" && n == "mood";
+    assert!(declared_type(&facts, &1, declares));
+    assert!(declared_type(&facts, &2, declares));
+    assert!(!declared_type(&facts, &3, declares));
+    assert!(!declared_type(&facts, &4, declares));
+    // A composite (a relation's row type) of that name is not an enum.
+    assert!(!declared_type(&facts, &5, declares));
+    assert!(!declared_type(&facts, &6, declares));
+}
+
+/// A name the engine has to quote (a keyword, a capital, a quote of its own)
+/// is compared as the name it is: the catalog gives the parts, and no spelling
+/// is built from them (#2407 review).
+#[test]
+fn a_declared_type_whose_name_needs_quotes_is_recognised_as_it_is_named() {
+    let mut facts = Facts::default();
+    let ty = |kind, schema: &str, name: &str, element| Type {
+        kind,
+        schema: schema.into(),
+        name: name.into(),
+        element,
+        ..Type::default()
+    };
+    facts.types.insert(1, ty('d', "app", "select", 0));
+    facts.types.insert(2, ty('b', "app", "_select", 1));
+    facts.types.insert(3, ty('e', "select", "Mood", 0));
+    facts.types.insert(4, ty('b', "select", "_Mood", 3));
+    facts.types.insert(5, ty('d', "app", "select2", 0));
+    facts.types.insert(6, ty('d', "app", "Select", 0));
+    let declares = |s: &str, n: &str| (s, n) == ("app", "select") || (s, n) == ("select", "Mood");
+    for oid in [1, 2, 3, 4] {
+        assert!(declared_type(&facts, &oid, declares), "{oid}");
+    }
+    for oid in [5, 6] {
+        assert!(!declared_type(&facts, &oid, declares), "{oid}");
+    }
 }

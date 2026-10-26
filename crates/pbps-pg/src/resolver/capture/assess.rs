@@ -37,6 +37,9 @@ pub struct Managed {
     /// Declared routines by name, each with its kind, which a dropped one's
     /// lookup must match (#1126).
     routines: BTreeMap<(String, String), BTreeMap<pbps_model::ModuleId, pbps_model::ModuleKind>>,
+    /// Declared enums and domains: types the project creates, which a view
+    /// or routine reaches through a column or by name.
+    types: BTreeSet<(String, String)>,
 }
 
 impl Managed {
@@ -52,6 +55,11 @@ impl Managed {
             for index in table.indexes.keys().chain(table.unique.keys()).chain(&key) {
                 managed.indexes.insert((name.schema.clone(), index.clone()));
             }
+        }
+        for name in schema.types.keys() {
+            managed
+                .types
+                .insert((name.schema().to_owned(), name.name().to_owned()));
         }
         for (id, module) in &schema.modules {
             let key = (id.schema().to_owned(), id.name().to_owned());
@@ -115,7 +123,28 @@ impl Managed {
                     .keys()
                     .map(|key| set(CandidateClass::Routine, key)),
             )
+            .chain(self.types.iter().map(|key| set(CandidateClass::Type, key)))
             .collect()
+    }
+
+    /// Whether the project declares an enum or a domain of this name.
+    pub fn declares_type(&self, schema: &str, name: &str) -> bool {
+        self.types.contains(&(schema.to_owned(), name.to_owned()))
+    }
+
+    /// [`Self::declares_type`] for a type as `pg_identify_object_as_address`
+    /// spells it: one qualified name the engine quoted with its own rule, and
+    /// `[]` after an array type. The parts are read back and compared as
+    /// names, so the engine decides what needs quotes, not this code.
+    pub fn declares_type_spelled(&self, spelled: &str) -> bool {
+        let spelled = spelled.strip_suffix("[]").unwrap_or(spelled);
+        let Some(parts) = quoted_parts(spelled) else {
+            return false;
+        };
+        let [schema, name] = parts.as_slice() else {
+            return false;
+        };
+        self.declares_type(schema, name)
     }
 
     /// Whether a relation of this name is managed: a table, a view, or a
@@ -140,7 +169,7 @@ impl Managed {
             "pg_class" => {
                 self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
             }
-            "pg_type" => self.relations.contains(&key),
+            "pg_type" => self.relations.contains(&key) || self.types.contains(&key),
             _ => false,
         }
     }
@@ -165,7 +194,9 @@ impl Managed {
             // array type's name is only the engine's first choice, taken by
             // an earlier type of that name, so the array is the project's
             // only through its internal dependency on the row type (#1041).
-            CandidateClass::Type => self.relations.contains(&key(name)),
+            CandidateClass::Type => {
+                self.relations.contains(&key(name)) || self.types.contains(&key(name))
+            }
             // A declared overload the desired schema keeps was compiled on
             // scratch, which gives its catalog identity; one the plan drops is
             // identified from its declared signature. Only those identities
@@ -185,6 +216,40 @@ impl Managed {
             | CandidateClass::OperatorFamily
             | CandidateClass::Cast
             | CandidateClass::Extension => false,
+        }
+    }
+}
+
+/// The identifiers of a dotted name as the engine's `quote_ident` wrote them:
+/// a bare one as is, a quoted one without its quotes and with `""` read as
+/// `"`. `None` where the text is no such list. A dot inside quotes is part of
+/// its identifier.
+fn quoted_parts(spelled: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = spelled.chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next()? {
+                    '"' if chars.next_if_eq(&'"').is_some() => part.push('"'),
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| *c != '.' && *c != '"') {
+                part.push(c);
+            }
+        }
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') => {}
+            Some(_) => return None,
         }
     }
 }
@@ -938,6 +1003,110 @@ mod tests {
             &["id"],
             vec![id("pg_class", &["pg_catalog", "pg_class"], Vec::new())]
         )));
+    }
+
+    fn declaring(types: &[(&str, &str)]) -> Managed {
+        Managed {
+            types: types
+                .iter()
+                .map(|(schema, name)| ((*schema).to_owned(), (*name).to_owned()))
+                .collect(),
+            ..Managed::default()
+        }
+    }
+
+    /// The engine quotes a keyword, a capital and a character that is no plain
+    /// identifier; the name it returns is read back as parts, so a declared
+    /// type of any of these is recognised, alone or as an array, and a name
+    /// that merely looks alike is not (#2407 review).
+    #[test]
+    fn a_declared_types_quoted_spelling_is_read_back_as_names() {
+        let managed = declaring(&[
+            ("app", "select"),
+            ("app", "Mood"),
+            ("select", "mood"),
+            ("app", "odd\"na.me"),
+            ("app", "plain"),
+        ]);
+        for spelled in [
+            "app.\"select\"",
+            "app.\"select\"[]",
+            "app.\"Mood\"",
+            "app.\"Mood\"[]",
+            "\"select\".mood",
+            "\"select\".mood[]",
+            "app.\"odd\"\"na.me\"",
+            "app.\"odd\"\"na.me\"[]",
+            "app.plain",
+            "app.plain[]",
+        ] {
+            assert!(managed.declares_type_spelled(spelled), "{spelled}");
+        }
+        for spelled in [
+            "app.\"select2\"",
+            "app.\"Select\"",
+            "app.\"SELECT\"[]",
+            "app.mood",
+            "app.\"plain\"x",
+            "app.\"select",
+            "app.\"select\"[]x",
+            "\"other\".mood",
+            "app..plain",
+            "plain",
+            "a.app.plain",
+            "",
+        ] {
+            assert!(!managed.declares_type_spelled(spelled), "{spelled}");
+        }
+        assert_eq!(quoted_parts("\"a.b\".\"c\"\"d\"").unwrap(), ["a.b", "c\"d"]);
+        assert!(quoted_parts("a.\"\"").is_none());
+    }
+
+    /// A declared enum or domain is a managed type: held by its name, named
+    /// by an externals file that would create it, and captured as a candidate
+    /// set. Its array type is taken through its dependency, as a relation's
+    /// is, and an undeclared type of the same name is none of these (#2407).
+    #[test]
+    fn a_declared_type_is_managed_by_its_name_alone() {
+        let mut schema = pbps_model::Schema::default();
+        schema.types.insert(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum { values: vec![] },
+        );
+        let managed = Managed::from_schema(&schema);
+        let order = crate::resolver::reconstruct::Reconstruction::new(
+            &crate::Postgres::new(),
+            &crate::resolver::reconstruct::fixture_plan(&[]),
+            &pbps_model::IdsFile::default(),
+        )
+        .unwrap();
+        let mood = id("pg_type", &["app", "mood"], Vec::new());
+        assert!(managed.holds(CandidateClass::Type, &mood, &order));
+        assert!(managed.names(&mood));
+        assert!(managed.scope().contains(&CandidateSet {
+            class: CandidateClass::Type,
+            namespace: Some("app".into()),
+            name: Some("mood".into()),
+        }));
+        // Negative: another name, another schema, and no relation.
+        for other in [
+            id("pg_type", &["app", "_mood"], Vec::new()),
+            id("pg_type", &["app", "other"], Vec::new()),
+            id("pg_type", &["ext", "mood"], Vec::new()),
+        ] {
+            assert!(
+                !managed.holds(CandidateClass::Type, &other, &order),
+                "{other:?}"
+            );
+            assert!(!managed.names(&other), "{other:?}");
+        }
+        assert!(!managed.holds(
+            CandidateClass::Relation,
+            &id("pg_class", &["app", "mood"], Vec::new()),
+            &order
+        ));
+        assert!(!managed.relation("app", "mood"));
+        assert!(!Managed::default().names(&mood));
     }
 
     /// A relation's name covers its row type and array type. An overload

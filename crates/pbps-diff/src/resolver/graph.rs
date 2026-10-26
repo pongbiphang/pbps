@@ -148,7 +148,7 @@ fn table_of(s: &Surface) -> Option<&TableName> {
             Some(t)
         }
         Surface::Column(c) | Surface::Default(c) => Some(&c.table),
-        Surface::Namespace(_) | Surface::Module(_) => None,
+        Surface::Namespace(_) | Surface::Module(_) | Surface::Type(_) => None,
     }
 }
 

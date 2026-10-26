@@ -705,6 +705,7 @@ pub fn chains(
                 | "sequence" | "index",
                 [schema, name],
             ) => managed.relation(schema, name),
+            ("type", [spelled]) => managed.declares_type_spelled(spelled),
             ("function" | "procedure" | "aggregate", _) => routines.contains(&address.oid),
             _ => false,
         };
@@ -1065,6 +1066,72 @@ mod tests {
         assert!(
             super::chains(&links, &managed(&[], &["app.v"]), &managed(&[], &[]), &none).is_empty()
         );
+    }
+
+    /// A domain over a managed relation's row type is a chain unless the
+    /// project declares the domain itself (#2407); an undeclared one still is.
+    #[test]
+    fn a_declared_domain_in_the_middle_is_no_chain_and_an_undeclared_one_is() {
+        let through = |domain: &str| Link {
+            binder: address("view app.v", "view", &["app", "v"]),
+            middle: address(&format!("type {domain}"), "type", &[domain]),
+            named: address("table app.m", "table", &["app", "m"]),
+        };
+        let mut schema = pbps_model::Schema::default();
+        schema
+            .tables
+            .insert("app.m".parse().unwrap(), pbps_model::Table::default());
+        schema.modules.insert(
+            "app.v".parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::View,
+                description: None,
+                definition: String::new(),
+            },
+        );
+        for declared in [
+            "app.wrapped",
+            "app.select",
+            "app.\"Wrapped\"",
+            "select.wrapped",
+        ] {
+            schema.types.insert(
+                declared.parse().unwrap(),
+                pbps_model::ManagedType::Domain {
+                    base: "text".parse().unwrap(),
+                    not_null: false,
+                    default: None,
+                    checks: Default::default(),
+                    collation: None,
+                },
+            );
+        }
+        let managed = crate::resolver::capture::Managed::from_schema(&schema);
+        let none = ManagedRoutines::default();
+        // As the engine spells them: a keyword or a capital is quoted, an
+        // array type carries `[]`.
+        for declared in [
+            "app.wrapped",
+            "app.\"select\"",
+            "app.\"Wrapped\"",
+            "\"select\".wrapped",
+            "app.\"select\"[]",
+            "app.\"Wrapped\"[]",
+        ] {
+            assert!(
+                chains(&[through(declared)], &managed, &managed, &none).is_empty(),
+                "{declared}"
+            );
+        }
+        for undeclared in [
+            "ext.wrapped",
+            "app.\"select2\"",
+            "app.\"Select\"",
+            "app.\"wrapped2\"[]",
+        ] {
+            let chain = chains(&[through(undeclared)], &managed, &managed, &none);
+            assert_eq!(chain.len(), 1, "{undeclared}: {chain:?}");
+        }
     }
 
     #[test]

@@ -899,6 +899,7 @@
         "row_security_renames_preserve_unmanaged_policy_owners",
         "row_security_policy_targets_must_exist_before_planning_or_bootstrap",
         "row_security_resolver_plans_apply_and_preserve_adopted_policies",
+        "a_resolved_plan_builds_declared_enums_and_domains_on_scratch",
         "row_security_routine_renames_and_rebuilds_refuse_only_policy_callers",
         "row_security_table_renames_refuse_only_changed_policy_predicates",
         "staged_and_resumed_writes_pin_the_session_before_the_next_statement",

@@ -35802,3 +35802,11 @@ fn late_dependent_descriptions_are_shown_once_in_plan_and_apply() {
         succeeds(d.run(&["verify", "--db", connection]));
     }
 }
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn a_resolved_plan_builds_declared_enums_and_domains_on_scratch() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        resolver_publication::declared_types(&std::env::var(variable).unwrap());
+    }
+}

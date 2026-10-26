@@ -213,7 +213,7 @@ fn table(surface: &Surface) -> Option<&TableName> {
         Surface::Table(table) => Some(table),
         Surface::Column(column) | Surface::Default(column) => Some(&column.table),
         Surface::Check { table, .. } | Surface::Index { table, .. } => Some(table),
-        Surface::Namespace(_) | Surface::Module(_) => None,
+        Surface::Namespace(_) | Surface::Module(_) | Surface::Type(_) => None,
     }
 }
 

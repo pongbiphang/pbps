@@ -114,7 +114,7 @@ fn relocate(
                 | Surface::Check { table, .. }
                 | Surface::Index { table, .. } => Some(table),
                 Surface::Column(column) | Surface::Default(column) => Some(&mut column.table),
-                Surface::Namespace(_) | Surface::Module(_) => None,
+                Surface::Namespace(_) | Surface::Module(_) | Surface::Type(_) => None,
             };
             let (from, to) = if forward { (from, to) } else { (to, from) };
             if let Some(table) = table
@@ -123,6 +123,18 @@ fn relocate(
             {
                 *table_uid = Some(uid.clone());
                 *table = to.clone();
+            }
+        }
+        // A type is selected by its rename's UID as a table is, in the same
+        // slot: a surface is one or the other.
+        Change::RenameType { uid, from, to, .. } => {
+            let (from, to) = if forward { (from, to) } else { (to, from) };
+            if let Surface::Type(name) = surface
+                && name == from
+                && table_uid.as_ref().is_none_or(|selected| selected == uid)
+            {
+                *table_uid = Some(uid.clone());
+                *name = to.clone();
             }
         }
         Change::RenameColumn {
@@ -143,5 +155,57 @@ fn relocate(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PlannedChange, TypeRef, Uid, UidKind};
+
+    fn renaming(uid: &Uid, from: &str, to: &str) -> ChangeSet {
+        ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::RenameType {
+                    uid: uid.clone(),
+                    from: from.parse().unwrap(),
+                    to: to.parse().unwrap(),
+                    definition: Box::new(crate::ManagedType::Enum { values: Vec::new() }),
+                }),
+                // A step after it, to ask the opening snapshot of.
+                PlannedChange::new(Change::CreateRole {
+                    uid: Uid::generate(UidKind::Role),
+                    name: "later".into(),
+                }),
+            ],
+        }
+    }
+
+    /// A type's rename moves its surface between the two spellings, and only
+    /// that type's: another name, and a reused spelling, stay put (#2407).
+    #[test]
+    fn a_types_rename_moves_only_its_own_surface() {
+        let uid = Uid::generate(UidKind::Type);
+        let changes = renaming(&uid, "app.old", "app.new");
+        let name = |text: &str| Surface::Type(text.parse::<TypeRef>().unwrap());
+        assert_eq!(
+            at_endpoint(&name("app.old"), &changes, 0, false),
+            name("app.new")
+        );
+        assert_eq!(
+            at_endpoint(&name("app.new"), &changes, 1, true),
+            name("app.old")
+        );
+        // Negative: another type is not moved, nor is a table of that name.
+        assert_eq!(
+            at_endpoint(&name("app.other"), &changes, 0, false),
+            name("app.other")
+        );
+        assert_eq!(
+            at_endpoint(&name("app.other"), &changes, 1, true),
+            name("app.other")
+        );
+        let table = Surface::Table(crate::TableName::new("app", "old"));
+        assert_eq!(at_endpoint(&table, &changes, 0, false), table);
     }
 }

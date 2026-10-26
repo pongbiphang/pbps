@@ -46,7 +46,7 @@ fn binding_class(surface: &Surface) -> &'static str {
         Surface::Module(ModuleId::Named(_)) => "pg_rewrite",
         Surface::Module(ModuleId::Routine(_)) => "pg_proc",
         Surface::Module(ModuleId::Trigger { .. }) => "pg_trigger",
-        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) => {
+        Surface::Namespace(_) | Surface::Table(_) | Surface::Column(_) | Surface::Type(_) => {
             unreachable!("not a creation-time binding surface")
         }
     }

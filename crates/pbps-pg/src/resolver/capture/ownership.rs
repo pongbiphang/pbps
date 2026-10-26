@@ -434,6 +434,30 @@ pub(super) fn classify(
             assign(&mut owned, constraint, table_owner)?;
         }
     }
+    // A declared enum or domain is matched by its recorded UID, never by
+    // whatever holds the spelling. Its array type goes with it below, by the
+    // measured internal edge (#2407).
+    for name in recorded.schema.types.keys() {
+        if recorded_names.type_uid(name).is_none() {
+            return Err(Uncovered::class(
+                "recorded-uid",
+                "declared type lacks its recorded UID",
+            ));
+        }
+        let root = identity(
+            "pg_type",
+            vec![name.schema().to_owned(), name.name().to_owned()],
+            Vec::new(),
+        );
+        direct(
+            capture,
+            &mut owned,
+            root,
+            "typtype",
+            &["e", "d"],
+            Surface::Type(name.clone()),
+        )?;
+    }
     for (id, module) in &recorded.schema.modules {
         match (id, module.kind) {
             (ModuleId::Named(name), ModuleKind::View) => {
@@ -533,7 +557,7 @@ pub(super) fn classify(
                     (
                         "pg_type",
                         "pg_class" | "pg_type",
-                        Surface::Table(_) | Surface::Module(ModuleId::Named(_)),
+                        Surface::Table(_) | Surface::Module(ModuleId::Named(_)) | Surface::Type(_),
                     ) => true,
                     ("pg_rewrite", "pg_class", Surface::Module(ModuleId::Named(_))) => {
                         made.name.len() == 1
@@ -589,9 +613,23 @@ pub(super) fn classify(
             "pg_index" | "pg_sequence" | "pg_depend" | "pg_partitioned_table" | "pg_inherits" => {
                 object.signature.first()
             }
+            // An enum's labels are its own rows, and a domain's constraints
+            // name it as their type (#2407).
+            "pg_enum" => object.signature.first(),
+            "pg_constraint" => object
+                .signature
+                .get(2)
+                .filter(|domain| domain.class == "pg_type" && !domain.name.is_empty()),
             _ => None,
         };
-        if let Some(owner) = subject.and_then(|subject| owned.get(subject)).cloned() {
+        if let Some(owner) = subject
+            .and_then(|subject| owned.get(subject))
+            .filter(|owner| {
+                !matches!(object.class.as_str(), "pg_enum" | "pg_constraint")
+                    || matches!(owner, Surface::Type(_))
+            })
+            .cloned()
+        {
             assign(&mut owned, object.clone(), owner)?;
         }
     }
