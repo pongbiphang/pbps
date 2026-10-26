@@ -2252,7 +2252,9 @@ DEC-1674.1).**
       naming it; a non-empty database with no claim is never touched. A run
       holds an advisory lock in that database from before it reads the claim
       until its own is made, so two runs never clean one dead claim at once,
-      and a release removes the claim as its last step.
+      and a release removes the claim as its last step. The claim's
+      account defaults move with an allowed externals file's changes to them,
+      in that file's transaction.
       - A leftover that cannot be removed does not stop the run. It is a
         warning (a finding, `scratch.leftover`, in `--format json`) naming
         the resource, why, and the statement that removes it. A database

@@ -184,17 +184,17 @@ impl Scratch<'_> {
     }
 
     async fn lock_database(&mut self, admin: &mut Conn) -> Result<(), Error> {
-        record::lock(admin).await.map_err(|error| match error {
-            record::LockError::Busy => Error::Unusable(
+        if !record::lock(admin)
+            .await
+            .map_err(|error| Error::Read(format!("the scratch database's lock: {error}")))?
+        {
+            return Err(Error::Unusable(
                 "another run has been starting in the scratch database, or cleaning what a \
                  killed run left in it, for over a minute; wait for it, or use another \
                  scratch database"
                     .into(),
-            ),
-            record::LockError::Db(error) => {
-                Error::Read(format!("the scratch database's lock: {error}"))
-            }
-        })?;
+            ));
+        }
         self.holds_lock = true;
         Ok(())
     }
@@ -221,7 +221,6 @@ impl Scratch<'_> {
         {
             return Ok(());
         }
-        // Held until this run's own claim is made (DEC-2410.1).
         self.lock_database(admin).await?;
         let claim = match record::read_claim(admin)
             .await

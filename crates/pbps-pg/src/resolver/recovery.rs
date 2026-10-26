@@ -127,14 +127,6 @@ pub const LOCK: (i32, i32) = (0x7062_7073, 2410);
 /// How long a run waits for the lock before it refuses.
 const LOCK_WAIT: &str = "60s";
 
-/// Why the database lock could not be taken.
-#[derive(Debug)]
-pub enum LockError {
-    /// Another run held it for the whole wait.
-    Busy,
-    Db(DbError),
-}
-
 fn advisory(function: &str) -> String {
     let (class, object) = LOCK;
     format!("SELECT pg_catalog.{function}({class}, {object})")
@@ -155,20 +147,20 @@ async fn transaction<C: ExecuteConnection>(
     }
 }
 
-/// Takes the lock for the session, or gives up after [`LOCK_WAIT`].
-/// `lock_timeout` is local to the transaction, so the session's settings are
-/// untouched.
-pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<(), LockError> {
-    transaction(conn, async |conn| {
+/// Takes the lock for the session: `false` when another run held it for the
+/// whole of [`LOCK_WAIT`]. `lock_timeout` is local to the transaction, so the
+/// session's settings are untouched.
+pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<bool, DbError> {
+    match transaction(conn, async |conn| {
         conn.execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
             .await?;
         conn.execute(&advisory("pg_advisory_lock")).await
     })
     .await
-    .map_err(|error| match error.server_error_code().as_deref() {
-        Some("55P03") => LockError::Busy,
-        _ => LockError::Db(error),
-    })
+    {
+        Err(error) if error.server_error_code().as_deref() == Some("55P03") => Ok(false),
+        taken => taken.map(|()| true),
+    }
 }
 
 /// Releases the lock; a session that does not hold it has nothing to release.
@@ -226,16 +218,33 @@ pub(crate) async fn create(
     conn: &mut impl ExecuteConnection,
     comment: &str,
 ) -> Result<(), DbError> {
+    conn.execute(&format!("CREATE SCHEMA {CLAIM}")).await?;
+    set_comment(conn, comment).await
+}
+
+async fn set_comment(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), DbError> {
     // The literal below doubles quotes and nothing else, which is whole only
     // while backslashes are literal.
     conn.execute("SET LOCAL standard_conforming_strings = on")
         .await?;
-    conn.execute(&format!("CREATE SCHEMA {CLAIM}")).await?;
     conn.execute(&format!(
         "COMMENT ON SCHEMA {CLAIM} IS '{}'",
         comment.replace('\'', "''")
     ))
     .await
+}
+
+/// Records the login's defaults as they now stand in the claim, in the
+/// caller's transaction, so both commit together (DEC-2410.1). The schema
+/// stays: a new one would show as the externals file's. No claim, no move.
+pub async fn rebase(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    let Some(Ok(mut claim)) = read_claim(conn).await? else {
+        return Ok(());
+    };
+    claim.defaults = super::scratch::login_defaults(conn).await?;
+    let json = serde_json::to_string(&claim).map_err(|error| DbError::BadRow(error.to_string()))?;
+    conn.execute("SET LOCAL ROLE NONE").await?;
+    set_comment(conn, &json).await
 }
 
 /// Removes the claim: the last step of a release.

@@ -2037,6 +2037,7 @@
         "resolver::server::scratch::live_tests::recovery2410_tests::the_keepers_settings_survive_the_two_places_that_reset_a_session",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_release_that_cannot_finish_keeps_the_login_as_the_record",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_cleanup_stopped_before_the_privileges_are_put_back_is_finished_by_the_next_run",
+        "resolver::server::scratch::live_tests::recovery2410_tests::a_run_killed_after_its_externals_changed_the_logins_defaults_is_recovered_with_them",
         "resolver::server::scratch::live_tests::recovery2410_tests::a_run_that_reads_a_dead_claim_waits_for_the_recovery_in_progress_and_then_refuses",
         "resolver::server::scratch::live_tests::resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles",
       "resolver::server::scratch::live_tests::postgres_request_counts_cover_batches_failures_and_connection_startup",

@@ -251,7 +251,6 @@ impl Scratch<'_> {
         };
         let recipe = scope::recipe(driver, target_catalog)
             .map_err(|error| Error::Scope(error.to_string()))?;
-        // Every name carries the run's token (#2410).
         let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
         let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
@@ -1175,7 +1174,10 @@ async fn run_externals(
         // type the script creates may be named `text`: for the session, not
         // the transaction, as what runs after the commit relies on it too.
         if !checked {
-            return Ok(());
+            // Kept: the claim's defaults move with them, in this transaction.
+            return record::rebase(session)
+                .await
+                .map_err(read("the scratch database's claim"));
         }
         reset_settings(session, "the externals file session").await?;
         let after = externals::shared_state(session)
@@ -1530,8 +1532,7 @@ impl Scratch<'_> {
                         .await
                 }
                 .await;
-                // Normally released after the claim; this covers every error
-                // before it.
+                // Released after the claim; this covers an error before it.
                 self.unlock_database(admin).await;
                 prepared
             }

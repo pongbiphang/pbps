@@ -4699,6 +4699,12 @@ decide the design, each measured on PostgreSQL 16 and 18.
   cleanup's own transaction and dropped by the release as its last step, so a
   kill anywhere in between leaves a claim the next run finishes from. A
   release that fails leaves it for the same reason.
+  What the claim records is what the run found, and the one baseline the run
+  later moves is the account's defaults, when `outside_writes: allow` keeps an
+  externals file's change to them: the claim is rewritten in that file's own
+  transaction, so no commit holds the kept change with the old baseline, or
+  the reverse. The ACL is not moved: the release restores it whatever a file
+  granted.
 - *Keeping is the safe error.* The sweep never forces: `DROP DATABASE`
   refuses while a session is connected (`being accessed by other users`), so
   a wrong decision still cannot close a live run's connection. A removal that

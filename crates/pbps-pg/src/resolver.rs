@@ -288,10 +288,9 @@ pub async fn drop_scratch(
     database.and(login)
 }
 
-/// Drops a run-owned database. Only the owning run forces; a later run
-/// removing a dead run's does not, so a session the engine still shows
-/// connected refuses the drop, a second guard behind the decision that the
-/// run is gone (`recovery`, #2410).
+/// Drops a run-owned database. Only the owning run forces: a later run
+/// removing a dead run's does not, so a session still connected refuses the
+/// drop, a second guard behind the decision that the run is gone (#2410).
 pub async fn drop_database(
     conn: &mut impl ExecuteConnection,
     database: &str,

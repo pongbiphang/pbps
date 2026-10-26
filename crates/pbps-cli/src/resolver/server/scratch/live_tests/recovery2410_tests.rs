@@ -1017,3 +1017,74 @@ async fn a_release_that_cannot_finish_keeps_the_login_as_the_record() {
         "and both are named"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recovered_with_them() {
+    // Under `outside_writes: allow` the externals file's change to the
+    // login's own defaults is kept, so the claim's baseline moves with it.
+    // Recovery that compared against the old baseline would call the kept
+    // default a failed cleanup and never remove the claim.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        let (login, scratch_db) = fixture.confined().await;
+        let go = |externals: Option<&'static str>| {
+            let (scratch, target) = (
+                fixture.as_login(&scratch_db, &login),
+                fixture.on(&target_db),
+            );
+            async move {
+                let inputs = Inputs::overload();
+                let mut planning = Conn::connect(Driver::Postgres, &target).await.unwrap();
+                let identity = sql::cluster_identity(&mut planning).await.unwrap();
+                super::super::produce(
+                    Driver::Postgres,
+                    &scratch,
+                    &target,
+                    &identity,
+                    &inputs.binding(),
+                    inputs.base(),
+                    inputs.desired(),
+                    &inputs.hints,
+                    &[],
+                    &ProjectKey::new(true).project,
+                    Some(super::ENVIRONMENT),
+                    &standard::Standard::default(),
+                    externals,
+                    &super::super::Provenance {
+                        entry: "scratch".into(),
+                        scratch: pbps_model::resolver::ScratchSource::Server {},
+                        outside_writes: pbps_model::resolver::OutsideWrites::Allowed,
+                        same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+                    },
+                )
+                .await
+            }
+        };
+        engine::stop_after_cleanup(&scratch_db, true);
+        let stopped = go(Some("ALTER ROLE CURRENT_USER SET work_mem = '5MB';")).await;
+        engine::stop_after_cleanup(&scratch_db, false);
+        let between = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
+        let finished = go(None).await;
+        let after = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
+        let mut as_login = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
+            .await
+            .unwrap();
+        let kept = sql::login_defaults(&mut as_login).await.unwrap();
+        fixture.drop().await;
+        assert!(
+            format!("{:?}", stopped.as_ref().err()).contains("stopped after the cleanup"),
+            "{server}: the run stopped where it was told to: {:?}",
+            stopped.err()
+        );
+        assert!(between, "{server}: the claim outlives the stopped cleanup");
+        assert!(finished.is_ok(), "{server}: {:?}", finished.err());
+        assert!(!after, "{server}: recovery removed the claim");
+        assert_eq!(
+            kept,
+            BTreeSet::from([(String::new(), "work_mem=5MB".to_owned())]),
+            "{server}: the kept default is unchanged"
+        );
+    }
+}
