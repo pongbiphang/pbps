@@ -6021,6 +6021,60 @@ fn a_renamed_domain_is_altered_under_its_final_name() {
 
 /// A domain over an enum, as a plan that adds a label meets it: the default or
 /// check the alteration introduces names the label (DEC-1635.8).
+/// The domain is renamed, a label of its base enum is renamed, and a default
+/// using the new label is set, in one plan: the domain's rename has run when
+/// the label's does, and the alteration is still ahead (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_renamed_domain_over_a_renamed_label_takes_the_default_that_uses_it() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(
+            &server,
+            "domain_rename_label4a",
+            "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'keep'); \
+             CREATE DOMAIN app.d AS app.e DEFAULT 'a' CONSTRAINT c CHECK (VALUE <> 'keep'); \
+             CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);",
+        );
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [{name: b, renamed_from: a}, keep]\n",
+        )
+        .unwrap();
+        std::fs::remove_file(d.dir.join("schema/app.d.type.yml")).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dd.type.yml"),
+            "domain: app.dd\nrenamed_from: app.d\ntype: app.e\ndefault: \"'b'\"\nchecks:\n  c: \"(VALUE <> 'keep'::app.e)\"\n",
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  m: {type: app.dd}\nprimary_key: [id]\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("rename-label.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let kinds = halves(&plan);
+        assert!(
+            kinds.contains(&"RenameType".to_owned())
+                && kinds.contains(&"RenameEnumValue".to_owned())
+                && kinds.contains(&"Loosen".to_owned()),
+            "{kinds:?}"
+        );
+        succeeds(apply_allowing(&d, db, &path, &["rename"]));
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE oid = 'app.dd'::regtype"
+            ),
+            "'b'::app.e"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert!(no_unvalidated_domain_check(db));
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied() {

@@ -202,12 +202,19 @@ fn check_definitions(
                 .filter_map(|s| s.declared_type.as_ref())
                 .rev()
                 .find(|s| s.uid == pin.uid);
-            // A domain the plan will alter, once a label of an enum has been
-            // renamed or added: the engine now spells the labels its default
-            // and checks name as they stand, so their text no longer equals the
-            // catalog text of before the plan. What a label change cannot
-            // touch, the structure, is still held (DEC-1635.8).
-            let label_moved = latest.is_none()
+            // A domain the plan has yet to alter, once a label of an enum has
+            // been renamed or added: the engine now spells the labels its
+            // default and checks name as they stand, so their text no longer
+            // equals the catalog text of before the plan. What a label change
+            // cannot touch, the structure, is still held (DEC-1635.8). Not
+            // "no statement of this domain has run": a rename of the domain
+            // itself changes only its name, which the uid already resolves,
+            // and an alteration that has run is held by its own structure
+            // below.
+            let label_moved = !executed
+                .iter()
+                .filter_map(|s| s.declared_type.as_ref())
+                .any(|s| s.uid == pin.uid && s.altered)
                 && executed.iter().any(|s| {
                     s.declared_type
                         .as_ref()
@@ -792,6 +799,92 @@ mod tests {
             domain(false, None, &[("c1", "x")]),
         ] {
             assert!(check(&live(wrong), &alter, std::slice::from_ref(&renamed_label)).is_err());
+        }
+    }
+
+    /// The domain is renamed first, then a label of its base enum, and the
+    /// alteration that sets a default using the new label is still ahead:
+    /// the rename of the domain changes only its name, so the structural
+    /// allowance holds (DEC-1635.8).
+    #[test]
+    fn a_renamed_domain_is_still_one_the_plan_has_yet_to_alter() {
+        let from = domain(
+            false,
+            Some("'a'::app.e"),
+            &[("c1", "(VALUE <> 'a'::app.e)")],
+        );
+        let to = domain(false, Some("'b'"), &[("c1", "VALUE <> 'b'")]);
+        let uid = pbps_model::Uid::derived(pbps_model::UidKind::Type, "renamed-labelled", 0);
+        let pin = DeclaredTypePin {
+            uid: uid.clone(),
+            name: "app.renamed".parse().unwrap(),
+            definition: to.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: "app.d".parse().unwrap(),
+                definition: from.clone(),
+            }),
+        };
+        let statement = |uid: &pbps_model::Uid, name: &str, definition: ManagedType, altered| {
+            let mut statement = pbps_dialect::Statement::new("unused");
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: uid.clone(),
+                name: name.parse().unwrap(),
+                definition: Some(definition),
+                altered,
+                after_vet: None,
+            });
+            statement
+        };
+        // The domain's rename, then the base enum's label rename.
+        let domain_renamed = statement(&uid, "app.renamed", from.clone(), false);
+        let label_renamed = statement(
+            &pbps_model::Uid::derived(pbps_model::UidKind::Type, "enum", 0),
+            "app.e",
+            enumeration("b"),
+            false,
+        );
+        let altering = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterDomain {
+                    uid: uid.clone(),
+                    name: "app.renamed".parse().unwrap(),
+                    from: Box::new(from.clone()),
+                    to: Box::new(to.clone()),
+                    half: pbps_model::DomainHalf::Loosen,
+                },
+            )],
+        };
+        let live = |definition: ManagedType| Schema {
+            types: [("app.renamed".parse().unwrap(), definition)].into(),
+            ..Default::default()
+        };
+        let check = |live: &Schema,
+                     changes: &pbps_model::ChangeSet,
+                     executed: &[pbps_dialect::Statement]| {
+            check_definitions(live, std::slice::from_ref(&pin), false, changes, executed)
+        };
+        let respelled = live(domain(
+            false,
+            Some("'b'::app.e"),
+            &[("c1", "(VALUE <> 'b'::app.e)")],
+        ));
+        let both = [domain_renamed.clone(), label_renamed.clone()];
+        check(&respelled, &altering, &both).unwrap();
+        // The label renamed first and the domain after it comes out the same.
+        let reversed = [label_renamed.clone(), domain_renamed.clone()];
+        check(&respelled, &altering, &reversed).unwrap();
+        // Negatives: no alteration ahead, no enum statement run, and the
+        // domain's rename alone leave the respelled text as drift.
+        assert!(check(&respelled, &Default::default(), &both).is_err());
+        assert!(check(&respelled, &altering, std::slice::from_ref(&domain_renamed)).is_err());
+        // A structural change is drift whatever ran: a check name, NOT NULL,
+        // the default's presence.
+        for wrong in [
+            domain(false, Some("'b'::app.e"), &[("c2", "x")]),
+            domain(true, Some("'b'::app.e"), &[("c1", "x")]),
+            domain(false, None, &[("c1", "x")]),
+        ] {
+            assert!(check(&live(wrong), &altering, &both).is_err());
         }
     }
 

@@ -393,7 +393,9 @@ impl Cx<'_> {
     #[allow(clippy::wildcard_enum_match_arm)]
     fn type_inputs(&mut self) {
         match self.op.change() {
-            Change::CreateType { definition, .. } | Change::RenameType { definition, .. } => {
+            // A rename names the domain and not what it is built on, so only
+            // a creation needs its base standing in its final incarnation.
+            Change::CreateType { definition, .. } => {
                 if let crate::ManagedType::Domain { base, .. } = definition.as_ref() {
                     self.type_input(base);
                 }

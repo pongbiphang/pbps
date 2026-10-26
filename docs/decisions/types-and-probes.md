@@ -3467,9 +3467,18 @@ a `Loosen` that sets a default is ordered in class 7 after every label change
 (the one that drops a default or only drops checks stays in class 2), and the
 apply's per-statement check holds a domain the plan has yet to alter to its
 structure once an enum statement has run, since the engine then spells the
-renamed label in the unaltered default and checks.
+renamed label in the unaltered default and checks. That holds for a domain
+the plan has *yet to alter*, whatever renames of it have run: the domain's own
+rename changes only its name, which the uid resolves, so it does not end the
+allowance. A domain's `RenameType` therefore requires nothing of the incarnation
+of the enum it is built on (only its creation does), which let the order
+effects contradict the plan's own order for a domain renamed beside a rename of
+its base enum's label.
 
-Tests: `an_altered_domain_refuses_a_new_label_in_what_its_halves_introduce`,
+Tests: `a_renamed_domain_is_still_one_the_plan_has_yet_to_alter` and
+`a_renamed_domain_over_a_renamed_label_takes_the_default_that_uses_it` (the
+domain's rename, the label's rename and the default in one plan),
+`an_altered_domain_refuses_a_new_label_in_what_its_halves_introduce`,
 `a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied`,
 `a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename`, and
 `domain_alterations_converge_in_place_keep_the_uid_and_record_the_authored_text`,
