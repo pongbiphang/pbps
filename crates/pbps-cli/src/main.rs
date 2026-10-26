@@ -30,11 +30,7 @@ mod paths;
 mod pins;
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        unused_imports,
-        reason = "#1165 PR D wires the `test` command"
-    )
+    expect(dead_code, reason = "#1165 PR D wires the `test` command")
 )]
 mod plan_test;
 mod prompt;

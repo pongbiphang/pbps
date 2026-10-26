@@ -44,39 +44,46 @@ fn git_marker(root: &Path) -> std::io::Result<bool> {
     Ok(std::env::var_os("GIT_DIR").is_some())
 }
 
-pub(crate) fn check(root: &Path, sha: &str) -> Evidence {
+/// The repository `root` belongs to, canonicalized, and whether it is a
+/// shallow clone. `Err` is the evidence to report instead.
+pub(crate) fn repository(root: &Path) -> Result<(std::path::PathBuf, bool), Evidence> {
     // Relative or symlinked project paths must find the physical repository's
     // ancestors too; failing to resolve them is unreadable evidence, not absence.
     let root = match root.canonicalize() {
         Ok(root) => root,
-        Err(e) => return Evidence::Unreadable(e.to_string()),
+        Err(e) => return Err(Evidence::Unreadable(e.to_string())),
     };
-    let root = root.as_path();
     // Exit 128 also covers corrupt metadata and denied access. Only a known
     // non-repository is the no-evidence case; an unreadable repository refuses.
-    match run(root, &["rev-parse", "--git-dir"]) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Evidence::GitUnavailable,
-        Err(e) => return Evidence::Unreadable(e.to_string()),
+    match run(&root, &["rev-parse", "--git-dir"]) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Evidence::GitUnavailable),
+        Err(e) => return Err(Evidence::Unreadable(e.to_string())),
         Ok(out) if !out.status.success() => {
             let message = diagnostic(&out);
-            return match git_marker(root) {
+            return Err(match git_marker(&root) {
                 Ok(false) if message.starts_with("fatal: not a git repository") => {
                     Evidence::NoCheckout
                 }
                 Err(e) => Evidence::Unreadable(e.to_string()),
                 _ => Evidence::Unreadable(message),
-            };
+            });
         }
         Ok(_) => {}
     }
-    let shallow = match run(root, &["rev-parse", "--is-shallow-repository"]) {
+    let shallow = match run(&root, &["rev-parse", "--is-shallow-repository"]) {
         Ok(out) if out.status.success() => out.stdout.trim_ascii() == b"true",
-        Ok(out) => return Evidence::Unreadable(diagnostic(&out)),
-        Err(e) => return Evidence::Unreadable(e.to_string()),
+        Ok(out) => return Err(Evidence::Unreadable(diagnostic(&out))),
+        Err(e) => return Err(Evidence::Unreadable(e.to_string())),
     };
+    Ok((root, shallow))
+}
+
+/// `None` when `sha` is a commit this repository holds, otherwise the evidence
+/// that it is not.
+fn commit_kind(root: &Path, sha: &str, shallow: bool) -> Option<Evidence> {
     // A recorded object id is data, never revision syntax or a command option.
     if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Evidence::Missing { shallow };
+        return Some(Evidence::Missing { shallow });
     }
     // Batch-check can report `missing` with success even for a corrupt object;
     // measured Git also writes the inflate/unpack errors to stderr. A clean
@@ -96,15 +103,42 @@ pub(crate) fn check(root: &Path, sha: &str) -> Evidence {
         Ok(output)
     })();
     match object {
-        Ok(out) if !out.status.success() => return Evidence::Unreadable(diagnostic(&out)),
+        Ok(out) if !out.status.success() => Some(Evidence::Unreadable(diagnostic(&out))),
         Ok(out) if out.stdout.trim_ascii() != b"commit" && !out.stderr.trim_ascii().is_empty() => {
-            return Evidence::Unreadable(diagnostic(&out));
+            Some(Evidence::Unreadable(diagnostic(&out)))
         }
-        Ok(out) if out.stdout.trim_ascii() != b"commit" => return Evidence::Missing { shallow },
-        Err(e) => return Evidence::Unreadable(e.to_string()),
-        Ok(_) => {}
+        Ok(out) if out.stdout.trim_ascii() != b"commit" => Some(Evidence::Missing { shallow }),
+        Err(e) => Some(Evidence::Unreadable(e.to_string())),
+        Ok(_) => None,
     }
-    match run(root, &["merge-base", "--is-ancestor", sha, "HEAD"]) {
+}
+
+/// Whether `sha` is a commit this repository holds. `Contains` here means the
+/// commit is present, which is how a caller names the one that is not when
+/// [`check_between`] cannot say which of its two is missing.
+pub(crate) fn commit(root: &Path, sha: &str) -> Evidence {
+    match repository(root) {
+        Err(evidence) => evidence,
+        Ok((root, shallow)) => commit_kind(&root, sha, shallow).unwrap_or(Evidence::Contains),
+    }
+}
+
+/// Whether `ancestor` is an ancestor of, or equal to, `descendant`: a full
+/// commit id, or `HEAD`. Merged history counts, not only the first parent.
+pub(crate) fn check_between(root: &Path, ancestor: &str, descendant: &str) -> Evidence {
+    let (root, shallow) = match repository(root) {
+        Ok(found) => found,
+        Err(evidence) => return evidence,
+    };
+    let root = root.as_path();
+    for sha in [ancestor, descendant] {
+        if sha != "HEAD"
+            && let Some(evidence) = commit_kind(root, sha, shallow)
+        {
+            return evidence;
+        }
+    }
+    match run(root, &["merge-base", "--is-ancestor", ancestor, descendant]) {
         Ok(out) if out.status.success() => Evidence::Contains,
         Ok(out) if out.status.code() == Some(1) => {
             // A shallow boundary can hide the path from HEAD to an object that
@@ -118,6 +152,10 @@ pub(crate) fn check(root: &Path, sha: &str) -> Evidence {
         Ok(out) => Evidence::Unreadable(diagnostic(&out)),
         Err(e) => Evidence::Unreadable(e.to_string()),
     }
+}
+
+pub(crate) fn check(root: &Path, sha: &str) -> Evidence {
+    check_between(root, sha, "HEAD")
 }
 
 #[cfg(test)]
@@ -184,6 +222,42 @@ mod tests {
         let nested = dir.path().join("nested/project");
         std::fs::create_dir_all(&nested).unwrap();
         assert_eq!(check(&nested, &a), Evidence::Contains);
+    }
+
+    #[test]
+    fn any_two_commits_are_related_by_ancestry_not_only_a_commit_and_head() {
+        let dir = repo();
+        let a = commit(dir.path(), "a");
+        let b = commit(dir.path(), "b");
+        let c = commit(dir.path(), "c");
+        assert_eq!(check_between(dir.path(), &a, &c), Evidence::Contains);
+        assert_eq!(check_between(dir.path(), &b, &b), Evidence::Contains);
+        assert_eq!(check_between(dir.path(), &c, &a), Evidence::Diverged);
+        // `check` is the same question with `HEAD` as the descendant.
+        assert_eq!(check_between(dir.path(), &a, "HEAD"), check(dir.path(), &a));
+        git(dir.path(), &["checkout", "-q", "--detach", &a]);
+        let side = commit(dir.path(), "side");
+        assert_eq!(check_between(dir.path(), &side, &c), Evidence::Diverged);
+        assert_eq!(check_between(dir.path(), &c, &side), Evidence::Diverged);
+        // A descendant git does not hold is missing evidence, never "no".
+        let ghost = "0".repeat(40);
+        assert_eq!(
+            check_between(dir.path(), &a, &ghost),
+            Evidence::Missing { shallow: false }
+        );
+        assert_eq!(
+            check_between(dir.path(), &a, "--help"),
+            Evidence::Missing { shallow: false }
+        );
+        assert_eq!(
+            commit_kind(dir.path(), &ghost, false),
+            Some(Evidence::Missing { shallow: false })
+        );
+        assert_eq!(super::commit(dir.path(), &a), Evidence::Contains);
+        assert_eq!(
+            super::commit(dir.path(), &ghost),
+            Evidence::Missing { shallow: false }
+        );
     }
 
     #[test]
