@@ -304,8 +304,9 @@ test('every flow share has the full-list CI entry and both servers and packages'
   assert.ok(installed);
   assert.match(installed, /job\.services\.postgres\.id.*:18/);
   assert.match(installed, /job\.services\.postgres-old\.id.*:16/);
-  assert.match(block, /^      PBPS_TEST_PG_CONTAINER: \$\{\{ job\.services\.postgres\.id \}\}$/m);
-  assert.match(block, /^      PBPS_TEST_PG_OLD_CONTAINER: \$\{\{ job\.services\.postgres-old\.id \}\}$/m);
+  // The job context is available in step env, not job env (GitHub rejects the latter).
+  assert.doesNotMatch(block.split('    steps:\n')[0],
+    /^\s*PBPS_TEST_PG_(?:OLD_)?CONTAINER:/m);
   const selectors = [];
   for (const suite of suites) {
     const selected = flow.filter(step => !falsy(evaluate(
@@ -319,6 +320,8 @@ test('every flow share has the full-list CI entry and both servers and packages'
       const match = command.match(/^python3 scripts\/live-shards\.py ci ([0-9]+)\/3 test -p pbps-cli --test flow_pg -- --ignored$/);
       assert.ok(match, 'the entry enumerates the complete ignored list without name filters');
       selectors.push(Number(match[1]));
+      assert.match(step, /^          PBPS_TEST_PG_CONTAINER: \$\{\{ job\.services\.postgres\.id \}\}$/m);
+      assert.match(step, /^          PBPS_TEST_PG_OLD_CONTAINER: \$\{\{ job\.services\.postgres-old\.id \}\}$/m);
       assert.doesNotMatch(step, /continue-on-error/);
     }
   }
