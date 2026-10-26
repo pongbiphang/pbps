@@ -202,6 +202,20 @@ fn check_definitions(
                 .filter_map(|s| s.declared_type.as_ref())
                 .rev()
                 .find(|s| s.uid == pin.uid);
+            // A domain the plan will alter, once a label of an enum has been
+            // renamed or added: the engine now spells the labels its default
+            // and checks name as they stand, so their text no longer equals the
+            // catalog text of before the plan. What a label change cannot
+            // touch, the structure, is still held (DEC-1635.8).
+            let label_moved = latest.is_none()
+                && executed.iter().any(|s| {
+                    s.declared_type
+                        .as_ref()
+                        .is_some_and(|t| matches!(t.definition, Some(ManagedType::Enum { .. })))
+                })
+                && changes.changes.iter().any(|p| {
+                    matches!(&p.change, pbps_model::Change::AlterDomain { uid, .. } if uid == &pin.uid)
+                });
             let (definition, before) = match latest.and_then(|s| s.definition.as_ref()) {
                 Some(definition @ ManagedType::Enum { .. }) => (definition, true),
                 // A domain the plan altered in place is held to the structure
@@ -225,6 +239,18 @@ fn check_definitions(
                 ))
             })?;
             let mut expected = definition.clone();
+            if label_moved && let Some(was) = &pin.before {
+                let mut was = was.definition.clone();
+                renames.definition(&mut was);
+                if !matches_declaration(&was, actual) {
+                    return Err(failed(format!(
+                        "declared type `{}` changed since planning; plan again",
+                        name.shown()
+                    )));
+                }
+                present.push(name.clone());
+                continue;
+            }
             if before {
                 // Pins hold only the saved catalog text. Follow exactly the
                 // approved moves already executed, including expression casts.
@@ -683,6 +709,90 @@ mod tests {
             *base = "integer".parse().unwrap();
         }
         assert!(check(&live(other_base), true, &executed).is_err());
+    }
+
+    /// A label renamed before the plan alters the domain that names it leaves
+    /// the domain's catalog text changed (`'a'` deparses as `'b'`). Its
+    /// structure is still held, and only while the plan has an alteration of
+    /// it to come (DEC-1635.8).
+    #[test]
+    fn a_label_change_before_the_alteration_does_not_make_the_domain_drift() {
+        let from = domain(
+            false,
+            Some("'a'::app.e"),
+            &[("c1", "(VALUE <> 'a'::app.e)")],
+        );
+        let to = domain(false, Some("'b'"), &[("c1", "VALUE <> 'b'")]);
+        let uid = pbps_model::Uid::derived(pbps_model::UidKind::Type, "labelled", 0);
+        let pin = DeclaredTypePin {
+            uid: uid.clone(),
+            name: "app.d".parse().unwrap(),
+            definition: to.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: "app.d".parse().unwrap(),
+                definition: from.clone(),
+            }),
+        };
+        let renamed_label = {
+            let mut statement = pbps_dialect::Statement::new("unused");
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Type, "enum", 0),
+                name: "app.e".parse().unwrap(),
+                definition: Some(ManagedType::Enum {
+                    values: vec!["b".into()],
+                }),
+                altered: false,
+                after_vet: None,
+            });
+            statement
+        };
+        let altering = |half| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::AlterDomain {
+                    uid: uid.clone(),
+                    name: "app.d".parse().unwrap(),
+                    from: Box::new(from.clone()),
+                    to: Box::new(to.clone()),
+                    half,
+                },
+            )],
+        };
+        let live = |definition: ManagedType| Schema {
+            types: [("app.d".parse().unwrap(), definition)].into(),
+            ..Default::default()
+        };
+        let check = |live: &Schema,
+                     changes: &pbps_model::ChangeSet,
+                     executed: &[pbps_dialect::Statement]| {
+            check_definitions(live, std::slice::from_ref(&pin), false, changes, executed)
+        };
+        let respelled = live(domain(
+            false,
+            Some("'b'::app.e"),
+            &[("c1", "(VALUE <> 'b'::app.e)")],
+        ));
+        let alter = altering(pbps_model::DomainHalf::Loosen);
+        check(&respelled, &alter, std::slice::from_ref(&renamed_label)).unwrap();
+        // Negatives: the text differs with no label change executed, or with
+        // no alteration to come, is drift as ever.
+        assert!(check(&respelled, &alter, &[]).is_err());
+        assert!(
+            check(
+                &respelled,
+                &Default::default(),
+                std::slice::from_ref(&renamed_label)
+            )
+            .is_err()
+        );
+        // A structural difference is still drift: a check missing, NOT NULL,
+        // the default gone.
+        for wrong in [
+            domain(false, Some("'b'::app.e"), &[]),
+            domain(true, Some("'b'::app.e"), &[("c1", "x")]),
+            domain(false, None, &[("c1", "x")]),
+        ] {
+            assert!(check(&live(wrong), &alter, std::slice::from_ref(&renamed_label)).is_err());
+        }
     }
 
     #[test]

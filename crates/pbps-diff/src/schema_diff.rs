@@ -6877,6 +6877,13 @@ fn dependency_rank(
         Change::AddEnumValue { ordinal, .. } | Change::RenameEnumValue { ordinal, .. } => {
             *ordinal as isize
         }
+        // After every label change of class 7, which it may name.
+        Change::AlterDomain {
+            half: pbps_model::DomainHalf::Loosen,
+            from,
+            to,
+            ..
+        } if domain_sets_default(from, to) => isize::MAX,
         Change::AlterDomain { .. } => 0,
         Change::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { ordinal, .. },
@@ -7646,6 +7653,12 @@ const COLUMN_ALTERATIONS: u8 = 9;
 /// tightening of a table with row changes is placed at its end (#1367).
 const ROW_DELETIONS: u8 = 12;
 
+/// Whether going from `from` to `to` sets a domain's default, as against
+/// dropping or keeping it.
+fn domain_sets_default(from: &pbps_model::ManagedType, to: &pbps_model::ManagedType) -> bool {
+    pbps_model::DomainDelta::of(from, to).is_some_and(|d| matches!(d.default, Some(Some(_))))
+}
+
 fn order_key(c: &Change) -> u8 {
     match c {
         Change::RebuildPartitionedTable(_)
@@ -7663,10 +7676,21 @@ fn order_key(c: &Change) -> u8 {
         | Change::CreateType { .. } => 7,
         // A domain's checks and NOT NULL are dropped with a table's, before
         // the plan's rows, and added with them after the rows (DEC-1635.8).
+        // A default the half sets can name a label the plan renames or adds,
+        // so that half waits for the type changes (class 7); it still
+        // precedes every column and row.
         Change::AlterDomain {
             half: pbps_model::DomainHalf::Loosen,
+            from,
+            to,
             ..
-        } => 2,
+        } => {
+            if domain_sets_default(from, to) {
+                7
+            } else {
+                2
+            }
+        }
         Change::AlterDomain {
             half: pbps_model::DomainHalf::Tighten,
             ..
@@ -8412,6 +8436,54 @@ mod tests {
         );
         // A domain nothing changes plans nothing.
         assert!(alter_domain(&base, &base, &[]).unwrap().changes.is_empty());
+    }
+
+    /// A default the loosening sets can name a label the plan renames or adds,
+    /// so that half waits for the type changes; one that drops it, or sets
+    /// nothing, stays with the checks it drops.
+    #[test]
+    fn a_loosening_that_sets_a_default_waits_for_the_label_changes() {
+        let no_default = code(false, None, &[], "text");
+        let with_default = code(false, Some("'b'"), &[], "text");
+        let with_check = code(false, None, &[("c", "VALUE <> 'a'")], "text");
+        let loosen =
+            |from: &pbps_model::ManagedType, to: &pbps_model::ManagedType| Change::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.code".parse().unwrap(),
+                from: Box::new(from.clone()),
+                to: Box::new(to.clone()),
+                half: pbps_model::DomainHalf::Loosen,
+            };
+        let rename = Change::RenameEnumValue {
+            uid: "y_000002".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            from: "a".into(),
+            to: "b".into(),
+            ordinal: 0,
+            definition: Box::new(pbps_model::ManagedType::Enum {
+                values: vec!["b".into()],
+            }),
+        };
+        assert_eq!(
+            order_key(&loosen(&no_default, &with_default)),
+            order_key(&rename)
+        );
+        assert_eq!(order_key(&loosen(&with_default, &no_default)), 2);
+        assert_eq!(order_key(&loosen(&with_check, &no_default)), 2);
+        // And within the class it follows every label change.
+        let (type_rank, drop_type_rank) = (BTreeMap::new(), BTreeMap::new());
+        let rank = |c: &Change| {
+            dependency_rank(
+                c,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &type_rank,
+                &drop_type_rank,
+            )
+        };
+        assert!(rank(&loosen(&no_default, &with_default)) > rank(&rename));
     }
 
     #[test]

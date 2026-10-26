@@ -3458,7 +3458,21 @@ VALID` check compares equal; the base type and collation wait for 4b.
   the composite's pin digests its attributes' domains, and the alteration
   changes that digest between the plan and the statements. Plan format 55.
 
-Tests: `domain_alterations_converge_in_place_keep_the_uid_and_record_the_authored_text`,
+Labels of the enum a domain is built on (round 2 of the PR). The same-plan
+new-label check (slice 3a) reads what each half introduces: the default
+`Loosen` sets and each check `Tighten` adds or changes, by the lexical test
+that reads a created domain's; what a half drops or leaves is no use of the
+label. A default naming a label the plan renames must run after the rename, so
+a `Loosen` that sets a default is ordered in class 7 after every label change
+(the one that drops a default or only drops checks stays in class 2), and the
+apply's per-statement check holds a domain the plan has yet to alter to its
+structure once an enum statement has run, since the engine then spells the
+renamed label in the unaltered default and checks.
+
+Tests: `an_altered_domain_refuses_a_new_label_in_what_its_halves_introduce`,
+`a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied`,
+`a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename`, and
+`domain_alterations_converge_in_place_keep_the_uid_and_record_the_authored_text`,
 `a_tightening_over_a_violating_row_rolls_the_apply_back_and_keeps_the_old_check`,
 `a_check_calling_a_project_function_is_vetted_before_it_runs_and_leaves_nothing`
 (the pinned negative: emitted as a plain `ADD CONSTRAINT`, it fails because the

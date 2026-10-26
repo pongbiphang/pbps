@@ -5964,3 +5964,139 @@ fn a_renamed_domain_is_altered_under_its_final_name() {
         assert!(no_unvalidated_domain_check(db));
     }
 }
+
+/// A domain over an enum, as a plan that adds a label meets it: the default or
+/// check the alteration introduces names the label (DEC-1635.8).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_new_label_in_what_a_domain_alteration_introduces_is_refused_until_the_label_is_applied() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // (what the database holds, what is declared, the classes the split needs)
+        let cases: [(&str, &str, &[&str]); 3] = [
+            ("", "domain: app.d\ntype: app.e\ndefault: \"'new'\"\n", &[]),
+            (
+                "",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'new'\"\n",
+                &["constraint"],
+            ),
+            (
+                " CONSTRAINT c CHECK (VALUE <> 'old')",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'new'\"\n",
+                &["constraint"],
+            ),
+        ];
+        for (n, (held, declared, allow)) in cases.into_iter().enumerate() {
+            let (own, d) = adopted(
+                &server,
+                "domain_label4a",
+                &format!(
+                    "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('old'); \
+                     CREATE DOMAIN app.d AS app.e{held}; \
+                     CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);"
+                ),
+            );
+            let db = own.connection();
+            let enum_file = d.dir.join("schema/app.e.type.yml");
+            let domain_file = d.dir.join("schema/app.d.type.yml");
+            let pulled = std::fs::read_to_string(&domain_file).unwrap();
+            std::fs::write(&enum_file, "enum: app.e\nvalues: [old, new]\n").unwrap();
+            std::fs::write(&domain_file, declared).unwrap();
+            d.commit();
+            let path = d.dir.join("domain-label.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "case {n}");
+            assert!(
+                stderr(&out).contains("app.d")
+                    && stderr(&out).contains("new")
+                    && stderr(&out).contains("apply the label first, then the rest"),
+                "case {n}: {}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+            let labels = "SELECT count(*)::bigint FROM pg_enum \
+                          WHERE enumtypid = 'app.e'::regtype AND enumlabel = 'new'";
+            assert_eq!(scalar(db, labels), 0, "refused before any SQL");
+
+            // The two-plan split: the label first, then the domain.
+            std::fs::write(&domain_file, &pulled).unwrap();
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            assert_eq!(halves(&plan), ["AddEnumValue"], "case {n}");
+            succeeds(apply_allowing(&d, db, &path, &[]));
+            assert_eq!(scalar(db, labels), 1);
+            std::fs::write(&domain_file, declared).unwrap();
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            assert!(!halves(&plan).is_empty(), "case {n}");
+            succeeds(apply_allowing(&d, db, &path, allow));
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "case {n}");
+            assert!(no_unvalidated_domain_check(db));
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+/// A label renamed in the same plan is usable by the alteration only once the
+/// rename has run: the half that sets a default or adds a check follows it.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // (what the database holds, what is declared, the classes it needs)
+        let cases: [(&str, &str, &[&str]); 3] = [
+            (
+                " DEFAULT 'a'",
+                "domain: app.d\ntype: app.e\ndefault: \"'b'\"\n",
+                &["rename"],
+            ),
+            (
+                "",
+                "domain: app.d\ntype: app.e\ndefault: \"'b'\"\n",
+                &["rename"],
+            ),
+            (
+                " CONSTRAINT c CHECK (VALUE <> 'a')",
+                "domain: app.d\ntype: app.e\nchecks:\n  c: \"VALUE <> 'b'\"\n",
+                &["rename", "constraint"],
+            ),
+        ];
+        for (n, (held, declared, allow)) in cases.into_iter().enumerate() {
+            let (own, d) = adopted(
+                &server,
+                "domain_rename4a",
+                &format!(
+                    "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'keep'); \
+                     CREATE DOMAIN app.d AS app.e{held}; \
+                     CREATE TABLE app.t (id integer PRIMARY KEY, m app.d);"
+                ),
+            );
+            let db = own.connection();
+            std::fs::write(
+                d.dir.join("schema/app.e.type.yml"),
+                "enum: app.e\nvalues: [{name: b, renamed_from: a}, keep]\n",
+            )
+            .unwrap();
+            std::fs::write(d.dir.join("schema/app.d.type.yml"), declared).unwrap();
+            d.commit();
+            let path = d.dir.join("domain-rename.plan.json");
+            let plan = label_plan(&d, db, &path);
+            let kinds = halves(&plan);
+            let rename = kinds.iter().position(|k| k == "RenameEnumValue").unwrap();
+            // The half that introduces the label is the last of the two.
+            let after = kinds
+                .iter()
+                .rposition(|k| k == "Loosen" || k == "Tighten")
+                .unwrap();
+            assert!(rename < after, "case {n}: {kinds:?}");
+            succeeds(apply_allowing(&d, db, &path, allow));
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "case {n}");
+            assert!(no_unvalidated_domain_check(db));
+        }
+    }
+}
