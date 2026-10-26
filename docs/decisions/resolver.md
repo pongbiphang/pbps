@@ -4935,3 +4935,41 @@ engine rehearses. SQL Server selects `Skip` for any entry and any switch until
 its own rehearsal lands, so its plans carry no record and acquire nothing. The
 `explain`, `plan --format json` and `apply` displays share one line.
 
+<a id="dec-2410-3"></a>
+
+**DEC-2410.3. A Docker scratch is recovered by the session its run keeps in the
+container's server, with one window that has no sound answer (#2410).** The
+`Drop` guard that removes a container on a panic does not run on SIGKILL, and
+a killed run left its container running, with its generated superuser password
+in its environment, for good. The design of DEC-2410.1 carries over: the
+container is named `pbps-scratch-<token>`, labelled with the token and its
+engine, and its run keeps a session named by the token in the server (a
+PostgreSQL `application_name`, SQL Server's `##pbps_<token>` table), read by
+the same reads the engines' adapters make. A container is the dead run's when
+it has exited; or it is running and its keeper, which once connected (the
+server keeps a persistent mark of that, a comment on the `postgres` database or
+an extended property in `master`), is gone. That needs no wait, and the first
+version of this rule, which waited for every container whatever it had seen,
+would have kept the container of a run killed a second after it connected.
+
+*The window.* From `docker run` to the keeper's first connection there is no
+keeper, and a dead run in that window cannot be told from one that has not
+connected yet. A container that is running, answers, and has never had a keeper
+is presumed its run's until it is older than the readiness deadline and two
+minutes, on the container's own clock, which the daemon's host shares, so no
+cross-machine skew can decide it. A live run suspended for longer than that
+while it starts fails loudly, its container gone, and corrupts nothing; that
+is the one place a clock decides, and the alternative, keeping the container
+until an operator removes it, leaves a running server with a known
+password behind. Past the deadline a live run would have removed the container
+itself, so the rule is never reached by one that is working.
+
+*What is not judged.* A running container whose server this run cannot reach
+(the daemon may be shared by processes that see another loopback) is neither
+removed nor presumed alive: it is reported with the exact `docker rm` that
+removes it. A container without the token label, or whose name is not its
+token's, is another tool's, or an earlier version's, and is never touched; the
+containers an earlier version left are removed by hand once. Removal is the
+run's own (`kill`, `rm --force --volumes`, and a read that confirms the
+container and its volumes gone), and a failure is a warning, never a refusal.
+

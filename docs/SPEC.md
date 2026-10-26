@@ -2460,7 +2460,20 @@ DEC-1674.1).**
         left until the run's own sandbox user exists, so that two runs never
         clean the same dead sandbox, and one that cannot get it in 30 s
         refuses naming it.
-      - `kind: docker` is not yet recovered.
+      - **`kind: docker`** is recovered the same way (DEC-2410.3). The
+        container is named `pbps-scratch-<token>` and labelled with the token
+        and its engine, and the run keeps one session in its server, named by
+        the token (the reads above), until the container is removed. Before it
+        starts a container, every run lists the containers labelled as scratch
+        and removes one that is provably its run's leavings with `docker rm
+        --force --volumes`: one that has exited, one whose keeper connected and
+        is gone, and one that is running, answers, and never had a keeper once
+        it is older than the readiness deadline and two minutes (the run's own
+        deadline for the server to come up has then passed twice over). Age is
+        read on the container's clock, which the daemon's host shares. A
+        container this run cannot read the server of is not judged and is
+        named with the command that removes it; one without the token label, or
+        named otherwise, is not this tool's and is never touched.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
       subscriptions included, and no large object, whose OID may be
