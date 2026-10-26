@@ -181,7 +181,7 @@ fn run(scratch: &str) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>
         let target = server("PBPS_TEST_DB");
         let outcome = refusal(&target, scratch).await;
         assert!(
-            matches!(&outcome, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2238")),
+            matches!(&outcome, ProduceError::Run(Error::Binding(reason)) if reason.contains("#2143")),
             "{outcome}"
         );
     })
@@ -1084,7 +1084,7 @@ async fn two_runs_that_start_together_on_one_supplied_database_exactly_one_proce
         let outcomes = [a, b];
         let proceeded = outcomes
             .iter()
-            .filter(|o| matches!(o, ProduceError::Run(Error::Binding(r)) if r.contains("#2238")))
+            .filter(|o| matches!(o, ProduceError::Run(Error::Binding(r)) if r.contains("#2143")))
             .count();
         let refused = outcomes
             .iter()
