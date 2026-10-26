@@ -196,8 +196,9 @@ resolved against declarations. SQL Server routines use their declared two-part
 names because their model identity has no signature. Declared candidates are
 checked before guessing from punctuation in an identifier. Missing or ambiguous objects are errors naming
 the entry and candidates. `writes` accepts only a table or writable column.
-A table contract covers its column interface; a column write also identifies
-its written table. Duplicate consumer names and duplicate canonical entries
+A table contract covers its column interface; every write entry identifies
+its written table and that table's whole partition tree by UID. New constraints
+there affect the consumer even when they name another column. Duplicate consumer names and duplicate canonical entries
 are refused. Owner/note are optional review metadata, not access control.
 
 `consumer.breaking` refuses loss/rename of contracted names. Narrowing,

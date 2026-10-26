@@ -4,6 +4,7 @@ use super::{
     binding::{Entry, Target},
 };
 use pbps_model::{Change, ChangeSet, PlannedChange, RiskClass, Uid, ValueSource};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
 pub(super) enum Class {
@@ -71,11 +72,13 @@ pub(super) fn classify(
     p: &PlannedChange,
     entry: &Entry,
     table: Option<&Uid>,
+    written: Option<&BTreeSet<Uid>>,
     cs: &ChangeSet,
     sides: &[Side<'_>],
 ) -> Option<Class> {
     use Class::{Breaking as B, Unproven as U};
     let hit = table.is_some() && table == entry.table();
+    let write_hit = table.is_some_and(|uid| written.is_some_and(|set| set.contains(uid)));
     let column = |uid: &Uid| {
         (hit && entry.column(uid))
             || sides.iter().any(|side| {
@@ -96,13 +99,27 @@ pub(super) fn classify(
             })
     };
     let named = |name: &pbps_model::ColumnName| hit && entry.named_column(name);
+    let nullability = |column_hit: bool, nullable: bool| {
+        if entry.writes {
+            write_hit && !nullable
+        } else {
+            column_hit && nullable
+        }
+    };
     let write = |yes| (entry.writes && yes).then_some(U);
     let unchanged_module = |id| {
-        sides.first().and_then(|s| s.schema.modules.get(id))
-            == sides.last().and_then(|s| s.schema.modules.get(id))
+        // Descriptions are declaration metadata, absent from introspection.
+        sides
+            .first()
+            .and_then(|s| s.schema.modules.get(id))
+            .map(|m| (m.kind, &m.options, &m.definition))
+            == sides
+                .last()
+                .and_then(|s| s.schema.modules.get(id))
+                .map(|m| (m.kind, &m.options, &m.definition))
     };
-    let before = sides.first().and_then(|s| s.table(entry.table()));
-    let after = sides.last().and_then(|s| s.table(entry.table()));
+    let before = sides.first().and_then(|s| s.table(table));
+    let after = sides.last().and_then(|s| s.table(table));
     match &p.change {
         Change::RebuildPartitionedTable(_) => hit.then_some(U),
         Change::BuildPartitionedIndex(index) => {
@@ -111,7 +128,7 @@ pub(super) fn classify(
                 pbps_model::PartitionIndexDefinition::PrimaryKey(_)
                 | pbps_model::PartitionIndexDefinition::Unique(_) => true,
             };
-            write(hit && unique)
+            write(write_hit && unique)
         }
         Change::RenameEnumValue { name, .. } | Change::DropType { name, .. } => {
             uses_type(entry, name, sides).then_some(U)
@@ -146,7 +163,7 @@ pub(super) fn classify(
         }
         Change::AddColumn {
             uid, column: spec, ..
-        } => write(hit && !spec.nullable && !supplied_new(uid, cs, sides)),
+        } => write(write_hit && !spec.nullable && !supplied_new(uid, cs, sides)),
         Change::AlterColumnType {
             uid,
             from_nullable,
@@ -154,16 +171,14 @@ pub(super) fn classify(
             from_collation,
             to_collation,
             ..
-        } => (column(uid)
-            && (p.risks.contains(&RiskClass::Narrowing)
-                || from_collation != to_collation
-                || (from_nullable != to_nullable && entry.writes != *to_nullable))
+        } => (((column(uid)
+            && (p.risks.contains(&RiskClass::Narrowing) || from_collation != to_collation))
+            || (from_nullable != to_nullable && nullability(column(uid), *to_nullable)))
             && !supplied_new(uid, cs, sides))
         .then_some(U),
         Change::AlterColumnNullability {
             uid, to_nullable, ..
-        } => (column(uid) && entry.writes != *to_nullable && !supplied_new(uid, cs, sides))
-            .then_some(U),
+        } => (nullability(column(uid), *to_nullable) && !supplied_new(uid, cs, sides)).then_some(U),
         Change::AlterColumnDefault { uid, .. } => {
             write(column(uid) && !supplied_new(uid, cs, sides))
         }
@@ -200,43 +215,43 @@ pub(super) fn classify(
         Change::SetPartitionDefault { .. } => write(hit),
         Change::SetPartitionNotNull {
             column, not_null, ..
-        } => ((named(column) || hit && entry.writes) && entry.writes == *not_null).then_some(U),
+        } => nullability(named(column), !not_null).then_some(U),
         // A dependent restoration can carry the engine's spelling. Compare
         // the logical before/after declarations, never that physical payload.
         Change::SetPrimaryKey { to, .. } => write(
-            hit && to.is_some()
+            write_hit
+                && to.is_some()
                 && before.and_then(|t| t.primary_key.as_ref())
                     != after.and_then(|t| t.primary_key.as_ref()),
         ),
         Change::AddUnique { name, .. } => write(
-            hit && before.and_then(|t| t.unique.get(name))
-                != after.and_then(|t| t.unique.get(name)),
+            write_hit
+                && before.and_then(|t| t.unique.get(name))
+                    != after.and_then(|t| t.unique.get(name)),
         ),
         Change::AddCheck { name, .. } => write(
-            hit && before.and_then(|t| t.checks.get(name))
-                != after.and_then(|t| t.checks.get(name)),
+            write_hit
+                && before.and_then(|t| t.checks.get(name))
+                    != after.and_then(|t| t.checks.get(name)),
         ),
         Change::AddForeignKey {
             name, constraint, ..
         } => {
-            let unchanged = sides
-                .first()
-                .and_then(|s| s.table(table))
-                .and_then(|t| t.foreign_keys.get(name))
-                == sides
-                    .last()
-                    .and_then(|s| s.table(table))
-                    .and_then(|t| t.foreign_keys.get(name));
+            let unchanged = before.and_then(|t| t.foreign_keys.get(name))
+                == after.and_then(|t| t.foreign_keys.get(name));
             write(
                 !unchanged
-                    && (hit
+                    && (write_hit
                         || sides.iter().any(|s| {
-                            s.ids.table_uid(&constraint.references_table) == entry.table()
+                            s.ids
+                                .table_uid(&constraint.references_table)
+                                .is_some_and(|uid| written.is_some_and(|set| set.contains(uid)))
                         })),
             )
         }
         Change::AddIndex { name, index, .. } => write(
-            hit && index.unique
+            write_hit
+                && index.unique
                 && before.and_then(|t| t.indexes.get(name))
                     != after.and_then(|t| t.indexes.get(name)),
         ),

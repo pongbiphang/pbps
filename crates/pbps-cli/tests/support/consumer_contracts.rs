@@ -166,25 +166,63 @@ fn consumer_contracts_writes_have_their_own_unproven_rule_and_default_exception(
     refused(&d, "consumer.unproven", &["plan"]);
 }
 
+#[test]
+fn consumer_contracts_suppressions_do_not_spill_between_unrelated_written_tables() {
+    let d = Demo::new("consumer-suppression-roots");
+    table(&d, "  old: {type: integer}\n");
+    let second = d.dir.join("schema/second.yml");
+    let declaration = "table: app.second\ncolumns:\n  old: {type: integer}\n";
+    std::fs::write(&second, declaration).unwrap();
+    ok(d.run(&["plan"]));
+    d.commit();
+    let contracts = "consumers:\n  writer: {writes: [app.t.old, app.second.old]}\npolicies:\n  suppress:\n    - {rule: consumer.unproven, on: app.second.old, reason: reviewed exception, until: '2099-01-01'}\n";
+    config(&d, contracts);
+    std::fs::write(second, format!("{declaration}checks:\n  ck: old > 0\n")).unwrap();
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("consumer.unproven"));
+    config(&d, &contracts.replace("2099-01-01", "2020-01-01"));
+    let json = refused(&d, "consumer.unproven", &["plan"]);
+    let findings: Vec<_> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "consumer.unproven")
+        .collect();
+    assert_eq!(findings.len(), 1, "{json}");
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("consumers.writer.writes: app.second.old")
+    );
+}
+
 /// Called by one owned-database case on MSSQL and both supported PG engines.
 pub(super) fn live(server: &str, pg: bool) {
     let own = OwnDatabase::new(server, "consumer2398");
     let connection = own.connection();
     on_server(connection, "CREATE SCHEMA app");
     let d = Demo::new("consumer-connected");
-    d.table("table: app.t\ncolumns:\n  old: {type: varchar(50)}\nchecks:\n  ck: old <> ''\n");
+    d.table("table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer}\nchecks:\n  ck: old <> ''\n");
+    std::fs::write(
+        d.dir.join("schema/restored.yml"),
+        format!("view: app.restored\ndescription: consumer report\n{}definition: SELECT old FROM app.t\n",
+            if pg { "" } else { "schemabinding: true\n" }),
+    ).unwrap();
     ok(d.run(&["plan"]));
     d.commit();
     ok(d.run(&["bootstrap", "--db", connection]));
-    let contracts = "consumers:\n  billing-v41: {writes: [app.t]}\n";
+    let contracts = "consumers:\n  billing-v41: {uses: [app.restored], writes: [app.t.old]}\n";
     config(&d, contracts);
-    d.table("table: app.t\ncolumns:\n  old: {type: varchar(100)}\nchecks:\n  ck: old <> ''\n");
+    d.table("table: app.t\ncolumns:\n  old: {type: varchar(100)}\n  other: {type: integer}\nchecks:\n  ck: old <> ''\n");
     ok(d.run(&["plan", "--db", connection]));
     for declaration in [
-        "table: app.t\ncolumns:\n  old: {type: varchar(50), nullable: false}\n",
-        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nchecks:\n  ck: old <> 'blocked'\n",
-        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nunique:\n  uq: [old]\n",
-        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nindexes:\n  ux: {columns: [old], unique: true}\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer, nullable: false}\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: bigint, nullable: false}\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer}\nchecks:\n  ck: old <> 'blocked'\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer}\nunique:\n  uq: [other]\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer}\nindexes:\n  ux: {columns: [other], unique: true}\n",
     ] {
         d.table(declaration);
         refused(&d, "consumer.unproven", &["plan", "--db", connection]);
@@ -194,12 +232,16 @@ pub(super) fn live(server: &str, pg: bool) {
     }
     // Seal before adding a contract that would refuse the same plan now.
     config(&d, "");
-    table(&d, "  old: {type: varchar(50), nullable: false}\n");
+    table(
+        &d,
+        "  old: {type: varchar(50), nullable: false}\n  other: {type: integer}\n",
+    );
     let plan = d.dir.join("sealed.json");
     ok(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
     let checksum = plan_checksum(&plan);
     config(&d, contracts);
     refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    // Restoring the bound view keeps the ordinary destructive approval gate.
     ok(d.run(&[
         "apply",
         "--db",
@@ -209,9 +251,39 @@ pub(super) fn live(server: &str, pg: bool) {
         "--checksum",
         &checksum,
         "--allow",
-        "not-null",
+        "destructive,not-null",
     ]));
     ok(d.run(&["verify", "--db", connection]));
+    if pg {
+        let own = OwnDatabase::new(server, "consumer_partitions2398");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("consumer-partitions");
+        let parent = "table: app.t\ncolumns:\n  old: {type: integer}\npartition_by: [old]\npartitions:\n  leaf: {from: [0], to: [10]}\n";
+        d.table(parent);
+        let unrelated = d.dir.join("schema/unrelated.yml");
+        let other = "table: app.unrelated\ncolumns:\n  old: {type: integer}\n";
+        std::fs::write(&unrelated, other).unwrap();
+        ok(d.run(&["plan"]));
+        d.commit();
+        ok(d.run(&["bootstrap", "--db", connection]));
+        config(&d, "consumers:\n  writer: {writes: [app.leaf]}\n");
+        d.table(&format!("{parent}checks:\n  ck: old >= 0\n"));
+        refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+        config(&d, "");
+        ok(d.run(&["plan", "--db", connection]));
+        config(&d, "consumers:\n  writer: {writes: [app.leaf]}\n");
+        d.table(parent);
+        std::fs::write(&unrelated, format!("{other}checks:\n  ck: old >= 0\n")).unwrap();
+        ok(d.run(&["plan", "--db", connection]));
+        d.table(&parent.replace(
+            "  old: {type: integer}\n",
+            "  old: {type: integer}\n  added: {type: integer, nullable: false, default: '0'}\n",
+        ));
+        ok(d.run(&["plan"]));
+        d.commit();
+        ok(d.run(&["plan", "--db", connection]));
+    }
     // A view-column removal and a routine-interface change are opaque, not safe.
     let d = Demo::new("consumer-modules");
     table(&d, "  old: {type: integer}\n");

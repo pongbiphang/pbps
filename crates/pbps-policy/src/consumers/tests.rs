@@ -297,10 +297,12 @@ fn module_changes_are_unproven_but_an_identical_restoration_is_compatible() {
         id: m.clone(),
         kind: ModuleKind::View,
     };
+    let mut described = s.clone();
+    described.modules.get_mut(&m).unwrap().description = Some("consumer report".into());
     assert!(
         findings(
             &s,
-            &s,
+            &described,
             &ids(),
             &ids(),
             &consumers("app.v", false),
@@ -613,4 +615,217 @@ fn punctuation_does_not_hide_a_declared_relation_or_an_ambiguous_routine() {
             && errors[0].contains("module app.f(integer)"),
         "{errors:?}"
     );
+}
+
+#[test]
+fn written_tables_include_sibling_columns_but_not_unrelated_tables() {
+    let mut before = schema();
+    let mut i = ids();
+    before
+        .tables
+        .get_mut(&name())
+        .unwrap()
+        .columns
+        .insert("other".into(), Column::new(ColumnType::simple("integer")));
+    let unrelated: TableName = "app.unrelated".parse().unwrap();
+    before
+        .tables
+        .insert(unrelated.clone(), before.tables[&name()].clone());
+    i.tables.insert(uid("t_bbbbbb"), unrelated.clone());
+    i.columns.insert(uid("c_bbbbbb"), name().column("other"));
+    i.columns.insert(uid("c_cccccc"), unrelated.column("other"));
+    for (table, column_uid, expected) in [
+        (name(), uid("c_bbbbbb"), 1),
+        (unrelated, uid("c_cccccc"), 0),
+    ] {
+        for folded in [false, true] {
+            let mut after = before.clone();
+            let column = after
+                .tables
+                .get_mut(&table)
+                .unwrap()
+                .columns
+                .get_mut("other")
+                .unwrap();
+            column.nullable = false;
+            let change = if folded {
+                column.ty = ColumnType::simple("bigint");
+                Change::AlterColumnType {
+                    uid: column_uid.clone(),
+                    column: table.column("other"),
+                    from: ColumnType::simple("integer"),
+                    to: column.ty.clone(),
+                    from_nullable: true,
+                    to_nullable: false,
+                    from_collation: None,
+                    to_collation: None,
+                    through_external_partitions: false,
+                    using: None,
+                }
+            } else {
+                Change::AlterColumnNullability {
+                    uid: column_uid.clone(),
+                    column: table.column("other"),
+                    ty: column.ty.clone(),
+                    to_nullable: false,
+                    collation: None,
+                    through_external_partitions: false,
+                }
+            };
+            let f = findings(
+                &before,
+                &after,
+                &i,
+                &i,
+                &consumers("app.t.old", true),
+                vec![change],
+            );
+            assert_eq!(f.len(), expected, "folded={folded}, table={table:?}: {f:?}");
+            assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));
+        }
+    }
+}
+
+#[test]
+fn written_tables_include_the_whole_partition_tree_by_uid() {
+    let mut before = schema();
+    let mut i = ids();
+    let branch: TableName = "app.branch".parse().unwrap();
+    let leaf: TableName = "app.leaf".parse().unwrap();
+    let sibling: TableName = "app.sibling".parse().unwrap();
+    let unrelated: TableName = "app.unrelated".parse().unwrap();
+    before.tables.get_mut(&name()).unwrap().partition_by = Some(pbps_model::PartitionBy {
+        strategy: Default::default(),
+        columns: vec!["old".into()],
+        external: false,
+    });
+    for (child, parent, id) in [
+        (branch.clone(), name(), "t_bbbbbb"),
+        (leaf.clone(), branch.clone(), "t_cccccc"),
+        (sibling.clone(), name(), "t_dddddd"),
+    ] {
+        let mut shape = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent,
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        if child == branch {
+            shape.partition_by = before.tables[&name()].partition_by.clone();
+        }
+        before.tables.insert(child.clone(), shape);
+        i.tables.insert(uid(id), child);
+    }
+    before
+        .tables
+        .insert(unrelated.clone(), before.tables[&name()].clone());
+    i.tables.insert(uid("t_eeeeee"), unrelated.clone());
+    for table in [name(), leaf, sibling, unrelated.clone()] {
+        let mut after = before.clone();
+        let constraint = pbps_model::CheckConstraint {
+            expression: "old > 0".into(),
+        };
+        after
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .checks
+            .insert("ck".into(), constraint.clone());
+        let change = Change::AddCheck {
+            table: table.clone(),
+            name: "ck".into(),
+            constraint,
+        };
+        for entry in ["app.leaf", "app.branch.old", "app.t"] {
+            let f = findings(
+                &before,
+                &after,
+                &i,
+                &i,
+                &consumers(entry, true),
+                vec![change.clone()],
+            );
+            assert_eq!(
+                f.len(),
+                usize::from(table != unrelated),
+                "entry={entry}, table={table:?}: {f:?}"
+            );
+            assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));
+            assert!(
+                findings(
+                    &after,
+                    &after,
+                    &i,
+                    &i,
+                    &consumers(entry, true),
+                    vec![change.clone()]
+                )
+                .is_empty(),
+                "an unchanged inherited constraint restoration is compatible"
+            );
+        }
+    }
+}
+
+#[test]
+fn unrelated_write_entries_keep_their_own_findings_and_suppressions() {
+    let mut before = schema();
+    let mut i = ids();
+    let second: TableName = "app.second".parse().unwrap();
+    before
+        .tables
+        .insert(second.clone(), before.tables[&name()].clone());
+    i.tables.insert(uid("t_bbbbbb"), second.clone());
+    i.columns.insert(uid("c_bbbbbb"), second.column("old"));
+    let mut after = before.clone();
+    let constraint = pbps_model::CheckConstraint {
+        expression: "old > 0".into(),
+    };
+    after
+        .tables
+        .get_mut(&second)
+        .unwrap()
+        .checks
+        .insert("ck".into(), constraint.clone());
+    let mut consumers = consumers("app.t.old", true);
+    consumers
+        .get_mut("billing-v41")
+        .unwrap()
+        .writes
+        .push("app.second.old".into());
+    let sides = [
+        Side {
+            schema: &before,
+            ids: &i,
+        },
+        Side {
+            schema: &after,
+            ids: &i,
+        },
+    ];
+    let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
+    let cs = ChangeSet {
+        changes: vec![PlannedChange::new(Change::AddCheck {
+            table: second,
+            name: "ck".into(),
+            constraint,
+        })],
+    };
+    let mut policies = Policies::default();
+    let f = plan(&cs, &bound, &sides, &policies, &context());
+    assert_eq!(f.len(), 1, "only the second entry is affected: {f:?}");
+    assert!(
+        f[0].1
+            .message
+            .contains("consumers.billing-v41.writes: app.second.old")
+    );
+    policies.suppress.push(crate::Suppression {
+        rule: "consumer.unproven".into(),
+        on: Some("app.second.old".into()),
+        reason: "reviewed compatibility exception".into(),
+        until: Some("2099-01-01".into()),
+    });
+    assert!(plan(&cs, &bound, &sides, &policies, &context()).is_empty());
 }

@@ -2928,7 +2928,8 @@ pub trait Dialect {
     /// SPEC §7.6's promise and cannot be predicted by a lexical normalizer.
     /// Unchanged modules still compare two catalog reads exactly.
     fn module_matches_declaration(&self, wrote: &Module, now: &Module) -> bool {
-        wrote == now
+        // Descriptions belong to declarations; introspection does not keep them.
+        wrote.kind == now.kind && wrote.options == now.options && wrote.definition == now.definition
     }
 
     /// The definition with everything that is not code blanked out, by this
@@ -4981,6 +4982,27 @@ mod tests {
             MinimalDialect.change_risks(&retype(None)),
             [RiskClass::TypeRebuild].into()
         );
+    }
+
+    #[test]
+    fn module_documentation_is_not_a_written_definition_but_body_and_options_are() {
+        let wrote = Module {
+            kind: ModuleKind::View,
+            description: Some("consumer report".into()),
+            options: Default::default(),
+            definition: "SELECT old FROM app.t".into(),
+        };
+        let mut read = wrote.clone();
+        read.description = None;
+        assert!(MinimalDialect.module_matches_declaration(&wrote, &read));
+        read.definition = "SELECT 1".into();
+        assert!(!MinimalDialect.module_matches_declaration(&wrote, &read));
+        read.definition = wrote.definition.clone();
+        read.options.schemabinding = true;
+        assert!(!MinimalDialect.module_matches_declaration(&wrote, &read));
+        read.options = wrote.options.clone();
+        read.kind = ModuleKind::Procedure;
+        assert!(!MinimalDialect.module_matches_declaration(&wrote, &read));
     }
 
     /// Producers render each value once; error display preserves the prose.

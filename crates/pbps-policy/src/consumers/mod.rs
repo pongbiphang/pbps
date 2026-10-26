@@ -5,8 +5,8 @@ mod changes;
 
 use crate::{Context, Policies, evaluate::Live};
 pub use binding::Bindings;
-use pbps_model::{ChangeSet, Finding, IdsFile, ModuleId, Schema};
-use std::collections::BTreeMap;
+use pbps_model::{ChangeSet, Finding, IdsFile, ModuleId, Schema, Uid};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Consumers = BTreeMap<String, Consumer>;
 
@@ -72,6 +72,51 @@ impl Bindings {
     }
 }
 
+// Column writes are table writes. Cache each written UID's whole partition
+// tree once, retaining its seed so unrelated entries do not share suppressions.
+fn written_tables(bound: &Bindings, sides: &[Side<'_>]) -> BTreeMap<Uid, BTreeSet<Uid>> {
+    let mut links: BTreeMap<Uid, BTreeSet<Uid>> = BTreeMap::new();
+    for side in sides {
+        for (name, table) in &side.schema.tables {
+            if let Some(of) = &table.partition_of
+                && let (Some(child), Some(parent)) =
+                    (side.ids.table_uid(name), side.ids.table_uid(&of.parent))
+            {
+                links
+                    .entry(child.clone())
+                    .or_default()
+                    .insert(parent.clone());
+                links
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(child.clone());
+            }
+        }
+    }
+    let mut written: BTreeMap<Uid, BTreeSet<Uid>> = BTreeMap::new();
+    for entry in &bound.0 {
+        if entry.writes
+            && let Some(table) = entry.table()
+        {
+            written
+                .entry(table.clone())
+                .or_default()
+                .insert(table.clone());
+        }
+    }
+    for tables in written.values_mut() {
+        let mut pending: Vec<_> = tables.iter().cloned().collect();
+        while let Some(table) = pending.pop() {
+            for neighbor in links.get(&table).into_iter().flatten() {
+                if tables.insert(neighbor.clone()) {
+                    pending.push(neighbor.clone());
+                }
+            }
+        }
+    }
+    written
+}
+
 pub fn plan(
     cs: &ChangeSet,
     bound: &Bindings,
@@ -80,6 +125,7 @@ pub fn plan(
     ctx: &Context,
 ) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
+    let written = written_tables(bound, sides);
     let mut tables: BTreeMap<_, _> = sides
         .first()
         .into_iter()
@@ -104,7 +150,14 @@ pub fn plan(
             })
         };
         for entry in &bound.0 {
-            let Some(class) = changes::classify(p, entry, table, cs, sides) else {
+            let Some(class) = changes::classify(
+                p,
+                entry,
+                table,
+                entry.table().and_then(|uid| written.get(uid)),
+                cs,
+                sides,
+            ) else {
                 continue;
             };
             let Some(live) = Live::of(policies, class.id(), ctx) else {
