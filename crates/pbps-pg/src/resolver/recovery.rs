@@ -31,6 +31,11 @@
 //! object the run creates, whose comment carries the token and the state the
 //! release needs to restore. Creating it is the arbitration between two runs
 //! that start together.
+//!
+//! Cleaning a dead claim is not covered by that: two runs can read the same
+//! one, and the second's cleanup would empty the first's objects. The
+//! database lock ([`lock`]) is held from before the claim is read to the
+//! moment the run's own is made.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -152,6 +157,64 @@ pub async fn alive(
         sessions.insert(token);
     }
     Ok(own_seen.then_some(sessions))
+}
+
+/// The advisory lock that serialises runs in one supplied database: a pair of
+/// integers, `"pbps"` and the issue that introduced it. An advisory lock is
+/// private to the database it is taken in, which is why #2410 rejected it for
+/// what is cluster-wide (liveness) and is the scope this needs.
+pub const LOCK: (i32, i32) = (0x7062_7073, 2410);
+
+/// Why the database lock could not be taken.
+#[derive(Debug)]
+pub enum LockError {
+    /// Another run held it for the whole wait.
+    Busy,
+    Db(DbError),
+}
+
+/// How long a run waits for the lock before it refuses. The holder is a run
+/// between its start and its claim, or one cleaning a dead claim.
+const LOCK_WAIT: &str = "60s";
+
+/// Takes the lock, or gives up after [`LOCK_WAIT`]. Session-level: it
+/// outlives the transaction it is asked in, and a session that ends releases
+/// it. `lock_timeout` is local to that transaction, so the session's own
+/// settings are not touched.
+pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<(), LockError> {
+    let (class, object) = LOCK;
+    conn.execute("BEGIN").await.map_err(LockError::Db)?;
+    let taken = async {
+        conn.execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
+            .await?;
+        conn.execute(&format!(
+            "SELECT pg_catalog.pg_advisory_lock({class}, {object})"
+        ))
+        .await
+    }
+    .await;
+    match taken {
+        Ok(()) => conn.execute("COMMIT").await.map_err(LockError::Db),
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK").await;
+            // lock_not_available
+            if error.server_error_code().as_deref() == Some("55P03") {
+                Err(LockError::Busy)
+            } else {
+                Err(LockError::Db(error))
+            }
+        }
+    }
+}
+
+/// Releases the lock this session holds. A session that never held it, or
+/// lost it, has nothing to release.
+pub async fn unlock(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    let (class, object) = LOCK;
+    conn.execute(&format!(
+        "SELECT pg_catalog.pg_advisory_unlock({class}, {object})"
+    ))
+    .await
 }
 
 /// What a supplied run records in its database before it creates anything

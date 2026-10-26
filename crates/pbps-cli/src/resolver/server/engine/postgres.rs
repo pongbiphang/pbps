@@ -181,6 +181,10 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     /// stays open for the run (#2410).
     token: String,
     created: Created,
+    /// Whether this session holds the supplied database's lock, taken before
+    /// the claim is read and released once the run's own claim is made, or on
+    /// any error before (`recovery`).
+    holds_lock: bool,
 }
 
 /// The scratch side, provisioned and qualified: the session the declarations
@@ -407,12 +411,13 @@ impl Scratch<'_> {
         // and the state its release puts back. A run killed after this is
         // found and cleaned by the next one (`recovery`, #2410); two runs
         // that start together cannot both make it.
-        record::claim(
+        let claimed = record::claim(
             admin,
             &record::Claim::new(&self.token, defaults.clone(), acl.clone()),
         )
-        .await
-        .map_err(|error| match error {
+        .await;
+        self.unlock_database(admin).await;
+        claimed.map_err(|error| match error {
             record::ClaimError::Taken => Error::Unusable(
                 "another run claimed the scratch database first; wait for it to finish, or \
                  use another scratch database"
@@ -1472,6 +1477,7 @@ pub(super) async fn scratch<'a>(
             provenance,
             token: tokens.scratch.clone(),
             created: Created::Nothing,
+            holds_lock: false,
         },
     ))
 }
@@ -1497,9 +1503,16 @@ impl Scratch<'_> {
                     .await
             }
             Provisioning::Supplied => {
-                self.recover_supplied(admin).await?;
-                self.supplied(admin, authorization, scope_schemas, fill)
-                    .await
+                let prepared = async {
+                    self.recover_supplied(admin).await?;
+                    self.supplied(admin, authorization, scope_schemas, fill)
+                        .await
+                }
+                .await;
+                // Released right after the claim; this ends every error
+                // before it.
+                self.unlock_database(admin).await;
+                prepared
             }
         }
     }

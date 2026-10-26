@@ -2249,7 +2249,9 @@ DEC-1674.1).**
       state its release restores; creating it settles which of two runs that
       start together has the database. A claim whose run is gone is cleaned
       as a release cleans; a claim whose run is alive refuses the new run,
-      naming it; a non-empty database with no claim is never touched.
+      naming it; a non-empty database with no claim is never touched. A run
+      holds an advisory lock in that database from before it reads the claim
+      until its own is made, so two runs never clean one dead claim at once.
       - A leftover that cannot be removed does not stop the run. It is a
         warning (a finding, `scratch.leftover`, in `--format json`) naming
         the resource, why, and the statement that removes it. A database

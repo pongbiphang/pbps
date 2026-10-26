@@ -194,6 +194,33 @@ impl Scratch<'_> {
         recovery::emit(&recovery::sweep(&mut cluster).await);
     }
 
+    async fn lock_database(&mut self, admin: &mut Conn) -> Result<(), Error> {
+        match record::lock(admin).await {
+            Ok(()) => {
+                self.holds_lock = true;
+                Ok(())
+            }
+            Err(record::LockError::Busy) => Err(Error::Unusable(
+                "another run has been starting in the scratch database, or cleaning what a \
+                 killed run left in it, for over a minute; wait for it, or use another \
+                 scratch database"
+                    .into(),
+            )),
+            Err(record::LockError::Db(error)) => {
+                Err(Error::Read(format!("the scratch database's lock: {error}")))
+            }
+        }
+    }
+
+    /// Releases the lock if this session holds it. Never fails the run: a
+    /// session that ends releases it anyway.
+    pub(super) async fn unlock_database(&mut self, admin: &mut Conn) {
+        if std::mem::take(&mut self.holds_lock) {
+            let _ = admin.execute("ROLLBACK").await;
+            let _ = record::unlock(admin).await;
+        }
+    }
+
     /// What a run killed in the supplied database left: refuses when the
     /// claim's run is still running, cleans it when that run is gone. A
     /// database that holds objects but no claim is not touched here, and the
@@ -211,6 +238,11 @@ impl Scratch<'_> {
         {
             return Ok(());
         }
+        // Before the claim is read, and held until this run's own claim is
+        // made: two runs that read the same dead claim would each clean it,
+        // and the second's cleanup would empty what the first, now live, had
+        // made. The late one waits here, then finds the first's claim.
+        self.lock_database(admin).await?;
         let claim = match record::read_claim(admin)
             .await
             .map_err(read("the scratch database's claim"))?

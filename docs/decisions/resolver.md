@@ -4687,6 +4687,13 @@ decide the design, each measured on PostgreSQL 16 and 18.
   a schema made first and holding the state the release restores
   (`pbps_claim`); the creation is atomic with its comment and is the
   arbitration between two runs. Without a claim, objects are not pbps's.
+- *One recoverer at a time.* Two runs can read the same dead claim; the one
+  that cleans second would empty what the first, now live, made. A run
+  therefore takes a session-level advisory lock in the supplied database
+  before it reads the claim, and holds it until its own claim is made
+  (released explicitly after it and on every error before it; a session that
+  ends releases it anyway). An advisory lock is private to its database,
+  which is why liveness does not use one and why this does.
 - *Keeping is the safe error.* The sweep never forces: `DROP DATABASE`
   refuses while a session is connected (`being accessed by other users`), so
   a wrong decision still cannot close a live run's connection. A removal that

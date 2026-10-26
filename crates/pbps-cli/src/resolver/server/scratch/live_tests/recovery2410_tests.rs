@@ -748,6 +748,116 @@ async fn two_runs_that_start_together_cannot_both_claim_the_database() {
     }
 }
 
+/// How long a test waits for something it expects to happen.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn a_run_that_reads_a_dead_claim_waits_for_the_recovery_in_progress_and_then_refuses() {
+    // Two runs read the same dead claim: the first cleans it and makes its
+    // own claim and objects; the second's cleanup, had it run, would empty
+    // them. The database lock makes the second wait before it reads a claim,
+    // so it finds the first's.
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = fixture.target().await;
+        // No connection limit: two runs of one account are the case.
+        let login = fixture
+            .login("u", "NOSUPERUSER NOCREATEDB NOCREATEROLE")
+            .await;
+        fixture
+            .admin()
+            .await
+            .execute(&format!("GRANT pg_read_all_settings TO {}", login.0))
+            .await
+            .unwrap();
+        let scratch_db = fixture.database("s", Some(&login.0)).await;
+        drop(leave_claimed(&fixture, &scratch_db, &login, &token()).await);
+        let first_token = token();
+        let mut first = Conn::connect_named(
+            Driver::Postgres,
+            &fixture.as_login(&scratch_db, &login),
+            &format!("pbps-{first_token}"),
+        )
+        .await
+        .unwrap();
+        record::lock(&mut first).await.unwrap();
+        let waiting = async {
+            let mut admin = fixture.admin().await;
+            let started = std::time::Instant::now();
+            while started.elapsed() < WAIT {
+                let rows = admin
+                    .query(&format!(
+                        "SELECT 1 FROM pg_catalog.pg_locks l \
+                          WHERE l.locktype = 'advisory' AND NOT l.granted \
+                            AND l.database = (SELECT oid FROM pg_catalog.pg_database \
+                                               WHERE datname = '{scratch_db}')"
+                    ))
+                    .await
+                    .unwrap();
+                if !rows.is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            false
+        };
+        // The first run goes on while the second waits: it cleans the dead
+        // claim, makes its own and its objects, then lets go of the lock.
+        let first_run = async {
+            let blocked = waiting.await;
+            let claim = record::read_claim(&mut first).await.unwrap();
+            if let Some(Ok(dead)) = claim {
+                let backend = sql::backend(&mut first).await.unwrap();
+                let _ = engine::release_supplied(
+                    &mut first,
+                    &backend,
+                    &pbps_pg::resolver::standard::Standard::default(),
+                    &scratch_db,
+                    &dead.defaults,
+                    &dead.acl,
+                )
+                .await;
+            }
+            let defaults = sql::login_defaults(&mut first).await.unwrap();
+            let acl = standard::read_state(&mut first).await.unwrap().acl;
+            let claimed =
+                record::claim(&mut first, &record::Claim::new(&first_token, defaults, acl)).await;
+            let _ = first.execute("CREATE SCHEMA first_runs").await;
+            record::unlock(&mut first).await.unwrap();
+            (blocked, claimed.is_ok())
+        };
+        let second_run = async {
+            produce(
+                &fixture.as_login(&scratch_db, &login),
+                &fixture.on(&target_db),
+                &Inputs::overload(),
+                &ProjectKey::new(true),
+            )
+            .await
+        };
+        let ((blocked, claimed), second) = tokio::join!(first_run, second_run);
+        let kept = (
+            schema_exists(&fixture, &scratch_db, record::CLAIM).await,
+            schema_exists(&fixture, &scratch_db, "first_runs").await,
+        );
+        drop(first);
+        fixture.drop().await;
+        assert!(blocked, "{server}: the second run waited on the lock");
+        assert!(claimed, "{server}: the first run made its claim");
+        let reason = resolver_refusal(second);
+        assert!(
+            reason.contains("in use by a run that is still running"),
+            "{server}: {reason}"
+        );
+        assert_eq!(
+            kept,
+            (true, true),
+            "{server}: the first run's claim and objects survive"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn the_keepers_settings_survive_the_two_places_that_reset_a_session() {
