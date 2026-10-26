@@ -13,7 +13,7 @@ use super::super::{Error, ProduceError, engine};
 
 mod recovery;
 #[cfg(test)]
-pub(super) use recovery::{Keeper, seen, swept};
+pub(super) use recovery::{Keeper, seen, swept, swept_alone};
 mod startup;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};

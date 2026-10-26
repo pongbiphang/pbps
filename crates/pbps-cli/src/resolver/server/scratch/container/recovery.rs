@@ -35,7 +35,6 @@ use pbps_db::{Conn, Driver};
 
 use super::super::super::engine;
 use super::super::recovery::{self, Adapter, Failed, Liveness, Resource};
-#[cfg(not(test))]
 use super::READY;
 use super::{docker, remove_named};
 
@@ -47,12 +46,10 @@ pub(super) const ENGINE: &str = "pbps.resolver.engine";
 
 /// How old a running container with no keeper that never had one must be
 /// before it is taken as dead: the run's readiness deadline, and two minutes.
-#[cfg(not(test))]
+/// Tests sweep under it too: test runs share one daemon with other shards,
+/// and a shorter grace removed a loaded SQL Server container that had not yet
+/// connected its keeper.
 const GRACE: Duration = Duration::from_secs(READY.as_secs() + 120);
-// Longer than a loaded daemon takes to start a server, which the tests'
-// containers must not be older than when first swept.
-#[cfg(test)]
-const GRACE: Duration = Duration::from_secs(20);
 
 /// How long one probe of a candidate's server may take.
 const PROBE: Duration = Duration::from_secs(15);
@@ -138,8 +135,9 @@ fn verdict(
     state: &State,
     seen: Option<Result<Option<Kept>, String>>,
     age: Option<i64>,
+    grace: Duration,
 ) -> Liveness {
-    let grace = GRACE.as_secs() as i64;
+    let grace = grace.as_secs() as i64;
     match state.status.as_str() {
         // A server that is not running serves no run.
         "exited" | "dead" => Liveness::Dead,
@@ -173,11 +171,19 @@ fn verdict(
 /// The scratch containers on the runner, other than this run's.
 pub(super) struct Containers<'a> {
     own: &'a str,
+    grace: Duration,
+    /// The one run whose container is judged, when a test confines a sweep
+    /// to its own.
+    only: Option<&'a str>,
 }
 
 impl<'a> Containers<'a> {
     pub(super) fn new(own: &'a str) -> Self {
-        Self { own }
+        Self {
+            own,
+            grace: GRACE,
+            only: None,
+        }
     }
 
     async fn state(&self, name: &str) -> Result<State, String> {
@@ -269,7 +275,11 @@ impl Adapter for Containers<'_> {
             &format!("{{{{.Names}}}} {{{{.Label \"{TOKEN}\"}}}}"),
         ])
         .await?;
-        Ok(parse_listing(&listing, self.own))
+        let mut found = parse_listing(&listing, self.own);
+        if let Some(only) = self.only {
+            found.retain(|token, _| token == only);
+        }
+        Ok(found)
     }
 
     async fn liveness(&mut self, tokens: &[String]) -> Result<BTreeMap<String, Liveness>, String> {
@@ -298,7 +308,7 @@ impl Adapter for Containers<'_> {
                     } else {
                         None
                     };
-                    verdict(&state, seen, age)
+                    verdict(&state, seen, age, self.grace)
                 }
             };
             lives.insert(token.clone(), live);
@@ -367,6 +377,21 @@ pub(in crate::resolver::server::scratch) async fn seen(
 #[cfg(test)]
 pub(in crate::resolver::server::scratch) async fn swept(own: &str) -> recovery::Report {
     recovery::sweep(&mut Containers::new(own)).await
+}
+
+/// The sweep of `token`'s container alone, under `grace`, so that a test can
+/// cross a short grace without judging the containers of runs it shares the
+/// daemon with.
+#[cfg(test)]
+pub(in crate::resolver::server::scratch) async fn swept_alone(
+    own: &str,
+    token: &str,
+    grace: Duration,
+) -> recovery::Report {
+    let mut containers = Containers::new(own);
+    containers.grace = grace;
+    containers.only = Some(token);
+    recovery::sweep(&mut containers).await
 }
 
 #[cfg(test)]
@@ -444,48 +469,51 @@ mod tests {
         let old = Some(GRACE.as_secs() as i64 + 1);
         let young = Some(1);
         // A server that is not running serves no run.
-        assert_eq!(verdict(&state("exited"), None, None), Liveness::Dead);
-        assert_eq!(verdict(&state("dead"), None, None), Liveness::Dead);
+        assert_eq!(verdict(&state("exited"), None, None, GRACE), Liveness::Dead);
+        assert_eq!(verdict(&state("dead"), None, None, GRACE), Liveness::Dead);
         // Its keeper is there.
         assert_eq!(
-            verdict(&state("running"), seen(true, true), old),
+            verdict(&state("running"), seen(true, true), old, GRACE),
             Liveness::Alive
         );
         // It connected once and is gone: dead at once, however young.
         assert_eq!(
-            verdict(&state("running"), seen(false, true), young),
+            verdict(&state("running"), seen(false, true), young, GRACE),
             Liveness::Dead
         );
         // It never connected: presumed its run's until the grace has passed.
         assert_eq!(
-            verdict(&state("running"), seen(false, false), young),
+            verdict(&state("running"), seen(false, false), young, GRACE),
             Liveness::Alive
         );
         assert_eq!(
-            verdict(&state("running"), seen(false, false), old),
+            verdict(&state("running"), seen(false, false), old, GRACE),
             Liveness::Dead
         );
         // Its age cannot be read: not judged, and named.
         assert!(matches!(
-            verdict(&state("running"), seen(false, false), None),
+            verdict(&state("running"), seen(false, false), None, GRACE),
             Liveness::Unprovable(_)
         ));
         // A server this run cannot read, or reads blind, is not judged.
         for unread in [Some(Err("refused".to_owned())), Some(Ok(None)), None] {
             assert!(
                 matches!(
-                    verdict(&state("running"), unread, old),
+                    verdict(&state("running"), unread, old, GRACE),
                     Liveness::Unprovable(_)
                 ),
                 "unread servers are kept"
             );
         }
         // Never started, past the grace.
-        assert_eq!(verdict(&state("created"), None, old), Liveness::Dead);
-        assert_eq!(verdict(&state("created"), None, young), Liveness::Alive);
+        assert_eq!(verdict(&state("created"), None, old, GRACE), Liveness::Dead);
+        assert_eq!(
+            verdict(&state("created"), None, young, GRACE),
+            Liveness::Alive
+        );
         // Anything else is not judged.
         assert!(matches!(
-            verdict(&state("paused"), seen(false, true), old),
+            verdict(&state("paused"), seen(false, true), old, GRACE),
             Liveness::Unprovable(_)
         ));
     }

@@ -6,7 +6,7 @@
 //! `tests/flow_pg.rs`. The grace for a container that never had a keeper is
 //! twenty seconds here, not five minutes.
 
-use super::super::container::{Keeper, swept};
+use super::super::container::{Keeper, swept, swept_alone};
 use super::setting;
 use crate::resolver::server::engine;
 use pbps_db::resolver::Kept;
@@ -14,7 +14,8 @@ use pbps_db::{Conn, Driver};
 use std::process::Command;
 use std::time::Duration;
 
-/// The grace the tests run under (`container::recovery::GRACE`).
+/// The grace the tests that cross it sweep their own container under, with
+/// `swept_alone`. Every other sweep keeps the run's own grace.
 const GRACE: Duration = Duration::from_secs(20);
 
 fn token() -> String {
@@ -211,10 +212,10 @@ async fn a_container_that_never_connected_is_kept_inside_the_grace_and_removed_a
     let mut made = Made(Vec::new());
     let dead = token();
     let (name, _) = start(&mut made, &dead).await;
-    let inside = swept(&token()).await;
+    let inside = swept_alone(&token(), &dead, GRACE).await;
     let kept = exists(&name);
     tokio::time::sleep(GRACE + Duration::from_millis(1500)).await;
-    let after = swept(&token()).await;
+    let after = swept_alone(&token(), &dead, GRACE).await;
     let gone = !exists(&name);
     assert!(kept, "a run that has not connected yet may still");
     assert!(
@@ -223,6 +224,10 @@ async fn a_container_that_never_connected_is_kept_inside_the_grace_and_removed_a
     );
     assert!(gone, "removed after the grace: {after:?}");
     assert!(!alive(&after, &dead), "{after:?}");
+    assert!(
+        after.groups.iter().all(|group| group.token == dead),
+        "a confined sweep judges no other run's container: {after:?}"
+    );
 }
 
 #[tokio::test]
@@ -235,7 +240,7 @@ async fn a_live_runs_container_is_never_touched_even_past_the_grace() {
         .await
         .unwrap();
     tokio::time::sleep(GRACE + Duration::from_millis(1500)).await;
-    let report = swept(&token()).await;
+    let report = swept_alone(&token(), &live, GRACE).await;
     let kept = exists(&name);
     drop(keeper);
     assert!(kept, "its keeper is in the server");
