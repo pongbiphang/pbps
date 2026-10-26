@@ -301,6 +301,7 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         }
 
         Change::AddEnumValue { name, .. }
+        | Change::AlterDomain { name, .. }
         | Change::RenameEnumValue { name, .. }
         | Change::EnumRebuild { name, .. }
         | Change::CreateType { name, .. }
@@ -5285,7 +5286,34 @@ mod enum_label_tests {
             ordinal: 0,
             definition,
         };
-        for step in [add, rename] {
+        let domain = |checks: bool| {
+            Box::new(pbps_model::ManagedType::Domain {
+                base: "text".parse().unwrap(),
+                not_null: false,
+                default: None,
+                checks: if checks {
+                    [("c".into(), "VALUE <> ''".to_owned())].into()
+                } else {
+                    Default::default()
+                },
+                collation: None,
+            })
+        };
+        // A domain alteration is a declared-type change like the others: this
+        // dialect holds none (DEC-1635.8).
+        let alter = |half| Change::AlterDomain {
+            uid: "y_000002".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            from: domain(false),
+            to: domain(true),
+            half,
+        };
+        for step in [
+            add,
+            rename,
+            alter(pbps_model::DomainHalf::Loosen),
+            alter(pbps_model::DomainHalf::Tighten),
+        ] {
             let error = emit(&step, Strategy::default()).unwrap_err().to_string();
             assert!(error.contains("app.e"), "{error}");
             assert!(!takes_online(&step));

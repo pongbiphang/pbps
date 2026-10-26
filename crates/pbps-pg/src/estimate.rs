@@ -1044,6 +1044,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }

@@ -320,6 +320,7 @@ impl ResolverEvidence {
                         | Change::Revoke { .. }
                         | Change::PublicExecution { .. }
                         | Change::AddEnumValue { .. }
+                        | Change::AlterDomain { .. }
                         | Change::RenameEnumValue { .. }
                         | Change::EnumRebuild { .. }
                         | Change::CreateType { .. }

@@ -3840,6 +3840,7 @@ name = name.shown(),
         // them by name until it lands. The securable probe the other dialect
         // asks for a schema target belongs with that step, not ahead of it.
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
@@ -4236,6 +4237,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }

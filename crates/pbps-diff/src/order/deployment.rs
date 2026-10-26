@@ -2986,6 +2986,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
     if matches!(
         change,
         Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild {
                 step: pbps_model::EnumRebuildStep::Create { .. }

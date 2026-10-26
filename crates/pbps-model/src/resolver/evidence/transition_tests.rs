@@ -1392,6 +1392,7 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }

@@ -131,6 +131,7 @@ Change::AnalyzeTableTree(a) => TableUse { complete: std::iter::once(&a.parent.na
         | Change::DropPolicy { .. }
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
@@ -619,6 +620,7 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }

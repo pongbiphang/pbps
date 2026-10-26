@@ -342,6 +342,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
             Some(to.clone()),
         )),
         Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }

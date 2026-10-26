@@ -300,6 +300,7 @@ pub(crate) fn planned_schema_grants(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -416,6 +417,7 @@ impl Authorization {
                             | Change::Revoke { .. }
                             | Change::PublicExecution { .. }
                             | Change::AddEnumValue { .. }
+                            | Change::AlterDomain { .. }
                             | Change::RenameEnumValue { .. }
                             | Change::EnumRebuild { .. }
                             | Change::CreateType { .. }

@@ -625,6 +625,14 @@ impl Cx<'_> {
                 self.exists(key.clone());
                 self.rewrites(Resource::Object(key, Incarnation::Final));
             }
+            // Both halves alter a domain that stands and write no instance of
+            // it: a column typed by the domain needs the domain, not a
+            // finished one, so the halves are ordered by their class, a
+            // loosening before the plan's rows and a tightening after them
+            // (DEC-1635.8).
+            Change::AlterDomain { uid, .. } => {
+                self.exists(ObjectKey::Type(Recorded(uid.clone())));
+            }
 
             Change::CreateTable {
                 uid,

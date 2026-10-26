@@ -281,9 +281,9 @@ fn replacement_warnings_name_both_uids_and_preserve_identity_advice() {
         "history does not carry over",
         "original declaration file",
         "renamed_from",
-        "not supported yet",
-        "currently refused",
-        "#1635 slices 3 and 4",
+        "change in place under the same uid",
+        "slice 4a",
+        "slice 4b",
     ] {
         assert!(message.contains(text), "{text}: {message}");
     }

@@ -1334,6 +1334,60 @@
     }
   },
   {
+    "name": "AlterDomain/Loosen",
+    "change": {
+      "op": "alter_domain",
+      "uid": "y_aaaaaa",
+      "name": "app.d",
+      "from": {
+        "kind": "domain",
+        "base": "text",
+        "not_null": false,
+        "default": null,
+        "checks": {},
+        "collation": null
+      },
+      "to": {
+        "kind": "domain",
+        "base": "text",
+        "not_null": true,
+        "default": null,
+        "checks": {
+          "c": "VALUE <> ''"
+        },
+        "collation": null
+      },
+      "half": "loosen"
+    }
+  },
+  {
+    "name": "AlterDomain/Tighten",
+    "change": {
+      "op": "alter_domain",
+      "uid": "y_aaaaaa",
+      "name": "app.d",
+      "from": {
+        "kind": "domain",
+        "base": "text",
+        "not_null": false,
+        "default": null,
+        "checks": {},
+        "collation": null
+      },
+      "to": {
+        "kind": "domain",
+        "base": "text",
+        "not_null": true,
+        "default": null,
+        "checks": {
+          "c": "VALUE <> ''"
+        },
+        "collation": null
+      },
+      "half": "tighten"
+    }
+  },
+  {
     "name": "RenameEnumValue",
     "change": {
       "op": "rename_enum_value",

@@ -204,6 +204,15 @@ fn check_definitions(
                 .find(|s| s.uid == pin.uid);
             let (definition, before) = match latest.and_then(|s| s.definition.as_ref()) {
                 Some(definition @ ManagedType::Enum { .. }) => (definition, true),
+                // A domain the plan altered in place is held to the structure
+                // its latest alteration left, its default and checks by
+                // presence, for the reason the catalog text of before the
+                // plan is no longer there to compare (DEC-1635.8).
+                Some(definition @ ManagedType::Domain { .. })
+                    if latest.is_some_and(|s| s.altered) =>
+                {
+                    (definition, false)
+                }
                 _ => match &pin.before {
                     Some(before) => (&before.definition, true),
                     None => (&pin.definition, false),
@@ -234,7 +243,8 @@ fn check_definitions(
                 )));
             }
             if complete
-                && matches!(pin.definition, ManagedType::Enum { .. })
+                && (matches!(pin.definition, ManagedType::Enum { .. })
+                    || latest.is_some_and(|s| s.altered))
                 && !matches_declaration(&pin.definition, actual)
             {
                 return Err(failed(format!(
@@ -329,6 +339,12 @@ pub async fn vet(
                 false,
             )
             .await?;
+            // A check added `NOT VALID` binds its expression and evaluates no
+            // row; the scan that does comes only after the vet above has read
+            // the bound code (DEC-1635.8).
+            if let Some(tail) = &statement.after_vet {
+                conn.execute(tail).await?;
+            }
         }
         None if live.types.contains_key(&statement.name) => {
             return Err(failed(format!(
@@ -386,6 +402,8 @@ mod tests {
             uid: pin.uid.clone(),
             name: name.parse().unwrap(),
             definition: Some(pin.definition.clone()),
+            altered: false,
+            after_vet: None,
         });
         statement
     }
@@ -556,6 +574,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn domain(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
+        ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    /// DEC-1635.8: after an in-place alteration the live domain is held to the
+    /// structure that alteration left (name set, NOT NULL, base, collation),
+    /// and its default and check texts by presence; before any statement it is
+    /// still held to the catalog text of the plan's baseline.
+    #[test]
+    fn an_altered_domain_is_held_to_the_structure_each_alteration_left() {
+        let from = domain(false, None, &[("c1", "(VALUE <> ''::text)")]);
+        let to = domain(
+            true,
+            Some("'a'"),
+            &[("c1", "VALUE <> ''"), ("c2", "length(VALUE) < 9")],
+        );
+        let pin = DeclaredTypePin {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Type, "altered", 0),
+            name: "app.d".parse().unwrap(),
+            definition: to.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: "app.d".parse().unwrap(),
+                definition: from.clone(),
+            }),
+        };
+        let statement = |definition: ManagedType, altered: bool| {
+            let mut statement = pbps_dialect::Statement::new("unused");
+            statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                uid: pin.uid.clone(),
+                name: "app.d".parse().unwrap(),
+                definition: Some(definition),
+                altered,
+                after_vet: None,
+            });
+            statement
+        };
+        let live = |definition: ManagedType| Schema {
+            types: [("app.d".parse().unwrap(), definition)].into(),
+            ..Default::default()
+        };
+        let check = |live: &Schema, complete: bool, executed: &[pbps_dialect::Statement]| {
+            check_definitions(
+                live,
+                std::slice::from_ref(&pin),
+                complete,
+                &Default::default(),
+                executed,
+            )
+        };
+        // Before any statement: the baseline's catalog text, exactly.
+        check(&live(from.clone()), false, &[]).unwrap();
+        assert!(
+            check(
+                &live(domain(false, None, &[("c1", "(VALUE <> 'x'::text)")])),
+                false,
+                &[]
+            )
+            .is_err()
+        );
+        // The loosening half left no default and the one check, as `from`
+        // had it, and NOT NULL still off: held by structure, not by text.
+        let loosened = domain(false, Some("'a'"), &[("c1", "VALUE <> ''")]);
+        let after_loosen = live(domain(
+            false,
+            Some("'a'::text"),
+            &[("c1", "(VALUE <> ''::text)")],
+        ));
+        check(&after_loosen, false, &[statement(loosened.clone(), true)]).unwrap();
+        // Negative: the same live state, from a statement that altered
+        // nothing, is drift from the baseline.
+        assert!(check(&after_loosen, false, &[statement(loosened.clone(), false)]).is_err());
+        // The tightening half left both checks and NOT NULL.
+        let tightened = live(domain(
+            true,
+            Some("'a'::text"),
+            &[("c1", "(VALUE <> ''::text)"), ("c2", "(length(VALUE) < 9)")],
+        ));
+        let executed = [statement(loosened, true), statement(to.clone(), true)];
+        check(&tightened, true, &executed).unwrap();
+        // Negatives, each a structural field: a check missing or extra,
+        // NOT NULL, the default, the base.
+        for wrong in [
+            domain(true, Some("'a'"), &[("c1", "x")]),
+            domain(true, Some("'a'"), &[("c1", "x"), ("c2", "x"), ("c3", "x")]),
+            domain(false, Some("'a'"), &[("c1", "x"), ("c2", "x")]),
+            domain(true, None, &[("c1", "x"), ("c2", "x")]),
+        ] {
+            assert!(
+                check(&live(wrong.clone()), true, &executed).is_err(),
+                "{wrong:?}"
+            );
+            assert!(check(&live(wrong), false, &executed).is_err());
+        }
+        let mut other_base = domain(true, Some("'a'"), &[("c1", "x"), ("c2", "x")]);
+        if let ManagedType::Domain { base, .. } = &mut other_base {
+            *base = "integer".parse().unwrap();
+        }
+        assert!(check(&live(other_base), true, &executed).is_err());
     }
 
     #[test]
@@ -1006,6 +1133,8 @@ mod label_tests {
                 uid: pin.uid.clone(),
                 name: name.clone(),
                 definition: Some(definition.clone()),
+                altered: false,
+                after_vet: None,
             });
             executed.push(statement);
             check_definitions(
@@ -1061,6 +1190,8 @@ mod label_tests {
                 uid: uid.clone(),
                 name: at.clone(),
                 definition: Some(pin.definition.clone()),
+                altered: false,
+                after_vet: None,
             });
             statement
         };

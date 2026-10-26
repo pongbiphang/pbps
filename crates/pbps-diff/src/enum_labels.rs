@@ -1008,6 +1008,7 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 .map(|b| (p.uid.clone(), b.definition.clone()))
         })
         .collect();
+    let anchors = definitions.clone();
     let mut replacements: BTreeMap<Uid, ManagedType> = BTreeMap::new();
     for step in &changes.changes {
         match &step.change {
@@ -1015,6 +1016,67 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                 uid, definition, ..
             } => {
                 definitions.insert(uid.clone(), (**definition).clone());
+            }
+            // The statements derive from `(from, to, half)` alone, so the
+            // payload is held to what the approved before-definition and the
+            // sealed final definition say (DEC-1635.8): the sealed one is
+            // `to`, `from` has the before-definition's NOT NULL, collation,
+            // check names and default presence (its texts are the differ's
+            // own, the catalog's before-definition being another spelling of
+            // them), and the half has a statement to run.
+            Change::AlterDomain {
+                uid,
+                name,
+                from,
+                to,
+                half,
+            } => {
+                if !pins
+                    .iter()
+                    .any(|p| &p.uid == uid && &p.name == name && p.definition == **to)
+                {
+                    return false;
+                }
+                let (
+                    Some(ManagedType::Domain {
+                        not_null,
+                        default,
+                        checks,
+                        collation,
+                        ..
+                    }),
+                    ManagedType::Domain {
+                        not_null: from_not_null,
+                        default: from_default,
+                        checks: from_checks,
+                        collation: from_collation,
+                        ..
+                    },
+                ) = (anchors.get(uid), from.as_ref())
+                else {
+                    return false;
+                };
+                if not_null != from_not_null
+                    || default.is_some() != from_default.is_some()
+                    || collation != from_collation
+                    || !checks.keys().eq(from_checks.keys())
+                {
+                    return false;
+                }
+                let Some(delta) = pbps_model::DomainDelta::of(from, to) else {
+                    return false;
+                };
+                let left = match half {
+                    pbps_model::DomainHalf::Loosen if delta.loosens() => {
+                        pbps_model::DomainDelta::loosened(from, to)
+                    }
+                    pbps_model::DomainHalf::Tighten if delta.tightens() => Some((**to).clone()),
+                    pbps_model::DomainHalf::Loosen | pbps_model::DomainHalf::Tighten => None,
+                };
+                let Some(left) = left else {
+                    return false;
+                };
+                definitions.insert(uid.clone(), left);
             }
             Change::AddEnumValue {
                 uid,
@@ -1895,6 +1957,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn code(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
+        ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    /// A saved plan's domain alterations replay against the approved
+    /// before-definition and the sealed final one: the payload cannot say a
+    /// different difference, and each half has a statement to run.
+    #[test]
+    fn a_saved_domain_alteration_replays_against_its_pins_and_cannot_certify_itself() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let uid: Uid = "y_000002".parse().unwrap();
+        let name: TypeRef = "app.d".parse().unwrap();
+        let before = code(false, Some("'a'"), &[("c1", "x")]);
+        let to = code(true, Some("'b'"), &[("c1", "y"), ("c2", "z")]);
+        let pin = DeclaredTypePin {
+            uid: uid.clone(),
+            name: name.clone(),
+            definition: to.clone(),
+            before: Some(DeclaredTypeBefore {
+                name: name.clone(),
+                definition: before.clone(),
+            }),
+        };
+        let step = |from: &ManagedType, to: &ManagedType, half| {
+            PlannedChange::new(Change::AlterDomain {
+                uid: uid.clone(),
+                name: name.clone(),
+                from: Box::new(from.clone()),
+                to: Box::new(to.clone()),
+                half,
+            })
+        };
+        let plan = |steps: Vec<PlannedChange>| ChangeSet { changes: steps };
+        let whole = || vec![step(&before, &to, Loosen), step(&before, &to, Tighten)];
+        assert!(valid_steps(&plan(whole()), std::slice::from_ref(&pin)));
+        // Either half alone replays when it has something to do.
+        assert!(valid_steps(
+            &plan(whole()[..1].to_vec()),
+            std::slice::from_ref(&pin)
+        ));
+        // Negatives: each of these would make the emitter write other
+        // statements than the approved definitions call for.
+        let lie = code(true, Some("'b'"), &[("c1", "y"), ("c2", "other")]);
+        assert!(!valid_steps(
+            &plan(vec![step(&before, &lie, Loosen)]),
+            std::slice::from_ref(&pin)
+        ));
+        let fewer = code(false, Some("'a'"), &[]);
+        assert!(!valid_steps(
+            &plan(vec![step(&fewer, &to, Loosen), step(&fewer, &to, Tighten)]),
+            std::slice::from_ref(&pin)
+        ));
+        // NOT NULL, the default's presence, or the collation said otherwise
+        // than the before-definition has them.
+        for other in [
+            code(true, Some("'a'"), &[("c1", "x")]),
+            code(false, None, &[("c1", "x")]),
+        ] {
+            assert!(!valid_steps(
+                &plan(vec![step(&other, &to, Loosen)]),
+                std::slice::from_ref(&pin)
+            ));
+        }
+        // The texts of the checks are the differ's own spelling of the
+        // before-definition's, and are not compared with them.
+        let respelled = code(false, Some("'a'"), &[("c1", "(x)")]);
+        assert!(valid_steps(
+            &plan(vec![step(&respelled, &to, Loosen)]),
+            std::slice::from_ref(&pin)
+        ));
+        // A half with nothing to do: this declaration adds nothing.
+        let narrower = DeclaredTypePin {
+            definition: code(false, None, &[]),
+            ..pin.clone()
+        };
+        let nothing = code(false, None, &[]);
+        assert!(!valid_steps(
+            &plan(vec![step(&before, &nothing, Tighten)]),
+            std::slice::from_ref(&narrower)
+        ));
+        // No pin, another name, no before-definition, or an enum: refused.
+        assert!(!valid_steps(&plan(whole()), &[]));
+        let other_name = DeclaredTypePin {
+            name: "app.other".parse().unwrap(),
+            ..pin.clone()
+        };
+        assert!(!valid_steps(&plan(whole()), &[other_name]));
+        let created = DeclaredTypePin {
+            before: None,
+            ..pin.clone()
+        };
+        assert!(!valid_steps(&plan(whole()), &[created]));
+        let enum_pin = DeclaredTypePin {
+            definition: enumeration(&["a"]),
+            before: Some(DeclaredTypeBefore {
+                name: "app.d".parse().unwrap(),
+                definition: enumeration(&["a"]),
+            }),
+            ..pin
+        };
+        assert!(!valid_steps(&plan(whole()), &[enum_pin]));
     }
 
     #[test]

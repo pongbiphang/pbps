@@ -241,6 +241,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
+                | Change::AlterDomain { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
@@ -354,6 +355,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
+                | Change::AlterDomain { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }

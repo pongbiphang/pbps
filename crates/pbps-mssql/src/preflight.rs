@@ -872,6 +872,7 @@ name = name.shown(),
         // A permission change fails on nothing in the data; the engine refuses
         // an impossible grant inside the transaction.
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }

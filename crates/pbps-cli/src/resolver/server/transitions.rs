@@ -607,7 +607,9 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     base.ids.types.get(uid).cloned().unwrap_or_else(|| from.clone()),
                 )),
             ),
-            Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
+            Change::AddEnumValue { name, .. }
+            | Change::AlterDomain { name, .. }
+            | Change::RenameEnumValue { name, .. } => {
                 (Surface::Type(name.clone()), false, true, true, None)
             }
             Change::EnumRebuild {

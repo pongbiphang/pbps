@@ -494,6 +494,7 @@ impl Build<'_, '_> {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }

@@ -116,6 +116,7 @@ pub async fn key_drop_blockers(
                 | Change::AlterModule { .. }
                 | Change::DropModule { .. }
                 | Change::AddEnumValue { .. }
+                | Change::AlterDomain { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
@@ -295,6 +296,7 @@ pub async fn key_drop_blockers(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }

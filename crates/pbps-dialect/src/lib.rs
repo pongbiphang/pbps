@@ -219,6 +219,14 @@ pub struct DeclaredTypeStatement {
     pub uid: pbps_model::Uid,
     pub name: pbps_model::TypeRef,
     pub definition: Option<pbps_model::ManagedType>,
+    /// This statement alters a standing domain in place, so the definition it
+    /// leaves is held to the live domain by structure and not by the text of
+    /// the catalog before the plan (DEC-1635.8).
+    pub altered: bool,
+    /// SQL the executor runs in the same transaction right after it has vetted
+    /// the statement's definition: a domain's checks are added `NOT VALID`,
+    /// vetted, and only then validated, which scans every row (DEC-1635.8).
+    pub after_vet: Option<String>,
 }
 
 /// One executable statement.
@@ -656,6 +664,7 @@ impl Unchecked {
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }

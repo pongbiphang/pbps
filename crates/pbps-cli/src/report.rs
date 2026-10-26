@@ -988,7 +988,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
 Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => None,
-        Change::AddEnumValue { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
+        Change::AddEnumValue { .. } | Change::AlterDomain { .. } | Change::RenameEnumValue { .. } | Change::EnumRebuild { .. } | Change::CreateType { .. } | Change::DropType { .. } | Change::RenameType { .. } => None,
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
@@ -1397,6 +1397,55 @@ pub fn describe(c: &Change) -> String {
                 "+ add enum value {} to {}{position}",
                 Escaped(value),
                 name.shown()
+            )
+        }
+        Change::AlterDomain {
+            name,
+            from,
+            to,
+            half,
+            ..
+        } => {
+            let mut parts = Vec::new();
+            if let Some(delta) = pbps_model::DomainDelta::of(from, to) {
+                match half {
+                    pbps_model::DomainHalf::Loosen => {
+                        parts.extend(
+                            delta
+                                .drop_checks
+                                .iter()
+                                .map(|check| format!("drop check {}", check.shown())),
+                        );
+                        if delta.drop_not_null {
+                            parts.push("drop NOT NULL".to_owned());
+                        }
+                        match delta.default {
+                            Some(Some(_)) => parts.push("set the default".to_owned()),
+                            Some(None) => parts.push("drop the default".to_owned()),
+                            None => {}
+                        }
+                    }
+                    pbps_model::DomainHalf::Tighten => {
+                        if delta.set_not_null {
+                            parts.push("set NOT NULL".to_owned());
+                        }
+                        parts.extend(delta.add_checks.iter().map(|(check, _)| {
+                            format!(
+                                "add check {}, validated over every existing row",
+                                check.shown()
+                            )
+                        }));
+                    }
+                }
+            }
+            format!(
+                "~ {} domain {}: {}",
+                match half {
+                    pbps_model::DomainHalf::Loosen => "loosen",
+                    pbps_model::DomainHalf::Tighten => "tighten",
+                },
+                name.shown(),
+                parts.join(", ")
             )
         }
         Change::RenameEnumValue { name, from, to, .. } => format!(
@@ -2196,6 +2245,42 @@ mod tests {
                 definition
             }),
             "~ rename enum value old -> new\\nline in app.e"
+        );
+    }
+
+    /// DEC-1635.8: each half of a domain alteration names what it does, and
+    /// a check's name is escaped like any other name in the line.
+    #[test]
+    fn a_domain_alterations_halves_say_what_they_drop_add_and_set() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let domain = |not_null: bool, default: Option<&str>, checks: &[(&str, &str)]| {
+            pbps_model::ManagedType::Domain {
+                base: "text".parse().unwrap(),
+                not_null,
+                default: default.map(str::to_owned),
+                checks: checks
+                    .iter()
+                    .map(|(n, t)| ((*n).into(), (*t).to_owned()))
+                    .collect(),
+                collation: None,
+            }
+        };
+        let alter = |from, to, half| Change::AlterDomain {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.code".parse().unwrap(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        let from = domain(true, Some("'a'"), &[("old\nname", "1"), ("kept", "2")]);
+        let to = domain(false, None, &[("kept", "2"), ("fresh", "3")]);
+        assert_eq!(
+            super::describe(&alter(from.clone(), to.clone(), Loosen)),
+            "~ loosen domain app.code: drop check old\\nname, drop NOT NULL, drop the default"
+        );
+        assert_eq!(
+            super::describe(&alter(to, from, Tighten)),
+            "~ tighten domain app.code: set NOT NULL, add check old\\nname, validated over every existing row"
         );
     }
 

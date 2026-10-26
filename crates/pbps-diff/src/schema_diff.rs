@@ -675,16 +675,19 @@ pub fn diff_partial(
 /// has none, and neither has a DEFAULT the plan drops, detaches or makes:
 /// one leaving goes in class 6, before the partition is created, and a new
 /// one starts empty. The name is the declared one because renames run in
-/// Slice-one lifecycle refusals, shared with connected prerequisite admission
-/// so a missing declared type is named before its column's reference gate.
+/// Lifecycle refusals for the attributes no executable change covers, shared
+/// with connected prerequisite admission so a missing declared type is named
+/// before its column's reference gate. `alterable` leaves out what a retained
+/// domain changes in place: its NOT NULL, default and checks (DEC-1635.8).
 pub fn type_differences(
     base: &Schema,
     declared: &Schema,
     dialect: &(impl Dialect + ?Sized),
+    alterable: bool,
 ) -> Vec<DiffError> {
     let mut errs = Vec::new();
     // Whole-object changes are handled by uid; retained definitions still
-    // refuse the attributes reserved for later slices.
+    // refuse the attributes no change covers.
     let names: BTreeSet<_> = base.types.keys().chain(declared.types.keys()).collect();
     for name in names {
         let reason = match (base.types.get(name), declared.types.get(name)) {
@@ -699,8 +702,26 @@ pub fn type_differences(
                     }
                     definition
                 };
-                let fields = normalize(old).differences(&normalize(new));
-                (!fields.is_empty()).then(|| format!("{} changed; an enum's labels change only through its recorded uid (#1635 slice 3, DEC-1635.6, DEC-1635.7), domain alterations require slice 4; base-type and collation changes remain unsupported", fields.join(", ")))
+                let mut fields = normalize(old).differences(&normalize(new));
+                if alterable {
+                    fields.retain(|field| {
+                        !matches!(
+                            *field,
+                            "domain NOT NULL" | "domain default" | "domain checks"
+                        )
+                    });
+                }
+                (!fields.is_empty()).then(|| {
+                    let why = match new {
+                        pbps_model::ManagedType::Enum { .. } => {
+                            "an enum's labels change only through its recorded uid (#1635 slice 3, DEC-1635.6, DEC-1635.7)"
+                        }
+                        pbps_model::ManagedType::Domain { .. } => {
+                            "a domain's base type and collation change by rebuilding it (#1635 slice 4b), and its NOT NULL, default and checks only through its recorded uid (DEC-1635.8)"
+                        }
+                    };
+                    format!("{} changed; {why}", fields.join(", "))
+                })
             }
             (None, None) => None,
         };
@@ -805,7 +826,12 @@ pub(crate) fn diff_partial_rebuilding(
             .collect(),
         ..Default::default()
     };
-    errs.extend(type_differences(&unrecorded_base, declared.schema, dialect));
+    errs.extend(type_differences(
+        &unrecorded_base,
+        declared.schema,
+        dialect,
+        false,
+    ));
     let mut type_renames = BTreeMap::new();
     for (uid, old_name) in &base.ids.types {
         let Some(old) = base.schema.types.get(old_name) else {
@@ -841,6 +867,7 @@ pub(crate) fn diff_partial_rebuilding(
                     types: [(name.clone(), new.clone())].into(),
                     ..Default::default()
                 };
+                let mut refused = Vec::new();
                 if !matches!(
                     (&old_schema.types[name], new),
                     (
@@ -848,21 +875,53 @@ pub(crate) fn diff_partial_rebuilding(
                         pbps_model::ManagedType::Enum { .. }
                     )
                 ) {
-                    errs.extend(type_differences(&old_schema, &new_schema, dialect));
+                    refused = type_differences(&old_schema, &new_schema, dialect, true);
                 }
+                // A retained domain changes its checks, default and NOT NULL
+                // in place: what it drops before the plan's rows, and what it
+                // adds after them. A base or collation change was refused
+                // above and plans nothing (DEC-1635.8).
+                let comparable = &old_schema.types[name];
+                let alters = refused.is_empty()
+                    && matches!(
+                        (comparable, new),
+                        (
+                            pbps_model::ManagedType::Domain { .. },
+                            pbps_model::ManagedType::Domain { .. }
+                        )
+                    );
+                if alters && let Some(delta) = pbps_model::DomainDelta::of(comparable, new) {
+                    for (half, wanted) in [
+                        (pbps_model::DomainHalf::Loosen, delta.loosens()),
+                        (pbps_model::DomainHalf::Tighten, delta.tightens()),
+                    ] {
+                        if wanted {
+                            changes.push(Change::AlterDomain {
+                                uid: uid.clone(),
+                                name: name.clone(),
+                                from: Box::new(comparable.clone()),
+                                to: Box::new(new.clone()),
+                                half,
+                            });
+                        }
+                    }
+                }
+                errs.extend(refused);
                 if old_name != name {
                     type_renames.insert(old_name.clone(), name.clone());
                     changes.push(Change::RenameType {
                         uid: uid.clone(),
                         from: old_name.clone(),
                         to: name.clone(),
-                        definition: Box::new(
-                            if matches!(old, pbps_model::ManagedType::Enum { .. }) {
-                                old.clone()
-                            } else {
-                                new.clone()
-                            },
-                        ),
+                        // What stands when the rename runs: an enum's labels
+                        // and a domain the plan alters are the old ones, the
+                        // domain under the spellings of the types it is over
+                        // that the plan leaves.
+                        definition: Box::new(match (old, alters) {
+                            (pbps_model::ManagedType::Enum { .. }, _) => old.clone(),
+                            (pbps_model::ManagedType::Domain { .. }, true) => comparable.clone(),
+                            (pbps_model::ManagedType::Domain { .. }, false) => new.clone(),
+                        }),
                     });
                 }
             }
@@ -1479,6 +1538,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1542,6 +1602,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1800,6 +1861,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -1867,6 +1929,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -3047,6 +3110,7 @@ fn recreate_referenced_foreign_keys(
             | Change::AlterModule { .. }
             | Change::DropModule { .. }
             | Change::AddEnumValue { .. }
+            | Change::AlterDomain { .. }
             | Change::RenameEnumValue { .. }
             | Change::EnumRebuild { .. }
             | Change::CreateType { .. }
@@ -3668,6 +3732,7 @@ fn recreate_retyped_dependents(
         | Change::AlterModule { .. }
         | Change::DropModule { .. }
         | Change::AddEnumValue { .. }
+        | Change::AlterDomain { .. }
         | Change::RenameEnumValue { .. }
         | Change::EnumRebuild { .. }
         | Change::CreateType { .. }
@@ -5759,6 +5824,7 @@ fn refuse_computed_dependencies(
                     | Change::AlterModule { .. }
                     | Change::DropModule { .. }
                     | Change::AddEnumValue { .. }
+                    | Change::AlterDomain { .. }
                     | Change::RenameEnumValue { .. }
                     | Change::EnumRebuild { .. }
                     | Change::CreateType { .. }
@@ -6811,6 +6877,7 @@ fn dependency_rank(
         Change::AddEnumValue { ordinal, .. } | Change::RenameEnumValue { ordinal, .. } => {
             *ordinal as isize
         }
+        Change::AlterDomain { .. } => 0,
         Change::EnumRebuild {
             step: pbps_model::EnumRebuildStep::Create { ordinal, .. },
             ..
@@ -7594,6 +7661,16 @@ fn order_key(c: &Change) -> u8 {
             ..
         }
         | Change::CreateType { .. } => 7,
+        // A domain's checks and NOT NULL are dropped with a table's, before
+        // the plan's rows, and added with them after the rows (DEC-1635.8).
+        Change::AlterDomain {
+            half: pbps_model::DomainHalf::Loosen,
+            ..
+        } => 2,
+        Change::AlterDomain {
+            half: pbps_model::DomainHalf::Tighten,
+            ..
+        } => 13,
         Change::EnumRebuild { .. } => COLUMN_ALTERATIONS,
         Change::DropType { .. } => 18,
         Change::RenameType { .. } => 1,
@@ -8082,6 +8159,259 @@ mod tests {
         let mut s = Schema::default();
         s.tables.insert(name.parse().unwrap(), t);
         s
+    }
+
+    /// The domain `app.code` of a table `app.t` that uses it, as a schema.
+    fn domain_world(domain: pbps_model::ManagedType, extra_column: bool, rows: bool) -> Schema {
+        let mut t = table(&[
+            ("id", Column::new(ty("int")).not_null()),
+            ("v", Column::new(ty("app.code"))),
+        ]);
+        if extra_column {
+            t.columns.insert("w".into(), Column::new(ty("app.code")));
+        }
+        let mut s = schema_of("app.t", t);
+        s.types.insert("app.code".parse().unwrap(), domain);
+        if rows {
+            let mut u = table(&[
+                ("id", Column::new(ty("int")).not_null()),
+                ("name", Column::new(ty("text"))),
+            ]);
+            u.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            u.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: [(
+                    pbps_model::RowKey::from("1"),
+                    pbps_model::Row([("name".into(), pbps_model::Value::Text("a".into()))].into()),
+                )]
+                .into(),
+            });
+            s.tables.insert("app.u".parse().unwrap(), u);
+        }
+        s
+    }
+
+    fn code(
+        not_null: bool,
+        default: Option<&str>,
+        checks: &[(&str, &str)],
+        base: &str,
+    ) -> pbps_model::ManagedType {
+        pbps_model::ManagedType::Domain {
+            base: ty(base),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(n, t)| ((*n).into(), (*t).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    fn alter_domain(
+        base: &Schema,
+        declared: &Schema,
+        intents: &[Intent],
+    ) -> Result<ChangeSet, Vec<DiffError>> {
+        let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+            .unwrap()
+            .ids;
+        diff(
+            Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: declared,
+                ids: &declared_ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .map(|plan| plan.changes().clone())
+    }
+
+    /// DEC-1635.8: what a retained domain changes in place, by half.
+    #[test]
+    fn a_retained_domains_checks_default_and_not_null_plan_their_halves() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let base = domain_world(
+            code(
+                false,
+                Some("'a'"),
+                &[("c1", "VALUE <> ''"), ("c2", "length(VALUE) < 9")],
+                "text",
+            ),
+            false,
+            false,
+        );
+        let halves = |wanted: pbps_model::ManagedType| -> Vec<pbps_model::DomainHalf> {
+            alter_domain(&base, &domain_world(wanted, false, false), &[])
+                .expect("an in-place alteration plans")
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::AlterDomain { half, .. } => *half,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let two = |c1: &'static str| [("c1", c1), ("c2", "length(VALUE) < 9")];
+        assert_eq!(
+            halves(code(false, Some("'a'"), &two("VALUE <> ''"), "text")),
+            []
+        );
+        // A changed check is a drop and an add under its name.
+        assert_eq!(
+            halves(code(false, Some("'a'"), &two("VALUE <> 'x'"), "text")),
+            [Loosen, Tighten]
+        );
+        // An added check tightens; a dropped one loosens.
+        let added = [
+            ("c1", "VALUE <> ''"),
+            ("c2", "length(VALUE) < 9"),
+            ("c3", "VALUE <> 'z'"),
+        ];
+        assert_eq!(halves(code(false, Some("'a'"), &added, "text")), [Tighten]);
+        assert_eq!(
+            halves(code(false, Some("'a'"), &[("c1", "VALUE <> ''")], "text")),
+            [Loosen]
+        );
+        // The default is set, changed or dropped with the loosening half.
+        for default in [Some("'b'"), None] {
+            assert_eq!(
+                halves(code(false, default, &two("VALUE <> ''"), "text")),
+                [Loosen]
+            );
+        }
+        // NOT NULL set tightens and dropped loosens.
+        assert_eq!(
+            halves(code(true, Some("'a'"), &two("VALUE <> ''"), "text")),
+            [Tighten]
+        );
+        let held = domain_world(code(true, None, &[], "text"), false, false);
+        let released = domain_world(code(false, None, &[], "text"), false, false);
+        let plan = alter_domain(&held, &released, &[]).unwrap();
+        assert!(matches!(
+            &plan.changes[..],
+            [p] if matches!(&p.change, Change::AlterDomain { half: Loosen, .. })
+        ));
+        // Everything at once plans both halves.
+        assert_eq!(
+            halves(code(true, None, &[("c1", "VALUE <> 'x'")], "text")),
+            [Loosen, Tighten]
+        );
+    }
+
+    /// Negative: a base type or collation change is the rebuild's, and plans
+    /// nothing, with a pointer to it; so is a domain whose identity is not
+    /// recorded.
+    #[test]
+    fn a_domains_base_or_collation_change_plans_no_alteration_and_points_at_the_rebuild() {
+        let base = domain_world(code(false, None, &[], "text"), false, false);
+        let mut collated = code(false, None, &[], "text");
+        if let pbps_model::ManagedType::Domain { collation, .. } = &mut collated {
+            *collation = Some("pg_catalog.\"C\"".parse().unwrap());
+        }
+        for wanted in [code(false, None, &[], "varchar(20)"), collated] {
+            let errors = alter_domain(&base, &domain_world(wanted, false, false), &[])
+                .expect_err("a base or collation change is refused");
+            assert!(
+                errors.iter().any(|e| {
+                    let said = e.to_string();
+                    said.contains("app.code") && said.contains("rebuilding it (#1635 slice 4b)")
+                }),
+                "{errors:?}"
+            );
+        }
+        // Beside a base change, a changed check plans no half either.
+        let both = domain_world(
+            code(false, None, &[("c", "VALUE <> ''")], "varchar(20)"),
+            false,
+            false,
+        );
+        assert!(alter_domain(&base, &both, &[]).is_err());
+        // No identity recorded for the type: nothing to alter by.
+        let ids = IdsFile::default();
+        let errors = diff(
+            Side {
+                schema: &base,
+                ids: &ids,
+            },
+            Side {
+                schema: &domain_world(code(true, None, &[], "text"), false, false),
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+        )
+        .expect_err("an unrecorded domain is not altered");
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("app.code")),
+            "{errors:?}"
+        );
+    }
+
+    /// DEC-1635.8: a loosening goes in after the domain's rename and before
+    /// the plan's other writes; a tightening after them.
+    #[test]
+    fn a_domain_alterations_halves_sort_around_the_plans_columns_and_rows() {
+        let base = domain_world(
+            code(false, None, &[("short", "length(VALUE) < 5")], "text"),
+            false,
+            false,
+        );
+        let desired = domain_world(
+            code(false, None, &[("short", "length(VALUE) < 9")], "text"),
+            true,
+            true,
+        );
+        let plan = alter_domain(&base, &desired, &[]).unwrap();
+        let name = |p: &PlannedChange| match &p.change {
+            Change::AlterDomain { half, .. } => format!("{half:?}"),
+            Change::AddColumn { .. } => "AddColumn".to_owned(),
+            Change::CreateTable { .. } => "CreateTable".to_owned(),
+            Change::InsertRow { .. } => "InsertRow".to_owned(),
+            other => panic!("{other:?}"),
+        };
+        let order: Vec<String> = plan.changes.iter().map(name).collect();
+        let at = |kind: &str| order.iter().position(|k| k == kind).unwrap();
+        assert!(at("Loosen") < at("CreateTable"), "{order:?}");
+        assert!(at("Loosen") < at("AddColumn"), "{order:?}");
+        assert!(at("AddColumn") < at("InsertRow"), "{order:?}");
+        assert!(at("InsertRow") < at("Tighten"), "{order:?}");
+        // Tightening only: after the same writes.
+        let only = domain_world(
+            code(
+                false,
+                None,
+                &[("short", "length(VALUE) < 5"), ("more", "VALUE <> 'x'")],
+                "text",
+            ),
+            true,
+            true,
+        );
+        let order: Vec<String> = alter_domain(&base, &only, &[])
+            .unwrap()
+            .changes
+            .iter()
+            .map(name)
+            .collect();
+        assert!(!order.contains(&"Loosen".to_owned()), "{order:?}");
+        assert!(
+            order.iter().position(|k| k == "InsertRow") < order.iter().position(|k| k == "Tighten"),
+            "{order:?}"
+        );
+        // A domain nothing changes plans nothing.
+        assert!(alter_domain(&base, &base, &[]).unwrap().changes.is_empty());
     }
 
     #[test]
@@ -25223,6 +25553,7 @@ mod managed_type_tests {
         assert!(matches!(
             created.changes[0].change,
             Change::AddEnumValue { .. }
+                | Change::AlterDomain { .. }
                 | Change::RenameEnumValue { .. }
                 | Change::EnumRebuild { .. }
                 | Change::CreateType { .. }
@@ -25327,7 +25658,8 @@ mod managed_type_tests {
             assert!(
                 errors.iter().any(|error| {
                     let message = error.to_string();
-                    message.contains("app.t") && message.contains("slice 3")
+                    message.contains("app.t")
+                        && (message.contains("slice 3") || message.contains("slice 4b"))
                 }),
                 "{errors:?}"
             );

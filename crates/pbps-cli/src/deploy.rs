@@ -4640,6 +4640,11 @@ fn refuse_pinned_movement(
             pbps_model::Change::AddEnumValue {
                 uid, definition, ..
             }
+            | pbps_model::Change::AlterDomain {
+                uid,
+                to: definition,
+                ..
+            }
             | pbps_model::Change::RenameEnumValue {
                 uid, definition, ..
             }
@@ -6937,12 +6942,49 @@ pub(crate) fn type_replacement_warnings(
             return None;
         }
         let message = format!(
-            "Type `{}` is replaced: old uid `{old}` and new uid `{new}` are different types to pbps, so the old uid's history does not carry over to the new one. To change the type while keeping its uid, keep the original declaration file and its uid and edit the definition there; rename with `renamed_from`. In-place definition changes are not supported yet (#1635 slices 3 and 4), so changing the definition under the same uid is currently refused. This is a suggestion only; pbps never infers identity from the name.",
+            "Type `{}` is replaced: old uid `{old}` and new uid `{new}` are different types to pbps, so the old uid's history does not carry over to the new one. To change the type while keeping its uid, keep the original declaration file and its uid and edit the definition there; rename with `renamed_from`. Enum labels (#1635 slice 3) and a domain's NOT NULL, default and checks (slice 4a) change in place under the same uid; a domain's base type or collation is refused until the domain rebuild (slice 4b). This is a suggestion only; pbps never infers identity from the name.",
             name.shown(),
         );
         if !json { eprintln!("warning: {message}"); }
         Some(crate::output::Finding::warning("plan.type-replacement", message))
     }).collect()
+}
+
+/// A standing `NOT VALID` check of a declared domain compares equal to its
+/// declaration, as the model holds no validation (DECISIONS 251, DEC-1635.4);
+/// the plan says so and names the statement that validates it (DEC-1635.8).
+async fn domain_check_not_valid_warnings(
+    conn: &mut Conn,
+    recorded: &Schema,
+    json: bool,
+) -> anyhow::Result<Vec<crate::output::Finding>> {
+    if conn.driver() != pbps_db::Driver::Postgres
+        || !recorded
+            .types
+            .values()
+            .any(|t| matches!(t, pbps_model::ManagedType::Domain { .. }))
+    {
+        return Ok(Vec::new());
+    }
+    let standing = pbps_pg::domain_alter::not_valid(conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(standing
+        .into_iter()
+        .filter(|found| recorded.types.contains_key(&found.domain))
+        .map(|found| {
+            let message = format!(
+                "Check `{}` of domain `{}` is NOT VALID: the engine has not confirmed the rows that were there when it was added, and pbps compares it equal to its declaration because a declaration holds no validation.",
+                pbps_model::escape::Escaped(&found.check),
+                found.domain.shown(),
+            );
+            if !json {
+                eprintln!("warning: {message}\n  Run `{}` by hand.", found.remedy);
+            }
+            crate::output::Finding::warning("plan.domain-check-not-valid", message)
+                .remedy(format!("run `{}`", found.remedy))
+        })
+        .collect())
 }
 
 /// `pbps plan --db` — the applyable plan, computed against the target
@@ -7408,6 +7450,7 @@ pub fn cmd_plan_db(
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
         findings.extend(type_replacement_warnings(&recorded_ids, &resolved.ids, cs.changes(), json));
+        findings.extend(domain_check_not_valid_warnings(&mut conn, &base, json).await?);
 
         let prerequisite_types = crate::engine::seal_plan_type_pins(
             &mut conn,
@@ -8002,6 +8045,8 @@ pub fn cmd_plan_db(
             }
         };
         let declared_type_pins = pbps_pg::type_refs::declared::seal(&read_back, &recorded_ids, &declared, &resolved.ids);
+        let domain_validation =
+            crate::engine::check_domain_alterations(&mut conn, &cs, &recorded_ids).await?;
         Ok(Connected::Ordinary(Box::new((
             cs,
             // The zone this session started in: what every offset-less
@@ -8024,7 +8069,10 @@ pub fn cmd_plan_db(
                 rebuilds,
                 logical_slots,
                 fills,
-            ],
+            ]
+            .into_iter()
+            .chain(domain_validation)
+            .collect::<Vec<_>>(),
             findings,
             cost,
             routine_pins,
@@ -8831,6 +8879,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         .await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
         recheck_enum_rebuilds(conn, &plan.changes, &recorded_ids, false).await?;
+        recheck_domain_alterations(conn, &plan.changes, &recorded_ids).await?;
         crate::engine::check_drop_blockers(
             conn,
             &plan.changes,
@@ -9151,6 +9200,19 @@ async fn recheck_enum_rebuilds(
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// The tightened domains again, where the plan runs: a column of an array or
+/// a composite of the domain that appeared after the plan was made is refused
+/// by name before the first statement (DEC-1635.8).
+async fn recheck_domain_alterations(
+    conn: &mut Conn,
+    changes: &pbps_model::ChangeSet,
+    stored: &IdsFile,
+) -> anyhow::Result<()> {
+    crate::engine::check_domain_alterations(conn, changes, stored)
+        .await
+        .map(|_| ())
+}
+
 async fn apply_staged_under_lock<D: crate::emission::Engine>(
     conn: &mut Conn,
     d: &Deployment<'_, D>,
@@ -9418,7 +9480,11 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     if start < statements.len() {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
-        let seen = recheck_enum_rebuilds(conn, &plan.changes, &entry.snapshot.ids, resume).await;
+        let mut seen =
+            recheck_enum_rebuilds(conn, &plan.changes, &entry.snapshot.ids, resume).await;
+        if seen.is_ok() && !resume {
+            seen = recheck_domain_alterations(conn, &plan.changes, &entry.snapshot.ids).await;
+        }
         let rolled = conn
             .rollback(&dialect.transaction_framing(&pin_zone(conn)))
             .await;

@@ -70,6 +70,122 @@ impl ManagedType {
     }
 }
 
+/// Which half of an in-place domain alteration a change is (DEC-1635.8). A
+/// check is dropped before the plan's rows and added after them, as a table's
+/// is, so the two directions are two changes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainHalf {
+    /// Drop the checks the declaration removed or changed and NOT NULL it no
+    /// longer holds, and set or drop the default.
+    Loosen,
+    /// Add the checks it added or changed, validated, and set NOT NULL.
+    Tighten,
+}
+
+/// What changes between two definitions of one domain, split as the two
+/// halves of an in-place alteration take it (DEC-1635.8). The differ, the
+/// emitter and the risk gate read it from here, so none of them has a second
+/// idea of which check is "changed". A check whose text differs is dropped and
+/// added again under its name, exactly as a table's is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainDelta<'a> {
+    /// Checks the declaration removed or changed, dropped by `Loosen`.
+    pub drop_checks: Vec<&'a ObjectLocalName>,
+    /// Checks it added or changed, added and validated by `Tighten`.
+    pub add_checks: Vec<(&'a ObjectLocalName, &'a str)>,
+    /// `Loosen` drops NOT NULL.
+    pub drop_not_null: bool,
+    /// `Tighten` sets NOT NULL.
+    pub set_not_null: bool,
+    /// The default, when it changed: `Some(None)` drops it.
+    pub default: Option<Option<&'a str>>,
+}
+
+impl<'a> DomainDelta<'a> {
+    /// `None` unless both are domains.
+    pub fn of(from: &'a ManagedType, to: &'a ManagedType) -> Option<Self> {
+        let (
+            ManagedType::Domain {
+                not_null: was_not_null,
+                default: was_default,
+                checks: was_checks,
+                ..
+            },
+            ManagedType::Domain {
+                not_null,
+                default,
+                checks,
+                ..
+            },
+        ) = (from, to)
+        else {
+            return None;
+        };
+        Some(Self {
+            drop_checks: was_checks
+                .iter()
+                .filter(|(name, text)| checks.get(*name) != Some(*text))
+                .map(|(name, _)| name)
+                .collect(),
+            add_checks: checks
+                .iter()
+                .filter(|(name, text)| was_checks.get(*name) != Some(*text))
+                .map(|(name, text)| (name, text.as_str()))
+                .collect(),
+            drop_not_null: *was_not_null && !*not_null,
+            set_not_null: !*was_not_null && *not_null,
+            default: (was_default != default).then_some(default.as_deref()),
+        })
+    }
+
+    /// The domain once `Loosen` has run: what `from` keeps of what `to` still
+    /// holds, with `to`'s default. The re-read after that half is held to it.
+    pub fn loosened(from: &ManagedType, to: &ManagedType) -> Option<ManagedType> {
+        let (
+            ManagedType::Domain {
+                base,
+                not_null: was_not_null,
+                checks: was_checks,
+                collation,
+                ..
+            },
+            ManagedType::Domain {
+                not_null,
+                default,
+                checks,
+                ..
+            },
+        ) = (from, to)
+        else {
+            return None;
+        };
+        Some(ManagedType::Domain {
+            base: base.clone(),
+            not_null: *was_not_null && *not_null,
+            default: default.clone(),
+            checks: was_checks
+                .iter()
+                .filter(|(name, text)| checks.get(*name) == Some(*text))
+                .map(|(name, text)| (name.clone(), text.clone()))
+                .collect(),
+            collation: collation.clone(),
+        })
+    }
+
+    /// Whether the `Loosen` half has a statement.
+    pub fn loosens(&self) -> bool {
+        !self.drop_checks.is_empty() || self.drop_not_null || self.default.is_some()
+    }
+
+    /// Whether the `Tighten` half has a statement.
+    pub fn tightens(&self) -> bool {
+        !self.add_checks.is_empty() || self.set_not_null
+    }
+}
+
 /// The neighbour already exists at this operation's position (DEC-1635.6).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(
@@ -173,6 +289,137 @@ mod label_tests {
                 serde_json::from_str::<Change>(&serde_json::to_string(&step).unwrap()).unwrap(),
                 step
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+    use crate::{Change, RiskClass};
+
+    fn domain(not_null: bool, default: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
+        ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: checks
+                .iter()
+                .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+                .collect(),
+            collation: None,
+        }
+    }
+
+    #[test]
+    fn a_delta_splits_the_difference_between_two_domains_into_the_two_halves() {
+        let from = domain(
+            true,
+            Some("'a'"),
+            &[("keep", "1"), ("gone", "2"), ("edit", "3")],
+        );
+        let to = domain(false, None, &[("keep", "1"), ("edit", "4"), ("new", "5")]);
+        let delta = DomainDelta::of(&from, &to).unwrap();
+        let names = |checks: &[&ObjectLocalName]| -> Vec<String> {
+            checks.iter().map(|c| c.raw().to_owned()).collect()
+        };
+        assert_eq!(names(&delta.drop_checks), ["edit", "gone"]);
+        assert_eq!(
+            delta
+                .add_checks
+                .iter()
+                .map(|(n, t)| (n.raw().to_owned(), *t))
+                .collect::<Vec<_>>(),
+            [("edit".to_owned(), "4"), ("new".to_owned(), "5")]
+        );
+        assert!(delta.drop_not_null && !delta.set_not_null);
+        assert_eq!(delta.default, Some(None));
+        assert!(delta.loosens() && delta.tightens());
+        // What the loosening half leaves.
+        assert_eq!(
+            DomainDelta::loosened(&from, &to),
+            Some(domain(false, None, &[("keep", "1")]))
+        );
+        // Negatives: equal domains change nothing; an enum has no delta.
+        let same = DomainDelta::of(&from, &from).unwrap();
+        assert!(!same.loosens() && !same.tightens() && same.default.is_none());
+        assert!(DomainDelta::of(&from, &ManagedType::Enum { values: vec![] }).is_none());
+        assert!(DomainDelta::loosened(&ManagedType::Enum { values: vec![] }, &to).is_none());
+    }
+
+    /// DEC-1635.8: the loosening carries no class, as `DropCheck` does
+    /// (DECISIONS 486); the tightening is `constraint` for a check added or
+    /// changed and `not-null` for NOT NULL, each only when it has one.
+    #[test]
+    fn the_halves_carry_the_risk_classes_of_the_statements_they_hold() {
+        let alter = |from: ManagedType, to: ManagedType, half| Change::AlterDomain {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.code".parse().unwrap(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        let plain = domain(false, None, &[]);
+        let checked = domain(false, None, &[("c", "VALUE <> ''")]);
+        let required = domain(true, None, &[]);
+        let both = domain(true, None, &[("c", "VALUE <> ''")]);
+        assert!(
+            alter(both.clone(), plain.clone(), DomainHalf::Loosen)
+                .intrinsic_risks()
+                .is_empty()
+        );
+        assert!(
+            alter(plain.clone(), both.clone(), DomainHalf::Loosen)
+                .intrinsic_risks()
+                .is_empty()
+        );
+        for (to, expected) in [
+            (checked.clone(), vec![RiskClass::Constraint]),
+            (required.clone(), vec![RiskClass::NotNull]),
+            (
+                both.clone(),
+                vec![RiskClass::Constraint, RiskClass::NotNull],
+            ),
+        ] {
+            let change = alter(plain.clone(), to, DomainHalf::Tighten);
+            assert_eq!(
+                change.intrinsic_risks(),
+                expected
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+        }
+        // A tightening half with neither (it cannot be planned) is empty.
+        assert!(
+            alter(plain.clone(), plain, DomainHalf::Tighten)
+                .intrinsic_risks()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_domain_alteration_round_trips_and_names_its_type_and_no_table() {
+        for half in [DomainHalf::Loosen, DomainHalf::Tighten] {
+            let change = Change::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: "app.code".parse().unwrap(),
+                from: Box::new(domain(false, None, &[])),
+                to: Box::new(domain(true, Some("'a'"), &[("c", "VALUE <> ''")])),
+                half,
+            };
+            let json = serde_json::to_value(&change).unwrap();
+            assert_eq!(json["op"], "alter_domain");
+            assert_eq!(
+                json["half"],
+                if half == DomainHalf::Loosen {
+                    "loosen"
+                } else {
+                    "tighten"
+                }
+            );
+            assert_eq!(serde_json::from_value::<Change>(json).unwrap(), change);
+            assert!(change.table().is_none() && change.columns().is_empty());
+            assert_eq!(change.subject(), "app.code");
         }
     }
 }

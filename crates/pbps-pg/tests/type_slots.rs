@@ -545,6 +545,8 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
                 uid: pin.uid.clone(),
                 name: name.clone(),
                 definition: Some(definition),
+                altered: false,
+                after_vet: None,
             };
             declared::vet(&mut conn, &metadata, &Default::default())
                 .await
@@ -579,6 +581,125 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
                 .is_err()
             );
         }
+        conn.execute("ROLLBACK").await.unwrap();
+    }
+}
+
+/// DEC-1635.8: a domain tightening is vetted between its `NOT VALID` add and
+/// its validation. The check that calls a function the project wrote is
+/// refused with the function never run, and what is allowed is validated by
+/// the tail the vet runs, over the rows that were there.
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn a_domain_tightening_is_vetted_after_its_add_and_before_its_validation() {
+    use pbps_dialect::DeclaredTypeStatement;
+    use pbps_pg::type_refs::declared;
+    let domain = |checks: &[(&str, &str)]| ManagedType::Domain {
+        base: "text".parse().unwrap(),
+        not_null: false,
+        default: None,
+        checks: checks
+            .iter()
+            .map(|(name, text)| ((*name).into(), (*text).to_owned()))
+            .collect(),
+        collation: None,
+    };
+    let statement = |checks: &[(&str, &str)], tail: &str| DeclaredTypeStatement {
+        uid: uid(UidKind::Type, "tighten1635"),
+        name: "tighten4a.code".parse().unwrap(),
+        definition: Some(domain(checks)),
+        altered: true,
+        after_vet: Some(tail.to_owned()),
+    };
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let mut conn =
+            pbps_db::Conn::connect(pbps_db::Driver::Postgres, &std::env::var(variable).unwrap())
+                .await
+                .unwrap();
+        let ran =
+            |rows: Vec<pbps_db::Row>| -> i64 { rows[0].try_get::<i64>("ran").unwrap().unwrap() };
+        conn.execute(
+            "BEGIN; CREATE SCHEMA tighten4a;
+             CREATE SEQUENCE tighten4a.seen;
+             CREATE FUNCTION tighten4a.probe(text) RETURNS boolean LANGUAGE sql
+               AS $$ SELECT nextval('tighten4a.seen') > 0 $$;
+             CREATE DOMAIN tighten4a.code AS text;
+             CREATE TABLE tighten4a.t (v tighten4a.code);
+             INSERT INTO tighten4a.t VALUES ('a'), ('bb')",
+        )
+        .await
+        .unwrap();
+        let validated = |name: &'static str| {
+            format!(
+                "SELECT convalidated::int::int8 AS ran FROM pg_constraint \
+                 WHERE contypid = 'tighten4a.code'::regtype AND conname = '{name}'"
+            )
+        };
+        // Added NOT VALID, a project function: refused by the vet, never run.
+        conn.execute(
+            "ALTER DOMAIN tighten4a.code ADD CONSTRAINT probed \
+             CHECK (tighten4a.probe(VALUE)) NOT VALID",
+        )
+        .await
+        .unwrap();
+        let refused = declared::vet(
+            &mut conn,
+            &statement(
+                &[("probed", "tighten4a.probe(VALUE)")],
+                "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT probed",
+            ),
+            &Default::default(),
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(
+            ran(conn
+                .query("SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS ran FROM tighten4a.seen")
+                .await
+                .unwrap()),
+            0,
+            "the function ran before the vet"
+        );
+        conn.execute("ALTER DOMAIN tighten4a.code DROP CONSTRAINT probed")
+            .await
+            .unwrap();
+        // A built-in check passes the vet and the tail validates it.
+        conn.execute(
+            "ALTER DOMAIN tighten4a.code ADD CONSTRAINT short CHECK (length(VALUE) < 3) NOT VALID",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran(conn.query(&validated("short")).await.unwrap()), 0);
+        declared::vet(
+            &mut conn,
+            &statement(
+                &[("short", "length(VALUE) < 3")],
+                "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT short",
+            ),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran(conn.query(&validated("short")).await.unwrap()), 1);
+        // A tail that finds a row the check refuses fails the vet.
+        conn.execute(
+            "ALTER DOMAIN tighten4a.code ADD CONSTRAINT tiny CHECK (length(VALUE) < 2) NOT VALID",
+        )
+        .await
+        .unwrap();
+        let failed = declared::vet(
+            &mut conn,
+            &statement(
+                &[
+                    ("short", "length(VALUE) < 3"),
+                    ("tiny", "length(VALUE) < 2"),
+                ],
+                "ALTER DOMAIN tighten4a.code VALIDATE CONSTRAINT tiny",
+            ),
+            &Default::default(),
+        )
+        .await;
+        assert!(failed.unwrap_err().to_string().contains("violate"));
         conn.execute("ROLLBACK").await.unwrap();
     }
 }
