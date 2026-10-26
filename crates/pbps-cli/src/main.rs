@@ -41,6 +41,7 @@ mod report;
 mod resolution;
 mod row_security;
 mod saved_plan;
+mod state_data_work;
 mod state_history;
 mod state_list;
 mod status;
@@ -620,6 +621,9 @@ impl Command {
                 command: StateCommand::Export { format, .. },
             } => ("state export", *format),
             Command::State {
+                command: StateCommand::RecordDataWork(args),
+            } => ("state record-data-work", args.format),
+            Command::State {
                 command: StateCommand::Prune { .. },
             } => return None,
         };
@@ -705,6 +709,9 @@ enum KeyCommand {
 
 #[derive(Subcommand)]
 enum StateCommand {
+    /// Record external data work without executing it or changing managed state
+    RecordDataWork(state_data_work::RecordDataWorkArgs),
+
     /// Show this environment's history, newest first
     List {
         #[command(flatten)]
@@ -896,7 +903,10 @@ fn run() -> anyhow::Result<()> {
         | Command::DropRole { .. }
         | Command::MoveRows { .. }
         | Command::Convert { .. }
-        | Command::RebuildTable { .. } => {
+        | Command::RebuildTable { .. }
+        | Command::State {
+            command: StateCommand::RecordDataWork(_),
+        } => {
             operator_override(std::env::var("PBPS_OPERATOR"))?;
         }
         Command::Doctor { .. }
@@ -1491,6 +1501,7 @@ fn run() -> anyhow::Result<()> {
             deploy::cmd_bootstrap(&project, target.as_ref(), sql.as_deref())
         }
         Command::State { command } => match command {
+            StateCommand::RecordDataWork(args) => state_data_work::cmd_record(&project, args),
             StateCommand::List {
                 target,
                 limit,

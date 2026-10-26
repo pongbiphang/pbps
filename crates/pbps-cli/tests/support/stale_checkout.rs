@@ -7,7 +7,7 @@ fn ok(out: Output) -> Output {
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
     out
 }
-fn git(root: &Path, args: &[&str]) -> String {
+pub(super) fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -49,11 +49,16 @@ fn offline(d: &Demo) {
     ok(d.run(&["plan", "--no-dev"]));
     d.commit();
 }
-fn plan(d: &Demo, connection: &str, path: &Path) -> pbps_model::SavedPlan {
+pub(super) fn plan(d: &Demo, connection: &str, path: &Path) -> pbps_model::SavedPlan {
     ok(d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]));
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
-fn apply(d: &Demo, connection: &str, path: &Path, plan: &pbps_model::SavedPlan) -> Output {
+pub(super) fn apply(
+    d: &Demo,
+    connection: &str,
+    path: &Path,
+    plan: &pbps_model::SavedPlan,
+) -> Output {
     let checksum = plan.wire_fingerprint();
     let risks = plan
         .changes
@@ -76,14 +81,14 @@ fn apply(d: &Demo, connection: &str, path: &Path, plan: &pbps_model::SavedPlan) 
     }
     d.run(&args)
 }
-fn ledger(pg: bool) -> &'static str {
+pub(super) fn ledger(pg: bool) -> &'static str {
     if pg {
         "public.__pbps_state"
     } else {
         "dbo.__pbps_state"
     }
 }
-fn records(connection: &str, pg: bool) -> Vec<(i64, String, Option<String>)> {
+pub(super) fn records(connection: &str, pg: bool) -> Vec<(i64, String, Option<String>)> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -129,7 +134,7 @@ fn configure(d: &Demo, pg: bool) {
     )
     .unwrap();
 }
-fn expected(sha: &str, list: &str, missing: bool) -> String {
+pub(super) fn expected(sha: &str, list: &str, missing: bool) -> String {
     let reason = if missing {
         format!("deployed commit `{sha}` is not a commit this repository has.")
     } else {
@@ -144,7 +149,7 @@ fn expected(sha: &str, list: &str, missing: bool) -> String {
     };
     format!("Cannot plan deletions against `target`: {reason}\nDeletions:\n  {list}\n{remedy}")
 }
-fn refused(d: &Demo, connection: &str, pg: bool, message: &str) {
+pub(super) fn refused(d: &Demo, connection: &str, pg: bool, message: &str) {
     let before_ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
     let before_ledger = records(connection, pg);
     let out = d.dir.join("sentinel-plan.json");
@@ -562,6 +567,6 @@ pub fn failed_attempt(server: &str, pg: bool) {
     note(
         &d,
         connection,
-        "Checkout ancestry was not checked for `target`: the ledger has no retained non-failed entry. Planning continues without checkout-ancestry protection.",
+        "Checkout ancestry was not checked for `target`: the ledger has no retained schema-establishing entry. Planning continues without checkout-ancestry protection.",
     );
 }

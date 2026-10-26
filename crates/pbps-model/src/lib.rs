@@ -27,6 +27,7 @@ pub mod baseline_evidence;
 pub mod change;
 mod column_wire;
 pub mod data;
+pub mod data_work;
 pub mod declared;
 pub mod dependency;
 pub mod diagnostic;
@@ -71,6 +72,7 @@ pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,
     RowConflict, RowKey, RowScope, TableData, Value,
 };
+pub use data_work::{DataWorkError, DataWorkIdentity, DataWorkOutcome, DataWorkRecord};
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};

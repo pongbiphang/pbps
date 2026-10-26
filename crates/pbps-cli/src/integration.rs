@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 63;
+pub const SCHEMA_VERSION: u32 = 64;
+// 64: recording self-reported external data work (#2402); ordered after #2432's 63.
 // 63: an environment's `rehearse:` and a connected plan's `rehearsal` (#2379).
 // 62: a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).
 // 61: `explain`'s `rehearsal`, a plan's sealed rehearsal record (#2379).
@@ -146,6 +147,7 @@ macro_rules! envelope_branches {
             "verify" => pbps_model::DriftReport,
             "status" => Vec<crate::status::EnvStatus>,
             "state list" => crate::state_list::StateListData,
+            "state record-data-work" => crate::state_data_work::RecordedDataWorkData,
             "state show" => crate::state_history::ShowData,
             "state diff" => crate::state_history::DiffData,
             "state export" => crate::state_history::ExportData,
@@ -226,7 +228,7 @@ fn envelope_schema() -> serde_json::Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "pbps --format json envelope",
         "description":
-            "One envelope per read-only command (SPEC 9.8). `command` selects which \
+            "One findings envelope per reporting command (SPEC 9.8). `command` selects which \
              branch applies, and `data` is that command's own payload.",
         "oneOf": branches,
         "$defs": defs,
@@ -758,6 +760,8 @@ mod tests {
     /// `Observation`s, and nothing else. `TypeRoutine` retains the saved
     /// plan's closed source-record shape (DEC-2181.2). Dependency records
     /// retain their closed saved shape and three-part map-key grammar.
+    /// Data-work identities and records retain their closed ledger shape so
+    /// unknown audit metadata cannot be silently discarded (DEC-2402.1).
     #[test]
     fn only_the_named_envelope_objects_constrain_unnamed_properties() {
         let constrained = constrained_objects(&schema(SchemaKind::Envelope));
@@ -765,6 +769,9 @@ mod tests {
         assert_eq!(
             names,
             [
+                "DataWorkIdentity/oneOf/0",
+                "DataWorkIdentity/oneOf/1",
+                "DataWorkRecord",
                 "Dependency",
                 "DependencyColumn",
                 "Discovery/properties/observations",

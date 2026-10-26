@@ -55,7 +55,7 @@ pub(super) fn assess(
     };
     let Some(revision) = revision else {
         return Ok(Some(unchecked(
-            "the ledger has no retained non-failed entry".into(),
+            "the ledger has no retained schema-establishing entry".into(),
         )));
     };
     let Some(sha) = revision.git_sha.as_ref() else {
@@ -435,7 +435,7 @@ mod tests {
         );
         assert_eq!(
             assess(&root, "db", None, &[]).unwrap().unwrap().message,
-            "Checkout ancestry was not checked for `db`: the ledger has no retained non-failed entry. Planning continues without checkout-ancestry protection."
+            "Checkout ancestry was not checked for `db`: the ledger has no retained schema-establishing entry. Planning continues without checkout-ancestry protection."
         );
         let mut revision = revision;
         revision.git_sha = Some("a".repeat(40).into());

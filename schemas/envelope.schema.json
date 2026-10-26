@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "pbps --format json envelope",
-  "description": "One envelope per read-only command (SPEC 9.8). `command` selects which branch applies, and `data` is that command's own payload.",
+  "description": "One findings envelope per reporting command (SPEC 9.8). `command` selects which branch applies, and `data` is that command's own payload.",
   "oneOf": [
     {
       "$ref": "#/$defs/envelope.plan"
@@ -26,6 +26,9 @@
     },
     {
       "$ref": "#/$defs/envelope.state-list"
+    },
+    {
+      "$ref": "#/$defs/envelope.state-record-data-work"
     },
     {
       "$ref": "#/$defs/envelope.state-show"
@@ -2562,6 +2565,147 @@
       "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
       "type": "object"
     },
+    "RecordedDataWorkData": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string"
+        },
+        "entry_id": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "self_reported": {
+          "type": "boolean"
+        },
+        "data_work": {
+          "$ref": "#/$defs/DataWorkRecord"
+        }
+      },
+      "required": [
+        "environment",
+        "entry_id",
+        "self_reported",
+        "data_work"
+      ]
+    },
+    "DataWorkRecord": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/DataWorkIdentity"
+        },
+        "expand_checksum": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/DataWorkOutcome"
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "expand_checksum",
+        "outcome"
+      ]
+    },
+    "DataWorkIdentity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "script"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "path",
+            "sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "external_version"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "version"
+          ]
+        }
+      ]
+    },
+    "DataWorkOutcome": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed"
+      ]
+    },
+    "envelope.state-record-data-work": {
+      "required": [
+        "schema_version",
+        "tool_version",
+        "command",
+        "result",
+        "findings"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "command": {
+          "const": "state record-data-work"
+        },
+        "result": {
+          "description": "Derived from the findings rather than set by the caller, so it cannot\ncome to disagree with them — except for [`Outcome::Unanswerable`], which\nno finding can imply and which the command marks explicitly with\n[`Report::unanswerable`].",
+          "$ref": "#/$defs/Outcome"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Finding"
+          }
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecordedDataWorkData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "What a read-only command produced.\n\nGeneric over the payload so a command with one — `verify`'s drift report,\n`status`'s environment rows — carries it without inventing a second\nenvelope. Commands with nothing but diagnostics use [`Report::plain`].",
+      "type": "object"
+    },
     "ShowData": {
       "type": "object",
       "properties": {
@@ -2788,6 +2932,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 63,
+  "x-pbps-schema-version": 64,
   "x-pbps-tool-version": "0.0.0"
 }

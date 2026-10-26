@@ -1199,3 +1199,47 @@ PR C advances state/plan/schema-set to 28/45/52 for authored policy predicates a
 <a id="dec-1523-2"></a>
 
 **DEC-1523.2. State 29 admits type references; plan 46 requires their pins; published schema set 53 adds trusted_roles.** States 6–28 remain readable. Measured on 16 and 18, a referenced domain remains a domain in the column catalog: an older reader's omission cannot represent the new state. Plans require the current version so an older apply cannot skip prerequisites.
+
+
+<a id="dec-2402-1"></a>
+
+**DEC-2402.1. External data work is a self-reported ledger event, carrying the
+previous managed state and never establishing schema provenance.**
+`state record-data-work` records either a script path and SHA-256 of the bytes
+read now, or a nonblank external version (at most 1024 UTF-8 bytes). It never
+executes the script, verifies the reported result, or changes reference data.
+The report requires a retained `apply` row with its expand checksum in this
+target ledger, checked under the ordinary apply/baseline lock; baseline,
+bootstrap, staged, failed and data-work rows cannot supply that evidence.
+Pruned evidence refuses, as does a missing, empty or unreadable previous
+snapshot. A staged checkpoint must be finished or explicitly baselined first.
+There is no built-in contract assertion here; #2401 owns plan-time assertions.
+
+The `data_work` kind carries identity, expand checksum, `completed`/`failed`
+outcome and optional notes (at most 4096 UTF-8 bytes) in `state_json`. Explicit
+reason and operator use the existing fields and storage bounds, including
+DEC-2330.1's operator precedence. Bounds refuse rather than truncate. Recording
+a failed outcome successfully exits 0. The reporting checkout's Git SHA is
+audit metadata; top-level `plan_checksum` is absent because no plan ran.
+Schema, identities, declared expressions/bindings, module dependencies and
+baseline evidence are copied from the newest snapshot under the lock. A later
+failed apply clears this report payload when constructing its own audit row.
+
+Snapshot version 34 introduces this optional payload; versions 6–33 retain
+their original meaning and remain readable, with no data-work record. Appending
+constructs a version-34 snapshot without rewriting old rows. A data-work payload
+in an earlier version is malformed. The free-text kind already fits both
+engines' tables, so this adds no columns or DDL. Existing legacy projection
+migration remains unchanged. Older clients refuse version 34 before parsing.
+`state list` retains projected-only reads and shows the new kind, operator and
+reason; `state show` carries the complete record. The recording command uses
+the findings envelope. Published schema set 64 is ordered after #2432's 63,
+with a complete new archive and no changes to prior archives (DECISIONS 465).
+
+`StateKind::establishes_schema()` exhaustively classifies Apply, Baseline,
+Bootstrap and Staged as schema evidence, and Failed and DataWork as audit-only.
+Both engines bind an SQL allowlist derived from this match, bounded by the
+snapshot ID already observed. The planning shortcut uses the same method;
+no reporting checkout can replace deployed-commit evidence (DEC-2397.1).
+Drift/verify and ordinary baseline reads still use the newest managed snapshot.
+A data-work outcome does not acquire failed-deployment or resume semantics.

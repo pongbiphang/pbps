@@ -18,7 +18,7 @@ use pbps_db::ledger::{
     LedgerEntry, LedgerError, LockInfo, TimelineEntry, TimelineStaged, TimelineState, ids_to_prune,
 };
 use pbps_db::{Conn, DbError, Param};
-use pbps_model::{StateSnapshot, Unreadable};
+use pbps_model::{StateKind, StateSnapshot, Unreadable};
 
 use crate::catalog::{get, opt};
 
@@ -480,10 +480,18 @@ pub async fn deployed_revision(
     conn: &mut Conn,
     observed_id: i64,
 ) -> Result<Option<pbps_db::ledger::StateRevision>, LedgerError> {
-    let rows = conn.query_with(
-        "SELECT TOP (1) id, git_sha FROM dbo.__pbps_state WHERE id <= @P1 AND kind <> N'failed' ORDER BY id DESC",
-        &[observed_id.into()],
-    ).await?;
+    let allowed: Vec<_> = StateKind::ALL
+        .iter()
+        .copied()
+        .filter(|kind| kind.establishes_schema())
+        .collect();
+    let kinds = (0..allowed.len())
+        .map(|i| format!("@P{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params: Vec<Param<'_>> = vec![observed_id.into()];
+    params.extend(allowed.iter().map(|kind| Param::from(kind.as_str())));
+    let rows = conn.query_with(&format!("SELECT TOP (1) id, git_sha FROM dbo.__pbps_state WHERE id <= @P1 AND kind IN ({kinds}) ORDER BY id DESC"), &params).await?;
     rows.first()
         .map(|row| {
             Ok(pbps_db::ledger::StateRevision {
@@ -492,6 +500,12 @@ pub async fn deployed_revision(
             })
         })
         .transpose()
+}
+
+/// A retained successful apply is the evidence for an expand, not a baseline
+/// or another report that happens to name the same checksum (DEC-2402.1).
+pub async fn has_applied_plan(conn: &mut Conn, checksum: &str) -> Result<bool, LedgerError> {
+    Ok(!conn.query_with("SELECT TOP (1) id FROM dbo.__pbps_state WHERE kind = @P1 AND plan_checksum = @P2 ORDER BY id DESC", &[StateKind::Apply.as_str().into(), checksum.into()]).await?.is_empty())
 }
 
 /// A selected historical entry, or the newest when no id is supplied.
@@ -675,6 +689,12 @@ fn saturating_i32(n: u64) -> i32 {
 /// and a caller able to set them independently could make them lie. The five
 /// issue #103 added follow the same rule (DECISIONS 435).
 pub async fn record(conn: &mut Conn, snapshot: &StateSnapshot) -> Result<i64, LedgerError> {
+    snapshot
+        .validate_data_work()
+        .map_err(|e| LedgerError::BadEntry {
+            id: 0,
+            message: e.to_string(),
+        })?;
     ensure_tables(conn).await?;
     let snapshot = &*bounded_operator(snapshot);
     let state_json = serde_json::to_string(snapshot).map_err(|e| LedgerError::BadEntry {
