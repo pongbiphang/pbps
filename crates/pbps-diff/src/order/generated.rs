@@ -528,6 +528,7 @@ fn texts(change: &Change) -> Vec<&str> {
             .columns
             .values()
             .flat_map(column)
+            .chain(table.computed.values().map(|c| c.expression.as_str()))
             .chain(table.checks.values().map(|c| c.expression.as_str()))
             .chain(
                 table
@@ -544,6 +545,7 @@ fn texts(change: &Change) -> Vec<&str> {
             }))
             .collect(),
         Change::AddColumn { column: c, .. } => column(c),
+        Change::AddComputedColumn { computed, .. } => vec![&computed.expression],
         Change::AlterColumnExpression { to, .. } => vec![to],
         Change::AlterColumnDefault { to, .. } => to.as_deref().into_iter().collect(),
         Change::SetPartitionDefault { to, fallback, .. } => {
@@ -595,7 +597,6 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::RenameColumn { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnNumbering { .. }
-        | Change::AddComputedColumn { .. }
         | Change::DropComputedColumn { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetReplicaIdentity { .. }
@@ -634,6 +635,46 @@ fn texts(change: &Change) -> Vec<&str> {
 
 /// Constraints on the parts, not a second ordering algorithm. The caller
 /// includes these in the schedule it already settles.
+/// The columns of `table` that every one of `texts` may read, for an engine
+/// that can say, and `None` where any text cannot be read that way (unknown,
+/// or a projection of every column), which keeps the whole-shape rule.
+fn reads(
+    dialect: &(impl Dialect + ?Sized),
+    texts: &[&str],
+    table: &TableName,
+) -> Option<BTreeSet<String>> {
+    let mut named = BTreeSet::new();
+    for text in texts {
+        named.extend(dialect.generation_column_names(text, table)?);
+    }
+    Some(named)
+}
+
+/// A reader of only some columns waits for the first part and for the part
+/// of each late column it names, not for the columns it does not.
+fn wait_for(
+    dialect: &(impl Dialect + ?Sized),
+    out: &mut Schedule,
+    first: usize,
+    own: &[(usize, &PlannedChange)],
+    columns: &BTreeSet<String>,
+    reader: usize,
+) {
+    let mut wait = |before: usize| {
+        if before != reader {
+            out.edge(before, reader, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    wait(first);
+    for (part, p) in own {
+        if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } = &p.change
+            && columns.contains(&dialect.generation_column_key(name.raw()))
+        {
+            wait(*part);
+        }
+    }
+}
+
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn constraints(
     cs: &ChangeSet,
@@ -677,13 +718,30 @@ pub fn constraints(
                 }
             }
         }
+        // A computed column is added after every column before it, and in
+        // declared order: the engine appends it, and its position is compared
+        // as reported, so adding `d` before `c` would reproduce the target's
+        // columns in another order.
+        for column in full.computed.keys() {
+            for (i, p) in &own {
+                if matches!(&p.change, Change::AddComputedColumn { name, .. } if name == column) {
+                    edge(&mut out, previous, *i);
+                    previous = *i;
+                }
+            }
+        }
         let complete = previous;
+        // The prefix holds every column the table declares, computed ones
+        // included, so the first part is already the complete shape.
+        let whole = prefix.columns.len() == full.columns.len()
+            && prefix.computed.len() == full.computed.len();
         for (i, p) in &own {
             edge(&mut out, first, *i);
             if !matches!(
                 &p.change,
                 Change::CreateTable { .. }
                     | Change::AddColumn { .. }
+                    | Change::AddComputedColumn { .. }
                     | Change::AlterColumnExpression { .. }
             ) {
                 edge(&mut out, complete, *i);
@@ -716,7 +774,7 @@ pub fn constraints(
             for (function, id, _) in &modules {
                 if texts(&p.change)
                     .iter()
-                    .any(|t| dialect.generation_may_call(t, id.name()))
+                    .any(|t| dialect.generation_calls(t, id))
                 {
                     edge(&mut out, *function, *i);
                 }
@@ -734,6 +792,7 @@ pub fn constraints(
                 for (part, p) in &own {
                     match &p.change {
                         Change::AddColumn { .. }
+                        | Change::AddComputedColumn { .. }
                         | Change::AlterColumnExpression { .. }
                         | Change::AlterColumnDefault { .. } => edge(&mut out, *part, i),
                         Change::CreateTable { .. } => {}
@@ -758,11 +817,7 @@ pub fn constraints(
                 let name_only = references
                     .iter()
                     .all(|text| dialect.generation_table_name_only(text, name));
-                let shape = if name_only || prefix.columns.len() == full.columns.len() {
-                    first
-                } else {
-                    complete
-                };
+                let shape = if name_only || whole { first } else { complete };
                 edge(&mut out, shape, i);
             }
         }
@@ -792,12 +847,11 @@ pub fn constraints(
             if dialect.generation_names_table(&module.definition, name) {
                 // Called readers already chose a full-shape placeholder or
                 // the whole-table hold; every consumer sees that full shape.
-                let shape = if prefix.columns.len() == full.columns.len() {
-                    first
+                if let Some(columns) = reads(dialect, &[module.definition.as_str()], name) {
+                    wait_for(dialect, &mut out, first, &own, &columns, *i);
                 } else {
-                    complete
-                };
-                edge(&mut out, shape, *i);
+                    edge(&mut out, if whole { first } else { complete }, *i);
+                }
             }
         }
     }

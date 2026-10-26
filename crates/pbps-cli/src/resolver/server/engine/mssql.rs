@@ -7,6 +7,7 @@ use crate::resolver::scope;
 use pbps_db::resolver::ScratchNames;
 use pbps_db::resolver::environment::CatalogFacts;
 use pbps_db::{Conn, Driver};
+use pbps_mssql::resolver::reconstruct::{ReconstructError, Reconstruction};
 use pbps_mssql::resolver::{
     self, authorization as auth, capture, dependencies, externals, scratch as sql,
 };
@@ -42,33 +43,75 @@ pub(in crate::resolver::server) struct Scratch<'a> {
 pub(in crate::resolver::server) struct Prepared {
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "#2238 seals dependency rehearsal placement")
+        expect(dead_code, reason = "#2376 seals dependency rehearsal placement")
     )]
     pub(in crate::resolver::server) dependencies: dependencies::Rehearsals,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the compile connection handoff is consumed by #2238"
-        )
-    )]
+    /// The reproduced deployer, entered from the sandbox: the declarations
+    /// compile here and nowhere else. It cannot leave its context, so a read
+    /// that needs more than the deployer may see opens [`Reach::open`].
     pub(in crate::resolver::server) compile: Conn,
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the principal map handoff is consumed by #2238")
+        expect(dead_code, reason = "the principal map is sealed by #2143")
     )]
     pub(in crate::resolver::server) map: scope::Principals,
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "the accepted inventory handoff is consumed by #2238"
-        )
+        expect(dead_code, reason = "the accepted inventory is sealed by #2143")
     )]
     pub(in crate::resolver::server) inventory: externals::Inventory,
     pub(in crate::resolver::server) staged: capture::Staged,
     pub(super) scratch_catalog: CatalogFacts,
     pub(super) differences: Vec<String>,
+    reach: Reach,
+}
+
+impl Prepared {
+    /// A copy of what reopens the scratch: `Prepared` holds the deployer's
+    /// connection, so a borrow of it cannot be held across an await.
+    pub(super) fn reach(&self) -> Reach {
+        self.reach.clone()
+    }
+}
+
+/// What reaches the scratch database again, bounded as the sandbox is:
+/// every fact `Scratch::bounded` re-verifies on a fresh connection.
+#[derive(Clone)]
+pub(super) struct Reach {
+    connection: String,
+    mark: sql::SessionMark,
+    acquired: Option<sql::Database>,
+    database: String,
+    sandbox: String,
+    databases: Vec<String>,
+}
+
+impl Reach {
+    async fn open(&self) -> Result<Conn, Error> {
+        let mut conn = Conn::connect(Driver::Mssql, &self.connection)
+            .await
+            .map_err(read)?;
+        if !sql::marked(&mut conn, &self.mark).await.map_err(read)? {
+            return Err(Error::Unusable(
+                "the staging session does not reach the marked instance".into(),
+            ));
+        }
+        sql::use_database(&mut conn, &self.database)
+            .await
+            .map_err(read)?;
+        if self.acquired.as_ref() != Some(&sql::database(&mut conn).await.map_err(read)?) {
+            return Err(Error::Unusable(
+                "the staging database changed after acquisition".into(),
+            ));
+        }
+        sql::enter_sandbox(&mut conn, &self.sandbox)
+            .await
+            .map_err(read)?;
+        sql::sandbox_checks(&mut conn, &self.databases, &self.database)
+            .await
+            .map_err(read)?;
+        Ok(conn)
+    }
 }
 
 pub(in crate::resolver::server) struct Acquired {
@@ -119,6 +162,50 @@ pub(in crate::resolver::server) async fn preview<'a>(
 
 fn read(error: pbps_db::DbError) -> Error {
     Error::Read(error.to_string())
+}
+
+/// A keyed fingerprint of what the engine reports about its build: product
+/// version, level and update level. The rule compares the same facts
+/// (`mssql-reported-scope-v2`); nothing reads an executable. An RTM build has
+/// no update level, and that known absence is part of the fingerprint.
+pub(super) fn reported_build(
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    catalog: &CatalogFacts,
+) -> Result<String, Error> {
+    let reported = |name: &str| {
+        catalog
+            .observations
+            .get(name)
+            .ok_or_else(|| Error::Scope(format!("{name} was not reported")))
+    };
+    let required = |name: &str| {
+        reported(name)?
+            .value()
+            .ok_or_else(|| Error::Scope(format!("{name} was not reported")))
+    };
+    // An unreadable update level is not the RTM build's known absence.
+    let update_level = match reported("product_update_level")? {
+        pbps_db::resolver::Observation::Observed { value } => Some(value.as_str()),
+        pbps_db::resolver::Observation::NotReported => None,
+        pbps_db::resolver::Observation::Unknown { reason } => {
+            return Err(Error::Scope(format!(
+                "product_update_level could not be read: {reason}"
+            )));
+        }
+    };
+    let build = (
+        required("product_version")?,
+        required("product_level")?,
+        update_level,
+    );
+    let bytes = serde_json::to_vec(&build)
+        .map_err(|_| Error::Scope("the reported build cannot be encoded".into()))?;
+    Ok(super::super::producer::fingerprint(
+        key,
+        "pbps/mssql-reported-build/v1",
+        "reported",
+        &bytes,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,6 +723,7 @@ impl Scratch<'_> {
             staged,
             scratch_catalog,
             differences,
+            reach: self.reach(&database, &sandbox, &databases),
         })
     }
 
@@ -645,25 +733,18 @@ impl Scratch<'_> {
         sandbox: &str,
         databases: &[String],
     ) -> Result<Conn, Error> {
-        let mut conn = Conn::connect(Driver::Mssql, self.connection)
-            .await
-            .map_err(read)?;
-        if !sql::marked(&mut conn, &self.mark).await.map_err(read)? {
-            return Err(Error::Unusable(
-                "the staging session does not reach the marked instance".into(),
-            ));
+        self.reach(database, sandbox, databases).open().await
+    }
+
+    fn reach(&self, database: &str, sandbox: &str, databases: &[String]) -> Reach {
+        Reach {
+            connection: self.connection.to_owned(),
+            mark: self.mark.clone(),
+            acquired: self.acquired.clone(),
+            database: database.to_owned(),
+            sandbox: sandbox.to_owned(),
+            databases: databases.to_vec(),
         }
-        sql::use_database(&mut conn, database).await.map_err(read)?;
-        if self.acquired.as_ref() != Some(&sql::database(&mut conn).await.map_err(read)?) {
-            return Err(Error::Unusable(
-                "the staging database changed after acquisition".into(),
-            ));
-        }
-        sql::enter_sandbox(&mut conn, sandbox).await.map_err(read)?;
-        sql::sandbox_checks(&mut conn, databases, database)
-            .await
-            .map_err(read)?;
-        Ok(conn)
     }
 
     pub(in crate::resolver::server) async fn release(
@@ -801,5 +882,358 @@ fn stage_error(error: capture::StageError) -> Error {
     match error {
         capture::StageError::Refused(findings) => Error::Externals(findings),
         capture::StageError::Capture(error) => capture_error(error),
+    }
+}
+
+/// How many times both sides are read before the scope of their runtime-bound
+/// names is declared not to settle. Each pass adds only candidate sets, which
+/// are finite, so a pass past the second means a candidate brought a module
+/// of its own.
+const SETTLING_READS: usize = 8;
+
+/// What a failed scratch compilation is. A declaration that did not compile
+/// is the binding's verdict; a statement the server or connection
+/// interrupted answered nothing about it (SPEC 9.8, #1597).
+pub(super) fn compile_failed(error: ReconstructError) -> Error {
+    match error {
+        ReconstructError::Interrupted { .. } => Error::Read(error.to_string()),
+        ReconstructError::Unsupported(_)
+        | ReconstructError::Emit { .. }
+        | ReconstructError::Compile { .. }
+        | ReconstructError::Cycle(_) => Error::Binding(error.to_string()),
+    }
+}
+
+/// The private reconstruction, and what the two captures of its run read.
+pub(in crate::resolver::server) struct Binding {
+    reconstruction: Reconstruction,
+    /// The roots both sides' declarations name.
+    managed: capture::CaptureScope,
+    declarations: pbps_model::dependency::Dependencies,
+}
+
+/// The compiled scratch capture and the exact scope its opening read uses.
+pub(in crate::resolver::server) struct Closing {
+    #[expect(dead_code, reason = "#2375 assesses the compiled scratch capture")]
+    captured: capture::CapturedInputs,
+    /// The target's own roots and the candidates both sides settled on.
+    target_scope: capture::CaptureScope,
+    namespaces: BTreeSet<String>,
+}
+
+/// `scope` with only the roots `captured` holds. A manifest requires every
+/// retained root to be among its prerequisites, and a root only one side has,
+/// a new object on scratch or a dropped one on the target, is absent on the
+/// other: asked for and not found, it would be sealed as an incomplete read.
+fn held(
+    scope: &capture::CaptureScope,
+    captured: &capture::CapturedInputs,
+) -> capture::CaptureScope {
+    let present: BTreeSet<_> = captured.objects().collect();
+    capture::CaptureScope {
+        retained: scope
+            .retained
+            .iter()
+            .filter(|root| present.contains(root))
+            .cloned()
+            .collect(),
+        candidates: scope.candidates.clone(),
+    }
+}
+
+impl Scratch<'_> {
+    pub(super) fn reconstruction(
+        &self,
+        binding: &BindingRequest<'_>,
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
+    ) -> Result<Binding, Error> {
+        let reconstruction =
+            Reconstruction::new(&pbps_mssql::Mssql, binding.bootstrap, ids, dependencies)
+                .map_err(compile_failed)?;
+        Ok(Binding {
+            reconstruction,
+            managed: capture::managed_scope(&[binding.base, binding.desired]),
+            declarations: binding.dependencies.clone(),
+        })
+    }
+}
+
+impl Binding {
+    pub(super) fn len(&self) -> usize {
+        self.reconstruction.len()
+    }
+
+    /// Compiles `steps` as the reproduced deployer, each statement in its own
+    /// batch and autocommit (measured on 17.0, `reconstruct.rs`).
+    pub(super) async fn compile(
+        &self,
+        prepared: &mut Prepared,
+        steps: std::ops::Range<usize>,
+    ) -> Result<(), Error> {
+        self.reconstruction
+            .compile_steps(&mut prepared.compile, steps)
+            .await
+            .map_err(compile_failed)
+    }
+
+    /// Reads the compiled scratch on a fresh bounded sandbox connection: the
+    /// deployer's cannot leave its context and may lack `VIEW DEFINITION`.
+    ///
+    /// Both captures are made under one scope. A runtime-bound name needs its
+    /// candidates in the scope, and a module only the target holds, one the
+    /// plan drops, binds names scratch never read, so the scope settles over
+    /// what each side reads before anything is sealed.
+    pub(super) async fn capture_desired(
+        &self,
+        reach: Reach,
+        target: &mut Conn,
+        schemas: &[String],
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        desired: pbps_diff::Side<'_>,
+        staged: &capture::Staged,
+    ) -> Result<Closing, Error> {
+        let mut scratch = reach.open().await?;
+        let mut scope = self.managed.clone();
+        // The staged scope already holds every root the comparison accepted.
+        scope
+            .retained
+            .extend(staged.scope().retained.iter().cloned());
+        scope
+            .candidates
+            .extend(staged.scope().candidates.iter().cloned());
+        let mut settled = None;
+        for _ in 0..SETTLING_READS {
+            let on_scratch = capture::capture_declared(&mut scratch, &scope, &self.declarations)
+                .await
+                .map_err(super::catalog_read_failed)?;
+            let on_target = capture::capture_declared(target, &scope, &self.declarations)
+                .await
+                .map_err(super::catalog_read_failed)?;
+            let mut next = on_scratch.runtime_scope();
+            next.candidates.extend(on_target.runtime_scope().candidates);
+            if next == scope {
+                settled = Some((held(&scope, &on_scratch), held(&scope, &on_target)));
+                break;
+            }
+            scope = next;
+        }
+        let Some((scratch_scope, target_scope)) = settled else {
+            return Err(Error::Read(
+                "the candidates of the runtime-bound names did not settle".into(),
+            ));
+        };
+        let namespaces: BTreeSet<String> = schemas.iter().cloned().collect();
+        let recorded = capture::RecordedOwnership {
+            schema: desired.schema,
+            ids: desired.ids,
+            namespaces: &namespaces,
+        };
+        let (captured, _) = capture::capture_qualified_declared(
+            &mut scratch,
+            &scratch_scope,
+            &self.declarations,
+            key,
+            &recorded,
+        )
+        .await
+        .map_err(super::catalog_read_failed)?;
+        let present: BTreeSet<_> = captured.objects().collect();
+        if let Some(made) = self.reconstruction.absent_from(&present).first() {
+            return Err(Error::Read(format!(
+                "the compiled {:?} is absent from the scratch capture",
+                made.name
+            )));
+        }
+        Ok(Closing {
+            captured,
+            target_scope,
+            namespaces,
+        })
+    }
+
+    pub(super) async fn capture_opening(
+        &self,
+        target: &mut Conn,
+        closing: &Closing,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+        base: pbps_diff::Side<'_>,
+    ) -> Result<(capture::CapturedInputs, pbps_model::resolver::InputManifest), Error> {
+        let recorded = capture::RecordedOwnership {
+            schema: base.schema,
+            ids: base.ids,
+            namespaces: &closing.namespaces,
+        };
+        capture::capture_qualified_declared(
+            target,
+            &closing.target_scope,
+            &self.declarations,
+            key,
+            &recorded,
+        )
+        .await
+        .map_err(super::catalog_read_failed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pbps_db::resolver::Observation;
+    use pbps_db::resolver::environment::Verdict;
+
+    fn facts(entries: &[(&str, Option<&str>)]) -> CatalogFacts {
+        CatalogFacts {
+            observations: entries
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), Observation::reported(*value)))
+                .collect(),
+            extensions: Vec::new(),
+            available_extensions: BTreeMap::new(),
+            collations: Vec::new(),
+            settings: BTreeMap::new(),
+            visibility: BTreeMap::new(),
+        }
+    }
+
+    // A key file's owner-only permission is provable only on Unix, and the
+    // environment route would need `set_var`, which the workspace forbids as
+    // unsafe; scope.rs gates its key-backed case the same way.
+    #[cfg(unix)]
+    fn key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!("pbps2374-key-{}", rand::random::<u64>()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+            .unwrap();
+        let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        key
+    }
+
+    /// The run asks the SQL Server rule, not the PostgreSQL one and not an
+    /// error: a hosted family is named, and nothing maps it to a boxed build.
+    #[test]
+    fn a_hosted_family_refuses_by_name_through_the_run_scope_check() {
+        let boxed = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("engine_edition", Some("3")),
+        ]);
+        let hosted = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("engine_edition", Some("5")),
+        ]);
+        let report = scope::compare_reported(Driver::Mssql, &boxed, &hosted).unwrap();
+        assert_eq!(report.rule.as_str(), resolver::compatibility::REPORTED_RULE);
+        let Verdict::Unknown(unknown) = report.verdict() else {
+            panic!(
+                "a hosted family is not a boxed build: {:?}",
+                report.verdict()
+            );
+        };
+        assert_eq!(unknown, ["engine_edition"], "{:?}", report.facts);
+        // A boxed edition difference is a recorded limitation, not a fact
+        // that differs: the target's own edition checks stay the authority.
+        let express = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("engine_edition", Some("4")),
+            ("edition", Some("Express Edition (64-bit)")),
+        ]);
+        let developer = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("engine_edition", Some("3")),
+            ("edition", Some("Enterprise Developer Edition (64-bit)")),
+        ]);
+        let report = scope::compare_reported(Driver::Mssql, &developer, &express).unwrap();
+        assert!(
+            report.limitations["edition"].contains("Express Edition"),
+            "{:?}",
+            report.limitations
+        );
+        assert!(!report.facts.values().any(|fact| matches!(
+            fact,
+            pbps_db::resolver::environment::FactStatus::Mismatch { .. }
+        )));
+        // Another engine's rule is not this one.
+        assert_ne!(
+            super::super::reported_rule(Driver::Postgres).unwrap(),
+            super::super::reported_rule(Driver::Mssql).unwrap()
+        );
+    }
+
+    /// The build is what the rule compares: version, level and update level.
+    /// An RTM build's absent update level is a known absence; an unreadable
+    /// one is no fingerprint at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_reported_build_moves_with_version_level_and_update_and_refuses_unreadable_ones() {
+        let key = key();
+        let build = |version: &str, level: &str, update: Option<&str>| {
+            reported_build(
+                &key,
+                &facts(&[
+                    ("product_version", Some(version)),
+                    ("product_level", Some(level)),
+                    ("product_update_level", update),
+                ]),
+            )
+        };
+        let rtm = build("17.0.4075.5", "RTM", None).unwrap();
+        assert_eq!(rtm, build("17.0.4075.5", "RTM", None).unwrap());
+        for different in [
+            build("17.0.4075.6", "RTM", None),
+            build("17.0.4075.5", "CU1", None),
+            build("17.0.4075.5", "RTM", Some("CU1")),
+        ] {
+            assert_ne!(rtm, different.unwrap());
+        }
+        let mut unreadable = facts(&[
+            ("product_version", Some("17.0.4075.5")),
+            ("product_level", Some("RTM")),
+        ]);
+        unreadable.observations.insert(
+            "product_update_level".into(),
+            Observation::Unknown {
+                reason: "denied".into(),
+            },
+        );
+        assert!(matches!(
+            reported_build(&key, &unreadable),
+            Err(Error::Scope(_))
+        ));
+        let missing = facts(&[("product_level", Some("RTM"))]);
+        assert!(matches!(
+            reported_build(&key, &missing),
+            Err(Error::Scope(_))
+        ));
+    }
+
+    /// A statement the server or connection interrupted answered nothing
+    /// about the declaration, so it is a read failure and not a verdict.
+    #[test]
+    fn an_interrupted_compile_is_a_read_failure_and_a_failed_statement_a_verdict() {
+        assert!(matches!(
+            compile_failed(ReconstructError::Interrupted {
+                declaration: "view dbo.v".into(),
+                reason: "deadlock victim".into(),
+            }),
+            Error::Read(_)
+        ));
+        for verdict in [
+            ReconstructError::Compile {
+                declaration: "view dbo.v".into(),
+                reason: "Invalid object name".into(),
+            },
+            ReconstructError::Unsupported("drop_table".into()),
+            ReconstructError::Cycle("dbo.t".into()),
+        ] {
+            assert!(matches!(compile_failed(verdict), Error::Binding(_)));
+        }
     }
 }

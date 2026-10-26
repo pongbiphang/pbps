@@ -22,7 +22,8 @@
 //! is qualified under the compatibility rule that compares what each engine
 //! reports about itself.
 //! SQL Server records its run-owned resources before creation too, executes
-//! setup and externals in NO REVERT sandboxes, and refuses at reconstruction (#2238).
+//! setup and externals in NO REVERT sandboxes, compiles as the reproduced deployer, and
+//! refuses where planning from evidence begins (#2143).
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
@@ -316,7 +317,6 @@ impl Run<'_> {
                 pbps_db::resolver::Observation::Observed { value: build },
             );
         }
-        prepared.require_reconstruction()?;
         let mut report = scope::compare_reported(driver, &target_catalog, prepared.catalog())
             .map_err(Error::Scope)?;
         for key in prepared.differences() {
@@ -351,7 +351,7 @@ impl Run<'_> {
                 .compare_externals(provisioning, &mut prepared, admin, target, &reconstruction)
                 .await?
         } else {
-            engine::staged(driver)?
+            engine::staged(driver, &prepared)?
         };
         #[cfg(test)]
         if let Ok(Some(sql)) = AFTER_STAGING.try_with(Clone::clone) {
@@ -432,6 +432,7 @@ impl Run<'_> {
             .capture_desired(
                 &mut prepared,
                 admin,
+                target,
                 extras,
                 &target_catalog.visibility,
                 &request.schemas,
@@ -453,7 +454,7 @@ impl Run<'_> {
                 changed.join("; ")
             )));
         }
-        let assessment = reconstruction.assess(&compiled, &current, &staged);
+        let assessment = reconstruction.assess(&compiled, &current, &staged)?;
         let records = compiled
             .planning_records()
             .map_err(|error| Error::Binding(error.to_string()))?;

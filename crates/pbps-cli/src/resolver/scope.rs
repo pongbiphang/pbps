@@ -203,7 +203,7 @@ pub(crate) fn recipe(
 }
 
 /// [`compare`] without executables: the resolver's rule,
-/// which observes no process (#1672). SQL Server has no such rule yet.
+/// which observes no process (#1672).
 pub(crate) fn compare_reported(
     driver: Driver,
     target: &CatalogFacts,
@@ -213,7 +213,9 @@ pub(crate) fn compare_reported(
         Driver::Postgres => Ok(pbps_pg::resolver::compatibility::compare_reported(
             target, resolver,
         )),
-        Driver::Mssql => Err("the resolver has no SQL Server rule".into()),
+        Driver::Mssql => Ok(pbps_mssql::resolver::compatibility::compare_reported(
+            target, resolver,
+        )),
     }
 }
 

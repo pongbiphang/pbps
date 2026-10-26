@@ -965,7 +965,7 @@ real object under the ordinary transaction boundary.
 
 The per-dependency placement, shape source and verification outcome live in
 SQL Server's typed preparation handoff (DEC-2323.1). This adds no saved-plan
-field or Schema member; #2238 seals the outcome later. The resolver's refusal
+field or Schema member; #2376 carries the outcome into sealed evidence. The resolver's refusal
 of undeclared managed three-part references and DEC-619.3's sandbox boundary
 are unchanged. Apply continues to bind the real objects in its transaction.
 

@@ -36,6 +36,7 @@ pub mod doctor;
 pub mod edition;
 pub mod emit;
 pub mod estimate;
+mod generated;
 pub mod ident;
 pub mod impact;
 pub mod introspect;
@@ -149,6 +150,32 @@ impl Dialect for Mssql {
 
     fn name(&self) -> &'static str {
         types::DIALECT
+    }
+
+    fn generated_table_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        _needs_complete_shape: bool,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        generated::parts(self, change, ids, functions)
+    }
+
+    fn generation_calls(&self, text: &str, function: &pbps_model::ModuleId) -> bool {
+        generated::calls(self, text, function)
+    }
+
+    fn generation_column_names(
+        &self,
+        text: &str,
+        _table: &pbps_model::TableName,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        generated::column_names(self, text)
+    }
+
+    fn generation_column_key(&self, name: &str) -> String {
+        generated::name_key(name)
     }
 
     /// What SQL Server's catalog refuses beyond the portable effects

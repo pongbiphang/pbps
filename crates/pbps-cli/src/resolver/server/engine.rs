@@ -25,6 +25,12 @@ pub(super) use pbps_pg::resolver::capture::BindingRecord;
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 
+/// Where a SQL Server run stops: reconstruction, the compiled capture and
+/// the target's opening capture exist, and planning from their evidence is
+/// #2143. The first step that needs it, assessment, names it.
+const PLANNING_FROM_EVIDENCE: &str =
+    "SQL Server planning from evidence is not implemented yet (#2143)";
+
 fn unsupported() -> Error {
     Error::Binding("the resolver is implemented for PostgreSQL only".into())
 }
@@ -59,23 +65,22 @@ pub(super) enum Prepared {
 }
 pub(super) enum Binding {
     Postgres(postgres::Binding),
+    Mssql(mssql::Binding),
 }
 pub(super) enum Chained {
     Postgres(pbps_pg::resolver::externals::Created),
 }
 pub(super) enum Staged {
     Postgres(pbps_pg::resolver::capture::Staged),
-    #[expect(
-        dead_code,
-        reason = "accepted SQL Server capture consumers are implemented by #2238"
-    )]
     Mssql(pbps_mssql::resolver::capture::Staged),
 }
 pub(super) enum CompiledCapture {
-    Postgres(postgres::Closing),
+    Postgres(Box<postgres::Closing>),
+    Mssql(Box<mssql::Closing>),
 }
 pub(super) enum CapturedInputs {
     Postgres(pbps_pg::resolver::capture::CapturedInputs),
+    Mssql(pbps_mssql::resolver::capture::CapturedInputs),
 }
 
 pub fn declared_standard(
@@ -194,9 +199,9 @@ impl Scratch<'_> {
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
         match self {
-            Self::Mssql(_) => Err(Error::Binding(
-                "SQL Server resolver reconstruction is not implemented yet (#2238)".into(),
-            )),
+            Self::Mssql(scratch) => scratch
+                .reconstruction(binding, ids, dependencies)
+                .map(Binding::Mssql),
             Self::Postgres(scratch) => scratch
                 .reconstruction(target, binding, ids, dependencies)
                 .await
@@ -224,6 +229,7 @@ impl Scratch<'_> {
                     .await
                     .map(Staged::Postgres)
             }
+            (Self::Postgres(_), Prepared::Postgres(_), Binding::Mssql(_)) => Err(unsupported()),
         }
     }
 
@@ -247,17 +253,6 @@ impl Scratch<'_> {
 }
 
 impl Prepared {
-    /// SQL Server preparation is usable on its own; the shared planning path
-    /// still needs reconstruction and a real binding certificate (#2238).
-    pub(super) fn require_reconstruction(&self) -> Result<(), Error> {
-        match self {
-            Self::Postgres(_) => Ok(()),
-            Self::Mssql(_) => Err(Error::Binding(
-                "SQL Server resolver reconstruction is not implemented yet (#2238)".into(),
-            )),
-        }
-    }
-
     pub(super) fn catalog(&self) -> &CatalogFacts {
         match self {
             Self::Postgres(prepared) => &prepared.scratch_catalog,
@@ -292,7 +287,7 @@ impl Prepared {
     pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
         match (self, binding) {
             (Self::Postgres(prepared), Binding::Postgres(binding)) => prepared.split(binding),
-            (Self::Mssql(_), _) => None,
+            (Self::Mssql(_), _) | (Self::Postgres(_), Binding::Mssql(_)) => None,
         }
     }
     pub(super) fn has_filled(&self) -> bool {
@@ -319,14 +314,16 @@ impl Binding {
     pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
         match (self, prepared) {
             (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding.chains(prepared),
-            (Self::Postgres(_), Prepared::Mssql(_)) => {
-                unreachable!("SQL Server reconstruction refuses before binding")
+            (Self::Mssql(_), Prepared::Mssql(_)) => Vec::new(),
+            (Self::Postgres(_), Prepared::Mssql(_)) | (Self::Mssql(_), Prepared::Postgres(_)) => {
+                unreachable!("a binding and its preparation come from one engine")
             }
         }
     }
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Postgres(binding) => binding.len(),
+            Self::Mssql(binding) => binding.len(),
         }
     }
     pub(super) async fn compile(
@@ -346,7 +343,12 @@ impl Binding {
                 };
                 binding.compile(extras, driver, zone, compile, steps).await
             }
-            (_, Prepared::Mssql(_)) => Err(unsupported()),
+            (Self::Mssql(binding), Prepared::Mssql(prepared)) => {
+                binding.compile(prepared, steps).await
+            }
+            (Self::Postgres(_), Prepared::Mssql(_)) | (Self::Mssql(_), Prepared::Postgres(_)) => {
+                Err(unsupported())
+            }
         }
     }
     pub(super) async fn fill_chained(
@@ -361,7 +363,7 @@ impl Binding {
                 .fill_chained(prepared, admin, split, outside)
                 .await
                 .map(Chained::Postgres),
-            (_, Prepared::Mssql(_)) => Err(unsupported()),
+            (Self::Mssql(_), _) | (_, Prepared::Mssql(_)) => Err(unsupported()),
         }
     }
     pub(super) async fn compare_chained(
@@ -378,7 +380,7 @@ impl Binding {
                     .await
                     .map(Staged::Postgres)
             }
-            (_, Prepared::Mssql(_), _) => Err(unsupported()),
+            (Self::Mssql(_), _, _) | (_, Prepared::Mssql(_), _) => Err(unsupported()),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -386,6 +388,7 @@ impl Binding {
         &self,
         prepared: &mut Prepared,
         admin: &mut Conn,
+        target: &mut Conn,
         extras: &[String],
         visibility: &std::collections::BTreeMap<String, pbps_db::resolver::Observation>,
         schemas: &[String],
@@ -400,9 +403,13 @@ impl Binding {
                         prepared, admin, extras, visibility, schemas, key, desired, staged,
                     )
                     .await
-                    .map(CompiledCapture::Postgres)
+                    .map(|closing| CompiledCapture::Postgres(Box::new(closing)))
             }
-            (_, Prepared::Mssql(_), _) | (_, _, Staged::Mssql(_)) => Err(unsupported()),
+            (Self::Mssql(binding), Prepared::Mssql(prepared), Staged::Mssql(staged)) => binding
+                .capture_desired(prepared.reach(), target, schemas, key, desired, staged)
+                .await
+                .map(|closing| CompiledCapture::Mssql(Box::new(closing))),
+            (Self::Postgres(_), ..) | (Self::Mssql(_), ..) => Err(unsupported()),
         }
     }
     pub(super) async fn capture_opening(
@@ -418,6 +425,13 @@ impl Binding {
                     binding.capture_opening(target, closing, key, base).await?;
                 Ok((CapturedInputs::Postgres(current), opening))
             }
+            (Self::Mssql(binding), CompiledCapture::Mssql(closing)) => {
+                let (current, opening) =
+                    binding.capture_opening(target, closing, key, base).await?;
+                Ok((CapturedInputs::Mssql(current), opening))
+            }
+            (Self::Postgres(_), CompiledCapture::Mssql(_))
+            | (Self::Mssql(_), CompiledCapture::Postgres(_)) => Err(unsupported()),
         }
     }
     pub(super) fn assess(
@@ -425,17 +439,18 @@ impl Binding {
         closing: &CompiledCapture,
         current: &CapturedInputs,
         staged: &Staged,
-    ) -> Assessment {
+    ) -> Result<Assessment, Error> {
         match (self, closing, current, staged) {
             (
                 Self::Postgres(binding),
                 CompiledCapture::Postgres(closing),
                 CapturedInputs::Postgres(current),
                 Staged::Postgres(staged),
-            ) => binding.assess(closing, current, staged),
-            (_, _, _, Staged::Mssql(_)) => {
-                unreachable!("SQL Server reconstruction refuses before assessment")
-            }
+            ) => Ok(binding.assess(closing, current, staged)),
+            // The compiled and opening captures exist; what to conclude from
+            // their difference is #2375's assessment and #2143's planning.
+            (Self::Mssql(_), ..) => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
+            (Self::Postgres(_), ..) => Err(unsupported()),
         }
     }
 }
@@ -447,7 +462,7 @@ impl Staged {
             (Self::Mssql(_), Self::Mssql(_))
             | (Self::Mssql(_), Self::Postgres(_))
             | (Self::Postgres(_), Self::Mssql(_)) => {
-                unreachable!("SQL Server has no chained reconstruction yet (#2238)")
+                unreachable!("SQL Server has no chained reconstruction yet (#2376)")
             }
         }
     }
@@ -456,7 +471,11 @@ impl Staged {
             (Self::Postgres(staged), CapturedInputs::Postgres(current)) => {
                 staged.changed_since(current)
             }
-            (Self::Mssql(_), _) => unreachable!("SQL Server reconstruction refuses before capture"),
+            (Self::Mssql(staged), CapturedInputs::Mssql(current)) => staged.changed_since(current),
+            (Self::Postgres(_), CapturedInputs::Mssql(_))
+            | (Self::Mssql(_), CapturedInputs::Postgres(_)) => {
+                unreachable!("a staged set and its capture come from one engine")
+            }
         }
     }
     pub(super) fn through_shape_view(&self, error: Error) -> Error {
@@ -467,10 +486,12 @@ impl Staged {
     }
 }
 
-pub(super) fn staged(driver: Driver) -> Result<Staged, Error> {
-    match driver {
-        Driver::Postgres => Ok(Staged::Postgres(Default::default())),
-        Driver::Mssql => Err(unsupported()),
+pub(super) fn staged(driver: Driver, prepared: &Prepared) -> Result<Staged, Error> {
+    match (driver, prepared) {
+        (Driver::Postgres, _) => Ok(Staged::Postgres(Default::default())),
+        // Preparation always compares the externals, an empty set included.
+        (Driver::Mssql, Prepared::Mssql(prepared)) => Ok(Staged::Mssql(prepared.staged.clone())),
+        (Driver::Mssql, Prepared::Postgres(_)) => Err(unsupported()),
     }
 }
 
@@ -480,6 +501,7 @@ impl CompiledCapture {
     ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
         match self {
             Self::Postgres(closing) => closing.planning_records(),
+            Self::Mssql(_) => unreachable!("SQL Server planning refuses at assessment (#2143)"),
         }
     }
     pub(super) fn seal_for_plan(
@@ -487,6 +509,7 @@ impl CompiledCapture {
     ) -> Result<InputManifest, pbps_pg::resolver::capture::SealError> {
         match self {
             Self::Postgres(closing) => closing.seal_for_plan(),
+            Self::Mssql(_) => unreachable!("SQL Server planning refuses at assessment (#2143)"),
         }
     }
 }
@@ -504,6 +527,9 @@ pub(super) async fn recapture(
 ) -> Result<Vec<CaptureDifference>, CaptureError> {
     match current {
         CapturedInputs::Postgres(current) => postgres::recapture(target, current).await,
+        CapturedInputs::Mssql(current) => pbps_mssql::resolver::capture::recapture(target, current)
+            .await
+            .map(|(_, differences)| differences),
     }
 }
 
@@ -535,6 +561,7 @@ impl Binding {
     {
         match self {
             Self::Postgres(binding) => binding.plan(base, desired, hints, extras, surfaces),
+            Self::Mssql(_) => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
         }
     }
 }
@@ -551,7 +578,7 @@ pub(super) fn surfaces(
         Driver::Postgres => {
             super::resolution::from_sides(base, desired, opening, compiled, assessment)
         }
-        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+        Driver::Mssql => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
     }
 }
 
@@ -562,14 +589,14 @@ pub(super) fn reported_build(
 ) -> Result<String, Error> {
     match driver {
         Driver::Postgres => postgres::reported_build(key, catalog),
-        Driver::Mssql => Err(Error::Scope("the resolver has no SQL Server rule".into())),
+        Driver::Mssql => mssql::reported_build(key, catalog),
     }
 }
 
 pub(super) fn reported_rule(driver: Driver) -> Result<&'static str, Error> {
     match driver {
         Driver::Postgres => Ok(pbps_pg::resolver::compatibility::REPORTED_RULE),
-        Driver::Mssql => Err(Error::Scope("the resolver has no SQL Server rule".into())),
+        Driver::Mssql => Ok(pbps_mssql::resolver::compatibility::REPORTED_RULE),
     }
 }
 

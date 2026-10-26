@@ -545,16 +545,8 @@ fn check_may_read_computed(expression: &str, column: &str) -> bool {
     if code.is_ascii() && column.is_ascii() {
         return false;
     }
-    let column = computed_note_fold(column);
-    // NFKD is not a catalog collation: measured, even ł/l, æ/ae and ß/ss
-    // bind on CI_AI. An unresolved letter on either side cannot prove no
-    // binding. Accept extra notes, but only for a possible code name.
-    let unresolved = |c: char| !c.is_ascii() && c.is_alphabetic();
-    let column_unresolved = column.chars().any(unresolved);
-    let may_bind = |name: &str| {
-        let name = computed_note_fold(name);
-        name == column || column_unresolved || name.chars().any(unresolved)
-    };
+    // Accept extra notes, but only for a possible code name.
+    let may_bind = |name: &str| may_be_same_name(name, column);
     // Decode the original delimiters before folding their contents. A
     // fullwidth closer is not doubled in SQL; folding it first would confuse
     // it with a real, escaped closer in the same identifier.
@@ -596,19 +588,65 @@ fn check_may_read_computed(expression: &str, column: &str) -> bool {
     false
 }
 
-fn computed_note_fold(text: &str) -> String {
+/// Whether the catalog may bind `a` and `b` to one name, whatever its
+/// collation: their folds are equal, or either still holds a letter the fold
+/// leaves alone. NFKD is not a catalog collation: the letters of
+/// `LATIN_UNDECOMPOSED` are measured and mapped, any other left over cannot
+/// prove no binding.
+pub(crate) fn may_be_same_name(a: &str, b: &str) -> bool {
+    let unresolved = |c: char| !c.is_ascii() && c.is_alphabetic();
+    let (a, b) = (computed_note_fold(a), computed_note_fold(b));
+    a == b || a.chars().any(unresolved) || b.chars().any(unresolved)
+}
+
+/// Latin letters NFKD leaves alone, with what a CI_AI catalog binds each to
+/// (lower case; the fold lowercases first). Every entry was measured on
+/// SQL Server 17.0 as a column name read by its mapping, on both
+/// `Latin1_General_100_CI_AI` and `SQL_Latin1_General_CP1_CI_AI`, upper case
+/// form included: bound on both. ŀ/Ŀ bind `l` too, through the middle dot
+/// NFKD leaves, which the fold drops.
+///
+/// Measured and left out, because the engine does not bind them to ASCII, or
+/// binds them on one collation only: ŋ, ŧ, ꞁ (neither), ȼ/Ȼ and Ƀ
+/// (`Latin1_General_100` only; ƀ goes with Ƀ because the fold lowercases one
+/// to the other), ŉ (NFKD gives ʼn). Left out, a letter stays "unresolved"
+/// and `may_be_same_name` stays conservative about it. `ẞ` lowercases to ß and
+/// so folds to `ss` though the engine binds it to neither: an over-equation,
+/// the safe side.
+const LATIN_UNDECOMPOSED: [(char, &str); 14] = [
+    ('ł', "l"),  // ł/Ł → l
+    ('æ', "ae"), // æ/Æ → ae
+    ('ß', "ss"), // ß → ss
+    ('ø', "o"),  // ø/Ø → o
+    ('đ', "d"),  // đ/Đ → d
+    ('ð', "d"),  // ð/Ð → d
+    ('þ', "th"), // þ/Þ → th
+    ('œ', "oe"), // œ/Œ → oe
+    ('ħ', "h"),  // ħ/Ħ → h
+    ('ı', "i"),  // dotless i → i
+    ('ĸ', "k"),  // kra → k
+    ('ƒ', "f"),  // ƒ/Ƒ → f
+    ('ǥ', "g"),  // ǥ/Ǥ → g
+    ('ɨ', "i"),  // ɨ/Ɨ → i
+];
+
+pub(crate) fn computed_note_fold(text: &str) -> String {
     // Compatibility decomposition supplies the width mapping, including
     // halfwidth kana; canonical decomposition alone supplies neither.
     text.nfkd()
         .flat_map(char::to_lowercase)
-        .filter(|c| !is_combining_mark(*c))
-        .map(|c| match c {
-            'ı' => 'i',
+        // NFKD writes ŀ/Ŀ as `l` and a middle dot, which the engine ignores
+        // (ŀ binds `l`, measured); the dot is no identifier character.
+        .filter(|c| !is_combining_mark(*c) && *c != '\u{b7}')
+        .flat_map(|c| match c {
             // Katakana letters and iteration marks share hiragana's order.
             '\u{30a1}'..='\u{30f6}' | '\u{30fd}'..='\u{30fe}' => {
-                char::from_u32(u32::from(c) - 0x60).unwrap()
+                vec![char::from_u32(u32::from(c) - 0x60).unwrap()]
             }
-            _ => c,
+            _ => match LATIN_UNDECOMPOSED.iter().find(|(letter, _)| *letter == c) {
+                Some((_, ascii)) => ascii.chars().collect(),
+                None => vec![c],
+            },
         })
         .collect()
 }

@@ -327,7 +327,7 @@ fn managed_dependencies(
             }
             if managed.contains(&id) {
                 refused.push(format!(
-                    "external {} depends on managed {}; it waits for reconstruction (#2238)",
+                    "external {} depends on managed {}; it waits for chained staging (#2376)",
                     named(root),
                     named(&id)
                 ));
