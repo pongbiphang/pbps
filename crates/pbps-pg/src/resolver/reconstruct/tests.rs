@@ -66,6 +66,7 @@ fn module(id: &str, kind: ModuleKind, definition: &str) -> Change {
             kind,
             description: None,
             definition: definition.into(),
+            options: Default::default(),
         }),
     }
 }
@@ -443,6 +444,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
                 kind: ModuleKind::Function,
                 description: None,
                 definition: body.into(),
+                options: Default::default(),
             },
         );
         schema.modules.insert(
@@ -451,6 +453,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT g FROM app.n".into(),
+                options: Default::default(),
             },
         );
         // Names the table only inside an OID-alias literal.
@@ -460,6 +463,7 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT 'app.n'::regclass AS r".into(),
+                options: Default::default(),
             },
         );
         schema
@@ -588,6 +592,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
             kind: ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            options: Default::default(),
         },
     );
     let ids = pbps_diff::resolve(
@@ -753,6 +758,7 @@ fn split_generated_tables_expose_names_before_either_function() {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+                options: Default::default(),
             },
         );
     }
@@ -876,6 +882,7 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
             kind: ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            options: Default::default(),
         },
     );
     let ids = pbps_diff::resolve(
@@ -1009,6 +1016,7 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
                 kind,
                 description: None,
                 definition: definition.into(),
+                options: Default::default(),
             },
         );
     }

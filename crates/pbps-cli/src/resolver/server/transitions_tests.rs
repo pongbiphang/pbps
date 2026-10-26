@@ -30,6 +30,7 @@ fn an_object_grant_after_a_same_name_replacement_names_the_replacement() {
         kind: ModuleKind::View,
         description: None,
         definition: "SELECT 1 AS id".into(),
+        options: Default::default(),
     };
     let relation = ObjectIdentity {
         class: "pg_class".into(),

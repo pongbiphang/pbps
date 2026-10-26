@@ -2174,6 +2174,7 @@ fn add_module(
             kind,
             description: None,
             definition: definition.into_owned(),
+            options: Default::default(),
         },
     );
 }

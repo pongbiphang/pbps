@@ -215,6 +215,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::View,
                 description: Some("Customers that are not legacy records".into()),
                 definition: "SELECT customer_id FROM dbo.customer".into(),
+                options: Default::default(),
             },
         );
 

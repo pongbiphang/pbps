@@ -1129,6 +1129,70 @@ indexes:
         );
     }
 
+    /// A view's `WITH SCHEMABINDING` is a key of its own, and absent means off
+    /// (DEC-2329.1).
+    #[test]
+    fn a_view_declares_schemabinding_and_absent_means_off() {
+        let bound = load_module("view: dbo.v\nschemabinding: true\ndefinition: SELECT 1\n");
+        assert!(bound.module.options.schemabinding);
+        for text in [
+            "view: dbo.v\nschemabinding: false\ndefinition: SELECT 1\n",
+            "view: dbo.v\ndefinition: SELECT 1\n",
+        ] {
+            assert!(!load_module(text).module.options.schemabinding, "{text}");
+        }
+    }
+
+    /// A function states the option in its own header, and the other kinds have
+    /// none: a `schemabinding:` key there would read as a guarantee and do
+    /// nothing, so it is refused.
+    #[test]
+    fn only_a_view_may_say_schemabinding() {
+        for (text, hint) in [
+            (
+                "function: dbo.f\nschemabinding: true\ndefinition: (@x int) RETURNS int AS BEGIN RETURN 1 END\n",
+                "own header",
+            ),
+            (
+                "procedure: dbo.p\nschemabinding: true\ndefinition: AS SELECT 1\n",
+                "only a view",
+            ),
+            (
+                "trigger: dbo.trg\non: dbo.t\nschemabinding: false\ndefinition: AFTER INSERT AS SELECT 1\n",
+                "only a view",
+            ),
+        ] {
+            let e = load_module_str(Path::new("m.yml"), text).expect_err(text);
+            assert!(render(&e).contains("`schemabinding:`"), "{}", render(&e));
+            assert!(render(&e).contains(hint), "{}", render(&e));
+        }
+    }
+
+    /// An indexed view declares its indexes as a table does, and names the
+    /// clustered one (DEC-2329.3); nothing but a view may.
+    #[test]
+    fn a_view_declares_indexes_and_only_a_view_may() {
+        let m = load_module(
+            "view: dbo.v\nschemabinding: true\nclustered: ux\nindexes:\n  ux: {columns: [id], unique: true}\n  ix: {columns: [a desc], include: [b]}\ndefinition: SELECT id, a, b FROM dbo.t\n",
+        );
+        let options = &m.module.options;
+        assert_eq!(options.clustered.as_ref().map(|c| c.raw()), Some("ux"));
+        assert_eq!(options.indexes.len(), 2);
+        assert!(options.indexes[&pbps_model::ObjectLocalName::from("ux")].unique);
+        assert!(options.indexes[&pbps_model::ObjectLocalName::from("ix")].columns[0].descending);
+        for text in [
+            "function: dbo.f\nindexes:\n  ux: {columns: [id]}\ndefinition: (@x int) RETURNS int AS BEGIN RETURN 1 END\n",
+            "procedure: dbo.p\nclustered: ux\ndefinition: AS SELECT 1\n",
+        ] {
+            let e = load_module_str(Path::new("m.yml"), text).expect_err(text);
+            assert!(
+                render(&e).contains("only a view can be indexed"),
+                "{}",
+                render(&e)
+            );
+        }
+    }
+
     /// `on:` on anything but a trigger would read as if it did something.
     #[test]
     fn only_a_trigger_may_name_a_table_in_a_file() {

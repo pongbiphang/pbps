@@ -105,6 +105,7 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
         kind: ModuleKind::Trigger,
         description: None,
         definition: definition.into(),
+        options: Default::default(),
     };
     let mut plan = Plan::new(
         &[("t", "app.t")],
@@ -705,6 +706,7 @@ fn a_dropped_triggers_catalog_row_does_not_hold_its_name() {
             kind: pbps_model::ModuleKind::Trigger,
             description: None,
             definition: "after insert as select 1".into(),
+            options: Default::default(),
         },
     );
     let facts = CatalogFacts {

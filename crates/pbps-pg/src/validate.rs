@@ -795,6 +795,7 @@ mod tests {
                     kind,
                     description: None,
                     definition: "SELECT 1".to_owned(),
+                    options: Default::default(),
                 },
             );
         };

@@ -387,6 +387,98 @@ pub const FIXED_ROLES: [&str; 10] = [
     "db_denydatawriter",
 ];
 
+/// An operator class on a key of an index, which SQL Server cannot honour:
+/// the emitter writes no class, so the declaration would differ from the
+/// database for good and every plan would rebuild the index (DEC-1169.1).
+/// One check for the indexes of a table and of an indexed view alike, so the
+/// two cannot disagree about what the emitter drops.
+fn operator_classes(what: &str, index: &pbps_model::Index) -> Vec<DialectError> {
+    index
+        .columns
+        .iter()
+        .filter_map(|key| {
+            let class = key.opclass.as_ref()?;
+            Some(invalid(format!(
+                "{what} indexes `{}` with `{class}`, and SQL Server has no operator classes \
+                 (if `{class}` was meant as a direction, it is `asc` or `desc`)",
+                pbps_model::escape::Escaped(key.key.text()),
+                class = pbps_model::escape::Escaped(class),
+            )))
+        })
+        .collect()
+}
+
+/// What an indexed view must satisfy before the engine is asked
+/// (DEC-2329.3), each measured on 17.0.4075.5: an index on a view that is not
+/// schema bound is refused (1939), the first must be unique and clustered
+/// (1940), and a filtered index, an expression key or a method are not a
+/// view's. A module that has none of these keys passes untouched.
+fn view_indexes(name: &str, module: &Module) -> Vec<DialectError> {
+    let options = &module.options;
+    if options.indexes.is_empty() && options.clustered.is_none() {
+        return Vec::new();
+    }
+    let mut errs = Vec::new();
+    if module.kind != ModuleKind::View || !options.schemabinding {
+        errs.push(invalid(format!(
+            "{} `{name}` declares indexes, which only a schema-bound view can have \
+             (the engine refuses an index on any other view, 1939)",
+            module.kind
+        )));
+    }
+    match &options.clustered {
+        None => errs.push(invalid(format!(
+            "`{name}` declares indexes but no `clustered:`; an indexed view needs a unique \
+             clustered index first (1940)"
+        ))),
+        Some(clustered) => match options.indexes.get(clustered) {
+            None => errs.push(invalid(format!(
+                "`{name}` names `{}` as its clustered index, which it does not declare",
+                clustered.shown()
+            ))),
+            Some(index) => {
+                if !index.unique {
+                    errs.push(invalid(format!(
+                        "clustered index `{}` on `{name}` is not unique; the clustered index \
+                         of a view must be",
+                        clustered.shown()
+                    )));
+                }
+                if !index.include.is_empty() {
+                    errs.push(invalid(format!(
+                        "clustered index `{}` on `{name}` has INCLUDE columns, which a \
+                         clustered index cannot",
+                        clustered.shown()
+                    )));
+                }
+            }
+        },
+    }
+    for (index_name, index) in &options.indexes {
+        let shown = index_name.shown();
+        let mut say = |what: &str| {
+            errs.push(invalid(format!("index `{shown}` on view `{name}` {what}")));
+        };
+        if index.columns.is_empty() {
+            say("names no key columns");
+        }
+        if index.columns.iter().any(|c| c.key.column().is_none()) {
+            say("has an expression key; SQL Server indexes only columns");
+        }
+        if index.filter.is_some() {
+            say("is filtered, which an index on a view cannot be");
+        }
+        if !index.method.is_btree() || !index.storage_parameters.is_empty() {
+            say("sets a method or storage parameters, which are PostgreSQL's");
+        }
+        errs.extend(operator_classes(
+            &format!("index `{shown}` on view `{name}`"),
+            index,
+        ));
+    }
+    errs
+}
+
 /// Every problem with a module, not just the first (ADR-0002).
 ///
 /// The checks are few on purpose. Whether the body compiles is the engine's
@@ -428,6 +520,20 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
             name = name.shown()
         )));
     }
+
+    // The key is a view's. A function states the option in its own header, and
+    // the loader refuses the key there; this catches a module that reached the
+    // emitter another way, whose flag the emitter would then ignore.
+    if module.options.schemabinding && module.kind != ModuleKind::View {
+        errs.push(invalid(format!(
+            "{} `{name}` sets `schemabinding`, which only a view carries as an option; a function \
+             writes `WITH SCHEMABINDING` in its own header",
+            module.kind,
+            name = name.shown()
+        )));
+    }
+
+    errs.extend(view_indexes(&name.raw().to_string(), module));
 
     // A `GO` is not T-SQL: it is a batch separator the client interprets. One
     // inside a definition would be sent to the server verbatim and rejected —
@@ -1186,17 +1292,10 @@ pub(crate) fn table_sources(
                 n = n.shown(),
             )));
         }
-        for key in &idx.columns {
-            if let Some(class) = &key.opclass {
-                errs.push(invalid(format!(
-                    "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
-                     classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                    pbps_model::escape::Escaped(key.key.text()),
-                    n = n.shown(),
-                    class = pbps_model::escape::Escaped(class),
-                )));
-            }
-        }
+        errs.extend(operator_classes(
+            &format!("index `{n}`", n = n.shown()),
+            idx,
+        ));
         // The engine's rules for the clustered index, which is the table's
         // rows rather than a copy of some of them — so every column is in it
         // already and it covers every row. Measured on 17.0: `INCLUDE` is
@@ -2642,6 +2741,7 @@ mod tests {
             kind,
             description: None,
             definition: body.to_owned(),
+            options: Default::default(),
         };
         schema.modules.insert(
             ModuleId::Named(TableName::new("dbo", "v")),
@@ -2890,6 +2990,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         }
     }
 
@@ -2922,6 +3023,115 @@ mod tests {
             &a_module(ModuleKind::View, "SELECT 1\nGO\nSELECT 2"),
         );
         assert!(e.contains("GO"), "{e}");
+    }
+
+    /// The key is a view's: a function writes the option in its own header,
+    /// and the flag on one would be ignored by the emitter (DEC-2329.1).
+    #[test]
+    fn only_a_view_carries_schemabinding_as_an_option() {
+        let bound = |kind, definition: &str| {
+            let mut m = a_module(kind, definition);
+            m.options.schemabinding = true;
+            m
+        };
+        assert!(
+            module(
+                &"dbo.v".parse().unwrap(),
+                &bound(ModuleKind::View, "SELECT id FROM dbo.t")
+            )
+            .is_empty()
+        );
+        for (kind, name) in [
+            (ModuleKind::Function, "dbo.f"),
+            (ModuleKind::Procedure, "dbo.p"),
+        ] {
+            let e = module_errors(name, &bound(kind, "AS SELECT 1"));
+            assert!(e.contains("which only a view carries"), "{e}");
+        }
+    }
+
+    /// An indexed view is a schema-bound view with a unique clustered index
+    /// named first, whose other indexes are plain column indexes (1939, 1940).
+    #[test]
+    fn an_indexed_view_is_validated_against_what_the_engine_demands() {
+        let index = |unique: bool| pbps_model::Index {
+            columns: vec![pbps_model::IndexColumn::column("id")],
+            include: Vec::new(),
+            unique,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let indexed = |bound: bool, clustered: Option<&str>, unique: bool| {
+            let mut m = a_module(ModuleKind::View, "SELECT id FROM dbo.t");
+            m.options.schemabinding = bound;
+            m.options.indexes.insert("ux".into(), index(unique));
+            m.options.clustered = clustered.map(Into::into);
+            m
+        };
+        assert_eq!(module_errors("dbo.v", &indexed(true, Some("ux"), true)), "");
+        for (m, needle) in [
+            (indexed(false, Some("ux"), true), "schema-bound view"),
+            (indexed(true, None, true), "no `clustered:`"),
+            (
+                indexed(true, Some("nope"), true),
+                "which it does not declare",
+            ),
+            (indexed(true, Some("ux"), false), "is not unique"),
+        ] {
+            let e = module_errors("dbo.v", &m);
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        let mut filtered = indexed(true, Some("ux"), true);
+        filtered
+            .options
+            .indexes
+            .get_mut(&pbps_model::ObjectLocalName::from("ux"))
+            .unwrap()
+            .filter = Some("id > 0".into());
+        assert!(module_errors("dbo.v", &filtered).contains("is filtered"));
+        let mut function = a_module(ModuleKind::Function, "AS SELECT 1");
+        function.options.indexes.insert("ux".into(), index(true));
+        assert!(module_errors("dbo.f", &function).contains("schema-bound view"));
+    }
+
+    /// The emitter writes no operator class, so one on a view's index would
+    /// leave the declaration different from the database for good and rebuild
+    /// the view on every plan. Refused by name whichever way the loader reads
+    /// it, as a table's index is (DEC-1169.1).
+    #[test]
+    fn an_operator_class_on_an_indexed_views_index_is_refused_by_name() {
+        let view = |index: &str| {
+            let text = format!(
+                "view: dbo.v\nschemabinding: true\nclustered: ux\nindexes:\n  ux:\n    unique: true\n\
+                 {index}definition: SELECT id FROM dbo.t\n"
+            );
+            let loaded = pbps_load::load_module_str(std::path::Path::new("v.yml"), &text)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+            module_errors("dbo.v", &loaded.module)
+        };
+        for (how, index) in [
+            ("columns", "    columns: [id int4_ops]\n"),
+            (
+                "keys",
+                "    keys:\n      - {column: id, opclass: int4_ops}\n",
+            ),
+        ] {
+            let e = view(index);
+            assert!(
+                e.contains("index `ux` on view `dbo.v` indexes `id` with `int4_ops`")
+                    && e.contains("no operator classes"),
+                "{how}: {e}"
+            );
+        }
+        // A plain index, in either spelling and with a direction, is accepted.
+        for index in [
+            "    columns: [id]\n",
+            "    columns: [id desc]\n",
+            "    keys:\n      - {column: id, order: desc}\n",
+        ] {
+            assert_eq!(view(index), "", "{index}");
+        }
     }
 
     /// An encrypted module cannot be read back, so every plan would re-state

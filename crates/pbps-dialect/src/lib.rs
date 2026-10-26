@@ -3033,6 +3033,25 @@ pub trait Dialect {
         BTreeSet::new()
     }
 
+    /// The modules the engine will not let this plan's changes stand beside,
+    /// because they are bound to what a change alters, drops or renames
+    /// (SQL Server's `WITH SCHEMABINDING`, DEC-2329.1). Each must be dropped
+    /// before the change and created again after it.
+    ///
+    /// Only ids the base and the declarations both hold: a module the plan
+    /// already drops or creates needs nothing more. The differ answers with a
+    /// `DropModule` and a `CreateModule` in place of any `AlterModule`, and
+    /// the class ranks (drops first, creates last) do the bracketing; no
+    /// pass or tie-break is involved. Dialects without a binding return none.
+    fn schema_bound_teardown(
+        &self,
+        _base: &Schema,
+        _declared: &Schema,
+        _changes: &[Change],
+    ) -> BTreeSet<ModuleId> {
+        BTreeSet::new()
+    }
+
     /// This argument type as the engine spells it *in a routine's identity*.
     ///
     /// Deliberately not [`Dialect::normalize_type`], and deliberately not over
@@ -5518,6 +5537,7 @@ mod tests {
             kind,
             description: None,
             definition: "AS SELECT 1".to_owned(),
+            options: Default::default(),
         }
     }
 

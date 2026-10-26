@@ -129,6 +129,7 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
             "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
             if constraint { "CONSTRAINT " } else { "" }
         ),
+        options: Default::default(),
     };
     let mut schema = Schema::default();
     let mut ids = IdsFile::default();
@@ -295,6 +296,7 @@ fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_release
             "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
             if constraint { "CONSTRAINT " } else { "" }
         ),
+        options: Default::default(),
     };
     for attach in [false, true] {
         for (was, will, check, handover) in [
@@ -445,6 +447,7 @@ fn an_attach_claims_its_standing_checks_instead_of_its_final_checks() {
             "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
             if constraint { "CONSTRAINT " } else { "" }
         ),
+        options: Default::default(),
     };
     before.modules.insert(id.clone(), module(true));
     for removed_first in [false, true] {

@@ -868,9 +868,11 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
         // `CREATE OR ALTER` (2016 SP1+) rather than drop + create, and not only
         // because it is idempotent: it **preserves the permissions** granted on
         // the object, which drop + create silently destroys (ADR-0002).
-        Change::CreateModule { id, module } | Change::AlterModule { id, module } => Ok(vec![
-            Statement::new(module_definition(id, module)?).own_batch(),
-        ]),
+        Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+            let mut statements = vec![Statement::new(module_definition(id, module)?).own_batch()];
+            statements.extend(view_indexes(id, module)?);
+            Ok(statements)
+        }
 
         // The object's own name, without a signature: nothing overloads on
         // this engine (ADR-0009 §1), so `DROP FUNCTION app.f` names exactly
@@ -884,6 +886,43 @@ pub(crate) fn emit(change: &Change, strategy: Strategy) -> Sql {
             .releasing(pbps_dialect::Released::Module(id.clone())),
         ]),
     }
+}
+
+/// An indexed view's `CREATE INDEX` statements, the clustered one first: the
+/// engine refuses a nonclustered index on a view that has no unique clustered
+/// one (1940).
+///
+/// After every `CREATE OR ALTER VIEW`, not only after a create: measured on
+/// 17.0.4075.5, restating a view drops every index it has, even when the text
+/// is identical, so an alter that did not restate them would leave the view
+/// unindexed and the next read-back would show a different module
+/// (DEC-2329.3).
+fn view_indexes(id: &ModuleId, module: &Module) -> Result<Vec<Statement>, DialectError> {
+    let options = &module.options;
+    if options.indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(view) = id.referenced_name() else {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: "an index is declared on a module that is not a view".to_owned(),
+        });
+    };
+    let mut ordered: Vec<_> = options.indexes.iter().collect();
+    ordered.sort_by_key(|(name, _)| Some(*name) != options.clustered.as_ref());
+    ordered
+        .into_iter()
+        .map(|(name, index)| {
+            let clustered = Some(name) == options.clustered.as_ref();
+            Ok(Statement::new(create_index(
+                &view,
+                name.raw(),
+                index,
+                clustered,
+                Strategy::default(),
+            )?))
+        })
+        .collect()
 }
 
 /// The T-SQL keyword for a module kind.
@@ -923,6 +962,12 @@ pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, Diale
     Ok(match module.kind {
         // The `AS` is the emitter's, so a view's definition is just its query —
         // which is what a reader of the declarations wants to see.
+        //
+        // `WITH SCHEMABINDING` sits between the name and the `AS`, which is
+        // where `introspect::split_module` reads it back from (DEC-2329.1).
+        ModuleKind::View if module.options.schemabinding => {
+            format!("{head}\nWITH SCHEMABINDING\nAS\n{body}")
+        }
         ModuleKind::View => format!("{head}\nAS\n{body}"),
         ModuleKind::Trigger => {
             // The table is in the identity now, so a trigger without one is
@@ -2354,6 +2399,133 @@ mod tests {
 
     use super::*;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid};
+
+    fn indexed_view() -> (ModuleId, Module) {
+        let index = |keys: &[&str], include: &[&str], unique: bool| pbps_model::Index {
+            columns: keys.iter().map(|k| IndexColumn::column(*k)).collect(),
+            include: include.iter().map(|c| (*c).into()).collect(),
+            unique,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let mut options = pbps_model::ModuleOptions {
+            schemabinding: true,
+            ..Default::default()
+        };
+        // Named so that the clustered one sorts last: the emitter orders by
+        // role, not by name.
+        options
+            .indexes
+            .insert("ix_a_b".into(), index(&["a"], &["b"], false));
+        options
+            .indexes
+            .insert("ux_view".into(), index(&["id"], &[], true));
+        options.clustered = Some("ux_view".into());
+        (
+            ModuleId::Named("dbo.v".parse().unwrap()),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                options,
+                definition: "SELECT id, a, b FROM dbo.t".into(),
+            },
+        )
+    }
+
+    /// Every field of an index the loader keeps is either written or refused
+    /// before a plan exists: one the emitter drops would leave the declaration
+    /// different from the database for good, and rebuild the view on every
+    /// plan. Each variant sets one field away from the plain index.
+    #[test]
+    fn no_field_of_an_indexed_views_index_is_dropped_silently() {
+        let (id, plain) = indexed_view();
+        // An error from the emitter is a refusal too, not a silent drop.
+        let restated = |module: &Module| -> Option<Vec<String>> {
+            super::view_indexes(&id, module)
+                .ok()
+                .map(|v| v.into_iter().map(|s| s.sql).collect())
+        };
+        let baseline = restated(&plain);
+        type Vary = fn(&mut pbps_model::Index);
+        let variants: [(&str, Vary); 8] = [
+            ("descending", |i| i.columns[0].descending = true),
+            ("included", |i| i.include.push("b".into())),
+            ("unique", |i| i.unique = !i.unique),
+            ("filter", |i| i.filter = Some("a > 0".into())),
+            ("opclass", |i| {
+                i.columns[0].opclass = Some("int4_ops".into());
+            }),
+            ("expression key", |i| {
+                i.columns[0].key = pbps_model::IndexKey::Expression("a + 1".into());
+            }),
+            ("method", |i| i.method = pbps_model::IndexMethod::Gin),
+            ("storage parameters", |i| {
+                i.storage_parameters
+                    .insert("fillfactor".into(), "70".into());
+            }),
+        ];
+        for (field, change) in variants {
+            let mut module = plain.clone();
+            change(
+                module
+                    .options
+                    .indexes
+                    .get_mut(&pbps_model::ObjectLocalName::from("ix_a_b"))
+                    .unwrap(),
+            );
+            let refused = !crate::validate::module(&id, &module).is_empty();
+            let written = restated(&module) != baseline;
+            assert!(refused || written, "{field} is neither written nor refused");
+        }
+    }
+
+    /// `CREATE OR ALTER VIEW` drops every index the view has (measured on
+    /// 17.0.4075.5), so the create and the alter both restate them, and the
+    /// clustered one first: the engine refuses a nonclustered index on a view
+    /// with no unique clustered one (1940). DEC-2329.3.
+    #[test]
+    fn an_indexed_view_restates_its_indexes_after_every_create_and_alter() {
+        let (id, module) = indexed_view();
+        for change in [
+            Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            },
+            Change::AlterModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            },
+        ] {
+            let sql: Vec<String> = super::emit(&change, Strategy::default())
+                .unwrap()
+                .into_iter()
+                .map(|s| s.sql)
+                .collect();
+            assert_eq!(sql.len(), 3, "{sql:?}");
+            assert!(sql[0].starts_with("CREATE OR ALTER VIEW [dbo].[v]\nWITH SCHEMABINDING"));
+            assert_eq!(
+                sql[1],
+                "CREATE UNIQUE CLUSTERED INDEX [ux_view] ON [dbo].[v] ([id] ASC);"
+            );
+            assert_eq!(
+                sql[2],
+                "CREATE INDEX [ix_a_b] ON [dbo].[v] ([a] ASC) INCLUDE ([b]);"
+            );
+        }
+        // And a view with no indexes is still the one statement.
+        let mut plain = module;
+        plain.options = Default::default();
+        let sql = super::emit(
+            &Change::AlterModule {
+                id,
+                module: Box::new(plain),
+            },
+            Strategy::default(),
+        )
+        .unwrap();
+        assert_eq!(sql.len(), 1);
+    }
 
     #[test]
     fn serial_sequence_statements_are_refused_instead_of_granting_on_the_table() {

@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 61;
+pub const SCHEMA_VERSION: u32 = 62;
+// 62: a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).
 // 61: `explain`'s `rehearsal`, a plan's sealed rehearsal record (#2379).
 // 60: preview rehearsal selects a shared scratch entry (#587).
 // 59: explicit enum label rename annotations (#1635 slice 3a).

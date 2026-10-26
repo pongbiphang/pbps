@@ -4391,10 +4391,11 @@ async fn pull_reads_every_kind_of_module_back() {
         "CREATE PROCEDURE dbo.sp_touch AS SELECT 1;",
         "CREATE FUNCTION dbo.fn_double(@n int) RETURNS int AS BEGIN RETURN @n * 2 END;",
         "CREATE TRIGGER dbo.tr_t ON dbo.t AFTER INSERT AS SELECT 1;",
-        // Two that cannot be managed, and must be reported rather than lost:
-        // SCHEMABINDING has nowhere to live in the model, and an encrypted
-        // module has no readable definition at all.
+        // A bound view is managed (DEC-2329.1). Two that cannot be, and must
+        // be reported rather than lost: an option the model has no place for,
+        // and an encrypted module, which has no readable definition at all.
         "CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id FROM dbo.t;",
+        "CREATE VIEW dbo.v_meta WITH VIEW_METADATA AS SELECT id FROM dbo.t;",
         "CREATE PROCEDURE dbo.sp_secret WITH ENCRYPTION AS SELECT 1;",
     ] {
         db.conn
@@ -4421,7 +4422,8 @@ async fn pull_reads_every_kind_of_module_back() {
             "dbo.fn_double",
             "dbo.sp_touch",
             "dbo.t.tr_t",
-            "dbo.v_active"
+            "dbo.v_active",
+            "dbo.v_bound"
         ],
         "every readable module kind must come back managed, the trigger under its table (ADR-0009 §1)"
     );
@@ -4432,6 +4434,11 @@ async fn pull_reads_every_kind_of_module_back() {
     let view =
         &pulled.schema.modules[&pbps_model::ModuleId::Named(TableName::new("dbo", "v_active"))];
     assert_eq!(view.definition, "SELECT id FROM dbo.t WHERE flag = 1;");
+    assert!(!view.options.schemabinding);
+    let bound =
+        &pulled.schema.modules[&pbps_model::ModuleId::Named(TableName::new("dbo", "v_bound"))];
+    assert!(bound.options.schemabinding);
+    assert_eq!(bound.definition, "SELECT id FROM dbo.t;");
     // The trigger's table is its key's, not a field beside it (ADR-0009 §1).
     let trigger_id = pbps_model::ModuleId::Trigger {
         on: TableName::new("dbo", "t"),
@@ -4450,7 +4457,7 @@ async fn pull_reads_every_kind_of_module_back() {
         .collect();
     assert_eq!(
         unmanaged,
-        ["dbo.sp_secret".to_owned(), "dbo.v_bound".to_owned()]
+        ["dbo.sp_secret".to_owned(), "dbo.v_meta".to_owned()]
     );
 
     // The table itself still came through untouched.
@@ -4488,6 +4495,7 @@ async fn a_bare_name_in_another_schema_is_not_an_edge() {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
                 definition: definition.to_owned(),
+                options: Default::default(),
             },
         );
     }
@@ -4539,6 +4547,7 @@ async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_fr
                 kind: pbps_model::ModuleKind::View,
                 description: None,
                 definition: definition.to_owned(),
+                options: Default::default(),
             },
         );
     }
@@ -4625,6 +4634,7 @@ async fn a_module_applied_then_read_back_equals_what_was_declared() {
                 kind,
                 description: None,
                 definition: definition.to_owned(),
+                options: Default::default(),
             },
         );
     }
@@ -17883,6 +17893,7 @@ async fn a_recorded_module_keeps_its_schema_in_the_readiness_check_until_its_dro
                 kind,
                 description: None,
                 definition: create.to_owned(),
+                options: Default::default(),
             },
         );
         pbps_mssql::state::record(

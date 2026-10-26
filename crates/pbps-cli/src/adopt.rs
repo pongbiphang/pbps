@@ -1093,6 +1093,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: sql.into(),
+            options: Default::default(),
         };
         s.modules
             .insert("$user.v".parse().unwrap(), view("SELECT 1 AS x"));
@@ -1102,6 +1103,7 @@ mod tests {
             kind: ModuleKind::Trigger,
             description: None,
             definition: "AFTER INSERT ON {} FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+            options: Default::default(),
         };
         let on = |t: &str| Module {
             definition: trigger.definition.replace("{}", t),

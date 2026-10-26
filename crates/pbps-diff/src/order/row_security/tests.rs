@@ -126,6 +126,7 @@ fn policy_setup_follows_modules_and_columns_for_both_origins() {
         kind: ModuleKind::Function,
         definition: "SELECT true".into(),
         description: None,
+        options: Default::default(),
     });
     let suppliers = [
         Change::CreateModule {

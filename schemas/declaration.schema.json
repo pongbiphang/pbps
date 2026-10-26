@@ -1498,6 +1498,29 @@
           ],
           "default": null
         },
+        "schemabinding": {
+          "description": "Makes a SQL Server view `WITH SCHEMABINDING` (DEC-2329.1). Meaningless\non anything else and rejected there: a function states the option in\nits own header text, and the other kinds have none.\n\nWritten by `fmt` only when `true`, as `public_execute:` is.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "indexes": {
+          "description": "An indexed view's indexes, as a table declares them: plain column keys\nunder `columns:` or `keys:` (each optionally `desc`, or `order:` under\n`keys:`), `include:` and `unique:`. A view's index takes no expression\nkey, `opclass:`, `where:`, `method:` or `storage_parameters:`; the\ndialect refuses them.\nMeaningless without `schemabinding: true`, and rejected on every kind\nbut a view (DEC-2329.3).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/IndexDto"
+          }
+        },
+        "clustered": {
+          "description": "The name of the unique index among `indexes:` that is clustered: the\nengine wants one first, and says nothing about which it is.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "definition": {
           "description": "The body. What it starts with depends on the kind; see\n[`pbps_model::Module`].",
           "type": "string"
@@ -1562,6 +1585,15 @@
             },
             "on": {
               "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
+              "type": "null"
             }
           },
           "required": [
@@ -1584,6 +1616,15 @@
             },
             "on": {
               "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
+              "type": "null"
             }
           },
           "required": [
@@ -1605,6 +1646,15 @@
               "type": "null"
             },
             "function": {
+              "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
               "type": "null"
             }
           },
@@ -1783,6 +1833,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 61,
+  "x-pbps-schema-version": 62,
   "x-pbps-tool-version": "0.0.0"
 }

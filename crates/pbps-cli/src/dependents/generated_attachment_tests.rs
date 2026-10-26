@@ -64,6 +64,7 @@ fn fixture(placeholder: bool, generated: bool) -> (ChangeSet, Schema, IdsFile, S
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2".into(),
+                options: Default::default(),
             },
         );
     }

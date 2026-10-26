@@ -3223,6 +3223,16 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     if ascii_trim(&module.definition).is_empty() {
         found.push(empty_definition(id));
     }
+    // A PostgreSQL view has no schema binding to keep, and its indexes are
+    // not a view's: the emitter would drop the keys without a word, which is
+    // the reading `validate` exists to refuse.
+    if !module.options.is_default() {
+        found.push(invalid(format!(
+            "{} `{id}` declares `schemabinding:`, `indexes:` or `clustered:`, which only SQL Server has; remove the keys",
+            module.kind,
+            id = id.shown()
+        )));
+    }
     // The names first: `quote` refuses an identifier over the engine's byte
     // limit, so a module this call passed would be one the emitter cannot
     // spell. `validate` is the command that exists to say so offline.
@@ -7461,6 +7471,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         }
     }
 
@@ -8490,6 +8501,35 @@ mod tests {
                 Postgres::new().validate_module(&id(key), &module(ModuleKind::View, "SELECT 1"));
             assert!(found.is_empty(), "`{key}` is a project's own: {found:?}");
         }
+    }
+
+    /// `schemabinding:` is SQL Server's. A PostgreSQL view that declares it
+    /// would be created without it, which reads as a guarantee the engine
+    /// never gave (DEC-2329.1).
+    #[test]
+    fn a_postgres_view_may_not_declare_schemabinding() {
+        let mut view = module(ModuleKind::View, "SELECT 1");
+        view.options.schemabinding = true;
+        let found = Postgres::new().validate_module(&id("app.v"), &view);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.to_string().contains("only SQL Server has")),
+            "{found:?}"
+        );
+        // The indexes of an indexed view are SQL Server's too.
+        let mut indexed = module(ModuleKind::View, "SELECT 1");
+        indexed.options.clustered = Some("ux".into());
+        let found = Postgres::new().validate_module(&id("app.v"), &indexed);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.to_string().contains("only SQL Server has")),
+            "{found:?}"
+        );
+        let plain =
+            Postgres::new().validate_module(&id("app.v"), &module(ModuleKind::View, "SELECT 1"));
+        assert!(plain.is_empty(), "{plain:?}");
     }
 
     /// `$user` is refused for a module as it is for a table and a grant: the

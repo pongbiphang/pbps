@@ -594,6 +594,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         kind: ModuleKind::Function,
         description: None,
         definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        options: Default::default(),
     });
     pin(
         Change::CreateModule {

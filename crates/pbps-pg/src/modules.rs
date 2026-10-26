@@ -2604,6 +2604,7 @@ mod tests {
             kind: ModuleKind::Function,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         }
     }
 
@@ -2907,6 +2908,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         };
         let rebuilds = |definition: &str, arriving: &str| {
             let mut declared = Schema::default();

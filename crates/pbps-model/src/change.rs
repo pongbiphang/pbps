@@ -3914,6 +3914,7 @@ mod tests {
             kind: crate::module::ModuleKind::View,
             description: None,
             definition: "SELECT customer_id FROM dbo.customer".into(),
+            options: Default::default(),
         }
     }
 

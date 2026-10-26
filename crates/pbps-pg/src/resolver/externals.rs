@@ -1019,6 +1019,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::View,
                     description: None,
                     definition: String::new(),
+                    options: Default::default(),
                 },
             );
         }
@@ -1086,6 +1087,7 @@ mod tests {
             pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
+                options: Default::default(),
                 definition: String::new(),
             },
         );
@@ -1239,6 +1241,7 @@ mod tests {
             pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
+                options: Default::default(),
                 definition: String::new(),
             },
         );

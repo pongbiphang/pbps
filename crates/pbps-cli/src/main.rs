@@ -5263,6 +5263,7 @@ mod tests {
                     kind: ModuleKind::View,
                     description: None,
                     definition: "AS SELECT 1 AS one".into(),
+                    options: Default::default(),
                 }),
             }])
             .is_ok()
@@ -5345,6 +5346,7 @@ mod tests {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
+            options: Default::default(),
         })
     }
 
@@ -5412,6 +5414,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::Function,
                     description: None,
                     definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+                    options: Default::default(),
                 },
             );
         }

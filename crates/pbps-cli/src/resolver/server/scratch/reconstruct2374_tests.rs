@@ -109,6 +109,7 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> (pbps_model::ModuleId
         Module {
             kind,
             description: None,
+            options: Default::default(),
             definition: definition.into(),
         },
     )
@@ -359,6 +360,7 @@ async fn mssql_managed_view_over_an_external_table_compiles_and_a_missing_one_re
                 Module {
                     kind: ModuleKind::View,
                     description: None,
+                    options: Default::default(),
                     definition: "SELECT i FROM ext.x".into(),
                 },
             );

@@ -3020,6 +3020,7 @@ mod tests {
             kind: pbps_model::ModuleKind::Trigger,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         };
         let found = |parent_trigger: &str, own: &[&str], check: Option<&str>| {
             let mut schema = pbps_model::Schema::default();
@@ -4082,6 +4083,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::Trigger,
                     description: None,
                     definition: definition.into(),
+                    options: Default::default(),
                 },
             );
             s
@@ -5146,6 +5148,7 @@ mod tests {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "() RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT f(1); END".into(),
+                options: Default::default(),
             },
         );
         let arrivals: Vec<ModuleId> = ["app.f(integer)", "app.f(smallint)"]
@@ -5181,11 +5184,13 @@ mod tests {
             kind: ModuleKind::View,
             description: Some("a repository annotation".into()),
             definition: "SELECT id FROM app.t".into(),
+            options: Default::default(),
         };
         let mut read = Module {
             kind: ModuleKind::View,
             description: None,
             definition: " SELECT t.id\n   FROM app.t;".into(),
+            options: Default::default(),
         };
         assert!(pg.module_matches_declaration(&wrote, &read));
         read.kind = ModuleKind::Function;

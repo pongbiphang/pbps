@@ -1421,12 +1421,51 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
         None => false,
     };
 
+    // Refused rather than ignored, like `public_execute:` above: a line a
+    // reader takes for a guarantee and the tool takes for nothing is the
+    // worst of the readings. A function's header is the user's text, so the
+    // option is written there (DEC-2329.1).
+    let schemabinding = match &dto.schemabinding {
+        Some(v) if kind != ModuleKind::View => {
+            errs.push(LoadError::semantic(
+                src,
+                to_span(&v.defined),
+                format!("`schemabinding:` is meaningless on a {kind}"),
+                if kind == ModuleKind::Function {
+                    "write `WITH SCHEMABINDING` in the function's own header and remove the key"
+                } else {
+                    "only a view has the option as a key; remove it"
+                },
+            ));
+            false
+        }
+        Some(v) => v.value,
+        None => false,
+    };
+
+    // The same refusal for the indexes of an indexed view: only a view has
+    // them, and the dialect decides whether they are valid (DEC-2329.3).
+    if kind != ModuleKind::View && (!dto.indexes.is_empty() || dto.clustered.is_some()) {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&name_value.defined),
+            format!("`indexes:` and `clustered:` are meaningless on a {kind}"),
+            "only a view can be indexed; remove the keys",
+        ));
+    }
+    let indexes = convert_indexes(src, dto.indexes, &mut errs);
+
     match (id, errs.is_empty()) {
         (Some(id), true) => Ok(LoadedModule {
             id,
             module: Module {
                 kind,
                 description: dto.description.map(pbps_model::Text::from),
+                options: pbps_model::ModuleOptions {
+                    schemabinding,
+                    indexes,
+                    clustered: dto.clustered,
+                },
                 definition: dto.definition,
             },
             depends_on,

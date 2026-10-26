@@ -95,6 +95,7 @@ fn module(kind: ModuleKind, id: &str, definition: &str) -> Change {
             kind,
             definition: definition.into(),
             description: None,
+            options: Default::default(),
         }),
     }
 }
@@ -907,6 +908,7 @@ async fn names_that_only_look_like_a_read_or_a_call_make_no_cycle() {
                 kind: ModuleKind::Function,
                 definition: FUNCTION.into(),
                 description: None,
+                options: Default::default(),
             }),
         };
         compile(

@@ -55,6 +55,7 @@ fn assert_observational(shape: Shape) {
             if bound { "WITH SCHEMABINDING" } else { "" }
         ),
         description: None,
+        options: Default::default(),
     };
     let f: ModuleId = "dbo.f".parse().unwrap();
     let g: ModuleId = "dbo.g".parse().unwrap();

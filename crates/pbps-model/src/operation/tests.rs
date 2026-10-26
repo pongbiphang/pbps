@@ -68,6 +68,7 @@ fn function() -> (ModuleId, Module) {
                          LANGUAGE sql;"
                 .into(),
             description: None,
+            options: Default::default(),
         },
     )
 }
@@ -470,6 +471,7 @@ fn rebuild() -> (Operations, ObjectKey, ObjectKey) {
         kind: ModuleKind::View,
         definition: "CREATE VIEW app.v AS SELECT app.f(1) AS x;".into(),
         description: None,
+        options: Default::default(),
     };
     let root = Source::Change(0);
     let ops = Operations::expanded(

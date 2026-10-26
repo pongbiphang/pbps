@@ -138,7 +138,9 @@ use crate::schema::Schema;
 /// Version 30 records declared enums and domains (DEC-1635.1).
 /// Version 31 records opaque baseline-only catalog evidence (DEC-2179.1).
 /// Version 32 records authored domain expressions beside catalog definitions (DEC-1635.4).
-pub const CURRENT_VERSION: u32 = 32;
+/// Version 33 records a module's `options`: a view's `WITH SCHEMABINDING` and its
+/// indexes (DEC-2329.1, DEC-2329.3).
+pub const CURRENT_VERSION: u32 = 33;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -624,7 +626,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 32);
+        assert_eq!(CURRENT_VERSION, 33);
     }
 
     fn schema_with(ty: &str) -> Schema {

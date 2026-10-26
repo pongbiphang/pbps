@@ -247,6 +247,26 @@ where
             // the last definition into the removed slot.
             .shift_remove(name);
     }
+    // #2329 adds a view's `schemabinding:`, `indexes:` and `clustered:` (schema
+    // set 62); the captured module branches predate it.
+    let module = &mut declaration_schema["$defs"]["ModuleDto"];
+    module["properties"]
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("schemabinding");
+    for key in ["indexes", "clustered"] {
+        module["properties"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove(key);
+    }
+    for branch in module["oneOf"].as_array_mut().unwrap() {
+        if let Some(properties) = branch["properties"].as_object_mut() {
+            for key in ["schemabinding", "indexes", "clustered"] {
+                properties.shift_remove(key);
+            }
+        }
+    }
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );

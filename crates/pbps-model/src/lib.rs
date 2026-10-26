@@ -77,8 +77,8 @@ pub use ids::{Conversion, IdsFile, IdsIndex, Move, Tombstone, ValidIds};
 pub use intent::Intent;
 pub use managed_type::{EnumPlacement, EnumRebuildStep, ManagedType};
 pub use module::{
-    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,
-    RoutineArg, RoutineArgError, RoutineId,
+    Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ModuleOptions, ObjectName,
+    PublicExecute, RoutineArg, RoutineArgError, RoutineId,
 };
 pub use name::{
     ColumnName, ColumnRef, NameError, ObjectLocalName, RoleName, TableName, check_segment,

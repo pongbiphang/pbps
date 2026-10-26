@@ -28,6 +28,7 @@ fn function(bound: bool, body: &str) -> Module {
             if bound { "WITH SCHEMABINDING" } else { "" }
         ),
         description: None,
+        options: Default::default(),
     }
 }
 fn alter(name: &str, module: &Module) -> Change {

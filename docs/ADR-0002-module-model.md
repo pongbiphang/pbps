@@ -112,6 +112,12 @@ file.
 
 ### Known limitation: an alter that releases a schema-bound dependency
 
+> **Amended by DEC-2329.1 and DEC-2329.2.** A schema-bound view keeps its option
+> in the model, and a plan drops and recreates a schema-bound module around the
+> changes it would otherwise refuse, restoring declared grants through
+> ADR-0005. The text below is the original decision; it still describes any
+> module that is not schema-bound.
+
 Module changes bracket the table changes: drops first, creates and alters
 last. "Alters last" is right for the common case — a view that starts
 selecting a column the same plan adds must be restated *after* the column

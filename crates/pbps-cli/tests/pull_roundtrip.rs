@@ -160,6 +160,8 @@ fn full_catalog() -> RawCatalog {
                 ),
                 parent: None,
                 requires_bound_references: true,
+                schema_bound: false,
+                clr: false,
                 default_set_options: true,
             },
             RawModule {
@@ -174,6 +176,8 @@ fn full_catalog() -> RawCatalog {
                 ),
                 parent: Some(("dbo".into(), "customer".into())),
                 requires_bound_references: false,
+                schema_bound: false,
+                clr: false,
                 default_set_options: true,
             },
         ],

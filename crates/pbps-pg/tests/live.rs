@@ -14977,6 +14977,7 @@ fn module(kind: pbps_model::ModuleKind, definition: &str) -> pbps_model::Module 
         kind,
         description: None,
         definition: definition.to_owned(),
+        options: Default::default(),
     }
 }
 
@@ -28255,6 +28256,7 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
             kind: ModuleKind::Function,
             description: None,
             definition: "SELECT $1".to_owned(),
+            options: Default::default(),
         },
     );
     let pg = Postgres::new();
@@ -28592,6 +28594,7 @@ async fn a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it(
             kind: ModuleKind::Function,
             description: None,
             definition: "SELECT $1".to_owned(),
+            options: Default::default(),
         },
     );
     let mut bare = Role::default();
@@ -34509,6 +34512,7 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
                 kind: ModuleKind::View,
                 definition: "SELECT 1 AS id".into(),
                 description: None,
+                options: Default::default(),
             }),
         },
         dropping_column(&s, "id"),
@@ -34580,6 +34584,7 @@ fn schema_103(tables: usize, modules: usize) -> Schema {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
                 definition: "SELECT 1 AS x".to_owned(),
+                options: Default::default(),
             },
         );
     }
@@ -38174,6 +38179,7 @@ async fn catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments(
         schema.tables.insert(TableName::new("c", "t"), Default::default());
         schema.modules.insert(pbps_model::ModuleId::Named(TableName::new("c", "reader")), pbps_model::Module {
             kind: pbps_model::ModuleKind::View, definition: String::new(), description: None,
+            options: Default::default(),
         });
         let links = externals::links(&mut db.conn).await?;
         let managed = Managed::from_schema(&schema);

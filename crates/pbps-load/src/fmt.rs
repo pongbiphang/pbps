@@ -532,6 +532,15 @@ pub fn render_module(
         let _ = writeln!(s, "public_execute: true");
     }
 
+    // Same rule as `public_execute:`: `false` is what the absent key means.
+    if module.options.schemabinding {
+        let _ = writeln!(s, "schemabinding: true");
+    }
+    if let Some(clustered) = &module.options.clustered {
+        let _ = writeln!(s, "clustered: {}", scalar(clustered.raw()));
+    }
+    render_indexes(&mut s, &module.options.indexes, "", "");
+
     // Quotes and backslashes need no escaping in a literal block, and tabs
     // and LF keep their meaning there. Every other escape follows the shared
     // scalar policy: literal controls can invalidate YAML or change on reload.
@@ -787,9 +796,20 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
         }
     }
 
-    if !table.indexes.is_empty() {
+    render_indexes(s, &table.indexes, pad, lead);
+}
+
+/// An `indexes:` block, each line under `pad`: a table's, a partition's, or an
+/// indexed view's (DEC-2329.3).
+fn render_indexes(
+    s: &mut String,
+    indexes: &std::collections::BTreeMap<pbps_model::ObjectLocalName, pbps_model::Index>,
+    pad: &str,
+    lead: &str,
+) {
+    if !indexes.is_empty() {
         let _ = writeln!(s, "{lead}{pad}indexes:");
-        for (n, ix) in &table.indexes {
+        for (n, ix) in indexes {
             let _ = writeln!(s, "{pad}  {}:", scalar(n.raw()));
             if !ix.method.is_btree() {
                 let _ = writeln!(s, "{pad}    method: {}", ix.method.as_str());
@@ -898,6 +918,7 @@ mod tests {
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: "SELECT 'first  \nsecond' AS note".into(),
+            options: Default::default(),
         };
         let name: pbps_model::ObjectName = "dbo.v".parse().unwrap();
         let out = render_module(&ModuleId::Named(name), &module, &Default::default(), false);
@@ -1342,6 +1363,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::View,
                 description: Some(s.as_str().into()),
                 definition: "SELECT 'first  \nsecond' AS note".into(),
+                options: Default::default(),
             };
             let id = ModuleId::Named("app.v".parse().unwrap());
             let out = render_module(&id, &module, &Default::default(), false);
@@ -1606,6 +1628,35 @@ mod tests {
             "function: app.f(int)\ndefinition: |-\n  (a integer) RETURNS int AS $$ SELECT 1 $$\n",
         );
         assert!(!closed.contains("public_execute"), "{closed}");
+    }
+
+    /// The same rule for a view's `schemabinding:`: losing it would recreate
+    /// the view without the binding on the next apply, and writing the default
+    /// would put the key into every view file, where a function refuses it.
+    #[test]
+    fn a_views_schemabinding_survives_formatting_and_the_default_writes_nothing() {
+        let bound = module_round_trip(
+            "view: dbo.v\nschemabinding: true\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        );
+        assert!(bound.contains("schemabinding: true"), "{bound}");
+        let plain = module_round_trip(
+            "view: dbo.v\nschemabinding: false\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+        );
+        assert!(!plain.contains("schemabinding"), "{plain}");
+    }
+
+    /// An indexed view's indexes and its clustered one survive `fmt`: losing
+    /// them would restate the view unindexed on the next apply (DEC-2329.3).
+    #[test]
+    fn an_indexed_views_indexes_survive_formatting() {
+        let out = module_round_trip(
+            "view: dbo.v\nschemabinding: true\nclustered: ux\nindexes:\n  ix:\n    columns: [a desc]\n    include: [b]\n  ux:\n    columns: [id]\n    unique: true\ndefinition: |-\n  SELECT id, a, b FROM dbo.t\n",
+        );
+        assert!(out.contains("clustered: ux"), "{out}");
+        assert!(
+            out.contains("columns: [a desc]") && out.contains("include: [b]"),
+            "{out}"
+        );
     }
 
     #[test]

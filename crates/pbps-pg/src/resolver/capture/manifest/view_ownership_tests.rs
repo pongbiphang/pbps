@@ -73,6 +73,7 @@ fn ownership(
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT 1 AS x".into(),
+            options: Default::default(),
         },
     );
     let ids = IdsFile::default();

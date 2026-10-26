@@ -11762,6 +11762,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT 1".into(),
+            options: Default::default(),
         };
         let create_view = || {
             PlannedChange::new(Change::CreateModule {
@@ -12258,6 +12259,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::View,
                     description: None,
                     definition: "CREATE VIEW dbo.Ck_Name AS SELECT 1 AS x".into(),
+                    options: Default::default(),
                 }),
             }),
         ]);
@@ -14958,6 +14960,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::View,
                     description: None,
                     definition: "SELECT 1".into(),
+                    options: Default::default(),
                 }),
             }),
         ];
@@ -15017,6 +15020,7 @@ mod tests {
             kind: ModuleKind::View,
             description: None,
             definition: "SELECT 1".into(),
+            options: Default::default(),
         };
         let occupant = |kind, owner: Option<&TableName>| NameOccupant {
             name: x.clone(),
@@ -15723,6 +15727,7 @@ mod tests {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$".into(),
+                options: Default::default(),
             }),
         };
         let decided = |name: &str, access| Change::PublicExecution {
@@ -17028,6 +17033,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::Function,
                     description: None,
                     definition: "RETURN 1".to_owned(),
+                    options: Default::default(),
                 },
             );
             s.roles.insert(
@@ -17089,6 +17095,7 @@ mod tests {
                         kind: pbps_model::ModuleKind::View,
                         description: None,
                         definition: "SELECT 1".to_owned(),
+                        options: Default::default(),
                     }),
                 }),
             ],
@@ -17109,6 +17116,7 @@ mod tests {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: body.to_owned(),
+            options: Default::default(),
         };
         let int: ModuleId = "dbo.f(integer)".parse().unwrap();
         let text: ModuleId = "dbo.f(text)".parse().unwrap();
@@ -17399,6 +17407,7 @@ mod tests {
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         };
         let schema_with = |module: Option<pbps_model::Module>| {
             let mut s = Schema::default();
@@ -18112,6 +18121,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::View,
                     description: None,
                     definition: "SELECT 1".to_owned(),
+                    options: Default::default(),
                 },
             )
         };
@@ -18417,6 +18427,7 @@ mod tests {
             kind,
             description: None,
             definition: "SELECT 1".to_owned(),
+            options: Default::default(),
         };
         let schema_with = |kind: pbps_model::ModuleKind| {
             let mut s = Schema::default();

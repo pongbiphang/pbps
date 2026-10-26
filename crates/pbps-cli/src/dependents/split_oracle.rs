@@ -250,6 +250,7 @@ fn schema() -> Schema {
                 kind: ModuleKind::Function,
                 definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2".into(),
                 description: None,
+                options: Default::default(),
             },
         )]
         .into(),

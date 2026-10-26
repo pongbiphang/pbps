@@ -871,6 +871,7 @@ mod tests {
                 kind: ModuleKind::View,
                 description: None,
                 definition: "SELECT id FROM t".into(),
+                options: Default::default(),
             },
         );
         let mut desired = base.clone();
@@ -880,6 +881,7 @@ mod tests {
                 kind: ModuleKind::Function,
                 description: None,
                 definition: "RETURNS int LANGUAGE sql RETURN 1".into(),
+                options: Default::default(),
             },
         );
         (base, desired)

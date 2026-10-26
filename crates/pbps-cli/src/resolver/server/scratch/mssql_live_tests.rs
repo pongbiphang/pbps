@@ -1204,7 +1204,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         target.execute("CREATE TABLE dbo.ext2269(i ext2269.amount CONSTRAINT ext2269_pk PRIMARY KEY);").await.unwrap();
         target.execute("CREATE VIEW dbo.managed2269 AS SELECT i FROM dbo.ext2269;").await.unwrap();
         let mut schema=Schema::default();
-        schema.modules.insert("dbo.managed2269".parse().unwrap(),pbps_model::Module { kind:pbps_model::ModuleKind::View,description:None,definition:"CREATE VIEW dbo.managed2269 AS SELECT i FROM dbo.ext2269;".into() });
+        schema.modules.insert("dbo.managed2269".parse().unwrap(),pbps_model::Module { kind:pbps_model::ModuleKind::View,description:None,options: Default::default(),definition:"CREATE VIEW dbo.managed2269 AS SELECT i FROM dbo.ext2269;".into() });
         let ids=IdsFile::default();
         let side=pbps_diff::Side { schema:&schema,ids:&ids };
         let bootstrap=pbps_diff::resolver::ordinary(side,side,&pbps_mssql::Mssql,&Hints::default()).unwrap();
@@ -1263,6 +1263,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: "CREATE VIEW dbo.managed2269 AS SELECT g,d FROM dbo.external2269;".into(),
+            options: Default::default(),
         });
         let ids = IdsFile::default();
         let side = pbps_diff::Side { schema: &schema, ids: &ids };

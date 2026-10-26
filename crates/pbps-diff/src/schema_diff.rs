@@ -1592,6 +1592,34 @@ pub(crate) fn diff_partial_rebuilding(
         }
         changes = split;
     }
+    // A module the engine binds to what this plan changes cannot stand beside
+    // the change, whether the declarations edited it or not (SQL Server's
+    // SCHEMABINDING, DEC-2329.1). It goes as a drop and comes back as a
+    // create: the classes put the first before the table changes and the
+    // second after them, as they do for any module. Before `diff_roles`, so
+    // the grants a rebuilt module loses are written again.
+    for id in dialect.schema_bound_teardown(base.schema, declared.schema, &changes) {
+        let (Some(before), Some(module)) = (
+            base.schema.modules.get(&id),
+            declared.schema.modules.get(&id),
+        ) else {
+            continue;
+        };
+        if changes.iter().any(|c| {
+            matches!(c, Change::DropModule { id: other, .. } | Change::CreateModule { id: other, .. } if *other == id)
+        }) {
+            continue;
+        }
+        changes.retain(|c| !matches!(c, Change::AlterModule { id: other, .. } if *other == id));
+        changes.push(Change::DropModule {
+            id: id.clone(),
+            kind: before.kind,
+        });
+        changes.push(Change::CreateModule {
+            id,
+            module: Box::new(module.clone()),
+        });
+    }
     diff_roles(base, declared, dialect, &mut changes);
     revoke_public_execution(base.schema, dialect, hints, &mut changes);
 
@@ -7487,6 +7515,10 @@ fn diff_modules(
                 // keeps the permissions granted on the object.
                 if dialect.normalize_definition(&before.definition)
                     != dialect.normalize_definition(&module.definition)
+                    // The option is part of what the module is: the engine
+                    // keeps it, refuses changes to what it reads while it
+                    // holds, and `CREATE OR ALTER` sets it either way.
+                    || before.options != module.options
                 {
                     changes.push(Change::AlterModule {
                         id: id.clone(),
@@ -12566,6 +12598,7 @@ mod tests {
                 kind: pbps_model::ModuleKind::Trigger,
                 description: None,
                 definition: "AFTER INSERT AS SELECT 1".to_owned(),
+                options: Default::default(),
             },
         );
         let mut triggered_base = ordinary(&|_| {});
@@ -18979,6 +19012,7 @@ mod tests {
                     kind: pbps_model::ModuleKind::Trigger,
                     description: None,
                     definition: "AFTER INSERT AS SELECT 1".to_owned(),
+                    options: Default::default(),
                 },
             )
         };
@@ -22413,6 +22447,7 @@ mod tests {
             kind,
             description: None,
             definition: definition.to_owned(),
+            options: Default::default(),
         }
     }
 
@@ -24066,6 +24101,7 @@ mod tests {
                         kind: pbps_model::ModuleKind::Function,
                         description: None,
                         definition: body.to_owned(),
+                        options: Default::default(),
                     },
                 )
             };

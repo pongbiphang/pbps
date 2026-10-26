@@ -1916,6 +1916,7 @@ fn declared(views: &[(&str, &str)], tables: &[&str]) -> pbps_model::Schema {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
                 definition: (*definition).to_owned(),
+                options: Default::default(),
             },
         );
     }
@@ -2452,6 +2453,7 @@ fn generating(mut schema: pbps_model::Schema) -> pbps_model::Schema {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: GENERATING.into(),
+            options: Default::default(),
         },
     );
     let mut generated = pbps_model::Column::new("integer".parse().unwrap());
@@ -2788,6 +2790,7 @@ async fn resolver_fills_what_a_routine_declared_through_the_extras_needs() {
                 kind: pbps_model::ModuleKind::Function,
                 description: None,
                 definition: body.into(),
+                options: Default::default(),
             },
         );
         schema
@@ -3187,6 +3190,7 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
                 "() RETURNS void LANGUAGE sql BEGIN ATOMIC \
                  INSERT INTO {EXTERNAL}.v (id, name) VALUES (1, 'x'); END"
             ),
+            options: Default::default(),
         },
     );
     base.modules
@@ -4453,6 +4457,7 @@ async fn resolver_takes_an_unmanaged_overload_of_a_managed_routine_for_no_chain(
                 kind: pbps_model::ModuleKind::Function,
                 description: None,
                 definition: "(integer) RETURNS integer LANGUAGE sql RETURN $1".into(),
+                options: Default::default(),
             },
         );
         schema
@@ -5612,6 +5617,7 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
             kind: pbps_model::ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+            options: Default::default(),
         },
     );
     for server in SERVERS {

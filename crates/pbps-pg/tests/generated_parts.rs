@@ -33,6 +33,7 @@ fn fixture() -> (Schema, IdsFile) {
             kind: ModuleKind::Function,
             description: None,
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2".into(),
+            options: Default::default(),
         },
     );
     let ids = identities(&schema);
