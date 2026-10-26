@@ -39,6 +39,21 @@ mod conversions2359;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/drop_intent2414.rs"]
+mod drop_intent2414;
+
+#[test]
+#[ignore = "needs live pg18"]
+fn drop_intent2414_removals_require_recorded_reasons_on_pg18() {
+    drop_intent2414::check(&std::env::var("PBPS_TEST_PG_DB").unwrap(), true);
+}
+
+#[test]
+#[ignore = "needs live pg16"]
+fn drop_intent2414_removals_require_recorded_reasons_on_pg16() {
+    drop_intent2414::check(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
+}
+
 #[path = "support/refusal_next_steps_pg.rs"]
 mod refusal_next_steps;
 

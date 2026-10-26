@@ -304,7 +304,18 @@ pub fn acceptance(server: &str, pg: bool) {
     // Importing reviewed identities and recording a drop never supplies Git
     // ancestry: this is exactly the stale checkout the guard must still refuse.
     let ids = git(&d.dir, &["show", &format!("{deployed}:schema.ids.json")]);
-    std::fs::write(d.dir.join("schema.ids.json"), ids).unwrap();
+    let mut imported: pbps_model::IdsFile = serde_json::from_str(&ids).unwrap();
+    let path = d.dir.join("schema.ids.json");
+    let local: pbps_model::IdsFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Import deployed identities without retiring the local-only coupon UID
+    // and minting a replacement for the same declaration (DEC-2414.1).
+    let coupon: pbps_model::ColumnRef = format!("{schema}.customer.coupon").parse().unwrap();
+    assert!(imported.column_uid(&coupon).is_none());
+    imported
+        .columns
+        .insert(local.column_uid(&coupon).unwrap().clone(), coupon);
+    std::fs::write(path, serde_json::to_vec_pretty(&imported).unwrap()).unwrap();
     write(&d, schema, true, true, false);
     extra(&d, schema, &role.name, pg);
     offline(&d);

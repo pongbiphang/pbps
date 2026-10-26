@@ -3,28 +3,8 @@ use crate::baseline::ancestry::{self, Evidence};
 use crate::output::Finding;
 use pbps_model::{IdsFile, Intent, Schema, StateSnapshot};
 
-// Match the resolver's disappeared-to-appeared eligibility, so a retained
-// annotation cannot move a new object that has reused the source name.
-fn project_pending_renames<N: Clone + Ord>(
-    names: &mut std::collections::BTreeMap<pbps_model::Uid, N>,
-    declared: std::collections::BTreeSet<N>,
-    intents: impl Iterator<Item = (N, N)>,
-) {
-    let known: std::collections::BTreeSet<_> = names.values().cloned().collect();
-    let pending: std::collections::BTreeMap<_, _> = intents
-        .filter(|(from, to)| {
-            !declared.contains(from) && declared.contains(to) && !known.contains(to)
-        })
-        .collect();
-    for name in names.values_mut() {
-        if let Some(to) = pending.get(name) {
-            *name = to.clone();
-        }
-    }
-}
-
-/// This is a projection of existing names and explicit rename annotations, not
-/// identity resolution: it allocates no uid and makes no rename decision.
+// The differ owns this inventory so ancestry and drop-intent resolution
+// cannot disagree about what disappeared (DEC-2397.1, DEC-2414.1).
 fn removals(
     recorded: &IdsFile,
     recorded_schema: &Schema,
@@ -32,131 +12,18 @@ fn removals(
     schema: &Schema,
     intents: &[Intent],
 ) -> Vec<String> {
-    let mut names = local.clone();
-    project_pending_renames(
-        &mut names.tables,
-        schema.tables.keys().cloned().collect(),
-        intents.iter().filter_map(|i| {
-            let Intent::RenameTable { from, to } = i else {
-                return None;
-            };
-            Some((from.clone(), to.clone()))
-        }),
-    );
-    let local_index = local.index();
-    for column in names.columns.values_mut() {
-        if let Some(uid) = local_index.table_uid(&column.table)
-            && let Some(to) = names.tables.get(uid)
-        {
-            column.table = to.clone();
-        }
-    }
-    project_pending_renames(
-        &mut names.columns,
-        schema
-            .tables
-            .iter()
-            .flat_map(|(name, table)| table.columns.keys().map(|column| name.column(column)))
-            .collect(),
-        intents.iter().filter_map(|i| {
-            let Intent::RenameColumn { table, from, to } = i else {
-                return None;
-            };
-            Some((table.column(from), table.column(to)))
-        }),
-    );
-    project_pending_renames(
-        &mut names.roles,
-        schema.roles.keys().cloned().collect(),
-        intents.iter().filter_map(|i| {
-            let Intent::RenameRole { from, to } = i else {
-                return None;
-            };
-            Some((from.clone(), to.clone()))
-        }),
-    );
-    let mut removed_tables = std::collections::BTreeSet::new();
-    let mut removed = Vec::new();
-    for (uid, name) in &recorded.tables {
-        if !recorded_schema.tables.contains_key(name) {
-            continue;
-        }
-        if !names
-            .tables
-            .get(uid)
-            .is_some_and(|name| schema.tables.contains_key(name))
-        {
-            removed_tables.insert(name);
-            removed.push(format!("table {}", name.shown()));
-        }
-    }
-    let declared_tables: std::collections::BTreeMap<_, _> = recorded
-        .tables
-        .iter()
-        .filter_map(|(uid, old)| {
-            let name = names.tables.get(uid)?;
-            Some((old, (name, schema.tables.get(name)?)))
-        })
-        .collect();
-    for (uid, column) in &recorded.columns {
-        let attached = declared_tables
-            .get(&column.table)
-            .is_some_and(|(_, table)| table.partition_of.is_some());
-        if !attached
-            && recorded_schema
-                .tables
-                .get(&column.table)
-                .is_some_and(|table| table.columns.contains_key(&column.name))
-            && !removed_tables.contains(&column.table)
-            && !names.columns.get(uid).is_some_and(|column| {
-                schema
-                    .tables
-                    .get(&column.table)
-                    .is_some_and(|table| table.columns.contains_key(&column.name))
-            })
-        {
-            let table = declared_tables
-                .get(&column.table)
-                .map_or(&column.table, |(name, _)| *name);
-            removed.push(format!(
-                "column {}",
-                table.column(column.name.clone()).shown()
-            ));
-        }
-    }
-    // Computed columns have no uid; their names are their existing identity.
-    for (uid, old) in &recorded.tables {
-        if removed_tables.contains(old) {
-            continue;
-        }
-        if let Some(table) = recorded_schema.tables.get(old) {
-            for column in table.computed.keys() {
-                if !names
-                    .tables
-                    .get(uid)
-                    .and_then(|name| schema.tables.get(name))
-                    .is_some_and(|table| {
-                        table.computed.contains_key(column) || table.columns.contains_key(column)
-                    })
-                {
-                    let name = names.tables.get(uid).unwrap_or(old);
-                    removed.push(format!("column {}.{}", name.shown(), column.shown()));
-                }
-            }
-        }
-    }
-    // PostgreSQL preserves the principal, but revoking its grants and removing
-    // it from management can still undo another branch's deployed application.
-    for (uid, role) in &recorded.roles {
-        if recorded_schema.roles.contains_key(role)
-            && !names
-                .roles
-                .get(uid)
-                .is_some_and(|name| schema.roles.contains_key(name))
-        {
-            removed.push(format!("role {}", role.shown()));
-        }
-    }
+    let mut removed: Vec<_> = pbps_diff::identity::removals::inventory(
+        pbps_diff::Side {
+            schema: recorded_schema,
+            ids: recorded,
+        },
+        local,
+        schema,
+        intents,
+    )
+    .into_iter()
+    .map(|removal| removal.to_string())
+    .collect();
     removed.sort();
     removed
 }

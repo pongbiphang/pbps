@@ -1227,3 +1227,28 @@ if a merge brings the two together, and `--withdraw` takes the conversions of
 the replacement columns it removes, as it takes the replacements' moves.
 Carrying a conversion into the replacement and applying it in the copy is
 deferred to lowering the copy (PR4b).
+
+
+<a id="dec-2414-1"></a>
+
+**DEC-2414.1. Planning requires the recorded drop intent for every tracked
+identity removed from its baseline, including one absent from the checkout.**
+Measured on SQL Server 17.0.4075.5 and PostgreSQL 16.15/18.6, removing a table,
+column, role or managed type refuses while its local UID remains, but plans
+its removal when that UID is missing. Offline previews have the same gap.
+Identity resolution therefore also reads the recorded baseline and requires
+its disappearing UID's tombstone, using the existing reason blockers and
+remedies (SPEC §7.1). It shares the removal inventory with checkout ancestry
+(DEC-2397.1), including the same projection of pending explicit renames. It preserves reviewed UID bindings and writes no inferred
+identity. PostgreSQL role removal still revokes and unmanages the role; it
+never drops the cluster principal.
+
+An absent-name drop command also measured as success with no recording. Only
+a matching recorded retirement excuses a repeat; an unknown name uses the
+existing unused-intent refusal. A redeclared name is not a prior retirement.
+
+Non-UID objects keep their existing boundaries: modules use git history
+(ADR-0002), reference rows use their declared keys (ADR-0005), SQL Server
+computed columns remain table parts (DEC-1174.1), and constraints, indexes and
+row policies retain their reviewed risk gates (SPEC §7.2). This adds no reason
+requirement to those objects and changes no saved-plan or identity format.

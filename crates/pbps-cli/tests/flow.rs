@@ -27,6 +27,15 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/drop_intent2414.rs"]
+mod drop_intent2414;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn drop_intent2414_removals_require_recorded_reasons_on_mssql() {
+    drop_intent2414::check(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/dependencies2322.rs"]
 mod dependencies2322;
 #[path = "support/dev587.rs"]
