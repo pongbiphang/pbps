@@ -3562,6 +3562,19 @@ Maintainer, 2026-10-24: the second of two PRs, after the partition keys
   (`SetEnsureKeys`), a second logical change, so such a plan is not a staged
   one (measured); a staged plan can rename a label that rows hold in a
   cell, or that no declared row names, and those apply and resume.
+- **The checksum pins the row a takeover under a renamed key depends on**
+  (`pinned_baseline_scopes`): the plan's baseline checksum is taken over the
+  recorded scopes and the planned ones, and the planned ones are widened by the
+  labels their keys hold before the plan's renames, on the side that pins
+  (`plan`) and the side that verifies (`apply`, transactional and staged,
+  fresh) through the one function. Without it the row `sad` that a takeover
+  renames to `blue` was in the comparison but not in the checksum, and a change
+  or a delete of it between `plan` and `apply` passed unseen into the baseline
+  the apply recorded (SPEC 7.6). A plan that renames no label a key holds pins
+  exactly `pinned_scopes`, so its checksum does not change. The resume of a
+  staged run is checked against the checkpoint's own recorded rows and needs
+  nothing; the plan's read is widened from the `renamed_from` hints, which name
+  the same pairs the plan's renames do.
 - **The widened baseline is trimmed to what the plan still manages**
   (`trim_to_the_final_scope`): the baseline of an `ensure` table is read under
   the declared keys and the labels they held, and a chain (`b→c`, `a→b`) over
@@ -3600,7 +3613,8 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows`,
 `a_staged_label_rename_under_ensure_rows_applies_and_resumes`,
 `a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key`,
-`a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table` and
+`a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table`,
+`a_takeover_under_a_renamed_key_pins_the_row_it_depends_on` and
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.

@@ -6952,3 +6952,83 @@ fn a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_tab
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_takeover_under_a_renamed_key_pins_the_row_it_depends_on() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The unmanaged row `sad` is taken over under `ensure` as `blue`; the
+        // plan is the rename alone, and the row it depends on is in the
+        // baseline the checksum pins (DEC-2346.2).
+        for outside in [
+            Some("UPDATE app.moods SET note = 'changed' WHERE m = 'sad'"),
+            Some("DELETE FROM app.moods WHERE m = 'sad'"),
+            None,
+        ] {
+            let (own, d) = adopted(
+                &server,
+                "enum_rows_pinned2346",
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad', 'ok'); \
+                 CREATE TABLE app.moods (m app.mood PRIMARY KEY, next app.mood, note text); \
+                 INSERT INTO app.moods VALUES ('sad', 'ok', 'low'), ('ok', NULL, NULL);",
+            );
+            let db = own.connection();
+            enum_rows(
+                &d,
+                "[{name: blue, renamed_from: sad}, ok]",
+                "ensure",
+                "    blue: {next: ok, note: low}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("pinned.plan.json");
+            let plan = label_plan(&d, db, &path);
+            assert!(
+                changes_of(&plan).contains(&"RenameEnumValue".to_owned())
+                    && !changes_of(&plan).iter().any(|k| k.ends_with("Row")),
+                "{plan:?}"
+            );
+            if let Some(sql) = outside {
+                on_server(db, sql);
+                let out = approved_apply(&d, db, &path, &["--allow", "rename"]);
+                assert_ne!(code(&out), 0, "{sql}");
+                assert!(
+                    stderr(&out).contains("no longer the database this plan was computed against"),
+                    "{sql}: {}",
+                    stderr(&out)
+                );
+                // Nothing was applied, and no success is recorded: the refusal
+                // is a `failed` entry beside the baseline, the state advances
+                // by none.
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM pg_enum WHERE enumtypid = 'app.mood'::regtype AND enumlabel = 'blue'"
+                    ),
+                    0
+                );
+            } else {
+                succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM app.moods WHERE m = 'blue' AND note = 'low'"
+                    ),
+                    1
+                );
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                succeeds(d.run(&["verify", "--db", db]));
+            }
+        }
+    }
+}
