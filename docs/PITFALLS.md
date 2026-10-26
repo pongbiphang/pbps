@@ -2310,6 +2310,12 @@ permissive ALL policy and explicit TRUE policy admitted different rows.
   an owned transient task through selection, reaps it before mounting, and
   still checks the real backend and controls on both engines. Restoring the
   child census makes both fixtures fail again.
+- **A file restored from a copy keeps the copy's old modification time, and
+  cargo keeps the build it made from the mutated one.** A revert check that
+  backs the file up with `cp -p` (or `shutil.copy2`), mutates it, runs the test
+  and moves the backup back left the next run on the mutation: three tests
+  failed on correct source (#1165). Touch the restored file, or copy without
+  preserving times, and rerun the tests on the restored tree before reporting.
 - Find the service container by **published port**, never by
   `--filter ancestor=<image>`. That filter repeats the image reference, so the
   two spellings drift apart the moment one is pinned.

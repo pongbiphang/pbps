@@ -683,3 +683,26 @@ builds, domain and array nesting, refusal before an expression can error, the
 cast passing, and unreadable catalog access. ADR-0019 §7 and SPEC §9.9 state
 this exception alongside the one-output-column rule. Types with server binary
 output but no client renderer still produce marked unrenderable evidence.
+
+<a id="dec-1165-4"></a>
+
+**DEC-1165.4. The test manifest is read strictly and every pin names one commit.**
+The manifest parser takes only what the text can answer and returns every
+problem in one pass; paths, containment and git facts belong to the caller. The
+version is read first, so a manifest from a later version is refused for its
+version rather than for the first key this build does not know. `candidate:
+working-tree` is reserved: a branch of that name is selected by its full commit
+id. An image is `name@sha256:<64 lowercase hex>` and may not also carry a tag,
+since a tag that disagrees with the digest is a second claim about which image
+is meant (ADR-0019 §2 asks for a digest reference, not a mutable tag). Pins
+are 40- or 64-digit hexadecimal ids, stored lowercase.
+
+Inputs are read, hashed and kept in one step: a fixture's text is the bytes
+that were hashed, never reopened by the runner. A path is judged by what it
+resolves to, so a symlink leaving the project and one file spelled two ways are
+both caught. An unknown version, an unreadable file and an input changed after
+it was read cannot be answered (`unanswerable`, exit 1); every other refusal is
+a finding (exit 2). A file that is missing, not regular, outside the project,
+not UTF-8 and unreadable are five different facts, and an empty file is none of
+them. The recheck compares what each path resolves to as well as its hash, so a
+symlink moved to a file with the same bytes is noticed.

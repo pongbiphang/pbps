@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub mod resolver;
+pub mod test_manifest;
 
 pub const CONFIG_FILE: &str = "pbps.yml";
 
