@@ -705,6 +705,7 @@ async fn prepared(
             kind: pbps_model::ModuleKind::View,
             description: None,
             definition: format!("SELECT id,name FROM [{}].dbo.dep2323", case.other_name),
+            options: Default::default(),
         },
     );
     let ids = IdsFile::default();
