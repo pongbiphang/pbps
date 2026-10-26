@@ -4802,14 +4802,63 @@ and reaches no compatibility verdict: it answers whether the statements run and
 converge, and a scratch of another build proves syntax and convergence only.
 
 *What is rehearsed.* The base is the plan's own base side, lowered from empty
-(`lower_from_empty`), and the plan runs as apply runs it. Changes to roles,
-their grants and row-security policies (which name roles) are left out of both
-and out of the comparison: a scratch server is shared, so a role created on it
-outlives the run, and a grant or a policy naming a role the target holds and the
-scratch does not fails for a reason that says nothing about the plan. Measured on PostgreSQL 18.6 and 16.15: tables with serial keys,
-foreign keys, checks and partial indexes, a view over a function, and declared
-rows all lower from empty and compile in one pass, so the scratch route's
-reconstruction ordering is not needed for the base.
+(`lower_from_empty`), and the plan runs as apply runs it. Measured on PostgreSQL
+18.6 and 16.15: tables with serial keys, foreign keys, checks and partial
+indexes, a view over a function, and declared rows all lower from empty and
+compile in one pass, so the scratch route's reconstruction ordering is not
+needed for the base.
+
+*Authorization, by run-scoped role mapping (the maintainer's option C).* A
+cluster's roles are shared, so the target's names are never created on the
+scratch (two plans at once would collide, and the roles would outlive the run),
+and a grant or policy naming a role the scratch lacks would fail a plan for a
+reason that says nothing about it. Leaving authorization out, as the first draft
+did, is therefore not an answer either: a wrong grant or policy would pass the
+rehearsal and fail at apply. Each role the plan, the base or the declarations
+name maps to `pbps_rehearsal_<n>_<token>` (`RoleMapping`, in `pbps-model`, the
+engine-neutral half that PR 3 reuses beside SQL Server's `PrincipalMap`; the
+engine's own `pg_*` roles keep their names). The mapping is applied to the
+model and the plan is lowered again: the base's schema and identity file, the
+declarations and the ordered plan (`OrderedPlan::under_role_names`, the one way
+to rename an already ordered plan, which renames roles and nothing else and
+makes the ordering proof again). Role, grant and row-security policy changes
+therefore run and are compared like every other change, with nothing excluded on
+the mapped path. A name inside a policy's `USING` is an expression and is not
+mapped; it runs as written.
+
+*Ownership.* The mapped roles are the run's resources, recorded before they are
+made. A run-owned run adds them to the roles its release drops after the
+database, so the login, the record, outlives them and a failed drop names the
+role left. A supplied run adds them to its claim (`Claim::roles`, omitted when
+none, so no claim changes shape for a run without them), because the claim is
+what a later run finds the run dead by and the role is the cluster's: the
+release drops them after emptying the database, which revoked what they were
+granted, and the claim goes last. The run-owned sweep already recognises
+`pbps_rehearsal_<n>_<token>` by its token (DEC-2410.1). Measured with a real
+SIGKILL on a run-owned scratch and on a supplied account holding `CREATEROLE`:
+a killed rehearsal leaves its roles, and the next run removes exactly them, once
+the server has seen the dead run's sessions go, while a live run's roles stand.
+
+*Downgrade.* The scratch account needs `SUPERUSER` or `CREATEROLE`, asked before
+anything is recorded (dropping a role takes the same attribute, so a recording
+made by an account that could never create the role could never be released). A
+run-owned scratch has a superuser. The account the target's own cluster demands
+is confined and has neither, so there authorization is not rehearsed, and that
+is the rule on that layout and not an exception: the rest of the rehearsal runs,
+the plan is not refused, and the record says `not_rehearsed` with the reason. A
+project that names no role has nothing to leave out and is recorded as
+rehearsed. Authorization errors the downgrade cannot see are not claimed: the
+record says it did not look.
+
+*The authorization field.* `Converged` carries `authorization`: `rehearsed`, or
+`not_rehearsed { reason }`. The field is required, not defaulted: a record that
+does not say what ran about authorization is refused, not read as either answer
+(DEC-2270.1 reads a missing value as the conservative one; there is none here,
+since no `Converged` record existed before this field, and a required field
+cannot be read wrongly). `plan` (human and JSON), `explain` and `apply` print
+it with the one line they share, and a skipped class adds `authorization NOT
+rehearsed` to it and a note of its own, so it cannot be read as a full
+rehearsal. Published schema set 63.
 
 *What differs.* PostgreSQL stores a check, a default, an index predicate and a
 module body as its parser deparses them, so a textual comparison finds a
@@ -4827,7 +4876,7 @@ something is staged. A managed type, which the resolver's fill does not know, an
 a fill chained to managed relations are refused with the switch named.
 
 *The record.* `Converged` carries the entry, the scratch, the layout the run
-found and the spellings; `Off` is sealed only where an entry is selected and the
+found, the spellings and the authorization field above; `Off` is sealed only where an entry is selected and the
 engine rehearses. SQL Server selects `Skip` for any entry and any switch until
 its own rehearsal lands, so its plans carry no record and acquire nothing. The
 `explain`, `plan --format json` and `apply` displays share one line.
