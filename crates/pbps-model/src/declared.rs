@@ -951,11 +951,15 @@ mod tests {
             definition: Box::new(enumeration(&["ok"])),
             removed: vec!["sad".into()],
             ordinal: 0,
+            over: None,
+            why: None,
         })]));
         assert_eq!(record.types.get(&name), Some(&enumeration(&["sad", "ok"])));
         record.advance(&changes(vec![step(EnumRebuildStep::Swap {
             definition: Box::new(enumeration(&["ok"])),
             comment: None,
+            depth: 0,
+            over: None,
         })]));
         assert_eq!(record.types.get(&name), Some(&enumeration(&["ok"])));
     }

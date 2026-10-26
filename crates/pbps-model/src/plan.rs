@@ -271,7 +271,10 @@ use crate::zone::SessionZone;
 /// clustered key; DEC-2329.1, DEC-2329.3), which an older build reads as
 /// unknown and would otherwise drop.
 /// 55 adds the in-place domain alteration, one `AlterDomain` per half (DEC-1635.8).
-pub const CURRENT_VERSION: u32 = 55;
+/// 56 adds the keep-uid rebuild of a declared domain: a rebuild step may create a
+/// domain, over its base's replacement, and convert a column by assignment
+/// (DEC-1635.9).
+pub const CURRENT_VERSION: u32 = 56;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -833,7 +836,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 55);
+        assert_eq!(CURRENT_VERSION, 56);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

@@ -159,13 +159,23 @@ pub(crate) fn changes(
         let kept: Vec<_> = current.iter().filter(|v| wanted.contains(*v)).collect();
         let retained: Vec<_> = wanted.iter().filter(|v| current.contains(v)).collect();
         if !removed.is_empty() || kept != retained {
-            match rebuild(
+            match rebuild_type(
                 base,
                 desired,
                 hints,
                 (uid, name),
-                (wanted.as_slice(), removed),
-                ordinal,
+                Replacement {
+                    definition: ManagedType::Enum {
+                        values: wanted.clone(),
+                    },
+                    removed,
+                    over: None,
+                    why: None,
+                    conversion: pbps_model::RetypeConversion::Text,
+                    base_change: None,
+                    ordinal,
+                    depth: 0,
+                },
             ) {
                 Ok(steps) => out.extend(steps),
                 Err(why) => errors.push(refusal(name, why)),
@@ -247,32 +257,64 @@ fn replacement_name(base: Side<'_>, desired: Side<'_>, uid: &Uid, name: &TypeRef
         .expect("an unbounded search")
 }
 
-/// Rebuild an enum under its uid (DEC-1635.7): the replacement, one retype per
-/// column that holds the type, and the swap. Everything that must come down
-/// for the retype is the ordinary differ's: checks, foreign keys and indexes
-/// by the dialect's retype policy, defaults by [`rebuild_defaults`], modules by
-/// the connected rebuild of their dependents.
-fn rebuild(
+/// What a rebuild creates and how its columns convert.
+pub(crate) struct Replacement {
+    /// The final declaration the replacement is created from.
+    pub definition: ManagedType,
+    /// The labels the rebuild removes from the enum at the root of the chain,
+    /// which a row of a column of any type built on it must not hold.
+    pub removed: Vec<String>,
+    /// The replacement of the type this one is built on, when that is rebuilt.
+    pub over: Option<TypeRef>,
+    /// Why it is rebuilt, for the plan's reader.
+    pub why: Option<String>,
+    pub conversion: pbps_model::RetypeConversion,
+    /// A domain's base before and after, for the plan-time narrowing probe.
+    pub base_change: Option<(ColumnType, ColumnType)>,
+    /// After the label renames of the same uid, and after the replacement of
+    /// the type this one is built on.
+    pub ordinal: usize,
+    /// How many rebuilt types this one is built on.
+    pub depth: usize,
+}
+
+/// Whether `ty` is `uid` itself or an array of it, and not a type built on it:
+/// a domain over the type is rebuilt on its own account and holds its own
+/// columns.
+pub(crate) fn holds_directly(ty: &ColumnType, uid: &Uid, ids: &IdsFile) -> bool {
+    ty.type_ref().is_some_and(|name| {
+        matches!(
+            TypeResolver::new(ids, ids).resolve(TypeSide::Desired, name),
+            TypeIdentity::Declared(at) if at == uid
+        )
+    })
+}
+
+/// Rebuild an enum or a domain under its uid (DEC-1635.7, DEC-1635.9): the
+/// replacement, one retype per column that holds the type, and the swap.
+/// Everything that must come down for the retype is the ordinary differ's:
+/// checks, foreign keys and indexes by the dialect's retype policy, defaults
+/// by [`rebuild_defaults`], modules by the connected rebuild of their
+/// dependents.
+pub(crate) fn rebuild_type(
     base: Side<'_>,
     desired: Side<'_>,
     hints: &Hints,
     (uid, name): (&Uid, &TypeRef),
-    (wanted, removed): (&[String], Vec<String>),
-    ordinal: usize,
+    replacement: Replacement,
 ) -> Result<Vec<Change>, String> {
     let resolver = TypeResolver::new(base.ids, desired.ids);
+    let is_domain = matches!(replacement.definition, ManagedType::Domain { .. });
+    let (kind, what) = if is_domain {
+        ("domain", "this domain")
+    } else {
+        ("enum", "this enum")
+    };
     if resolver.name(TypeSide::Base, uid) != Some(name) {
-        return Err("the type is renamed or moved in this plan; do that in a plan of its own, then change its labels".into());
-    }
-    for (domain, definition) in &desired.schema.types {
-        if let ManagedType::Domain { base: ty, .. } = definition
-            && uses_enum(ty, uid, desired.schema, desired.ids)
-        {
-            return Err(format!(
-                "domain {} is over this enum; removing or reordering labels under a domain waits for the domain rebuild (#1635 slice 4)",
-                domain.shown()
-            ));
-        }
+        return Err(format!(
+            "the type is renamed or moved in this plan; do that in a plan of its own, then change its {}",
+            if is_domain { "definition" } else { "labels" }
+        ));
     }
     let spelled = name.raw().to_string();
     for id in desired.schema.modules.keys() {
@@ -283,7 +325,7 @@ fn rebuild(
             })
         {
             return Err(format!(
-                "routine {} takes this enum as an argument, which blocks DROP TYPE; declare it without the type first",
+                "routine {} takes this {kind} as an argument, which blocks DROP TYPE; declare it without the type first",
                 id.shown()
             ));
         }
@@ -291,7 +333,7 @@ fn rebuild(
     let mut columns = Vec::new();
     for (table_name, table) in &desired.schema.tables {
         for (column_name, column) in &table.columns {
-            if !uses_enum(&column.ty, uid, desired.schema, desired.ids) {
+            if !holds_directly(&column.ty, uid, desired.ids) {
                 continue;
             }
             let reference = pbps_model::ColumnRef {
@@ -306,16 +348,16 @@ fn rebuild(
                 .columns
                 .get(column_uid)
                 .and_then(|at| base.schema.tables.get(&at.table)?.columns.get(&at.name))
-                .is_some_and(|c| uses_enum(&c.ty, uid, base.schema, base.ids));
+                .is_some_and(|c| holds_directly(&c.ty, uid, base.ids));
             if !standing {
                 return Err(format!(
-                    "{} is created or retyped to this enum in the same plan; rebuild the enum first, then change the column",
+                    "{} is created or retyped to {what} in the same plan; rebuild the {kind} first, then change the column",
                     reference.shown()
                 ));
             }
             if matches!(column.value_source, ValueSource::Generated(_)) {
                 return Err(format!(
-                    "{} is a generated column of this enum, which PostgreSQL cannot retype",
+                    "{} is a generated column of this {kind}, which PostgreSQL cannot retype",
                     reference.shown()
                 ));
             }
@@ -331,8 +373,9 @@ fn rebuild(
                 .is_some_and(|by| by.columns.contains(column_name))
             {
                 return Err(format!(
-                    "{} is a partition key of this enum, which PostgreSQL cannot retype; rebuild the partitioned table (#2298), then change the labels",
-                    reference.shown()
+                    "{} is a partition key of {what}, which PostgreSQL cannot retype; rebuild the partitioned table (#2298), then change the {}",
+                    reference.shown(),
+                    if is_domain { "definition" } else { "labels" }
                 ));
             }
             columns.push((column_uid.clone(), reference, column.ty.clone()));
@@ -348,7 +391,7 @@ fn rebuild(
                 && root
                     .columns
                     .get(column)
-                    .is_some_and(|c| uses_enum(&c.ty, uid, desired.schema, desired.ids))
+                    .is_some_and(|c| holds_directly(&c.ty, uid, desired.ids))
             {
                 return Err(format!(
                     "partition {} keeps its own default for {}, which a rebuild does not restore",
@@ -359,9 +402,17 @@ fn rebuild(
         }
     }
     let tmp = replacement_name(base, desired, uid, name);
-    let definition = ManagedType::Enum {
-        values: wanted.to_vec(),
-    };
+    let Replacement {
+        definition,
+        removed,
+        over,
+        why,
+        conversion,
+        base_change,
+        ordinal,
+        depth,
+    } = replacement;
+    let over_swap = over.clone();
     let mut out = vec![Change::EnumRebuild {
         uid: uid.clone(),
         name: name.clone(),
@@ -370,6 +421,8 @@ fn rebuild(
             definition: Box::new(definition.clone()),
             removed: removed.clone(),
             ordinal,
+            over,
+            why,
         },
     }];
     out.extend(
@@ -385,6 +438,8 @@ fn rebuild(
                     array: to.is_array(),
                     to,
                     removed: removed.clone(),
+                    conversion,
+                    base_change: base_change.clone().map(Box::new),
                 },
             }),
     );
@@ -395,6 +450,8 @@ fn rebuild(
         step: EnumRebuildStep::Swap {
             definition: Box::new(definition),
             comment: hints.enum_comments.get(name).cloned(),
+            depth,
+            over: over_swap,
         },
     });
     Ok(out)
@@ -1273,6 +1330,7 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
         .collect();
     let anchors = definitions.clone();
     let mut replacements: BTreeMap<Uid, ManagedType> = BTreeMap::new();
+    let mut rebuilt_domains: BTreeSet<Uid> = BTreeSet::new();
     for step in &changes.changes {
         match &step.change {
             Change::CreateType {
@@ -1413,6 +1471,22 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
                     return false;
                 }
                 match step {
+                    // A domain's replacement is its sealed final definition.
+                    EnumRebuildStep::Create { definition, .. }
+                        if matches!(definition.as_ref(), ManagedType::Domain { .. }) =>
+                    {
+                        if !matches!(definitions.get(uid), Some(ManagedType::Domain { .. }))
+                            || !pins
+                                .iter()
+                                .any(|p| &p.uid == uid && p.definition == **definition)
+                            || replacements
+                                .insert(uid.clone(), (**definition).clone())
+                                .is_some()
+                        {
+                            return false;
+                        }
+                        rebuilt_domains.insert(uid.clone());
+                    }
                     EnumRebuildStep::Create {
                         definition,
                         removed,
@@ -1451,7 +1525,7 @@ pub fn valid_steps(changes: &ChangeSet, pins: &[pbps_model::DeclaredTypePin]) ->
     }
     replacements.is_empty()
         && pins.iter().all(|p| {
-            !matches!(p.definition, ManagedType::Enum { .. })
+            !(matches!(p.definition, ManagedType::Enum { .. }) || rebuilt_domains.contains(&p.uid))
                 || definitions.get(&p.uid) == Some(&p.definition)
         })
 }
@@ -2994,6 +3068,7 @@ mod rebuild_tests {
             definition,
             removed,
             ordinal,
+            ..
         } = create
         else {
             panic!("{create:?}");
@@ -3021,7 +3096,7 @@ mod rebuild_tests {
         );
         assert!(matches!(
             swap,
-            EnumRebuildStep::Swap { comment: None, definition } if **definition == enumeration(&["ok", "happy"])
+            EnumRebuildStep::Swap { comment: None, definition, .. } if **definition == enumeration(&["ok", "happy"])
         ));
         // One uid throughout, never a new one, and a name no label step uses.
         for change in &out {
@@ -3113,22 +3188,6 @@ mod rebuild_tests {
             assert!(steps(&out).is_empty(), "{expect}: {out:?}");
         };
         let t: TableName = "app.t".parse().unwrap();
-        // A domain over the enum waits for the domain rebuild.
-        refuses(
-            &|_, d| {
-                d.0.types.insert(
-                    "app.d".parse().unwrap(),
-                    ManagedType::Domain {
-                        base: "app.e".parse().unwrap(),
-                        not_null: false,
-                        default: None,
-                        checks: Default::default(),
-                        collation: None,
-                    },
-                );
-            },
-            "domain app.d",
-        );
         // A routine that takes the type blocks DROP TYPE.
         refuses(
             &|_, d| {
@@ -3522,6 +3581,8 @@ mod rebuild_tests {
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array: false,
                 removed: vec![],
+                base_change: None,
+                conversion: Default::default(),
             },
         };
         let (mut base, mut desired) = (world(&["a"]), world(&["a"]));

@@ -216,6 +216,8 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
     let swap = || EnumRebuildStep::Swap {
         definition: Box::new(ManagedType::Enum { values: vec![] }),
         comment: None,
+        depth: 0,
+        over: None,
     };
     let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", swap());
     assert!(super::saved::rebuild_is_well_formed(&ids, &change));
@@ -237,6 +239,8 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
         to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
         array: false,
         removed: vec![],
+        base_change: None,
+        conversion: Default::default(),
     };
     let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("c_aaaaaa"));
     assert!(super::saved::rebuild_is_well_formed(&ids, &change));

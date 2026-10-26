@@ -8,6 +8,7 @@
 //! CLAUDE.md).
 
 pub mod conversion;
+pub mod domain_rebuild;
 pub mod enum_labels;
 pub mod foreign_keys;
 pub mod identity;

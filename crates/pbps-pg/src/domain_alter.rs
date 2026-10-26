@@ -103,8 +103,7 @@ pub async fn census(
                 "domain {domain} cannot take a new check or NOT NULL while an array or a \
                  composite of it is a column: {columns}. PostgreSQL refuses it over any table, \
                  empty or not (`cannot alter type \"{name}\" because column \"{first}\" uses \
-                 it`). Stop using the domain there first; the domain rebuild that lifts this \
-                 is #1635 slice 4b",
+                 it`). Stop using the domain there first",
                 domain = live.shown(),
                 columns = blocked.join(", "),
                 name = live.name(),
@@ -112,6 +111,30 @@ pub async fn census(
             )));
         }
         out.scans.push((live.clone(), scans));
+    }
+    Ok(out)
+}
+
+/// The domains, by uid, that an array or a composite holds as a column of a
+/// standing table, named by the live name the caller gives. A check or NOT NULL
+/// added to one is refused by the engine in place, so the plan rebuilds it
+/// (DEC-1635.9); the same read before any plan costs one query per domain.
+pub async fn array_holders(
+    conn: &mut Conn,
+    domains: &[(pbps_model::Uid, TypeRef)],
+) -> Result<std::collections::BTreeSet<pbps_model::Uid>, DbError> {
+    let mut out = std::collections::BTreeSet::new();
+    for (uid, name) in domains {
+        let rows = conn
+            .query_with(STANDING, &[Param::Str(&quoted(name)?)])
+            .await?;
+        let mut held = false;
+        for row in &rows {
+            held |= !row.try_get::<bool>("direct")?.unwrap_or(false);
+        }
+        if held {
+            out.insert(uid.clone());
+        }
     }
     Ok(out)
 }

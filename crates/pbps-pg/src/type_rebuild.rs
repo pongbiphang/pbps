@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use pbps_db::{Conn, DbError, Param};
 use pbps_diff::order::catalog::{Dependent, Holds, Part};
 use pbps_model::{
-    Change, ChangeSet, ColumnName, EnumRebuildStep, IdsFile, ModuleId, Schema, TableName, TypeRef,
+    Change, ChangeSet, ColumnName, EnumRebuildStep, IdsFile, ManagedType, ModuleId, Schema,
+    TableName, TypeRef,
 };
 
 fn refused(why: String) -> DbError {
@@ -95,16 +96,28 @@ pub async fn census(
                 uid,
                 name,
                 tmp,
-                step: EnumRebuildStep::Create { .. },
+                step: EnumRebuildStep::Create { definition, .. },
             } = &p.change
             {
-                Some((uid, name, tmp))
+                Some((
+                    uid,
+                    name,
+                    tmp,
+                    matches!(definition.as_ref(), ManagedType::Domain { .. }),
+                ))
             } else {
                 None
             }
         })
         .collect();
-    for (uid, name, tmp) in rebuilt {
+    // The types this plan rebuilds, which a type built on one of them need not
+    // block: it is rebuilt too.
+    let rebuilt_names: BTreeSet<String> = rebuilt
+        .iter()
+        .map(|(_, name, _, _)| format!("{}.{}", name.schema(), name.name()))
+        .collect();
+    for (uid, name, tmp, is_domain) in rebuilt {
+        let noun = if is_domain { "domain" } else { "enum" };
         let shown = name.shown().to_string();
         let rows = conn
             .query_with(
@@ -136,23 +149,26 @@ pub async fn census(
             {
                 continue;
             }
-            return Err(refused(format!("enum {shown} is not in the database")));
+            return Err(refused(format!("{noun} {shown} is not in the database")));
         };
         let (ty, array) = (
             row.try_get::<i64>("oid")?.unwrap_or_default(),
             row.try_get::<i64>("array")?.unwrap_or_default(),
         );
-        if row.try_get::<&str>("kind")?.unwrap_or_default() != "e" {
-            return Err(refused(format!("{shown} is not an enum in the database")));
+        if row.try_get::<&str>("kind")?.unwrap_or_default() != if is_domain { "d" } else { "e" } {
+            return Err(refused(format!(
+                "{shown} is not a{} {noun} in the database",
+                if is_domain { "" } else { "n" }
+            )));
         }
         if row.try_get::<bool>("foreign_owner")?.unwrap_or_default() {
             return Err(refused(format!(
-                "enum {shown} is owned by a role other than the one deploying; the replacement would not keep its owner, so the rebuild is refused"
+                "{noun} {shown} is owned by a role other than the one deploying; the replacement would not keep its owner, so the rebuild is refused"
             )));
         }
         if row.try_get::<bool>("has_acl")?.unwrap_or_default() {
             return Err(refused(format!(
-                "enum {shown} has an explicit privilege list, which the replacement would not keep; the rebuild is refused"
+                "{noun} {shown} has an explicit privilege list, which the replacement would not keep; the rebuild is refused"
             )));
         }
         if !resuming && row.try_get::<bool>("tmp_taken")?.unwrap_or_default() {
@@ -271,13 +287,13 @@ pub async fn census(
                 }
                 "m" => "a materialized view, which no declaration holds".into(),
                 "c" => {
-                    "a composite type's attribute, which cannot move to a replacement enum".into()
+                    "a composite type's attribute, which cannot move to a replacement type".into()
                 }
                 "f" => "a foreign table".into(),
                 _ => "a relation of a kind pbps cannot rebuild around".into(),
             };
             return Err(refused(format!(
-                "column {shown_column} holds enum {shown}, and it is {what}; the rebuild of {shown} is refused"
+                "column {shown_column} holds {noun} {shown}, and it is {what}; the rebuild of {shown} is refused"
             )));
         }
 
@@ -295,7 +311,7 @@ pub async fn census(
             .await?;
         if let Some(row) = routines.first() {
             return Err(refused(format!(
-                "{} names enum {shown} in its signature, which blocks DROP TYPE; the rebuild of {shown} is refused until the routine is changed in a plan of its own",
+                "{} names {noun} {shown} in its signature, which blocks DROP TYPE; the rebuild of {shown} is refused until the routine is changed in a plan of its own",
                 row.try_get::<&str>("described")?.unwrap_or_default()
             )));
         }
@@ -348,6 +364,22 @@ pub async fn census(
             if !judged.insert(dependent.described.clone()) {
                 continue;
             }
+            // A domain built on the type is rebuilt by this plan too, over the
+            // replacement; it holds nothing the swap drops (DEC-1635.9).
+            // So are the domain's own checks, which stand on it and go with it
+            // (the dependent names the domain it is a check of).
+            let on_a_rebuilt_domain = |of: &str| rebuilt_names.contains(&of.replace('"', ""));
+            if level == Level::Type
+                && (dependent
+                    .described
+                    .strip_prefix("type ")
+                    .is_some_and(on_a_rebuilt_domain)
+                    || constraint_owner(&dependent.holds)
+                        .as_deref()
+                        .is_some_and(on_a_rebuilt_domain))
+            {
+                continue;
+            }
             match verdict(level, &dependent, changes, declared, &parents) {
                 Verdict::Fine => {}
                 Verdict::Rebuild(id) => {
@@ -355,7 +387,7 @@ pub async fn census(
                 }
                 Verdict::Refuse(why) => {
                     return Err(refused(format!(
-                        "{} stands on enum {shown} ({why}); the rebuild of {shown} is refused",
+                        "{} stands on {noun} {shown} ({why}); the rebuild of {shown} is refused",
                         dependent.described
                     )));
                 }
@@ -363,6 +395,18 @@ pub async fn census(
         }
     }
     Ok(out)
+}
+
+/// The domain a dependent constraint belongs to, when the dependent is a check
+/// of a domain rather than of a table (its text is `modules.rs`'s).
+fn constraint_owner(holds: &Holds) -> Option<String> {
+    match holds {
+        Holds::Unrepresentable(why) => why
+            .strip_prefix("a constraint on domain ")
+            .and_then(|rest| rest.split_once(" rather than on a table"))
+            .map(|(domain, _)| domain.to_owned()),
+        Holds::Module(_) | Holds::TablePart { .. } => None,
+    }
 }
 
 /// The column a partition's or child's follows when its root is retyped: the
@@ -657,6 +701,21 @@ mod tests {
             table: TableName::new("app", "t"),
             part,
         }
+    }
+
+    #[test]
+    fn a_domains_own_check_names_its_domain_and_nothing_else_does() {
+        let check = Holds::Unrepresentable(
+            "a constraint on domain app.d rather than on a table, which this model does not hold"
+                .into(),
+        );
+        assert_eq!(constraint_owner(&check).as_deref(), Some("app.d"));
+        // Another reason, and a table's own part, name no domain.
+        assert_eq!(
+            constraint_owner(&Holds::Unrepresentable("a materialized view".into())),
+            None
+        );
+        assert_eq!(constraint_owner(&part(Part::Check("c".into()))), None);
     }
 
     #[test]

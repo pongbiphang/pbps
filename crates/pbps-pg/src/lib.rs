@@ -8526,6 +8526,43 @@ mod enum_rebuild_dependents_tests {
     /// Measured on 16 and 18 (DEC-1635.7): constants typed as the old enum sit
     /// in checks, foreign keys and filtered or expression indexes, and the
     /// retype refuses them; plain keys and indexes are rebuilt by the engine.
+    /// A domain's base narrowed under its rebuild carries the narrowing risk
+    /// beside the rebuild's; a widening, and a rebuild with no base change,
+    /// carry only the rebuild's (DEC-1635.9).
+    #[test]
+    fn a_domain_rebuilds_retype_carries_the_narrowing_risk_of_its_base_change() {
+        use pbps_model::{Change, EnumRebuildStep, RetypeConversion, RiskClass};
+        let pg = Postgres::new();
+        let ty = |text: &str| pg.normalize_type(&text.parse().unwrap()).unwrap();
+        let retype = |base_change| Change::EnumRebuild {
+            uid: "y_000002".parse().unwrap(),
+            name: "app.d".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: pbps_model::TableName::new("app", "t").column("v"),
+                to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
+                array: false,
+                removed: vec![],
+                base_change,
+                conversion: RetypeConversion::Assign,
+            },
+        };
+        let risks = |change| pg.change_risks(&change);
+        assert_eq!(
+            risks(retype(Some(Box::new((
+                ty("varchar(20)"),
+                ty("varchar(10)")
+            ))))),
+            [RiskClass::TypeRebuild, RiskClass::Narrowing].into()
+        );
+        assert_eq!(
+            risks(retype(Some(Box::new((ty("varchar(20)"), ty("text")))))),
+            [RiskClass::TypeRebuild].into()
+        );
+        assert_eq!(risks(retype(None)), [RiskClass::TypeRebuild].into());
+    }
+
     #[test]
     fn postgres_rebuilds_what_holds_constants_of_the_old_enum_and_leaves_keys_to_the_engine() {
         let pg = Postgres::new().enum_rebuild_dependents();

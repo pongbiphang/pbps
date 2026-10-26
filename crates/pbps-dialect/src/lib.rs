@@ -2527,6 +2527,20 @@ pub trait Dialect {
         {
             risks.insert(risk);
         }
+        // A domain's base narrowed under its rebuild: the column moves to a
+        // replacement over the narrower type (DEC-1635.9).
+        if let Change::EnumRebuild {
+            step:
+                pbps_model::EnumRebuildStep::Retype {
+                    base_change: Some(pair),
+                    ..
+                },
+            ..
+        } = change
+            && let Some(risk) = self.type_change_risk(&pair.0, &pair.1).risk_class()
+        {
+            risks.insert(risk);
+        }
         if let Change::AlterColumnType {
             to,
             from_collation,
@@ -4806,6 +4820,36 @@ mod tests {
     use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
 
     use super::*;
+
+    /// A domain rebuild's retype carries the risk of its base change beside
+    /// the rebuild's, and only when the base changes (DEC-1635.9).
+    #[test]
+    fn a_rebuild_retype_takes_the_risk_of_its_base_change_and_none_without_one() {
+        let retype = |base_change| Change::EnumRebuild {
+            uid: "y_000002".parse().unwrap(),
+            name: "app.d".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: pbps_model::TableName::new("app", "t").column("v"),
+                to: ColumnType::reference("app.d".parse().unwrap()),
+                array: false,
+                removed: vec![],
+                base_change,
+                conversion: pbps_model::RetypeConversion::Assign,
+            },
+        };
+        let (text, integer): (ColumnType, ColumnType) =
+            ("text".parse().unwrap(), "integer".parse().unwrap());
+        let both = MinimalDialect.change_risks(&retype(Some(Box::new((text.clone(), integer)))));
+        assert!(both.contains(&RiskClass::TypeRebuild) && both.contains(&RiskClass::Narrowing));
+        let same = MinimalDialect.change_risks(&retype(Some(Box::new((text.clone(), text)))));
+        assert_eq!(same, [RiskClass::TypeRebuild].into());
+        assert_eq!(
+            MinimalDialect.change_risks(&retype(None)),
+            [RiskClass::TypeRebuild].into()
+        );
+    }
 
     /// Producers render each value once; error display preserves the prose.
     #[test]

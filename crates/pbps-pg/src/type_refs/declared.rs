@@ -174,6 +174,24 @@ pub(super) fn identities(
     (base, desired)
 }
 
+/// A domain whose base is the replacement of a rebuilt type, read as built on
+/// the type's own name: the replacement is that type once the swap has run.
+fn over_the_final_name(
+    definition: &mut ManagedType,
+    rebuilt: &std::collections::BTreeMap<TypeRef, TypeRef>,
+) {
+    if let ManagedType::Domain { base, .. } = definition
+        && let Some(name) = base.type_ref().and_then(|at| rebuilt.get(at))
+    {
+        let named = pbps_model::ColumnType::reference(name.clone());
+        *base = if base.is_array() {
+            named.into_array()
+        } else {
+            named
+        };
+    }
+}
+
 fn check_definitions(
     live: &Schema,
     pins: &[DeclaredTypePin],
@@ -193,6 +211,24 @@ fn check_definitions(
     let resolver = TypeResolver::new(&base, &positioned);
     let desired_resolver = TypeResolver::new(&desired, &positioned);
     let renames = super::renames::TypeRenames::resolved(&base, &positioned);
+    // The replacement each rebuilt type holds until its swap (DEC-1635.7).
+    let rebuilt_tmp: std::collections::BTreeMap<TypeRef, TypeRef> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let pbps_model::Change::EnumRebuild {
+                name,
+                tmp,
+                step: pbps_model::EnumRebuildStep::Create { .. },
+                ..
+            } = &p.change
+            {
+                Some((tmp.clone(), name.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut present = Vec::new();
     let mut absent = Vec::new();
     for pin in pins {
@@ -245,6 +281,12 @@ fn check_definitions(
                     name.shown()
                 ))
             })?;
+            // A domain built on a type this plan rebuilds stands over the
+            // replacement until the swap names it back: both sides are read
+            // as over the final name (DEC-1635.9).
+            let mut named = actual.clone();
+            over_the_final_name(&mut named, &rebuilt_tmp);
+            let actual = &named;
             let mut expected = definition.clone();
             if label_moved && let Some(was) = &pin.before {
                 let mut was = was.definition.clone();
@@ -265,6 +307,8 @@ fn check_definitions(
             } else if let ManagedType::Domain { base, .. } = &mut expected {
                 desired_resolver.remap(base, TypeSide::Base, TypeSide::Desired);
             }
+            // After the remap, which resolves a base by uid to where it stands.
+            over_the_final_name(&mut expected, &rebuilt_tmp);
             let mut comparable = actual.clone();
             super::renames::TypeRenames::default().definition(&mut comparable);
             if (before && comparable != expected)

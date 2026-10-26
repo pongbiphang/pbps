@@ -1047,10 +1047,14 @@ mod tests {
                 definition: definition(),
                 removed: Vec::new(),
                 ordinal: 0,
+                over: None,
+                why: None,
             }),
             rebuild(crate::EnumRebuildStep::Swap {
                 definition: definition(),
                 comment: None,
+                depth: 0,
+                over: None,
             }),
             rename,
         ];
@@ -1074,6 +1078,8 @@ mod tests {
             to: crate::ColumnType::reference(mood()),
             array: false,
             removed: Vec::new(),
+            base_change: None,
+            conversion: Default::default(),
         });
         assert!(!touches(&retype, &surface));
     }
@@ -1116,6 +1122,8 @@ mod tests {
         let swap = rebuild(crate::EnumRebuildStep::Swap {
             definition: definition(),
             comment: None,
+            depth: 0,
+            over: None,
         });
         assert!(matches!(
             owner(&swap).0.as_slice(),
@@ -1127,6 +1135,8 @@ mod tests {
             to: crate::ColumnType::reference(mood()),
             array: false,
             removed: Vec::new(),
+            base_change: None,
+            conversion: Default::default(),
         });
         assert!(matches!(
             owner(&retype).0.as_slice(),

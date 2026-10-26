@@ -365,6 +365,8 @@ fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is()
             definition: definition.clone(),
             removed: vec![],
             ordinal: 0,
+            over: None,
+            why: None,
         }),
         step(pbps_model::EnumRebuildStep::Retype {
             column_uid: uid(UidKind::Column, "m"),
@@ -372,10 +374,14 @@ fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is()
             to: ColumnType::reference("app.e".parse().unwrap()),
             array: false,
             removed: vec![],
+            base_change: None,
+            conversion: Default::default(),
         }),
         step(pbps_model::EnumRebuildStep::Swap {
             definition,
             comment: None,
+            depth: 0,
+            over: None,
         }),
     ];
     let ids = IdsFile {

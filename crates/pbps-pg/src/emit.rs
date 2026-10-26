@@ -376,6 +376,8 @@ mod declared_type_emission_tests {
             definition: definition.clone(),
             removed: vec![],
             ordinal: 0,
+            over: None,
+            why: None,
         }));
         assert_eq!(create.len(), 1);
         assert_eq!(
@@ -392,6 +394,8 @@ mod declared_type_emission_tests {
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array,
                 removed: vec![],
+                base_change: None,
+                conversion: Default::default(),
             }));
             assert_eq!(
                 moved[0].sql,
@@ -404,6 +408,8 @@ mod declared_type_emission_tests {
         let swap = sql(&step(Step::Swap {
             definition: definition.clone(),
             comment: Some("moods it's".into()),
+            depth: 0,
+            over: None,
         }));
         let texts: Vec<_> = swap.iter().map(|s| s.sql.as_str()).collect();
         assert_eq!(
@@ -436,9 +442,119 @@ mod declared_type_emission_tests {
         let bare = sql(&step(Step::Swap {
             definition,
             comment: None,
+            depth: 0,
+            over: None,
         }));
         assert_eq!(bare.len(), 2);
         assert!(bare.iter().all(|s| s.transactional));
+    }
+
+    /// A domain's rebuild: the replacement is the final declaration (over the
+    /// base's replacement while that is rebuilt too), a base or collation
+    /// change rides the assignment cast with no `USING`, and the swap
+    /// certifies the structure it leaves (DEC-1635.9).
+    #[test]
+    fn domain_rebuild_steps_create_from_the_declaration_convert_by_cast_and_swap() {
+        use pbps_model::EnumRebuildStep as Step;
+        let uid: pbps_model::Uid = "y_000002".parse().unwrap();
+        let name = pbps_model::TypeRef::new("app", "d").unwrap();
+        let tmp = pbps_model::TypeRef::new("app", "pbps_rebuild_y_000002").unwrap();
+        let under = pbps_model::TypeRef::new("app", "pbps_rebuild_y_000001").unwrap();
+        let definition = Box::new(pbps_model::ManagedType::Domain {
+            base: "app.e".parse().unwrap(),
+            not_null: true,
+            default: Some("'a'".into()),
+            checks: BTreeMap::from([("c".into(), "VALUE <> 'b'".into())]),
+            collation: None,
+        });
+        let step = |step| Change::EnumRebuild {
+            uid: uid.clone(),
+            name: name.clone(),
+            tmp: tmp.clone(),
+            step,
+        };
+        let sql = |change: &Change| emit(&Postgres::new(), change, Strategy::default()).unwrap();
+        let create = sql(&step(Step::Create {
+            definition: definition.clone(),
+            removed: vec![],
+            ordinal: 0,
+            over: Some(under.clone()),
+            why: None,
+        }));
+        assert_eq!(
+            create[0].sql,
+            "SET search_path = \"app\", \"pg_temp\";\n\
+             CREATE DOMAIN \"app\".\"pbps_rebuild_y_000002\" AS \"app\".\"pbps_rebuild_y_000001\" \
+             DEFAULT ('a'\n) NOT NULL CONSTRAINT \"c\" CHECK (VALUE <> 'b'\n);\n\
+             SET search_path = '';"
+        );
+        // The vet reads the replacement over the replacement, structurally.
+        let certified = create[0].declared_type.as_ref().expect("the vet");
+        assert!(certified.altered && certified.name == tmp);
+        let table = pbps_model::TableName::new("app", "t");
+        let retype = |array, conversion| {
+            sql(&step(Step::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("v"),
+                to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
+                array,
+                removed: vec![],
+                base_change: None,
+                conversion,
+            }))
+        };
+        assert_eq!(
+            retype(false, pbps_model::RetypeConversion::Assign)[0].sql,
+            "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"v\" TYPE \"app\".\"pbps_rebuild_y_000002\";"
+        );
+        assert_eq!(
+            retype(true, pbps_model::RetypeConversion::Assign)[0].sql,
+            "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"v\" TYPE \"app\".\"pbps_rebuild_y_000002\"[];"
+        );
+        // Over a rebuilt enum or domain the labels go through text.
+        assert!(
+            retype(false, pbps_model::RetypeConversion::Text)[0]
+                .sql
+                .ends_with("USING \"v\"::text::\"app\".\"pbps_rebuild_y_000002\";")
+        );
+        let swap = sql(&step(Step::Swap {
+            definition,
+            comment: Some("a name".into()),
+            depth: 1,
+            over: Some(under.clone()),
+        }));
+        let texts: Vec<_> = swap.iter().map(|s| s.sql.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "DROP DOMAIN \"app\".\"d\";",
+                "ALTER DOMAIN \"app\".\"pbps_rebuild_y_000002\" RENAME TO \"d\";",
+                "COMMENT ON DOMAIN \"app\".\"d\" IS 'a name';",
+            ]
+        );
+        // While its base is still the replacement, that is what stands.
+        for statement in &swap[..2] {
+            let declared = statement.declared_type.as_ref().expect("certified");
+            let Some(pbps_model::ManagedType::Domain { base, .. }) = &declared.definition else {
+                panic!("{declared:?}");
+            };
+            assert_eq!(base.type_ref(), Some(&under));
+        }
+        // An enum's definition is not a domain's: no `CREATE DOMAIN` for it.
+        let wrong = emit(
+            &Postgres::new(),
+            &step(Step::Swap {
+                definition: Box::new(pbps_model::ManagedType::Enum {
+                    values: vec!["a".into()],
+                }),
+                comment: None,
+                depth: 0,
+                over: None,
+            }),
+            Strategy::default(),
+        )
+        .unwrap();
+        assert!(wrong[0].sql.starts_with("DROP TYPE"));
     }
 
     #[test]
@@ -3762,7 +3878,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             name,
             tmp,
             step,
-        } => emit_enum_rebuild(uid, name, tmp, step),
+        } => emit_enum_rebuild(pg, uid, name, tmp, step),
         Change::CreateType {
             uid,
             name,
@@ -3779,42 +3895,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                pbps_model::ManagedType::Domain {
-                    base,
-                    not_null,
-                    default,
-                    checks,
-                    collation,
-                } => {
-                    let mut sql = format!(
-                        "CREATE DOMAIN {} AS {}",
-                        qualified(&address)?,
-                        sql_type(base)?
-                    );
-                    if let Some(c) = collation {
-                        sql.push_str(&format!(
-                            " COLLATE {}.{}",
-                            quote(c.schema())?,
-                            quote(c.name())?
-                        ));
-                    }
-                    if let Some(text) = default {
-                        // CREATE DOMAIN takes b_expr too (DEC-2312.1).
-                        sql.push_str(&format!(" DEFAULT ({})", verbatim(text)));
-                    }
-                    if *not_null {
-                        sql.push_str(" NOT NULL");
-                    }
-                    for (constraint, text) in checks {
-                        sql.push_str(&format!(
-                            " CONSTRAINT {} CHECK ({})",
-                            quote(constraint.raw())?,
-                            verbatim(text)
-                        ));
-                    }
-                    sql.push(';');
-                    sql
-                }
+                domain @ pbps_model::ManagedType::Domain { .. } => create_domain_sql(name, domain)?,
             };
             let mut statement = scoped(pg, name.schema(), &sql)?;
             statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
@@ -5013,15 +5094,88 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
     }
 }
 
-/// The statements of one step of an enum rebuild (DEC-1635.7). Every name is
-/// qualified, so none needs a schema's path.
+/// `CREATE DOMAIN` for a declared domain, from its definition alone: the base
+/// (with its collation), the default, NOT NULL and the named checks, in the
+/// order the engine reads them. A domain rebuild uses it for the replacement.
+fn create_domain_sql(
+    name: &pbps_model::TypeRef,
+    definition: &pbps_model::ManagedType,
+) -> Result<String, DialectError> {
+    let pbps_model::ManagedType::Domain {
+        base,
+        not_null,
+        default,
+        checks,
+        collation,
+    } = definition
+    else {
+        return Err(invalid(
+            "only a domain is created by CREATE DOMAIN".to_owned(),
+        ));
+    };
+    let address = TableName::new(name.schema(), name.name());
+    let mut sql = format!(
+        "CREATE DOMAIN {} AS {}",
+        qualified(&address)?,
+        sql_type(base)?
+    );
+    if let Some(c) = collation {
+        sql.push_str(&format!(
+            " COLLATE {}.{}",
+            quote(c.schema())?,
+            quote(c.name())?
+        ));
+    }
+    if let Some(text) = default {
+        // CREATE DOMAIN takes b_expr too (DEC-2312.1).
+        sql.push_str(&format!(" DEFAULT ({})", verbatim(text)));
+    }
+    if *not_null {
+        sql.push_str(" NOT NULL");
+    }
+    for (constraint, text) in checks {
+        sql.push_str(&format!(
+            " CONSTRAINT {} CHECK ({})",
+            quote(constraint.raw())?,
+            verbatim(text)
+        ));
+    }
+    sql.push(';');
+    Ok(sql)
+}
+
+/// A domain's definition with its base replaced by the replacement of the base
+/// it is built over, while that is rebuilt too (DEC-1635.9).
+fn over_the_replacement(
+    definition: &pbps_model::ManagedType,
+    over: Option<&pbps_model::TypeRef>,
+) -> pbps_model::ManagedType {
+    let mut effective = definition.clone();
+    if let (Some(over), pbps_model::ManagedType::Domain { base, .. }) = (over, &mut effective) {
+        let replacement = ColumnType::reference(over.clone());
+        *base = if base.is_array() {
+            replacement.into_array()
+        } else {
+            replacement
+        };
+    }
+    effective
+}
+
+/// The statements of one step of an enum or domain rebuild (DEC-1635.7,
+/// DEC-1635.9). Every name is qualified, so none needs a schema's path.
 ///
 /// `USING c::text::<tmp>` is the only `USING` pbps writes: each label maps by
-/// its final name and no value changes (ADR-0012 §5, amendment 5). The swap's
-/// two statements each certify the uid where the type stands after them, as a
-/// rename through `SET SCHEMA` does, so a per-statement check sees the
-/// replacement under its temporary name and then under its own.
+/// its final name and no value changes (ADR-0012 §5, amendment 5). A domain's
+/// base change rides the engine's assignment cast instead, with no `USING`
+/// (`Conversion::Assign`). The swap's two statements each certify the uid where
+/// the type stands after them, as a rename through `SET SCHEMA` does, so a
+/// per-statement check sees the replacement under its temporary name and then
+/// under its own. A domain's replacement is created over its base's
+/// replacement when that is rebuilt too, and is vetted at once: its checks
+/// are evaluated by the retypes that follow.
 fn emit_enum_rebuild(
+    pg: &Postgres,
     uid: &pbps_model::Uid,
     name: &pbps_model::TypeRef,
     tmp: &pbps_model::TypeRef,
@@ -5031,6 +5185,9 @@ fn emit_enum_rebuild(
     let ty = |t: &pbps_model::TypeRef| -> Result<String, DialectError> {
         Ok(format!("{}.{}", quote(t.schema())?, quote(t.name())?))
     };
+    let domain = |definition: &pbps_model::ManagedType| {
+        matches!(definition, pbps_model::ManagedType::Domain { .. })
+    };
     let certifying =
         |sql: String, at: &pbps_model::TypeRef, definition: &pbps_model::ManagedType| {
             let mut statement = Statement::new(sql);
@@ -5038,17 +5195,19 @@ fn emit_enum_rebuild(
                 uid: uid.clone(),
                 name: at.clone(),
                 definition: Some(definition.clone()),
-                altered: false,
+                // A rebuilt domain is held to its structure, as an altered
+                // one is: the engine's text of its default and checks is not
+                // the declaration's (DEC-1635.8).
+                altered: domain(definition),
                 after_vet: None,
             });
             statement
         };
     match step {
-        Step::Create { definition, .. } => {
-            let pbps_model::ManagedType::Enum { values } = definition.as_ref() else {
-                return Err(invalid("an enum rebuild creates an enum".to_owned()));
-            };
-            unscoped(format!(
+        Step::Create {
+            definition, over, ..
+        } => match definition.as_ref() {
+            pbps_model::ManagedType::Enum { values } => unscoped(format!(
                 "CREATE TYPE {} AS ENUM ({});",
                 ty(tmp)?,
                 values
@@ -5056,33 +5215,68 @@ fn emit_enum_rebuild(
                     .map(|v| literal(v))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ))
-        }
-        Step::Retype { column, array, .. } => {
+            )),
+            pbps_model::ManagedType::Domain { .. } => {
+                // Over the base's replacement when that is rebuilt too: the
+                // old base is dropped with the swap.
+                let effective = over_the_replacement(definition, over.as_ref());
+                let mut statement =
+                    scoped(pg, name.schema(), &create_domain_sql(tmp, &effective)?)?;
+                statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
+                    uid: uid.clone(),
+                    name: tmp.clone(),
+                    definition: Some(effective),
+                    altered: true,
+                    after_vet: None,
+                });
+                Ok(vec![statement])
+            }
+        },
+        Step::Retype {
+            column,
+            array,
+            conversion,
+            ..
+        } => {
             let brackets = if *array { "[]" } else { "" };
             let c = quote(column.name.raw())?;
+            let using = match conversion {
+                pbps_model::RetypeConversion::Text => {
+                    format!(" USING {c}::text::{}{brackets}", ty(tmp)?)
+                }
+                pbps_model::RetypeConversion::Assign => String::new(),
+            };
             unscoped(format!(
-                "ALTER TABLE {} ALTER COLUMN {c} TYPE {}{brackets} USING {c}::text::{}{brackets};",
+                "ALTER TABLE {} ALTER COLUMN {c} TYPE {}{brackets}{using};",
                 qualified(&column.table)?,
                 ty(tmp)?,
-                ty(tmp)?
             ))
         }
         Step::Swap {
             definition,
             comment,
+            over,
+            ..
         } => {
+            let kind = if domain(definition) { "DOMAIN" } else { "TYPE" };
+            // Until its base is swapped, a domain stands over the base's
+            // replacement, and that is what the certification reads.
+            let standing = over_the_replacement(definition, over.as_ref());
             let mut out = vec![
-                certifying(format!("DROP TYPE {};", ty(name)?), tmp, definition),
+                certifying(format!("DROP {kind} {};", ty(name)?), tmp, &standing),
                 certifying(
-                    format!("ALTER TYPE {} RENAME TO {};", ty(tmp)?, quote(name.name())?),
+                    format!(
+                        "ALTER {kind} {} RENAME TO {};",
+                        ty(tmp)?,
+                        quote(name.name())?
+                    ),
                     name,
-                    definition,
+                    &standing,
                 ),
             ];
             if let Some(text) = comment {
                 out.push(Statement::new(format!(
-                    "COMMENT ON TYPE {} IS {};",
+                    "COMMENT ON {kind} {} IS {};",
                     ty(name)?,
                     literal(text)
                 )));

@@ -3251,11 +3251,13 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     column,
                     array,
                     removed,
+                    base_change,
                     ..
                 },
             ..
         } => {
-            if removed.is_empty() {
+            // Nothing to count: no label goes, no base narrows.
+            if removed.is_empty() && base_change.is_none() {
                 return Ok(Vec::new());
             }
             let Some(stored) = names.column(column) else {
@@ -3263,6 +3265,35 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             };
             let table = qualified(&stored.table)?;
             let quoted = quote(stored.name.raw())?;
+            let mut probes = Vec::new();
+            // A domain's base narrowed (DEC-1635.9): the rows the replacement's
+            // base cannot hold, by the built-in expression alone. The new
+            // domain's checks are not asked here: that would run declared code
+            // before the apply vets it (DEC-1635.4), and the engine decides
+            // them at the retype. An array's elements are not counted.
+            if let Some((from, to)) = base_change.as_deref() {
+                if *array {
+                    unchecked.push(Unchecked::for_change(
+                        change,
+                        "the elements of an array are not checked against a narrower base",
+                    ));
+                } else if let Some(fails) = crate::types::cannot_become(from, to, &quoted) {
+                    probes.push(Probe::new(
+                        format!(
+                            "values in {column} that cannot become {to}",
+                            column = column.shown(),
+                            to = to.shown(),
+                        ),
+                        format!(
+                            "SELECT {} AS n FROM {table}\n WHERE {quoted} IS NOT NULL AND ({fails});",
+                            saturated_count("count(*)")
+                        ),
+                    ));
+                }
+            }
+            if removed.is_empty() {
+                return Ok(probes);
+            }
             let labels = format!(
                 "ARRAY[{}]::pg_catalog.text[]",
                 removed
@@ -3291,7 +3322,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     ),
                 )
             };
-            Ok(vec![Probe::new(
+            probes.push(Probe::new(
                 format!(
                     "{what} of {column} holding a label this plan removes ({})",
                     removed
@@ -3302,7 +3333,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     column = column.shown(),
                 ),
                 sql,
-            )])
+            ));
+            Ok(probes)
         }
         Change::AlterColumnType {
             column,
@@ -5787,6 +5819,53 @@ mod tests {
         PlannedChange::new(change)
     }
 
+    /// A domain's base narrowed under its rebuild: the rows the replacement's
+    /// base cannot hold are counted by the built-in expression alone, and a
+    /// domain that only widens, or whose column is an array, counts none
+    /// (DEC-1635.9).
+    #[test]
+    fn a_domains_narrowing_rebuild_counts_the_rows_that_do_not_fit() {
+        let table: TableName = "app.t".parse().unwrap();
+        let ty = |text: &str| crate::types::normalize(&text.parse().unwrap()).unwrap();
+        let retype = |array: bool, from: &str, to: &str| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.name".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("v"),
+                to: pbps_model::ColumnType::reference("app.name".parse().unwrap()),
+                array,
+                removed: vec![],
+                base_change: Some(Box::new((ty(from), ty(to)))),
+                conversion: pbps_model::RetypeConversion::Assign,
+            },
+        };
+        let report = preflight(&set(vec![retype(false, "varchar(20)", "varchar(10)")]));
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe
+                .description
+                .contains("values in app.t.v that cannot become")
+                && probe.sql.contains("IS NOT NULL"),
+            "{probe:#?}"
+        );
+        // Negatives: a widening has nothing to count, and an array's elements
+        // are reported unchecked and not counted.
+        assert!(
+            preflight(&set(vec![retype(false, "varchar(20)", "text")]))
+                .probes
+                .is_empty()
+        );
+        let array = preflight(&set(vec![retype(true, "varchar(20)", "varchar(10)")]));
+        assert!(
+            array.probes.is_empty() && !array.unchecked.is_empty(),
+            "{array:#?}"
+        );
+    }
+
     /// The cast to the replacement refuses a row holding a removed label, so
     /// the plan counts them first: rows of a scalar column, elements of an
     /// array, by the spelling the database stores (DEC-1635.7).
@@ -5803,6 +5882,8 @@ mod tests {
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array,
                 removed: removed.iter().map(|l| (*l).to_owned()).collect(),
+                base_change: None,
+                conversion: Default::default(),
             },
         };
         let report = preflight(&set(vec![retype(false, &["sad", "it's"])]));
@@ -5857,6 +5938,8 @@ mod tests {
             step: pbps_model::EnumRebuildStep::Swap {
                 definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
                 comment: None,
+                depth: 0,
+                over: None,
             },
         };
         let report = preflight(&set(vec![create]));
@@ -7083,6 +7166,8 @@ mod tests {
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
                 removed: vec!["sad".to_owned()],
+                base_change: None,
+                conversion: Default::default(),
             },
         };
 
@@ -7155,6 +7240,8 @@ mod tests {
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
                 removed: vec!["sad".to_owned()],
+                base_change: None,
+                conversion: Default::default(),
             },
         };
         let probed =

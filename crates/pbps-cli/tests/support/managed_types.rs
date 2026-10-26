@@ -836,9 +836,9 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         let mood = pbps_load::load_type_str(&mood_path, &mood_text).unwrap();
         let phone = pbps_load::load_type_str(&phone_path, &phone_text).unwrap();
         let mut variants = Vec::new();
-        // Enum label changes are executable (DEC-1635.6, DEC-1635.7) and so
-        // are a domain's NOT NULL, default and checks (DEC-1635.8); only the
-        // base type and the collation below still refuse.
+        // Enum label changes are executable (DEC-1635.6, DEC-1635.7), and so
+        // are a domain's NOT NULL, default, checks (DEC-1635.8), base type and
+        // collation (DEC-1635.9).
         let _ = &mood;
         for field in [0, 7] {
             let mut changed = phone.definition.clone();
@@ -871,13 +871,13 @@ fn pulled_type_files_converge_and_type_attribute_changes_are_refused_without_sql
         for (path, name, definition) in variants {
             std::fs::write(&path, pbps_load::render_type(&name, &definition)).unwrap();
             let out = d.run(&["plan", "--db", db, "--out", plan_path.to_str().unwrap()]);
-            assert_ne!(code(&out), 0, "{}", stdout(&out));
-            let message = stderr(&out);
+            assert_eq!(code(&out), 0, "{}", stderr(&out));
             assert!(
-                message.contains(&name.shown().to_string()) && message.contains("slice 4b"),
-                "{message}"
+                stdout(&out).contains(&format!("rebuild domain {}", name.shown())),
+                "{}",
+                stdout(&out)
             );
-            assert!(!plan_path.exists());
+            std::fs::remove_file(&plan_path).unwrap();
             std::fs::write(&mood_path, &mood_text).unwrap();
             std::fs::write(&phone_path, &phone_text).unwrap();
         }
@@ -3783,7 +3783,6 @@ fn enum_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql(
             CREATE TABLE app.t (id int PRIMARY KEY, m app.mood);
             INSERT INTO app.t VALUES (1,'ok');";
         for (slug, extra, expected) in [
-            ("domain", "CREATE DOMAIN app.d AS app.mood;", "domain app.d"),
             (
                 "signature",
                 "CREATE FUNCTION app.f(x app.mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
@@ -5615,24 +5614,28 @@ fn a_check_calling_a_project_function_is_vetted_before_it_runs_and_leaves_nothin
     }
 }
 
-/// Refused where the plan is made, naming the column and the engine's reason,
-/// for each container that holds the domain (DEC-1635.8). A domain nothing
+/// An array of the domain is rebuilt under `--allow type-rebuild` (DEC-1635.9);
+/// a composite type's attribute cannot move to a replacement, so the plan is
+/// refused where it is made, naming the holder (DEC-1635.8). A domain nothing
 /// holds that way tightens, and so does one a plan loosens beside.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_a_column() {
+fn a_tightening_is_rebuilt_for_an_array_of_the_domain_and_refused_for_a_composite() {
     for server in [
         server(),
         std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
     ] {
-        for (holder, column) in [
-            ("x app.code[]", "t.x"),
-            ("x app.pair", "t.x"),
-            ("x app.pair[]", "t.x"),
+        for (holder, rebuilt) in [
+            ("x app.code[]", true),
+            ("x app.pair", false),
+            ("x app.pair[]", false),
         ] {
-            let sql = format!(
-                "{CODE_SQL} CREATE TYPE app.pair AS (a app.code, b integer); ALTER TABLE app.t ADD COLUMN {holder};"
-            );
+            let pair = if rebuilt {
+                ""
+            } else {
+                "CREATE TYPE app.pair AS (a app.code, b integer);"
+            };
+            let sql = format!("{CODE_SQL} {pair} ALTER TABLE app.t ADD COLUMN {holder};");
             let (own, d) = adopted(&server, "domain_holders4a", &sql);
             let db = own.connection();
             let path = d.dir.join("holders.plan.json");
@@ -5646,14 +5649,44 @@ fn a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_
                 &d,
                 &code_domain(false, None, &[("c1", C1), ("c2", "VALUE <> 'x'")]),
             );
+            if rebuilt {
+                let plan = label_plan(&d, db, &path);
+                assert!(
+                    changes_of(&plan).iter().all(|k| k == "EnumRebuild"),
+                    "{:?}",
+                    changes_of(&plan)
+                );
+                let refused = apply_allowing(&d, db, &path, &["constraint"]);
+                assert_ne!(code(&refused), 0);
+                assert!(
+                    stderr(&refused).contains("type-rebuild"),
+                    "{}",
+                    stderr(&refused)
+                );
+                succeeds(apply_allowing(
+                    &d,
+                    db,
+                    &path,
+                    &["type-rebuild", "constraint"],
+                ));
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM pg_constraint WHERE contypid = 'app.code'::regtype"
+                    ),
+                    2
+                );
+                succeeds(d.run(&["verify", "--db", db]));
+                continue;
+            }
             let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
             assert_ne!(code(&out), 0, "{holder}");
             let said = format!("{}{}", stdout(&out), stderr(&out));
             assert!(
-                said.contains("domain app.code cannot take a new check or NOT NULL")
-                    && said.contains(&format!("app.{column}"))
-                    && said.contains("cannot alter type \"code\" because column")
-                    && said.contains("slice 4b"),
+                said.contains("app.code")
+                    && said.contains("composite type")
+                    && said.contains("refused"),
                 "{holder}: {said}"
             );
             assert!(!path.exists());
@@ -5672,7 +5705,7 @@ fn a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_
 /// the census names the parent, the engine refusing it there as anywhere.
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_holder() {
+fn a_domain_beside_an_enum_partition_key_is_tightened_or_rebuilt_like_any_other_holder() {
     for server in [
         server(),
         std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
@@ -5706,15 +5739,19 @@ fn a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_
                 assert!(no_unvalidated_domain_check(db));
                 succeeds(d.run(&["verify", "--db", db]));
             } else {
-                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
-                assert_ne!(code(&out), 0);
-                let said = format!("{}{}", stdout(&out), stderr(&out));
-                assert!(
-                    said.contains("domain app.code cannot take a new check or NOT NULL")
-                        && said.contains("app.p.x"),
-                    "{said}"
-                );
-                assert!(!path.exists());
+                // The array of it is a column of the parent: rebuilt, the
+                // retype cascading to the partitions (DEC-1635.9).
+                let plan = label_plan(&d, db, &path);
+                assert!(changes_of(&plan).iter().all(|k| k == "EnumRebuild"));
+                succeeds(apply_allowing(
+                    &d,
+                    db,
+                    &path,
+                    &["type-rebuild", "constraint"],
+                ));
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.p"), 2);
+                succeeds(d.run(&["verify", "--db", db]));
             }
         }
     }
@@ -5722,30 +5759,26 @@ fn a_domain_beside_an_enum_partition_key_is_tightened_or_refused_like_any_other_
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn a_base_type_or_collation_change_is_refused_by_name_and_points_at_the_rebuild() {
+fn a_base_the_engine_cannot_convert_is_refused_by_name_and_points_at_the_author_stated_conversion()
+{
     for server in [
         server(),
         std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
     ] {
-        let (own, d) = adopted(&server, "domain_base4a", CODE_SQL);
+        let (own, d) = adopted(&server, "domain_base4b_refused", CODE_SQL);
         let db = own.connection();
         let path = d.dir.join("base.plan.json");
-        for yaml in [
-            "domain: app.code\ntype: varchar(20)\ndefault: \"'a'\"\nchecks:\n  c1: \"VALUE <> ''\"\n",
-            "domain: app.code\ntype: text\ncollation: pg_catalog.\"C\"\ndefault: \"'a'\"\nchecks:\n  c1: \"VALUE <> ''\"\n",
-        ] {
-            write_code(&d, yaml);
-            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
-            assert_ne!(code(&out), 0, "{yaml}");
-            let said = format!("{}{}", stdout(&out), stderr(&out));
-            assert!(
-                said.contains("app.code")
-                    && said.contains("rebuilding it (#1635 slice 4b)")
-                    && !said.contains("require slice 4,"),
-                "{said}"
-            );
-            assert!(!path.exists());
-        }
+        // A conversion with no assignment cast is the author's to state
+        // (#2331); a rebuild would fail at the first retype.
+        write_code(&d, "domain: app.code\ntype: integer\n");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("app.code") && said.contains("#2331") && said.contains("text to integer"),
+            "{said}"
+        );
+        assert!(!path.exists());
     }
 }
 
@@ -7301,5 +7334,436 @@ fn rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type
             assert!(label_plan(&d, db, &path).changes.is_empty());
             succeeds(d.run(&["verify", "--db", db]));
         }
+    }
+}
+
+const NAME_SQL: &str = "CREATE SCHEMA app;
+CREATE DOMAIN app.name AS varchar(20) DEFAULT 'x' CONSTRAINT c1 CHECK (VALUE <> '');
+CREATE TABLE app.t (id integer PRIMARY KEY, v app.name, tags app.name[], CONSTRAINT t_not_zz CHECK (v <> 'zz'));
+CREATE INDEX t_v ON app.t (v);
+CREATE TABLE app.p (id integer, v app.name, PRIMARY KEY (id)) PARTITION BY RANGE (id);
+CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (100);
+INSERT INTO app.t VALUES (1, 'abc', ARRAY['p','q']), (2, 'xyz', NULL);
+INSERT INTO app.p VALUES (1, 'pp');";
+
+fn name_domain(base: &str, collation: Option<&str>) -> String {
+    let mut yaml = format!(
+        "domain: app.name\ntype: {base}\ndefault: \"'x'::{plain}\"\n",
+        plain = base.split('(').next().unwrap().trim()
+    );
+    if let Some(collation) = collation {
+        yaml.push_str(&format!("collation: {collation}\n"));
+    }
+    yaml.push_str(&format!(
+        "checks:\n  c1: \"(VALUE <> ''::{})\"\n",
+        base.split('(').next().unwrap().trim()
+    ));
+    yaml
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domains_base_or_collation_change_is_rebuilt_under_its_uid_with_its_columns_converted() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (base, collation) in [
+            ("text", None),
+            ("varchar(30)", None),
+            ("varchar(20)", Some("pg_catalog.\"C\"")),
+        ] {
+            // An expression index over a column whose collation the domain
+            // changes cannot be read back by the model: left out there.
+            let sql = if collation.is_some() {
+                NAME_SQL.to_owned()
+            } else {
+                format!("{NAME_SQL}\nCREATE INDEX t_lower ON app.t (lower(v));")
+            };
+            let (own, d) = adopted(&server, "domain_rebuild4b", &sql);
+            let db = own.connection();
+            let uids = type_ids(&d);
+            let indexes = scalar(
+                db,
+                "SELECT count(*) FROM pg_indexes WHERE schemaname = 'app'",
+            );
+            std::fs::write(
+                d.dir.join("schema/app.name.type.yml"),
+                name_domain(base, collation),
+            )
+            .unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("rebuild.plan.json");
+            let plan = label_plan(&d, db, &path);
+            let kinds = changes_of(&plan);
+            assert!(
+                kinds.iter().all(|k| k == "EnumRebuild"),
+                "{base}: {kinds:?}"
+            );
+            // Create, a retype for each of v and tags of t and v of p, the swap.
+            assert_eq!(kinds.len(), 5, "{base}: {kinds:?}");
+            // Without the gate's class the plan is refused.
+            let refused = apply_allowing(&d, db, &path, &[]);
+            assert_ne!(code(&refused), 0, "{base}");
+            assert!(
+                stderr(&refused).contains("type-rebuild"),
+                "{}",
+                stderr(&refused)
+            );
+            succeeds(apply_allowing(&d, db, &path, &["type-rebuild"]));
+            assert_eq!(type_ids(&d), uids, "{base}: the uid never changes");
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 2, "{base}");
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.p"), 1, "{base}");
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_indexes WHERE schemaname = 'app'"
+                ),
+                indexes,
+                "{base}"
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_constraint WHERE conname = 't_not_zz'"
+                ),
+                1,
+                "{base}: the table check stands"
+            );
+            assert_eq!(
+                text_of(
+                    db,
+                    "SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'app.name'::regtype"
+                ),
+                if base == "text" {
+                    "text"
+                } else if base == "varchar(30)" {
+                    "character varying(30)"
+                } else {
+                    "character varying(20)"
+                },
+                "{base}"
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "{base}");
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_narrowed_domain_base_reports_the_rows_that_do_not_fit_and_rolls_back_a_late_one() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_narrow4b", NAME_SQL);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        let long = "abcdefghijklmnop";
+        on_server(db, &format!("INSERT INTO app.t VALUES (3, '{long}', NULL)"));
+        std::fs::write(
+            d.dir.join("schema/app.name.type.yml"),
+            name_domain("varchar(10)", None),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("narrow.plan.json");
+        // A row that does not fit stops the plan, naming the column and the
+        // count; nothing ran.
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("app.t.v") && said.contains("cannot become"),
+            "{said}"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'app.name'::regtype"
+            ),
+            "character varying(20)"
+        );
+
+        // With none, it needs both classes.
+        on_server(db, "DELETE FROM app.t WHERE id = 3");
+        let plan = label_plan(&d, db, &path);
+        assert!(changes_of(&plan).iter().all(|k| k == "EnumRebuild"));
+        let refused = apply_allowing(&d, db, &path, &["type-rebuild"]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("narrowing"),
+            "{}",
+            stderr(&refused)
+        );
+
+        // A row that arrives between plan and apply fails the retype, and the
+        // whole apply rolls back with the old domain standing.
+        on_server(db, &format!("INSERT INTO app.t VALUES (3, '{long}', NULL)"));
+        let late = apply_allowing(&d, db, &path, &["type-rebuild", "narrowing"]);
+        assert_ne!(code(&late), 0);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_type WHERE typname LIKE 'pbps_rebuild%'"
+            ),
+            0
+        );
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'app.name'::regtype"
+            ),
+            "character varying(20)"
+        );
+        on_server(db, "DELETE FROM app.t WHERE id = 3");
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert_eq!(type_ids(&d), uids);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+const DERIVED_SQL: &str = "CREATE SCHEMA app;
+CREATE TYPE app.e AS ENUM ('sad', 'ok', 'happy');
+CREATE DOMAIN app.dm AS app.e DEFAULT 'ok' CONSTRAINT not_ok CHECK (VALUE <> 'ok');
+CREATE DOMAIN app.dm2 AS app.dm;
+CREATE TABLE app.t (id integer PRIMARY KEY, m app.dm, a app.dm[], n app.dm2, e app.e);
+CREATE VIEW app.v AS SELECT id, m FROM app.t;
+INSERT INTO app.t VALUES (1, 'happy', ARRAY['happy']::app.dm[], 'happy', 'ok'), (2, NULL, NULL, 'happy', 'happy');";
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_enum_rebuild_rebuilds_the_domains_over_it_in_depth_order_and_says_why() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(&server, "domain_derived4b", DERIVED_SQL);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        // `sad` goes: the enum is rebuilt, and with it the domain over it and
+        // the domain over that. The checks are declared without a cast to the
+        // enum, which would bind the type the swap drops.
+        std::fs::write(
+            d.dir.join("schema/app.e.type.yml"),
+            "enum: app.e\nvalues: [ok, happy]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dm.type.yml"),
+            "domain: app.dm\ntype: app.e\ndefault: \"'ok'\"\nchecks:\n  not_ok: \"VALUE <> 'ok'\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dm2.type.yml"),
+            // A domain over a domain takes its base's default, which the
+            // declaration therefore states.
+            "domain: app.dm2\ntype: app.dm\ndefault: \"'ok'\"\n",
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("derived.plan.json");
+        let said = {
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_eq!(code(&out), 0, "{}", stderr(&out));
+            stdout(&out)
+        };
+        assert!(
+            said.contains("rebuild domain app.dm as")
+                && said.contains("rebuild domain app.dm2 as")
+                && said.contains("it is built on app.e, which is rebuilt")
+                && said.contains("it is built on app.dm, which is rebuilt"),
+            "{said}"
+        );
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            changes_of(&plan).iter().any(|k| k == "DropModule")
+                && changes_of(&plan).iter().any(|k| k == "CreateModule"),
+            "the view comes down and goes back: {:?}",
+            changes_of(&plan)
+        );
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "destructive"],
+        ));
+        assert_eq!(type_ids(&d), uids, "the uid of each type is unchanged");
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 2);
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.v"), 2);
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum \
+                 WHERE enumtypid = 'app.e'::regtype"
+            ),
+            "ok,happy"
+        );
+        // The domains stand over the rebuilt enum and each other, with their
+        // default and check.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_type WHERE typname IN ('dm', 'dm2') AND typtype = 'd'"
+            ),
+            2
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let base = "CREATE SCHEMA app;
+            CREATE DOMAIN app.name AS varchar(20) DEFAULT 'x' CONSTRAINT c1 CHECK (VALUE <> '');
+            CREATE TABLE app.t (id int PRIMARY KEY, v app.name);
+            INSERT INTO app.t VALUES (1,'ok');";
+        for (slug, extra, expected) in [
+            (
+                "signature",
+                "CREATE FUNCTION app.f(x app.name) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
+                "as an argument",
+            ),
+            (
+                "policy",
+                "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;
+                 CREATE POLICY p ON app.t USING (v <> 'sad');",
+                "a policy",
+            ),
+            (
+                "generated_reader",
+                "ALTER TABLE app.t ADD COLUMN g boolean GENERATED ALWAYS AS (v = 'ok') STORED;",
+                "generated column",
+            ),
+            (
+                "composite",
+                "CREATE TYPE app.pair AS (x app.name); CREATE TABLE app.c (p app.pair);",
+                "composite type",
+            ),
+            (
+                "partition_key",
+                "CREATE TABLE app.p (k app.name NOT NULL, n int) PARTITION BY LIST (k);
+                 CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES IN ('a');",
+                "app.p.k holds domain app.name",
+            ),
+            (
+                "privileges",
+                "REVOKE USAGE ON TYPE app.name FROM PUBLIC;",
+                "explicit privilege list",
+            ),
+        ] {
+            let (own, d) = adopted(
+                &server,
+                &format!("domain_refuses_{slug}4b"),
+                &format!("{base} {extra}"),
+            );
+            let db = own.connection();
+            std::fs::write(
+                d.dir.join("schema/app.name.type.yml"),
+                name_domain("text", None),
+            )
+            .unwrap();
+            let path = d.dir.join("refused.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{slug}");
+            let text = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(text.contains(expected), "{slug}: {text}");
+            assert!(text.contains("app.name"), "{slug}: {text}");
+            assert!(!path.exists(), "{slug}");
+            assert_eq!(
+                text_of(
+                    db,
+                    "SELECT format_type(typbasetype, typtypmod) FROM pg_type WHERE oid = 'app.name'::regtype"
+                ),
+                "character varying(20)",
+                "{slug}"
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_type WHERE typname LIKE 'pbps_rebuild%'"
+                ),
+                0,
+                "{slug}"
+            );
+            assert_eq!(
+                scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+                1,
+                "{slug}"
+            );
+        }
+        // A domain owned by another role would lose its owner in the copy.
+        let role = format!("pbps_domain_owner_{}", std::process::id());
+        on_server(
+            &server,
+            &format!("DROP ROLE IF EXISTS {role}; CREATE ROLE {role}"),
+        );
+        let (own, d) = adopted(&server, "domain_refuses_owner4b", base);
+        let db = own.connection();
+        on_server(db, &format!("ALTER DOMAIN app.name OWNER TO {role}"));
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "owner changed"]));
+        std::fs::write(
+            d.dir.join("schema/app.name.type.yml"),
+            name_domain("text", None),
+        )
+        .unwrap();
+        let out = d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--out",
+            d.dir.join("owner.plan.json").to_str().unwrap(),
+        ]);
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        drop(own);
+        on_server(&server, &format!("DROP ROLE IF EXISTS {role}"));
+        assert_ne!(code(&out), 0);
+        assert!(
+            text.contains("owned by a role other than the one deploying"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_rebuild_carries_the_comment_to_the_replacement() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = format!("{NAME_SQL} COMMENT ON DOMAIN app.name IS 'a display name';");
+        let (own, d) = adopted(&server, "domain_comment4b", &sql);
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.name.type.yml"),
+            name_domain("text", None),
+        )
+        .unwrap();
+        let path = d.dir.join("comment.plan.json");
+        let _ = label_plan(&d, db, &path);
+        succeeds(apply_allowing(&d, db, &path, &["type-rebuild"]));
+        assert_eq!(
+            text_of(db, "SELECT obj_description('app.name'::regtype, 'pg_type')"),
+            "a display name"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
     }
 }
