@@ -64,7 +64,7 @@ pub(super) enum Prepared {
     Mssql(mssql::Prepared),
 }
 pub(super) enum Binding {
-    Postgres(postgres::Binding),
+    Postgres(Box<postgres::Binding>),
     Mssql(mssql::Binding),
 }
 pub(super) enum Chained {
@@ -205,7 +205,7 @@ impl Scratch<'_> {
             Self::Postgres(scratch) => scratch
                 .reconstruction(target, binding, ids, dependencies)
                 .await
-                .map(Binding::Postgres),
+                .map(|binding| Binding::Postgres(Box::new(binding))),
         }
     }
 

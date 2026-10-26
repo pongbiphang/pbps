@@ -1331,3 +1331,128 @@ fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
         }
     );
 }
+
+fn create_type(name: &str, definition: pbps_model::ManagedType) -> Change {
+    Change::CreateType {
+        uid: Uid::generate(UidKind::Type),
+        name: name.parse().unwrap(),
+        definition: Box::new(definition),
+    }
+}
+
+fn mood() -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Enum {
+        values: vec!["sad".into(), "ok".into(), "happy".into()],
+    }
+}
+
+fn domain_over(base: &str) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: base.parse().unwrap(),
+        not_null: false,
+        default: None,
+        checks: Default::default(),
+        collation: None,
+    }
+}
+
+/// A declared enum or domain is created before every table and module, in the
+/// order the differ gave the types themselves: a domain over an enum follows
+/// it. The table is first in the input to show the phase, not the input
+/// order, puts the types ahead of it.
+#[test]
+fn a_declared_type_is_created_before_the_tables_and_modules_that_name_it() {
+    let mut typed = Table::default();
+    typed
+        .columns
+        .insert("m".into(), Column::new("app.mood".parse().unwrap()));
+    typed
+        .columns
+        .insert("s".into(), Column::new("app.moody".parse().unwrap()));
+    let changes = [
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: TableName::new("app", "t"),
+            table: Box::new(typed),
+            beside_default: None,
+            moves_at_most: None,
+        },
+        module("app.v", ModuleKind::View, "SELECT m FROM app.t"),
+        create_type("app.mood", mood()),
+        create_type("app.moody", domain_over("app.mood")),
+    ];
+    let reconstruction = Reconstruction::new(
+        &crate::Postgres::new(),
+        &super::fixture_plan(&changes),
+        &Default::default(),
+    )
+    .unwrap();
+    let order: Vec<_> = reconstruction
+        .steps
+        .iter()
+        .map(|step| (step.phase, step.declaration.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (Phase::Types, "type app.mood"),
+            (Phase::Types, "type app.moody"),
+            (Phase::Tables, "table app.t"),
+            (Phase::Modules, "view app.v"),
+        ]
+    );
+    assert!(
+        reconstruction.steps[0].statements[0].contains("CREATE TYPE \"app\".\"mood\" AS ENUM")
+            && reconstruction.steps[1].statements[0].contains("CREATE DOMAIN \"app\".\"moody\""),
+        "{:?}",
+        reconstruction.steps
+    );
+    // A type is a nameable type, which only a call written as a cast reaches.
+    assert_eq!(
+        reconstruction.steps[0].names,
+        [(Nameable::Type, "app".to_owned(), "mood".to_owned())]
+    );
+}
+
+/// A bootstrap holds only creations. The label operations and the drops and
+/// renames of a type are not one, and stay refused by name; a bootstrap with
+/// no type is the same steps it always was.
+#[test]
+fn only_the_creation_of_a_type_is_part_of_a_bootstrap() {
+    let pg = crate::Postgres::new();
+    for (change, op) in [
+        (
+            Change::DropType {
+                uid: Uid::generate(UidKind::Type),
+                name: "app.mood".parse().unwrap(),
+                definition: Box::new(mood()),
+            },
+            "drop_type",
+        ),
+        (
+            Change::AddEnumValue {
+                uid: Uid::generate(UidKind::Type),
+                name: "app.mood".parse().unwrap(),
+                value: "meh".into(),
+                placement: None,
+                ordinal: 0,
+                definition: Box::new(mood()),
+            },
+            "add_enum_value",
+        ),
+    ] {
+        let changes = [create_type("app.mood", mood()), change];
+        let error = Reconstruction::new(&pg, &super::fixture_plan(&changes), &Default::default())
+            .unwrap_err();
+        assert_eq!(error, ReconstructError::Unsupported(op.into()));
+    }
+    let untouched = build_reconstruction(&pg, &bootstrap()).unwrap();
+    assert!(
+        untouched
+            .steps
+            .iter()
+            .all(|step| step.phase != Phase::Types),
+        "{:?}",
+        untouched.steps
+    );
+}

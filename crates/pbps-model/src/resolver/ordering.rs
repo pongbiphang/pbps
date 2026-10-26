@@ -27,6 +27,9 @@ pub enum Surface {
         name: crate::ObjectLocalName,
     },
     Module(ModuleId),
+    /// A declared enum or domain: its `pg_type` row and its array type
+    /// (#2407).
+    Type(crate::TypeRef),
 }
 
 /// One actual observation. `managed_inputs` is the adapter's mapping of

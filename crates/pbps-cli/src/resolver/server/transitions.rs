@@ -102,7 +102,7 @@ fn table_of(surface: &Surface) -> Option<&pbps_model::TableName> {
             Some(table)
         }
         Surface::Column(column) | Surface::Default(column) => Some(&column.table),
-        Surface::Namespace(_) | Surface::Module(_) => None,
+        Surface::Namespace(_) | Surface::Module(_) | Surface::Type(_) => None,
     }
 }
 
@@ -178,6 +178,11 @@ fn opening_endpoint(
             })
         }
         Surface::Module(id) => Some(Surface::Module(id.clone())),
+        // The recorded UID locates the opening spelling across a rename.
+        Surface::Type(name) => {
+            let uid = desired.ids.type_uid(name)?;
+            base.ids.types.get(uid).cloned().map(Surface::Type)
+        }
     }
 }
 
@@ -217,6 +222,7 @@ fn declared(schema: &Schema, surface: &Surface) -> bool {
             .get(table)
             .is_some_and(|table| table.indexes.contains_key(name)),
         Surface::Module(id) => schema.modules.contains_key(id),
+        Surface::Type(name) => schema.types.contains_key(name),
     }
 }
 
@@ -578,6 +584,52 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                 false,
                 Some(Surface::Module(id.clone())),
             ),
+            // A declared type is a surface of its own: its `pg_type` row and
+            // its array type. A label operation, and a rebuild's create and
+            // swap, change it in place; the rebuild's retype is a column's
+            // (#2407).
+            Change::CreateType { name, .. } => {
+                (Surface::Type(name.clone()), false, false, true, None)
+            }
+            Change::DropType { name, .. } => (
+                Surface::Type(name.clone()),
+                false,
+                true,
+                false,
+                Some(Surface::Type(name.clone())),
+            ),
+            Change::RenameType { uid, from, to, .. } => (
+                Surface::Type(to.clone()),
+                false,
+                true,
+                true,
+                Some(Surface::Type(
+                    base.ids.types.get(uid).cloned().unwrap_or_else(|| from.clone()),
+                )),
+            ),
+            Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
+                (Surface::Type(name.clone()), false, true, true, None)
+            }
+            Change::EnumRebuild {
+                name,
+                step:
+                    pbps_model::EnumRebuildStep::Create { .. }
+                    | pbps_model::EnumRebuildStep::Swap { .. },
+                ..
+            } => (Surface::Type(name.clone()), false, true, true, None),
+            Change::EnumRebuild {
+                step:
+                    pbps_model::EnumRebuildStep::Retype {
+                        column_uid, column, ..
+                    },
+                ..
+            } => (
+                Surface::Column(final_column(column_uid, column, desired)),
+                true,
+                true,
+                true,
+                None,
+            ),
             // Authorization changes leave every fingerprinted property as it
             // was (DEC-1274.1): the target stays an untouched input, and the
             // ordinary apply guard checks that a declared grant took.
@@ -590,12 +642,6 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::AddEnumValue { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }
             | Change::DropRole { .. } => continue,

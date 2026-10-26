@@ -8,6 +8,9 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
+    /// Declared enums and domains: every table and routine that names one
+    /// needs it first, and nothing a bootstrap makes is needed by a type.
+    Types,
     Tables,
     Keys,
     Modules,
@@ -360,6 +363,7 @@ fn function_edges<E: Engine>(
     let mut schedule = super::Schedule::new(steps.len());
     let mut previous = None;
     for phase in [
+        Phase::Types,
         Phase::Tables,
         Phase::Keys,
         Phase::Modules,

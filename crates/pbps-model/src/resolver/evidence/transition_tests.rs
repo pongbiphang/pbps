@@ -1440,7 +1440,8 @@ fn aggregate_renames_require_owned_records_at_both_endpoints() {
                 | Surface::Default(_)
                 | Surface::Check { .. }
                 | Surface::Index { .. }
-                | Surface::Module(_) => panic!("table or column"),
+                | Surface::Module(_)
+                | Surface::Type(_) => panic!("table or column"),
             };
             let child = ObjectIdentity {
                 class: "adapter-owned-default".into(),

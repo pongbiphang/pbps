@@ -2855,7 +2855,8 @@ maintainer's (2026-10-15).
   constraints by name, owned and identity sequences, own options), views
   as shape views, enums, domains, composite types, extensions with their
   version. These are the common classes, and the shapes the comparison
-  reads of each are known.
+  reads of each are known. An enum or a domain the project declares is a
+  managed type and never drafted or filled (DEC-2407.1).
 - **Listed, never written:** routines by signature, since pbps sends no
   routine source to scratch; casts, operators, collations, operator
   classes and the table structures the draft does not write, for the
@@ -3432,7 +3433,7 @@ lifts (#1778).** The maintainer chose this on 2026-10-17. It corrects the
 that is no change of it (`Refusal::Outside`, `Refusal::Mismatch`). A
 filled object exists on the target already, so it never enters the plan.
 Scratch is built by the reconstruction instead: the plan from an empty
-schema, sorted into tables, keys, modules and expressions. Fill is placed
+schema, sorted into types, tables, keys, modules and expressions. Fill is placed
 in that order, so the plan's ordering gains no edge and no pass (#1776).
 
 **What was decided.**
@@ -4495,3 +4496,53 @@ one, because a function shares a name with a column through an alias or another
 table's column, is a lexical over-read and refuses the same way, naming the
 alias or column to rename.
 
+<a id="dec-2407-1"></a>
+
+**DEC-2407.1. A declared type is built on scratch in a phase of its own, owned by a
+surface of its own, and managed in the capture (#2407).** A resolver-backed
+connected plan of a project that declares an enum or a domain was refused
+outright: the reconstruction of the desired namespace from the empty-to-desired
+bootstrap listed `CreateType` among the changes "a bootstrap has none of", and
+every binding question of the plan went unanswered. Three parts fix it.
+
+- **A Types phase.** `Phase::Types` precedes `Tables` in the scratch route
+  (`pbps-diff/src/order/scratch.rs`), and `CreateType` is a step of it through
+  the ordinary emitter, so scratch creates a type before any table, view or
+  routine that names it. Peers keep the differ's order, which already puts a
+  domain after its base. A domain whose check calls a declared routine fails to
+  compile there, as it does in a real plan (types are class 7, modules 14), and
+  the refusal names the type. The label operations, `DropType`, `RenameType`
+  and `EnumRebuild` stay refused: a bootstrap holds none of them. The schemas
+  of the declared types are in the qualified scope, so a schema that holds
+  only types exists on scratch.
+- **`Surface::Type(TypeRef)`.** A declared type owns its `pg_type` row, its
+  array type (the measured internal edge), its labels and its domain
+  constraints, matched by its recorded UID, like a module. Without a surface a
+  view that binds the type, by its column or by a constant of it, had a binding
+  target the closing manifest could neither find on the target (the plan makes
+  it) nor install, and the evidence could not be sealed. `CreateType`,
+  `DropType`, `RenameType`, the label operations and a rebuild's create and swap
+  are now catalog changes of that surface (a rebuild's retype is its column's),
+  so the projection, the transitions, the ownership and the explain all account
+  for them. The evidence version moves to 6, since an older reader refuses the
+  new surface kind.
+- **A managed `pg_type`.** The managed set names declared types: they are held
+  by name, captured as candidate sets on both sides, and not created by an
+  externals file; fill and the draft treat a declared enum or domain, and the
+  array of one, as managed, and a chain through a declared domain is no chain.
+  A type nobody declares stays external, staged by the externals file or drafted
+  as before.
+
+**Rejected: a narrower exemption.** Dropping the bindings whose target is a type
+the plan creates, because the type pins already hold its definition, would have
+been smaller. It would also leave the sealed evidence silent about what the view
+resolved, for a name-resolved binding as much as an identity one, and the
+closing read would have no record to find. The surface keeps the evidence
+complete, at the cost of a new surface kind.
+
+**Pinned by** `a_resolved_plan_builds_declared_enums_and_domains_on_scratch`
+(live, 16 and 18: control, enum, domain, a type already on the target, a type in
+a schema of its own, an undeclared external type, a label added, an enum
+rebuilt; each plans, seals, applies and re-plans clean), the `reconstruct`,
+`type_ownership`, `draft`, `externals`, `assess` and `transitions` unit tests,
+and the `projection` and `ownership` tests of the model.

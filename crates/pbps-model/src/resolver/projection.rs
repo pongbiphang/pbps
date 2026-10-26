@@ -738,19 +738,27 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
         Change::CreateModule { id, .. } => (Exact(Surface::Module(id.clone())), false, true),
         Change::AlterModule { id, .. } => (Exact(Surface::Module(id.clone())), true, true),
         Change::DropModule { id, .. } => (Exact(Surface::Module(id.clone())), true, false),
+        // A declared type is one surface: its `pg_type` row and its array
+        // type. A label operation and a rebuild's create and swap change it
+        // in place; a rename moves it (#2407).
+        Change::CreateType { name, .. } => (Exact(Surface::Type(name.clone())), false, true),
+        Change::DropType { name, .. } => (Exact(Surface::Type(name.clone())), true, false),
+        Change::RenameType { from, .. } => (Exact(Surface::Type(from.clone())), true, true),
+        Change::AddEnumValue { name, .. } | Change::RenameEnumValue { name, .. } => {
+            (Exact(Surface::Type(name.clone())), true, true)
+        }
+        Change::EnumRebuild {
+            name,
+            step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
+            ..
+        } => (Exact(Surface::Type(name.clone())), true, true),
         Change::InsertRow { .. }
         | Change::UpdateRow { .. }
         | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::SetColumnDeprecated { .. }
-        | Change::AddEnumValue { .. }
-        | Change::RenameEnumValue { .. }
-        | Change::EnumRebuild { .. }
-        | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
-            | Change::CreateRole { .. }
+        | Change::CreateRole { .. }
         | Change::RenameRole { .. }
         | Change::DropRole { .. }
         | Change::Grant { .. }
@@ -774,6 +782,8 @@ fn planned_absence(owner: &Surface, changes: &ChangeSet, before: bool) -> bool {
             Change::DropColumn { column, .. } if !before => Surface::Column(column.clone()),
             Change::CreateModule { id, .. } if before => Surface::Module(id.clone()),
             Change::DropModule { id, .. } if !before => Surface::Module(id.clone()),
+            Change::CreateType { name, .. } if before => Surface::Type(name.clone()),
+            Change::DropType { name, .. } if !before => Surface::Type(name.clone()),
             Change::AddCheck { table, name, .. } if before => Surface::Check {
                 table: table.clone(),
                 name: name.clone(),
@@ -823,7 +833,8 @@ fn covers_change(c: &Change, surface: &Surface) -> bool {
             | Surface::Table(_)
             | Surface::Check { .. }
             | Surface::Index { .. }
-            | Surface::Module(_) => true,
+            | Surface::Module(_)
+            | Surface::Type(_) => true,
         }
 }
 
@@ -866,6 +877,19 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
             matches!(c, Change::AddIndex { table: t, name: n, .. } | Change::DropIndex { table: t, name: n } if t == table && n == name)
                 || matches!(c, Change::SetIndexStorageParameters { table: t, target: crate::change::IndexPart::Index(n), .. } if t == table && n == name)
         }
+        Surface::Type(name) => match c {
+            Change::CreateType { name: n, .. }
+            | Change::DropType { name: n, .. }
+            | Change::AddEnumValue { name: n, .. }
+            | Change::RenameEnumValue { name: n, .. } => n == name,
+            Change::EnumRebuild {
+                name: n,
+                step: crate::EnumRebuildStep::Create { .. } | crate::EnumRebuildStep::Swap { .. },
+                ..
+            } => n == name,
+            Change::RenameType { from, to, .. } => from == name || to == name,
+            _ => false,
+        },
         Surface::Module(id) => {
             c.module_id() == Some(id)
                 || matches!((c, id), (Change::PublicExecution { routine, .. }, ModuleId::Routine(r)) if routine == r)
@@ -904,12 +928,6 @@ fn changes_catalog(c: &Change) -> bool {
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::SetColumnDeprecated { .. }
-            | Change::AddEnumValue { .. }
-            | Change::RenameEnumValue { .. }
-            | Change::EnumRebuild { .. }
-            | Change::CreateType { .. }
-            | Change::DropType { .. }
-            | Change::RenameType { .. }
             | Change::CreateRole { .. }
             | Change::RenameRole { .. }
             | Change::DropRole { .. }
@@ -954,5 +972,190 @@ mod tests {
         // Negative: another index's surface, and a key's change.
         assert!(!touches(&set(IndexPart::Index("other".into())), &index));
         assert!(!touches(&set(IndexPart::PrimaryKey), &index));
+    }
+
+    fn mood() -> crate::TypeRef {
+        "app.mood".parse().unwrap()
+    }
+
+    fn other() -> crate::TypeRef {
+        "app.other".parse().unwrap()
+    }
+
+    fn definition() -> Box<crate::ManagedType> {
+        Box::new(crate::ManagedType::Enum {
+            values: vec!["a".into()],
+        })
+    }
+
+    fn uid() -> crate::Uid {
+        crate::Uid::generate(crate::UidKind::Type)
+    }
+
+    fn rebuild(step: crate::EnumRebuildStep) -> Change {
+        Change::EnumRebuild {
+            uid: uid(),
+            name: mood(),
+            tmp: "app.tmp".parse().unwrap(),
+            step,
+        }
+    }
+
+    /// Every change of a declared type touches that type's surface and no
+    /// other, and is a catalog change the closing manifest must account for
+    /// (#2407). A rename touches both of its spellings.
+    #[test]
+    fn a_types_changes_touch_its_surface_and_no_other() {
+        let surface = Surface::Type(mood());
+        let rename = Change::RenameType {
+            uid: uid(),
+            from: "app.old".parse().unwrap(),
+            to: mood(),
+            definition: definition(),
+        };
+        let own = [
+            Change::CreateType {
+                uid: uid(),
+                name: mood(),
+                definition: definition(),
+            },
+            Change::DropType {
+                uid: uid(),
+                name: mood(),
+                definition: definition(),
+            },
+            Change::AddEnumValue {
+                uid: uid(),
+                name: mood(),
+                value: "b".into(),
+                placement: None,
+                ordinal: 0,
+                definition: definition(),
+            },
+            Change::RenameEnumValue {
+                uid: uid(),
+                name: mood(),
+                from: "a".into(),
+                to: "b".into(),
+                ordinal: 0,
+                definition: definition(),
+            },
+            rebuild(crate::EnumRebuildStep::Create {
+                definition: definition(),
+                removed: Vec::new(),
+                ordinal: 0,
+            }),
+            rebuild(crate::EnumRebuildStep::Swap {
+                definition: definition(),
+                comment: None,
+            }),
+            rename,
+        ];
+        for change in &own {
+            assert!(changes_catalog(change), "{change:?}");
+            assert!(touches(change, &surface), "{change:?}");
+            assert!(covers_change(change, &surface), "{change:?}");
+            // Negative: another type, and a table of the same name.
+            assert!(!touches(change, &Surface::Type(other())), "{change:?}");
+            assert!(
+                !touches(change, &Surface::Table(TableName::new("app", "mood"))),
+                "{change:?}"
+            );
+        }
+        // The rename's other spelling.
+        assert!(touches(&own[6], &Surface::Type("app.old".parse().unwrap())));
+        // A rebuild's retype is its column's, not the type's.
+        let retype = rebuild(crate::EnumRebuildStep::Retype {
+            column_uid: uid(),
+            column: TableName::new("app", "t").column("m"),
+            to: crate::ColumnType::reference(mood()),
+            array: false,
+            removed: Vec::new(),
+        });
+        assert!(!touches(&retype, &surface));
+    }
+
+    /// The owner of each type change: created and dropped at one end, altered
+    /// and renamed at both, the rebuild's retype a column's (#2407).
+    #[test]
+    fn a_types_changes_are_owned_by_its_exact_surface() {
+        let owner = |c: &Change| changed_owners(c).expect("an owned change");
+        let create = Change::CreateType {
+            uid: uid(),
+            name: mood(),
+            definition: definition(),
+        };
+        let drop = Change::DropType {
+            uid: uid(),
+            name: mood(),
+            definition: definition(),
+        };
+        let label = Change::AddEnumValue {
+            uid: uid(),
+            name: mood(),
+            value: "b".into(),
+            placement: None,
+            ordinal: 0,
+            definition: definition(),
+        };
+        for (change, opening, closing) in [
+            (&create, false, true),
+            (&drop, true, false),
+            (&label, true, true),
+        ] {
+            let (owners, o, c) = owner(change);
+            assert!(
+                matches!(owners.as_slice(), [OwnerScope::Exact(Surface::Type(n))] if *n == mood()),
+                "{change:?}"
+            );
+            assert_eq!((o, c), (opening, closing), "{change:?}");
+        }
+        let swap = rebuild(crate::EnumRebuildStep::Swap {
+            definition: definition(),
+            comment: None,
+        });
+        assert!(matches!(
+            owner(&swap).0.as_slice(),
+            [OwnerScope::Exact(Surface::Type(_))]
+        ));
+        let retype = rebuild(crate::EnumRebuildStep::Retype {
+            column_uid: uid(),
+            column: TableName::new("app", "t").column("m"),
+            to: crate::ColumnType::reference(mood()),
+            array: false,
+            removed: Vec::new(),
+        });
+        assert!(matches!(
+            owner(&retype).0.as_slice(),
+            [OwnerScope::WithChildren(Surface::Column(_))]
+        ));
+    }
+
+    /// Only a plan's own creation explains the type's missing opening
+    /// record, and only its own drop the closing one.
+    #[test]
+    fn a_type_is_absent_only_where_the_plan_creates_or_drops_it() {
+        let create = ChangeSet {
+            changes: vec![crate::PlannedChange::new(Change::CreateType {
+                uid: uid(),
+                name: mood(),
+                definition: definition(),
+            })],
+        };
+        let drop = ChangeSet {
+            changes: vec![crate::PlannedChange::new(Change::DropType {
+                uid: uid(),
+                name: mood(),
+                definition: definition(),
+            })],
+        };
+        let surface = Surface::Type(mood());
+        assert!(planned_absence(&surface, &create, true));
+        assert!(!planned_absence(&surface, &create, false));
+        assert!(planned_absence(&surface, &drop, false));
+        assert!(!planned_absence(&surface, &drop, true));
+        // Negative: another type.
+        assert!(!planned_absence(&Surface::Type(other()), &create, true));
+        assert!(!planned_absence(&Surface::Type(other()), &drop, false));
     }
 }

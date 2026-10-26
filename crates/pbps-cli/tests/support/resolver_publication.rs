@@ -1694,3 +1694,234 @@ row_policies:
     assert_eq!(value["data"]["changes"], 0, "{value}");
     assert!(value["findings"].to_string().contains("#595"), "{value}");
 }
+
+/// The acceptance project of #2407: a resolver-backed plan whose declarations
+/// hold a type. The revision replaces `app.f(numeric)` with `app.f(integer)`,
+/// which captures the calls `app.f(1)` and so makes the resolver necessary
+/// (the `published` fixture), and adds a view `app.uv` over a column of
+/// `column_type`. Where the type is new, the plan creates it and the table
+/// too; where it is `existing`, both are on the target and only the view is
+/// new.
+pub fn declared_types(server: &str) {
+    let enum_file = (
+        "app.mood.type.yml",
+        "enum: app.mood\nvalues: [sad, ok, happy]\n",
+    );
+    // A schema that holds nothing but the type.
+    let own_schema_file = (
+        "kinds.mood.type.yml",
+        "enum: kinds.mood\nvalues: [sad, ok, happy]\n",
+    );
+    let domain_file = (
+        "app.short.type.yml",
+        "domain: app.short\ntype: text\nchecks: {nonempty: \"VALUE <> ''\"}\n",
+    );
+    // (name, the type's declaration, the column's type, the pg_type the plan
+    // leaves behind, whether the type is already on the target). `external`
+    // is a type nobody declares, which an externals file stages instead.
+    let variants = [
+        ("control", None, "text", None, false),
+        ("enum", Some(enum_file), "app.mood", Some("mood"), false),
+        (
+            "domain",
+            Some(domain_file),
+            "app.short",
+            Some("short"),
+            false,
+        ),
+        (
+            "enum_existing",
+            Some(enum_file),
+            "app.mood",
+            Some("mood"),
+            true,
+        ),
+        (
+            "own_schema",
+            Some(own_schema_file),
+            "kinds.mood",
+            None,
+            false,
+        ),
+        ("external", None, "ext.kind", None, true),
+        // The type changes in the same plan: a label is added, then labels
+        // are removed and reordered, which rebuilds the enum under its uid.
+        (
+            "label_added",
+            Some(("app.mood.type.yml", "enum: app.mood\nvalues: [sad, ok]\n")),
+            "app.mood",
+            Some("mood"),
+            true,
+        ),
+        ("rebuilt", Some(enum_file), "app.mood", Some("mood"), true),
+    ];
+    for (name, type_file, column_type, made, existing) in variants {
+        let revised = match name {
+            "label_added" => Some("enum: app.mood\nvalues: [sad, ok, happy]\n"),
+            "rebuilt" => Some("enum: app.mood\nvalues: [happy, ok]\n"),
+            _ => None,
+        };
+        let external = name == "external";
+        let own_schema = name == "own_schema";
+        let slug = format!("ctgap_{name}");
+        let own = OwnDatabase::new(server, &slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        if external {
+            on_server(
+                connection,
+                "CREATE SCHEMA ext; CREATE TYPE ext.kind AS ENUM ('x', 'y')",
+            );
+        }
+        if own_schema {
+            on_server(connection, "CREATE SCHEMA kinds");
+        }
+        let scratch = Confined::new(server);
+        let d = Demo::new(&slug);
+        declare(&d);
+        let table = |d: &Demo| {
+            if let Some((file, body)) = type_file {
+                std::fs::write(d.dir.join("schema").join(file), body).unwrap();
+            }
+            std::fs::write(
+                d.dir.join("schema/app.u.yml"),
+                format!(
+                    "table: app.u\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                     m: {{type: {column_type}}}\nprimary_key: {{name: pk_u, columns: [id]}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let view = |d: &Demo| {
+            std::fs::write(
+                d.dir.join("schema/app.uv.view.yml"),
+                // A constant of the type binds it by name, besides the
+                // column's type, which binds it by identity.
+                if column_type == "text" || column_type == "ext.kind" {
+                    "view: app.uv\ndefinition: SELECT id, m FROM app.u\n".to_owned()
+                } else {
+                    let constant = if column_type == "app.short" { "'x'" } else { "'ok'" };
+                    format!(
+                        "view: app.uv\ndefinition: SELECT id, m, {constant}::{column_type} AS k FROM app.u\n"
+                    )
+                },
+            )
+            .unwrap();
+        };
+        if existing {
+            table(&d);
+        }
+        successful(run(&d, &["plan"], None));
+        d.commit();
+        successful(run(&d, &["bootstrap", "--db", connection], None));
+        std::fs::write(
+            d.dir.join("schema/app.f%28integer%29.function.yml"),
+            "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+             (integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1\n",
+        )
+        .unwrap();
+        if !existing {
+            table(&d);
+        }
+        if let (Some(body), Some((file, _))) = (revised, type_file) {
+            std::fs::write(d.dir.join("schema").join(file), body).unwrap();
+        }
+        view(&d);
+        successful(run(&d, &["plan"], None));
+        d.commit();
+        configure(&d);
+        if external {
+            // The resolver builds the type the project reads but does not
+            // declare from its externals file, as it always has.
+            std::fs::create_dir_all(d.dir.join("db")).unwrap();
+            std::fs::write(
+                d.dir.join("db/externals.sql"),
+                "CREATE SCHEMA ext;\nCREATE TYPE ext.kind AS ENUM ('x', 'y');\n",
+            )
+            .unwrap();
+            let config = d.dir.join("pbps.yml");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                text.replace(
+                    "    url_env: PBPS_SCRATCH_1516\n",
+                    "    url_env: PBPS_SCRATCH_1516\n    externals: db/externals.sql\n",
+                ),
+            )
+            .unwrap();
+        }
+        successful(run(
+            &d,
+            &[
+                "key",
+                "generate",
+                "--out",
+                d.dir.join("key").to_str().unwrap(),
+            ],
+            None,
+        ));
+        let targets = Targets {
+            target: connection,
+            scratch: &scratch.connection,
+        };
+        let artifact = d.dir.join("plan.json");
+        let sql = d.dir.join("plan.sql");
+        let out = run(&d, &plan_args(&artifact, &sql), Some(&targets));
+        assert_eq!(code(&out), 0, "{name}: {}{}", stdout(&out), stderr(&out));
+        // Pre-flight lines can precede the document.
+        let text = stdout(&out);
+        let json: serde_json::Value = serde_json::from_str(&text[text.find('{').unwrap()..])
+            .unwrap_or_else(|e| panic!("{name}: {e}: {text}{}", stderr(&out)));
+        assert_eq!(
+            json["data"]["resolver_assessment"]["need"], "resolved",
+            "{name}"
+        );
+        // It seals and applies, and the view stands over the column.
+        successful(run(
+            &d,
+            &[
+                "apply",
+                "--env",
+                "prod",
+                "--plan",
+                artifact.to_str().unwrap(),
+                "--checksum",
+                &plan_checksum(&artifact),
+                "--allow",
+                "grant-widen,destructive,constraint,type-rebuild",
+            ],
+            Some(&targets),
+        ));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_catalog.pg_views WHERE viewname = 'uv'"
+            ),
+            1,
+            "{name}"
+        );
+        if let Some(made) = made {
+            assert_eq!(
+                scalar(
+                    connection,
+                    &format!(
+                        "SELECT count(*) FROM pg_catalog.pg_type WHERE typname = '{made}' \
+                         AND typnamespace = 'app'::pg_catalog.regnamespace"
+                    )
+                ),
+                1,
+                "{name}"
+            );
+        }
+        // And the next plan has nothing left to do.
+        let next = successful(run(
+            &d,
+            &["plan", "--env", "prod", "--format", "json"],
+            Some(&targets),
+        ));
+        let text = stdout(&next);
+        let value: serde_json::Value =
+            serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+        assert_eq!(value["data"]["changes"], 0, "{name}: {value}");
+    }
+}

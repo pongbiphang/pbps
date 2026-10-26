@@ -37,6 +37,9 @@ pub struct Managed {
     /// Declared routines by name, each with its kind, which a dropped one's
     /// lookup must match (#1126).
     routines: BTreeMap<(String, String), BTreeMap<pbps_model::ModuleId, pbps_model::ModuleKind>>,
+    /// Declared enums and domains: types the project creates, which a view
+    /// or routine reaches through a column or by name.
+    types: BTreeSet<(String, String)>,
 }
 
 impl Managed {
@@ -52,6 +55,11 @@ impl Managed {
             for index in table.indexes.keys().chain(table.unique.keys()).chain(&key) {
                 managed.indexes.insert((name.schema.clone(), index.clone()));
             }
+        }
+        for name in schema.types.keys() {
+            managed
+                .types
+                .insert((name.schema().to_owned(), name.name().to_owned()));
         }
         for (id, module) in &schema.modules {
             let key = (id.schema().to_owned(), id.name().to_owned());
@@ -115,7 +123,36 @@ impl Managed {
                     .keys()
                     .map(|key| set(CandidateClass::Routine, key)),
             )
+            .chain(self.types.iter().map(|key| set(CandidateClass::Type, key)))
             .collect()
+    }
+
+    /// Whether the project declares an enum or a domain of this name.
+    pub fn declares_type(&self, schema: &str, name: &str) -> bool {
+        self.types.contains(&(schema.to_owned(), name.to_owned()))
+    }
+
+    /// [`Self::declares_type`] for a type as `pg_identify_object_as_address`
+    /// spells it: one qualified name, quoted only where it needs it, and
+    /// `[]` after an array type.
+    pub fn declares_type_spelled(&self, spelled: &str) -> bool {
+        let spelled = spelled.strip_suffix("[]").unwrap_or(spelled);
+        let plain = |ident: &str| {
+            ident.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && ident
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+        };
+        let quoted = |ident: &str| {
+            if plain(ident) {
+                ident.to_owned()
+            } else {
+                format!("\"{}\"", ident.replace('"', "\"\""))
+            }
+        };
+        self.types
+            .iter()
+            .any(|(schema, name)| format!("{}.{}", quoted(schema), quoted(name)) == spelled)
     }
 
     /// Whether a relation of this name is managed: a table, a view, or a
@@ -140,7 +177,7 @@ impl Managed {
             "pg_class" => {
                 self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
             }
-            "pg_type" => self.relations.contains(&key),
+            "pg_type" => self.relations.contains(&key) || self.types.contains(&key),
             _ => false,
         }
     }
@@ -165,7 +202,9 @@ impl Managed {
             // array type's name is only the engine's first choice, taken by
             // an earlier type of that name, so the array is the project's
             // only through its internal dependency on the row type (#1041).
-            CandidateClass::Type => self.relations.contains(&key(name)),
+            CandidateClass::Type => {
+                self.relations.contains(&key(name)) || self.types.contains(&key(name))
+            }
             // A declared overload the desired schema keeps was compiled on
             // scratch, which gives its catalog identity; one the plan drops is
             // identified from its declared signature. Only those identities
@@ -938,6 +977,53 @@ mod tests {
             &["id"],
             vec![id("pg_class", &["pg_catalog", "pg_class"], Vec::new())]
         )));
+    }
+
+    /// A declared enum or domain is a managed type: held by its name, named
+    /// by an externals file that would create it, and captured as a candidate
+    /// set. Its array type is taken through its dependency, as a relation's
+    /// is, and an undeclared type of the same name is none of these (#2407).
+    #[test]
+    fn a_declared_type_is_managed_by_its_name_alone() {
+        let mut schema = pbps_model::Schema::default();
+        schema.types.insert(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum { values: vec![] },
+        );
+        let managed = Managed::from_schema(&schema);
+        let order = crate::resolver::reconstruct::Reconstruction::new(
+            &crate::Postgres::new(),
+            &crate::resolver::reconstruct::fixture_plan(&[]),
+            &pbps_model::IdsFile::default(),
+        )
+        .unwrap();
+        let mood = id("pg_type", &["app", "mood"], Vec::new());
+        assert!(managed.holds(CandidateClass::Type, &mood, &order));
+        assert!(managed.names(&mood));
+        assert!(managed.scope().contains(&CandidateSet {
+            class: CandidateClass::Type,
+            namespace: Some("app".into()),
+            name: Some("mood".into()),
+        }));
+        // Negative: another name, another schema, and no relation.
+        for other in [
+            id("pg_type", &["app", "_mood"], Vec::new()),
+            id("pg_type", &["app", "other"], Vec::new()),
+            id("pg_type", &["ext", "mood"], Vec::new()),
+        ] {
+            assert!(
+                !managed.holds(CandidateClass::Type, &other, &order),
+                "{other:?}"
+            );
+            assert!(!managed.names(&other), "{other:?}");
+        }
+        assert!(!managed.holds(
+            CandidateClass::Relation,
+            &id("pg_class", &["app", "mood"], Vec::new()),
+            &order
+        ));
+        assert!(!managed.relation("app", "mood"));
+        assert!(!Managed::default().names(&mood));
     }
 
     /// A relation's name covers its row type and array type. An overload

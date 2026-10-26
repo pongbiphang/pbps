@@ -7830,7 +7830,8 @@ keep free peers before the complete table group, readers after it, and the
 remaining peers after those readers. The next table reads the projection
 returned by Schedule, rather than a locally spliced list. Edges also chain
 foreign keys naming late tables after the modules, and preserve the existing
-Tables, Keys, Modules and Expressions phase barriers. Only the scheduler's
+Types, Tables, Keys, Modules and Expressions phase barriers (the first is
+DEC-2407.1's). Only the scheduler's
 permutation is applied to lowering metadata; every source operation remains
 the actual typed expansion's change.
 
