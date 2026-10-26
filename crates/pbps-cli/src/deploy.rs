@@ -2563,13 +2563,14 @@ async fn baseline_state(
 )> {
     // Before the plan's transaction opens: the baseline is the database as
     // it stands, not as this apply is about to leave it.
+    // One read for both projections: the rows either one keeps.
     let managed = managed_state_full(
         conn,
         ids,
         modules,
         external,
         unmanaged,
-        &rows_to_read(scopes),
+        &rows_to_read(&pinned_scopes(scopes, as_the_apply_reads_it)),
         crate::engine::Read::Snapshot,
     )
     .await?;
@@ -4821,7 +4822,13 @@ fn refuse_pinned_movement(
                 &label_renames,
             );
         }
-        table
+        // And so do its rows (DEC-2346.2).
+        pbps_diff::enum_labels::forwarded_rows(
+            &table,
+            (&resolver, TypeSide::Desired),
+            &label_renames,
+        )
+        .unwrap_or(table)
     };
     compare(
         "",
@@ -4851,10 +4858,32 @@ fn refuse_pinned_movement(
         mode: pbps_model::DataMode::Exact,
         rows: Default::default(),
     };
+    // The rows the engine renames a label in follow this plan's label renames
+    // without a change of their own: the baseline's keys and cells are brought
+    // forward as the differ brought them (DEC-2346.2).
+    let forwarded_rows: BTreeMap<&TableName, pbps_model::TableData> = before
+        .tables
+        .iter()
+        .filter_map(|(name, was)| {
+            let forwarded = pbps_diff::enum_labels::forwarded_rows(
+                was,
+                (&resolver, TypeSide::Desired),
+                &label_renames,
+            )?;
+            Some((name, forwarded.data?))
+        })
+        .collect();
     let touched_tables = before
         .tables
         .iter()
-        .map(|(name, was)| (name, guard::Fields::of(was).data))
+        .map(|(name, was)| {
+            (
+                name,
+                forwarded_rows
+                    .get(name)
+                    .or_else(|| guard::Fields::of(was).data),
+            )
+        })
         .chain(
             after
                 .tables
@@ -7224,6 +7253,10 @@ pub fn cmd_plan_db(
         let declared_live = tables_under(&loaded.schema, &resolved.ids, &recorded_ids);
         let declared_data = declared_live.data_scopes();
         refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
+        // A key the declarations renamed a label to is held by the row under
+        // the label it had (DEC-2346.2).
+        let mut to_read = pbps_model::data::read_scopes(&recorded_data, &declared_data);
+        pbps_diff::enum_labels::read_before_the_renames(&mut to_read, &declared_live, &loaded.hints);
         let managed = managed_state_full(
             &mut conn,
             &recorded_ids,
@@ -7233,7 +7266,7 @@ pub fn cmd_plan_db(
             // differ's to refuse (DEC-1533.1).
             &pbps_diff::external_parents(&entry.snapshot.schema),
             pbps_config::Unmanaged::Ignore,
-            &pbps_model::data::read_scopes(&recorded_data, &declared_data),
+            &to_read,
             crate::engine::Read::Snapshot,
         )
         .await?;
@@ -8839,6 +8872,17 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     // database has *now* — the second projection is compared against that
     // read, so it has to ask it the same question.
     let planned_scopes = scopes_under(&plan.data, &plan.ids, &entry.snapshot.ids);
+    // The database holds the labels it has now, which a rename of this plan
+    // changes: the baseline is read under both (DEC-2346.2).
+    let held_scopes = pbps_diff::enum_labels::scopes_before_the_plan(
+        &planned_scopes,
+        &entry.snapshot.schema,
+        (
+            &TypeResolver::new(&entry.snapshot.ids, &plan.ids),
+            TypeSide::Base,
+        ),
+        &pbps_diff::enum_labels::label_renames(plan.changes.changes.iter().map(|p| &p.change)),
+    );
     let (scoped, mut before, unrevocable) = baseline_state(
         conn,
         &recorded_ids,
@@ -8847,7 +8891,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
         project.config.unmanaged,
         &pinned_scopes(&entry.snapshot.schema.data_scopes(), &planned_scopes),
         &entry.snapshot.schema,
-        &planned_scopes,
+        &held_scopes,
     )
     .await?;
     retain_managed_roles(&mut before, &plan.ids, dialect);

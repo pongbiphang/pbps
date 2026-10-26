@@ -160,11 +160,27 @@ pub fn query(
     table: &Table,
     scope: &RowScope,
 ) -> Result<Option<RowQuery>, RowsError> {
+    // No declared type is known to a table alone, so none is admitted.
+    query_in_schema(name, table, scope, &BTreeMap::new())
+}
+
+/// [`query`] with the declared types, which admit a scalar declared enum
+/// column (DEC-2346.2).
+pub fn query_in_schema(
+    name: &TableName,
+    table: &Table,
+    scope: &RowScope,
+    types: &BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
+) -> Result<Option<RowQuery>, RowsError> {
     let key = key_column(name, table)?;
+    // A scalar declared enum is read like any scalar (DEC-2346.2); every other
+    // reference keeps DEC-1523.1's refusal.
+    let is_enum =
+        |spec: &pbps_model::Column| crate::declared_enum_labels(&spec.ty, types).is_some();
     if let Some((column, spec)) = table
         .columns
         .iter()
-        .find(|(_, c)| c.ty.type_ref().is_some())
+        .find(|(_, c)| c.ty.type_ref().is_some() && !is_enum(c))
     {
         return Err(RowsError::Unreadable {
             table: name.clone(),
@@ -204,6 +220,7 @@ pub fn query(
     {
         return Ok(None);
     }
+    let key_is_enum = is_enum(key_spec);
     let requested: Vec<String> = scope
         .known()
         .iter()
@@ -330,7 +347,7 @@ pub fn query(
         let list: Vec<String> = keys.iter().map(|k| value_literal(k.as_str())).collect();
         sql.push_str(&format!(
             "\n WHERE {} IN ({})",
-            quote(key.raw())?,
+            key_operand(&quote(key.raw())?, key_is_enum),
             list.join(", ")
         ));
     }
@@ -338,6 +355,7 @@ pub fn query(
 
     let table = qualified(name)?;
     let key = quote(key.raw())?;
+    let operand = key_operand(&format!("pbps_table.{key}"), key_is_enum);
     // One scalar subquery per requested spelling rather than a join
     // against a `VALUES` list: a `VALUES` column resolves to `text`, and
     // `"id" = v.requested` on an `integer` column is then an operator that
@@ -354,7 +372,7 @@ pub fn query(
                     format!(
                         "SELECT {r} AS requested, \
                          (SELECT {} FROM {table} AS pbps_table \
-                         WHERE pbps_table.{key} = {r}) AS canonical",
+                         WHERE {operand} = {r}) AS canonical",
                         read_expr(&format!("pbps_table.{key}"))
                     )
                 })
@@ -370,6 +388,21 @@ pub fn query(
         columns,
         aliases,
     }))
+}
+
+/// What a key is compared as in a read by key. An enum key is compared as text
+/// (DEC-2346.2): the declared key may be a label this plan adds or renames,
+/// which the database does not hold yet, and the native comparison of an
+/// enum with an unknown label is an error that would abort the plan
+/// (measured on 16 and 18: `invalid input value for enum`), where as text it
+/// is no row. Writes, which run after the type's changes, keep the native
+/// comparison.
+fn key_operand(quoted: &str, is_enum: bool) -> String {
+    if is_enum {
+        read_expr(quoted)
+    } else {
+        quoted.to_owned()
+    }
 }
 
 /// The expression that renders one column as the text the state will hold.
@@ -1245,7 +1278,17 @@ pub fn spelling_queries(
     name: &TableName,
     table: &Table,
     at: &Catalogued,
+    types: &BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
 ) -> Result<Vec<SpellingQuery>, RowsError> {
+    // A declared enum's cell is one of its labels, which has one spelling and
+    // is judged by validation; asking the engine would need a type this plan
+    // may not have created yet, or a label it has yet to add (DEC-2346.2).
+    let declared_enum = |column: &str| {
+        table
+            .columns
+            .get(column)
+            .is_some_and(|c| crate::declared_enum_labels(&c.ty, types).is_some())
+    };
     let Some(data) = &table.data else {
         return Ok(Vec::new());
     };
@@ -1343,14 +1386,16 @@ pub fn spelling_queries(
     };
 
     let mut out = Vec::new();
-    let (base, ty) = ty_of(key.raw())?;
-    let keys: Vec<(RowKey, String)> = data
-        .rows
-        .keys()
-        .map(|k| (k.clone(), k.as_str().to_owned()))
-        .collect();
-    if !keys.is_empty() {
-        out.push(query(None, &base, ty, keys)?);
+    if !declared_enum(key.raw()) {
+        let (base, ty) = ty_of(key.raw())?;
+        let keys: Vec<(RowKey, String)> = data
+            .rows
+            .keys()
+            .map(|k| (k.clone(), k.as_str().to_owned()))
+            .collect();
+        if !keys.is_empty() {
+            out.push(query(None, &base, ty, keys)?);
+        }
     }
     for (column, spec) in &table.columns {
         if *column == key
@@ -1362,6 +1407,9 @@ pub fn spelling_queries(
                 pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => false,
             })
         {
+            continue;
+        }
+        if declared_enum(column.raw()) {
             continue;
         }
         let (base, ty) = ty_of(column.raw())?;
@@ -2666,7 +2714,8 @@ mod tests {
                 ],
             )],
         );
-        let queries = spelling_queries(&name(), &t, &Catalogued::default()).expect("built");
+        let queries = spelling_queries(&name(), &t, &Catalogued::default(), &Default::default())
+            .expect("built");
         let asked: Vec<Option<String>> = queries
             .iter()
             .map(|q| q.column.as_ref().map(|c| c.raw().to_owned()))
@@ -2701,7 +2750,7 @@ mod tests {
                 key_collation: Some(("app".to_owned(), "ci".to_owned())),
                 ..Catalogued::default()
             };
-            spelling_queries(&name(), &t, &at).expect("built")[0]
+            spelling_queries(&name(), &t, &at, &Default::default()).expect("built")[0]
                 .collisions
                 .clone()
                 .expect("the key groups for collisions")
@@ -3194,5 +3243,112 @@ mod tests {
             &[("id", "integer", None), ("mood", "text", None)],
         );
         assert!(query(&name(), &without, &every()).is_ok());
+    }
+
+    fn declared_mood() -> BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType> {
+        [(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum {
+                values: vec!["sad".into(), "ok".into()],
+            },
+        )]
+        .into()
+    }
+
+    /// DEC-2346.2: a scalar declared enum is read like a scalar, its key
+    /// compared as text so a label the database does not hold yet cannot
+    /// abort the read; any other reference, and any array, keeps its refusal.
+    #[test]
+    fn a_declared_enum_is_read_and_its_key_is_compared_as_text() {
+        let types = declared_mood();
+        let t = table(
+            Some(vec!["m"]),
+            &[
+                ("m", "app.mood", None),
+                ("next", "app.mood", None),
+                ("note", "text", None),
+            ],
+        );
+        let keys = RowScope::Keys(["sad".into(), "joy".into()].into());
+        let q = query_in_schema(&name(), &t, &keys, &types)
+            .expect("an enum column is readable")
+            .expect("the scope names rows");
+        assert!(
+            q.sql
+                .contains("WHERE CAST(\"m\" AS text) IN (E'joy', E'sad')"),
+            "{}",
+            q.sql
+        );
+        assert!(
+            q.aliases
+                .iter()
+                .all(|a| a.contains("CAST(pbps_table.\"m\" AS text) =")),
+            "{:?}",
+            q.aliases
+        );
+        // The cell is read as text, as every cell is.
+        assert_eq!(q.columns[0].kind, ValueKind::Text);
+
+        // Negatives: a key that is not an enum keeps its native comparison.
+        let plain = table(Some(vec!["m"]), &[("m", "text", None)]);
+        let q = query_in_schema(&name(), &plain, &keys, &types)
+            .unwrap()
+            .unwrap();
+        assert!(q.sql.contains("WHERE \"m\" IN ("), "{}", q.sql);
+        // The refusal of every other reference, and of any array, stands; so
+        // does the refusal of a table seen beside no declaration.
+        for (ty, why) in [
+            ("app.dmood", "user-defined type reference"),
+            ("ext.mood", "user-defined type reference"),
+            ("app.mood[]", "user-defined type reference"),
+            ("text[]", "array"),
+        ] {
+            let t = table(
+                Some(vec!["id"]),
+                &[("id", "integer", None), ("m", ty, None)],
+            );
+            let e = query_in_schema(&name(), &t, &every(), &types)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("`m`") && e.contains(why), "{ty}: {e}");
+        }
+        assert!(query(&name(), &t, &every()).is_err());
+    }
+
+    /// DEC-2346.2: the engine is not asked how it spells a label; the
+    /// declared list decides, and a type this plan creates has none yet.
+    #[test]
+    fn a_declared_enums_cells_and_key_are_not_asked_about() {
+        let types = declared_mood();
+        let mut t = table(
+            Some(vec!["m"]),
+            &[
+                ("m", "app.mood", None),
+                ("next", "app.mood", None),
+                ("note", "text", None),
+            ],
+        );
+        with_rows(
+            &mut t,
+            &[(
+                "sad",
+                &[
+                    ("next", Value::Text("ok".into())),
+                    ("note", Value::Text("low".into())),
+                ],
+            )],
+        );
+        let asked = |types: &BTreeMap<_, _>| {
+            spelling_queries(&name(), &t, &Catalogued::default(), types)
+                .expect("built")
+                .iter()
+                .map(|q| q.column.clone())
+                .collect::<Vec<_>>()
+        };
+        // Only the text column, which is not an enum.
+        assert_eq!(asked(&types), vec![Some("note".into())]);
+        // Without the declaration the enum columns are asked about as any
+        // reference would be (the key and the cell).
+        assert_eq!(asked(&BTreeMap::new()).len(), 3);
     }
 }

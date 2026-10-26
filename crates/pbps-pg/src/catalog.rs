@@ -2984,7 +2984,7 @@ async fn read_every_scoped_table(
             continue;
         };
         let mut observed = pbps_model::ObservedTable::default();
-        if let Some(query) = crate::rows::query(name, table, scope)? {
+        if let Some(query) = crate::rows::query_in_schema(name, table, scope, &schema.types)? {
             let read = |source| crate::rows::RowsError::Read {
                 table: name.clone(),
                 source: Box::new(source),
@@ -3650,7 +3650,7 @@ async fn ask_about_every_spelling(
     let as_declared = crate::rows::Catalogued::default();
     for (name, table) in &schema.tables {
         let at = at.get(name).unwrap_or(&as_declared);
-        for q in crate::rows::spelling_queries(name, table, at)? {
+        for q in crate::rows::spelling_queries(name, table, at, &schema.types)? {
             let read = |source| crate::rows::RowsError::Read {
                 table: name.clone(),
                 source: Box::new(source),

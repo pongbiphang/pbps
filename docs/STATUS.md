@@ -96,9 +96,10 @@ place (slice 3a, DEC-1635.6) and removed or reordered by rebuilding the enum
 under its uid (slice 3b, DEC-1635.7); a domain's checks, default and NOT NULL
 change in place (slice 4a, DEC-1635.8); base and collation changes remain
 refused by name until the domain rebuild (slice 4b). References retain the
-current eligibility gate. References are pinned at replay; retypes and row data
-over them are refused, and so are partition keys except a scalar declared enum
-as a LIST or RANGE key (#1523, DEC-1523.1, DEC-2346.1).
+current eligibility gate. References are pinned at replay; retypes are refused,
+and so are row data and partition keys over them except a scalar declared enum,
+which carries rows and keys a LIST or RANGE table (#1523, DEC-1523.1,
+DEC-2346.1, DEC-2346.2).
 
 A SQL Server table declares `system_time:`, its period and its system
 versioning into a history table that is part of it. `pull` reads a pair whose

@@ -1439,9 +1439,16 @@ pub(crate) fn diff_partial_rebuilding(
                 .iter()
                 .filter_map(|(uid, d)| base_cols.get(uid).map(|b| (d.name.clone(), b.name.clone())))
                 .collect();
+        // The observed rows as this plan's label renames leave them: the
+        // engine renames a label in the rows that hold it (DEC-2346.2).
+        let forwarded = crate::enum_labels::forwarded_rows(
+            base_table,
+            (&TypeResolver::new(base.ids, declared.ids), TypeSide::Base),
+            &crate::enum_labels::label_renames(&changes),
+        );
         diff_data(
             declared_name,
-            base_table,
+            forwarded.as_ref().unwrap_or(base_table),
             declared_table,
             &base_name_of,
             &mut changes,
@@ -12174,6 +12181,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The engine renames a label in the rows that hold it (measured on 16 and
+    /// 18), so rows that follow a label rename are no change of rows: the
+    /// observed key and cells are carried through the plan's renames before
+    /// they are compared with the declared ones (DEC-2346.2).
+    #[test]
+    fn rows_that_follow_a_label_rename_are_no_change_of_rows() {
+        use pbps_model::{DataMode, Row, RowKey, TableData, Value};
+        let mood = |labels: &[&str]| pbps_model::ManagedType::Enum {
+            values: labels.iter().map(|l| (*l).to_owned()).collect(),
+        };
+        let rows = |entries: &[(&str, &str)]| TableData {
+            mode: DataMode::Exact,
+            rows: entries
+                .iter()
+                .map(|(key, next)| {
+                    (
+                        RowKey::from(*key),
+                        Row([("next".into(), Value::Text((*next).into()))].into()),
+                    )
+                })
+                .collect(),
+        };
+        let world = |labels: &[&str], data: TableData| {
+            let mut t = table(&[
+                ("m", Column::new(ty("app.mood")).not_null()),
+                ("next", Column::new(ty("app.mood"))),
+            ]);
+            t.primary_key = Some(pbps_model::PrimaryKey {
+                name: None,
+                columns: vec!["m".into()],
+                storage_parameters: Default::default(),
+            });
+            t.data = Some(data);
+            let mut schema = schema_of("app.lookup", t);
+            schema
+                .types
+                .insert("app.mood".parse().unwrap(), mood(labels));
+            schema
+        };
+        let plan = |base: &Schema, declared: &Schema, renames: &[(&str, &str)]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &[], &ctx())
+                .unwrap()
+                .ids;
+            let hints = Hints {
+                enum_value_renames: [(
+                    "app.mood".parse().unwrap(),
+                    renames
+                        .iter()
+                        .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                        .collect(),
+                )]
+                .into(),
+                ..Default::default()
+            };
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &hints,
+            )
+        };
+        let kinds = |plan: &ChangeSet| -> Vec<String> {
+            plan.changes
+                .iter()
+                .map(|p| {
+                    format!("{:?}", p.change)
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let base = world(&["sad", "ok"], rows(&[("sad", "ok"), ("ok", "sad")]));
+        // The rename carries the key and the cell: the plan is the rename.
+        let renamed = plan(
+            &base,
+            &world(&["blue", "ok"], rows(&[("blue", "ok"), ("ok", "blue")])),
+            &[("sad", "blue")],
+        )
+        .expect("the rows follow the label");
+        assert_eq!(kinds(&renamed), ["RenameEnumValue"], "{renamed:?}");
+        // A cell that really changes is one update, from the carried value.
+        let changed = plan(
+            &base,
+            &world(&["blue", "ok"], rows(&[("blue", "ok"), ("ok", "ok")])),
+            &[("sad", "blue")],
+        )
+        .expect("one cell differs");
+        assert_eq!(
+            kinds(&changed),
+            ["RenameEnumValue", "UpdateRow"],
+            "{changed:?}"
+        );
+        let Some(Change::UpdateRow { key, columns, .. }) = changed
+            .changes
+            .iter()
+            .map(|p| &p.change)
+            .find(|c| matches!(c, Change::UpdateRow { .. }))
+        else {
+            panic!("an update: {changed:?}");
+        };
+        assert_eq!(key.as_str(), "ok");
+        let (before, after) = &columns["next"];
+        assert_eq!(
+            (before, after),
+            (
+                &pbps_model::Cell::Value(Value::Text("blue".into())),
+                &pbps_model::Cell::Value(Value::Text("ok".into()))
+            )
+        );
+        // A chain: `b` becomes `c`, then `a` becomes `b`; both rows follow.
+        let chained = plan(
+            &world(&["a", "b"], rows(&[("a", "b"), ("b", "a")])),
+            &world(&["b", "c"], rows(&[("b", "c"), ("c", "b")])),
+            &[("b", "c"), ("a", "b")],
+        )
+        .expect("a chain of renames");
+        assert!(
+            kinds(&chained).iter().all(|k| k == "RenameEnumValue"),
+            "{chained:?}"
+        );
+        // Without the rename the key is another row: an insert and a delete.
+        let labels = ["sad", "ok", "blue"];
+        let moved = plan(
+            &world(&labels, rows(&[("sad", "ok"), ("ok", "sad")])),
+            &world(&labels, rows(&[("blue", "ok"), ("ok", "sad")])),
+            &[],
+        )
+        .expect("another key");
+        let kinds_without = kinds(&moved);
+        assert!(
+            kinds_without.contains(&"InsertRow".to_owned())
+                && kinds_without.contains(&"DeleteRow".to_owned()),
+            "{kinds_without:?}"
+        );
+        // And a row over a label this plan adds is refused (DEC-2346.2).
+        let errors = plan(
+            &world(&["sad", "ok"], rows(&[("ok", "sad")])),
+            &world(&["sad", "ok", "blue"], rows(&[("ok", "blue")])),
+            &[],
+        )
+        .expect_err("a new label in a cell");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::EnumValueUse { label, .. } if label == "blue")),
+            "{errors:?}"
+        );
     }
 
     /// The move a human allowed reaches the create that moves (#1788): its

@@ -1752,6 +1752,8 @@ fn cmd_pull(
             crate::engine::Read::Snapshot,
         )
         .await?;
+        // The declared types a row's enum cell is judged against (DEC-2346.2).
+        let declared = pulled.schema.clone();
         for (name, rows) in rows {
             if let Some(table) = pulled.schema.tables.get_mut(&name) {
                 table.data = Some(pbps_model::TableData {
@@ -1774,7 +1776,7 @@ fn cmd_pull(
                 let mut problems: Vec<String> = pbps_model::data::check(&name, table);
                 problems.extend(
                     dialect
-                        .validate_table(&name, table)
+                        .validate_table_in_schema(&name, table, Default::default(), &declared)
                         .iter()
                         .map(ToString::to_string),
                 );
