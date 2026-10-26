@@ -208,6 +208,17 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
     pbps_model::operation::Operations,
 )> {
     let dialect = selected.as_ref();
+    // A type whose identity is recorded and whose declaration the base lacks
+    // is a type the target does not hold yet (a declared type is recorded when
+    // it is planned, not when it exists), and an empty apply may not claim an
+    // identity it does not hold.
+    let absent: Vec<_> = ids
+        .types
+        .values()
+        .filter(|name| !schema.types.contains_key(*name))
+        .cloned()
+        .collect();
+    let ids = &ids.without_types(&absent);
     let build = pbps_diff::diff(
         pbps_diff::Side {
             schema: &Schema::default(),
@@ -224,8 +235,11 @@ pub fn lower_from_empty<D: crate::emission::Engine>(
     )
     .map_err(|errs| {
         anyhow::anyhow!(
-            "the baseline cannot be expressed: {} problem(s)",
-            errs.len()
+            "the baseline cannot be expressed: {}",
+            errs.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
         )
     })?;
     // SQL Server has no passes of its own today.
@@ -411,13 +425,21 @@ pub async fn rehearse_in(
         )
         .map_err(|errs| {
             anyhow::anyhow!(
-                "the rehearsal produced {} inexpressible difference(s)",
-                errs.len()
+                "the rehearsal produced inexpressible differences: {}",
+                errs.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             )
         })
     };
-    let remaining = compare(&engine)?;
+    // Compared as read, the engine's deparsed text differs in nearly every
+    // declaration, and a domain's differs where the differ cannot say so as a
+    // change at all. That comparison is only the source of the respellings, so
+    // a refusal of it is not the rehearsal's: the comparison that decides
+    // follows, and still refuses.
     let (structural, spelling) = if base.respells_text() {
+        let remaining = compare(&engine).ok();
         // PostgreSQL stores a check, a default, an index predicate and a
         // module body as its parser deparses them, never as written, so a
         // textual comparison finds a difference in nearly every declaration.
@@ -428,8 +450,14 @@ pub async fn rehearse_in(
         let declared_forms = pbps_model::Declared::from_schema(&declared_here).overlay(&engine);
         let left = compare(&declared_forms)?;
         let structural = classify(&left, &declared_forms).0;
-        (structural, respelt(&remaining, &engine))
+        let mut spelling = remaining
+            .as_ref()
+            .map(|remaining| respelt(remaining, &engine))
+            .unwrap_or_default();
+        spelling.extend(domain_respellings(&declared_here, &engine));
+        (structural, spelling)
     } else {
+        let remaining = compare(&engine)?;
         classify(&remaining, &engine)
     };
     Ok(Findings {
@@ -537,6 +565,52 @@ fn clear_row_security(schema: &mut Schema) {
         table.row_security = Default::default();
         table.row_policies.clear();
     }
+}
+
+/// A domain's default and checks as the declarations wrote them and as the
+/// engine stored them, where both are there and the text differs: the part of a
+/// type's text that [`respelt`] cannot read out of a change, since the differ
+/// refuses to express a changed domain.
+fn domain_respellings(declared: &Schema, engine: &Schema) -> Vec<String> {
+    use pbps_model::ManagedType::Domain;
+    let mut lines = Vec::new();
+    for (name, wanted) in &declared.types {
+        let (
+            Domain {
+                default: wanted_default,
+                checks: wanted_checks,
+                ..
+            },
+            Some(Domain {
+                default: stored_default,
+                checks: stored_checks,
+                ..
+            }),
+        ) = (wanted, engine.types.get(name))
+        else {
+            continue;
+        };
+        if let (Some(wanted), Some(stored)) = (wanted_default, stored_default)
+            && wanted != stored
+        {
+            lines.push(format!(
+                "domain {} default: declared `{wanted}`, the engine stores `{stored}`",
+                name.shown()
+            ));
+        }
+        for (check, wanted) in wanted_checks {
+            if let Some(stored) = stored_checks.get(check)
+                && wanted != stored
+            {
+                lines.push(format!(
+                    "domain {} check {}: declared `{wanted}`, the engine stores `{stored}`",
+                    name.shown(),
+                    check.shown()
+                ));
+            }
+        }
+    }
+    lines
 }
 
 /// What the engine respelt: the declared text and the form it stored, for each
@@ -709,6 +783,80 @@ mod tests {
             definition: definition.into(),
             options: Default::default(),
         }
+    }
+
+    fn domain(default: Option<&str>, check: &str) -> pbps_model::ManagedType {
+        pbps_model::ManagedType::Domain {
+            base: "text".parse().unwrap(),
+            not_null: false,
+            default: default.map(str::to_owned),
+            checks: [("allowed".into(), check.to_owned())].into(),
+            collation: None,
+        }
+    }
+
+    /// The text of a domain the engine deparsed is a respelling to print, not
+    /// a difference to fail on; text that agrees, a domain the engine lacks and
+    /// an enum say nothing.
+    #[test]
+    fn a_domains_deparsed_text_is_reported_as_a_respelling() {
+        let name: pbps_model::TypeRef = "app.choice".parse().unwrap();
+        let mut declared = Schema::default();
+        declared
+            .types
+            .insert(name.clone(), domain(Some("'a'"), "VALUE IN ('a','b')"));
+        declared.types.insert(
+            "app.mood".parse().unwrap(),
+            pbps_model::ManagedType::Enum {
+                values: vec!["ok".into()],
+            },
+        );
+        let mut engine = Schema::default();
+        engine.types.insert(
+            name.clone(),
+            domain(
+                Some("'a'::text"),
+                "(VALUE = ANY (ARRAY['a'::text, 'b'::text]))",
+            ),
+        );
+        let lines = domain_respellings(&declared, &engine);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("default: declared `'a'`, the engine stores `'a'::text`"));
+        assert!(lines[1].contains("check allowed: declared `VALUE IN ('a','b')`"));
+        // Negative: the same text, and a type the engine does not hold.
+        let mut same = Schema::default();
+        same.types
+            .insert(name.clone(), declared.types[&name].clone());
+        assert!(domain_respellings(&declared, &same).is_empty());
+        assert!(domain_respellings(&declared, &Schema::default()).is_empty());
+    }
+
+    /// A declared type is recorded when it is planned, so the target's base can
+    /// record an identity for a type it does not hold yet. Built from empty,
+    /// that is not an identity to claim; the base builds without it.
+    #[test]
+    fn a_type_the_base_records_and_does_not_hold_does_not_stop_it_building() {
+        let pg = pbps_pg::Postgres::new();
+        let hints = pbps_model::Hints::default();
+        let name: pbps_model::TypeRef = "app.choice".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.types.insert(
+            pbps_model::Uid::generate(pbps_model::uid::UidKind::Type),
+            name.clone(),
+        );
+        assert!(lower_from_empty(&pg, &Schema::default(), &ids, &hints).is_ok());
+        // Negative: a type the base holds is built, with its identity.
+        let mut held = Schema::default();
+        held.types.insert(name, domain(None, "VALUE <> ''"));
+        let (lowered, _) = lower_from_empty(&pg, &held, &ids, &hints).unwrap();
+        assert!(
+            lowered
+                .statements()
+                .iter()
+                .any(|s| s.sql.contains("CREATE DOMAIN")),
+            "{:?}",
+            lowered.statements()
+        );
     }
 
     fn declarations() -> (Schema, IdsFile) {

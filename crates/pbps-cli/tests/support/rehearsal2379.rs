@@ -363,6 +363,17 @@ impl Fixture {
         self.d.commit();
     }
 
+    /// Declares the two rows of `app.country` with one label and a unique
+    /// constraint over it, which the rows break.
+    pub fn make_labels_unique(&self) {
+        let table = country("Japan").replace(
+            "primary_key: {name: pk_country, columns: [code]}\n",
+            "primary_key: {name: pk_country, columns: [code]}\nunique:\n  uq_label: [label]\n",
+        );
+        std::fs::write(self.d.dir.join("schema/app.country.yml"), table).unwrap();
+        self.d.commit();
+    }
+
     /// Adds a column with a default, which a kept binding could reach: the
     /// resolver is needed.
     pub fn add_column(&self, default: &str) {
@@ -674,48 +685,48 @@ pub fn shares_one_scratch(server: &str, kind: Kind) {
     }
 }
 
-/// #2312's shape: a default with `IN`, emitted ungrouped, fails at apply. The
-/// rehearsal meets it at plan time and names the statement. EXPECTED REFUSAL
-/// while #2312 is open: when the emitter groups the default, this plan
-/// converges, and this case flips to assert `Converged`.
-pub fn refuses_the_ungrouped_default_of_issue_2312(server: &str, kind: Kind) {
+/// A statement the engine rejects at apply is rejected at plan time: the
+/// rehearsal meets it, names it, and writes nothing. (This was #2312's
+/// ungrouped `IN` default until the emitter grouped it.) Two declared rows
+/// that share a label fail the unique constraint the plan adds over it.
+pub fn refuses_a_statement_the_engine_rejects(server: &str, kind: Kind) {
     let f = Fixture::new(
         server,
-        &format!("rehearse-2312-{kind:?}").to_lowercase(),
+        &format!("rehearse-reject-{kind:?}").to_lowercase(),
         kind,
         &Options::default(),
     );
-    f.add_column("'a' IN ('a','b')");
+    f.make_labels_unique();
     let prior = "prior plan 2379";
     std::fs::write(f.artifact(), prior).unwrap();
     let out = f.plan(&[]);
     assert_eq!(code(&out), 2, "{kind:?}: {}", said(&out));
     let text = said(&out);
     assert!(
-        text.contains("rejected statement 1 of the plan"),
+        text.contains("rejected statement 2 of the plan"),
         "{kind:?}: {text}"
     );
     assert!(
-        text.contains("DEFAULT 'a' IN ('a','b')"),
+        text.contains("ADD CONSTRAINT \"uq_label\" UNIQUE"),
         "{kind:?}: {text}"
     );
     assert!(
-        text.contains("syntax error at or near \"IN\""),
+        text.contains("could not create unique index"),
         "{kind:?}: {text}"
     );
     assert!(text.contains("--no-rehearse"), "{kind:?}: {text}");
     // Nothing was written, and the file the plan would have replaced is as it was.
     assert_eq!(std::fs::read_to_string(f.artifact()).unwrap(), prior);
 
-    // Negative: without the rehearsal the same plan is written, and fails
-    // only at apply, which is what the rehearsal exists to prevent.
+    // Negative: without the rehearsal the same plan is written, and apply is
+    // where the data refuses it, which is what the rehearsal moves to plan time.
     let off = f.plan(&["--no-rehearse"]);
     assert_eq!(code(&off), 0, "{kind:?}: {}", said(&off));
     assert_eq!(f.record(), serde_json::json!("off"));
-    let applied = f.apply("");
-    assert_ne!(code(&applied), 0, "{}", said(&applied));
+    let applied = f.apply("constraint,data-update");
+    assert_ne!(code(&applied), 0, "{kind:?}: {}", said(&applied));
     assert!(
-        said(&applied).contains("syntax error at or near \"IN\""),
+        said(&applied).contains("would collide under the new unique constraint"),
         "{}",
         said(&applied)
     );

@@ -1152,9 +1152,9 @@ fn the_resolver_and_the_rehearsal_share_one_scratch() {
 
 #[test]
 #[ignore = "needs live postgres and docker"]
-fn a_default_postgresql_cannot_parse_is_refused_at_plan_time_by_the_rehearsal() {
+fn a_statement_the_engine_rejects_is_refused_at_plan_time_by_the_rehearsal() {
     for kind in rehearsal2379::Kind::ALL {
-        rehearsal2379::refuses_the_ungrouped_default_of_issue_2312(&server(), kind);
+        rehearsal2379::refuses_a_statement_the_engine_rejects(&server(), kind);
     }
 }
 

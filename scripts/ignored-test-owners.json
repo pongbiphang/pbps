@@ -811,7 +811,7 @@
         "a_supplied_database_a_live_run_holds_is_refused_and_left_alone",
         "a_connected_plan_is_rehearsed_and_sealed_on_every_kind_of_scratch",
         "the_resolver_and_the_rehearsal_share_one_scratch",
-        "a_default_postgresql_cannot_parse_is_refused_at_plan_time_by_the_rehearsal",
+        "a_statement_the_engine_rejects_is_refused_at_plan_time_by_the_rehearsal",
         "both_rehearsal_switches_seal_a_plan_as_not_rehearsed",
         "a_plan_with_no_scratch_entry_selected_carries_no_rehearsal",
         "a_supplied_scratch_database_is_empty_after_every_use",
