@@ -291,6 +291,22 @@ authorization on scratch and compares the facts both engines report under the
 engine's versioned rule before it can be used. SQL Server's binding adapter is
 unimplemented (#619, #620).
 
+**Windows LocalDB as SQL Server's other instance (#2271, DEC-2271.2).** The
+driver admits a local named pipe with the current Windows user's integrated
+authentication (DEC-2271.1), and a scratch variable may name
+`Server=(localdb)\<name>;Integrated Security=SSPI`, which the engine resolves
+once per run by asking the installed `SqlLocalDB.exe` for the instance's pipe.
+The operator provides and starts the instance. The measured boundary is what
+the `resolver-localdb` job has run, as a dedicated ordinary Windows user
+against private instances of one pinned SQL Server 2025 (17.x) LocalDB
+installer: **nothing is recorded as measured yet**. Everything above is
+compiled for Windows and exercised on Linux for parsing, refusal, bounded
+helper execution and the selector rewrite only; the pipe, SSPI, TLS over it,
+the utility's real output, privileges and layout, restart timing, and which
+shared SQL Server suite cases pass on LocalDB are unmeasured until that job
+has run. A Linux target with a Windows scratch stays a named platform
+mismatch.
+
 The PostgreSQL target-input library (#612) captures actual historical bindings,
 recorded baseline, complete requested candidate sets and prerequisite properties
 on one owned snapshot. Fresh recapture compares private versioned fingerprints,

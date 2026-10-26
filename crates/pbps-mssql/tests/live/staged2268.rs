@@ -19,12 +19,7 @@ where
     let scratch = std::env::var("PBPS_TEST_MSSQL_SCRATCH_DB").unwrap();
     let name = format!("pbps2268_{tag}_{}", std::process::id());
     for server in [&target, &scratch] {
-        connect_live(server)
-            .await
-            .unwrap()
-            .execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .unwrap();
+        super::create_database_apart(server, &name).await;
     }
     let fixture = Fixture {
         target: connect_live(&format!("{target};Database={name}"))

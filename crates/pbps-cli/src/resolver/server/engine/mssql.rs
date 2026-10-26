@@ -160,6 +160,26 @@ pub(in crate::resolver::server) async fn preview<'a>(
     ))
 }
 
+/// Resolves a LocalDB selector in the scratch connection string. Discovery
+/// failures are the scratch server being unreachable, so they are the
+/// acquire failure a connection error is.
+pub(super) async fn endpoint(connection: &str) -> Result<String, ProduceError> {
+    use pbps_mssql::resolver::localdb;
+    match localdb::resolve(
+        connection,
+        localdb::helper().as_deref(),
+        pbps_db::CONNECT_TIMEOUT,
+    )
+    .await
+    {
+        Ok(None) => Ok(connection.to_owned()),
+        Ok(Some(found)) => Ok(found.connection().to_owned()),
+        Err(failure) => Err(ProduceError::Acquire(format!(
+            "the scratch server's LocalDB instance: {failure}"
+        ))),
+    }
+}
+
 fn read(error: pbps_db::DbError) -> Error {
     Error::Read(error.to_string())
 }

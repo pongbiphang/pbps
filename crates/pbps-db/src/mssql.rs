@@ -322,6 +322,109 @@ fn local_pipe(path: &str) -> Result<String, DbError> {
     Ok(path.to_owned())
 }
 
+/// A `Server=(localdb)\<instance>` selector: the instance an operator named,
+/// before anything has said where its pipe is (#2271).
+///
+/// The driver cannot open it and refuses it by name. Resolving it is not the
+/// driver's job either (LocalDB discovery belongs to `pbps-mssql`), but
+/// rewriting the string is, because only this module reads a connection string
+/// the way the driver does. So the caller learns the instance from
+/// [`LocalDbSelector::instance`], finds the pipe, and gets the string back from
+/// [`LocalDbSelector::with_pipe`]; the result is an ordinary pipe string that
+/// [`Conn::connect`] admits like any other, so a selector never skips a
+/// check.
+pub struct LocalDbSelector {
+    instance: String,
+    options: Options,
+}
+
+/// The instance only: the other settings may hold a password.
+impl std::fmt::Debug for LocalDbSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalDbSelector")
+            .field("instance", &self.instance)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A stand-in for the pipe a selector will be given: only its shape matters
+/// to the admission it is run through.
+const PLACEHOLDER_PIPE: &str = "np:\\\\.\\pipe\\LOCALDB#00000000\\tsql\\query";
+
+impl LocalDbSelector {
+    /// `Ok(None)` is a string that names no `(localdb)` server, or one this
+    /// module cannot read; opening it reports the latter by the driver's own
+    /// words. An error is a LocalDB request that cannot be honoured: a form
+    /// other than `(localdb)\<name>`, or a setting that would make the
+    /// resolved connection something other than a pipe with integrated
+    /// authentication. Both are decided before any helper runs.
+    pub fn read(connection_string: &str) -> Result<Option<Self>, DbError> {
+        Self::read_on(connection_string, cfg!(windows))
+    }
+
+    fn read_on(connection_string: &str, windows: bool) -> Result<Option<Self>, DbError> {
+        let Ok(options) = Options::parse(connection_string) else {
+            return Ok(None);
+        };
+        let Some(server) = SERVER_KEYS.iter().find_map(|key| options.get(key)) else {
+            return Ok(None);
+        };
+        let server = server.trim();
+        if !server.to_ascii_lowercase().contains("(localdb)") {
+            return Ok(None);
+        }
+        const PREFIX: &str = "(localdb)\\";
+        let instance = server
+            .get(..PREFIX.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+            .map(|_| &server[PREFIX.len()..])
+            .filter(|name| {
+                (1..=128).contains(&name.len())
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+            .ok_or_else(|| {
+                refuse(
+                    "only a named LocalDB instance is supported, `Server=(localdb)\\<name>` with \
+                     letters, digits and `_`; the shared, default and versioned forms are not",
+                )
+            })?;
+        let selector = Self {
+            instance: instance.to_owned(),
+            options,
+        };
+        Endpoint::admit(&selector.rewritten(PLACEHOLDER_PIPE)?, windows)?;
+        Ok(Some(selector))
+    }
+
+    /// The instance the connection string names.
+    #[must_use]
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// The connection string with `pipe` (`np:\\.\pipe\...`) as its server and
+    /// every other setting as it was. The pipe is held to the same local-pipe
+    /// rule as one the operator wrote.
+    pub fn with_pipe(&self, pipe: &str) -> Result<String, DbError> {
+        Ok(self.rewritten(pipe)?.canonical())
+    }
+
+    fn rewritten(&self, pipe: &str) -> Result<Options, DbError> {
+        let path = pipe
+            .get(..3)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("np:"))
+            .map(|_| &pipe[3..])
+            .ok_or_else(|| refuse("a LocalDB pipe must be written `np:\\\\.\\pipe\\<name>`"))?;
+        local_pipe(path)?;
+        let mut pairs = self.options.0.clone();
+        for key in SERVER_KEYS {
+            pairs.remove(key);
+        }
+        pairs.insert("server".to_owned(), pipe.to_owned());
+        Ok(Options(pairs))
+    }
+}
+
 /// One row as this driver hands it back.
 pub struct Row(tiberius::Row);
 
@@ -1161,5 +1264,171 @@ mod pipe_tests {
                 .is_err()
         );
         served.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod localdb_selector_tests {
+    use super::*;
+
+    const PIPE: &str = r"np:\\.\pipe\LOCALDB#ABCD1234\tsql\query";
+
+    fn read(connection: &str) -> Result<Option<LocalDbSelector>, String> {
+        LocalDbSelector::read_on(connection, true).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_named_instance_is_selected_and_keeps_every_other_setting() {
+        let selector = read(
+            r"Server=(localdb)\pbps_scratch;Integrated Security=SSPI;Encrypt=true;Database=x;TrustServerCertificate=true",
+        )
+        .unwrap()
+        .expect("a selector");
+        assert_eq!(selector.instance(), "pbps_scratch");
+        let rewritten = selector.with_pipe(PIPE).unwrap();
+        let options = Options::parse(&rewritten).unwrap();
+        assert_eq!(options.get("server"), Some(PIPE));
+        for (key, value) in [
+            ("integrated security", "SSPI"),
+            ("encrypt", "true"),
+            ("database", "x"),
+            ("trustservercertificate", "true"),
+        ] {
+            assert_eq!(options.get(key), Some(value), "{key}");
+        }
+        // The rewrite is what the driver admits, not a second reading of it.
+        assert_eq!(
+            Endpoint::admit(&options, true).unwrap(),
+            Endpoint::Pipe(PIPE[3..].to_owned())
+        );
+    }
+
+    #[test]
+    fn the_selector_may_be_spelled_with_either_server_key_and_any_case() {
+        let selector = read(r"Data Source=(LocalDB)\Inst;Integrated Security=true")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selector.instance(), "Inst");
+        // The pipe replaces the server under whichever key named it.
+        let options = Options::parse(&selector.with_pipe(PIPE).unwrap()).unwrap();
+        assert_eq!(options.get("server"), Some(PIPE));
+        assert_eq!(options.get("data source"), None);
+        // A space inside the parentheses is not the LocalDB spelling.
+        assert!(
+            read(r"server=( localdb )\x;Integrated Security=true")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_string_that_names_no_localdb_server_is_not_a_selector() {
+        for text in [
+            "Server=db,1433;User Id=sa;Password=x",
+            r"Server=np:\\.\pipe\x;Integrated Security=SSPI",
+            "Integrated Security=SSPI",
+            "",
+            // The port cannot read it, so opening it reports the driver's words.
+            "Server=(localdb)\\x;a='b",
+        ] {
+            assert!(read(text).unwrap().is_none(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_localdb_forms_are_refused_by_name_before_any_helper_runs() {
+        for text in [
+            r"Server=(localdb)\.;Integrated Security=SSPI",
+            r"Server=(localdb)\.\SHARED;Integrated Security=SSPI",
+            r"Server=(localdb)\v11.0;Integrated Security=SSPI",
+            r"Server=(localdb);Integrated Security=SSPI",
+            r"Server=(localdb)\;Integrated Security=SSPI",
+            r"Server=(localdb)\-x;Integrated Security=SSPI",
+            r"Server=(localdb)\a b;Integrated Security=SSPI",
+            r"Server=np:(localdb)\x;Integrated Security=SSPI",
+            r"Server=tcp:(localdb)\x;Integrated Security=SSPI",
+            r"Server=host\(localdb)\x;Integrated Security=SSPI",
+        ] {
+            let why = read(text).unwrap_err();
+            assert!(why.contains("named LocalDB instance"), "{text}: {why}");
+        }
+        let long = format!(
+            r"Server=(localdb)\{};Integrated Security=SSPI",
+            "a".repeat(129)
+        );
+        assert!(read(&long).is_err());
+    }
+
+    #[test]
+    fn a_selector_without_integrated_authentication_or_with_credentials_is_refused() {
+        for (text, needle) in [
+            (r"Server=(localdb)\x", "requires `Integrated Security=SSPI`"),
+            (
+                r"Server=(localdb)\x;Integrated Security=false",
+                "requires `Integrated Security=SSPI`",
+            ),
+            (
+                r"Server=(localdb)\x;Integrated Security=SSPI;User Id=sa;Password=p@ss",
+                "cannot be combined",
+            ),
+            (
+                r"Server=(localdb)\x;Trusted_Connection=yes",
+                "does not read `Trusted_Connection`",
+            ),
+        ] {
+            let why = read(text).unwrap_err();
+            assert!(why.contains(needle), "{text}: {why}");
+            assert!(!why.contains("p@ss"), "a refusal repeated a secret: {why}");
+        }
+    }
+
+    #[test]
+    fn a_selector_is_refused_off_windows_without_naming_a_host() {
+        let why = LocalDbSelector::read_on(r"Server=(localdb)\x;Integrated Security=SSPI", false)
+            .expect_err("refused")
+            .to_string();
+        assert!(why.contains("only available on Windows"), "{why}");
+    }
+
+    #[test]
+    fn only_a_local_pipe_can_stand_in_for_the_selector() {
+        let selector = read(r"Server=(localdb)\x;Integrated Security=SSPI")
+            .unwrap()
+            .unwrap();
+        for pipe in [
+            r"\\.\pipe\LOCALDB#1\tsql\query",
+            r"np:\\host\pipe\x",
+            r"np:\\.\pipe\..\x",
+            r"np:\\.\pipe\a;Integrated Security=false",
+            "tcp:host,1433",
+            "",
+        ] {
+            assert!(selector.with_pipe(pipe).is_err(), "{pipe:?}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_containing_quotes_cannot_add_a_setting() {
+        // The alphabet has no quote or semicolon, so the rewrite cannot be
+        // made to carry a second setting past admission.
+        let selector = read(r"Server=(localdb)\x;Integrated Security=SSPI")
+            .unwrap()
+            .unwrap();
+        assert!(
+            selector
+                .with_pipe(r"np:\\.\pipe\a';Encrypt=off;b='")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_selector_never_prints_the_settings_it_holds() {
+        let selector =
+            read(r"Server=(localdb)\x;Integrated Security=SSPI;Description=kept-private")
+                .unwrap()
+                .unwrap();
+        let shown = format!("{selector:?}");
+        assert!(shown.contains("\"x\""), "{shown}");
+        assert!(!shown.contains("kept-private"), "{shown}");
     }
 }

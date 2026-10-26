@@ -1,7 +1,7 @@
 //! SQL Server's acquisition boundary, exercised through the shared producer.
 
 use super::super::{BindingRequest, Error, ProduceError};
-use super::fixtures::{ENVIRONMENT, ProjectKey};
+use super::fixtures::{ENVIRONMENT, KEY_LINE, ProjectKey};
 use super::{Provenance, Standard};
 use pbps_db::{Conn, Driver};
 use pbps_model::{Hints, IdsFile, Schema};
@@ -14,14 +14,14 @@ mod catalog_cases {
     ));
 }
 
-fn provenance() -> Provenance {
+pub(super) fn provenance() -> Provenance {
     Provenance {
         same_instance: pbps_model::resolver::SameInstance::Refused,
         ..Provenance::server()
     }
 }
 
-fn server(variable: &str) -> String {
+pub(super) fn server(variable: &str) -> String {
     std::env::var(variable)
         .unwrap_or_else(|_| panic!("{variable} must name the owned SQL Server resolver fixture"))
 }
@@ -71,11 +71,27 @@ async fn mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_s
     .unwrap();
     assert!(entered.is_dbo());
     assert!(sql::marked(&mut compile, &marker).await.unwrap());
-    // The ordinary check must still reject dbo's extra DENY ONLY entries.
-    assert!(
+    // dbo carries extra DENY ONLY entries (dbo, db_owner) into master,
+    // tempdb and msdb only when the scratch's owner also owns them, as sa does
+    // on the Linux fixtures. A LocalDB scratch's Windows owner does not, and
+    // its token there is guest and public alone (measured on 17.0). Where the
+    // extras exist, the ordinary check must still reject them.
+    let owns_system = owner
+        .query(&format!(
+            "SELECT COUNT(*) AS n FROM sys.databases s JOIN sys.databases d \
+             ON d.owner_sid = s.owner_sid WHERE s.name = N'{name}' \
+             AND d.name IN (N'master', N'tempdb', N'msdb');"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        != Some(0);
+    assert_eq!(
         sql::sandbox_checks(&mut compile, &databases, &name)
             .await
-            .is_err()
+            .is_err(),
+        owns_system
     );
     compile
         .execute("CREATE TABLE dbo.compiled2267(i int);")
@@ -112,13 +128,16 @@ async fn mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_s
     drop_database(&source, &name).await;
 }
 
-async fn connection(url: &str) -> Conn {
+pub(super) async fn connection(url: &str) -> Conn {
     Conn::connect(Driver::Mssql, url).await.unwrap()
 }
 
 // Repeated acquisitions inside nested Docker fixtures otherwise copy their
 // futures into a debug poll frame that exhausts the default test-thread stack.
-fn refusal<'a>(target: &'a str, scratch: &'a str) -> impl Future<Output = ProduceError> + 'a {
+pub(super) fn refusal<'a>(
+    target: &'a str,
+    scratch: &'a str,
+) -> impl Future<Output = ProduceError> + 'a {
     Box::pin(refusal_inner(target, scratch))
 }
 
@@ -130,7 +149,7 @@ async fn refusal_file_inner(target: &str, scratch: &str, externals: Option<&str>
     refusal_policy_inner(target, scratch, externals, &provenance()).await
 }
 
-async fn refusal_policy_inner(
+pub(super) async fn refusal_policy_inner(
     target: &str,
     scratch: &str,
     externals: Option<&str>,
@@ -161,11 +180,12 @@ async fn declared_refusal(
     let mut target_session = connection(target).await;
     let identity = sql::cluster_identity(&mut target_session).await.unwrap();
     let mut key = ProjectKey::new(true);
-    let config = "dialect: mssql\nenvironments:\n  fixture:\n    url_env: PBPS_2236_UNUSED\n    \
-        fingerprint_key_file: key\n";
+    let config = format!(
+        "dialect: mssql\nenvironments:\n  fixture:\n    url_env: PBPS_2236_UNUSED\n{KEY_LINE}"
+    );
     let path = key.project.root.join("pbps.yml");
-    std::fs::write(&path, config).unwrap();
-    key.project.config = pbps_config::Config::parse(config, &path).unwrap();
+    std::fs::write(&path, &config).unwrap();
+    key.project.config = pbps_config::Config::parse(&config, &path).unwrap();
     let ids = |schema: &Schema| {
         pbps_diff::resolve(
             schema,
@@ -230,7 +250,7 @@ async fn declared_refusal(
     }
 }
 
-async fn create_database(url: &str) -> (String, String) {
+pub(super) async fn create_database(url: &str) -> (String, String) {
     let name = format!("pbps2236_{:032x}", rand::random::<u128>());
     connection(url)
         .await
@@ -248,7 +268,7 @@ async fn create_database(url: &str) -> (String, String) {
     (name, on)
 }
 
-async fn drop_database(url: &str, name: &str) {
+pub(super) async fn drop_database(url: &str, name: &str) {
     connection(url)
         .await
         .execute(&format!(

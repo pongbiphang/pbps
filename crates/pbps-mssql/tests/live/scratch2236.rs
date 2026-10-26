@@ -54,9 +54,17 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
     let name = format!("pbps2236_model_measure_{}", std::process::id());
     for (column, change, restore) in cases {
         let mut changed = false;
+        // A case states one direction. Where model already holds the changed
+        // value (LocalDB's model is SIMPLE recovery, a container's is FULL),
+        // the other direction is the change and the stated one restores it.
+        let mut swapped = false;
         let outcome: Result<_, pbps_db::DbError> = async {
             conn.execute(&change).await?;
             changed = true;
+            if model_row(&mut conn).await == original {
+                conn.execute(&restore).await?;
+                swapped = true;
+            }
             let reference = options::supplied_reference(&mut conn).await;
             conn.execute(&format!("CREATE DATABASE [{name}];")).await?;
             let actual = options::read(&mut conn, &name).await?;
@@ -71,7 +79,7 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
             ))
             .await;
         let restoration = if changed {
-            conn.execute(&restore).await
+            conn.execute(if swapped { &change } else { &restore }).await
         } else {
             Ok(())
         };
@@ -117,6 +125,101 @@ async fn model_inheritance_is_measured_and_read_only_model_refuses_with_its_reme
         }
     }
     assert!(options::supplied_reference(&mut conn).await.is_ok());
+}
+
+/// Express (and LocalDB, which is Express) creates every database with
+/// AUTO_CLOSE ON whatever model says, so a supplied scratch's reference must
+/// predict it; a prediction from model alone refuses every fresh database.
+#[tokio::test]
+#[ignore = "needs a second live SQL Server; set PBPS_TEST_EXPRESS_DB (see scripts/live-tests.sh)"]
+async fn an_express_supplied_reference_predicts_a_fresh_database_exactly() {
+    let express = std::env::var("PBPS_TEST_EXPRESS_DB").expect(
+        "PBPS_TEST_EXPRESS_DB is not set; this test needs the Express server scripts/live-tests.sh starts",
+    );
+    let mut conn = connect_live(&express).await.unwrap();
+    let name = format!("pbps2377_express_{}", std::process::id());
+    let reference = options::supplied_reference(&mut conn).await.unwrap();
+    conn.execute(&format!("CREATE DATABASE [{name}];"))
+        .await
+        .unwrap();
+    // Acquisition reads the options from inside the database. Idle, Express
+    // closes it and reports it cleanly shut down (measured), which describes
+    // that moment, not the database.
+    let inside = connect_live(&format!("{express};Database={name}")).await;
+    let actual = options::read(&mut conn, &name).await;
+    drop(inside);
+    conn.execute(&format!(
+        "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+    ))
+    .await
+    .unwrap();
+    let actual = actual.unwrap();
+    assert_eq!(
+        options::differences(&actual, &reference),
+        Vec::<String>::new()
+    );
+    // The edition rule is what made it match: model itself says OFF.
+    assert_eq!(model_row(&mut conn).await["is_auto_close_on"], false);
+}
+
+/// The run-owned reference is created and read on one connection. Express
+/// can close it in between (CI run 40219619692 refused its own fresh scratch
+/// this way), so the read must not depend on how fast that happens: this
+/// waits until the database is closed and still expects the open values.
+#[tokio::test]
+#[ignore = "needs a second live SQL Server; set PBPS_TEST_EXPRESS_DB (see scripts/live-tests.sh)"]
+async fn an_express_database_closed_before_its_read_still_reads_as_open() {
+    let express = std::env::var("PBPS_TEST_EXPRESS_DB").expect(
+        "PBPS_TEST_EXPRESS_DB is not set; this test needs the Express server scripts/live-tests.sh starts",
+    );
+    let mut conn = connect_live(&express).await.unwrap();
+    let closed = format!("pbps2377_closed_{}", std::process::id());
+    let open = format!("pbps2377_open_{}", std::process::id());
+    conn.execute(&format!(
+        "CREATE DATABASE [{closed}]; CREATE DATABASE [{open}];"
+    ))
+    .await
+    .unwrap();
+    let inside = connect_live(&format!("{express};Database={open}")).await;
+    let shut = format!(
+        "SELECT CONVERT(int, is_cleanly_shutdown) AS shut FROM sys.databases WHERE name = N'{closed}';"
+    );
+    let mut waited = 0;
+    while waited < 120
+        && conn.query(&shut).await.unwrap()[0]
+            .try_get::<i32>("shut")
+            .unwrap()
+            != Some(1)
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        waited += 1;
+    }
+    let outside = options::read(&mut conn, &closed).await;
+    let read = options::read_inside(&mut conn, &closed).await;
+    let expected = options::read(&mut conn, &open).await;
+    let home = conn.query("SELECT DB_NAME() AS name;").await.unwrap()[0]
+        .try_get::<&str>("name")
+        .unwrap()
+        .map(str::to_owned);
+    drop(inside);
+    for name in [&closed, &open] {
+        conn.execute(&format!(
+            "ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{name}];"
+        ))
+        .await
+        .unwrap();
+    }
+    assert!(waited < 120, "the idle database never closed");
+    let (outside, read, expected) = (outside.unwrap(), read.unwrap(), expected.unwrap());
+    // Negative: from outside, the closed row is what refused the scratch.
+    assert!(
+        options::differences(&outside, &expected).contains(&"is_cleanly_shutdown".to_owned()),
+        "{:?}",
+        options::differences(&outside, &expected)
+    );
+    assert_eq!(options::differences(&read, &expected), Vec::<String>::new());
+    // The session is back where it started, so the drop above could run.
+    assert_eq!(home.as_deref(), Some("master"));
 }
 
 #[tokio::test]
@@ -246,7 +349,34 @@ async fn supplied_options_compare_every_column_and_allow_log_backup_status() {
         "{:?}",
         options::differences(&actual, &reference)
     );
-    let backup = format!("/tmp/{}.bak", db.name);
+    // The server's own data directory exists and is writable on every
+    // platform; `/tmp` does not exist on Windows (LocalDB).
+    let directory = db
+        .conn
+        .query("SELECT CONVERT(nvarchar(4000), SERVERPROPERTY('InstanceDefaultDataPath')) AS d;")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("d")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let backup = format!("{directory}{}.bak", db.name);
+    // A FULL-recovery model makes the database's own FULL a no-op. Where model
+    // is SIMPLE (LocalDB), the recovery columns are the expected difference.
+    let model = db
+        .conn
+        .query("SELECT recovery_model_desc AS r FROM sys.databases WHERE name = N'model';")
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("r")
+        .unwrap()
+        .unwrap()
+        .to_owned();
+    let recovery: Vec<String> = if model == "FULL" {
+        Vec::new()
+    } else {
+        vec!["recovery_model".into(), "recovery_model_desc".into()]
+    };
     db.conn
         .execute(&format!(
             "ALTER DATABASE [{}] SET RECOVERY FULL; BACKUP DATABASE [{}] TO DISK=N'{backup}' \
@@ -277,16 +407,15 @@ async fn supplied_options_compare_every_column_and_allow_log_backup_status() {
         state[0].try_get::<&str>("log_reuse_wait_desc").unwrap(),
         Some("LOG_BACKUP")
     );
-    assert!(options::differences(&waiting, &reference).is_empty());
+    assert_eq!(options::differences(&waiting, &reference), recovery);
     db.conn
         .execute(&format!("ALTER DATABASE [{}] SET AUTO_SHRINK ON;", db.name))
         .await
         .unwrap();
     let changed = options::read(&mut db.conn, &db.name).await.unwrap();
-    assert_eq!(
-        options::differences(&changed, &reference),
-        ["is_auto_shrink_on"]
-    );
+    let mut shrink = vec!["is_auto_shrink_on".to_owned()];
+    shrink.extend(recovery);
+    assert_eq!(options::differences(&changed, &reference), shrink);
     db.drop().await;
 }
 
@@ -552,19 +681,26 @@ async fn failed_database_creation_and_failed_reference_reads_release_every_recor
         ))
         .await
         .unwrap();
+    // The options are read inside the new reference, where its creator is
+    // dbo and no database deny applies. A server-scoped view's deny is kept
+    // in master (4629 elsewhere, measured) and fails the read after CREATE
+    // DATABASE, the moment this case is about.
+    admin
+        .execute(&format!(
+            "CREATE USER [{login}] FOR LOGIN [{login}]; \
+             DENY SELECT ON sys.database_recovery_status TO [{login}];"
+        ))
+        .await
+        .unwrap();
     db.conn
         .execute(&format!(
             "CREATE USER [{login}] FOR LOGIN [{login}]; ALTER ROLE db_owner ADD MEMBER \
-             [{login}]; DENY SELECT ON sys.all_columns TO public; EXECUTE AS \
-             LOGIN=N'{login}';"
+             [{login}]; EXECUTE AS LOGIN=N'{login}';"
         ))
         .await
         .unwrap();
     let reference = pbps_mssql::resolver::fresh_reference(&mut db.conn, &names).await;
-    db.conn
-        .execute("REVERT; REVOKE SELECT ON sys.all_columns FROM public;")
-        .await
-        .unwrap();
+    db.conn.execute("REVERT;").await.unwrap();
     let remaining = admin
         .query(&format!(
             "SELECT DB_ID(N'{}') AS database_id;",
@@ -574,10 +710,15 @@ async fn failed_database_creation_and_failed_reference_reads_release_every_recor
         .unwrap();
     db.drop().await;
     admin
-        .execute(&format!("DROP LOGIN [{login}];"))
+        .execute(&format!("DROP USER [{login}]; DROP LOGIN [{login}];"))
         .await
         .unwrap();
-    assert!(reference.unwrap_err().to_string().contains("all_columns"));
+    assert!(
+        reference
+            .unwrap_err()
+            .to_string()
+            .contains("database_recovery_status")
+    );
     assert_eq!(remaining[0].try_get::<i32>("database_id").unwrap(), None);
 }
 
@@ -846,6 +987,29 @@ async fn system_database_permissions_follow_fixed_rules_and_restore_each_change(
     }
 }
 
+/// Refusals of a catalog case's statement by an installation that lacks the
+/// feature, measured on LocalDB and on the Express container: 39020, Advanced
+/// Analytics Extensions not installed; 15707, automatic tuning needs
+/// Enterprise; 9982, no full-text search in a LocalDB user instance.
+const UNAVAILABLE: &[&str] = &["39020", "15707", "9982"];
+
+/// Whether the engine reports the default FILESTREAM row for the current
+/// database on an instance whose FILESTREAM level is 0.
+async fn filestream_unrecorded(conn: &mut pbps_db::Conn) -> bool {
+    let rows = conn
+        .query(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.database_filestream_options \
+             WHERE database_id = DB_ID() AND non_transacted_access = 0 \
+             AND directory_name IS NULL) \
+             AND CONVERT(int, SERVERPROPERTY('FilestreamEffectiveLevel')) = 0 \
+             AND CONVERT(int, SERVERPROPERTY('FilestreamConfiguredLevel')) = 0 \
+             THEN 1 ELSE 0 END AS unrecorded;",
+        )
+        .await
+        .unwrap();
+    rows[0].try_get::<i32>("unrecorded").unwrap() == Some(1)
+}
+
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner() {
@@ -859,8 +1023,21 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         )
         .await
         .unwrap();
+    let mut refused = Vec::new();
     for (expected, create) in cases.restore {
-        db.conn.execute(&create).await.unwrap();
+        if let Err(error) = db.conn.execute(&create).await {
+            // An installation that cannot create the object cannot leave its
+            // catalog dirty; only these measured refusals are accepted.
+            // Any other refusal is collected, so one run reports them all.
+            let code = error.server_error_code();
+            if !code
+                .as_deref()
+                .is_some_and(|code| UNAVAILABLE.contains(&code))
+            {
+                refused.push(format!("{expected}: {error}"));
+            }
+            continue;
+        }
         let names = inventory::read(&mut db.conn, Some("catalog_owner"))
             .await
             .unwrap()
@@ -870,6 +1047,16 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
         let fresh = inventory::read(&mut db.conn, Some("catalog_owner"))
             .await
             .unwrap();
+        // An instance without FILESTREAM (LocalDB: configured and effective
+        // level 0) accepts the setting and records nothing: the engine reports
+        // the default row, so the database is fresh and nothing is hidden
+        // (measured on the Windows job). Only that exact report is accepted.
+        if !found
+            && expected == "database FILESTREAM options"
+            && filestream_unrecorded(&mut db.conn).await
+        {
+            continue;
+        }
         // Restore the owned fixture before asserting either half of the contract.
         if !found || cleanup.is_err() || !fresh.is_empty() {
             db.conn.execute("REVERT;").await.unwrap();
@@ -879,6 +1066,11 @@ async fn independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_o
                 fresh.names()
             );
         }
+    }
+    if !refused.is_empty() {
+        db.conn.execute("REVERT;").await.unwrap();
+        db.drop().await;
+        panic!("refused outside UNAVAILABLE:\n{}", refused.join("\n"));
     }
     let mut denied_reads = Vec::new();
     for catalog in [

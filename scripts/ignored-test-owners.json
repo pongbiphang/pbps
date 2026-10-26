@@ -22,6 +22,37 @@
       "fixture": "Two pinned SQL Server instances with one build and collation; the configured resolver Docker image.",
       "job": "resolver-mssql"
     },
+    "localdb": {
+      "platform": "win32",
+      "fixture": "Three private SQL Server 2025 LocalDB instances created by a dedicated ordinary Windows user from one pinned installer.",
+      "job": "resolver-localdb",
+      "script": "scripts/localdb_qualify.py",
+      "selection": {
+        "kind": "calls",
+        "file": "scripts/localdb_qualify.py",
+        "scope": "main",
+        "callee": "run_case",
+        "argument": 1
+      },
+      "witnesses": [
+        {
+          "file": "scripts/localdb_qualify.py",
+          "language": "python",
+          "scope": "<module>",
+          "requires": [
+            "main()"
+          ]
+        },
+        {
+          "file": "scripts/localdb_qualify.py",
+          "language": "python",
+          "scope": "main",
+          "requires": [
+            "raise RuntimeError(\"no qualification case ran\")"
+          ]
+        }
+      ]
+    },
     "editions": {
       "platform": "linux",
       "fixture": "Pinned SQL Server Developer and case-sensitive Express instances.",
@@ -1112,6 +1143,8 @@
       ],
       "cases": [
         "binding619::a_global_temporary_table_marks_one_instance_to_every_login_on_it",
+        "scratch2236::an_express_supplied_reference_predicts_a_fresh_database_exactly",
+        "scratch2236::an_express_database_closed_before_its_read_still_reads_as_open",
         "resolver_tests::editions611::a_real_express_target_is_an_edition_limitation_and_its_server_collation_a_mismatch"
       ]
     },
@@ -2318,6 +2351,21 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes"]
+    },
+    {
+      "target": ["pbps-cli", "lib", "pbps_cli"],
+      "owner": "localdb",
+      "validate_on": "win32",
+      "ignored_on": ["win32"],
+      "cases": [
+        "resolver::server::scratch::localdb_live_tests::localdb2271_two_instances_are_distinct_live_instances_of_one_build_run_as_the_dedicated_user",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_a_windows_owners_dbo_token_adds_only_deny_only_windows_groups",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_a_selector_run_reaches_reconstruction_and_leaves_both_instances_clean",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_the_marker_separates_instances_and_same_instance_controls_hold",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_the_requested_certificate_policy_is_kept_over_the_pipe",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_a_missing_or_stopped_instance_fails_by_name_within_the_bound",
+        "resolver::server::scratch::localdb_live_tests::localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifies"
+      ]
     }
   ]
 }

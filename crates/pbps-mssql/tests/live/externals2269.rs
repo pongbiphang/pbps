@@ -25,12 +25,7 @@ where
     let scratch_url = std::env::var("PBPS_TEST_MSSQL_SCRATCH_DB").unwrap();
     let name = format!("pbps2269_{tag}_{}", std::process::id());
     for server in [&target, &scratch_url] {
-        connect_live(server)
-            .await
-            .unwrap()
-            .execute(&format!("CREATE DATABASE [{name}];"))
-            .await
-            .unwrap();
+        super::create_database_apart(server, &name).await;
     }
     let url = format!("{scratch_url};Database={name}");
     let mut scratch_conn = connect_live(&url).await.unwrap();

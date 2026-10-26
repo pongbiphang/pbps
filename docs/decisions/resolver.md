@@ -4546,3 +4546,120 @@ a schema of its own, an undeclared external type, a label added, an enum
 rebuilt; each plans, seals, applies and re-plans clean), the `reconstruct`,
 `type_ownership`, `draft`, `externals`, `assess` and `transitions` unit tests,
 and the `projection` and `ownership` tests of the model.
+<a id="dec-2271-2"></a>
+
+**DEC-2271.2. A Windows LocalDB instance is the SQL Server resolver's other
+instance by discovery: the operator provides and starts it, the engine finds
+its pipe once per run, and the ordinary driver does the rest (#2271).**
+LocalDB accepts only a named pipe whose name changes at every start, so a
+connection string can name the instance but never its endpoint.
+- **Selector.** The scratch server's variable holds
+  `Server=(localdb)\<name>;Integrated Security=SSPI;...`, under the existing
+  `kind: server` entry. Only a named instance is accepted (letters, digits and
+  `_`); the default, shared and versioned forms are refused by name rather than
+  guessed. The target's connection never takes a selector: the driver still
+  refuses `(localdb)` (DEC-2271.1).
+- **Discovery** (`pbps_mssql::resolver::localdb`). It runs
+  `SqlLocalDB.exe info <name>` once (and `info` alone only when no pipe is printed, below): a fixed path in the qualified major's
+  directory (`170`), not a `PATH` search; no shell; the name as one argument;
+  no SQL, credential or target string; output capped at 16 KiB; one deadline
+  (`CONNECT_TIMEOUT`); a helper that overruns either is killed. Only a pipe is
+  read from the output (`np:\\.\pipe\LOCALDB#<hex>\tsql\query`), because every
+  label in front of it is translated. The outcomes stay apart: a selected
+  instance, a resolved endpoint, and one failure per fact (not installed, would
+  not start, timed out, too much output, the helper's error, no pipe because
+  the instance is stopped, two pipes, a pipe of another shape). No pipe is a
+  failure, never an empty result, and nothing is retried: a retry would guess
+  at an instance state nobody has measured. Instances are never created,
+  started or stopped.
+- **Rewriting is the driver's.** `pbps_db::LocalDbSelector` reads the selector
+  with the same reader admission uses and returns the string with the pipe for
+  its server, in the canonical spelling. `pbps-mssql` therefore parses no
+  connection string, and the result is admitted by `Conn::connect` like any
+  pipe string: a selector skips no check. A selector that could never become a
+  valid pipe string (no integrated authentication, a credential, off Windows)
+  is refused before the helper runs.
+- **One endpoint per run.** `produce_unsealed` resolves the selector once,
+  before the first scratch connection, and every connection of the run (setup,
+  externals, compile, cleanup) opens that string. An instance restart or a
+  vanished pipe therefore fails the next open, and a restarted instance has
+  lost the marker (`tempdb`), which every connection checks. The run is
+  invalid; it never rediscovers and continues, and cleanup on a different
+  instance is never authorized. A new invocation discovers again and
+  qualifies from the start.
+- **Layouts.** Unchanged and unforced. Which one the dedicated user's
+  privileges select is reported by the Windows job, which qualifies whichever
+  it is.
+- **The job** (`resolver-localdb`, `scripts/localdb_qualify.py`). A pinned
+  SQL Server 2025 (17.x) LocalDB installer, checked by SHA-256; a dedicated
+  ordinary Windows user; three private instances (a target, a scratch and a
+  disposable one for the cases that stop and restart an instance). It runs
+  on pull requests as well as the merge group, so it adds no omission to
+  DEC-1835.1's set. A failed install or discovery, a case that did not run
+  (libtest passes a filter that selects nothing, so each run is held to the
+  cases it listed), a timeout and a skip all fail it.
+- **TLS (measured, maintainer decision 2026-10-25).** LocalDB 17.0.4025.3
+  offers no encryption on its pipe: a string that requires it fails with
+  "Server does not allow the requested encryption level", and `Encrypt=false`
+  still asks for an encrypted login, so the server drops the pipe (os error
+  233). pbps keeps its rule that an omitted `Encrypt` means required and that
+  nothing is ever downgraded, so a LocalDB selector names the driver's no-TLS
+  spelling, `Encrypt=DANGER_PLAINTEXT`, explicitly. The traffic stays on a
+  local pipe and the login is SSPI, with no password on the wire. pbps never
+  writes that setting for the operator.
+- **Windows groups in the owner's token (measured, maintainer decision
+  2026-10-25).** As dbo of a database a Windows login owns, `sys.login_token`
+  also lists that login's Windows groups, such as `\\Everyone`, all DENY ONLY.
+  A DENY ONLY entry can only subtract reach, so the scratch check admits a
+  `WINDOWS GROUP` entry exactly when it is DENY ONLY. A GRANT-capable group,
+  another login and every other kind still refuse. The LocalDB job prints the
+  whole token it measured.
+- **Express creates databases with AUTO_CLOSE ON (measured on 17.0.4075.5).**
+  Whatever model says, CREATE DATABASE on EngineEdition 4 sets AUTO_CLOSE
+  ON, and LocalDB is that edition. A supplied scratch's reference therefore
+  predicts `is_auto_close_on` true there. Predicting from model alone refused
+  every fresh LocalDB database. Every other `sys.databases` column of a fresh
+  Express database matched the existing prediction. Idle, an AUTO_CLOSE
+  database reports `is_cleanly_shutdown` 1, but acquisition reads the
+  options from inside the database, where it is 0.
+- **The run-owned reference is read from inside it too.** A closed Express
+  database also reports NULL for most option columns. The reference was
+  created and then read from master, and Express closed it in between: the
+  Windows job refused its own fresh scratch on nine of those columns. Both
+  sides of the comparison now read from inside, so the result no longer
+  depends on how soon the engine closes an idle database.
+- **A missing instance is told from a stopped one (measured on the Windows
+  job).** The 17.x helper answers `info <name>` for an instance that does not
+  exist with a success status and no pipe, the same answer as for a stopped
+  one. Only when no pipe is printed, discovery runs `info` once more and reads
+  the instance list. Names are the one part of that output no display
+  language translates. An unlisted name fails as missing, with the create
+  remedy. A listed one fails as stopped, with the start remedy. Both runs
+  share the one deadline.
+- **Not widened.** The platform comparison is unchanged: a Linux target with a
+  Windows LocalDB scratch stays a named platform mismatch, and major 16 is not
+  admitted. Edition differences remain recorded limitations (§9).
+
+Rejected:
+- **Native discovery through a wrapper of the LocalDB API.** It would avoid
+  reading utility output but adds a dependency and a DLL-loading obligation
+  that nothing shows is needed; the output is read for one language-independent
+  token. Revisit it if the Windows job shows the utility's output is not
+  reliable.
+- **Discovery inside the driver.** Keeps the helper out of `pbps-mssql`'s
+  boundary and makes the driver spawn processes.
+- **Resolving before every connection.** A restarted instance would be
+  silently continued under evidence from the old one.
+- **Rewriting the string in `pbps-mssql`.** A second reader of the connection
+  string is the disagreement DEC-2271.1 closed.
+
+Pinned by `localdb::tests` (output reading, bounded and terminated helper,
+no-instance and unsupported-form refusals) and `localdb_selector_tests` on
+every platform, `resolver::server::tests` for the producer's endpoint, and by
+the `localdb2271_*` cases and the shared SQL Server suites in the Windows job.
+**Unmeasured until that job has run:** the utility's real output and exit
+codes, the install path of its tools, whether the installer property and
+silent flags are as written, the dedicated user's privileges and so the layout
+chosen, SSPI over the pipe, every instance
+restart timing, and which of the shared suites' cases pass on LocalDB. Nothing
+in this entry was run on Windows by the machine that wrote it.

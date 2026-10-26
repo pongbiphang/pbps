@@ -144,6 +144,7 @@ jobs:
       - run: python3 scripts/ci_gate_verdict_test.py
       - run: python3 scripts/ci_release_scope_test.py
       - run: python3 scripts/pr_size_test.py
+      - run: python3 scripts/localdb_qualify_test.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -360,11 +361,36 @@ jobs:
       - name: the SQL Server resolver fixtures and live regressions
         run: |
           source scripts/resolver-mssql-fixtures.sh
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236
+          # The Express cases need the edition job's second server.
+          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 \
+            --skip an_express_supplied_reference_predicts_a_fresh_database_exactly \
+            --skip an_express_database_closed_before_its_read_still_reads_as_open
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 externals2269
           cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests
+
+  # LocalDB is a per-user Windows instance that accepts only a named pipe and
+  # integrated authentication, so no Linux job can qualify it as the resolver's
+  # other instance (#2271). The job installs the pinned installer, creates a
+  # dedicated ordinary user and three private instances, and runs the cases
+  # as that user (DEC-2271.2). It runs on pull requests too, so the Windows
+  # route cannot be the one thing a pull request is never asked about; an
+  # installer, discovery or instance failure, a case that did not run, a
+  # timeout and a skip all fail it, and nothing here is `continue-on-error`.
+  resolver-localdb:
+    needs: [approve, lint]
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 scripts/localdb_qualify.py
 
   # The SQL Server TLS fixture starts its own disposable SQL Server (3 GiB
   # limit). Run in `live`, it sat beside that job's service container: two SQL
@@ -453,15 +479,18 @@ jobs:
             -e "MSSQL_SA_PASSWORD=Pbps!Ci12345" -p 14331:1433 "$IMAGE" >/dev/null
           await pbps-ci-mssql-express Latin1_General_100_CS_AS
       # A name filter that matches nothing passes with zero tests, so the run
-      # is required to have run the two tests this job exists for: the edition
-      # comparison and the instance marker (#619).
+      # is required to have run the four tests this job exists for: the
+      # edition comparison, the instance marker (#619) and Express's fresh
+      # database options, predicted and read after AUTO_CLOSE (#2377).
       - name: the edition tests
         run: |
           set -o pipefail
           cargo test -p pbps-mssql --test live -- --ignored \
             a_real_express_target_is_an_edition_limitation \
-            a_global_temporary_table_marks_one_instance_to_every_login_on_it | tee edition.log
-          grep -q "test result: ok. 2 passed" edition.log
+            a_global_temporary_table_marks_one_instance_to_every_login_on_it \
+            an_express_supplied_reference_predicts_a_fresh_database_exactly \
+            an_express_database_closed_before_its_read_still_reads_as_open | tee edition.log
+          grep -q "test result: ok. 4 passed" edition.log
       # And the CLI's answer to an online strategy Express cannot run (#574).
       - name: the connected online-edition refusal
         run: |
@@ -900,7 +929,7 @@ jobs:
 
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, resolver-mssql, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
+    needs: [approve, lint, quick, windows, live, resolver-mssql, resolver-localdb, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

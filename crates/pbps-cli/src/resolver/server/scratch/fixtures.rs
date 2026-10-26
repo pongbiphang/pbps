@@ -132,6 +132,15 @@ pub(crate) fn pair_with_xml_fragments() -> (Schema, Schema) {
 
 pub(crate) const ENVIRONMENT: &str = "fixture";
 
+/// How a fixture environment names its key. A file is refused where its
+/// owner-only permission cannot be proved, which is every non-Unix platform,
+/// so there the key comes from the environment: the Windows LocalDB job sets
+/// this variable to a fresh key (scripts/localdb_qualify.py).
+#[cfg(unix)]
+pub(crate) const KEY_LINE: &str = "    fingerprint_key_file: key\n";
+#[cfg(not(unix))]
+pub(crate) const KEY_LINE: &str = "    fingerprint_key_env: PBPS_TEST_FINGERPRINT_KEY\n";
+
 pub(crate) struct ProjectKey {
     root: PathBuf,
     pub(crate) project: pbps_config::Project,
@@ -144,7 +153,7 @@ impl ProjectKey {
             rand::random::<u128>()
         ));
         std::fs::create_dir(&root).unwrap();
-        if with_key {
+        if with_key && cfg!(unix) {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             // A key file others can read is refused on Unix.
@@ -155,11 +164,7 @@ impl ProjectKey {
         }
         let config = format!(
             "dialect: postgres\nenvironments:\n  {ENVIRONMENT}:\n    url_env: PBPS_1274_UNUSED\n{}",
-            if with_key {
-                "    fingerprint_key_file: key\n"
-            } else {
-                ""
-            }
+            if with_key { KEY_LINE } else { "" }
         );
         let path = root.join("pbps.yml");
         std::fs::write(&path, &config).unwrap();

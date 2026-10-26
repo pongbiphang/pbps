@@ -10,6 +10,7 @@ pub mod compatibility;
 pub mod dependencies;
 pub mod environment;
 pub mod externals;
+pub mod localdb;
 pub mod reconstruct;
 pub mod scratch;
 
@@ -220,7 +221,9 @@ pub async fn fresh_reference(
     let result = async {
         conn.execute(&format!("CREATE DATABASE [{}];", names.database()))
             .await?;
-        scratch::options::read(conn, names.database()).await
+        // Read from inside, as the scratch is: Express may already have
+        // closed the new database (see `read_inside`).
+        scratch::options::read_inside(conn, names.database()).await
     }
     .await;
     drop_reference(conn, names).await.map_err(|error| {
