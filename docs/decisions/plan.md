@@ -704,3 +704,53 @@ A readable dependency must match kind, the exact column set, normalized native
 types (including length, precision and scale), and nullability. The connection's
 actual target database is refused by database ID. Resolver companion databases
 and the existing undeclared-three-part refusal remain #2323's separate slice.
+
+
+<a id="dec-2397-1"></a>
+
+**DEC-2397.1. Check deployed ancestry before planning management removals.**
+
+Connected `plan --db` / `plan --env` reads the target's latest snapshot before
+local identity resolution. It inventories tables, columns and roles that would
+disappear from management by comparing recorded identities, reviewed local
+identities and declarations, preserving known renames and explicit rename
+annotations. Computed columns have no uid and retain their existing name
+identity. A dropped table appears once, without its implicit column removals;
+all distinct removals are listed, sorted and never truncated. PostgreSQL role
+removal is included: keeping the principal but revoking grants can undo the
+application another branch deployed just as dropping an object can. Neither a
+local tombstone nor a recorded drop reason bypasses the ancestry check.
+
+The deployed commit must be equal to HEAD or its ancestor. Reuse the baseline
+reader's Git command boundary; no Git library, shell or identity inference is
+added. A missing/non-commit object refuses with fetch and merge/rebase remedies,
+including the existing shallow-clone advice. An unreadable repository or failed
+Git query refuses with a repair remedy. A known absence of a checkout or Git
+executable, a selected NULL SHA, or no retained non-failed row instead keeps
+existing behavior with a note in human and JSON output. Missing evidence is not
+an assertion that the checkout is current. Plans without management removals
+are not blocked by this check.
+
+Use the newest non-failed row at or before the observed latest row. Normally
+this is the snapshot already read; when the latest is failed, read only the
+older row's projected id and Git SHA, without decoding historical snapshots.
+Failed rows preserve the current state but may stamp an attempted checkout, so
+using that SHA could bless the same stale checkout that just failed apply.
+A selected NULL remains NULL: searching further for a non-NULL SHA would claim
+evidence newer than it is. Pruned evidence is known absence; query failures are
+errors. This is target-wide evidence, not per-object provenance, so it names
+the latest recorded successful state rather than each object's introducing
+commit. No state or plan wire shape changes.
+
+<a id="dec-2397-2"></a>
+
+**DEC-2397.2. Keep apply independent of checkout ancestry.**
+
+The ancestry check belongs to plan construction. `apply --plan` must keep
+working on a host with no checkout (decision 23). Its approved artifact already
+pins the exact changes, identity mapping, risk approvals and target baseline
+(§7.3; decisions 6 and 24). If the target moves after planning, the existing
+checksum comparison under the deployment lock refuses before DDL; the failed
+attempt remains an audit record, not new deployed provenance. Rechecking the
+applying host's Git history would reject an approved plan for evidence unrelated
+to its construction and would not strengthen that checksum boundary.

@@ -61,6 +61,16 @@ pub struct LedgerEntry {
     pub snapshot: StateSnapshot,
 }
 
+/// Provenance of the newest non-failed row, without decoding historical state.
+/// A failed attempt carries the attempted checkout, not the deployed revision
+/// (DEC-2397.1). `None` from the reader means no such row remains; a NULL SHA
+/// on a selected row is a different, known absence of commit evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRevision {
+    pub id: i64,
+    pub git_sha: Option<pbps_model::Text>,
+}
+
 /// One selected ledger row before its versioned snapshot has been decoded.
 ///
 /// Historical readers must distinguish an unsupported version from damaged
