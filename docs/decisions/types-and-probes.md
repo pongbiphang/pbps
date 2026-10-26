@@ -3785,9 +3785,8 @@ array of the type below it makes the pair one of arrays
 (`varchar(20)[]` to `varchar(10)[]`), through any number of links; the dialect
 keeps the element's risk, and preflight reports such a column's elements
 unchecked, by the mechanism a direct array column already has, instead of
-length-checking the array's text as a scalar. Over a rebuilt type the values go
-through text for every reason, since an enum has no assignment cast to its
-replacement. An enum below carries no pair.
+length-checking the array's text as a scalar. How the values reach the replacement
+is the root's, see round 6. An enum below carries no pair.
 `a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar` and
 `a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit`
 pin it on 16 and 18.
@@ -3825,4 +3824,22 @@ act on columns of the enum itself, and a column of a domain is refused rows
 (the enum rows of #2346). A column of an array of a domain over `e[]` is an array of arrays
 in the engine (two levels) and is counted level by level.
 `a_column_of_a_domain_over_an_array_of_a_rebuilt_enum_is_counted_by_its_elements`
+pins it on 16 and 18.
+
+Round 6 of the PR. How a value reaches the replacement is a fact about the
+chain under the column's type, found by the same walk that gives the base pair
+(`Replaced.carried`: the conversion and the change, inherited from the root
+through every collation, array or derived link), not a test on why the type is
+rebuilt. An enum root has no cast to its replacement, so every domain built on
+it moves its values through text. A built-in root, a changed base or only a
+collation, is carried by the engine's assignment cast, which the columns of a
+domain built on it take as well. Measured on 16 and 18, identical: over
+`d2 AS d AS numeric(10,2)` a column with `1.00`, `ALTER COLUMN … TYPE <d2 over
+integer>` with no `USING` gives `1` (`1.50` gives `2`, as the root's own column
+does), `USING v::<d2>` also works, and `USING v::text::<d2>` fails with `invalid
+input syntax for type integer: "1.00"`; the same through `d3 AS d[]`
+(`{1.00,2.00}` becomes `{1,2}`). Round 3's rule, text for every domain with a
+rebuilt type under it, failed that valid plan at apply; the probe could not see
+it, since it checks only the rounded range.
+`a_domain_built_on_a_narrowed_numeric_converts_by_the_assignment_cast_not_through_text`
 pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.

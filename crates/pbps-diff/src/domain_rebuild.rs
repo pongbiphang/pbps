@@ -101,7 +101,12 @@ pub(crate) fn plan(
                     removed: removed.clone(),
                     ordinal: *ordinal,
                     depth: 0,
-                    effective: None,
+                    // No cast leads from an enum to its replacement: the
+                    // labels go through text.
+                    carried: Carried {
+                        conversion: RetypeConversion::Text,
+                        change: None,
+                    },
                 },
             );
         }
@@ -333,17 +338,20 @@ pub(crate) fn plan(
                 None => (None, Vec::new(), labels_before(d.new), 1),
             };
             let reason = &why[uid];
-            // What the columns of this type undergo in their base type is a
-            // fact about the chain under it, not about why this type is
-            // rebuilt: its own base's change if that is what changed, else the
-            // one it inherits from the type it is built on, whatever the
-            // reason (a collation change, an array fallback, or only that the
-            // base is rebuilt). The pair is of the element types; whether a
-            // column's values are arrays is its shape's to say, one answer
-            // for every value check (`TypeResolver::values_shape`).
-            let inherited = under.and_then(|r| r.effective.clone());
-            let base_change = match reason {
-                Why::Base => {
+            // What the columns of this type undergo, as one walk down the
+            // chain under it, not a test on why this type is rebuilt: how a
+            // value reaches the replacement and which change of base type it
+            // meets on the way. The root says both and every domain built on
+            // it inherits them, through any collation, array or derived link:
+            // an enum root has no cast to its replacement, so the labels go
+            // through text; a built-in root's change is carried by the
+            // engine's assignment cast, which a column of a domain built on it
+            // takes by the leaf types (measured on 16 and 18, DEC-1635.9). The
+            // pair is of the element types; whether a column's values are
+            // arrays is its shape's to say (`TypeResolver::values_shape`).
+            let carried = match (under, reason) {
+                (Some(r), _) => r.carried.clone(),
+                (None, Why::Base) => {
                     let (
                         ManagedType::Domain { base: from, .. },
                         ManagedType::Domain { base: to, .. },
@@ -351,19 +359,20 @@ pub(crate) fn plan(
                     else {
                         continue;
                     };
-                    Some((normalized(from).element(), normalized(to).element()))
+                    Carried {
+                        conversion: RetypeConversion::Assign,
+                        change: Some((normalized(from).element(), normalized(to).element())),
+                    }
                 }
-                Why::Derived(_) | Why::Collation | Why::Array => inherited,
+                (None, Why::Derived(_) | Why::Collation | Why::Array) => Carried {
+                    conversion: RetypeConversion::Assign,
+                    change: None,
+                },
             };
-            // Over a rebuilt type the values go through text, whatever the
-            // reason: an enum has no assignment cast to its replacement, and a
-            // domain's is the same text.
-            let conversion = if under.is_some() {
-                RetypeConversion::Text
-            } else {
-                RetypeConversion::Assign
-            };
-            let effective_change = base_change.clone();
+            let Carried {
+                conversion,
+                change: base_change,
+            } = carried.clone();
             match rebuild_type(
                 base,
                 desired,
@@ -389,7 +398,7 @@ pub(crate) fn plan(
                                 removed,
                                 ordinal,
                                 depth,
-                                effective: effective_change,
+                                carried,
                             },
                         );
                     }
@@ -420,10 +429,18 @@ struct Replaced {
     removed: Vec<String>,
     ordinal: usize,
     depth: usize,
-    /// The old and new base type the columns of this type undergo, resolved
-    /// through the chain to the root built-in type: a domain built on this
-    /// one inherits it.
-    effective: Option<(ColumnType, ColumnType)>,
+    /// What the columns of this type undergo: a domain built on this one
+    /// inherits it.
+    carried: Carried,
+}
+
+/// How a value reaches the replacement and the change of base type it meets,
+/// as the root of the chain says them.
+#[derive(Debug, Clone)]
+struct Carried {
+    conversion: RetypeConversion,
+    /// The old and new element base type, when a built-in base changed.
+    change: Option<(ColumnType, ColumnType)>,
 }
 
 #[cfg(test)]
@@ -943,11 +960,11 @@ mod tests {
             changes["w"], pair,
             "the derived domain's column: {changes:?}"
         );
-        // The conversion of the derived column is still through text.
+        // A built-in root: the derived column rides the assignment cast too.
         assert!(out.changes.iter().any(|c| matches!(
             c,
             Change::EnumRebuild {
-                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Text, .. },
+                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Assign, .. },
                 ..
             } if column.name.raw() == "w"
         )));
@@ -1095,12 +1112,12 @@ mod tests {
             (p.clone(), p.clone(), p.clone()),
             "{changes:?}"
         );
-        // Over a rebuilt type the values go through text, for the collation
-        // reason too.
+        // The values of the derived column ride the assignment cast, as the
+        // root's do.
         assert!(out.changes.iter().any(|c| matches!(
             c,
             Change::EnumRebuild {
-                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Text, .. },
+                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Assign, .. },
                 ..
             } if column.name.raw() == "w"
         )));
@@ -1470,5 +1487,114 @@ mod tests {
             &Hints::default(),
         );
         assert_eq!(value_arrays(&out)["v"], 0);
+    }
+
+    /// How each column's value reaches its replacement, by column.
+    fn conversions(rebuilt: &Rebuilt) -> BTreeMap<String, RetypeConversion> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step:
+                        EnumRebuildStep::Retype {
+                            column, conversion, ..
+                        },
+                    ..
+                } => Some((column.name.raw().to_owned(), *conversion)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_conversion_of_a_derived_domain_is_its_roots_through_every_link() {
+        use RetypeConversion::{Assign, Text};
+        let on = |base: &str| domain(base, None, &[]);
+        let collated = |base: &str| domain(base, Some("pg_catalog.\"C\""), &[]);
+        let check = |out: &Rebuilt, want: [(&str, RetypeConversion); 3]| {
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            let got = conversions(out);
+            for (column, conversion) in want {
+                assert_eq!(got[column], conversion, "{column}: {got:?}");
+            }
+        };
+        // An enum root has no cast to its replacement: every domain built on
+        // it goes through text, through array and collation links as well.
+        let over_enum = |labels: &[&str], d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e")),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2")),
+            &over_enum(&["a"], on("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2[]")),
+            &over_enum(&["a"], on("app.d"), on("app.d2[]")),
+            &Hints::default(),
+        );
+        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        // Negative: an enum root under a collation link is still text.
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2")),
+            &over_enum(&["a"], collated("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        assert_eq!(out.uids.get(&uid(3)), Some(&Why::Collation));
+        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        // A built-in root's change rides the assignment cast for the root's
+        // columns and for every domain built on it, through a collation link
+        // and through array links.
+        let over_builtin = |base: &str, d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        for (d2, d3) in [
+            (on("app.d"), on("app.d2")),
+            (collated("app.d"), on("app.d2")),
+            (on("app.d[]"), on("app.d2")),
+            (on("app.d"), on("app.d2[]")),
+            (collated("app.d[]"), on("app.d2[]")),
+        ] {
+            let out = run(
+                &over_builtin("numeric(10, 2)", d2.clone(), d3.clone()),
+                &over_builtin("numeric(5, 0)", d2, d3),
+                &Hints::default(),
+            );
+            check(&out, [("v", Assign), ("w", Assign), ("x", Assign)]);
+        }
+        // A built-in collation change alone: the same.
+        let builtin_collation = |collation: Option<&str>| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", domain("text", collation, &[])),
+                ("app.d2", on("app.d")),
+                ("app.d3", on("app.d2")),
+            ]
+        };
+        let out = run(
+            &builtin_collation(None),
+            &builtin_collation(Some("pg_catalog.\"C\"")),
+            &Hints::default(),
+        );
+        check(&out, [("v", Assign), ("w", Assign), ("x", Assign)]);
+        // A scalar root alone is unchanged.
+        let out = run(
+            &over_builtin("varchar(20)", on("app.d"), on("app.d2")),
+            &over_builtin("text", on("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        assert_eq!(conversions(&out)["v"], Assign);
     }
 }

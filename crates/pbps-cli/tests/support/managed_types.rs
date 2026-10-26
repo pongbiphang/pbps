@@ -8228,3 +8228,45 @@ fn a_column_of_a_domain_over_an_array_of_a_rebuilt_enum_is_counted_by_its_elemen
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_built_on_a_narrowed_numeric_converts_by_the_assignment_cast_not_through_text() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // `1.00` as text is no integer, but the assignment cast takes the
+        // numeric to 1: a column of a domain built on the changed one, and of
+        // one built on an array of it, convert as the root's own do.
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS numeric(10, 2); \
+                   CREATE DOMAIN app.d2 AS app.d; CREATE DOMAIN app.d3 AS app.d[]; \
+                   CREATE TABLE app.t (id integer PRIMARY KEY, v app.d2, w app.d3); \
+                   INSERT INTO app.t VALUES (1, 1.00, ARRAY[1.00, 2.00]::app.d[]);";
+        let (own, d) = adopted(&server, "domain_derived_cast4b", sql);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: integer\n",
+        )
+        .unwrap();
+        let path = d.dir.join("derived-cast.plan.json");
+        let plan = label_plan(&d, db, &path);
+        assert!(changes_of(&plan).iter().all(|k| k == "EnumRebuild"));
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert_eq!(type_ids(&d), uids);
+        assert_eq!(text_of(db, "SELECT v::text FROM app.t WHERE id = 1"), "1");
+        assert_eq!(
+            text_of(db, "SELECT w::text FROM app.t WHERE id = 1"),
+            "{1,2}"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
