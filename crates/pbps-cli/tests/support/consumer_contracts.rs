@@ -447,6 +447,7 @@ pub(super) fn live(server: &str, pg: bool) {
         config(&d, "consumers:\n  writer: {writes: [app.t]}\n");
         ok(d.run(&["plan"]));
     }
+    defaults_live(server, pg);
     // A view-column removal and a routine-interface change are opaque, not safe.
     let d = Demo::new("consumer-modules");
     table(&d, "  old: {type: integer}\n");
@@ -505,4 +506,160 @@ pub(super) fn live(server: &str, pg: bool) {
         std::fs::write(&routine, "function: app.f(text)\ndefinition: (i text) RETURNS text LANGUAGE sql AS $$ SELECT i $$\n").unwrap();
         refused(&d, "consumer.breaking", &["plan", "--db", connection]);
     }
+}
+
+/// PostgreSQL releases DEFAULTs around a routine rebuild. SQL Server preserves
+/// one inside a caller-column retype with the routine unchanged. Contracts
+/// protect the declaration, not these intermediate steps.
+fn defaults_live(server: &str, pg: bool) {
+    for partition in [false, true] {
+        if partition && !pg {
+            continue;
+        }
+        let own = OwnDatabase::new(server, "consumer_default2398");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        if pg {
+            on_server(
+                connection,
+                "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+            );
+        } else {
+            on_server(connection, "CREATE TABLE app.source (old int NULL)");
+            on_server(
+                connection,
+                "CREATE FUNCTION app.f() RETURNS int WITH SCHEMABINDING AS BEGIN DECLARE @n int; SELECT @n = MAX(old) FROM app.source; RETURN ISNULL(@n, 0); END",
+            );
+        }
+        if partition {
+            on_server(
+                connection,
+                "CREATE TABLE app.parent (old integer) PARTITION BY RANGE(old)",
+            );
+            on_server(
+                connection,
+                "CREATE TABLE app.t PARTITION OF app.parent DEFAULT",
+            );
+            on_server(
+                connection,
+                "ALTER TABLE app.t ALTER COLUMN old SET DEFAULT app.f()",
+            );
+        } else {
+            on_server(
+                connection,
+                "CREATE TABLE app.t (old integer DEFAULT (app.f()))",
+            );
+        }
+        let d = Demo::new("consumer-default-restoration");
+        ok(d.run(&["pull", "--db", connection]));
+        d.commit();
+        ok(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        config(&d, "consumers:\n  writer: {writes: [app.t.old]}\n");
+        let files = declarations(&d.dir.join("schema"));
+        if pg {
+            let routine = files
+                .iter()
+                .find(|p| {
+                    std::fs::read_to_string(p)
+                        .unwrap()
+                        .contains("function: app.f(")
+                })
+                .unwrap();
+            std::fs::write(routine, "function: app.f()\ndefinition: () RETURNS bigint LANGUAGE sql AS $$ SELECT 2::bigint $$\n").unwrap();
+        } else {
+            // This engine also releases a DEFAULT for a caller-column retype.
+            let caller = files
+                .iter()
+                .find(|p| {
+                    std::fs::read_to_string(p)
+                        .unwrap()
+                        .contains("table: app.t\n")
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(caller).unwrap();
+            assert!(text.contains("type: int"), "{text}");
+            std::fs::write(caller, text.replacen("type: int", "type: bigint", 1)).unwrap();
+        }
+        let plan = d.dir.join("default-restoration.json");
+        let sql = d.dir.join("default-restoration.sql");
+        ok(d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+        let saved = std::fs::read_to_string(&plan).unwrap();
+        let kind = if partition {
+            "set_partition_default"
+        } else {
+            "alter_column_default"
+        };
+        let emitted = std::fs::read_to_string(sql).unwrap();
+        let defaults = if pg {
+            saved.matches(kind).count() >= 2
+        } else {
+            // SQL Server preserves the actual DEFAULT inside ALTER COLUMN.
+            saved.matches(kind).count() == 0
+                && emitted.contains("DROP CONSTRAINT")
+                && emitted.contains("ADD CONSTRAINT")
+                && emitted.contains("@definition")
+        };
+        let routine = if pg {
+            saved.contains("alter_module") && emitted.contains("DROP FUNCTION")
+        } else {
+            !saved.contains("drop_module") && !emitted.contains("DROP FUNCTION")
+        };
+        assert!(
+            routine && defaults,
+            "partition={partition}, pg={pg}: DEFAULT preservation must follow the engine lowering: {saved}"
+        );
+        ok(d.run(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--allow",
+            "destructive,revoke",
+        ]));
+        ok(d.run(&["verify", "--db", connection]));
+        // Changing the final default remains unproven even with the same call.
+        let name = if partition { "app.parent" } else { "app.t" };
+        let declaration = files
+            .iter()
+            .find(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .contains(&format!("table: {name}\n"))
+            })
+            .unwrap();
+        let changed = if partition {
+            "table: app.parent\ncolumns:\n  old: {type: integer}\npartition_by: [old]\npartitions:\n  t:\n    default: true\n    columns:\n      old: {default: 'app.f() + 1'}\n"
+        } else if pg {
+            "table: app.t\ncolumns:\n  old: {type: integer, default: 'app.f() + 1'}\n"
+        } else {
+            "table: app.t\ncolumns:\n  old: {type: bigint, default: 'app.f() + 1'}\n"
+        };
+        std::fs::write(declaration, changed).unwrap();
+        refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    }
+}
+
+fn declarations(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flat_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                declarations(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
 }

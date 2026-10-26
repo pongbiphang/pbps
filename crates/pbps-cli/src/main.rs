@@ -2492,6 +2492,194 @@ mod consumer_contract_tests {
     }
 
     #[test]
+    fn ordinary_defaults_restored_around_a_routine_rebuild_keep_their_contract() {
+        defaults_around_rebuild(false);
+    }
+
+    #[test]
+    fn partition_defaults_restored_around_a_routine_rebuild_keep_their_contract() {
+        defaults_around_rebuild(true);
+    }
+
+    fn defaults_around_rebuild(partition: bool) {
+        use pbps_model::{
+            Column, ColumnType, PartitionBound, PartitionColumn, PartitionOf, Table, TableName,
+            Uid, ValueSource,
+        };
+        let parent: TableName = "app.parent".parse().unwrap();
+        let table: TableName = "app.t".parse().unwrap();
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let column: Uid = "c_aaaaaa".parse().unwrap();
+        let mut shape = Table::default();
+        let mut spec = Column::new(ColumnType::simple("integer"));
+        spec.value_source = ValueSource::Default("app.f()".into());
+        shape.columns.insert("old".into(), spec);
+        let mut before = Schema::default();
+        if partition {
+            before.tables.insert(parent.clone(), shape);
+            shape = Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.clone(),
+                    bound: PartitionBound::Default,
+                    columns: [(
+                        "old".into(),
+                        PartitionColumn {
+                            default: Some("app.f()".into()),
+                            not_null: false,
+                        },
+                    )]
+                    .into(),
+                }),
+                ..Default::default()
+            };
+        }
+        before.tables.insert(table.clone(), shape);
+        let mut ids = IdsFile {
+            tables: [(owner.clone(), table.clone())].into(),
+            columns: [(
+                column.clone(),
+                if partition {
+                    parent.column("old")
+                } else {
+                    table.column("old")
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        if partition {
+            ids.tables
+                .insert("t_bbbbbb".parse().unwrap(), parent.clone());
+        }
+        let consumers: Consumers = [(
+            "writer".into(),
+            Consumer {
+                writes: vec!["app.t.old".into()],
+                ..Default::default()
+            },
+        )]
+        .into();
+        let ctx = pbps_policy::Context {
+            now: 0,
+            max_rows: 1000,
+            connected: false,
+            only: None,
+            deprecated_types: &[],
+        };
+        for changed in [false, true] {
+            let mut after = before.clone();
+            let desired = if changed { "app.f() + 1" } else { "app.f()" };
+            let shape = after.tables.get_mut(&table).unwrap();
+            if partition {
+                shape
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .columns
+                    .get_mut("old")
+                    .unwrap()
+                    .default = Some(desired.into());
+            } else {
+                shape.columns.get_mut("old").unwrap().value_source =
+                    ValueSource::Default(desired.into());
+            }
+            let id: pbps_model::ModuleId = "app.f".parse().unwrap();
+            let default_change = |from, to| {
+                if partition {
+                    Change::SetPartitionDefault {
+                        uid: owner.clone(),
+                        table: table.clone(),
+                        parent: parent.clone(),
+                        column: "old".into(),
+                        from,
+                        to,
+                        fallback: Some("app.f()".into()),
+                    }
+                } else {
+                    Change::AlterColumnDefault {
+                        uid: column.clone(),
+                        column: table.column("old"),
+                        from,
+                        to,
+                    }
+                }
+            };
+            let cs = ChangeSet {
+                changes: vec![
+                    PlannedChange::new(default_change(Some("app.f()".into()), None)),
+                    PlannedChange::new(Change::DropModule {
+                        id: id.clone(),
+                        kind: ModuleKind::Function,
+                    }),
+                    PlannedChange::new(Change::CreateModule {
+                        id,
+                        module: Box::new(Module {
+                            kind: ModuleKind::Function,
+                            definition: "new body".into(),
+                            description: None,
+                            options: ModuleOptions::default(),
+                        }),
+                    }),
+                    PlannedChange::new(default_change(None, Some(desired.into()))),
+                ],
+            };
+            let sides = [
+                Side {
+                    schema: &before,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &after,
+                    ids: &ids,
+                },
+            ];
+            let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
+            for engine in [DialectName::Mssql, DialectName::Postgres] {
+                let dialect = dialect_for(engine);
+                let compare = pbps_diff::schema_diff::restoration_comparison(
+                    pbps_diff::Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                    dialect.as_ref(),
+                );
+                let findings = pbps_policy::consumers::plan(
+                    &cs,
+                    &bound,
+                    &sides,
+                    &pbps_policy::Policies::default(),
+                    &ctx,
+                    &compare,
+                );
+                assert_eq!(
+                    findings.is_empty(),
+                    !changed,
+                    "partition={partition}, changed={changed}, {engine:?}: {findings:?}"
+                );
+                assert!(findings.iter().all(|(_, f)| f.id == "consumer.unproven"));
+                // Missing owners and columns are not a successful comparison.
+                let absent = IdsFile::default();
+                let unavailable = pbps_diff::schema_diff::restoration_comparison(
+                    pbps_diff::Side {
+                        schema: &before,
+                        ids: &absent,
+                    },
+                    pbps_diff::Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                    dialect.as_ref(),
+                );
+                assert!(!unavailable(&cs.changes[0].change, Some(&owner)));
+            }
+        }
+    }
+
+    #[test]
     fn restored_modules_use_the_differs_equivalence_for_each_dialect() {
         let id: pbps_model::ModuleId = "app.restored".parse().unwrap();
         let module = Module {

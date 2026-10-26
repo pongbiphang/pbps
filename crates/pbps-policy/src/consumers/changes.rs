@@ -176,7 +176,9 @@ pub(super) fn classify(
         Change::AlterColumnNullability {
             uid, to_nullable, ..
         } => (nullability(column(uid), *to_nullable) && !supplied(uid)).then_some(U),
-        Change::AlterColumnDefault { uid, .. } => write(column(uid) && !supplied(uid)),
+        Change::AlterColumnDefault { uid, .. } => {
+            write(column(uid) && !supplied(uid) && !unchanged(&p.change, table))
+        }
         Change::AlterColumnExpression { uid, .. } => {
             (column(uid) || (entry.writes && hit)).then_some(U)
         }
@@ -200,9 +202,14 @@ pub(super) fn classify(
                 Some(if restored { U } else { B })
             }
         }
-        Change::SetPartitionDefault { table, column, .. } => {
-            write(hit && !supplied_new(&table.column(column.clone()), cs, sides))
-        }
+        Change::SetPartitionDefault {
+            table: owner,
+            column,
+            ..
+        } => write(
+            hit && !supplied_new(&owner.column(column.clone()), cs, sides)
+                && !unchanged(&p.change, table),
+        ),
         Change::SetPartitionNotNull {
             table,
             column,
