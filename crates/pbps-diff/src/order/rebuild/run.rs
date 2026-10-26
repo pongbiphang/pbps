@@ -88,8 +88,15 @@ impl Rule<'_> {
         };
         ops.iter()
             .map(|op| {
-                Ok(effects(op, &owners, before, after)?
-                    .merged(self.dialect.engine_effects(op, &owners, before, after)?))
+                Ok(
+                    effects(op, &owners, before, after)?.merged(self.dialect.engine_effects(
+                        op,
+                        &owners,
+                        before,
+                        after,
+                        Some(&self.prepared.names),
+                    )?),
+                )
             })
             .collect::<Result<Vec<_>, OwnerError>>()
             .map_err(|e| e.to_string())

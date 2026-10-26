@@ -3164,8 +3164,9 @@ pub trait Dialect {
     /// Shipping partition producers remain guarded until their integration.
     ///
     /// Pure, like the rest of the dialect: it reads the step's payload and
-    /// the two snapshots, and runs no query. A dependency only a connected
-    /// plan's catalog reads is the `Catalog` edge source's, not this one's.
+    /// the two snapshots, and runs no query. Optional catalog facts refine
+    /// identifier equality, not dependency discovery (DEC-2221.1). Dependencies
+    /// read from the catalog still belong to the `Catalog` edge source.
     /// The default knows nothing the portable effects do not.
     fn engine_effects(
         &self,
@@ -3173,6 +3174,7 @@ pub trait Dialect {
         _owners: &dyn pbps_model::operation::Owners,
         _before: pbps_model::operation::Snapshot<'_>,
         _after: pbps_model::operation::Snapshot<'_>,
+        _catalog: Option<&slots::CatalogFacts>,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         Ok(pbps_model::operation::Effects::default())
     }

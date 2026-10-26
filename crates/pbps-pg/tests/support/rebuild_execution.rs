@@ -187,7 +187,15 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
         .iter()
         .map(|op| {
             effects(op, &owners, before, after).unwrap().merged(
-                pbps_dialect::Dialect::engine_effects(&pg, op, &owners, before, after).unwrap(),
+                pbps_dialect::Dialect::engine_effects(
+                    &pg,
+                    op,
+                    &owners,
+                    before,
+                    after,
+                    Some(prepared.names()),
+                )
+                .unwrap(),
             )
         })
         .collect();

@@ -466,6 +466,7 @@
         "roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan",
         "baseline_schema_bindings_are_released_before_callee_rewrites",
         "binding_releases_preserve_independent_connected_computed_releases",
+        "collated_callees_are_scheduled_before_new_bindings_and_apply",
         "snapshot_and_baseline_refuse_a_held_deployment_lock",
         "source_default_collation_notice_is_only_printed_once_during_onboarding",
         "sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate",
@@ -2402,6 +2403,15 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes"]
+    },
+    {
+      "target": ["pbps-cli", "bin", "pbps"],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "engine::mssql_live_tests::module_only_callers_use_catalog_collation_and_reversed_order_is_refused"
+      ]
     },
     {
       "target": ["pbps-cli", "lib", "pbps_cli"],

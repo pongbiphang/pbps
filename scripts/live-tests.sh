@@ -105,6 +105,7 @@ cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-thr
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268 "$@"
 cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 externals2269 "$@"
 cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests "$@"
+cargo test --profile live-test -p pbps-cli --bin pbps -- --ignored --test-threads=1 engine::mssql_live_tests "$@"
 # The seam's own error conversion on this driver (issue #167): measured
 # against a real server, `tiberius`'s `Display` already carries the server's
 # sentence, so this is a regression guard rather than a fix — see

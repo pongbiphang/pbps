@@ -7720,9 +7720,16 @@ pub fn cmd_plan_db(
             let object_facts = crate::engine::order_created_object_names(
                 &mut conn,
                 &mut cs,
-                &resolved.ids,
                 &target.label,
                 &precedence,
+                &crate::dependents::schedule::Declarations {
+                    schema: &loaded.schema,
+                    sources: crate::dependents::Sources {
+                        before: pbps_diff::Side { schema: &recorded_snapshot.schema, ids: &recorded_ids },
+                        after: &resolved.ids,
+                    },
+                    module_deps: &hints.module_deps,
+                },
             )
             .await?;
             // The module passes may plan the revision again in the differ's
