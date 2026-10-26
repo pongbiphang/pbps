@@ -1508,3 +1508,26 @@ three plus four when its 21 GiB budget fits. No over-commit exception applies.
 Record the chosen counts and the run's minimum available memory. A minimum
 below 3 GiB must be reported, identifying the Express-free SQL Server shard
 budget as the budget to raise before repeating that assignment.
+
+<a id="dec-2415-1"></a>
+
+**DEC-2415.1. The first push runs the round gate; an agent holds at most two
+independent issues; hot files are scheduled through a shared board.** This
+amends DEC-1838.1 for the first push of a branch.
+
+- **First push.** A draft head is reviewed and usually changed again before the
+  head that merges exists, and the full gate still runs before ready, before
+  every ready-phase push and before a code rebase. The first push now runs the
+  round gate with the change's own tests, live ones when engine-facing. A live
+  failure found at ready costs one more draft round instead of one more gate
+  per branch.
+- **Two issues per agent.** Agents mostly waited on the one shared gate slot
+  and on reviews; the rework that day came from review findings and rebases,
+  not from gate failures. A second issue may proceed while the first waits,
+  only when it is independent, so a failed gate never invalidates both.
+- **Hot files.** Concurrent pull requests collided on format versions,
+  `schema_diff.rs`, `plan.rs` and decision topic files. Recording each issue's
+  hot files on one board, and scheduling overlaps through one coordinating
+  session, avoids starting two such issues at once.
+- **Conflict precheck.** A head that conflicts with `master` gets no PR run and
+  is ejected by the queue, so a gate on it is wasted; it is rebased first.
