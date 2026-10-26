@@ -7688,11 +7688,12 @@ pub fn cmd_plan_db(
                 } if !removed.is_empty())
             })
         {
+            let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
             run_probes(
                 &mut conn,
                 dialect.as_ref(),
-                &pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?,
-                &pbps_model::Partitions::default(),
+                &names,
+                &probe_partitions(&recorded_snapshot.schema, &names),
                 None,
             )
             .await?;
@@ -10256,17 +10257,27 @@ async fn preflight<D: crate::emission::Engine>(
     // The probes take the plan's changes, which name a parent it renames by
     // its new name, so the stored relation is brought under those names
     // (#1751 review).
+    let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
     run_probes(
         conn,
         dialect,
-        &pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?,
-        &pbps_model::Partitions::of(stored).renamed(&pbps_model::plan_names::PlanNames::of(
-            &plan.changes.changes,
-            &plan.ids,
-        )?),
+        &names,
+        &probe_partitions(stored, &names),
         Some(approved),
     )
     .await
+}
+
+/// The partitions the probes read the plan against: the relation as the
+/// database stands before the plan, under the plan's final parent names. Every
+/// caller of [`run_probes`] that probes a plan builds it here, so the plan-time
+/// removed-label count and the apply-time probes see the same relation
+/// (#2406).
+fn probe_partitions(
+    stored: &pbps_model::Schema,
+    names: &pbps_model::plan_names::PlanNames<'_>,
+) -> pbps_model::Partitions {
+    pbps_model::Partitions::of(stored).renamed(names)
 }
 
 /// The body of one rename's impact report: what breaks, what blocks, and what
@@ -10703,6 +10714,94 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The plan-time removed-label count and the apply-time probes read the
+    /// plan against one relation: the stored partitions under the plan's final
+    /// parent names. Here the plan renames the parent, rebuilds an enum column
+    /// of it and checks a partition: the partition's check is judged under the
+    /// replacement's order, so it gets no probe over the old one. Negatives: an
+    /// empty map (the plan-time call before #2406) probes it, and so does a plan
+    /// without the rebuild (#2406).
+    #[test]
+    fn the_probes_read_a_plan_against_the_stored_partitions_under_their_new_parent() {
+        use pbps_dialect::Dialect as _;
+        let (parent, renamed, partition) = (
+            "app.p".parse::<pbps_model::TableName>().unwrap(),
+            "app.p2".parse::<pbps_model::TableName>().unwrap(),
+            "app.p_1".parse::<pbps_model::TableName>().unwrap(),
+        );
+        let mut stored = Schema::default();
+        stored
+            .tables
+            .insert(parent.clone(), pbps_model::Table::default());
+        stored.tables.insert(
+            partition.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..pbps_model::Table::default()
+            },
+        );
+        let (table_uid, column_uid): (pbps_model::Uid, pbps_model::Uid) =
+            ("t_aaaaaa".parse().unwrap(), "c_aaaaaa".parse().unwrap());
+        let ids = IdsFile {
+            tables: [(table_uid.clone(), renamed.clone())].into(),
+            columns: [(column_uid.clone(), renamed.column("m"))].into(),
+            ..IdsFile::default()
+        };
+        let rename = pbps_model::Change::RenameTable {
+            uid: table_uid,
+            from: parent,
+            to: renamed.clone(),
+            defaults: vec![],
+        };
+        let rebuild = pbps_model::Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.mood".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid,
+                column: renamed.column("m"),
+                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                array: false,
+                removed: vec!["sad".to_owned()],
+            },
+        };
+        let check = pbps_model::Change::AddCheck {
+            table: partition,
+            name: "p_1_mood".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "m <= 'ok'::app.mood".to_owned(),
+            },
+        };
+        let probed = |changes: Vec<pbps_model::Change>, with_relation: bool| {
+            let changes: Vec<_> = changes
+                .into_iter()
+                .map(pbps_model::PlannedChange::new)
+                .collect();
+            let names = pbps_model::plan_names::PlanNames::of(&changes, &ids).unwrap();
+            let partitions = if with_relation {
+                probe_partitions(&stored, &names)
+            } else {
+                pbps_model::Partitions::default()
+            };
+            pbps_pg::Postgres::new()
+                .preflight_with(&names, &partitions)
+                .probes
+                .iter()
+                .any(|p| p.sql.contains("m <= ''ok''"))
+        };
+        let beside = vec![rename.clone(), rebuild, check.clone()];
+        assert!(!probed(beside.clone(), true), "judged by the new order");
+        assert!(probed(beside, false), "the empty map reaches no partition");
+        assert!(
+            probed(vec![rename, check], true),
+            "no rebuild, still probed"
+        );
+    }
+
     #[test]
     fn bootstrap_requires_each_declared_type_identity() {
         for yaml in [

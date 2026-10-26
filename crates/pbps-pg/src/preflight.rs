@@ -6916,6 +6916,79 @@ mod tests {
         );
     }
 
+    /// The rebuild retypes the parent's column and the engine recurses that
+    /// into every partition, so a check on a *partition* beside it is judged
+    /// under the replacement's order as well: it gets no probe over the old
+    /// one. That needs the partition map; without it the rebuild reaches
+    /// the parent alone (#2406).
+    #[test]
+    fn a_partition_check_beside_an_enum_rebuild_is_not_probed_against_the_old_order() {
+        let parent: TableName = "app.p".parse().unwrap();
+        let partition: TableName = "app.p_1".parse().unwrap();
+        let mut stored = pbps_model::Schema::default();
+        stored
+            .tables
+            .insert(parent.clone(), pbps_model::Table::default());
+        stored.tables.insert(
+            partition.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: BTreeMap::new(),
+                }),
+                ..pbps_model::Table::default()
+            },
+        );
+        let partitions = pbps_model::Partitions::of(&stored);
+        let check = Change::AddCheck {
+            table: partition.clone(),
+            name: "p_1_mood".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "m <= 'ok'::app.mood".to_owned(),
+            },
+        };
+        let rebuild = |t: &TableName| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.mood".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: t.column("m"),
+                to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
+                array: false,
+                removed: vec!["sad".to_owned()],
+            },
+        };
+        let probed =
+            |report: &Preflight| report.probes.iter().any(|p| p.sql.contains("m <= ''ok''"));
+
+        let beside = set(vec![rebuild(&parent), check.clone()]);
+        assert!(
+            !probed(&probes_with(&beside, &partitions)),
+            "the partition's check is judged under the replacement's order"
+        );
+        assert!(
+            probes_with(&beside, &partitions)
+                .probes
+                .iter()
+                .any(|p| p.description.contains("holding a label this plan removes")),
+            "the removed-label count still runs"
+        );
+        // Negative: the relation is what carries it; without it the old
+        // reading stands, which is the gap this closes.
+        assert!(probed(&probes_with(
+            &beside,
+            &pbps_model::Partitions::default()
+        )));
+        // Negative: with no rebuild the same check is probed, with the relation.
+        assert!(probed(&probes_with(&set(vec![check.clone()]), &partitions)));
+        // Negative: a partition of another parent is not carried.
+        let other: TableName = "app.q".parse().unwrap();
+        let moved = rebuild(&other);
+        assert!(probed(&probes_with(&set(vec![moved, check]), &partitions)));
+    }
+
     /// A partition's own check or unique index is probed over the
     /// partition's stored rows, and its parent's retype or rename reaches
     /// those rows first: the engine recurses both into every partition. The
