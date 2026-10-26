@@ -3621,6 +3621,28 @@ held by the declared `key_type`; `ensure` keys emit no SQL and compare by
 `key_type` at read; the label-rename forwarding rewrites recorded text only and
 casts nothing. A schema move of the enum is the same case.
 
+Rebase review: a default. A row that omits an enum cell is held to the default
+the column then gives, and the recorded default is text the catalog deparsed
+with its type welded on (`'sad'::app.mood`), which the guard embedded as it
+stood; the type is renamed before the row statement runs, so the cast named a
+type that no longer exists. One rule for every site that embeds recorded
+default text (the update's and the delete's guard, the unchanged cells and the
+insert's postcondition all go through `defaulted_cell`): when every cast a
+default ends in is to a declared, schema-qualified type, array or not, the
+guard holds the literal alone and the column's own cast, the engine's, reads
+it; any other default keeps its text and its built-in cast. Measured, identical
+on 16 and 18: after the rename the catalog spells the default
+`'sad'::feeling`, and `column::text = CAST(CAST('sad' AS text) AS feeling)::text`
+is true for an untouched row, false for one changed outside pbps, and holds for
+`'{sad,ok}'::mood[]`, a domain over the enum and a `numeric(5,2)` default (which
+keeps its cast). Sites: explicit cells carry no type text; default cells in
+guards and the postcondition are this rule; keys are compared with the declared
+`key_type`; `SET … = DEFAULT` is the keyword; the label-rename forwarding
+rewrites recorded values and casts nothing. A default naming a label the plan
+renames stays the limit above.
+`rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type`
+pins it on 16 and 18, including a row changed outside pbps still refused.
+
 Tests: `only_a_scalar_declared_enum_carries_data_rows`,
 `a_cell_over_an_enum_column_names_declared_labels_only` and
 `a_declared_enum_is_read_and_its_key_is_compared_as_text` (pbps-pg),

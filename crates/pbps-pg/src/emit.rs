@@ -6113,6 +6113,20 @@ impl<'a> Held<'a> {
     }
 }
 
+/// A default's text with the casts it ends in dropped, when every one of them
+/// is to a declared (schema-qualified) type, array or not: what is left is the
+/// literal, which the column's own type then reads. Any other default is
+/// returned as it is, so a built-in cast stays where the catalog put it.
+fn without_declared_type_casts(default: &str) -> &str {
+    let (core, casts) = crate::rows::unwrapped_with_casts(default);
+    let declared = !casts.is_empty()
+        && casts.iter().all(|cast| {
+            cast.parse::<ColumnType>()
+                .is_ok_and(|ty| ty.type_ref().is_some())
+        });
+    if declared { core } else { default }
+}
+
 /// One cell as a predicate holding the row to it, by the rendering that read
 /// it back (DECISIONS 122): a NULL as `IS NULL`, a value compared as text
 /// under the `C` collation so a change of case alone is a change — the
@@ -6188,7 +6202,14 @@ fn defaulted_cell(
     // The expression is the user's text and the emitter's syntax follows it on
     // the same line, so a trailing line comment would swallow the rest
     // (DECISIONS 281).
-    let expr = format!("({})", verbatim(default));
+    //
+    // A default that is a literal welded to a declared type (`'sad'::app.mood`,
+    // as the catalog deparses an enum label) is held by its literal alone: the
+    // cast to the column's type below is the engine's own, and the welded cast
+    // names a type the plan may rename before this statement runs, which then
+    // no longer exists (DEC-2346.2, rebuild review). One rule for every site
+    // that embeds recorded default text, in place of a remap of each.
+    let expr = format!("({})", verbatim(without_declared_type_casts(default)));
     // **Through the column's type first, and this is not decoration.** Both
     // sides are compared as text, and the stored side went through the
     // column's type on the way in while the declared expression did not.
@@ -10920,6 +10941,57 @@ mod tests {
         for sql in texts("app.mood", Some("text")) {
             assert!(!sql.contains("\"mood\""), "{sql}");
         }
+    }
+
+    /// A recorded default welded to a declared type (`'sad'::app.mood`, as the
+    /// catalog deparses it) is held by its literal: the type may be renamed
+    /// before the row statement runs, and the engine's own cast to the
+    /// column's type is the one that reads it (DEC-2346.2, rebuild review).
+    /// Anything else keeps its text and its cast.
+    #[test]
+    fn a_default_welded_to_a_declared_type_is_held_by_its_literal() {
+        let held = |default: &str| without_declared_type_casts(default).to_owned();
+        // Declared types, scalar, array, quoted and parenthesised.
+        assert_eq!(held("'sad'::app.mood"), "'sad'");
+        assert_eq!(held("('sad'::app.mood)"), "'sad'");
+        assert_eq!(held("'{sad,ok}'::app.mood[]"), "'{sad,ok}'");
+        assert_eq!(held("'sad'::\"app\".\"mood\""), "'sad'");
+        assert_eq!(held("NULL::app.mood"), "NULL");
+        // Negatives: a built-in cast, no cast, a mix, and an expression the
+        // guard does not hold at all keep their text.
+        for kept in [
+            "1",
+            "'a'::text",
+            "'1'::numeric(5,2)",
+            "'sad'::text::app.mood",
+            "'x'::character varying",
+            "app.f()",
+        ] {
+            assert_eq!(held(kept), kept, "{kept}");
+        }
+        // And the guard built from it never names the type.
+        let guard = |default: &str, read: &str, now: Option<&str>| {
+            let (read, now): (ColumnType, Option<ColumnType>) =
+                (read.parse().unwrap(), now.map(|n| n.parse().unwrap()));
+            defaulted_cell("next", default, Held::of(Some(&read), now.as_ref()))
+                .unwrap()
+                .expect("a constant default is held")
+        };
+        let renamed = guard("'sad'::app.mood", "app.mood", Some("app.feeling"));
+        assert!(
+            !renamed.contains("mood") && renamed.contains("'sad'") && renamed.contains("feeling"),
+            "{renamed}"
+        );
+        let kept = guard("'sad'::app.mood", "app.mood", None);
+        assert!(
+            !kept.contains("::app.mood") && kept.contains("'sad'"),
+            "{kept}"
+        );
+        let array = guard("'{sad}'::app.mood[]", "app.mood[]", Some("app.feeling[]"));
+        assert!(!array.contains("mood"), "{array}");
+        // A built-in default keeps the cast to the column's type.
+        let numeric = guard("1", "numeric(5,2)", None);
+        assert!(numeric.contains("AS numeric(5, 2)"), "{numeric}");
     }
 
     /// A delete is keyed *and* held to the recorded row, and it asks whether

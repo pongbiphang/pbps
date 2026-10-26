@@ -7208,3 +7208,98 @@ fn rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_na
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // Two runs: the guards hold, and a row changed outside pbps is refused.
+        for outside in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_default_rename2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-default-rename2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            let declare = |ty: &str, default: &str, rows: &str| {
+                let name = ty.rsplit('.').next().unwrap();
+                std::fs::write(
+                    d.dir.join(format!("schema/{ty}.type.yml")),
+                    format!(
+                        "enum: {ty}\nvalues: [sad, ok]\n{}",
+                        if name == "feeling" {
+                            "renamed_from: app.mood\n"
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    d.dir.join("schema/app.moods.yml"),
+                    format!(
+                        "table: app.moods\ncolumns:\n  m: {{type: {ty}, nullable: false}}\n  next: {{type: {ty}, default: \"{default}\"}}\n  note: {{type: text}}\nprimary_key: [m]\ndata:\n  mode: exact\n  rows:\n{rows}"
+                    ),
+                )
+                .unwrap();
+            };
+            // `next` is omitted in every row: its default applies.
+            declare(
+                "app.mood",
+                "'sad'::app.mood",
+                "    sad: {note: a}\n    ok: {note: b}\n",
+            );
+            let path = connected_artifact(&d, db, false);
+            succeeds(approved_apply(&d, db, &path, &[]));
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE next = 'sad'"),
+                2
+            );
+            // The type is renamed and its default respelled; one row is
+            // updated and one deleted, both still omitting the cell.
+            std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+            declare("app.feeling", "'sad'::app.feeling", "    ok: {note: c}\n");
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            let kinds = changes_of(&plan);
+            for kind in ["RenameType", "UpdateRow", "DeleteRow"] {
+                assert!(kinds.iter().any(|k| k == kind), "{kind}: {kinds:?}");
+            }
+            let allow = ["--allow", "rename,data-update,data-delete"];
+            if outside {
+                // A cell changed by someone else is still caught by the guard:
+                // the apply is refused and nothing is applied.
+                on_server(db, "UPDATE app.moods SET next = 'ok' WHERE m = 'ok'");
+                let refused = approved_apply(&d, db, &path, &allow);
+                assert_ne!(code(&refused), 0);
+                let said = stderr(&refused);
+                assert!(!said.contains("does not exist"), "{said}");
+                assert_eq!(
+                    scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                    1,
+                    "nothing applied"
+                );
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+                continue;
+            }
+            succeeds(approved_apply(&d, db, &path, &allow));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.moods WHERE m = 'ok' AND note = 'c'"
+                ),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 1);
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                0
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}

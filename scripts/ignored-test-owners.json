@@ -645,6 +645,7 @@
         "managed_types::pulled_enum_rows_recreate_and_re_pull_the_same",
         "managed_types::a_label_rename_under_rows_plans_no_row_change_and_finds_the_renamed_key",
         "managed_types::rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name",
+        "managed_types::rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type",
         "managed_types::a_cell_that_is_not_a_declared_label_or_uses_a_new_one_is_refused_and_the_split_applies",
         "managed_types::a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused",
         "managed_types::a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows",
