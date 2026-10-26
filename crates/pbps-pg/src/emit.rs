@@ -396,6 +396,7 @@ mod declared_type_emission_tests {
                 removed: vec![],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             }));
             assert_eq!(
                 moved[0].sql,
@@ -501,6 +502,7 @@ mod declared_type_emission_tests {
                 removed: vec![],
                 base_change: None,
                 conversion,
+                value_arrays: 0,
             }))
         };
         assert_eq!(

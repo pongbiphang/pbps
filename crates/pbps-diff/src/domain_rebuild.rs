@@ -338,17 +338,10 @@ pub(crate) fn plan(
             // rebuilt: its own base's change if that is what changed, else the
             // one it inherits from the type it is built on, whatever the
             // reason (a collation change, an array fallback, or only that the
-            // base is rebuilt). An array link makes the columns' values
-            // arrays of the narrowed base, and says so in the pair's shape,
-            // which is how a direct array column is told apart (DEC-1635.9).
-            let inherited = under
-                .and_then(|r| r.effective.clone())
-                .map(|(from, to)| match d.new {
-                    ManagedType::Domain { base: ty, .. } if ty.is_array() => {
-                        (from.into_array(), to.into_array())
-                    }
-                    ManagedType::Domain { .. } | ManagedType::Enum { .. } => (from, to),
-                });
+            // base is rebuilt). The pair is of the element types; whether a
+            // column's values are arrays is its shape's to say, one answer
+            // for every value check (`TypeResolver::values_shape`).
+            let inherited = under.and_then(|r| r.effective.clone());
             let base_change = match reason {
                 Why::Base => {
                     let (
@@ -358,7 +351,7 @@ pub(crate) fn plan(
                     else {
                         continue;
                     };
-                    Some((normalized(from), normalized(to)))
+                    Some((normalized(from).element(), normalized(to).element()))
                 }
                 Why::Derived(_) | Why::Collation | Why::Array => inherited,
             };
@@ -905,6 +898,26 @@ mod tests {
             .collect()
     }
 
+    /// The levels of array in the stored values of each column a plan moves.
+    fn value_arrays(rebuilt: &Rebuilt) -> BTreeMap<String, usize> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step:
+                        EnumRebuildStep::Retype {
+                            column,
+                            value_arrays,
+                            ..
+                        },
+                    ..
+                } => Some((column.name.raw().to_owned(), *value_arrays)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_domain_built_on_a_rebuilt_one_undergoes_its_roots_base_change() {
         let on = |base: &str| domain(base, None, &[]);
@@ -1091,9 +1104,10 @@ mod tests {
                 ..
             } if column.name.raw() == "w"
         )));
-        // An array link: the columns' values are arrays of the narrowed base,
-        // which the pair's shape says (no scalar probe; the direct array
-        // case's note).
+        // An array link: the pair stays of the element types and the
+        // columns' values are arrays of them, which the shape says
+        // (`TypeResolver::values_shape`): no scalar probe, the direct array
+        // case's note.
         let out = run_pair(
             "varchar(20)",
             "varchar(10)",
@@ -1101,12 +1115,14 @@ mod tests {
             on("app.d[]"),
             on("app.d2"),
         );
-        let changes = base_changes(&out);
-        let arrays = pair("varchar(20)[]", "varchar(10)[]");
-        assert_eq!(changes["v"], p, "the root's own column stays scalar");
-        assert_eq!(changes["w"], arrays, "{changes:?}");
-        // Through a second link, still arrays, and a link above an array keeps
-        // them so.
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        assert_eq!(
+            (changes["v"].clone(), changes["w"].clone()),
+            (p.clone(), p.clone())
+        );
+        assert_eq!((arrays["v"], arrays["w"]), (0, 1), "{arrays:?}");
+        // Through a second link the levels add up, and a scalar link under an
+        // array link adds none.
         let out = run_pair(
             "varchar(20)",
             "varchar(10)",
@@ -1114,9 +1130,9 @@ mod tests {
             on("app.d[]"),
             on("app.d2[]"),
         );
-        let changes = base_changes(&out);
-        assert_eq!(changes["w"], arrays, "{changes:?}");
-        assert_eq!(changes["x"], arrays, "{changes:?}");
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        assert_eq!(changes["x"], p, "{changes:?}");
+        assert_eq!((arrays["w"], arrays["x"]), (1, 2), "{arrays:?}");
         let out = run_pair(
             "varchar(20)",
             "varchar(10)",
@@ -1124,9 +1140,9 @@ mod tests {
             on("app.d"),
             on("app.d2[]"),
         );
-        let changes = base_changes(&out);
-        assert_eq!(changes["w"], p);
-        assert_eq!(changes["x"], arrays, "{changes:?}");
+        let arrays = value_arrays(&out);
+        assert_eq!(base_changes(&out)["w"], p);
+        assert_eq!((arrays["w"], arrays["x"]), (0, 1), "{arrays:?}");
         // A widening is carried as well, with the same shape (the dialect says
         // it is no narrowing).
         let out = run_pair(
@@ -1138,10 +1154,11 @@ mod tests {
         );
         assert_eq!(
             base_changes(&out)["w"],
-            pair("varchar(20)[]", "text[]"),
+            pair("varchar(20)", "text"),
             "{:?}",
             base_changes(&out)
         );
+        assert_eq!(value_arrays(&out)["w"], 1);
         // Below an enum there is no base change, array link or collation or
         // not.
         let over_enum = |d: ManagedType, d2: ManagedType, labels: &[&str]| {
@@ -1374,5 +1391,84 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn the_columns_of_a_domain_over_an_array_of_a_rebuilt_enum_are_read_by_their_elements() {
+        let on = |base: &str| domain(base, None, &[]);
+        let world_of = |labels: &[&str]| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e[]")),
+                ("app.d2", on("app.d")),
+                ("app.d3", on("app.d2[]")),
+            ]
+        };
+        let out = run(&world_of(&["a", "b"]), &world_of(&["a"]), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // `v` is of `app.d` (an array of the enum), `w` of `app.d2` over it,
+        // `x` of `app.d3`, an array of that: each reads its elements, and the
+        // target type is spelled with `[]` only where the column is.
+        let arrays = value_arrays(&out);
+        assert_eq!(
+            (arrays["v"], arrays["w"], arrays["x"]),
+            (1, 1, 2),
+            "{arrays:?}"
+        );
+        for change in &out.changes {
+            if let Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { array, removed, .. },
+                ..
+            } = change
+            {
+                assert!(!array, "none of these columns is itself `[]`");
+                assert_eq!(removed, &["b".to_owned()]);
+            }
+        }
+        // Negative: a scalar domain over the enum reads the value.
+        let scalar = |labels: &[&str]| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e")),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&scalar(&["a", "b"]), &scalar(&["a"]), &Hints::default());
+        assert_eq!(value_arrays(&out)["v"], 0);
+        assert_eq!(value_arrays(&out)["w"], 0);
+    }
+
+    #[test]
+    fn a_root_domain_over_an_array_narrows_its_elements_and_its_columns_are_arrays() {
+        let on = |base: &str| domain(base, None, &[]);
+        let world_of = |root: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(root)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(
+            &world_of("varchar(20)[]"),
+            &world_of("varchar(10)[]"),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let pair = Some(("varchar(20)".to_owned(), "varchar(10)".to_owned()));
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        // The pair is of the element types; the root's own array base is a
+        // level of the values of its columns and of the ones built on it.
+        assert_eq!(
+            (changes["v"].clone(), changes["w"].clone()),
+            (pair.clone(), pair)
+        );
+        assert_eq!((arrays["v"], arrays["w"]), (1, 1), "{arrays:?}");
+        // Negative: a scalar root has no level.
+        let out = run(
+            &world_of("varchar(20)"),
+            &world_of("varchar(10)"),
+            &Hints::default(),
+        );
+        assert_eq!(value_arrays(&out)["v"], 0);
     }
 }

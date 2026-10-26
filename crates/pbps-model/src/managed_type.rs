@@ -255,6 +255,13 @@ pub enum EnumRebuildStep {
         /// narrow it: the plan-time probe reports the rows that do not fit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_change: Option<Box<(crate::ColumnType, crate::ColumnType)>>,
+        /// How many levels of array the stored values have, through every
+        /// domain between the column's type and its leaf type and the
+        /// column's own `[]` (DEC-1635.9): what a value check must unnest. It
+        /// is not `array`, which is only whether the target type is spelled
+        /// with `[]`. Zero for a scalar.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        value_arrays: usize,
     },
     /// `DROP TYPE <name>; ALTER TYPE <tmp> RENAME TO <name>` (`DOMAIN` for a
     /// domain), then the carried `COMMENT ON`. The uid never changes.
@@ -514,6 +521,7 @@ mod rebuild_tests {
                 removed: vec!["gone".into()],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             }),
             step(EnumRebuildStep::Swap {
                 definition,
@@ -565,7 +573,9 @@ mod rebuild_tests {
         let [_, retype, swap] = steps();
         let text = serde_json::to_string(&retype).unwrap();
         assert!(
-            !text.contains("conversion") && !text.contains("base_change"),
+            !text.contains("conversion")
+                && !text.contains("base_change")
+                && !text.contains("value_arrays"),
             "{text}"
         );
         let mut domain = retype.clone();
@@ -574,11 +584,13 @@ mod rebuild_tests {
                 EnumRebuildStep::Retype {
                     conversion,
                     base_change,
+                    value_arrays,
                     ..
                 },
             ..
         } = &mut domain
         {
+            *value_arrays = 2;
             *conversion = crate::RetypeConversion::Assign;
             *base_change = Some(Box::new((
                 "varchar(20)".parse().unwrap(),
@@ -587,7 +599,9 @@ mod rebuild_tests {
         }
         let text = serde_json::to_string(&domain).unwrap();
         assert!(
-            text.contains("\"conversion\":\"assign\"") && text.contains("base_change"),
+            text.contains("\"conversion\":\"assign\"")
+                && text.contains("base_change")
+                && text.contains("\"value_arrays\":2"),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<Change>(&text).unwrap(), domain);

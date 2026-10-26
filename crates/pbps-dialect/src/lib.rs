@@ -4837,6 +4837,7 @@ mod tests {
                 removed: vec![],
                 base_change,
                 conversion: pbps_model::RetypeConversion::Assign,
+                value_arrays: 0,
             },
         };
         let (text, integer): (ColumnType, ColumnType) =

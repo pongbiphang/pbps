@@ -2611,6 +2611,7 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
             removed: vec![],
             base_change: None,
             conversion: Default::default(),
+            value_arrays: 0,
         },
     }]);
     let mut ids = pbps_model::IdsFile::default();

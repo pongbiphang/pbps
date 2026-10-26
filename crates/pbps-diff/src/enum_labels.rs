@@ -425,24 +425,26 @@ pub(crate) fn rebuild_type(
             why,
         },
     }];
-    out.extend(
-        columns
-            .into_iter()
-            .map(|(column_uid, column, to)| Change::EnumRebuild {
-                uid: uid.clone(),
-                name: name.clone(),
-                tmp: tmp.clone(),
-                step: EnumRebuildStep::Retype {
-                    column_uid,
-                    column,
-                    array: to.is_array(),
-                    to,
-                    removed: removed.clone(),
-                    conversion,
-                    base_change: base_change.clone().map(Box::new),
-                },
-            }),
-    );
+    out.extend(columns.into_iter().map(|(column_uid, column, to)| {
+        let value_arrays = resolver
+            .values_shape(TypeSide::Desired, &to, desired.schema)
+            .arrays;
+        Change::EnumRebuild {
+            uid: uid.clone(),
+            name: name.clone(),
+            tmp: tmp.clone(),
+            step: EnumRebuildStep::Retype {
+                column_uid,
+                column,
+                array: to.is_array(),
+                to,
+                removed: removed.clone(),
+                conversion,
+                base_change: base_change.clone().map(Box::new),
+                value_arrays,
+            },
+        }
+    }));
     out.push(Change::EnumRebuild {
         uid: uid.clone(),
         name: name.clone(),
@@ -3589,6 +3591,7 @@ mod rebuild_tests {
                 removed: vec![],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         };
         let (mut base, mut desired) = (world(&["a"]), world(&["a"]));

@@ -8161,3 +8161,70 @@ fn an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it() {
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_column_of_a_domain_over_an_array_of_a_rebuilt_enum_is_counted_by_its_elements() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // `x` is of a domain over `e[]`, `z` an array of that domain: neither
+        // holds a scalar, and the label `b` is removed.
+        for (removed_in_use, x, z, rows) in [
+            (false, "'{a,c}'", "ARRAY['{a}', '{c,c}']", "valid"),
+            (
+                true,
+                "'{a,b}'",
+                "ARRAY['{a}', '{c}']",
+                "a scalar domain column",
+            ),
+            (
+                true,
+                "'{a,c}'",
+                "ARRAY['{a}', '{b,c}']",
+                "an array of the domain",
+            ),
+        ] {
+            let sql = format!(
+                "CREATE SCHEMA app; CREATE TYPE app.e AS ENUM ('a', 'b', 'c'); \
+                 CREATE DOMAIN app.d AS app.e[]; \
+                 CREATE TABLE app.t (id integer PRIMARY KEY, x app.d, z app.d[]); \
+                 INSERT INTO app.t VALUES (1, {x}, {z}::app.d[]);"
+            );
+            let (own, d) = adopted(&server, "domain_array_labels4b", &sql);
+            let db = own.connection();
+            let uids = type_ids(&d);
+            std::fs::write(
+                d.dir.join("schema/app.e.type.yml"),
+                "enum: app.e\nvalues: [a, c]\n",
+            )
+            .unwrap();
+            let path = d.dir.join("array-labels.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            if removed_in_use {
+                // Counted by element, naming the column.
+                assert_ne!(code(&out), 0, "{rows}");
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(
+                    said.contains("elements of app.t.")
+                        && said.contains("holding a label this plan removes"),
+                    "{rows}: {said}"
+                );
+                assert!(!path.exists());
+                continue;
+            }
+            // Valid: no element holds `b`, though the arrays' text contains
+            // other labels and the whole text is no label.
+            assert_eq!(code(&out), 0, "{rows}: {}", stderr(&out));
+            succeeds(apply_allowing(&d, db, &path, &["type-rebuild"]));
+            assert_eq!(type_ids(&d), uids);
+            assert_eq!(
+                text_of(db, "SELECT x::text FROM app.t WHERE id = 1"),
+                "{a,c}"
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}

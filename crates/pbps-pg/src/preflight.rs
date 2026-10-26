@@ -3252,10 +3252,14 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     array,
                     removed,
                     base_change,
+                    value_arrays,
                     ..
                 },
             ..
         } => {
+            // Levels of array in the stored values, through every domain
+            // (DEC-1635.9): `array` alone is only the target's own `[]`.
+            let levels = (*value_arrays).max(usize::from(*array));
             // Nothing to count: no label goes, no base narrows.
             if removed.is_empty() && base_change.is_none() {
                 return Ok(Vec::new());
@@ -3272,9 +3276,9 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // before the apply vets it (DEC-1635.4), and the engine decides
             // them at the retype. An array's elements are not counted.
             if let Some((from, to)) = base_change.as_deref() {
-                // The same for a column whose values are arrays of the base
-                // through a domain built on an array of it.
-                if *array || from.is_array() || to.is_array() {
+                // The same for a column whose values are arrays of the base,
+                // its own `[]` or a domain built on an array of it.
+                if levels > 0 {
                     unchecked.push(Unchecked::for_change(
                         change,
                         "the elements of an array are not checked against a narrower base",
@@ -3304,13 +3308,23 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            let (what, sql) = if *array {
+            // One unnest per level of array in the stored values, so a
+            // domain over `e[]` is read by its elements and not by the
+            // array's text.
+            let (what, sql) = if levels > 0 {
+                let mut joins = String::new();
+                let mut source = format!("t.{quoted}");
+                for level in 1..=levels {
+                    joins.push_str(&format!(
+                        " CROSS JOIN LATERAL pg_catalog.unnest({source}) AS x{level}(v{level})"
+                    ));
+                    source = format!("x{level}.v{level}");
+                }
                 (
                     "elements",
                     format!(
-                        "SELECT {} AS n FROM {table} AS t CROSS JOIN LATERAL \
-                         pg_catalog.unnest(t.{quoted}::pg_catalog.text[]) AS x(label) \
-                         WHERE x.label OPERATOR(pg_catalog.=) ANY ({labels});",
+                        "SELECT {} AS n FROM {table} AS t{joins} \
+                         WHERE {source}::pg_catalog.text OPERATOR(pg_catalog.=) ANY ({labels});",
                         saturated_count("count(*)")
                     ),
                 )
@@ -5841,6 +5855,7 @@ mod tests {
                 removed: vec![],
                 base_change: Some(Box::new((ty(from), ty(to)))),
                 conversion,
+                value_arrays: 0,
             },
         };
         let retype = |array, from: &str, to: &str| {
@@ -5885,13 +5900,21 @@ mod tests {
         );
         // Through an array link the values are arrays of the base: no scalar
         // probe, and the elements are reported unchecked as for a direct
-        // array column.
-        let through_array = retype_with(
+        // array column. The pair stays of the element types; the shape is the
+        // step's `value_arrays`.
+        let mut through_array = retype_with(
             false,
-            "varchar(20)[]",
-            "varchar(10)[]",
+            "varchar(20)",
+            "varchar(10)",
             pbps_model::RetypeConversion::Text,
         );
+        if let Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { value_arrays, .. },
+            ..
+        } = &mut through_array
+        {
+            *value_arrays = 1;
+        }
         let report = preflight(&set(vec![through_array]));
         assert!(
             report.probes.is_empty() && !report.unchecked.is_empty(),
@@ -5917,6 +5940,7 @@ mod tests {
                 removed: removed.iter().map(|l| (*l).to_owned()).collect(),
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         };
         let report = preflight(&set(vec![retype(false, &["sad", "it's"])]));
@@ -5951,11 +5975,52 @@ mod tests {
             probe.description
         );
         assert!(
-            probe
-                .sql
-                .contains("pg_catalog.unnest(t.\"m\"::pg_catalog.text[])"),
+            probe.sql.contains("pg_catalog.unnest(t.\"m\") AS x1(v1)")
+                && probe
+                    .sql
+                    .contains("x1.v1::pg_catalog.text OPERATOR(pg_catalog.=)"),
             "{}",
             probe.sql
+        );
+        // A column of a domain built on `e[]` is not itself an array, and its
+        // values are read by their elements all the same; one more level of
+        // array unnests once more; a scalar domain reads the value.
+        let through = |levels: usize, removed: &[&str]| {
+            let mut change = retype(false, removed);
+            if let Change::EnumRebuild {
+                step: pbps_model::EnumRebuildStep::Retype { value_arrays, .. },
+                ..
+            } = &mut change
+            {
+                *value_arrays = levels;
+            }
+            preflight(&set(vec![change]))
+        };
+        let report = through(1, &["sad"]);
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe.description.starts_with("elements of app.t.m")
+                && probe.sql.contains("pg_catalog.unnest(t.\"m\") AS x1(v1)")
+                && !probe.sql.contains("\"m\"::pg_catalog.text"),
+            "{}",
+            probe.sql
+        );
+        let report = through(2, &["sad"]);
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe.sql.contains("unnest(x1.v1) AS x2(v2)")
+                && probe.sql.contains("x2.v2::pg_catalog.text"),
+            "{}",
+            probe.sql
+        );
+        let report = through(0, &["sad"]);
+        assert!(
+            matches!(report.probes.as_slice(), [p] if p.description.starts_with("rows of")),
+            "{report:#?}"
         );
         // Nothing removed, nothing to count: a pure reorder asks no question.
         let report = preflight(&set(vec![retype(false, &[])]));
@@ -7201,6 +7266,7 @@ mod tests {
                 removed: vec!["sad".to_owned()],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         };
 
@@ -7275,6 +7341,7 @@ mod tests {
                 removed: vec!["sad".to_owned()],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         };
         let probed =

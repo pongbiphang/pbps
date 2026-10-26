@@ -3806,4 +3806,23 @@ or check naming a label added in the same transaction is refused by the
 engine. The domain's `Retype`, `Swap` and the restored defaults and checks are
 classes 9 and 13, after the label statements of class 7.
 `an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it` pins it
-on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.
+on 16 and 18.
+
+Round 5 of the PR. Whether a column's stored values are arrays is asked in one
+place: `TypeResolver::values_shape` reads a column's type down every domain to
+its leaf and returns the leaf (enum, built-in, or another type) and the levels
+of array on the way, the column's own `[]` and each domain built on an array
+included. The rebuild's `Retype` carries it as `value_arrays` (plan format 56,
+omitted when zero), separate from `array`, which stays whether the target type
+is spelled with `[]`. The label probe unnests once per level, so a column of a
+domain over `e[]` is counted by its elements and not by the array's text; the
+narrowing probe reports such a column's elements unchecked by the same field.
+The base-change pair is of the element types always, replacing round 3's
+array-typed pair. Other readers: the new-label use check asks only whether a
+type reaches an enum, which is shape-free; the census reads the catalog for
+the type and its array; the data-row checks and the label-rename forwarding
+act on columns of the enum itself, and a column of a domain is refused rows
+(the enum rows of #2346). A column of an array of a domain over `e[]` is an array of arrays
+in the engine (two levels) and is counted level by level.
+`a_column_of_a_domain_over_an_array_of_a_rebuilt_enum_is_counted_by_its_elements`
+pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.

@@ -241,6 +241,7 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
         removed: vec![],
         base_change: None,
         conversion: Default::default(),
+        value_arrays: 0,
     };
     let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("c_aaaaaa"));
     assert!(super::saved::rebuild_is_well_formed(&ids, &change));

@@ -3585,6 +3585,7 @@ mod tests {
                 removed: vec![],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         }
     }

@@ -64,6 +64,7 @@ fn a_rebuilds_retype_is_a_step_of_its_column_and_must_agree_with_the_identities(
                 removed: vec![],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         })
     };

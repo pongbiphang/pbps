@@ -8546,6 +8546,7 @@ mod enum_rebuild_dependents_tests {
                 removed: vec![],
                 base_change,
                 conversion,
+                value_arrays: 0,
             },
         };
         let retype = |base_change| retype_with(base_change, RetypeConversion::Assign);
@@ -8574,19 +8575,6 @@ mod enum_rebuild_dependents_tests {
         );
         assert_eq!(
             risks(derived(Some(Box::new((ty("varchar(20)"), ty("text")))))),
-            [RiskClass::TypeRebuild].into()
-        );
-        // Through an array link the pair is of arrays, and keeps the
-        // element's risk.
-        let arrays = |from: &str, to: &str| {
-            derived(Some(Box::new((ty(from).into_array(), ty(to).into_array()))))
-        };
-        assert_eq!(
-            risks(arrays("varchar(20)", "varchar(10)")),
-            [RiskClass::TypeRebuild, RiskClass::Narrowing].into()
-        );
-        assert_eq!(
-            risks(arrays("varchar(20)", "text")),
             [RiskClass::TypeRebuild].into()
         );
         // And a rebuilt enum's labels are no base change.

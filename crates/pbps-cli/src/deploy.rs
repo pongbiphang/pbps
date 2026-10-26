@@ -11242,6 +11242,7 @@ mod tests {
                 removed: vec!["sad".to_owned()],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
         };
         let check = pbps_model::Change::AddCheck {
@@ -16245,6 +16246,7 @@ mod tests {
                         removed: vec![],
                         base_change: None,
                         conversion: Default::default(),
+                        value_arrays: 0,
                     },
                 ),
                 step(

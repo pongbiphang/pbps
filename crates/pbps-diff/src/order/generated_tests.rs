@@ -55,6 +55,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 removed: vec![],
                 base_change: None,
                 conversion: Default::default(),
+                value_arrays: 0,
             },
             vec![&table],
         ),

@@ -1080,6 +1080,7 @@ mod tests {
             removed: Vec::new(),
             base_change: None,
             conversion: Default::default(),
+            value_arrays: 0,
         });
         assert!(!touches(&retype, &surface));
     }
@@ -1137,6 +1138,7 @@ mod tests {
             removed: Vec::new(),
             base_change: None,
             conversion: Default::default(),
+            value_arrays: 0,
         });
         assert!(matches!(
             owner(&retype).0.as_slice(),

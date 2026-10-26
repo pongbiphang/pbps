@@ -422,6 +422,7 @@ mod effects_of_each_kind {
                         removed: vec![],
                         base_change: None,
                         conversion: Default::default(),
+                        value_arrays: 0,
                     },
                 },
             ),
