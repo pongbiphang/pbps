@@ -7132,3 +7132,79 @@ fn a_staged_plan_cannot_hold_a_chain_of_label_renames() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // A rename in place, and a move to another schema.
+        for target in ["app.feeling", "moved.feeling"] {
+            let own = OwnDatabase::new(&server, "enum_type_rename_rows2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app; CREATE SCHEMA moved");
+            let d = Demo::new("enum-type-rename-rows2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            enum_rows(
+                &d,
+                "[sad, ok, happy]",
+                "exact",
+                "    sad: {next: ok, note: low}\n    ok: {next: happy}\n",
+            );
+            let path = connected_artifact(&d, db, false);
+            succeeds(approved_apply(&d, db, &path, &[]));
+
+            // The type is renamed and, in the same plan, a text cell changes in a
+            // row that holds enum cells, a row is inserted and a row is deleted.
+            // The rename runs first, so every guard must name the type as it is
+            // then (DEC-2346.2).
+            std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+            std::fs::write(
+                d.dir.join(format!("schema/{target}.type.yml")),
+                format!("enum: {target}\nrenamed_from: app.mood\nvalues: [sad, ok, happy]\n"),
+            )
+            .unwrap();
+            std::fs::write(
+            d.dir.join("schema/app.moods.yml"),
+            format!("table: app.moods\ncolumns:\n  m: {{type: {target}, nullable: false}}\n  next: {{type: {target}}}\n  note: {{type: text}}\nprimary_key: [m]\ndata:\n  mode: exact\n  rows:\n    sad: {{next: ok, note: high}}\n    happy: {{next: sad}}\n"),
+        )
+        .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let renamed = label_plan(&d, db, &path);
+            let kinds = changes_of(&renamed);
+            for kind in ["RenameType", "UpdateRow", "InsertRow", "DeleteRow"] {
+                assert!(kinds.iter().any(|k| k == kind), "{kind}: {kinds:?}");
+            }
+            let refused = approved_apply(&d, db, &path, &[]);
+            assert_ne!(code(&refused), 0);
+            assert!(
+                stderr(&refused).contains("data-update"),
+                "{}",
+                stderr(&refused)
+            );
+            let allow = ["--allow", "rename,data-update,data-delete"];
+            succeeds(approved_apply(&d, db, &path, &allow));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.moods WHERE m = 'sad' AND note = 'high' AND next = 'ok'"
+                ),
+                1
+            );
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE m = 'happy'"),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                0
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}

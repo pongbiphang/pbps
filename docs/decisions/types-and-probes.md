@@ -3605,6 +3605,22 @@ Maintainer, 2026-10-24: the second of two PRs, after the partition keys
   enum array or a domain stay refused until #1167's array codec exists and
   the domain's operators do (a domain over an enum has no `=`).
 
+A type this plan renames or moves (ready round 2). The rename runs before any
+row change, and the recorded cells are held by casting through the column's
+type, so a guard that named the type the rename retires failed at apply and
+rolled a valid plan back. The row changes keep `types` on the base side and
+`after_types` on the desired side, which the type pins depend on; the emitter's
+`Held::of` decides: a declared type read as one type and held as another reads
+the recorded text as `text` and goes to the type the column then has, never
+through the retired name. A rename is thereby no conversion; a retype to a
+built-in type goes through text the same way; a built-in retype keeps its
+cast chain. Verdict per row statement: an insert carries the declared types
+(execution-time names); an update's set values use `after_types` before
+`types`, its guard is fixed here; a delete's guard is fixed here; the key is
+held by the declared `key_type`; `ensure` keys emit no SQL and compare by
+`key_type` at read; the label-rename forwarding rewrites recorded text only and
+casts nothing. A schema move of the enum is the same case.
+
 Tests: `only_a_scalar_declared_enum_carries_data_rows`,
 `a_cell_over_an_enum_column_names_declared_labels_only` and
 `a_declared_enum_is_read_and_its_key_is_compared_as_text` (pbps-pg),
@@ -3622,7 +3638,9 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key`,
 `a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table`,
 `a_takeover_under_a_renamed_key_pins_the_row_it_depends_on`,
-`a_staged_plan_cannot_hold_a_chain_of_label_renames` and
+`a_staged_plan_cannot_hold_a_chain_of_label_renames`,
+`rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name`
+(a rename and a schema move; pbps-pg `row_guards_cast_a_renamed_declared_type_by_its_new_name_only`) and
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.

@@ -6043,10 +6043,29 @@ impl<'a> Held<'a> {
     /// one. `None` is not "no type" — it is "the same one".
     fn of(read: Option<&'a ColumnType>, now: Option<&'a ColumnType>) -> Option<Self> {
         let read = read?;
-        Some(Held {
-            read,
-            now: now.filter(|n| *n != read),
-        })
+        let now = now.filter(|n| *n != read);
+        // A declared type, retyped here or renamed or moved by this plan: the
+        // rename runs before any row change, so a cast through the name it
+        // retires names a type that no longer exists, and a rename is no
+        // conversion. The recorded text is the label or value itself (it is
+        // what the retype's own `USING col::text::...` maps), so it is read as
+        // text and goes to the type the column has when the statement runs
+        // (DEC-2346.2, round 2).
+        if let Some(now) = now
+            && read.type_ref().is_some()
+        {
+            static TEXT: std::sync::LazyLock<(ColumnType, ColumnType)> =
+                std::sync::LazyLock::new(|| {
+                    let text: ColumnType = "text".parse().expect("text parses");
+                    let array = text.clone().into_array();
+                    (text, array)
+                });
+            return Some(Held {
+                read: if read.is_array() { &TEXT.1 } else { &TEXT.0 },
+                now: Some(now),
+            });
+        }
+        Some(Held { read, now })
     }
 
     fn read(self) -> ColumnType {
@@ -10803,6 +10822,104 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("IF pbps.pbps_rows <> 1 THEN"), "{sql}");
+    }
+
+    /// A declared type this plan renames or moves is renamed before any row
+    /// changes, so the guards on the cells that hold it never cast through the
+    /// name the plan retires, and a rename is no conversion. Not a rename (no
+    /// retyped column, or a built-in one) leaves each guard as it was
+    /// (DEC-2346.2, round 2).
+    #[test]
+    fn row_guards_cast_a_renamed_declared_type_by_its_new_name_only() {
+        let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
+        let texts = |kind: &str, now: Option<&str>| {
+            let types: BTreeMap<ColumnName, ColumnType> =
+                [("kind".into(), ty(kind)), ("note".into(), ty("text"))].into();
+            let after_types: BTreeMap<ColumnName, ColumnType> =
+                now.map(|n| ("kind".into(), ty(n))).into_iter().collect();
+            let update = Change::UpdateRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                columns: [(
+                    "note".into(),
+                    (
+                        Cell::Value(Value::Text("low".into())),
+                        Cell::Value(Value::Text("high".into())),
+                    ),
+                )]
+                .into(),
+                unchanged: [("kind".into(), Cell::Value(Value::Text("ok".into())))].into(),
+                types: types.clone(),
+                after_types: after_types.clone(),
+                key_type: None,
+            };
+            let delete = Change::DeleteRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: BTreeMap::new(),
+                row: [
+                    ("kind".into(), Cell::Value(Value::Text("ok".into()))),
+                    ("note".into(), Cell::Value(Value::Text("low".into()))),
+                ]
+                .into(),
+                types,
+                after_types,
+                key_type: None,
+            };
+            [&update, &delete].map(|c| sql_of(&Postgres::new(), c).join("\n"))
+        };
+        // Renamed, moved, and an array of it: the old name is nowhere.
+        for (old, new) in [
+            ("app.mood", "app.feeling"),
+            ("app.mood", "moved.mood"),
+            ("app.mood[]", "app.feeling[]"),
+        ] {
+            for sql in texts(old, Some(new)) {
+                assert!(
+                    !sql.contains("mood\"") || new.contains("mood"),
+                    "{old}: {sql}"
+                );
+                assert!(
+                    !sql.contains(&format!("AS {}", ty(old).raw()))
+                        && !sql.contains("\"app\".\"mood\""),
+                    "{old} -> {new}: {sql}"
+                );
+                assert!(sql.contains("E'ok'"), "{sql}");
+            }
+        }
+        // No rename: no cast at all, as before.
+        for sql in texts("app.mood", None) {
+            assert!(!sql.contains("CAST(CAST("), "{sql}");
+        }
+        // A built-in column retyped keeps the conversion through the old type.
+        let numeric = {
+            let types: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("numeric(5,2)"))].into();
+            let after: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("integer"))].into();
+            let change = Change::DeleteRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: BTreeMap::new(),
+                row: [("n".into(), Cell::Value(Value::Text("1.50".into())))].into(),
+                types,
+                after_types: after,
+                key_type: None,
+            };
+            sql_of(&Postgres::new(), &change).join("\n")
+        };
+        assert!(
+            numeric.contains("AS numeric(5, 2)") && numeric.contains("AS integer"),
+            "{numeric}"
+        );
+        // A declared type retyped to a built-in one goes through text, never
+        // through the name it had.
+        for sql in texts("app.mood", Some("text")) {
+            assert!(!sql.contains("\"mood\""), "{sql}");
+        }
     }
 
     /// A delete is keyed *and* held to the recorded row, and it asks whether
