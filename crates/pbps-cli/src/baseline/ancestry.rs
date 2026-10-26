@@ -45,6 +45,13 @@ fn git_marker(root: &Path) -> std::io::Result<bool> {
 }
 
 pub(crate) fn check(root: &Path, sha: &str) -> Evidence {
+    // Relative or symlinked project paths must find the physical repository's
+    // ancestors too; failing to resolve them is unreadable evidence, not absence.
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(e) => return Evidence::Unreadable(e.to_string()),
+    };
+    let root = root.as_path();
     // Exit 128 also covers corrupt metadata and denied access. Only a known
     // non-repository is the no-evidence case; an unreadable repository refuses.
     match run(root, &["rev-parse", "--git-dir"]) {
@@ -220,6 +227,45 @@ mod tests {
         );
         let plain = Temp::new();
         assert_eq!(check(plain.path(), &a), Evidence::NoCheckout);
+    }
+
+    #[test]
+    fn relative_nested_projects_preserve_unreadable_git_evidence() {
+        const CHILD: &str = "PBPS_TEST_RELATIVE_ANCESTRY_SHA";
+        if let Ok(sha) = std::env::var(CHILD) {
+            let root = Path::new(".");
+            assert_eq!(check(root, &sha), Evidence::Contains);
+            std::fs::write("../../.git/HEAD", "broken metadata\n").unwrap();
+            let evidence = check(root, &sha);
+            assert!(matches!(evidence, Evidence::Unreadable(_)), "{evidence:?}");
+            std::fs::rename("../../.git", "../../damaged-git").unwrap();
+            assert_eq!(check(root, &sha), Evidence::NoCheckout);
+            let evidence = check(Path::new("missing-project"), &sha);
+            assert!(matches!(evidence, Evidence::Unreadable(_)), "{evidence:?}");
+            return;
+        }
+        let dir = repo();
+        let sha = commit(dir.path(), "a");
+        let nested = dir.path().join("nested/project");
+        std::fs::create_dir_all(&nested).unwrap();
+        // A child owns the relative working directory without changing it for
+        // the other tests running in this process.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "baseline::ancestry::tests::relative_nested_projects_preserve_unreadable_git_evidence",
+                "--nocapture",
+            ])
+            .env(CHILD, sha)
+            .current_dir(nested)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
