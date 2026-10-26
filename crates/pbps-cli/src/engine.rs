@@ -1411,14 +1411,12 @@ pub async fn refuse_added_computed_calls(
 /// creates or moves things to, and the children of the tables it changes,
 /// so the plan's own moves can be walked. The last pass to reorder the plan:
 /// called after every other one, so what it settles is what is saved.
-pub async fn order_created_object_names<S: Clone>(
+pub(crate) async fn order_created_object_names<S: Clone>(
     conn: &mut Conn,
     cs: &mut PlanningPlan<S>,
-    ids: &pbps_model::IdsFile,
     label: &str,
     precedence: &[(pbps_model::Change, pbps_model::Change)],
-    before: &Schema,
-    after: &Schema,
+    declared: &crate::dependents::schedule::Declarations<'_>,
 ) -> anyhow::Result<Option<pbps_dialect::slots::CatalogFacts>> {
     if conn.driver() != Driver::Mssql {
         return Ok(None);
@@ -1442,7 +1440,7 @@ pub async fn order_created_object_names<S: Clone>(
             .collect();
         crate::object_order::order_column_renames(cs, &alike, label)?;
     }
-    let index = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let index = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)?;
     let (mut names, parents) = crate::deploy::object_reads(cs, &index);
     let mut occupants = pbps_mssql::catalog::object_name_occupants(conn, &names, &parents).await?;
     // Where a transfer carries each child of a moved table: a name the
@@ -1482,12 +1480,33 @@ pub async fn order_created_object_names<S: Clone>(
     let mut candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
     // Computed-column reads may be skipped on a module-only plan. Extend this
     // existing comparison, whose answers the final observer already carries.
-    candidates.extend(pbps_mssql::schema_bound_call_names(cs, before, after));
+    candidates.extend(pbps_mssql::schema_bound_call_names(
+        cs,
+        declared.sources.before.schema,
+        declared.schema,
+    ));
     candidates.sort();
     candidates.dedup();
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
+    let facts = object_slots(&occupants, &candidates, &alike);
+    // Name equality can reveal a dependency that the earlier lexical passes
+    // could not schedule (#2221). Settle it before the final name walk and
+    // observer, using the same comparison and existing release mechanism.
+    *cs = pbps_diff::order::catalog_requirements(
+        cs.clone(),
+        declared.sources.before,
+        pbps_diff::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
+        &pbps_mssql::Mssql,
+        declared.module_deps,
+        &facts,
+        precedence,
+    )
+    .map_err(anyhow::Error::msg)?;
     crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)?;
-    Ok(Some(object_slots(&occupants, &candidates, &alike)))
+    Ok(Some(facts))
 }
 
 /// What the `sys.objects` reads found, as name slots for the slot replay

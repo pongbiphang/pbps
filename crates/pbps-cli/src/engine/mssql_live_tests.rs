@@ -60,26 +60,37 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
         after.modules.insert(caller.clone(), function(&caller_body));
         let changes = ChangeSet {
             changes: vec![
-                PlannedChange::new(Change::AlterModule {
-                    id: callee.clone(),
-                    module: Box::new(function(new)),
-                }),
                 PlannedChange::new(Change::CreateModule {
                     id: caller.clone(),
                     module: Box::new(function(&caller_body)),
+                }),
+                PlannedChange::new(Change::AlterModule {
+                    id: callee.clone(),
+                    module: Box::new(function(new)),
                 }),
             ],
         };
         assert!(before.tables.is_empty() && after.tables.is_empty());
         let mut plan = order::propose(changes);
         let ids = IdsFile::default();
+        let dependencies = Default::default();
+        let declarations = crate::dependents::schedule::Declarations {
+            schema: &after,
+            sources: crate::dependents::Sources {
+                before: pbps_diff::Side {
+                    schema: &before,
+                    ids: &ids,
+                },
+                after: &ids,
+            },
+            module_deps: &dependencies,
+        };
         // This is the shipping connected pass. Neither computed-column read
         // runs; its existing object-name comparison must still cover calls.
-        let facts =
-            order_created_object_names(&mut conn, &mut plan, &ids, "test", &[], &before, &after)
-                .await
-                .unwrap()
-                .unwrap();
+        let facts = order_created_object_names(&mut conn, &mut plan, "test", &[], &declarations)
+            .await
+            .unwrap()
+            .unwrap();
         let key = |name: &str| SlotKey {
             namespace: Namespace::Relations("app".into()),
             name: name.into(),
@@ -110,6 +121,11 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
             .iter()
             .position(|op| matches!(op.change(), Change::AlterModule { id, .. } if id == &callee))
             .unwrap();
+        assert_eq!(
+            f < g,
+            matches,
+            "caller-first input must be scheduled under {collation}"
+        );
         let requirement = Requirement::Is(ObjectKey::Module(callee.clone()), Incarnation::Final);
         assert_eq!(
             analysed.effects[g].requires.contains(&requirement),
@@ -198,7 +214,7 @@ async fn module_only_callers_use_catalog_collation_and_reversed_order_is_refused
             .is_err()
         );
         assert!(
-            order_created_object_names(&mut conn, &mut plan, &ids, "test", &[], &before, &after)
+            order_created_object_names(&mut conn, &mut plan, "test", &[], &declarations)
                 .await
                 .is_err()
         );

@@ -8624,7 +8624,8 @@ object-name comparison with the actual operation payload's two-part calls,
 baseline calls it releases, and managed function names from both snapshots.
 This runs on module-only plans too, independently of computed-column reads.
 It reuses the existing `COLLATE CATALOG_DEFAULT` comparison (DEC-1459.1)
-and passes its `CatalogFacts` to engine effects. The query now runs where
+and passes its `CatalogFacts` to engine effects and the existing dependency-release
+scheduler before the final name walk and observer. The query now runs where
 fewer than two candidates previously skipped it; no new metadata read or
 privilege is needed. These remain text-derived requirements, not catalog
 dependency edges.

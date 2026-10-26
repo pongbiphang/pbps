@@ -1708,7 +1708,9 @@ fn connected_call_candidates_include_payloads_and_old_bindings_without_computed_
             module: Box::new(view_of("SELECT APP.F(1) AS n", bound)),
         })],
     };
-    assert!(pbps_mssql::schema_bound_call_names(&view(true), &before, &after)
-        .contains(&TableName::new("APP", "F")));
+    assert!(
+        pbps_mssql::schema_bound_call_names(&view(true), &before, &after)
+            .contains(&TableName::new("APP", "F"))
+    );
     assert!(pbps_mssql::schema_bound_call_names(&view(false), &before, &after).is_empty());
 }

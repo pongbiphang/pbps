@@ -80,7 +80,7 @@ pub use plan::{
     Canonical, CanonicalPlan, Continuing, DiffPlan, Differ, Draft, OrderedPlan, PlanView,
     PlanningPlan, RouteState, propose, take,
 };
-pub use rewrites::before_rewrites;
+pub use rewrites::{before_rewrites, catalog_requirements};
 pub use roles::role_drops;
 pub use saved::{
     AdmissionError, AdmittedPlan, ArtifactView, SealedPlan, admit, seal, validate_saved_plan,
