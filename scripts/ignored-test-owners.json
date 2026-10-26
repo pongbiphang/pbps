@@ -351,7 +351,6 @@
         "darwin"
       ],
       "cases": [
-        "a_docker_sql_server_run_killed_inside_its_externals_file_is_removed_by_the_next_run",
         "dependencies2322::readable_dependencies_compare_exact_shapes_and_name_each_refusal",
         "dependencies2322::unreadable_dependencies_are_reported_without_claiming_comparison",
         "dependencies2322::apply_binds_dependencies_transactionally_without_repeating_the_comparison",
@@ -571,7 +570,8 @@
         "darwin"
       ],
       "cases": [
-        "a_dev_container_outlives_the_call_that_started_it"
+        "a_dev_container_outlives_the_call_that_started_it",
+        "recovery2410_docker::a_docker_sql_server_run_killed_inside_its_externals_file_is_removed_by_the_next_run"
       ]
     },
     {
