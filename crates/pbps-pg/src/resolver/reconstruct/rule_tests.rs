@@ -335,6 +335,55 @@ async fn scratch_rules_compile_on_both_servers() {
         vec![create("t", defaulted()), sql("f", "g"), plpgsql("g", "f")],
         literal_readers().to_vec(),
         header_readers(),
+        // A string is data unless an OID-alias type reads it: the objects
+        // whose strings equal each other's names are made in either order, and
+        // the ones a cast names are made before it.
+        vec![
+            declared_type("app.a", domain_with("text", Some("'b'"), None)),
+            declared_type("app.b", domain_with("text", Some("'a'"), None)),
+        ],
+        vec![
+            declared_type("app.a", domain_with("text", None, Some("VALUE <> 'b'"))),
+            declared_type("app.b", domain_with("text", None, Some("VALUE <> 'a'"))),
+        ],
+        vec![
+            declared_type(
+                "app.a",
+                domain_with("text", Some("'app.b'::regtype::text"), None),
+            ),
+            declared_type("app.b", mood()),
+        ],
+        vec![
+            module(
+                "app.f(regtype)",
+                ModuleKind::Function,
+                "(x regtype DEFAULT 'app.b') RETURNS integer LANGUAGE sql RETURN 1",
+            ),
+            declared_type("app.b", mood()),
+        ],
+        vec![
+            module("app.v", ModuleKind::View, "SELECT 'w' AS n"),
+            module("app.w", ModuleKind::View, "SELECT 'v' AS n"),
+            routine("g", "sql", " SELECT length('h') "),
+            routine("h", "sql", " SELECT length('g') "),
+            create("t", held_table()),
+            function("f"),
+        ],
+        vec![
+            module(
+                "app.v",
+                ModuleKind::View,
+                "SELECT 'app.w'::regclass::oid AS o",
+            ),
+            module("app.w", ModuleKind::View, "SELECT 1 AS n"),
+            create("t", held_table()),
+            function("f"),
+        ],
+        // A generation that only says the name of a routine reading its table.
+        vec![
+            create("t", saying_a_routine()),
+            routine("f", "sql", " SELECT count(*)::int FROM app.t "),
+        ],
         // A declared type is resolved at creation and a body or default is not.
         delayed_view(declaring(
             "r app.v%ROWTYPE; c CURSOR (p app.v) FOR SELECT 1;",
@@ -669,4 +718,210 @@ fn a_late_body_naming_an_index_does_not_follow_the_table_keeping_it() {
         at(&order, "function app.f(integer)") < at(&order, "table app.t"),
         "{order:?}"
     );
+}
+
+fn domain_with(base: &str, default: Option<&str>, check: Option<&str>) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: base.parse().unwrap(),
+        not_null: false,
+        default: default.map(str::to_owned),
+        checks: check
+            .map(|c| ("c".into(), c.to_owned()))
+            .into_iter()
+            .collect(),
+        collation: None,
+    }
+}
+
+fn defaulting(ty: &str, default: &str) -> Table {
+    let mut table = Table::default();
+    let mut column = Column::new(ty.parse().unwrap());
+    column.value_source = ValueSource::Default(default.into());
+    table.columns.insert("c".into(), column);
+    table
+}
+
+/// What a string says is data unless an OID-alias type reads it (DEC-2389.3,
+/// measured on 16.15 and 18.6, every named object absent): a domain
+/// `AS text DEFAULT 'b'` or a view selecting `'b'` is created with no `b`. So
+/// domains, views and routines whose strings equal one another's names are no
+/// cycle, though the engine creates them in either order.
+#[test]
+fn a_string_equal_to_an_objects_name_is_data_and_no_cycle() {
+    let domains = [
+        [
+            declared_type("app.a", domain_with("text", Some("'b'"), None)),
+            declared_type("app.b", domain_with("text", Some("'a'"), None)),
+        ],
+        [
+            declared_type("app.a", domain_with("text", None, Some("VALUE <> 'b'"))),
+            declared_type("app.b", domain_with("text", None, Some("VALUE <> 'a'"))),
+        ],
+        // The one that names `d2` as a base is no cycle with the one whose
+        // default only says `d3`.
+        [
+            declared_type("app.d2", domain_with("text", Some("'d3'"), None)),
+            declared_type("app.d3", domain_with("app.d2", None, None)),
+        ],
+    ];
+    for version in [None, Some(160_000)] {
+        for changes in &domains {
+            assert_eq!(order(changes, version).len(), 2, "{changes:?}");
+        }
+    }
+    // The table that holds the modules back keeps the modules' own edges.
+    let modules = [
+        module("app.v", ModuleKind::View, "SELECT 'w' AS n"),
+        module("app.w", ModuleKind::View, "SELECT 'v' AS n"),
+        routine("f", "sql", " SELECT length('g') "),
+        routine("g", "sql", " SELECT length('f') "),
+        create("t", held_table()),
+        function("h"),
+    ];
+    assert!(at(&order(&modules, None), "view app.v") < at(&order(&modules, None), "view app.w"));
+}
+
+/// Negative: where an OID-alias type reads a string the engine resolves it
+/// when it creates the change (measured: `42704`, `42P01`, `42883`), so it
+/// names its object, in each spelling that reads it and in a parameter's
+/// default.
+#[test]
+fn a_string_an_oid_alias_type_reads_still_orders() {
+    let reads = [
+        "'app.b'::regtype::text",
+        "(regtype 'app.b')::text",
+        "regtype('app.b')::text",
+        "CAST('app.b' AS regtype)::text",
+        "'app.b'::pg_catalog.regtype::text",
+    ];
+    for version in [None, Some(160_000)] {
+        for default in reads {
+            let changes = [
+                declared_type("app.a", domain_with("text", Some(default), None)),
+                declared_type("app.b", mood()),
+            ];
+            let order = order(&changes, version);
+            assert!(
+                at(&order, "type app.b") < at(&order, "type app.a"),
+                "{default}: {order:?}"
+            );
+        }
+        // A routine's parameter of such a type, in a header.
+        let header = |parameter: &str| {
+            [
+                module(
+                    "app.f(regtype)",
+                    ModuleKind::Function,
+                    &format!("(x {parameter}) RETURNS integer LANGUAGE sql RETURN 1"),
+                ),
+                declared_type("app.b", mood()),
+            ]
+        };
+        let typed = order(&header("regtype DEFAULT 'app.b'"), version);
+        assert!(
+            at(&typed, "type app.b") < at(&typed, "function app.f(regtype)"),
+            "{typed:?}"
+        );
+        let text = order(&header("text DEFAULT 'app.b'"), version);
+        assert!(
+            at(&text, "function app.f(regtype)") < at(&text, "type app.b"),
+            "{text:?}"
+        );
+        // The same strings in a module, behind a table held for its function.
+        let held = |view: &str| {
+            [
+                module("app.v", ModuleKind::View, view),
+                module("app.w", ModuleKind::View, "SELECT 1 AS n"),
+                create("t", held_table()),
+                function("f"),
+            ]
+        };
+        let named = order(&held("SELECT 'app.w'::regclass::oid AS o"), version);
+        assert!(
+            at(&named, "view app.w") < at(&named, "view app.v"),
+            "{named:?}"
+        );
+        let data = order(&held("SELECT 'app.w' AS o"), version);
+        assert!(
+            at(&data, "view app.v") < at(&data, "view app.w"),
+            "{data:?}"
+        );
+    }
+}
+
+/// A string equal to an index's name is data as well: the view that selects
+/// it keeps its place before the table that is held back (and
+/// `a_reader_naming_an_index_follows_the_table_that_keeps_it` is the cast).
+#[test]
+fn a_string_equal_to_an_indexs_name_does_not_follow_its_table() {
+    let changes = [
+        module("app.v", ModuleKind::View, "SELECT 'app.t_ix' AS o"),
+        create("t", held_table()),
+        function("f"),
+    ];
+    let order = order(&changes, None);
+    assert!(
+        at(&order, "view app.v") < at(&order, "table app.t"),
+        "{order:?}"
+    );
+}
+
+/// The premise of reading the strings of a text alone: no declared column or
+/// domain is of an OID-alias type, so none reads the string of a default
+/// without the cast showing in that default's text.
+#[test]
+fn no_declared_column_or_domain_is_of_an_oid_alias_type() {
+    let pg = crate::Postgres::new();
+    for changes in [
+        vec![create("t", defaulting("regtype", "'app.b'"))],
+        vec![declared_type("app.a", domain_with("regclass", None, None))],
+    ] {
+        assert!(super::tests::build_reconstruction(&pg, &changes).is_err());
+    }
+}
+
+fn saying_a_routine() -> Table {
+    let mut table = Table::default();
+    table.columns.insert("a".into(), int());
+    table
+        .columns
+        .insert("g".into(), generated("a + length('f')"));
+    table
+}
+
+/// A generated column whose expression only says the name of a routine that
+/// reads its table is no call of it: the routine would wait for the whole
+/// table and the column for the routine, a cycle the engine does not have.
+#[test]
+fn a_generation_saying_a_routines_name_does_not_wait_for_it() {
+    let mut table = saying_a_routine();
+    let reader = routine("f", "sql", " SELECT count(*)::int FROM app.t ");
+    for version in [None, Some(160_000)] {
+        let order = order(&[create("t", table.clone()), reader.clone()], version);
+        assert_eq!(order.len(), 3, "{order:?}");
+        assert!(
+            at(&order, "column app.t.g") < at(&order, "function app.f(integer)"),
+            "{order:?}"
+        );
+    }
+    // Two tables whose generations only say each other's names.
+    let saying = |other: &str| {
+        let mut t = Table::default();
+        t.columns.insert("a".into(), int());
+        t.columns
+            .insert("g".into(), generated(&format!("a + length('{other}')")));
+        t
+    };
+    assert_eq!(
+        order(&[create("t", saying("u")), create("u", saying("t"))], None).len(),
+        2
+    );
+    // Negative: a cast to an OID-alias type names it, and the same call is the cycle.
+    let named = generated("a + length('app.f(integer)'::regprocedure::text)");
+    table.columns.insert("g".into(), named);
+    let pg = crate::Postgres::new();
+    assert!(matches!(
+        super::tests::build_reconstruction(&pg, &[create("t", table), reader]),
+        Err(ReconstructError::Cycle(_))
+    ));
 }

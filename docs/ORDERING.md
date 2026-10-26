@@ -636,6 +636,7 @@ and the expression-bearing changes that need a function.
 | Module or generated expression → an index that holds an expression or a predicate | position | scratch only: the index follows every one, so each counts it among the names made resolvable after it | ✓ DEC-2389.1 |
 | Type created → every change whose text names it, a domain over it included | content, over-approximated | scratch only: a column, routine or domain over an absent type is `42704`; the module is read through `module_creation_text` | ✓ DEC-2389.1, DEC-2407.1 |
 | Module → module, table or index its text names | content, over-approximated | scratch only: read through the text the engine resolves at creation (`module_creation_text`): a PL/pgSQL body is a reference only where it declares a type, a `LANGUAGE sql` body, view, trigger and every header are | ✓ DEC-2389.2 |
+| A string in a text → the object it names | content, over-approximated | scratch only: a string is a name only where the text names an OID-alias type in code (`'app.b'::regtype`); otherwise it is data, so `DEFAULT 'b'` beside a type `b` orders nothing | ✓ DEC-2389.3 |
 
 ### Something removed before what it blocks
 

@@ -8792,3 +8792,55 @@ Pinned by `routines_that_call_each_other_late_are_no_cycle`,
 `a_late_body_naming_an_index_does_not_follow_the_table_keeping_it`,
 `a_sql_body_naming_an_index_and_a_table_by_literal_follows_both`, the
 `creation_text` tests, and the live `scratch_rules_compile_on_both_servers`.
+
+
+<a id="dec-2389-3"></a>
+
+**DEC-2389.3. The scratch route reads a string as the name of an object only
+where an OID-alias type reads it.** Part of #2389, ready-phase round 1. The
+type rule (DEC-2407.1) and the index rule read every string in a text as a
+possible name, as `generation_may_call` does (DEC-1364.1): two independent text
+domains `app.a AS text DEFAULT 'b'` and `app.b AS text DEFAULT 'a'` got an
+edge each way, and `settle` refused them as a cycle although neither default
+names a type. The route they replaced created both.
+
+Measured on PostgreSQL 16.15 and 18.6, which agree, with every named object
+absent. Created: a domain over `text` whose default or check holds `'app.b'`;
+a table, view, index, trigger `WHEN` or routine default holding the same
+string; a `LANGUAGE sql` body selecting it; `('app.b'::text)::regtype`;
+`to_regtype('app.b')`. Refused with `42704`, `42P01`, `42883` or `3F000`: the
+string cast to an OID-alias type (`'app.b'::regtype`, `regtype 'app.b'`,
+`regtype('app.b')`, `CAST('app.b' AS regtype)`, a `pg_catalog.`-qualified
+type, an array of them), for each of the eleven the pinned servers have
+(`regclass`, `regcollation`, `regconfig`, `regdictionary`, `regnamespace`,
+`regoper`, `regoperator`, `regproc`, `regprocedure`, `regrole`, `regtype`;
+there is no `regdatabase`); the default of a column, a domain or a routine
+parameter of such a type; a string handed bare to a function whose parameter is
+of such a type (`nextval('app.s')`). A comparison of such a column with a string
+is refused as an OID (`22P02`) whether or not the name exists, so it is no
+reference.
+
+`Dialect::literals_name_objects(text)`, true by default, is false for
+PostgreSQL's text that names none of those types in code, and the scratch
+route then reads the text with its strings blanked (`Lexicon::code_only`): the
+readers of the type and index rules, the module texts of the module
+dependencies and of the choice of a table to hold, a change's texts for the
+tables and routines they name, and a generated expression's call of a planned
+function. A text that names the type keeps every string it holds. No declared
+column or domain is of such a type (the type table refuses it), so the reader of
+a string is always the text itself, never a type declared elsewhere. The
+ordinary route is unchanged.
+
+Not read: a string handed bare to a function with a parameter of such a type,
+which needs the function's signature and was not found in a declaration that
+matters (a default `nextval('app.s')` names a sequence, which no name here is).
+A text that names such a function loses an edge it had, so a plan that creates
+the named object after the reader has no edge to hold it.
+
+Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
+`a_string_an_oid_alias_type_reads_still_orders`,
+`a_string_equal_to_an_indexs_name_does_not_follow_its_table`,
+`a_generation_saying_a_routines_name_does_not_wait_for_it`,
+`no_declared_column_or_domain_is_of_an_oid_alias_type`,
+`a_text_reads_its_strings_as_names_only_where_it_names_an_alias_type`, and the
+live `scratch_rules_compile_on_both_servers`.

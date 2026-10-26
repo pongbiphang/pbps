@@ -193,10 +193,50 @@ fn named_text<'a>(
     scratch: bool,
 ) -> std::borrow::Cow<'a, str> {
     if scratch {
-        dialect.module_creation_text(module)
+        reading(dialect, dialect.module_creation_text(module))
     } else {
         std::borrow::Cow::Borrowed(module.definition.as_str())
     }
+}
+
+/// `text` as the order reads it in `scratch` (DEC-2389.3): a string that no
+/// OID-alias type reads is data, not the name of an object, so it is blanked.
+/// A routine body stays code, as the scans read it.
+fn reading<'a>(
+    dialect: &(impl Dialect + ?Sized),
+    text: std::borrow::Cow<'a, str>,
+) -> std::borrow::Cow<'a, str> {
+    if dialect.literals_name_objects(&text) {
+        text
+    } else {
+        std::borrow::Cow::Owned(dialect.lexicon().code_only(&text))
+    }
+}
+
+fn change_text<'a>(
+    text: &'a str,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> std::borrow::Cow<'a, str> {
+    let text = std::borrow::Cow::Borrowed(text);
+    if scratch {
+        reading(dialect, text)
+    } else {
+        text
+    }
+}
+
+/// The texts of one change as `scratch` reads them, otherwise as `texts` has
+/// them.
+fn change_texts<'a>(
+    change: &'a Change,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<std::borrow::Cow<'a, str>> {
+    texts(change)
+        .into_iter()
+        .map(|text| change_text(text, dialect, scratch))
+        .collect()
 }
 
 /// Keep selection and settlement on exactly the same relation, including
@@ -263,7 +303,8 @@ fn parts_in(
                 module.kind == ModuleKind::Function
                     && table.columns.values().any(|c| {
                         matches!(&c.value_source,
-                ValueSource::Generated(g) if dialect.generation_may_call(&g.expression, id.name()))
+                ValueSource::Generated(g) if dialect.generation_may_call(
+                    &change_text(&g.expression, dialect, scratch), id.name()))
                     })
             })
             .map(|(i, _, _)| *i)
@@ -279,12 +320,14 @@ fn parts_in(
                 );
             }
         }
-        modules.iter().any(|(i, _, module)| {
-            let text = named_text(module, dialect, scratch);
-            reached.contains(i)
-                && dialect.generation_names_table(&text, name)
-                && !dialect.generation_table_name_only(&text, name)
-        })
+        modules
+            .iter()
+            .filter(|(i, _, _)| reached.contains(i))
+            .any(|(_, _, module)| {
+                let text = named_text(module, dialect, scratch);
+                dialect.generation_names_table(&text, name)
+                    && !dialect.generation_table_name_only(&text, name)
+            })
     } else {
         false
     };
@@ -833,11 +876,9 @@ pub(super) fn constraints_in(
                     }
                 }
             }
+            let read = change_texts(&p.change, dialect, scratch);
             for (function, id, _) in &modules {
-                if texts(&p.change)
-                    .iter()
-                    .any(|t| dialect.generation_calls(t, id))
-                {
+                if read.iter().any(|t| dialect.generation_calls(t, id)) {
                     edge(&mut out, *function, *i);
                 }
             }
@@ -871,7 +912,7 @@ pub(super) fn constraints_in(
                     }
                 }
             }
-            let references: Vec<_> = texts(&p.change)
+            let references: Vec<_> = change_texts(&p.change, dialect, scratch)
                 .into_iter()
                 .filter(|text| dialect.generation_names_table(text, name))
                 .collect();
@@ -1042,15 +1083,14 @@ fn scratch_rules(
                 Change::CreateType { definition, .. } => domain_texts(definition),
                 _ => Vec::new(),
             };
-            (
-                i,
-                texts(&p.change)
-                    .into_iter()
-                    .chain(domain)
-                    .map(std::borrow::Cow::Borrowed)
-                    .chain(module)
-                    .collect(),
-            )
+            let all = texts(&p.change)
+                .into_iter()
+                .chain(domain)
+                .map(std::borrow::Cow::Borrowed)
+                .chain(module)
+                .map(|text| reading(dialect, text))
+                .collect();
+            (i, all)
         })
         .collect();
     for (at, p) in cs.changes.iter().enumerate() {
