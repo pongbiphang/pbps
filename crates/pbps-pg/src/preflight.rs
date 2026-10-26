@@ -4393,6 +4393,14 @@ fn partition_probes(
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
+    // Every probe below asks the rows as the database holds them before the
+    // plan, and a bound is declared in the labels the plan leaves: an enum
+    // key's labels are carried back through the plan's renames once, here, and
+    // each probe is given the bound that results (DEC-2346.1).
+    let labels = pbps_diff::enum_labels::PlanLabels::of(changes.iter().map(|p| &p.change));
+    let before_the_plan = |parent: &TableName, bound: &pbps_model::PartitionBound| {
+        labels.before_the_plan(bound, partitions.key_types(parent))
+    };
     for (step, p) in changes.iter().enumerate() {
         let projection = LazyCell::new(|| {
             let mut names = AsStored::of(facts.before(step), partitions);
@@ -4444,6 +4452,7 @@ fn partition_probes(
             else {
                 continue;
             };
+            let bound = &before_the_plan(&of.parent, bound);
             let gone = dropped_triggers(&changes[..step], &stored, &parent);
             // A column this plan retypes or recomputes may be a referencing
             // column of a key the count finds in the catalog, and its new
@@ -4508,7 +4517,13 @@ fn partition_probes(
                 .view()
                 .table(&of.parent)
                 .unwrap_or_else(|| of.parent.clone());
-            partition_range_probe(name, &parent, bound, &leaving, "create a partition")
+            partition_range_probe(
+                name,
+                &parent,
+                &before_the_plan(&of.parent, bound),
+                &leaving,
+                "create a partition",
+            )
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -4542,6 +4557,7 @@ fn partition_probes(
             // does; and the DEFAULT partition's rows inside it (#1545), which
             // a HASH parent has none of (#1632).
             let leaving = leaving(parent);
+            let bound = &before_the_plan(parent, bound);
             for probe in [
                 attach_range_probe(table, parent, bound),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
@@ -4573,7 +4589,7 @@ fn partition_probes(
             // plan creates or attaches beside it is counted in either order,
             // since the engine refuses whichever comes second.
             let leaving = leaving(parent);
-            let beside: Vec<&pbps_model::PartitionBound> = changes
+            let beside: Vec<pbps_model::PartitionBound> = changes
                 .iter()
                 .filter_map(|c| {
                     if let Change::CreateTable { table: t, .. } = &c.change {
@@ -4591,7 +4607,9 @@ fn partition_probes(
                     }
                 })
                 .filter(|b| **b != pbps_model::PartitionBound::Default)
+                .map(|b| before_the_plan(parent, b))
                 .collect();
+            let beside: Vec<&pbps_model::PartitionBound> = beside.iter().collect();
             for probe in [
                 attach_default_rows_probe(table, parent, &beside, &leaving),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
@@ -6249,6 +6267,182 @@ mod tests {
                 .description
                 .contains("will not attach a table over them"),
             "{attached:?}"
+        );
+    }
+
+    /// DEC-2346.1: a bound is declared in the labels the plan leaves, and the
+    /// probes ask the rows as the database holds them, so an enum key's labels
+    /// are carried back through the plan's renames, once, for every probe.
+    #[test]
+    fn a_declared_enum_bound_is_asked_in_the_labels_the_rows_hold() {
+        use pbps_model::{ListDatum, PartitionBound};
+        let key = |ty: &str| {
+            let mut parent = pbps_model::Table::default();
+            for (name, ty) in [("id", "integer"), ("m", ty)] {
+                parent
+                    .columns
+                    .insert(name.into(), pbps_model::Column::new(ty.parse().unwrap()));
+            }
+            parent.partition_by = Some(pbps_model::PartitionBy {
+                strategy: pbps_model::PartitionStrategy::List,
+                columns: vec!["m".into()],
+                external: false,
+            });
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert("app.ev".parse().unwrap(), parent);
+            pbps_model::Partitions::of(&schema)
+        };
+        let rename = |uid: &str, ty: &str, from: &str, to: &str, ordinal: usize| {
+            PlannedChange::new(Change::RenameEnumValue {
+                uid: uid.parse().unwrap(),
+                name: ty.parse().unwrap(),
+                from: from.into(),
+                to: to.into(),
+                ordinal,
+                definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
+            })
+        };
+        let list = |label: &str| PartitionBound::List {
+            values: [ListDatum::Value(label.into())].into(),
+        };
+        let partition = |bound: PartitionBound| pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let creates = |beside: bool| {
+            PlannedChange::new(Change::CreateTable {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: "app.ev_b".parse().unwrap(),
+                table: Box::new(partition(list("b"))),
+                beside_default: beside.then(|| "app.ev_rest".parse().unwrap()),
+                moves_at_most: None,
+            })
+        };
+        let attaches = PlannedChange::new(Change::AttachPartition {
+            uid: "t_bbbbbb".parse().unwrap(),
+            table: "app.ev_b".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            bound: list("b"),
+            key: vec![],
+            shape: Box::new(partition(list("b"))),
+        });
+        // The finding's plan: `b` becomes `c`, `a` becomes `b`, and a partition
+        // takes `b`, the label the rows now called `a` will have.
+        let chain = |other: &str| {
+            vec![
+                rename("y_000001", other, "b", "c", 0),
+                rename("y_000001", other, "a", "b", 1),
+            ]
+        };
+        // What the plan's probes say about the labels: the SQL names `a` for
+        // the rows that will be `b`, or `b` where nothing is renamed.
+        let asked = |renames: Vec<PlannedChange>,
+                     change: PlannedChange,
+                     partitions: &pbps_model::Partitions| {
+            let mut changes = renames;
+            changes.push(change);
+            let plan = ChangeSet { changes };
+            let probes = probes_with(&plan, partitions).probes;
+            assert!(!probes.is_empty());
+            probes
+        };
+        // A label is written `E'x'`, or `E''x''` inside the text of a query
+        // the probe builds.
+        let says = |p: &Probe, label: &str| {
+            p.sql.contains(&format!("E'{label}'")) || p.sql.contains(&format!("E''{label}''"))
+        };
+        let shown = |probes: &[Probe]| -> Vec<String> {
+            probes
+                .iter()
+                .map(|p| p.description.chars().take(60).collect())
+                .collect()
+        };
+        for (form, change) in [
+            ("beside a default", creates(true)),
+            ("created", creates(false)),
+            ("attached", attaches.clone()),
+        ] {
+            let moved = asked(chain("app.mood"), change.clone(), &key("app.mood"));
+            // Every probe that carries the bound carries `a`, never `b`.
+            assert!(
+                moved.iter().any(|p| says(p, "a")),
+                "{form}: {:?}",
+                shown(&moved)
+            );
+            assert!(
+                moved.iter().all(|p| !says(p, "b") && !says(p, "c")),
+                "{form}: {:?}",
+                shown(&moved)
+            );
+            // Negatives, each leaving the bound as declared: no rename, a
+            // rename of another enum, a key that is not an enum.
+            for (case, renames, partitions) in [
+                ("no renames", vec![], key("app.mood")),
+                ("another enum", chain("app.other"), key("app.mood")),
+                ("another key type", chain("app.mood"), key("text")),
+            ] {
+                let same = asked(renames, change.clone(), &partitions);
+                assert!(
+                    same.iter().any(|p| says(p, "b")) && same.iter().all(|p| !says(p, "a")),
+                    "{form}, {case}: {:?}",
+                    shown(&same)
+                );
+            }
+        }
+        // A table attached as the DEFAULT counts its rows against the
+        // partitions made beside it, which are declared in the same labels.
+        let default_attach = PlannedChange::new(Change::AttachPartition {
+            uid: "t_dddddd".parse().unwrap(),
+            table: "app.ev_d".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            bound: PartitionBound::Default,
+            key: vec![],
+            shape: Box::new(partition(PartitionBound::Default)),
+        });
+        for (case, renames, partitions) in [
+            ("renamed", chain("app.mood"), key("app.mood")),
+            ("no renames", vec![], key("app.mood")),
+        ] {
+            let mut plan = renames;
+            plan.extend([creates(false), default_attach.clone()]);
+            let changes = ChangeSet { changes: plan };
+            let probes = probes_with(&changes, &partitions).probes;
+            let counting: Vec<&Probe> = probes
+                .iter()
+                .filter(|p| p.description.contains("app.ev_d"))
+                .collect();
+            assert!(!counting.is_empty(), "{case}");
+            let label = if case == "renamed" { "a" } else { "b" };
+            assert!(
+                counting.iter().any(|p| says(p, label))
+                    && counting
+                        .iter()
+                        .all(|p| !says(p, if label == "a" { "b" } else { "a" })),
+                "{case}: {:?}",
+                shown(&probes)
+            );
+        }
+        // An enum the plan renames a label of under another spelling: the
+        // type's own rename is followed.
+        let mut moved_type = chain("app.feeling");
+        moved_type.insert(
+            0,
+            PlannedChange::new(Change::RenameType {
+                uid: "y_000001".parse().unwrap(),
+                from: "app.mood".parse().unwrap(),
+                to: "app.feeling".parse().unwrap(),
+                definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
+            }),
+        );
+        let followed = asked(moved_type, creates(true), &key("app.mood"));
+        assert!(
+            followed.iter().any(|p| says(p, "a")),
+            "{:?}",
+            shown(&followed)
         );
     }
 

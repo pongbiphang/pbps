@@ -5196,3 +5196,75 @@ fn a_label_removal_or_reorder_of_an_enum_that_keys_a_partitioned_table_is_refuse
         }
     }
 }
+
+/// A bound is declared in the labels the plan leaves, and the pre-flight asks
+/// the rows as they are before it runs, so the bound goes back through the
+/// plan's renames first (DEC-2346.1). `b` becomes `c`, `a` becomes `b`, and a
+/// partition takes `b`: the DEFAULT row that is `b` now is `c` after, and
+/// does not move; one that is `a` now is `b` after, and would.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_declared_enum_bound_is_asked_of_the_rows_in_the_labels_they_hold() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (row, moves) in [("b", false), ("a", true)] {
+            let (own, d) = enum_keyed_tree(
+                &server,
+                "enum_key_asked2346",
+                true,
+                "[a, b]",
+                "  ev_rest: default\n",
+            );
+            let db = own.connection();
+            on_server(db, &format!("INSERT INTO app.ev VALUES (1, '{row}')"));
+            enum_keyed(
+                &d,
+                true,
+                "[{name: b, renamed_from: a}, {name: c, renamed_from: b}]",
+                "  ev_rest: default\n  ev_new: {in: [b]}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("asked.plan.json");
+            let plan = label_plan(&d, db, &path);
+            let mut kinds = changes_of(&plan);
+            kinds.sort();
+            assert_eq!(
+                kinds,
+                ["CreateTable", "RenameEnumValue", "RenameEnumValue"],
+                "{plan:?}"
+            );
+            let out = approved_apply(&d, db, &path, &["--allow", "rename"]);
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            if moves {
+                // Refused before a statement, with the remedy the move has.
+                assert_ne!(code(&out), 0, "{said}");
+                assert!(
+                    said.contains("rows of app.ev_rest are among the values of app.ev_new")
+                        && said.contains("no move of them was allowed")
+                        && said.contains("pbps move-rows app.ev_new --max-rows"),
+                    "{said}"
+                );
+                assert_eq!(
+                    scalar(db, "SELECT count(*) FROM pg_enum WHERE enumlabel = 'c'"),
+                    0
+                );
+            } else {
+                assert_eq!(code(&out), 0, "{said}");
+                // Renamed in place, and where it was: the DEFAULT.
+                assert_eq!(
+                    text_of(
+                        db,
+                        "SELECT m::text || ' in ' || tableoid::regclass::text FROM app.ev WHERE id = 1"
+                    ),
+                    "c in app.ev_rest"
+                );
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.ev_new"), 0);
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                succeeds(d.run(&["verify", "--db", db]));
+            }
+        }
+    }
+}

@@ -659,42 +659,46 @@ pub fn label_renames<'a>(changes: impl IntoIterator<Item = &'a Change>) -> Label
     out
 }
 
-/// A standing partition's bound as the plan's label renames leave it
-/// (DEC-2346.1). The engine renames a label where a bound holds it (measured
-/// on 16 and 18), so the observed bound is carried through the renames, in the
-/// order they run and by exact label, to be compared with the declared one: a
-/// rename then changes no bound. `parent` is the partition's parent on the
-/// observed side, whose type references `side` resolves.
-pub fn forwarded_bound(
+/// Which way a label is carried through a plan's renames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// A label the database has now to the label it has when the plan is done.
+    Forward,
+    /// A label the plan leaves to the label the database has now.
+    Backward,
+}
+
+/// A partition's bound with every label of an enum key carried through the
+/// plan's renames of that enum (DEC-2346.1). `renames_of` gives, for a key
+/// position, the renames of the enum that column has, in the order they run;
+/// a label is carried by exact match, one rename at a time in that order
+/// forwards and in the reverse order backwards, so a chain (`b→c`, then
+/// `a→b`) and a swap through a temporary label come out where the engine puts
+/// them. `MINVALUE`, `MAXVALUE`, `NULL` and a bound with no label are kept.
+pub fn carried_bound<'a>(
     bound: &pbps_model::PartitionBound,
-    parent: &pbps_model::Table,
-    (resolver, side): (&TypeResolver<'_>, TypeSide),
-    renames: &LabelRenames<'_>,
+    renames_of: impl Fn(usize) -> Option<&'a Vec<(usize, &'a str, &'a str)>>,
+    way: Carry,
 ) -> pbps_model::PartitionBound {
     use pbps_model::{BoundDatum, ListDatum, PartitionBound};
-    let Some(by) = parent.partition_by.as_ref().filter(|_| !renames.is_empty()) else {
-        return bound.clone();
-    };
-    let forward = |at: usize, label: &String| -> String {
-        let renamed = by
-            .columns
-            .get(at)
-            .and_then(|column| parent.columns.get(column))
-            .filter(|column| !column.ty.is_array())
-            .and_then(|column| column.ty.type_ref())
-            .and_then(|reference| match resolver.resolve(side, reference) {
-                TypeIdentity::Declared(uid) => renames.get(uid),
-                TypeIdentity::ExternalOrUnrecorded(_) => None,
-            });
-        renamed
-            .into_iter()
-            .flatten()
-            .fold(label.clone(), |now, (_, from, to)| {
+    let carry = |at: usize, label: &String| -> String {
+        let Some(pairs) = renames_of(at) else {
+            return label.clone();
+        };
+        match way {
+            Carry::Forward => pairs.iter().fold(label.clone(), |now, (_, from, to)| {
                 if now == *from { (*to).to_owned() } else { now }
-            })
+            }),
+            Carry::Backward => pairs
+                .iter()
+                .rev()
+                .fold(label.clone(), |now, (_, from, to)| {
+                    if now == *to { (*from).to_owned() } else { now }
+                }),
+        }
     };
     let datum = |at: usize, datum: &BoundDatum| match datum {
-        BoundDatum::Value(label) => BoundDatum::Value(forward(at, label)),
+        BoundDatum::Value(label) => BoundDatum::Value(carry(at, label)),
         BoundDatum::MinValue | BoundDatum::MaxValue => datum.clone(),
     };
     match bound {
@@ -710,12 +714,115 @@ pub fn forwarded_bound(
             values: values
                 .iter()
                 .map(|value| match value {
-                    ListDatum::Value(label) => ListDatum::Value(forward(0, label)),
+                    ListDatum::Value(label) => ListDatum::Value(carry(0, label)),
                     ListDatum::Null => ListDatum::Null,
                 })
                 .collect(),
         },
         PartitionBound::Default | PartitionBound::Hash { .. } => bound.clone(),
+    }
+}
+
+/// A standing partition's bound as the plan's label renames leave it
+/// (DEC-2346.1). The engine renames a label where a bound holds it (measured
+/// on 16 and 18), so the observed bound is carried through the renames, in the
+/// order they run and by exact label, to be compared with the declared one: a
+/// rename then changes no bound. `parent` is the partition's parent on the
+/// observed side, whose type references `side` resolves.
+pub fn forwarded_bound(
+    bound: &pbps_model::PartitionBound,
+    parent: &pbps_model::Table,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &LabelRenames<'_>,
+) -> pbps_model::PartitionBound {
+    let Some(by) = parent.partition_by.as_ref().filter(|_| !renames.is_empty()) else {
+        return bound.clone();
+    };
+    carried_bound(
+        bound,
+        |at| {
+            by.columns
+                .get(at)
+                .and_then(|column| parent.columns.get(column))
+                .filter(|column| !column.ty.is_array())
+                .and_then(|column| column.ty.type_ref())
+                .and_then(|reference| match resolver.resolve(side, reference) {
+                    TypeIdentity::Declared(uid) => renames.get(uid),
+                    TypeIdentity::ExternalOrUnrecorded(_) => None,
+                })
+        },
+        Carry::Forward,
+    )
+}
+
+/// What a plan renames in the labels of its enums, read once, for the probes
+/// that evaluate a declared bound against rows nothing has renamed yet
+/// (DEC-2346.1): the bound's labels are the plan's, and the rows hold the
+/// database's.
+pub struct PlanLabels<'a> {
+    renames: LabelRenames<'a>,
+    /// Each enum a label rename names, by the spelling it has once the plan's
+    /// type renames have run.
+    uids: BTreeMap<&'a TypeRef, &'a Uid>,
+    /// The plan's type renames, in the order they run.
+    moves: Vec<(&'a TypeRef, &'a TypeRef)>,
+}
+
+impl<'a> PlanLabels<'a> {
+    pub fn of(changes: impl IntoIterator<Item = &'a Change> + Clone) -> Self {
+        Self {
+            renames: label_renames(changes.clone()),
+            uids: changes
+                .clone()
+                .into_iter()
+                .filter_map(|change| {
+                    if let Change::RenameEnumValue { uid, name, .. } = change {
+                        Some((name, uid))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            moves: changes
+                .into_iter()
+                .filter_map(|change| {
+                    if let Change::RenameType { from, to, .. } = change {
+                        Some((from, to))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// `bound`, a declared bound over a table keyed by columns of the types
+    /// `key_types` (as the database spells them now), with each label of an
+    /// enum the plan renames carried back to the label the database holds
+    /// now. A chain (`b→c`, `a→b`) takes `b` back to `a`. Any other bound is
+    /// returned as it is.
+    pub fn before_the_plan(
+        &self,
+        bound: &pbps_model::PartitionBound,
+        key_types: &[Option<TypeRef>],
+    ) -> pbps_model::PartitionBound {
+        if self.renames.is_empty() {
+            return bound.clone();
+        }
+        carried_bound(
+            bound,
+            |at| {
+                let now = key_types.get(at)?.as_ref()?;
+                let after = self.moves.iter().fold(
+                    now,
+                    |at, (from, to)| {
+                        if at == *from { *to } else { at }
+                    },
+                );
+                self.renames.get(self.uids.get(after)?)
+            },
+            Carry::Backward,
+        )
     }
 }
 
@@ -2211,6 +2318,100 @@ mod rebuild_tests {
         let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(steps(&out).len(), 4);
+    }
+
+    /// DEC-2346.1: the probes read rows nothing has renamed, so a declared
+    /// bound goes back through the plan's renames, the reverse of how the
+    /// observed one goes forward, by the one table the forward way reads.
+    #[test]
+    fn a_declared_bound_is_carried_back_through_the_label_renames_the_plan_runs() {
+        use pbps_model::{BoundDatum, ListDatum, PartitionBound};
+        let rename = |name: &str, ordinal: usize, from: &str, to: &str| Change::RenameEnumValue {
+            uid: type_uid(),
+            name: name.parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+            ordinal,
+            definition: Box::new(enumeration(&[])),
+        };
+        let list = |labels: &[&str]| PartitionBound::List {
+            values: labels
+                .iter()
+                .map(|l| ListDatum::Value((*l).into()))
+                .chain([ListDatum::Null])
+                .collect(),
+        };
+        let key = |name: &str| vec![Some(name.parse::<TypeRef>().unwrap()), None];
+        let back = |plan: &[Change], bound: &PartitionBound, key: &[Option<TypeRef>]| {
+            PlanLabels::of(plan).before_the_plan(bound, key)
+        };
+        // The finding: `b` becomes `c`, then `a` becomes `b`; a bound on `b`
+        // is the rows that are `a` now, and one on `c` the rows that are `b`.
+        let chain = [rename("app.e", 0, "b", "c"), rename("app.e", 1, "a", "b")];
+        assert_eq!(back(&chain, &list(&["b"]), &key("app.e")), list(&["a"]));
+        assert_eq!(back(&chain, &list(&["c"]), &key("app.e")), list(&["b"]));
+        assert_eq!(
+            back(&chain, &list(&["b", "c"]), &key("app.e")),
+            list(&["a", "b"])
+        );
+        // And forward again, by the same table: a round trip is the bound, for
+        // the labels the plan leaves.
+        for labels in [&["b"][..], &["c"], &["b", "c"]] {
+            let declared = list(labels);
+            let before = back(&chain, &declared, &key("app.e"));
+            let mut renames = label_renames(&chain);
+            let pairs = renames.get_mut(&type_uid()).unwrap();
+            let again = carried_bound(&before, |_| Some(&*pairs), Carry::Forward);
+            assert_eq!(again, declared);
+        }
+        // A swap through a temporary label ends where its labels end.
+        let swap = [
+            rename("app.e", 0, "a", "t"),
+            rename("app.e", 1, "b", "a"),
+            rename("app.e", 2, "t", "b"),
+        ];
+        assert_eq!(back(&swap, &list(&["a"]), &key("app.e")), list(&["b"]));
+        assert_eq!(back(&swap, &list(&["b"]), &key("app.e")), list(&["a"]));
+        // The type's own rename is followed to the spelling the label
+        // renames name.
+        let moved = [
+            Change::RenameType {
+                uid: type_uid(),
+                from: "app.old".parse().unwrap(),
+                to: "app.e".parse().unwrap(),
+                definition: Box::new(enumeration(&[])),
+            },
+            rename("app.e", 0, "a", "b"),
+        ];
+        assert_eq!(back(&moved, &list(&["b"]), &key("app.old")), list(&["a"]));
+        // A range: both ends, and its unbounded ends kept.
+        let range = PartitionBound::Range {
+            from: vec![BoundDatum::MinValue],
+            to: vec![BoundDatum::Value("b".into())],
+        };
+        assert_eq!(
+            back(&chain, &range, &key("app.e")),
+            PartitionBound::Range {
+                from: vec![BoundDatum::MinValue],
+                to: vec![BoundDatum::Value("a".into())],
+            }
+        );
+        // Negatives: no renames; another enum's; a key that is no enum, or
+        // another column's type; a bound with no label.
+        assert_eq!(back(&[], &list(&["b"]), &key("app.e")), list(&["b"]));
+        let other = [rename("app.other", 0, "a", "b")];
+        assert_eq!(back(&other, &list(&["b"]), &key("app.e")), list(&["b"]));
+        assert_eq!(back(&chain, &list(&["b"]), &[None]), list(&["b"]));
+        assert_eq!(back(&chain, &list(&["b"]), &[]), list(&["b"]));
+        let rest = PartitionBound::Hash {
+            modulus: 4,
+            remainder: 1,
+        };
+        assert_eq!(back(&chain, &rest, &key("app.e")), rest);
+        assert_eq!(
+            back(&chain, &PartitionBound::Default, &key("app.e")),
+            PartitionBound::Default
+        );
     }
 
     #[test]

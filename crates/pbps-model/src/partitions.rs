@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use crate::plan_names::{At, Holder, PlanNames};
-use crate::{ColumnRef, Schema, TableName};
+use crate::{ColumnRef, Schema, TableName, TypeRef};
 
 /// The partitions of a schema, by parent, and each partition's parent.
 ///
@@ -26,6 +26,10 @@ use crate::{ColumnRef, Schema, TableName};
 pub struct Partitions {
     parents: BTreeMap<TableName, TableName>,
     held: BTreeMap<TableName, Vec<TableName>>,
+    /// Each partitioned parent's key columns, by the user-defined type a
+    /// scalar column names, as the schema spells it (DEC-2346.1). A bound's
+    /// labels are the labels of these types.
+    keys: BTreeMap<TableName, Vec<Option<TypeRef>>>,
 }
 
 impl Partitions {
@@ -33,6 +37,21 @@ impl Partitions {
     pub fn of(schema: &Schema) -> Self {
         let mut this = Self::default();
         for (name, table) in &schema.tables {
+            if let Some(by) = &table.partition_by {
+                this.keys.insert(
+                    name.clone(),
+                    by.columns
+                        .iter()
+                        .map(|column| {
+                            table
+                                .columns
+                                .get(column)
+                                .filter(|c| !c.ty.is_array())
+                                .and_then(|c| c.ty.type_ref().cloned())
+                        })
+                        .collect(),
+                );
+            }
             if let Some(of) = &table.partition_of {
                 this.parents.insert(name.clone(), of.parent.clone());
                 this.held
@@ -47,6 +66,12 @@ impl Partitions {
     /// The parent `table` is a partition of.
     pub fn parent(&self, table: &TableName) -> Option<&TableName> {
         self.parents.get(table)
+    }
+
+    /// The user-defined type of each key column of the partitioned `parent`,
+    /// in key order, where the column is a scalar reference to one.
+    pub fn key_types(&self, parent: &TableName) -> &[Option<TypeRef>] {
+        self.keys.get(parent).map_or(&[], Vec::as_slice)
     }
 
     /// The partitions `parent` holds, in name order.
@@ -108,6 +133,11 @@ impl Partitions {
                 .into_iter()
                 .map(|(of, held)| (to(of), held))
                 .collect(),
+            keys: self
+                .keys
+                .into_iter()
+                .map(|(parent, keys)| (to(parent), keys))
+                .collect(),
         }
     }
 
@@ -129,6 +159,11 @@ impl Partitions {
         }
         for children in result.held.values_mut() {
             children.sort();
+        }
+        for (parent, keys) in &self.keys {
+            if let Some(parent) = address(parent) {
+                result.keys.insert(parent, keys.clone());
+            }
         }
         result
     }
@@ -203,6 +238,52 @@ mod tests {
         assert_eq!(middle.parent(&name("app.q_1")), Some(&name("app.p")));
         assert_eq!(middle.at(&names, At::Before(2), At::End), moved);
         assert_eq!(moved.at(&names, At::End, At::Start), original);
+    }
+
+    /// DEC-2346.1: a parent keeps the user-defined types of its key columns,
+    /// scalar ones only, under the name the plan leaves it, and the relation
+    /// at another boundary carries them with it.
+    #[test]
+    fn a_parents_key_types_follow_the_parent_and_name_only_scalar_references() {
+        let mut parent = Table::default();
+        for (column, ty) in [("id", "integer"), ("m", "app.mood"), ("tags", "app.mood[]")] {
+            parent
+                .columns
+                .insert(column.into(), crate::Column::new(ty.parse().unwrap()));
+        }
+        parent.partition_by = Some(crate::PartitionBy {
+            strategy: crate::PartitionStrategy::Range,
+            columns: vec!["m".into(), "id".into(), "tags".into(), "gone".into()],
+            external: false,
+        });
+        let mut s = schema();
+        s.tables.insert(name("app.p"), parent);
+        let partitions = Partitions::of(&s);
+        let mood: TypeRef = "app.mood".parse().unwrap();
+        // Positions that are no scalar reference, or no column, name nothing;
+        // an ordinary table is no parent at all.
+        assert_eq!(
+            partitions.key_types(&name("app.p")),
+            [Some(mood.clone()), None, None, None]
+        );
+        assert!(partitions.key_types(&name("app.t")).is_empty());
+        // The parent is renamed: its key types go with it.
+        let uid = crate::Uid::derived(crate::UidKind::Table, "p", 0);
+        let changes = [crate::PlannedChange::new(crate::Change::RenameTable {
+            uid: uid.clone(),
+            from: name("app.p"),
+            to: name("app.q"),
+            defaults: vec![],
+        })];
+        let after = crate::IdsFile {
+            tables: [(uid, name("app.q"))].into(),
+            ..crate::IdsFile::default()
+        };
+        let names = PlanNames::of(&changes, &after).unwrap();
+        let moved = partitions.clone().renamed(&names);
+        assert_eq!(moved.key_types(&name("app.q"))[0], Some(mood));
+        assert!(moved.key_types(&name("app.p")).is_empty());
+        assert_eq!(moved.at(&names, At::End, At::Start), partitions);
     }
 
     #[test]

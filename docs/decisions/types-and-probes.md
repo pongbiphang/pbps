@@ -3368,6 +3368,16 @@ DEC-1523.1 and nothing else of it.
   before it is compared with the declared one, by the differ and by the
   apply's movement check; a plan that renames the label and no more holds no
   detach, attach or recreate.
+- **The probes ask the rows in the labels the rows hold.** A bound is declared
+  in the labels the plan leaves, and the pre-flight counts rows before any
+  statement has run. For an enum key every probe that evaluates a bound of a
+  partition the plan creates or attaches (the move and reference counts beside
+  a DEFAULT, the range counts of a create or an attach, the rows of an attached
+  DEFAULT against the partitions made beside it) is given the bound with its
+  labels carried back through the plan's own renames of that enum, once and by
+  exact match, so `b→c` then `a→b` takes a declared `b` back to `a`. The
+  parent's key types ride on `Partitions`. Post-rename statements (the staged
+  attach's CHECK, the move itself) keep the final labels.
 - **A removal or reorder is refused by name** when the enum keys a
   partitioned table, because a partition key cannot be retyped: the remedy
   is to rebuild the partitioned table (#2298). Labels can still be added and
