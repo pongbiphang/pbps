@@ -109,6 +109,10 @@ export PBPS_TEST_PG_CONTAINER="$NAME"
 # The grammar-upgrade regression carries a database from the old server to
 # this one with the old server's own `pg_dump` (issue #571).
 export PBPS_TEST_PG_OLD_CONTAINER="$OLD_NAME"
+# The images a Docker scratch starts from (#1674), for every run that starts
+# one: the resolver's own tests and the CLI's real runs.
+export PBPS_TEST_PG_SCRATCH_IMAGE=${PBPS_TEST_PG_SCRATCH_IMAGE:-$IMAGE}
+export PBPS_TEST_PG_OLD_SCRATCH_IMAGE=${PBPS_TEST_PG_OLD_SCRATCH_IMAGE:-$OLD_IMAGE}
 
 # One of these tests waits out `pbps_db::CONNECT_TIMEOUT` on purpose — a
 # firewall that drops rather than refuses is a category of its own, and thirty
@@ -138,8 +142,6 @@ cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 --skip engine::m
 # The resolver end to end (#1672), with no root: the three servers above are
 # its targets and scratch servers, and a Docker scratch (#1674) starts from
 # their images, already here.
-PBPS_TEST_PG_SCRATCH_IMAGE=${PBPS_TEST_PG_SCRATCH_IMAGE:-$IMAGE} \
-PBPS_TEST_PG_OLD_SCRATCH_IMAGE=${PBPS_TEST_PG_OLD_SCRATCH_IMAGE:-$OLD_IMAGE} \
 cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
