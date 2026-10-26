@@ -8881,13 +8881,30 @@ Which edge is which, by what it rests on:
 | a foreign key after both tables and the referenced key; a replica identity after its index | the declaration | stated |
 | a partition's own default after its parent's | the declaration | stated |
 | a module after the modules its `depends_on:` names | the user | stated |
-| a function before the generated column, default or check part that calls it (`generation_calls`) | the call the engine needs at creation (measured, DEC-1364.1) | stated |
+| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | the call the engine needs at creation (measured, DEC-1364.1); the provider is a function and the text an expression | stated |
+| a module, or a function named only in a type spelling or other declarative text, before a part whose text names it | a name in a text | guess |
 | a module after the table whose complete shape or first part its text names | a name in a text | guess |
 | a part that names a table after its shape | a name in a text | guess |
 | a module after the module its text calls | a name in a text | guess |
 | a type before every change whose text names it, a domain over it included (DEC-2407.1) | a name in a text | guess |
 | a relation-namespace index before the change whose text names it (DEC-2389.1) | a name in a text | guess |
 | an index that holds an expression or a predicate after every module and generated expression | conservatism, not an engine need | guess |
+
+The call edge is stated only where both halves hold: the provider is a function
+(a view, a trigger or a procedure is never called by an expression) and the text
+is one of the part's expressions (`expressions`, never a column's type spelling
+or the type of a row). Round 3 found the boundary: for a table `app.t(x text)`
+and a view `app.text` that reads it, the type `text` matched the view by leaf
+name, a stated view-before-table edge outweighed the guess that the table comes
+first, and the view was created before its table. A match that fails either half
+is a guess, not dropped, so the order it suggests still applies where no cycle
+forms (an idle function named `text` still goes ahead of the table). The sweep of
+the stated edges found no other whose evidence is a name match: the column chain,
+own parts, complete-shape consumers (`table_use`), foreign keys, replica identity
+(`name == target`), partition defaults (the declared parent and column) and
+`depends_on:` all read typed fields, and `module_dependencies` states only the
+declared ones. SQL Server and the ordinary route state both kinds as stated edges,
+so their edges are the same as before.
 
 The plan's order carries what the guesses give up: the ordinary route already
 orders a domain after the type it is over and a table after the types of its
@@ -8909,6 +8926,9 @@ Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_order
 `a_name_matched_by_accident_does_not_close_a_cycle`,
 `the_fallback_gives_the_same_order_twice`,
 `a_cycle_of_declared_dependencies_stays_the_named_refusal`,
+`a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it`,
+`a_routine_an_expression_calls_still_precedes_it_though_named_like_a_type`,
+`a_call_edge_is_stated_only_for_a_function_an_expression_calls`,
 `routines_that_call_each_other_at_creation_fall_back_to_the_plans_order`, and the
 live `scratch_rules_compile_on_both_servers` and
 `scratch_refusals_name_what_is_missing`.

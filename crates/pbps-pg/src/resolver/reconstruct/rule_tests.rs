@@ -390,6 +390,23 @@ async fn scratch_rules_compile_on_both_servers() {
             declared_type("app.value", domain_with("app.positive", None, None)),
         ],
         parameter_named_like_an_index(),
+        // A type spelling is no call: the view `app.text` and a routine of
+        // that name, reading the table whose column is of type `text`, follow
+        // it (DEC-2389.4); a routine of the name that a generation or a default
+        // calls still goes first.
+        vec![create("t", text_typed()), view_named_like_the_type()],
+        vec![
+            create("t", text_typed()),
+            routine("text", "sql", " SELECT count(*)::int FROM app.t "),
+        ],
+        vec![
+            create("t", calling_text("generated")),
+            routine("text", "sql", " SELECT $1 + 1 "),
+        ],
+        vec![
+            create("t", calling_text("default")),
+            routine("text", "sql", " SELECT $1 + 1 "),
+        ],
         // A generation that only says the name of a routine reading its table.
         vec![
             create("t", saying_a_routine()),
@@ -1111,4 +1128,164 @@ async fn scratch_refusals_name_what_is_missing() {
             );
         }
     }
+}
+
+/// `app.t(x text)`: a column whose type spelling is the name of a view or a
+/// routine, which no type spelling calls.
+fn text_typed() -> Table {
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("x".into(), Column::new("text".parse().unwrap()));
+    table
+}
+
+fn view_named_like_the_type() -> Change {
+    module("app.text", ModuleKind::View, "SELECT x FROM app.t")
+}
+
+/// A table whose generated column, or default, calls the routine `app.text`.
+fn calling_text(kind: &str) -> Table {
+    let mut table = Table::default();
+    table.columns.insert("id".into(), int());
+    let mut column = int();
+    column.value_source = if kind == "generated" {
+        ValueSource::Generated(Generated {
+            expression: "app.text(id)".into(),
+            stored: true,
+        })
+    } else {
+        ValueSource::Default("app.text(1)".into())
+    };
+    table.columns.insert("c".into(), column);
+    table
+}
+
+/// Only an expression that calls a routine makes the call edge the engine
+/// needs (DEC-2389.4). A column's type spelling does not: the type `text` of
+/// `app.t(x text)` is no call of the view `app.text` that reads the table, and
+/// a stated view-before-table edge would have put the view first (round 3).
+#[test]
+fn a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it() {
+    for version in [None, Some(160_000), Some(180_000)] {
+        let order = order(
+            &[create("t", text_typed()), view_named_like_the_type()],
+            version,
+        );
+        assert!(
+            at(&order, "table app.t") < at(&order, "view app.text"),
+            "{order:?}"
+        );
+        // A routine of that name, called nowhere, orders nothing hard either.
+        let reader = routine("text", "sql", " SELECT count(*)::int FROM app.t ");
+        let order = self::order(&[create("t", text_typed()), reader], version);
+        assert!(
+            at(&order, "table app.t") < at(&order, "function app.text(integer)"),
+            "{order:?}"
+        );
+        // The match is still a guess, and one in no cycle orders: a routine of
+        // that name that reads nothing goes ahead of the table.
+        let idle = routine("text", "sql", " SELECT $1 + 1 ");
+        let order = self::order(&[create("t", text_typed()), idle], version);
+        assert!(
+            at(&order, "function app.text(integer)") < at(&order, "table app.t"),
+            "{order:?}"
+        );
+    }
+}
+
+/// Negative: a routine called by an expression of the table, a generation or
+/// a default, is the engine's need whatever it is named, `text` included, and
+/// still goes first.
+#[test]
+fn a_routine_an_expression_calls_still_precedes_it_though_named_like_a_type() {
+    for version in [None, Some(160_000), Some(180_000)] {
+        for kind in ["generated", "default"] {
+            let order = order(
+                &[
+                    create("t", calling_text(kind)),
+                    routine("text", "sql", " SELECT $1 + 1 "),
+                ],
+                version,
+            );
+            // The step that carries the expression is the table's last: the
+            // whole table, the generated column or the default.
+            let carrying = order.iter().rposition(|d| d.contains("app.t")).unwrap();
+            assert!(
+                at(&order, "function app.text(integer)") < carrying,
+                "{kind} on {version:?}: {order:?}"
+            );
+        }
+    }
+}
+
+/// The kind of edge, in the schedule scratch settles, from the module of
+/// `kind` named `name` to the generated expression of `changes`, or to the
+/// table's first step when none is generated.
+fn call_edge(changes: &[Change], kind: ModuleKind, name: &str) -> Option<pbps_diff::order::Source> {
+    let pg = crate::Postgres::new().with_server_version(180_000);
+    let plan = crate::resolver::reconstruct::fixture_plan(changes);
+    let ids = crate::resolver::reconstruct::fixture_ids(changes);
+    let prepared =
+        pbps_diff::order::scratch::prepare(&plan, &ids, &pbps_model::ModuleDeps::new(), &pg)
+            .unwrap();
+    let steps = &prepared.changes().changes;
+    let provider = steps
+        .iter()
+        .position(|p| {
+            matches!(&p.change, Change::CreateModule { id, module }
+                if module.kind == kind && id.name() == name)
+        })
+        .unwrap();
+    let carrying = steps
+        .iter()
+        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .or_else(|| {
+            steps
+                .iter()
+                .position(|p| matches!(p.change, Change::CreateTable { .. }))
+        })
+        .unwrap();
+    prepared
+        .edges()
+        .iter()
+        .find(|c| c.before == provider && c.after == carrying)
+        .map(|c| c.source)
+}
+
+/// A stated call edge needs a routine as the provider and an expression as the
+/// text (DEC-2389.4): a function the generated expression calls holds the table
+/// behind it, while a view, a procedure or a function that only a type spelling
+/// names is a guess.
+#[test]
+fn a_call_edge_is_stated_only_for_a_function_an_expression_calls() {
+    use pbps_diff::order::Source;
+    let called = [
+        create("t", held_table()),
+        function("f"),
+        module("app.f", ModuleKind::View, "SELECT * FROM app.t"),
+        module(
+            "app.f(text)",
+            ModuleKind::Procedure,
+            "(text) LANGUAGE sql AS $$ SELECT 1 $$",
+        ),
+    ];
+    assert_eq!(
+        call_edge(&called, ModuleKind::Function, "f"),
+        Some(Source::Lexical)
+    );
+    assert_eq!(
+        call_edge(&called, ModuleKind::View, "f"),
+        Some(Source::Guess)
+    );
+    assert_eq!(
+        call_edge(&called, ModuleKind::Procedure, "f"),
+        Some(Source::Guess)
+    );
+    // Only the type spelling `text` names the function, which nothing calls.
+    let spelled = [create("t", text_typed()), function("text")];
+    assert_eq!(
+        call_edge(&spelled, ModuleKind::Function, "text"),
+        Some(Source::Guess)
+    );
 }

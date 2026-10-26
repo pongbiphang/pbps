@@ -233,7 +233,15 @@ fn change_texts<'a>(
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
 ) -> Vec<std::borrow::Cow<'a, str>> {
-    texts(change)
+    read_texts(texts(change), dialect, scratch)
+}
+
+fn read_texts<'a>(
+    texts: Vec<&'a str>,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<std::borrow::Cow<'a, str>> {
+    texts
         .into_iter()
         .map(|text| change_text(text, dialect, scratch))
         .collect()
@@ -595,13 +603,26 @@ pub(super) fn expand_in(
 }
 
 fn texts(change: &Change) -> Vec<&str> {
-    fn column(c: &pbps_model::Column) -> Vec<&str> {
+    gather(change, true)
+}
+
+/// The texts of `change` that are expressions: a default, a generated or
+/// computed expression, a check, an index expression or predicate, a policy.
+/// Not a type spelling, which names a type and calls nothing (DEC-2389.4).
+fn expressions(change: &Change) -> Vec<&str> {
+    gather(change, false)
+}
+
+fn gather(change: &Change, with_types: bool) -> Vec<&str> {
+    fn column(c: &pbps_model::Column, with_types: bool) -> Vec<&str> {
         let expression = match &c.value_source {
             ValueSource::Default(t) => Some(t.as_str()),
             ValueSource::Generated(g) => Some(g.expression.as_str()),
             ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
         };
-        std::iter::once(c.ty.base.as_str())
+        with_types
+            .then_some(c.ty.base.as_str())
+            .into_iter()
             .chain(expression)
             .collect()
     }
@@ -617,12 +638,15 @@ fn texts(change: &Change) -> Vec<&str> {
             | pbps_model::PartitionIndexDefinition::Unique(_) => Vec::new(),
         },
         Change::RebuildPartitionedTable(_) | Change::AnalyzeTableTree(_) => Vec::new(),
-        Change::CopyTableRows(c) => c.columns.iter().map(|p| p.cast.base.as_str()).collect(),
+        Change::CopyTableRows(c) if with_types => {
+            c.columns.iter().map(|p| p.cast.base.as_str()).collect()
+        }
+        Change::CopyTableRows(_) => Vec::new(),
 
         Change::CreateTable { table, .. } => table
             .columns
             .values()
-            .flat_map(column)
+            .flat_map(|c| column(c, with_types))
             .chain(table.computed.values().map(|c| c.expression.as_str()))
             .chain(table.checks.values().map(|c| c.expression.as_str()))
             .chain(
@@ -639,14 +663,15 @@ fn texts(change: &Change) -> Vec<&str> {
                     .chain(ix.columns.iter().filter_map(|c| c.key.expression()))
             }))
             .collect(),
-        Change::AddColumn { column: c, .. } => column(c),
+        Change::AddColumn { column: c, .. } => column(c, with_types),
         Change::AddComputedColumn { computed, .. } => vec![&computed.expression],
         Change::AlterColumnExpression { to, .. } => vec![to],
         Change::AlterColumnDefault { to, .. } => to.as_deref().into_iter().collect(),
         Change::SetPartitionDefault { to, fallback, .. } => {
             to.as_deref().or(fallback.as_deref()).into_iter().collect()
         }
-        Change::AlterColumnType { from, to, .. } => vec![&from.base, &to.base],
+        Change::AlterColumnType { from, to, .. } if with_types => vec![&from.base, &to.base],
+        Change::AlterColumnType { .. } => Vec::new(),
         Change::AddCheck { constraint, .. } => vec![&constraint.expression],
         Change::CreatePolicy { policy, .. } => policy
             .using
@@ -665,7 +690,12 @@ fn texts(change: &Change) -> Vec<&str> {
         } => defaults
             .values()
             .map(String::as_str)
-            .chain(types.values().map(|t| t.base.as_str()))
+            .chain(
+                types
+                    .values()
+                    .filter(|_| with_types)
+                    .map(|t| t.base.as_str()),
+            )
             .collect(),
         Change::UpdateRow {
             types,
@@ -678,12 +708,13 @@ fn texts(change: &Change) -> Vec<&str> {
             after_types,
             key_type,
             ..
-        } => types
+        } if with_types => types
             .values()
             .chain(after_types.values())
             .chain(key_type.iter())
             .map(|t| t.base.as_str())
             .collect(),
+        Change::UpdateRow { .. } | Change::DeleteRow { .. } => Vec::new(),
         Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -895,10 +926,19 @@ pub(super) fn constraints_in(
                     }
                 }
             }
+            // The engine needs a routine before the expression that calls it.
+            // A name matched anywhere else (a type spelling `text` beside a
+            // view `app.text`) is a guess, and so is a name that is no
+            // function (DEC-2389.4).
             let read = change_texts(&p.change, dialect, scratch);
-            for (function, id, _) in &modules {
-                if read.iter().any(|t| dialect.generation_calls(t, id)) {
+            let called = read_texts(expressions(&p.change), dialect, scratch);
+            for (function, id, module) in &modules {
+                if module.kind == ModuleKind::Function
+                    && called.iter().any(|t| dialect.generation_calls(t, id))
+                {
                     edge(&mut out, *function, *i);
+                } else if read.iter().any(|t| dialect.generation_calls(t, id)) {
+                    guess(&mut out, *function, *i);
                 }
             }
         }
