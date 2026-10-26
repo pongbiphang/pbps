@@ -138,6 +138,63 @@ pub async fn alive(
     Ok(up.contains(own).then_some(up))
 }
 
+/// The application lock that serialises the runs on one supplied database,
+/// held from before the first read of what a dead run left until the run's
+/// own sandbox user exists. Two runs that read the same dead sandbox would
+/// both clean it, and the late one would destroy what the first, already
+/// working, had made; two fresh runs would both pass the emptiness check.
+/// Application locks are scoped to the database they are taken in (measured:
+/// held in one database, free in another), which is the scope needed here.
+/// The lock is the session's, so a killed run frees it with its session
+/// (measured: within a poll of 215 ms).
+pub const LOCK: &str = "pbps_scratch_acquire";
+
+/// Why the lock was not taken.
+#[derive(Debug)]
+pub enum LockError {
+    /// Another session held it for the whole wait.
+    Busy,
+    Db(DbError),
+}
+
+/// Takes the lock on the connected database for this session, waiting at most
+/// `wait_ms` for whoever holds it.
+pub async fn lock(conn: &mut impl QueryConnection, wait_ms: u32) -> Result<(), LockError> {
+    let rows = conn
+        .query(&format!(
+            "DECLARE @r int; EXEC @r = sys.sp_getapplock @Resource = {}, @LockMode = N'Exclusive', \
+             @LockOwner = N'Session', @LockTimeout = {wait_ms}; SELECT @r AS result;",
+            literal(LOCK)
+        ))
+        .await
+        .map_err(LockError::Db)?;
+    match rows
+        .first()
+        .map(|row| row.try_get::<i32>("result"))
+        .transpose()
+        .map_err(LockError::Db)?
+        .flatten()
+    {
+        // Granted at once, or after the wait.
+        Some(0 | 1) => Ok(()),
+        Some(-1) => Err(LockError::Busy),
+        other => Err(LockError::Db(DbError::BadRow(format!(
+            "sp_getapplock answered {other:?}"
+        )))),
+    }
+}
+
+/// Releases it. Releasing what is not held is an error (1223): a caller that
+/// does not know whether it holds it ignores the answer, since the session's
+/// end releases it anyway.
+pub async fn unlock(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "EXEC sys.sp_releaseapplock @Resource = {}, @LockOwner = N'Session';",
+        literal(LOCK)
+    ))
+    .await
+}
+
 /// The tokens of the sandbox users in the connected database, `own` apart.
 pub async fn sandboxes(conn: &mut impl QueryConnection, own: &str) -> Result<Vec<String>, DbError> {
     let rows = conn

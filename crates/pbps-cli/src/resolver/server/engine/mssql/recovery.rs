@@ -62,6 +62,15 @@ fn refused(error: &pbps_db::DbError) -> String {
     }
 }
 
+/// How long a run waits for the application lock of a supplied database. The
+/// holder keeps it only through its recovery and the start of its acquisition
+/// (seconds), so a longer wait is a holder that is stuck, and is named. Tests
+/// that hold the lock on purpose do not wait the production half minute.
+#[cfg(not(test))]
+const LOCK_WAIT: u32 = 30_000;
+#[cfg(test)]
+const LOCK_WAIT: u32 = 6_000;
+
 /// A run-owned layout's leftovers: companion databases, a reference database,
 /// the scratch database and the login, per token, on the instance.
 struct Instance<'a> {
@@ -270,26 +279,60 @@ impl Scratch<'_> {
                 Ok(())
             }
             Provisioning::Supplied => {
-                let database = sql::database(admin).await.map_err(read)?;
-                let live = {
-                    let mut sandboxed = Sandboxed {
-                        scratch: self,
-                        admin,
-                        database,
-                    };
-                    let report = recovery::sweep(&mut sandboxed).await;
-                    recovery::emit(&report);
-                    report.live
-                };
-                if live.is_empty() {
-                    return Ok(());
+                // Before the first read of what a dead run left, and held
+                // until this run's own sandbox exists, so that no second run
+                // reads the same dead sandbox, and no two fresh runs both
+                // find the database empty.
+                match record::lock(admin, LOCK_WAIT).await {
+                    Ok(()) => self.locked = true,
+                    Err(record::LockError::Busy) => {
+                        return Err(Error::Unusable(format!(
+                            "another run is acquiring this supplied database: it holds the \
+                             application lock {} and did not release it in {} s; wait for it, or \
+                             use another scratch database",
+                            record::LOCK,
+                            LOCK_WAIT / 1000
+                        )));
+                    }
+                    Err(record::LockError::Db(error)) => return Err(read(error)),
                 }
-                Err(Error::Unusable(format!(
-                    "the scratch database is in use by a run that is still running (token {}…); \
-                     wait for it to finish, or use another scratch database",
-                    &live[0][..8]
-                )))
+                let outcome = self.recover_supplied(admin).await;
+                if outcome.is_err() {
+                    self.unlock(admin).await;
+                }
+                outcome
             }
         }
+    }
+
+    /// Releases the application lock, if this run holds it. Releasing is best
+    /// effort: the end of the session frees the lock whatever this answers.
+    pub(super) async fn unlock(&mut self, admin: &mut Conn) {
+        if std::mem::take(&mut self.locked) {
+            let _ = record::unlock(admin).await;
+        }
+    }
+
+    /// What a run killed in the supplied database left, read under the lock.
+    async fn recover_supplied(&mut self, admin: &mut Conn) -> Result<(), Error> {
+        let database = sql::database(admin).await.map_err(read)?;
+        let live = {
+            let mut sandboxed = Sandboxed {
+                scratch: self,
+                admin,
+                database,
+            };
+            let report = recovery::sweep(&mut sandboxed).await;
+            recovery::emit(&report);
+            report.live
+        };
+        if live.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Unusable(format!(
+            "the scratch database is in use by a run that is still running (token {}…); \
+             wait for it to finish, or use another scratch database",
+            &live[0][..8]
+        )))
     }
 }

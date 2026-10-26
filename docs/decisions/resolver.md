@@ -4767,6 +4767,20 @@ it; objects with no sandbox user are not pbps's and are refused as before.
 The sweep runs once the placement is known and before the first write, from
 the end of the scratch constructors, not from `acquire`: the cleanup is the
 deepest call in the run and belongs near its top. Two runs that start
-together on one supplied database are not arbitrated as PostgreSQL's claim
-does; each sees the other's sandbox only after it has made its own.
+together on one supplied database are serialised by an application lock
+(`sp_getapplock`, owner `Session`, exclusive) that a run takes on that
+database before it reads what a dead run left and holds until its own
+sandbox user exists. Without it two runs would read the same dead sandbox:
+the first would clean it and start working, and the late one would run the
+cleanup over the first's objects; and two fresh runs would both find the
+database empty. The lock is scoped to the database it is taken in (held in
+one database, free in another), a second session in the database is refused
+at once with a timeout of 0 and after the wait otherwise, a waiter is woken
+when the holder releases, and a killed holder frees it within a poll
+(215 ms), all measured. A run that cannot get it in 30 s refuses naming the
+lock. Releasing a lock not held is an error (1223), so the release is best
+effort, on every error path and when the run ends; the session's end frees it
+anyway. The sandbox user is the supplied record and goes last: the release
+empties the database as that user and drops it only after the cleanup has
+fully succeeded, and a cleanup that fails keeps it.
 

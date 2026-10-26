@@ -1016,3 +1016,204 @@ async fn the_marker_is_seen_by_a_login_with_no_privilege_and_goes_with_its_sessi
     assert!(up.unwrap().contains(&live), "visible with no privilege");
     assert!(!down.unwrap().contains(&live), "and gone with its session");
 }
+
+/// Two runs that read the same dead sandbox would both clean it, and the late
+/// one would destroy what the first, already working, had made. The first is
+/// played by hand: it holds the application lock the way a run does while it
+/// recovers, and releases it once its own sandbox and its work exist.
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_late_recoverer_waits_for_the_lock_then_finds_a_live_sandbox_and_refuses() {
+    let (target, scratch) = (server("PBPS_TEST_DB"), server("PBPS_TEST_MSSQL_SCRATCH_DB"));
+    let supplied = Box::pin(Supplied::new(&scratch)).await;
+    let (dead, live) = (token(), token());
+    supplied.leave_sandbox(&dead, true).await;
+    let mut first = connection(&supplied.admin).await;
+    record::lock(&mut first, 0).await.unwrap();
+    let mut late = refusal(&target, &supplied.connection);
+    let waiting = tokio::time::timeout(std::time::Duration::from_millis(1500), &mut late)
+        .await
+        .is_err();
+    // The first recoverer cleans the dead sandbox and starts working.
+    let session = alive(&scratch, &live).await;
+    first
+        .execute(&format!(
+            "DROP TABLE dbo.left_over; DROP USER [pbps_principal_0_{dead}]; ALTER ROLE db_owner \
+             DROP MEMBER [pbps_sandbox_{dead}]; DROP USER [pbps_sandbox_{dead}]; CREATE USER \
+             [pbps_sandbox_{live}] WITHOUT LOGIN; ALTER ROLE db_owner ADD MEMBER \
+             [pbps_sandbox_{live}]; CREATE TABLE dbo.first_work(i int);"
+        ))
+        .await
+        .unwrap();
+    record::unlock(&mut first).await.unwrap();
+    let outcome = late.await.to_string();
+    let names = supplied.names().await;
+    drop(session);
+    Box::pin(supplied.drop()).await;
+    assert!(
+        waiting,
+        "the late run waits for the lock instead of reading"
+    );
+    assert!(
+        outcome.contains("in use by a run that is still running"),
+        "{outcome}"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("first_work")),
+        "the first run's objects survived the late one: {names:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn two_runs_that_start_together_on_one_supplied_database_exactly_one_proceeds() {
+    let (target, scratch) = (server("PBPS_TEST_DB"), server("PBPS_TEST_MSSQL_SCRATCH_DB"));
+    for dead_sandbox in [false, true] {
+        let supplied = Box::pin(Supplied::new(&scratch)).await;
+        if dead_sandbox {
+            supplied.leave_sandbox(&token(), true).await;
+        }
+        recovery::take();
+        let (a, b) = tokio::join!(
+            refusal(&target, &supplied.connection),
+            refusal(&target, &supplied.connection)
+        );
+        let collected = recovery::take();
+        let left = supplied.names().await;
+        Box::pin(supplied.drop()).await;
+        let outcomes = [a, b];
+        let proceeded = outcomes
+            .iter()
+            .filter(|o| matches!(o, ProduceError::Run(Error::Binding(r)) if r.contains("#2238")))
+            .count();
+        let refused = outcomes
+            .iter()
+            .filter(|o| {
+                o.to_string()
+                    .contains("in use by a run that is still running")
+            })
+            .count();
+        assert_eq!(
+            (proceeded, refused),
+            (1, 1),
+            "{dead_sandbox}: exactly one proceeds and the other is refused: {outcomes:?}"
+        );
+        assert_eq!(
+            left,
+            Vec::<String>::new(),
+            "{dead_sandbox}: the one that ran emptied it"
+        );
+        assert_eq!(
+            collected.groups.len(),
+            usize::from(dead_sandbox),
+            "{dead_sandbox}: the dead sandbox is recovered once"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_run_that_cannot_get_the_lock_refuses_naming_it_and_touches_nothing() {
+    let (target, scratch) = (server("PBPS_TEST_DB"), server("PBPS_TEST_MSSQL_SCRATCH_DB"));
+    let supplied = Box::pin(Supplied::new(&scratch)).await;
+    supplied.leave_sandbox(&token(), true).await;
+    let mut holder = connection(&supplied.admin).await;
+    record::lock(&mut holder, 0).await.unwrap();
+    let seen = supplied.names().await;
+    let started = std::time::Instant::now();
+    let outcome = refusal(&target, &supplied.connection).await.to_string();
+    let waited = started.elapsed();
+    let kept = supplied.names().await;
+    record::unlock(&mut holder).await.unwrap();
+    drop(holder);
+    Box::pin(supplied.drop()).await;
+    assert!(outcome.contains(record::LOCK), "{outcome}");
+    assert!(outcome.contains("did not release it"), "{outcome}");
+    assert!(
+        waited >= std::time::Duration::from_secs(5),
+        "it waited: {waited:?}"
+    );
+    assert_eq!(kept, seen, "it read and removed nothing");
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn the_lock_is_the_sessions_and_a_dropped_session_frees_it() {
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let supplied = Box::pin(Supplied::new(&scratch)).await;
+    let mut holder = connection(&supplied.admin).await;
+    record::lock(&mut holder, 0).await.unwrap();
+    let mut other = connection(&supplied.admin).await;
+    let busy = matches!(
+        record::lock(&mut other, 0).await,
+        Err(record::LockError::Busy)
+    );
+    // Another database of the instance is another lock.
+    let mut elsewhere = connection(&scratch).await;
+    let apart = record::lock(&mut elsewhere, 0).await.is_ok();
+    record::unlock(&mut elsewhere).await.unwrap();
+    drop(holder);
+    let mut freed = false;
+    for _ in 0..60 {
+        if record::lock(&mut other, 0).await.is_ok() {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(other);
+    Box::pin(supplied.drop()).await;
+    assert!(busy, "a second session in the database cannot take it");
+    assert!(apart, "it is scoped to the database");
+    assert!(freed, "a killed session frees it");
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn a_refused_acquisition_releases_the_lock_on_its_own_session() {
+    let (target_url, scratch) = (server("PBPS_TEST_DB"), server("PBPS_TEST_MSSQL_SCRATCH_DB"));
+    let supplied = Box::pin(Supplied::new(&scratch)).await;
+    let live = token();
+    supplied.leave_sandbox(&live, false).await;
+    let session = alive(&scratch, &live).await;
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let request =
+        super::super::super::producer::request(Driver::Mssql, side, side, &Hints::default(), &[])
+            .unwrap();
+    let mut target = connection(&target_url).await;
+    let identity = sql::cluster_identity(&mut target).await.unwrap();
+    // The session stays open: the lock must be free without its end.
+    let mut admin = connection(&supplied.connection).await;
+    let tokens = super::super::Tokens::generate();
+    let provenance = provenance();
+    let refused = super::super::engine::scratch(
+        Driver::Mssql,
+        &mut target,
+        &mut admin,
+        &tokens,
+        &identity,
+        &supplied.connection,
+        &request,
+        &Standard::Mssql,
+        None,
+        &provenance,
+    )
+    .await
+    .err()
+    .map(|error| error.to_string());
+    let mut other = connection(&supplied.admin).await;
+    let free = record::lock(&mut other, 0).await.is_ok();
+    drop(admin);
+    drop(session);
+    Box::pin(supplied.drop()).await;
+    assert!(
+        refused.is_some_and(|reason| reason.contains("still running")),
+        "the live sandbox refuses the acquisition"
+    );
+    assert!(free, "and its lock is free while its session lives");
+}

@@ -46,6 +46,10 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     token: String,
     /// The companion databases recorded in the scratch database so far.
     recorded: Vec<String>,
+    /// Whether this run holds the application lock on the supplied database
+    /// (`recovery::lock`): from before it reads what a dead run left until its
+    /// own sandbox user exists.
+    locked: bool,
 }
 
 pub(in crate::resolver::server) struct Prepared {
@@ -163,6 +167,7 @@ pub(in crate::resolver::server) async fn preview<'a>(
         companions: Vec::new(),
         token,
         recorded: Vec::new(),
+        locked: false,
     };
     // Before the run creates anything: what runs killed earlier left.
     scratch.recover(provisioning, admin).await?;
@@ -305,6 +310,7 @@ pub(super) async fn scratch<'a>(
             companions: Vec::new(),
             token: tokens.scratch.clone(),
             recorded: Vec::new(),
+            locked: false,
         };
         // After the placement verdict and before the run's first write: what
         // runs killed earlier left (#2410).
@@ -507,6 +513,9 @@ impl Scratch<'_> {
         sql::create_sandbox(&mut owner, &sandbox)
             .await
             .map_err(read)?;
+        // The run's own sandbox user is its record on a supplied database:
+        // another run that takes the lock now finds it.
+        self.unlock(admin).await;
         sql::enter_sandbox(&mut owner, &sandbox)
             .await
             .map_err(read)?;
@@ -793,6 +802,9 @@ impl Scratch<'_> {
         &mut self,
         admin: &mut Conn,
     ) -> Result<(), Vec<String>> {
+        // Whatever stopped the run before its sandbox existed, the lock goes
+        // with it (the session's end would free it too).
+        self.unlock(admin).await;
         // The companions first: the scratch database holds their record, and
         // the login the run's (`recovery`, #2410). Anything left of them keeps
         // both, so a later run still finds what is left.

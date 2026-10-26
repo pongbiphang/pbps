@@ -2331,7 +2331,11 @@ DEC-1674.1).**
         keeps the rest. A database or login another login owns is named with
         the `DROP` that removes it. A supplied database is cleaned through the
         dead run's sandbox user, as a release cleans it, and refused while
-        that run is alive.
+        that run is alive. Runs on one supplied database are serialised by an
+        application lock held from before the first read of what a dead run
+        left until the run's own sandbox user exists, so that two runs never
+        clean the same dead sandbox, and one that cannot get it in 30 s
+        refuses naming it.
       - `kind: docker` is not yet recovered.
     - **Scratch is empty.** The database the run compiles in holds nothing
       initdb did not create: no object at or above `FirstNormalObjectId`,
