@@ -4778,6 +4778,22 @@ fn render_batches(statements: &[Statement], separator: Option<&str>) -> String {
         }
         out.push_str(&s.sql);
         out.push('\n');
+        // What the executor runs after the vet, in the same transaction or
+        // step, is part of what the reader approves: a domain's checks are
+        // added `NOT VALID` above and validated here, which scans every row
+        // holding locks until commit. The executor keeps its order (vet, then
+        // this); the script only shows it where it runs (DEC-1635.8).
+        if let Some(tail) = s
+            .declared_type
+            .as_ref()
+            .and_then(|declared| declared.after_vet.as_deref())
+        {
+            out.push_str(
+                "\n-- pbps vets the bound code of this declaration at this point, then runs:\n",
+            );
+            out.push_str(tail);
+            out.push('\n');
+        }
         previous_own_batch = s.own_batch;
     }
     out
@@ -5083,6 +5099,39 @@ mod tests {
         assert_eq!(
             d.type_change_risk(&ty("nvarchar(100)"), &ty("nvarchar(max)")),
             TypeChangeRisk::Safe
+        );
+    }
+
+    /// What the executor runs after a type statement's vet is rendered where
+    /// it runs, after the statement and before the next, behind a line that
+    /// says so; a statement with no such tail renders as it always did.
+    #[test]
+    fn a_statements_post_vet_sql_is_rendered_after_it_and_before_the_next() {
+        let mut tightening = Statement::new("ADD A NOT VALID;");
+        tightening.declared_type = Some(DeclaredTypeStatement {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.d".parse().unwrap(),
+            definition: None,
+            altered: true,
+            after_vet: Some("VALIDATE A;".to_owned()),
+        });
+        let mut loosening = Statement::new("DROP B;");
+        loosening.declared_type = Some(DeclaredTypeStatement {
+            after_vet: None,
+            ..tightening.declared_type.clone().unwrap()
+        });
+        let after = Statement::new("NEXT;");
+        let script = render_batches(&[tightening, loosening.clone(), after.clone()], None);
+        assert_eq!(
+            script,
+            "ADD A NOT VALID;\n\n\
+             -- pbps vets the bound code of this declaration at this point, then runs:\n\
+             VALIDATE A;\n\nDROP B;\n\nNEXT;\n"
+        );
+        // A statement with no tail is unchanged.
+        assert_eq!(
+            render_batches(&[loosening, after], None),
+            "DROP B;\n\nNEXT;\n"
         );
     }
 

@@ -3475,6 +3475,18 @@ of the enum it is built on (only its creation does), which let the order
 effects contradict the plan's own order for a domain renamed beside a rename of
 its base enum's label.
 
+What a reviewer approves shows the validation. `render_script` (the one
+renderer under `plan --sql`, a bootstrap script and a staged listing) prints a
+statement's post-vet SQL (`after_vet`) after the statement and before the
+next, behind a line saying that pbps vets the bound code at that point; the
+executor keeps its order and runs it, not the text. The tail is derived from
+the change (`from`, `to`, `half`), which the plan checksum covers through the
+change payload (the checksum is over the saved plan, not over the rendered
+script), so the validation shown is the one the checksum approves. A loosening
+and a `SET NOT NULL` alone have no tail and show none. Tests:
+`a_statements_post_vet_sql_is_rendered_after_it_and_before_the_next` and
+`the_rendered_script_shows_the_validation_after_the_not_valid_add`.
+
 Tests: `a_renamed_domain_is_still_one_the_plan_has_yet_to_alter` and
 `a_renamed_domain_over_a_renamed_label_takes_the_default_that_uses_it` (the
 domain's rename, the label's rename and the default in one plan),

@@ -1,4 +1,5 @@
-// Frozen a7352b65 script rendering for byte comparisons; test-only source.
+// Frozen a7352b65 script rendering for byte comparisons, plus the `after_vet`
+// tail below; test-only source.
 use pbps_dialect::{Dialect, Statement};
 use pbps_model::SessionZone;
 
@@ -38,6 +39,19 @@ fn render_batches(statements: &[Statement], separator: Option<&str>) -> String {
         }
         out.push_str(&s.sql);
         out.push('\n');
+        // The one rendering added since the freeze: what runs after the vet
+        // is shown where it runs (DEC-1635.8).
+        if let Some(tail) = s
+            .declared_type
+            .as_ref()
+            .and_then(|declared| declared.after_vet.as_deref())
+        {
+            out.push_str(
+                "\n-- pbps vets the bound code of this declaration at this point, then runs:\n",
+            );
+            out.push_str(tail);
+            out.push('\n');
+        }
         previous_own_batch = s.own_batch;
     }
     out

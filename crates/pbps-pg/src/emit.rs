@@ -192,6 +192,75 @@ mod declared_type_emission_tests {
         );
     }
 
+    /// The script a reviewer approves shows the validation the apply runs
+    /// after the vet, where it runs (DEC-1635.8): after its `ADD … NOT VALID`,
+    /// with a line saying the bound code is vetted there; a loosening and a
+    /// `SET NOT NULL` alone run no validation and show none. A staged plan's
+    /// listing is rendered the same way.
+    #[test]
+    fn the_rendered_script_shows_the_validation_after_the_not_valid_add() {
+        use pbps_model::DomainHalf::{Loosen, Tighten};
+        let pg = Postgres::new();
+        let render = |from: pbps_model::ManagedType,
+                      to: pbps_model::ManagedType,
+                      half,
+                      mode: pbps_model::PlanMode| {
+            let planned = pbps_model::PlannedChange::new(Change::AlterDomain {
+                uid: "y_000001".parse().unwrap(),
+                name: pbps_model::TypeRef::new("app", "code").unwrap(),
+                from: Box::new(from),
+                to: Box::new(to),
+                half,
+            });
+            let ordered = pbps_diff::order::singleton(planned, mode, &pg);
+            let lowered = pbps_dialect::lower::lower_all(
+                &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
+                &pg,
+            )
+            .unwrap();
+            pbps_dialect::render_script(&lowered, &pg, &pbps_model::SessionZone::utc())
+        };
+        let plain = domain_for_alteration(false, None, &[("old", "VALUE <> ''")]);
+        let checked = domain_for_alteration(
+            false,
+            None,
+            &[("old", "VALUE <> ''"), ("new", "length(VALUE) < 9")],
+        );
+        for mode in [
+            pbps_model::PlanMode::Transactional,
+            pbps_model::PlanMode::Staged,
+        ] {
+            let script = render(plain.clone(), checked.clone(), Tighten, mode);
+            let add = script.find("ADD CONSTRAINT \"new\"").expect(&script);
+            let note = script
+                .find("-- pbps vets the bound code of this declaration at this point")
+                .expect(&script);
+            let validate = script.find("VALIDATE CONSTRAINT \"new\"").expect(&script);
+            assert!(add < note && note < validate, "{mode:?}: {script}");
+            assert_eq!(script.matches("VALIDATE CONSTRAINT").count(), 1, "{script}");
+            // Negatives: a loosening, and `SET NOT NULL` alone, validate nothing.
+            let loosen = render(checked.clone(), plain.clone(), Loosen, mode);
+            assert!(
+                loosen.contains("DROP CONSTRAINT")
+                    && !loosen.contains("VALIDATE")
+                    && !loosen.contains("pbps vets"),
+                "{loosen}"
+            );
+            let not_null = render(
+                plain.clone(),
+                domain_for_alteration(true, None, &[("old", "VALUE <> ''")]),
+                Tighten,
+                mode,
+            );
+            assert!(
+                not_null.contains("SET NOT NULL")
+                    && !not_null.contains("VALIDATE")
+                    && !not_null.contains("pbps vets"),
+                "{not_null}"
+            );
+        }
+    }
+
     #[test]
     fn a_tightening_sets_not_null_before_the_checks_and_validates_only_checks() {
         use pbps_model::DomainHalf::Tighten;
