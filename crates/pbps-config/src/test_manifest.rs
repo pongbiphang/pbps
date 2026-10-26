@@ -449,15 +449,16 @@ impl TestManifest {
 }
 
 /// Why `rev` cannot be handed to git as a revision, if it cannot. It is
-/// resolved by the caller; this keeps it from being read as an option or from
-/// spanning lines in a report.
+/// resolved by the caller, and git alone judges the expression: `HEAD^{/some
+/// text}` is a revision with spaces in it. This only keeps it from being read
+/// as an option or from spanning lines in a report.
 fn revision_problem(rev: &str) -> Option<&'static str> {
     if rev.is_empty() {
         Some("name a revision, or leave `candidate` out to test the working tree")
     } else if rev.starts_with('-') {
         Some("a revision cannot start with `-`; git would read it as an option")
-    } else if rev.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        Some("a revision has no whitespace or control characters")
+    } else if rev.chars().any(char::is_control) {
+        Some("a revision has no control characters")
     } else {
         None
     }

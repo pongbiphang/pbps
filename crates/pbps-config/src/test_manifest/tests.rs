@@ -232,7 +232,14 @@ fn a_candidate_is_the_working_tree_or_a_revision_git_can_be_asked_about() {
         rev("working-tree").unwrap().candidate,
         Candidate::WorkingTree
     );
-    for bad in ["", "--upload-pack=x", "-x", "a b", "a\\nb"] {
+    // Git, not this parser, judges the expression; these have spaces.
+    for spaced in ["HEAD^{/read the manifest}", "HEAD@{1 day ago}"] {
+        assert_eq!(
+            rev(spaced).unwrap().candidate,
+            Candidate::Revision(spaced.into())
+        );
+    }
+    for bad in ["", "--upload-pack=x", "-x", "a\\nb", "a\\tb"] {
         assert!(
             matches!(
                 rev(bad).unwrap_err().as_slice(),
