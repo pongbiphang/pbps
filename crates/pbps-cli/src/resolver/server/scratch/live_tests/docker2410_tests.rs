@@ -4,7 +4,7 @@
 //! in the server. These tests make that state by hand with the names and
 //! labels a run gives it; the real SIGKILLs of a `pbps plan` are in
 //! `tests/flow_pg.rs`. The grace for a container that never had a keeper is
-//! four seconds here, not five minutes.
+//! twenty seconds here, not five minutes.
 
 use super::super::container::{Keeper, swept};
 use super::setting;
@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::Duration;
 
 /// The grace the tests run under (`container::recovery::GRACE`).
-const GRACE: Duration = Duration::from_secs(4);
+const GRACE: Duration = Duration::from_secs(20);
 
 fn token() -> String {
     format!("{:032x}", rand::random::<u128>())
@@ -120,12 +120,30 @@ async fn start(made: &mut Made, token: &str) -> (String, String) {
     panic!("the container {name} never accepted a connection");
 }
 
-fn removed_names(report: &super::super::recovery::Report) -> Vec<String> {
+/// What a sweep reported of one container. Other runs on the same daemon have
+/// containers of their own in the same report, and they are not a test's
+/// business (concurrent runs on one daemon are a supported case).
+fn removed(report: &super::super::recovery::Report, name: &str) -> bool {
     report
         .groups
         .iter()
-        .flat_map(|group| group.removed.iter().flat_map(|r| r.names.clone()))
+        .flat_map(|group| &group.removed)
+        .any(|resource| resource.names.iter().any(|n| n == name))
+}
+
+fn kept_why(report: &super::super::recovery::Report, name: &str) -> Vec<String> {
+    report
+        .groups
+        .iter()
+        .flat_map(|group| &group.kept)
+        .filter(|kept| kept.resource.names.iter().any(|n| n == name))
+        .map(|kept| kept.why.clone())
         .collect()
+}
+
+/// Whether a sweep found the owner of `token` alive.
+fn alive(report: &super::super::recovery::Report, token: &str) -> bool {
+    report.live.iter().any(|live| live == token)
 }
 
 #[tokio::test]
@@ -147,13 +165,14 @@ async fn a_container_whose_keeper_connected_and_is_gone_is_removed_at_once() {
         exists(&name),
         volumes.iter().filter(|v| volume_exists(v)).count(),
     );
-    assert_eq!(
-        removed_names(&report),
-        std::slice::from_ref(&name),
+    // Another run's sweep may have removed it first: what is asked is that it
+    // is gone, at once, and that this sweep did not keep or spare it.
+    assert!(!still, "removed well inside the grace: {report:?}");
+    assert_eq!(gone, 0, "with its volumes: {volumes:?}");
+    assert!(
+        kept_why(&report, &name).is_empty() && !alive(&report, &dead),
         "{report:?}"
     );
-    assert!(!still, "removed well inside the grace");
-    assert_eq!(gone, 0, "with its volumes: {volumes:?}");
 }
 
 #[tokio::test]
@@ -199,11 +218,11 @@ async fn a_container_that_never_connected_is_kept_inside_the_grace_and_removed_a
     let gone = !exists(&name);
     assert!(kept, "a run that has not connected yet may still");
     assert!(
-        inside.groups.is_empty() && inside.live == [dead.clone()],
+        alive(&inside, &dead) && !removed(&inside, &name) && kept_why(&inside, &name).is_empty(),
         "{inside:?}"
     );
-    assert_eq!(removed_names(&after), [name], "{after:?}");
-    assert!(gone);
+    assert!(gone, "removed after the grace: {after:?}");
+    assert!(!alive(&after, &dead), "{after:?}");
 }
 
 #[tokio::test]
@@ -221,7 +240,7 @@ async fn a_live_runs_container_is_never_touched_even_past_the_grace() {
     drop(keeper);
     assert!(kept, "its keeper is in the server");
     assert!(
-        report.groups.is_empty() && report.live == [live],
+        alive(&report, &live) && !removed(&report, &name) && kept_why(&report, &name).is_empty(),
         "{report:?}"
     );
 }
@@ -234,12 +253,11 @@ async fn a_container_that_has_exited_is_removed_at_once() {
     let (name, _) = start(&mut made, &dead).await;
     docker(&["kill", &name]);
     let report = swept(&token()).await;
-    assert_eq!(
-        removed_names(&report),
-        std::slice::from_ref(&name),
+    assert!(!exists(&name), "{report:?}");
+    assert!(
+        kept_why(&report, &name).is_empty() && !alive(&report, &dead),
         "{report:?}"
     );
-    assert!(!exists(&name));
 }
 
 #[tokio::test]
@@ -270,7 +288,7 @@ async fn a_container_from_another_tool_or_without_a_token_is_never_touched() {
     // The scratch label of an earlier version: no token.
     sleeping(
         &mut made,
-        "pbps-scratch-0123456789abcdef",
+        &format!("pbps-scratch-{}", &token()[..16]),
         &["pbps.resolver=scratch".to_owned()],
     );
     // A token that is not the name's.
@@ -295,7 +313,10 @@ async fn a_container_from_another_tool_or_without_a_token_is_never_touched() {
     let present = made.0.iter().all(|name| exists(name));
     assert!(present, "all four are still there");
     assert!(
-        report.groups.is_empty() && report.live.is_empty(),
+        made.0
+            .iter()
+            .all(|name| { !removed(&report, name) && kept_why(&report, name).is_empty() })
+            && [&a, &b, &c, &d].iter().all(|token| !alive(&report, token)),
         "{report:?}"
     );
 }
@@ -332,7 +353,11 @@ async fn a_container_whose_server_cannot_be_read_is_kept_and_named_with_the_comm
     let report = swept(&token()).await;
     let kept = exists(&name);
     assert!(kept, "it is not judged");
-    let group = &report.groups[0];
+    let group = report
+        .groups
+        .iter()
+        .find(|group| group.token == dead)
+        .unwrap_or_else(|| panic!("no group for {dead}: {report:?}"));
     assert!(group.removed.is_empty(), "{group:?}");
     assert_eq!(
         group.kept[0].statement,

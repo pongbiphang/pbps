@@ -49,8 +49,10 @@ pub(super) const ENGINE: &str = "pbps.resolver.engine";
 /// before it is taken as dead: the run's readiness deadline, and two minutes.
 #[cfg(not(test))]
 const GRACE: Duration = Duration::from_secs(READY.as_secs() + 120);
+// Longer than a loaded daemon takes to start a server, which the tests'
+// containers must not be older than when first swept.
 #[cfg(test)]
-const GRACE: Duration = Duration::from_secs(4);
+const GRACE: Duration = Duration::from_secs(20);
 
 /// How long one probe of a candidate's server may take.
 const PROBE: Duration = Duration::from_secs(15);

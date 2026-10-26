@@ -122,19 +122,29 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
     let dead = swept(&token_of_run).await;
     let removed = !exists(&name);
     drop(made);
+    // Other runs on the daemon are in the same reports: only this container
+    // is asked about.
+    let named = |report: &crate::resolver::server::scratch::recovery::Report| {
+        report.groups.iter().any(|g| {
+            g.removed.iter().any(|r| r.names == [name.clone()])
+                || g.kept.iter().any(|k| k.resource.names == [name.clone()])
+        })
+    };
     assert!(
-        kept && live.groups.is_empty() && live.live == [token.clone()],
+        kept && live.live.contains(&token) && !named(&live),
         "{live:?}"
     );
     assert!(gone, "the server forgot the session");
     assert_eq!(held, Some((true, true)));
     assert_eq!(after, Some((false, true)));
+    // Another run's sweep may have removed it first: it is gone, and this
+    // sweep did not keep it.
     assert!(
         removed
-            && dead
+            && !dead
                 .groups
                 .iter()
-                .any(|g| g.removed.iter().any(|r| r.names == [name.clone()])),
+                .any(|g| g.kept.iter().any(|k| k.resource.names == [name.clone()])),
         "{dead:?}"
     );
 }

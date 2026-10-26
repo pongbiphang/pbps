@@ -285,6 +285,14 @@ impl Container {
     }
 }
 
+/// Whether the runtime says the container is being removed, by this run or
+/// by another's sweep.
+async fn removing(id: &str) -> bool {
+    docker(&["container", "inspect", "--format", "{{.State.Status}}", id])
+        .await
+        .is_ok_and(|status| status.trim() == "removing")
+}
+
 /// [`Container::remove`] for a container named, not owned: a leftover of a run
 /// that was killed (`recovery`).
 async fn remove_named(id: &str) -> Result<(), Vec<String>> {
@@ -307,17 +315,37 @@ async fn remove_named(id: &str) -> Result<(), Vec<String>> {
     let mut left = Vec::new();
     // Only the runtime saying there is no such container is absence. An
     // unreachable daemon or a timeout says nothing, and the container
-    // may still run.
-    match docker(&["container", "inspect", "--format", "{{.Id}}", id]).await {
-        Err(why) if no_such_container(&why) => {}
-        _ => left.push(format!("the docker container {id} and its volumes")),
+    // may still run. A container another run's sweep is removing is waited
+    // for, with its volumes: two sweeps may find the same dead one.
+    let mut waits = 0;
+    let gone = loop {
+        match docker(&["container", "inspect", "--format", "{{.Id}}", id]).await {
+            Err(why) if no_such_container(&why) => break true,
+            Ok(_) if waits < 50 && removing(id).await => {
+                waits += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => break false,
+        }
+    };
+    if !gone {
+        left.push(format!("the docker container {id} and its volumes"));
     }
     match volumes {
         Ok(volumes) => {
             for volume in volumes {
-                match docker(&["volume", "inspect", "--format", "{{.Name}}", &volume]).await {
-                    Err(why) if no_such_volume(&why) => {}
-                    _ => left.push(format!("the docker volume {volume}")),
+                let mut tries = 0;
+                loop {
+                    match docker(&["volume", "inspect", "--format", "{{.Name}}", &volume]).await {
+                        Err(why) if no_such_volume(&why) => {}
+                        Ok(_) if gone && tries < 30 => {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        _ => left.push(format!("the docker volume {volume}")),
+                    }
+                    break;
                 }
             }
         }

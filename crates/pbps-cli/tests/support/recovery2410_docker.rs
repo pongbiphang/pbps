@@ -354,6 +354,14 @@ pub fn a_live_run_and_foreign_containers_are_left_alone(server: &str) {
         "the live run's container stood while another run swept"
     );
     assert_eq!(foreign_still, [true, true], "and so did the others");
-    assert!(recovered(&next).is_empty(), "{}", said(&next));
+    // Another run's leftovers on the same daemon may be removed and said so;
+    // none of these containers may be.
+    assert!(
+        recovered(&next)
+            .iter()
+            .all(|m| !m.contains(&name) && foreign.iter().all(|(n, _)| !m.contains(n))),
+        "{}",
+        said(&next)
+    );
     assert!(finished.success(), "and the live run was not disturbed");
 }
