@@ -269,8 +269,9 @@ indexes:
   is the engine's: PostgreSQL refuses a part over 63 bytes, which the server
   would truncate without an error (#2021). PostgreSQL admits references to
   existing enums, domains and standalone composites; SQL Server refuses them
-  by name. Retypes, `data:` and partition keys over references are refused
-  (DEC-1523.1).
+  by name. Retypes and `data:` over references are refused (DEC-1523.1), and
+  so is a partition key, except a scalar declared enum as a LIST or RANGE key
+  (DEC-2346.1).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent
@@ -340,7 +341,9 @@ indexes:
   partition `{modulus: m, remainder: r}`. Validation refuses what the engine
   does: a key of more than 32 columns, a LIST key of more than one column, a
   value two partitions take (a connected plan asks the engine, by the key
-  type's equality), a bound of another strategy than its parent's,
+  type's equality), a bound of another strategy than its parent's, a LIST or
+  RANGE key that is a user-defined type other than a scalar declared enum
+  (the enum's partitions bound it by declared labels, DEC-2346.1),
   a DEFAULT under HASH, a remainder not below its modulus, a modulus above
   2147483647, a modulus that is not a factor of the next larger, and hash
   partitions that overlap. A tree's strategy never changes in a plan
@@ -880,9 +883,12 @@ commit; #2354 tracks an engine-typed, scan-free approach. Plan-time expression
 probes defer by the resolved enum type when its label is renamed, including
 arrays and domains. The engine enforces the declaration at apply, with the
 existing vet and readback checks.
-`data:` rows and partition bounds over user-defined references remain refused
-by DEC-1523.1 before the label-use check can arise; #2346 tracks admitting
-those surfaces. Arrays also remain refused under `data:`. Domain
+`data:` rows over user-defined references remain refused by DEC-1523.1 before
+the label-use check can arise; #2346 tracks admitting them. A partition key may
+be a declared enum (DEC-2346.1): its bounds are declared labels, a bound naming
+a label added in the same plan is refused as above, a label rename carries the
+bounds that name it, and a removal or reorder of its labels is refused by name.
+Arrays also remain refused under `data:`. Domain
 check/default/NOT NULL changes require slice 4. Base and collation changes
 remain unsupported and refuse by name.
 

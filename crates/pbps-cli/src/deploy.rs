@@ -4798,13 +4798,32 @@ fn refuse_pinned_movement(
     // `sp_rename` — the referenced table and its columns are both rewritten by
     // the engine — so the child's shape moves with no change of this plan on
     // it and nothing to excuse it with.
+    // The engine renames a label where a partition's bound holds it, so a
+    // standing partition's bound follows this plan's label renames without a
+    // change of its own (DEC-2346.1).
+    let label_renames =
+        pbps_diff::enum_labels::label_renames(changes.changes.iter().map(|p| &p.change));
+    let label_forwarded = |table: &pbps_model::Table| {
+        let mut table = table.clone();
+        if let Some(of) = &mut table.partition_of
+            && let Some(parent) = before.tables.get(&of.parent)
+        {
+            of.bound = pbps_diff::enum_labels::forwarded_bound(
+                &of.bound,
+                parent,
+                (&resolver, TypeSide::Desired),
+                &label_renames,
+            );
+        }
+        table
+    };
     compare(
         "",
         &before.tables,
         &after.tables,
         named,
         |name: &TableName, was: &pbps_model::Table, now: &pbps_model::Table| {
-            undo_before.apply(was, name) == undo_after.apply(now, name)
+            label_forwarded(&undo_before.apply(was, name)) == *undo_after.apply(now, name)
         },
         &mut moved,
         |n| n.shown().to_string(),
@@ -4924,6 +4943,7 @@ fn refuse_pinned_movement(
             // plan does not rename, so a read from either side of a statement
             // lands in the same spelling.
             let was = &undo_before.apply(was, name);
+            let was = &label_forwarded(was);
             let now = &undo_after.apply(now, now_name);
             let expected_columns = column_changes.expect(now_name, was, now);
             let was_fields = guard::Fields::of(was);

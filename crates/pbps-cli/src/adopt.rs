@@ -184,7 +184,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
         .tables
         .iter()
         .filter_map(|(name, table)| {
-            let why = rendered(dialect.validate_table(name, table));
+            let why =
+                rendered(dialect.validate_table_in_schema(name, table, Default::default(), schema));
             (!why.is_empty()).then(|| (name.clone(), why))
         })
         .collect();
@@ -813,6 +814,50 @@ mod tests {
             "{warned}"
         );
         assert_eq!(pulled.warnings.len(), 2, "{warned}");
+    }
+
+    /// A table keyed by a declared enum is held, and one keyed by a type the
+    /// pull did not declare is left out, as `validate` would refuse it
+    /// (DEC-2346.1).
+    #[test]
+    fn a_table_partitioned_by_a_declared_enum_is_kept_and_by_any_other_type_is_left_out() {
+        for declared in [true, false] {
+            let mut pulled = Pulled::default();
+            let s = &mut pulled.schema;
+            let mut keyed = table("integer", None);
+            keyed.columns.insert(
+                "m".into(),
+                pbps_model::Column::new("app.mood".parse().unwrap()).not_null(),
+            );
+            keyed.primary_key.as_mut().unwrap().columns.push("m".into());
+            keyed.partition_by = Some(pbps_model::PartitionBy {
+                strategy: pbps_model::PartitionStrategy::List,
+                columns: vec!["m".into()],
+                external: false,
+            });
+            s.tables.insert(TableName::new("app", "ev"), keyed);
+            if declared {
+                s.types.insert(
+                    "app.mood".parse().unwrap(),
+                    pbps_model::ManagedType::Enum {
+                        values: vec!["sad".into()],
+                    },
+                );
+            }
+            leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+            assert_eq!(
+                pulled.schema.tables.len(),
+                usize::from(declared),
+                "{:?}",
+                pulled.warnings
+            );
+            let warned = pulled.warnings.join("\n");
+            assert_eq!(
+                warned.contains("table `app.ev` was left out") && warned.contains("partition key"),
+                !declared,
+                "{warned}"
+            );
+        }
     }
 
     /// A partition goes with a parent validation refuses, named, rather than

@@ -178,7 +178,10 @@ fn generation_problems(column: &str, generated: &pbps_model::Generated) -> Vec<D
 /// that declares nothing of its own but checks, indexes (#1577), foreign keys
 /// (#1632), persistence and storage parameters (#1580), since it inherits the
 /// rest and the other partition-level extras are not held yet (#1532); and no `data:` on either, whose rows the engine routes by bound.
-fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
+fn partition_problems(
+    table: &pbps_model::Table,
+    types: &BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
+) -> Vec<DialectError> {
     let invalid = |message: String| DialectError::Invalid {
         dialect: crate::types::DIALECT,
         message,
@@ -200,12 +203,15 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
                     .to_owned(),
             ));
         }
+        // A scalar declared enum keys a LIST or RANGE table (DEC-2346.1); every
+        // other reference keeps DEC-1523.1's refusal. A HASH key is the engine's
+        // hash of the enum's oid, which a rebuild or a restore changes.
+        let admits_enum = by.strategy != pbps_model::PartitionStrategy::Hash;
         for column in &by.columns {
-            if table
-                .columns
-                .get(column)
-                .is_some_and(|c| c.ty.type_ref().is_some())
-            {
+            if table.columns.get(column).is_some_and(|c| {
+                c.ty.type_ref().is_some()
+                    && !(admits_enum && declared_enum_labels(&c.ty, types).is_some())
+            }) {
                 found.push(DialectError::InvalidVerbatim {
                     dialect: crate::types::DIALECT,
                     message: format!(
@@ -269,6 +275,89 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
         found.push(invalid(
             "`data:` cannot be declared on a partitioned table or a partition yet".to_owned(),
         ));
+    }
+    found
+}
+
+/// The labels of the declared enum a scalar column type names, or `None` for
+/// any other type: an array, a domain, a composite, an undeclared name
+/// (DEC-2346.1). A lookup by name in the schema's own declarations.
+pub(crate) fn declared_enum_labels<'a>(
+    ty: &pbps_model::ColumnType,
+    types: &'a BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
+) -> Option<&'a [String]> {
+    if ty.is_array() {
+        return None;
+    }
+    match types.get(ty.type_ref()?)? {
+        pbps_model::ManagedType::Enum { values } => Some(values),
+        pbps_model::ManagedType::Domain { .. } => None,
+    }
+}
+
+/// A bound datum over a declared enum key is one of the enum's labels, which
+/// is the whole check: no engine is asked, so a type this plan creates is
+/// judged as a standing one is (DEC-2346.1). `MINVALUE`, `MAXVALUE` and
+/// `NULL` name no label.
+fn bound_label_problems(
+    name: &TableName,
+    table: &Table,
+    schema: &pbps_model::Schema,
+) -> Vec<DialectError> {
+    use pbps_model::{BoundDatum, ListDatum, PartitionBound};
+    let Some(of) = &table.partition_of else {
+        return Vec::new();
+    };
+    let Some(parent) = schema.tables.get(&of.parent) else {
+        return Vec::new();
+    };
+    let Some(by) = &parent.partition_by else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (at, column) in by.columns.iter().enumerate() {
+        let Some(ty) = parent.columns.get(column).map(|c| &c.ty) else {
+            continue;
+        };
+        let Some(labels) = declared_enum_labels(ty, &schema.types) else {
+            continue;
+        };
+        let named: Vec<&String> = match &of.bound {
+            PartitionBound::Range { from, to } => [from.get(at), to.get(at)]
+                .into_iter()
+                .flatten()
+                .filter_map(|datum| match datum {
+                    BoundDatum::Value(label) => Some(label),
+                    BoundDatum::MinValue | BoundDatum::MaxValue => None,
+                })
+                .collect(),
+            PartitionBound::List { values } => values
+                .iter()
+                .filter_map(|datum| match datum {
+                    ListDatum::Value(label) => Some(label),
+                    ListDatum::Null => None,
+                })
+                .collect(),
+            PartitionBound::Default | PartitionBound::Hash { .. } => Vec::new(),
+        };
+        for label in named.into_iter().filter(|l| !labels.contains(*l)) {
+            found.push(DialectError::Invalid {
+                dialect: crate::types::DIALECT,
+                message: format!(
+                    "partition `{name}` is bound to `{label}`, which is not a label of `{ty}`, the \
+                     type of its key column `{column}`; the declared labels are {labels}",
+                    name = name.shown(),
+                    label = pbps_model::escape::Escaped(label),
+                    ty = ty.shown(),
+                    column = column.shown(),
+                    labels = labels
+                        .iter()
+                        .map(|l| format!("`{}`", pbps_model::escape::Escaped(l)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            });
+        }
     }
     found
 }
@@ -1083,16 +1172,25 @@ impl Dialect for Postgres {
     fn attach_scan_key(
         &self,
         uid: &pbps_model::Uid,
-        key: &[pbps_model::ColumnName],
+        key: &[(pbps_model::ColumnName, pbps_model::ColumnType)],
+        types: &BTreeMap<pbps_model::TypeRef, pbps_model::ManagedType>,
     ) -> Vec<pbps_model::ColumnName> {
-        if self
-            .attach_constraint_names
-            .get(uid)
-            .is_some_and(|names| names.contains(&emit::scan_check_name(uid)))
+        // The staged CHECK spells its bound with bare operators and untyped
+        // literals, which resolve to the type's own for a built-in type and for
+        // an enum, and to none for a domain (measured, DEC-2346.1). A key over
+        // anything else attaches by the single statement.
+        let spells = key
+            .iter()
+            .all(|(_, ty)| ty.type_ref().is_none() || declared_enum_labels(ty, types).is_some());
+        if !spells
+            || self
+                .attach_constraint_names
+                .get(uid)
+                .is_some_and(|names| names.contains(&emit::scan_check_name(uid)))
         {
             Vec::new()
         } else {
-            key.to_vec()
+            key.iter().map(|(column, _)| column.clone()).collect()
         }
     }
 
@@ -1644,6 +1742,17 @@ impl Dialect for Postgres {
         table: &Table,
         sources: pbps_model::diagnostic::ColumnSources<'_>,
     ) -> Vec<DialectError> {
+        // No declared type is known to a table alone, so none is admitted.
+        self.validate_table_in_schema(name, table, sources, &pbps_model::Schema::default())
+    }
+
+    fn validate_table_in_schema(
+        &self,
+        name: &TableName,
+        table: &Table,
+        sources: pbps_model::diagnostic::ColumnSources<'_>,
+        schema: &pbps_model::Schema,
+    ) -> Vec<DialectError> {
         let mut found = Vec::new();
         // A partition's columns are its parent's, which it does not declare:
         // its checks and indexes are held to them by `validate_partition`.
@@ -1729,7 +1838,8 @@ impl Dialect for Postgres {
                 }
             }
         }
-        found.extend(partition_problems(table));
+        found.extend(partition_problems(table, &schema.types));
+        found.extend(bound_label_problems(name, table, schema));
         // SQL Server's (#1176). PostgreSQL has no system-versioned table.
         if table.system_time.is_some() {
             found.push(DialectError::Invalid {
@@ -2707,6 +2817,8 @@ mod tests {
         let uid: Uid = "t_aaaaaa".parse().unwrap();
         let other: Uid = "t_bbbbbb".parse().unwrap();
         let key: Vec<ColumnName> = vec!["id".into()];
+        let typed: Vec<(ColumnName, pbps_model::ColumnType)> =
+            vec![("id".into(), "integer".parse().unwrap())];
         let scratch = super::emit::scan_check_name(&uid);
         for (owner, held, occupied) in [
             (uid.clone(), scratch.clone(), true),
@@ -2724,7 +2836,7 @@ mod tests {
                     from: vec![BoundDatum::Value("1".into())],
                     to: vec![BoundDatum::Value("10".into())],
                 },
-                key: pg.attach_scan_key(&uid, &key),
+                key: pg.attach_scan_key(&uid, &typed, &Default::default()),
                 shape: Box::default(),
             };
             // Only the optional proof key is sealed. A fresh emitter at apply
@@ -2740,7 +2852,10 @@ mod tests {
                 assert!(sql[0].scan_check.is_some());
             }
         }
-        assert_eq!(super::Postgres::new().attach_scan_key(&uid, &key), key);
+        assert_eq!(
+            super::Postgres::new().attach_scan_key(&uid, &typed, &Default::default()),
+            key
+        );
     }
 
     fn partitioned(columns: &[&str], key: &[&str]) -> pbps_model::Table {
@@ -7924,6 +8039,253 @@ mod enum_surface_refusal_tests {
             table.columns["m"].value_source = pbps_model::ValueSource::Default("'old'".into());
             assert!(pg.validate_table(&loaded.name, &table).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod enum_partition_key_tests {
+    use super::*;
+    use pbps_model::{
+        BoundDatum, ColumnName, ColumnType, ListDatum, ManagedType, PartitionBound, PartitionOf,
+        PartitionStrategy, Schema, Uid,
+    };
+
+    fn declared() -> BTreeMap<pbps_model::TypeRef, ManagedType> {
+        let domain = |base: &str| ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        [
+            (
+                "app.mood".parse().unwrap(),
+                ManagedType::Enum {
+                    values: vec!["sad".into(), "ok".into(), "happy".into()],
+                },
+            ),
+            ("app.dmood".parse().unwrap(), domain("app.mood")),
+            ("app.dtxt".parse().unwrap(), domain("text")),
+            ("app.dint".parse().unwrap(), domain("integer")),
+        ]
+        .into()
+    }
+
+    fn keyed(ty: &str, strategy: PartitionStrategy) -> Table {
+        let mut table = Table::default();
+        for (name, ty) in [("id", "integer"), ("m", ty)] {
+            let mut column = pbps_model::Column::new(ty.parse().unwrap());
+            column.nullable = false;
+            table.columns.insert(name.into(), column);
+        }
+        table.partition_by = Some(pbps_model::PartitionBy {
+            strategy,
+            columns: vec!["m".into()],
+            external: false,
+        });
+        table
+    }
+
+    fn problems(table: &Table, schema: &Schema) -> Vec<String> {
+        Postgres::new()
+            .validate_table_in_schema(&"app.t".parse().unwrap(), table, Default::default(), schema)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// DEC-2346.1: a scalar reference to a declared enum keys a LIST or RANGE
+    /// table, and every other reference keeps DEC-1523.1's refusal and text.
+    #[test]
+    fn only_a_scalar_declared_enum_keys_a_list_or_range_table() {
+        let schema = Schema {
+            types: declared(),
+            ..Default::default()
+        };
+        for strategy in [PartitionStrategy::List, PartitionStrategy::Range] {
+            for (ty, admitted) in [
+                ("app.mood", true),
+                ("app.mood[]", false),
+                ("app.dmood", false),
+                ("app.dmood[]", false),
+                ("app.dtxt", false),
+                // Not declared here: an external enum, a composite.
+                ("ext.mood", false),
+                ("app.pair", false),
+            ] {
+                let table = keyed(ty, strategy);
+                let found = problems(&table, &schema);
+                if admitted {
+                    assert!(found.is_empty(), "{ty}: {found:?}");
+                } else {
+                    assert_eq!(found.len(), 1, "{ty}: {found:?}");
+                    assert!(
+                        found[0].contains(
+                            "partition key `m` has a user-defined type reference, which is not \
+                             supported as a partition key"
+                        ),
+                        "{ty}: {found:?}"
+                    );
+                }
+                // A table seen alone, or beside no declaration, admits nothing.
+                let lone = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
+                assert!(!lone.is_empty(), "{ty}: no schema, no admission");
+                assert_eq!(
+                    problems(&table, &Schema::default()).len(),
+                    1,
+                    "{ty}: the declaration is on the other side"
+                );
+            }
+        }
+        // The engine hashes an enum by its oid, which a rebuild changes.
+        let hashed = keyed("app.mood", PartitionStrategy::Hash);
+        assert_eq!(problems(&hashed, &schema).len(), 1);
+    }
+
+    fn child(bound: PartitionBound) -> Table {
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.p".parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// DEC-2346.1: a bound datum over a declared enum key is a declared label
+    /// (or an unbounded end, or NULL); the refusal names the partition and the
+    /// label, and the other key columns are not read as labels.
+    #[test]
+    fn a_bound_over_an_enum_key_names_declared_labels_only() {
+        let value = |l: &str| ListDatum::Value(l.into());
+        let at = |l: &str| BoundDatum::Value(l.into());
+        let mut schema = Schema {
+            types: declared(),
+            ..Default::default()
+        };
+        schema.tables.insert(
+            "app.p".parse().unwrap(),
+            keyed("app.mood", PartitionStrategy::List),
+        );
+        schema.tables.insert(
+            "app.r".parse().unwrap(),
+            keyed("app.mood", PartitionStrategy::Range),
+        );
+        let check = |schema: &Schema, parent: &str, bound: PartitionBound| {
+            let mut table = child(bound);
+            table.partition_of.as_mut().unwrap().parent = parent.parse().unwrap();
+            Postgres::new()
+                .validate_table_in_schema(
+                    &"app.child".parse().unwrap(),
+                    &table,
+                    Default::default(),
+                    schema,
+                )
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let list = |values: &[ListDatum]| PartitionBound::List {
+            values: values.iter().cloned().collect(),
+        };
+        assert!(
+            check(
+                &schema,
+                "app.p",
+                list(&[value("ok"), value("sad"), ListDatum::Null])
+            )
+            .is_empty()
+        );
+        assert!(check(&schema, "app.p", PartitionBound::Default).is_empty());
+        let found = check(&schema, "app.p", list(&[value("ok"), value("nonesuch")]));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("partition `app.child`")
+                && found[0].contains("`nonesuch`")
+                && found[0].contains("`app.mood`")
+                && found[0].contains("`sad`, `ok`, `happy`"),
+            "{found:?}"
+        );
+        // A label is exact: another case is another label.
+        assert_eq!(check(&schema, "app.p", list(&[value("OK")])).len(), 1);
+        let range = |from: BoundDatum, to: BoundDatum| PartitionBound::Range {
+            from: vec![from],
+            to: vec![to],
+        };
+        assert!(check(&schema, "app.r", range(BoundDatum::MinValue, at("ok"))).is_empty());
+        assert!(check(&schema, "app.r", range(at("sad"), BoundDatum::MaxValue)).is_empty());
+        assert_eq!(
+            check(&schema, "app.r", range(at("sad"), at("zzz"))).len(),
+            1
+        );
+        assert_eq!(
+            check(&schema, "app.r", range(at("yyy"), at("zzz"))).len(),
+            2
+        );
+        // Only the enum key column's datum is read as a label.
+        schema
+            .tables
+            .get_mut(&"app.r".parse().unwrap())
+            .unwrap()
+            .partition_by = Some(pbps_model::PartitionBy {
+            strategy: PartitionStrategy::Range,
+            columns: vec!["id".into(), "m".into()],
+            external: false,
+        });
+        let two = |id: &str, label: &str| PartitionBound::Range {
+            from: vec![at(id), at("sad")],
+            to: vec![at(id), at(label)],
+        };
+        assert!(check(&schema, "app.r", two("not a label", "ok")).is_empty());
+        assert_eq!(check(&schema, "app.r", two("1", "zzz")).len(), 1);
+    }
+
+    /// DEC-2346.1 (#2112): the staged attach's CHECK spells its bound with bare
+    /// operators and untyped literals, which resolve to the key type's own for
+    /// a built-in type and for an enum, and to none for a domain.
+    #[test]
+    fn an_attach_carries_its_key_only_over_built_in_types_and_declared_enums() {
+        let uid: Uid = "t_aaaaaa".parse().unwrap();
+        let pg = Postgres::new();
+        let types = declared();
+        let key =
+            |ty: &str| -> Vec<(ColumnName, ColumnType)> { vec![("k".into(), ty.parse().unwrap())] };
+        let carried = |ty: &str, types: &BTreeMap<_, _>| {
+            pg.attach_scan_key(&uid, &key(ty), types) == vec![ColumnName::from("k")]
+        };
+        for (ty, carries) in [
+            ("date", true),
+            ("text[]", true),
+            ("integer", true),
+            ("app.mood", true),
+            // A domain, over an enum or not: no operator for the first, and
+            // the others are not measured (DEC-1523.1 refuses them anyway).
+            ("app.dmood", false),
+            ("app.dint", false),
+            ("app.mood[]", false),
+            ("public.citext", false),
+        ] {
+            assert_eq!(carried(ty, &types), carries, "{ty}");
+        }
+        // The same name, undeclared on this side, is some other type.
+        assert!(!carried("app.mood", &BTreeMap::new()));
+        // Every column of the key must be spelled, not the first.
+        let mixed = vec![
+            ("a".into(), "date".parse().unwrap()),
+            ("b".into(), "app.dmood".parse().unwrap()),
+        ];
+        assert!(pg.attach_scan_key(&uid, &mixed, &types).is_empty());
+        assert!(pg.attach_scan_key(&uid, &[], &types).is_empty());
+        // DEC-2126.1's held name still empties the key for an enum.
+        let held = Postgres::new().with_attach_constraint_names(
+            [(uid.clone(), [emit::scan_check_name(&uid)].into())].into(),
+        );
+        assert!(
+            held.attach_scan_key(&uid, &key("app.mood"), &types)
+                .is_empty()
+        );
     }
 }
 

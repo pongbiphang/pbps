@@ -3422,6 +3422,10 @@ fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resum
 fn enum_data_and_list_keys_keep_named_refusals_before_label_use_checks() {
     for ty in ["app.e", "app.e[]", "app.d"] {
         for partition in [false, true] {
+            // A scalar declared enum keys a partitioned table (DEC-2346.1).
+            if partition && ty == "app.e" {
+                continue;
+            }
             let d = Demo::new("enum-surfaces-deferred2346");
             let enum_file = d.dir.join("schema/app.e.type.yml");
             std::fs::write(&enum_file, "enum: app.e\nvalues: [old]\n").unwrap();
@@ -4731,5 +4735,614 @@ fn enum_rebuild_staged_closing_read_refuses_a_moved_column_another_session_retyp
         // The column the session left alone was held to its type too, and
         // passed: only the one it moved is named.
         assert!(!text.contains("`tags`"), "{text}");
+    }
+}
+
+// ---- #2346 PR 1: a declared scalar enum keys a partitioned table ----
+
+/// A LIST- or RANGE-partitioned `app.ev` keyed by the declared enum `app.mood`
+/// (`values`), with `partitions` as the YAML under `partitions:`.
+fn enum_keyed(d: &Demo, list: bool, values: &str, partitions: &str) {
+    std::fs::write(
+        d.dir.join("schema/app.mood.type.yml"),
+        format!("enum: app.mood\nvalues: {values}\n"),
+    )
+    .unwrap();
+    let key = if list { "{list: [m]}" } else { "[m]" };
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        format!(
+            "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: app.mood, nullable: false}}\nprimary_key: [id, m]\npartition_by: {key}\npartitions:\n{partitions}"
+        ),
+    )
+    .unwrap();
+}
+
+/// The bound of the partition named `name`, as the engine deparses it.
+fn bound_of(db: &str, name: &str) -> String {
+    text_of(
+        db,
+        &format!(
+            "SELECT pg_catalog.pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = 'app.{name}'::regclass"
+        ),
+    )
+}
+
+fn changes_of(plan: &pbps_model::SavedPlan) -> Vec<String> {
+    plan.changes
+        .changes
+        .iter()
+        .map(|p| {
+            format!("{:?}", p.change)
+                .split([' ', '{', '('])
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_list_and_range_partition_keys_converge_with_their_type_in_one_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for list in [true, false] {
+            let own = OwnDatabase::new(&server, "enum_key2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-key2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            let (sad, ok, happy) = if list {
+                (
+                    "  ev_sad: {in: [sad]}\n",
+                    "  ev_ok: {in: [ok]}\n",
+                    "  ev_happy: {in: [happy]}\n",
+                )
+            } else {
+                (
+                    "  ev_sad: {from: [minvalue], to: [ok]}\n",
+                    "  ev_ok: {from: [ok], to: [happy]}\n",
+                    "  ev_happy: {from: [happy], to: [maxvalue]}\n",
+                )
+            };
+            enum_keyed(&d, list, "[sad, ok, happy]", &format!("{sad}{ok}"));
+            let path = connected_artifact(&d, db, false);
+            // The type, the table keyed by it and its partitions are one plan
+            // and one apply.
+            let plan: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let kinds = changes_of(&plan);
+            assert_eq!(
+                kinds.iter().filter(|k| *k == "CreateType").count(),
+                1,
+                "{kinds:?}"
+            );
+            assert_eq!(
+                kinds.iter().filter(|k| *k == "CreateTable").count(),
+                3,
+                "{kinds:?}"
+            );
+            succeeds(approved_apply(&d, db, &path, &[]));
+            let again = d.dir.join("again.plan.json");
+            assert!(label_plan(&d, db, &again).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+            on_server(db, "INSERT INTO app.ev VALUES (1, 'sad'), (2, 'ok')");
+            let routed = |name: &str| {
+                scalar(
+                    db,
+                    &format!("SELECT count(*) FROM app.ev WHERE tableoid = 'app.{name}'::regclass"),
+                )
+            };
+            assert_eq!((routed("ev_sad"), routed("ev_ok")), (1, 1));
+
+            // A partition is added: its creation alone.
+            enum_keyed(&d, list, "[sad, ok, happy]", &format!("{sad}{ok}{happy}"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let added = label_plan(&d, db, &again);
+            assert_eq!(changes_of(&added), ["CreateTable"], "{added:?}");
+            succeeds(approved_apply(&d, db, &again, &[]));
+            assert!(label_plan(&d, db, &again).changes.is_empty());
+
+            // And one is dropped, detached first.
+            enum_keyed(&d, list, "[sad, ok, happy]", &format!("{sad}{ok}"));
+            succeeds(d.run(&["drop-table", "app.ev_happy", "--reason", "retired"]));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let dropped = label_plan(&d, db, &again);
+            assert_eq!(changes_of(&dropped), ["DropTable"], "{dropped:?}");
+            succeeds(approved_apply(&d, db, &again, &["--allow", "destructive"]));
+            assert!(label_plan(&d, db, &again).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+/// The tree of [`enum_keyed`] on an empty database of `server`, applied.
+fn enum_keyed_tree(
+    server: &str,
+    slug: &str,
+    list: bool,
+    values: &str,
+    partitions: &str,
+) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(server, slug);
+    on_server(own.connection(), "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "empty database",
+    ]));
+    enum_keyed(&d, list, values, partitions);
+    let path = connected_artifact(&d, own.connection(), false);
+    succeeds(approved_apply(&d, own.connection(), &path, &[]));
+    (own, d)
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_label_rename_moves_the_bounds_of_its_partitions_without_detach_or_recreate() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for list in [true, false] {
+            let (sad, ok) = if list {
+                ("  ev_sad: {in: [sad]}\n", "  ev_ok: {in: [ok]}\n")
+            } else {
+                (
+                    "  ev_sad: {from: [minvalue], to: [ok]}\n",
+                    "  ev_ok: {from: [ok], to: [maxvalue]}\n",
+                )
+            };
+            let (own, d) = enum_keyed_tree(
+                &server,
+                "enum_key_rename2346",
+                list,
+                "[sad, ok, happy]",
+                &format!("{sad}{ok}"),
+            );
+            let db = own.connection();
+            on_server(db, "INSERT INTO app.ev VALUES (1, 'sad'), (2, 'ok')");
+            // `sad` becomes `blue`, in the type and in the bound that names it.
+            // The partition that follows the rename takes a check of its own
+            // in the same plan, so the plan touches it as well.
+            let check = "checks: {not_ok: \"m <> 'ok'\"}";
+            let (blue, ok) = if list {
+                (
+                    format!("  ev_sad: {{in: [blue], {check}}}\n"),
+                    ok.to_owned(),
+                )
+            } else {
+                (
+                    format!("  ev_sad: {{from: [minvalue], to: [ok], {check}}}\n"),
+                    "  ev_ok: {from: [ok], to: [maxvalue]}\n".to_owned(),
+                )
+            };
+            enum_keyed(
+                &d,
+                list,
+                "[{name: blue, renamed_from: sad}, ok, happy]",
+                &format!("{blue}{ok}"),
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("rename.plan.json");
+            let plan = label_plan(&d, db, &path);
+            // The rename and the check: the engine renames the label inside
+            // the bound, and no detach, attach or recreate follows.
+            let mut kinds = changes_of(&plan);
+            kinds.sort();
+            assert_eq!(kinds, ["AddCheck", "RenameEnumValue"], "{plan:?}");
+            succeeds(approved_apply(
+                &d,
+                db,
+                &path,
+                &["--allow", "rename,constraint"],
+            ));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+            if list {
+                assert!(
+                    bound_of(db, "ev_sad").contains("'blue'"),
+                    "{}",
+                    bound_of(db, "ev_sad")
+                );
+            }
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.ev WHERE m = 'blue'"),
+                1
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.ev WHERE tableoid = 'app.ev_sad'::regclass"
+                ),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_key_bounds_name_declared_labels_and_not_labels_added_in_the_same_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for list in [true, false] {
+            // What stands, and the partition whose bound would name `happy`.
+            let (standing, later) = if list {
+                (
+                    "  ev_sad: {in: [sad]}\n  ev_ok: {in: [ok]}\n",
+                    "  ev_happy: {in: [happy]}\n",
+                )
+            } else {
+                (
+                    "  ev_sad: {from: [minvalue], to: [ok]}\n",
+                    "  ev_ok: {from: [ok], to: [happy]}\n",
+                )
+            };
+            let (own, d) =
+                enum_keyed_tree(&server, "enum_key_labels2346", list, "[sad, ok]", standing);
+            let db = own.connection();
+            let path = d.dir.join("labels.plan.json");
+
+            // A bound that names no declared label is refused where the
+            // declarations are read, naming the partition and the label.
+            let bad = if list {
+                "  ev_bad: {in: [nonesuch]}\n"
+            } else {
+                "  ev_bad: {from: [nonesuch], to: [maxvalue]}\n"
+            };
+            enum_keyed(&d, list, "[sad, ok]", &format!("{standing}{bad}"));
+            let unreachable = "host=127.0.0.1 port=1 user=postgres dbname=unused sslmode=disable";
+            for args in [
+                vec!["validate"],
+                vec!["plan", "--db", unreachable, "--out", path.to_str().unwrap()],
+            ] {
+                let out = d.run(&args);
+                assert_ne!(code(&out), 0);
+                let why = format!("{}\n{}", stdout(&out), stderr(&out));
+                assert!(
+                    why.contains("app.ev_bad")
+                        && why.contains("`nonesuch`")
+                        && why.contains("not a label of `app.mood`"),
+                    "{why}"
+                );
+                assert!(!path.exists());
+            }
+
+            // A label added in this plan cannot bound a partition in it.
+            enum_keyed(&d, list, "[sad, ok, happy]", &format!("{standing}{later}"));
+            let out = d.run(&["plan"]);
+            assert_ne!(code(&out), 0);
+            let why = format!("{}\n{}", stdout(&out), stderr(&out));
+            assert!(
+                why.contains(&format!(
+                    "new enum label `happy` is used by app.{}",
+                    if list { "ev_happy" } else { "ev_ok" }
+                )) && why.contains("apply the label first, then the rest"),
+                "{why}"
+            );
+            assert!(!path.exists());
+
+            // The two-plan split succeeds: the label, then the partition.
+            enum_keyed(&d, list, "[sad, ok, happy]", standing);
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let labels = label_plan(&d, db, &path);
+            assert_eq!(changes_of(&labels), ["AddEnumValue"], "{labels:?}");
+            succeeds(approved_apply(&d, db, &path, &[]));
+            enum_keyed(&d, list, "[sad, ok, happy]", &format!("{standing}{later}"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let partition = label_plan(&d, db, &path);
+            assert_eq!(changes_of(&partition), ["CreateTable"], "{partition:?}");
+            succeeds(approved_apply(&d, db, &path, &[]));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_attach_to_an_enum_keyed_parent_skips_its_scan_as_a_built_in_key_does() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for list in [true, false] {
+            let own = OwnDatabase::new(&server, "enum_attach2346");
+            let db = own.connection().to_owned();
+            on_server(&db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-attach2346");
+            let (standing, bounds) = if list {
+                (
+                    "  ev_sad: {in: [sad]}\n",
+                    [
+                        ("u_st", "{in: [ok]}", "ok"),
+                        ("u_tx", "{in: [happy]}", "happy"),
+                    ],
+                )
+            } else {
+                (
+                    "  ev_sad: {from: [minvalue], to: [ok]}\n",
+                    [
+                        ("u_st", "{from: [ok], to: [happy]}", "ok"),
+                        ("u_tx", "{from: [happy], to: [maxvalue]}", "happy"),
+                    ],
+                )
+            };
+            enum_keyed(&d, list, "[sad, ok, happy]", standing);
+            for (name, _, _) in &bounds {
+                std::fs::write(
+                    d.dir.join(format!("schema/app.{name}.yml")),
+                    format!(
+                        "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: app.mood, nullable: false}}\nprimary_key: [id, m]\n"
+                    ),
+                )
+                .unwrap();
+            }
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", &db]));
+            for (name, _, label) in &bounds {
+                on_server(
+                    &db,
+                    &format!(
+                        "INSERT INTO app.{name} (id, m) SELECT g, '{label}' FROM generate_series(1, 1000) g"
+                    ),
+                );
+            }
+            let scans = |name: &str| {
+                scalar(
+                    &db,
+                    &format!(
+                        "SELECT seq_scan FROM pg_stat_user_tables WHERE relid = 'app.{name}'::regclass"
+                    ),
+                )
+            };
+            let mut deltas = Vec::new();
+            let mut partitions = String::from(standing);
+            for (name, bound, _) in &bounds {
+                let staged = *name == "u_st";
+                std::fs::remove_file(d.dir.join(format!("schema/app.{name}.yml"))).unwrap();
+                partitions.push_str(&format!("  {name}: {bound}\n"));
+                enum_keyed(&d, list, "[sad, ok, happy]", &partitions);
+                let plan = connected_artifact(&d, &db, staged);
+                let shown = std::fs::read_to_string(&plan).unwrap();
+                // The plan carries the key, which the staged form writes its
+                // CHECK over (the transactional form attaches by one statement).
+                assert!(shown.contains("\"key\": [\n"), "{name}: {shown}");
+                let before = scans(name);
+                let flags: &[&str] = if staged {
+                    &["--staged", "--allow", "constraint"]
+                } else {
+                    &["--allow", "constraint"]
+                };
+                succeeds(approved_apply(&d, &db, &plan, flags));
+                deltas.push(scans(name) - before);
+                assert_eq!(
+                    scalar(
+                        &db,
+                        &format!(
+                            "SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.{name}'::regclass"
+                        )
+                    ),
+                    1,
+                    "{name}"
+                );
+                assert_eq!(
+                    scalar(
+                        &db,
+                        "SELECT count(*) FROM pg_constraint WHERE conname LIKE 'pbps_attach_%'"
+                    ),
+                    0
+                );
+            }
+            // The staged attach reads its table once, for the VALIDATE; a
+            // CHECK that did not imply the bound would make the attach read it
+            // again, and the transactional form reads it once, for the attach.
+            assert_eq!(
+                deltas[0], deltas[1],
+                "staged and transactional scans: {deltas:?}"
+            );
+            succeeds(d.run(&["verify", "--db", &db]));
+            let again = d.dir.join("again.plan.json");
+            assert!(label_plan(&d, &db, &again).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn other_user_types_keep_refusing_as_partition_keys_before_any_staged_plan() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_key_refused2346");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE TYPE app.ext AS ENUM ('a', 'b'); \
+             CREATE TYPE app.pair AS (a integer, b integer)",
+        );
+        let d = Demo::new("enum-key-refused2346");
+        std::fs::write(
+            d.dir.join("schema/app.mood.type.yml"),
+            "enum: app.mood\nvalues: [sad, ok]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dm.type.yml"),
+            "domain: app.dm\ntype: app.mood\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.dt.type.yml"),
+            "domain: app.dt\ntype: text\n",
+        )
+        .unwrap();
+        let path = d.dir.join("refused.plan.json");
+        // A domain over an enum, a domain over text, an external enum, a
+        // composite, an array of the declared enum.
+        for ty in ["app.dm", "app.dt", "app.ext", "app.pair", "app.mood[]"] {
+            for list in [true, false] {
+                let key = if list { "{list: [m]}" } else { "[m]" };
+                d.table(&format!(
+                    "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: '{ty}', nullable: false}}\nprimary_key: [id, m]\npartition_by: {key}\n"
+                ));
+                for args in [
+                    vec!["validate"],
+                    vec![
+                        "plan",
+                        "--db",
+                        db,
+                        "--staged",
+                        "--out",
+                        path.to_str().unwrap(),
+                    ],
+                ] {
+                    let out = d.run(&args);
+                    assert_ne!(code(&out), 0, "{ty} {args:?}");
+                    let why = format!("{}\n{}", stdout(&out), stderr(&out));
+                    assert!(
+                        why.contains("app.t")
+                            && why.contains(
+                                "partition key `m` has a user-defined type reference, which is not supported as a partition key"
+                            ),
+                        "{ty} {args:?}: {why}"
+                    );
+                    assert!(!path.exists());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_label_removal_or_reorder_of_an_enum_that_keys_a_partitioned_table_is_refused_by_name() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for list in [true, false] {
+            let partitions = if list {
+                "  ev_ok: {in: [ok]}\n  ev_happy: {in: [happy]}\n"
+            } else {
+                "  ev_ok: {from: [ok], to: [happy]}\n  ev_happy: {from: [happy], to: [maxvalue]}\n"
+            };
+            let (own, d) = enum_keyed_tree(
+                &server,
+                "enum_key_rebuild2346",
+                list,
+                "[sad, ok, happy]",
+                partitions,
+            );
+            let db = own.connection();
+            let path = d.dir.join("rebuild.plan.json");
+            for values in ["[ok, happy]", "[happy, ok, sad]"] {
+                enum_keyed(&d, list, values, partitions);
+                d.commit();
+                let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+                assert_ne!(code(&out), 0, "{values}");
+                let why = format!("{}\n{}", stdout(&out), stderr(&out));
+                assert!(
+                    why.contains("type `app.mood`")
+                        && why.contains("app.ev.m is a partition key of this enum")
+                        && why.contains("rebuild the partitioned table"),
+                    "{values}: {why}"
+                );
+                assert!(!path.exists());
+            }
+            // The key's labels can still be added to and renamed.
+            enum_keyed(&d, list, "[sad, ok, happy, glad]", partitions);
+            d.commit();
+            let added = label_plan(&d, db, &path);
+            assert_eq!(changes_of(&added), ["AddEnumValue"], "{added:?}");
+        }
+    }
+}
+
+/// A bound is declared in the labels the plan leaves, and the pre-flight asks
+/// the rows as they are before it runs, so the bound goes back through the
+/// plan's renames first (DEC-2346.1). `b` becomes `c`, `a` becomes `b`, and a
+/// partition takes `b`: the DEFAULT row that is `b` now is `c` after, and
+/// does not move; one that is `a` now is `b` after, and would.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_declared_enum_bound_is_asked_of_the_rows_in_the_labels_they_hold() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (row, moves) in [("b", false), ("a", true)] {
+            let (own, d) = enum_keyed_tree(
+                &server,
+                "enum_key_asked2346",
+                true,
+                "[a, b]",
+                "  ev_rest: default\n",
+            );
+            let db = own.connection();
+            on_server(db, &format!("INSERT INTO app.ev VALUES (1, '{row}')"));
+            enum_keyed(
+                &d,
+                true,
+                "[{name: b, renamed_from: a}, {name: c, renamed_from: b}]",
+                "  ev_rest: default\n  ev_new: {in: [b]}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("asked.plan.json");
+            let plan = label_plan(&d, db, &path);
+            let mut kinds = changes_of(&plan);
+            kinds.sort();
+            assert_eq!(
+                kinds,
+                ["CreateTable", "RenameEnumValue", "RenameEnumValue"],
+                "{plan:?}"
+            );
+            let out = approved_apply(&d, db, &path, &["--allow", "rename"]);
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            if moves {
+                // Refused before a statement, with the remedy the move has.
+                assert_ne!(code(&out), 0, "{said}");
+                assert!(
+                    said.contains("rows of app.ev_rest are among the values of app.ev_new")
+                        && said.contains("no move of them was allowed")
+                        && said.contains("pbps move-rows app.ev_new --max-rows"),
+                    "{said}"
+                );
+                assert_eq!(
+                    scalar(db, "SELECT count(*) FROM pg_enum WHERE enumlabel = 'c'"),
+                    0
+                );
+            } else {
+                assert_eq!(code(&out), 0, "{said}");
+                // Renamed in place, and where it was: the DEFAULT.
+                assert_eq!(
+                    text_of(
+                        db,
+                        "SELECT m::text || ' in ' || tableoid::regclass::text FROM app.ev WHERE id = 1"
+                    ),
+                    "c in app.ev_rest"
+                );
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.ev_new"), 0);
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                succeeds(d.run(&["verify", "--db", db]));
+            }
+        }
     }
 }

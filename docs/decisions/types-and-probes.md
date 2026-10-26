@@ -3330,3 +3330,66 @@ a recorded conversion takes the path an ordinary retype takes.
   change in the plan (a new key or table), still reaches the apply; an
   expression-aware orphan probe for a recorded column would turn the rolled-back
   apply into a refusal by name.
+
+<a id="dec-2346-1"></a>
+
+**DEC-2346.1. A scalar declared enum may be a LIST or RANGE partition key; every other reference keeps DEC-1523.1's refusal (#2346 part 1, #2112).**
+Maintainer, 2026-10-24: the first of two PRs, partition keys with the staged
+attach's key rule; `data:` rows over an enum are the second. It narrows
+DEC-1523.1 and nothing else of it.
+
+- **Admission is a lookup by name.** A partition key column whose type is a
+  scalar reference to a key of `Schema.types` that is a `ManagedType::Enum`,
+  on the same side, is admitted for a LIST or RANGE parent. A domain (over an
+  enum or over anything), a composite, an external or unknown name and every
+  array keep DEC-1523.1's message, as does a HASH key, which the engine
+  computes from the enum's oid, a number a rebuild or a restore changes. The
+  dialect hook is `Dialect::validate_table_in_schema`, defaulted to
+  `validate_table_sources`; `validate_table_sources` and `validate_table`
+  call it with no declared types, so a table seen alone admits nothing. SQL
+  Server does not override it.
+- **A bound is a declared label.** A bound datum of a partition of such a key
+  must be one of the enum's `values`; `MINVALUE`, `MAXVALUE` and `NULL` name
+  none. Anything else is refused where the declarations are read, naming the
+  partition, the label and the declared labels. No engine is asked, so a
+  type created in the same plan is judged as a standing one is, and the
+  plan-time reads that cast a bound to the key type (the spelling and the
+  LIST collision queries) skip an enum key: its label has one spelling, and
+  the type may not exist yet.
+- **A label added in the plan cannot bound a partition in it** (measured on
+  16 and 18: `FOR VALUES IN ('new')` after `ADD VALUE` in one transaction is
+  "unsafe use of new value"). The refusal is DEC-1635.6's, with its remedy
+  "apply the label first, then the rest": the partition's bound, in a create
+  or an attach, joins the surfaces `unsafe_uses` reads.
+- **A rename carries the bounds.** The engine renames a label inside the
+  bounds that hold it (measured on 16 and 18: `pg_get_expr(relpartbound)`
+  follows `RENAME VALUE`). The observed bound is carried through the plan's
+  own `RenameEnumValue` pairs, in the order they run and by exact label,
+  before it is compared with the declared one, by the differ and by the
+  apply's movement check; a plan that renames the label and no more holds no
+  detach, attach or recreate.
+- **The probes ask the rows in the labels the rows hold.** A bound is declared
+  in the labels the plan leaves, and the pre-flight counts rows before any
+  statement has run. For an enum key every probe that evaluates a bound of a
+  partition the plan creates or attaches (the move and reference counts beside
+  a DEFAULT, the range counts of a create or an attach, the rows of an attached
+  DEFAULT against the partitions made beside it) is given the bound with its
+  labels carried back through the plan's own renames of that enum, once and by
+  exact match, so `b→c` then `a→b` takes a declared `b` back to `a`. The
+  parent's key types ride on `Partitions`. Post-rename statements (the staged
+  attach's CHECK, the move itself) keep the final labels.
+- **A removal or reorder is refused by name** when the enum keys a
+  partitioned table, because a partition key cannot be retyped: the remedy
+  is to rebuild the partitioned table (#2298). Labels can still be added and
+  renamed.
+- **#2112: the staged attach keeps its key where its CHECK is valid.**
+  `Dialect::attach_scan_key` receives the key columns' types and the declared
+  types. PostgreSQL carries the key for a built-in type, scalar or array, and
+  for a declared scalar enum, whose bare operators and untyped literals
+  resolve to the type's own (measured: the CHECK is created, validated, and
+  the attach logs `partition constraint … is implied by existing
+  constraints`, for LIST and RANGE); it carries none for any other reference,
+  since a domain over an enum has no operator at all (`operator does not
+  exist: dmood = unknown`) and a cast to its base type creates a CHECK that
+  does not imply the bound. DEC-2126.1's held-name rule is unchanged, and an
+  empty key is the single `ATTACH`, so no plan format changes.
