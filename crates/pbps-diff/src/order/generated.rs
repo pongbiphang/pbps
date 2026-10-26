@@ -980,6 +980,22 @@ fn is_judged(change: &Change) -> bool {
     }
 }
 
+/// What a domain's definition names: its base type, default and checks.
+fn domain_texts(definition: &pbps_model::ManagedType) -> Vec<&str> {
+    match definition {
+        pbps_model::ManagedType::Domain {
+            base,
+            default,
+            checks,
+            ..
+        } => std::iter::once(base.base.as_str())
+            .chain(default.as_deref())
+            .chain(checks.values().map(String::as_str))
+            .collect(),
+        pbps_model::ManagedType::Enum { .. } => Vec::new(),
+    }
+}
+
 /// What the resolver's scratch reconstruction orders beyond the lexical and
 /// structural constraints above, each measured on PostgreSQL 16 and 18
 /// (DEC-2389.1), in an engine whose indexes share the namespace of tables:
@@ -994,7 +1010,11 @@ fn is_judged(change: &Change) -> bool {
 ///   then counts the index among the names made resolvable after it;
 /// - a partition's own default follows the default its parent sets on the
 ///   same column, because the parent's `SET DEFAULT` reaches every partition
-///   and replaces the partition's own.
+///   and replaces the partition's own;
+/// - a declared enum or domain precedes every change whose text names it,
+///   a domain over it included (DEC-2407.1): the engine refuses a column,
+///   routine or domain over a type that does not exist, and a type is
+///   needed by nothing a bootstrap makes.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn scratch_rules(
     cs: &ChangeSet,
@@ -1007,28 +1027,46 @@ fn scratch_rules(
             out.edge(a, b, Source::Lexical, OrderReason::Structural);
         }
     };
+    let readers: Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let module = match &p.change {
+                Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                    Some(dialect.module_creation_text(module))
+                }
+                _ => None,
+            };
+            let domain = match &p.change {
+                Change::CreateType { definition, .. } => domain_texts(definition),
+                _ => Vec::new(),
+            };
+            (
+                i,
+                texts(&p.change)
+                    .into_iter()
+                    .chain(domain)
+                    .map(std::borrow::Cow::Borrowed)
+                    .chain(module)
+                    .collect(),
+            )
+        })
+        .collect();
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::CreateType { name, .. } = &p.change else {
+            continue;
+        };
+        for (reader, texts) in &readers {
+            if texts
+                .iter()
+                .any(|t| dialect.generation_may_call(t, name.name()))
+            {
+                edge(out, at, *reader);
+            }
+        }
+    }
     if dialect.indexes_share_namespace_with_tables() {
-        let readers: Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> = cs
-            .changes
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let module = match &p.change {
-                    Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
-                        Some(dialect.module_creation_text(module))
-                    }
-                    _ => None,
-                };
-                (
-                    i,
-                    texts(&p.change)
-                        .into_iter()
-                        .map(std::borrow::Cow::Borrowed)
-                        .chain(module)
-                        .collect(),
-                )
-            })
-            .collect();
         for (at, p) in cs.changes.iter().enumerate() {
             for name in early_index_names(&p.change) {
                 for (reader, texts) in &readers {

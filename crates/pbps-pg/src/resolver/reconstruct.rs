@@ -316,15 +316,12 @@ impl Reconstruction {
                         None,
                     )?);
                 }
-                // A declared enum or domain is created before every table and
-                // module that names it. A bootstrap holds only creations of
-                // them, so the label operations and the drops stay refused.
+                // A declared enum or domain precedes every part that names it,
+                // by a constraint. A bootstrap holds only creations of them, so
+                // the label operations and the drops stay refused.
                 Change::CreateType { name, .. } => {
-                    steps.push(step(
-                        dialect,
-                        Phase::Types,
+                    steps.push(make(
                         &format!("type {name}", name = name.shown()),
-                        change,
                         vec![(
                             Nameable::Type,
                             name.schema().to_owned(),

@@ -166,6 +166,61 @@ fn an_index_that_holds_a_predicate_follows_every_module_and_generation() {
     assert!(at(&order, "table app.t") < at(&order, "function app.f(integer)"));
 }
 
+fn declared_type(name: &str, definition: pbps_model::ManagedType) -> Change {
+    Change::CreateType {
+        uid: Uid::derived(UidKind::Type, name, 0),
+        name: name.parse().unwrap(),
+        definition: Box::new(definition),
+    }
+}
+
+fn mood() -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Enum {
+        values: vec!["sad".into(), "happy".into()],
+    }
+}
+
+fn domain_over(base: &str) -> pbps_model::ManagedType {
+    pbps_model::ManagedType::Domain {
+        base: base.parse().unwrap(),
+        not_null: false,
+        default: None,
+        checks: Default::default(),
+        collation: None,
+    }
+}
+
+/// The engine refuses a column, a routine or a domain over a type that does
+/// not exist (`42704`, DEC-2407.1), so a created type precedes each change that
+/// names it, a domain over another type included, wherever the plan listed
+/// them.
+#[test]
+fn a_created_type_precedes_what_names_it() {
+    let mut typed = Table::default();
+    typed
+        .columns
+        .insert("m".into(), Column::new("app.moody".parse().unwrap()));
+    let changes = [
+        create("t", typed),
+        module(
+            "app.f(integer)",
+            ModuleKind::Function,
+            "(i app.mood) RETURNS integer LANGUAGE sql RETURN 1",
+        ),
+        declared_type("app.moody", domain_over("app.mood")),
+        declared_type("app.mood", mood()),
+    ];
+    let order = order(&changes, None);
+    for (type_, reader) in [
+        ("type app.mood", "type app.moody"),
+        ("type app.moody", "table app.t"),
+        ("type app.mood", "function app.f(integer)"),
+    ] {
+        assert!(at(&order, type_) < at(&order, reader), "{order:?}");
+    }
+    assert_eq!(order.len(), changes.len(), "{order:?}");
+}
+
 /// A parent's `SET DEFAULT` reaches every partition and replaces its own
 /// (measured on 16 and 18), so a partition's own default follows it even
 /// when the parent's waits for a function and the partition's does not.

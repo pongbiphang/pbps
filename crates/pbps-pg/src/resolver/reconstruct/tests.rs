@@ -1387,8 +1387,8 @@ fn domain_over(base: &str) -> pbps_model::ManagedType {
 
 /// A declared enum or domain is created before every table and module, in the
 /// order the differ gave the types themselves: a domain over an enum follows
-/// it. The table is first in the input to show the phase, not the input
-/// order, puts the types ahead of it.
+/// it. The table is first in the input to show that the type edge, not the
+/// input order, puts the types ahead of it.
 #[test]
 fn a_declared_type_is_created_before_the_tables_and_modules_that_name_it() {
     let mut typed = Table::default();
@@ -1419,15 +1419,15 @@ fn a_declared_type_is_created_before_the_tables_and_modules_that_name_it() {
     let order: Vec<_> = reconstruction
         .steps
         .iter()
-        .map(|step| (step.phase, step.declaration.as_str()))
+        .map(|step| step.declaration.as_str())
         .collect();
     assert_eq!(
         order,
         [
-            (Phase::Types, "type app.mood"),
-            (Phase::Types, "type app.moody"),
-            (Phase::Tables, "table app.t"),
-            (Phase::Modules, "view app.v"),
+            "type app.mood",
+            "type app.moody",
+            "table app.t",
+            "view app.v"
         ]
     );
     assert!(
@@ -1480,7 +1480,7 @@ fn only_the_creation_of_a_type_is_part_of_a_bootstrap() {
         untouched
             .steps
             .iter()
-            .all(|step| step.phase != Phase::Types),
+            .all(|step| !step.declaration.starts_with("type ")),
         "{:?}",
         untouched.steps
     );

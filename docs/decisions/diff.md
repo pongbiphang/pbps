@@ -8686,6 +8686,11 @@ Rules the schedule states beyond what a text names, measured on PostgreSQL
   the names made resolvable after it (`later_names`), and an index made after
   it is a name it could not have bound; the schedule alone would put the
   index before a module the plan places later.
+- **A created type precedes every change whose text names it** (#2407,
+  DEC-2407.1). The engine refuses a column, a routine or a domain over a type
+  that does not exist (`42704`), and a type is needed by nothing a bootstrap
+  makes, so a domain over an enum follows the enum and no type waits for a
+  table. It was a `Types` phase before the phases went (#2407 merged first).
 
 Rules of the phases that no constraint reproduces, each measured and dropped:
 
