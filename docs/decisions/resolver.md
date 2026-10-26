@@ -4924,8 +4924,10 @@ A scratch that cannot be used, an externals file the target does not match, or
 a catalog read that fails is an error, as for the resolver, and so is a role
 that may not read the cluster's identity, with the grant and the switch named.
 The externals comparison reuses the resolver's reconstruction and runs only when
-something is staged. A managed type, which the resolver's fill does not know, and
-a fill chained to managed relations are refused with the switch named.
+something is staged. A fill chained to managed relations is refused with the
+switch named. A declared type is not: it is created with the base and compared,
+and the fill never sees it (DEC-2407.1); the first version of this entry refused
+it, while master did not yet build declared types on the scratch.
 
 *The record.* `Converged` carries the entry, the scratch, the layout the run
 found, the spellings and the authorization field above; `Off` is sealed only where an entry is selected and the

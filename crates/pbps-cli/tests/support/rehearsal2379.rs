@@ -1548,11 +1548,12 @@ pub fn a_declared_domain_is_rehearsed(server: &str) {
     assert!(text.contains("domain app.short check nonempty"), "{text}");
 }
 
-/// A project that declares a managed type cannot be rehearsed yet: the
-/// resolver's externals fill does not know types, and a rehearsal stages
-/// externals through it. The refusal says so and names the switch, which gets
-/// past it.
-pub fn managed_types_name_the_switch(server: &str) {
+/// A declared enum is created on the scratch with the rest of the base and
+/// compared with the declarations: master records a declared type when it is
+/// planned and builds it on the scratch, and the resolver's externals fill never
+/// sees it (DEC-2407.1), so nothing refuses the project. (It was refused, with the
+/// switch named, while the fill did not know types.)
+pub fn a_declared_enum_is_rehearsed(server: &str) {
     let f = Fixture::new(
         server,
         "rehearse-types",
@@ -1563,19 +1564,17 @@ pub fn managed_types_name_the_switch(server: &str) {
         },
     );
     f.revise_row();
-    let prior = "prior plan 2379";
-    std::fs::write(f.artifact(), prior).unwrap();
-    let refused = f.plan(&[]);
-    assert_ne!(code(&refused), 0, "{}", said(&refused));
-    let text = said(&refused);
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{}", said(&out));
     assert!(
-        text.contains("cannot answer for these declarations"),
-        "{text}"
+        stdout(&out).contains("Rehearsal: converged on scratch"),
+        "{}",
+        said(&out)
     );
-    assert!(text.contains("--no-rehearse"), "{text}");
-    assert_eq!(std::fs::read_to_string(f.artifact()).unwrap(), prior);
-    // The switch gets past it, and the plan says it was not rehearsed.
-    let off = f.plan(&["--no-rehearse"]);
-    assert_eq!(code(&off), 0, "{}", said(&off));
-    assert_eq!(f.record(), serde_json::json!("off"));
+    assert_eq!(
+        f.record()["converged"]["authorization"],
+        "rehearsed",
+        "{}",
+        f.record()
+    );
 }

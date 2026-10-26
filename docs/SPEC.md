@@ -2262,9 +2262,10 @@ What it does not reproduce, stated rather than implied:
   written, not as mapped.
 - **The engine's edition and build.** As above, a scratch validates syntax and
   convergence; it is not qualified against the target.
-- **Declarations the resolver's externals fill cannot answer for.** A managed
-  type, or a fill that reads managed relations, is refused with the switch
-  named.
+- **Declarations the resolver's externals fill cannot answer for.** A fill that
+  reads managed relations is refused with the switch named. A declared type is
+  not among them: it is created with the base and compared, and the fill never
+  sees it (DEC-2407.1).
 
 A target changed after planning is caught by the checksum at apply, as before.
 
