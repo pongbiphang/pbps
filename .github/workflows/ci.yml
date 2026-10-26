@@ -369,6 +369,7 @@ jobs:
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268
           cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 externals2269
           cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests
+          cargo test --profile live-test -p pbps-cli --bin pbps -- --ignored --test-threads=1 engine::mssql_live_tests
 
   # LocalDB is a per-user Windows instance that accepts only a named pipe and
   # integrated authentication, so no Linux job can qualify it as the resolver's
@@ -622,7 +623,7 @@ jobs:
       # is that the probes are answered under the settings the statements they
       # clear will run under (DECISIONS 415). `cargo test --workspace` in
       # `quick` builds it and does not run it: it is `#[ignore]`d.
-      - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1
+      - run: cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 --skip engine::mssql_live_tests
         if: matrix.suite == 'dialect'
       # The resolver end to end (#1672): no root, the three servers above,
       # and the runner's own Docker for a Docker scratch (#1674). The filter

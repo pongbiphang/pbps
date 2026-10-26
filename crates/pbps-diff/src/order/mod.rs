@@ -80,13 +80,13 @@ pub use plan::{
     Canonical, CanonicalPlan, Continuing, DiffPlan, Differ, Draft, OrderedPlan, PlanView,
     PlanningPlan, RouteState, propose, take,
 };
-pub use rewrites::before_rewrites;
+pub use rewrites::{before_rewrites, catalog_requirements};
 pub use roles::role_drops;
 pub use saved::{
     AdmissionError, AdmittedPlan, ArtifactView, SealedPlan, admit, seal, validate_saved_plan,
 };
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
-pub use shadow::{Report, Shadowed, analyse};
+pub use shadow::{Report, Shadowed, analyse, analyse_with_catalog};
 pub use verify::{Violation, verify};
 
 #[cfg(test)]

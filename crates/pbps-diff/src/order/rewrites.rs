@@ -1,9 +1,11 @@
 //! Settle binding releases through the general effect graph (DEC-2228.1).
 
-use super::{Baseline, Because, Checks, Schedule, analyse, graph};
-use pbps_dialect::Dialect;
-use pbps_model::ModuleDeps;
-use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Requirement, Snapshot};
+use super::{Baseline, Because, Checks, Schedule, analyse_with_catalog, graph};
+use pbps_dialect::{Dialect, slots::CatalogFacts};
+use pbps_model::operation::{
+    Incarnation, ModuleEdits, ObjectKey, Operations, PlanOwners, Requirement, Snapshot,
+};
+use pbps_model::{Change, ModuleDeps};
 
 /// Settle BeforeRewrite and the dependencies of its participants. Unrelated
 /// steps retain their relative order, and later stages keep their own edges.
@@ -14,6 +16,41 @@ pub fn before_rewrites(
     dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
 ) -> Result<super::PlanningPlan, String> {
+    settle_requirements(changes, before, after, dialect, declared, None, &[])
+}
+
+/// Settle requirements refined by connected name comparisons before the final
+/// observer. Reuse the release scheduler so callers and their prerequisites
+/// move together, while unrelated steps and catalog drop precedence stay put.
+pub fn catalog_requirements<S: Clone>(
+    changes: super::PlanningPlan<S>,
+    before: crate::Side<'_>,
+    after: crate::Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    declared: &ModuleDeps,
+    catalog: &CatalogFacts,
+    precedence: &[(Change, Change)],
+) -> Result<super::PlanningPlan<S>, String> {
+    settle_requirements(
+        changes,
+        before,
+        after,
+        dialect,
+        declared,
+        Some(catalog),
+        precedence,
+    )
+}
+
+fn settle_requirements<S: Clone>(
+    changes: super::PlanningPlan<S>,
+    before: crate::Side<'_>,
+    after: crate::Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    declared: &ModuleDeps,
+    catalog: Option<&CatalogFacts>,
+    precedence: &[(Change, Change)],
+) -> Result<super::PlanningPlan<S>, String> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)
         .map_err(|error| error.to_string())?;
     let owners = PlanOwners::new(names, before.ids, after.ids);
@@ -39,11 +76,13 @@ pub fn before_rewrites(
         schema: after.schema,
         ids: after.ids,
     };
-    let effects = analyse(&operations, &owners, base, end, dialect);
+    let effects = analyse_with_catalog(&operations, &owners, base, end, dialect, catalog);
     if !effects.effects.iter().any(|fx| {
-        fx.requires
-            .iter()
-            .any(|r| matches!(r, Requirement::BeforeRewrite(_)))
+        fx.requires.iter().any(|r| {
+            matches!(r, Requirement::BeforeRewrite(_))
+                || (catalog.is_some()
+                    && matches!(r, Requirement::Is(ObjectKey::Module(_), Incarnation::Final)))
+        })
     }) && changes.boundaries.is_empty()
     {
         return Ok(changes);
@@ -60,7 +99,13 @@ pub fn before_rewrites(
     );
     let mut moving = vec![false; changes.changes.len()];
     for edge in &graph.edges {
-        if matches!(edge.because, Because::BeforeRewrite(_)) {
+        let final_callee = catalog.is_some()
+            && matches!(&edge.because,
+                Because::Creates(key @ ObjectKey::Module(_))
+                | Because::Rewrites(key @ ObjectKey::Module(_))
+                    if effects.effects[edge.after].requires
+                        .contains(&Requirement::Is(key.clone(), Incarnation::Final)));
+        if matches!(edge.because, Because::BeforeRewrite(_)) || final_callee {
             moving[edge.before] = true;
             moving[edge.after] = true;
         }
@@ -73,15 +118,23 @@ pub fn before_rewrites(
     if !moving.iter().any(|m| *m) && changes.boundaries.is_empty() {
         return Ok(changes);
     }
-    // Only the release and its delayed rewrites may disturb this order.
+    // Only the release, its delayed rewrites and connected callees may disturb this order.
     // Their dependents have to follow them, transitively. Do not let the
     // connected pass's computed-column edges extend or constrain that set.
     graph
         .edges
         .retain(|edge| !super::edges::connected_module_release(edge, operations.as_slice()));
+    let at = |change: &Change| changes.changes.iter().position(|p| &p.change == change);
+    let precedence: Vec<_> = precedence
+        .iter()
+        .filter_map(|(before, after)| Some((at(before)?, at(after)?)))
+        .collect();
     let mut outgoing = vec![Vec::new(); moving.len()];
     for edge in &graph.edges {
         outgoing[edge.before].push(edge.after);
+    }
+    for &(before, after) in &precedence {
+        outgoing[before].push(after);
     }
     let mut pending: Vec<_> = (0..moving.len()).filter(|&at| moving[at]).collect();
     while let Some(at) = pending.pop() {
@@ -98,6 +151,14 @@ pub fn before_rewrites(
         .edges
         .retain(|edge| moving[edge.before] || moving[edge.after]);
     let mut schedule = Schedule::of_graph(&graph, operations.as_slice());
+    for &(before, after) in &precedence {
+        schedule.edge(
+            before,
+            after,
+            super::Source::Catalog,
+            pbps_model::resolver::OrderReason::Structural,
+        );
+    }
     let mut previous = None;
     for (at, moves) in moving.into_iter().enumerate() {
         if !moves {
