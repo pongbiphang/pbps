@@ -706,3 +706,21 @@ a finding (exit 2). A file that is missing, not regular, outside the project,
 not UTF-8 and unreadable are five different facts, and an empty file is none of
 them. The recheck compares what each path resolves to as well as its hash, so a
 symlink moved to a file with the same bytes is noticed.
+
+<a id="dec-1165-5"></a>
+
+**DEC-1165.5. Commits are resolved once, and their order is asked of git, never assumed.**
+A pin, the base and an explicit candidate are named by the commit id git
+resolves once; a branch moves between this call and the run, so the report
+keeps the id and never the spelling. Git still exits 0 for a name that is both a
+branch and a tag and only warns, and `--quiet` hides the warning, so any output
+beside the answer refuses the revision instead of matching the warning's words.
+A pin must be an ancestor of the base, which must be an ancestor of the
+candidate commit or of the `HEAD` captured for a working tree. Each ordered pair
+is asked of git once, merged history counts and a first-parent walk is not
+used, and two pins neither of which contains the other are refused by name
+rather than sorted. An answer git could not give (a shallow boundary, an
+unreadable history) is never read as "not an ancestor": it is the unanswerable
+outcome, not a finding. `baseline::ancestry::check` becomes the two-commit
+`check_between` and keeps its evidence classes, so the two callers cannot
+disagree about what git said.

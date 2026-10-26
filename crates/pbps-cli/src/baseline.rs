@@ -606,7 +606,7 @@ fn relative_to(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{}{}", prefix.trim(), name.to_string_lossy()))
 }
 
-fn git_command(dir: &Path) -> Command {
+pub(crate) fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(dir);
     command
