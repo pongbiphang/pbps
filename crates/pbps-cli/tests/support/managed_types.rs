@@ -5866,6 +5866,8 @@ fn a_domain_check_altered_by_hand_between_plan_and_apply_is_refused_as_drift() {
 /// (DEC-1635.8).
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+// The process-loss harness that interrupts after the checkpoint is Linux-only.
+#[cfg(target_os = "linux")]
 fn a_staged_domain_tightening_is_one_step_and_a_resume_accepts_it() {
     for server in [
         server(),
