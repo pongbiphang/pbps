@@ -427,6 +427,61 @@ pub fn acceptance(server: &str, pg: bool) {
             rows.last().unwrap().0
         ),
     );
+    absorbed_rename_still_allows_a_modification(server, pg);
+}
+
+fn absorbed_rename_still_allows_a_modification(server: &str, pg: bool) {
+    let own = OwnDatabase::new(server, "absorbed2397");
+    let connection = own.connection();
+    let schema = if pg { "app" } else { "dbo" };
+    if pg {
+        on_server(connection, "CREATE SCHEMA app");
+    }
+    let d = Demo::new("absorbed2397");
+    let artifacts = Demo::new("absorbed2397-artifacts");
+    configure(&d, pg);
+    write(&d, schema, false, false, false);
+    offline(&d);
+    let common = head(&d);
+    std::fs::write(d.dir.join("schema/customer.yml"), format!(
+        "table: {schema}.client\nrenamed_from: {schema}.customer\ncolumns:\n  id: {{type: int, nullable: false}}\n"
+    )).unwrap();
+    offline(&d);
+    let reused = d.dir.join("schema/reused.yml");
+    std::fs::write(
+        &reused,
+        format!("table: {schema}.customer\ncolumns:\n  reused: {{type: int}}\n"),
+    )
+    .unwrap();
+    offline(&d);
+    ok(d.run(&["bootstrap", "--db", connection]));
+    // Keep the absorbed annotation and both identities, but omit the deployed
+    // commit from this checkout's ancestry. Only a real removal may refuse it.
+    let tree = git(&d.dir, &["rev-parse", "HEAD^{tree}"]);
+    let sibling = git(
+        &d.dir,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &common,
+            "-m",
+            "retained annotation on sibling",
+        ],
+    );
+    d.git(&["checkout", "-q", "--detach", &sibling]);
+    std::fs::write(
+        &reused,
+        format!("table: {schema}.customer\ncolumns:\n  reused: {{type: bigint}}\n"),
+    )
+    .unwrap();
+    d.commit();
+    let planned = plan(&d, connection, &artifacts.dir.join("plan.json"));
+    assert!(!planned.changes.is_empty());
+    assert!(!planned.changes.changes.iter().any(|change| matches!(
+        change.change,
+        pbps_model::Change::DropColumn { .. } | pbps_model::Change::DropTable { .. }
+    )));
 }
 
 pub fn failed_attempt(server: &str, pg: bool) {

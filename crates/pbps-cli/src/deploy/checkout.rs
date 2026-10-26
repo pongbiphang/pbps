@@ -3,6 +3,26 @@ use crate::baseline::ancestry::{self, Evidence};
 use crate::output::Finding;
 use pbps_model::{IdsFile, Intent, Schema, StateSnapshot};
 
+// Match the resolver's disappeared-to-appeared eligibility, so a retained
+// annotation cannot move a new object that has reused the source name.
+fn project_pending_renames<N: Clone + Ord>(
+    names: &mut std::collections::BTreeMap<pbps_model::Uid, N>,
+    declared: std::collections::BTreeSet<N>,
+    intents: impl Iterator<Item = (N, N)>,
+) {
+    let known: std::collections::BTreeSet<_> = names.values().cloned().collect();
+    let pending: std::collections::BTreeMap<_, _> = intents
+        .filter(|(from, to)| {
+            !declared.contains(from) && declared.contains(to) && !known.contains(to)
+        })
+        .collect();
+    for name in names.values_mut() {
+        if let Some(to) = pending.get(name) {
+            *name = to.clone();
+        }
+    }
+}
+
 /// This is a projection of existing names and explicit rename annotations, not
 /// identity resolution: it allocates no uid and makes no rename decision.
 fn removals(
@@ -13,44 +33,47 @@ fn removals(
     intents: &[Intent],
 ) -> Vec<String> {
     let mut names = local.clone();
-    for name in names.tables.values_mut() {
-        if let Some(to) = intents.iter().find_map(|i| {
+    project_pending_renames(
+        &mut names.tables,
+        schema.tables.keys().cloned().collect(),
+        intents.iter().filter_map(|i| {
             let Intent::RenameTable { from, to } = i else {
                 return None;
             };
-            (from == name).then_some(to)
-        }) {
-            *name = to.clone();
-        }
-    }
+            Some((from.clone(), to.clone()))
+        }),
+    );
     for column in names.columns.values_mut() {
-        if let Some(to) = intents.iter().find_map(|i| {
-            let Intent::RenameTable { from, to } = i else {
-                return None;
-            };
-            (from == &column.table).then_some(to)
-        }) {
+        if let Some(uid) = local.table_uid(&column.table)
+            && let Some(to) = names.tables.get(uid)
+        {
             column.table = to.clone();
         }
-        if let Some(to) = intents.iter().find_map(|i| {
+    }
+    project_pending_renames(
+        &mut names.columns,
+        schema
+            .tables
+            .iter()
+            .flat_map(|(name, table)| table.columns.keys().map(|column| name.column(column)))
+            .collect(),
+        intents.iter().filter_map(|i| {
             let Intent::RenameColumn { table, from, to } = i else {
                 return None;
             };
-            (table == &column.table && from == &column.name).then_some(to)
-        }) {
-            column.name = to.clone();
-        }
-    }
-    for name in names.roles.values_mut() {
-        if let Some(to) = intents.iter().find_map(|i| {
+            Some((table.column(from), table.column(to)))
+        }),
+    );
+    project_pending_renames(
+        &mut names.roles,
+        schema.roles.keys().cloned().collect(),
+        intents.iter().filter_map(|i| {
             let Intent::RenameRole { from, to } = i else {
                 return None;
             };
-            (from == name).then_some(to)
-        }) {
-            *name = to.clone();
-        }
-    }
+            Some((from.clone(), to.clone()))
+        }),
+    );
     let mut removed_tables = std::collections::BTreeSet::new();
     let mut removed = Vec::new();
     for (uid, name) in &recorded.tables {
@@ -338,6 +361,82 @@ mod tests {
         let mut absent = schema.clone();
         absent.tables.values_mut().next().unwrap().columns.clear();
         assert!(removals(&ids, &absent, &ids, &absent, &[]).is_empty());
+    }
+
+    #[test]
+    fn absorbed_annotations_preserve_reused_names_and_do_not_hide_their_removal() {
+        let (mut ids, mut schema) = fixture();
+        let original = ids.tables.values_mut().next().unwrap();
+        *original = "app.client".parse().unwrap();
+        ids.columns.values_mut().next().unwrap().table = original.clone();
+        let table = schema
+            .tables
+            .remove(&"app.customer".parse().unwrap())
+            .unwrap();
+        schema.tables.insert(original.clone(), table);
+        ids.tables.insert(
+            Uid::generate(UidKind::Table),
+            "app.customer".parse().unwrap(),
+        );
+        ids.columns.insert(
+            Uid::generate(UidKind::Column),
+            "app.customer.reused".parse().unwrap(),
+        );
+        schema.tables.insert(
+            "app.customer".parse().unwrap(),
+            Table {
+                columns: [(
+                    "reused".into(),
+                    Column::new(ColumnType::new("integer", vec![])),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let renamed_column = schema
+            .tables
+            .get_mut(&"app.client".parse().unwrap())
+            .unwrap();
+        renamed_column.columns.insert(
+            "key".into(),
+            Column::new(ColumnType::new("integer", vec![])),
+        );
+        ids.columns.insert(
+            Uid::generate(UidKind::Column),
+            "app.client.key".parse().unwrap(),
+        );
+        ids.roles
+            .insert(Uid::generate(UidKind::Role), "writer".into());
+        schema.roles.insert("writer".into(), Role::default());
+        let intents = [
+            Intent::RenameTable {
+                from: "app.customer".parse().unwrap(),
+                to: "app.client".parse().unwrap(),
+            },
+            Intent::RenameColumn {
+                table: "app.client".parse().unwrap(),
+                from: "id".into(),
+                to: "key".into(),
+            },
+            Intent::RenameRole {
+                from: "reader".into(),
+                to: "writer".into(),
+            },
+        ];
+        assert!(removals(&ids, &schema, &ids, &schema, &intents).is_empty());
+        let mut desired = schema.clone();
+        desired.tables.remove(&"app.customer".parse().unwrap());
+        desired
+            .tables
+            .get_mut(&"app.client".parse().unwrap())
+            .unwrap()
+            .columns
+            .shift_remove("id");
+        desired.roles.remove("reader");
+        assert_eq!(
+            removals(&ids, &schema, &ids, &desired, &intents),
+            ["column app.client.id", "role reader", "table app.customer"]
+        );
     }
 
     #[test]
