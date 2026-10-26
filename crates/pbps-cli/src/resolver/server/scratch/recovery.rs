@@ -117,8 +117,11 @@ pub trait Adapter {
     /// Whether each of `tokens` has an owner.
     async fn liveness(&mut self, tokens: &[String]) -> Result<BTreeMap<String, Liveness>, String>;
 
-    /// Removes `resource`, or says why it could not and what is left of it.
-    async fn remove(&mut self, resource: &Resource) -> Result<(), Failed>;
+    /// Removes `resource` of the run `token`, or says why it could not and
+    /// what is left of it. Some resources are the run's only by what they
+    /// carry (a SQL Server companion database is marked with its run), so the
+    /// run is named.
+    async fn remove(&mut self, token: &str, resource: &Resource) -> Result<(), Failed>;
 
     /// What an operator runs to remove `resource` by hand.
     fn statement(&self, resource: &Resource) -> String;
@@ -160,7 +163,7 @@ pub async fn sweep(adapter: &mut impl Adapter) -> Report {
             Liveness::Dead => {
                 let mut rest = resources.into_iter();
                 while let Some(resource) = rest.next() {
-                    match adapter.remove(&resource).await {
+                    match adapter.remove(&token, &resource).await {
                         Ok(()) => group.removed.push(resource),
                         Err(Failed { why, left }) => {
                             let left = left.unwrap_or_else(|| resource.names.clone());
@@ -300,7 +303,7 @@ mod tests {
         async fn liveness(&mut self, _: &[String]) -> Result<BTreeMap<String, Liveness>, String> {
             Ok(self.lives.clone())
         }
-        async fn remove(&mut self, resource: &Resource) -> Result<(), Failed> {
+        async fn remove(&mut self, _: &str, resource: &Resource) -> Result<(), Failed> {
             if self.refuses.contains(&resource.kind) {
                 return Err("permission denied".to_owned().into());
             }

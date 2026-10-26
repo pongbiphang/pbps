@@ -320,6 +320,28 @@
         "test",
         "flow"
       ],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "recovery2410::a_run_owned_sql_server_run_killed_after_creating_its_database_is_recovered_by_the_next_run",
+        "recovery2410::a_run_owned_sql_server_run_killed_in_the_reference_window_is_recovered_by_the_next_run",
+        "recovery2410::a_run_owned_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_run_killed_after_its_sandbox_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_database_a_live_run_holds_is_refused_and_left_alone"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
       "owner": "mssql",
       "validate_on": "linux",
       "ignored_on": [
@@ -2351,6 +2373,28 @@
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_file_requires_explicit_allow",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::empty_file_still_requires_same_instance_allow",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::target_database_is_always_refused",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_record_longer_than_one_property_holds_is_read_back_in_order",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_run_killed_at_any_stage_is_removed_by_the_next_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_the_run_did_not_mark_is_kept_with_its_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_live_runs_resources_are_never_touched_by_another_runs_sweep",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_name_that_is_not_a_complete_run_is_never_touched",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_database_a_dead_run_still_has_a_session_on_is_kept_and_named",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_leftover_another_login_owns_is_named_with_the_statement_and_keeps_its_record",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_run_dropped_while_using_its_scratch_leaves_a_marker_named_by_its_token_and_is_recovered",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_companion_a_run_created_is_recorded_marked_and_removed_by_the_next_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_release_that_cannot_remove_a_companion_keeps_the_record_that_names_it",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_release_that_cannot_drop_the_reference_database_keeps_the_record_that_finds_it",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_run_killed_after_its_sandbox_is_cleaned_by_the_next_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_run_killed_before_its_sandbox_owned_the_database_is_cleaned_by_the_next_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_database_a_live_run_holds_is_refused_and_left_alone",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::objects_with_no_sandbox_are_still_refused_and_never_cleaned",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_supplied_run_dropped_while_using_its_database_is_cleaned_by_the_next_run",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::the_marker_is_seen_by_a_login_with_no_privilege_and_goes_with_its_session",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_late_recoverer_waits_for_the_lock_then_finds_a_live_sandbox_and_refuses",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::two_runs_that_start_together_on_one_supplied_database_exactly_one_proceeds",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_run_that_cannot_get_the_lock_refuses_naming_it_and_touches_nothing",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::the_lock_is_the_sessions_and_a_dropped_session_frees_it",
+        "resolver::server::scratch::mssql_live_tests::recovery2410::a_refused_acquisition_releases_the_lock_on_its_own_session",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_allow_keeps_containment_and_comparison",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::another_instance_does_not_require_file_consent",
         "resolver::server::scratch::mssql_live_tests::same_instance2270::same_instance_automatic_externals_use_catalog_rendering_only",

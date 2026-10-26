@@ -3213,7 +3213,7 @@ pub(crate) fn catalogued_as(
 /// warnings go to stderr.
 /// What this command's sweeps found (#2410): a note for what was removed, a
 /// warning with the removing statement for what was not.
-fn recovery_findings() -> Vec<crate::output::Finding> {
+pub(crate) fn recovery_findings() -> Vec<crate::output::Finding> {
     let collected = pbps_cli::resolver::server::scratch::recovery::take();
     let mut findings = Vec::new();
     for why in collected.unread {

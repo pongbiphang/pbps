@@ -11,6 +11,9 @@ use pbps_mssql::resolver::reconstruct::{ReconstructError, Reconstruction};
 use pbps_mssql::resolver::{
     self, authorization as auth, capture, dependencies, externals, scratch as sql,
 };
+use sql::recovery as record;
+
+mod recovery;
 use std::collections::{BTreeMap, BTreeSet};
 
 enum Created {
@@ -38,6 +41,15 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     _provenance: &'a Provenance,
     placement: Option<sql::Placement>,
     companions: Vec<sql::companion::Companion>,
+    /// The run's token: the marker table's, and in the name of everything the
+    /// run creates that can carry one (#2410).
+    token: String,
+    /// The companion databases recorded in the scratch database so far.
+    recorded: Vec<String>,
+    /// Whether this run holds the application lock on the supplied database
+    /// (`recovery::lock`): from before it reads what a dead run left until its
+    /// own sandbox user exists.
+    locked: bool,
 }
 
 pub(in crate::resolver::server) struct Prepared {
@@ -129,9 +141,8 @@ pub(in crate::resolver::server) async fn preview<'a>(
     provenance: &'a Provenance,
 ) -> Result<(Provisioning, Scratch<'a>), Error> {
     let backend = sql::backend(admin).await.map_err(read)?;
-    let mark = sql::mark(admin, &format!("{:032x}", rand::random::<u128>()))
-        .await
-        .map_err(read)?;
+    let token = format!("{:032x}", rand::random::<u128>());
+    let mark = sql::mark(admin, &token).await.map_err(read)?;
     if !sql::marked(admin, &mark).await.map_err(read)? {
         return Err(Error::Unusable(
             "the scratch session cannot see its own live marker".into(),
@@ -142,22 +153,25 @@ pub(in crate::resolver::server) async fn preview<'a>(
     } else {
         Provisioning::Supplied
     };
-    Ok((
-        provisioning,
-        Scratch {
-            connection,
-            mark,
-            backend,
-            created: Created::Nothing,
-            entered: false,
-            acquired: None,
-            externals: None,
-            request,
-            _provenance: provenance,
-            placement: None,
-            companions: Vec::new(),
-        },
-    ))
+    let mut scratch = Scratch {
+        connection,
+        mark,
+        backend,
+        created: Created::Nothing,
+        entered: false,
+        acquired: None,
+        externals: None,
+        request,
+        _provenance: provenance,
+        placement: None,
+        companions: Vec::new(),
+        token,
+        recorded: Vec::new(),
+        locked: false,
+    };
+    // Before the run creates anything: what runs killed earlier left.
+    scratch.recover(provisioning, admin).await?;
+    Ok((provisioning, scratch))
 }
 
 /// Resolves a LocalDB selector in the scratch connection string. Discovery
@@ -282,22 +296,26 @@ pub(super) async fn scratch<'a>(
                 }
             }
         };
-        Ok((
-            provisioning,
-            Scratch {
-                connection,
-                mark,
-                backend,
-                created: Created::Nothing,
-                entered: false,
-                acquired: None,
-                externals,
-                request,
-                _provenance: provenance,
-                placement: Some(placement),
-                companions: Vec::new(),
-            },
-        ))
+        let mut scratch = Scratch {
+            connection,
+            mark,
+            backend,
+            created: Created::Nothing,
+            entered: false,
+            acquired: None,
+            externals,
+            request,
+            _provenance: provenance,
+            placement: Some(placement),
+            companions: Vec::new(),
+            token: tokens.scratch.clone(),
+            recorded: Vec::new(),
+            locked: false,
+        };
+        // After the placement verdict and before the run's first write: what
+        // runs killed earlier left (#2410).
+        scratch.recover(provisioning, admin).await?;
+        Ok((provisioning, scratch))
     }
     .await;
     result.map_err(ProduceError::Run)
@@ -319,7 +337,7 @@ impl Scratch<'_> {
         }
         let (reference, database, databases) = match provisioning {
             Provisioning::RunOwned => {
-                let names = super::super::generated_names()?;
+                let names = super::super::names_for(&self.token)?;
                 self.created = Created::RunOwned {
                     names: names.clone(),
                     reference: None,
@@ -330,7 +348,7 @@ impl Scratch<'_> {
                 resolver::create_scratch(admin, &names, recipe)
                     .await
                     .map_err(|_| Error::Scratch)?;
-                let reference_names = super::super::generated_names()?;
+                let reference_names = super::super::names_for_reference(&self.token)?;
                 self.created = Created::RunOwned {
                     names: names.clone(),
                     reference: Some(reference_names.clone()),
@@ -347,10 +365,25 @@ impl Scratch<'_> {
                     .map(|inputs| inputs.databases())
                     .unwrap_or_default()
                 {
+                    // Recorded before it exists, and marked once it does: a
+                    // companion carries the dependency's own name, so the
+                    // record is what lets a later run find it (`recovery`).
+                    record::record_companion(
+                        admin,
+                        names.database(),
+                        self.recorded.len(),
+                        &database,
+                    )
+                    .await
+                    .map_err(read)?;
+                    self.recorded.push(database.clone());
                     let companion = sql::companion::Companion::create(admin, &database)
                         .await
                         .map_err(read)?;
                     self.companions.push(companion);
+                    record::mark_companion(admin, &database, &self.token)
+                        .await
+                        .map_err(read)?;
                     let mut owner = Conn::connect(Driver::Mssql, self.connection)
                         .await
                         .map_err(read)?;
@@ -473,7 +506,7 @@ impl Scratch<'_> {
                 differences.join(", ")
             )));
         }
-        let sandbox = format!("pbps_sandbox_{:032x}", rand::random::<u128>());
+        let sandbox = format!("pbps_sandbox_{}", self.token);
         if provisioning == Provisioning::Supplied {
             // Once acquired, every refusal must clean what setup created,
             // including a CREATE USER that succeeds before ADD MEMBER fails.
@@ -485,6 +518,9 @@ impl Scratch<'_> {
         sql::create_sandbox(&mut owner, &sandbox)
             .await
             .map_err(read)?;
+        // The run's own sandbox user is its record on a supplied database:
+        // another run that takes the lock now finds it.
+        self.unlock(admin).await;
         sql::enter_sandbox(&mut owner, &sandbox)
             .await
             .map_err(read)?;
@@ -578,7 +614,7 @@ impl Scratch<'_> {
         auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
             .await
             .map_err(read)?;
-        let token = format!("{:032x}", rand::random::<u128>());
+        let token = self.token.clone();
         let planned = scope::mssql_planned(&self.request.planned);
         let mut map = auth::PrincipalMap::generate(&context, &planned, &token);
         let mut setup_context = context.clone();
@@ -771,7 +807,13 @@ impl Scratch<'_> {
         &mut self,
         admin: &mut Conn,
     ) -> Result<(), Vec<String>> {
-        let mut failed = self.release_scratch(admin).await.err().unwrap_or_default();
+        // Whatever stopped the run before its sandbox existed, the lock goes
+        // with it (the session's end would free it too).
+        self.unlock(admin).await;
+        // The companions first: the scratch database holds their record, and
+        // the login the run's (`recovery`, #2410). Anything left of them keeps
+        // both, so a later run still finds what is left.
+        let mut failed = Vec::new();
         if !self.companions.is_empty() {
             if !matches!(sql::on_backend(admin, &self.backend).await, Ok(true)) {
                 failed.extend(self.companions.iter().map(|db| {
@@ -791,6 +833,13 @@ impl Scratch<'_> {
                 }
             }
         }
+        let keep_record = !failed.is_empty();
+        failed.extend(
+            self.release_scratch(admin, keep_record)
+                .await
+                .err()
+                .unwrap_or_default(),
+        );
         if failed.is_empty() {
             Ok(())
         } else {
@@ -798,7 +847,11 @@ impl Scratch<'_> {
         }
     }
 
-    async fn release_scratch(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
+    async fn release_scratch(
+        &mut self,
+        admin: &mut Conn,
+        keep_record: bool,
+    ) -> Result<(), Vec<String>> {
         let entered = std::mem::take(&mut self.entered);
         match std::mem::replace(&mut self.created, Created::Nothing) {
             Created::Nothing => Ok(()),
@@ -815,6 +868,12 @@ impl Scratch<'_> {
                     }
                     return Err(resources);
                 }
+                // The record names the reference too: a token is found by its
+                // login, so a reference left with no record is never retried.
+                let mut left = Vec::new();
+                if keep_record {
+                    left.push("companion databases");
+                }
                 if let Some(reference) = reference
                     && let Err(error) = resolver::drop_reference(admin, &reference).await
                 {
@@ -822,13 +881,26 @@ impl Scratch<'_> {
                         "reference database {} ({error})",
                         reference.database()
                     ));
+                    left.push("reference database");
                 }
-                if let Err(error) = resolver::drop_scratch(admin, &names).await {
+                if !left.is_empty() {
+                    failed.push(format!(
+                        "database {} and login {}, kept: they record the {} left",
+                        names.database(),
+                        names.login(),
+                        left.join(" and the ")
+                    ));
+                } else if let Err(error) =
+                    record::drop_database(admin, names.database(), true).await
+                {
                     failed.push(format!(
                         "database {} and login {} ({error})",
                         names.database(),
                         names.login()
                     ));
+                } else if let Err(error) = record::drop_login(admin, names.login()).await {
+                    // The login is the run's record: it goes last.
+                    failed.push(format!("login {} ({error})", names.login()));
                 }
                 if failed.is_empty() {
                     Ok(())

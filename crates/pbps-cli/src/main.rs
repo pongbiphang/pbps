@@ -4361,6 +4361,12 @@ fn cmd_plan(
         if json {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?;
             let (tables, modules) = report::touched(&names);
+            // What a dev rehearsal's scratch acquisition found left by runs
+            // killed earlier (#2410).
+            let findings = findings
+                .into_iter()
+                .chain(deploy::recovery_findings())
+                .collect();
             let report = output::Report::new(
                 "plan",
                 findings,

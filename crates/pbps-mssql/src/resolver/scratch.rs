@@ -8,6 +8,7 @@ use pbps_model::escape::Escaped;
 pub mod companion;
 pub mod inventory;
 pub mod options;
+pub mod recovery;
 mod system;
 
 pub(crate) fn literal(value: &str) -> String {
@@ -98,6 +99,16 @@ pub async fn database(conn: &mut impl QueryConnection) -> Result<Database, DbErr
 pub struct SessionMark {
     pub database: Database,
     name: String,
+    /// The run's token: the marker table is named by it, and so is every
+    /// resource the run creates, so a later run can tell from the marker
+    /// whether the owner is gone (`recovery`, #2410).
+    token: String,
+}
+
+impl SessionMark {
+    pub fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 pub async fn mark(conn: &mut impl ExecuteConnection, nonce: &str) -> Result<SessionMark, DbError> {
@@ -113,7 +124,11 @@ pub async fn mark(conn: &mut impl ExecuteConnection, nonce: &str) -> Result<Sess
         ident(&name)
     ))
     .await?;
-    Ok(SessionMark { database, name })
+    Ok(SessionMark {
+        database,
+        name,
+        token: nonce.to_owned(),
+    })
 }
 
 pub async fn marked(conn: &mut impl QueryConnection, mark: &SessionMark) -> Result<bool, DbError> {

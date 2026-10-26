@@ -1312,3 +1312,6 @@ mod dependencies2323;
 
 #[path = "reconstruct2374_tests.rs"]
 mod reconstruct2374;
+
+#[path = "recovery2410_mssql_tests.rs"]
+mod recovery2410;
