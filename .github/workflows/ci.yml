@@ -525,7 +525,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [dialect, capture, flow-programs, flow-rest]
+        suite: [dialect, capture, flow-0, flow-1, flow-2]
     services:
       postgres:
         # Pinned by digest, for the reason the SQL Server one is: PostgreSQL
@@ -591,17 +591,18 @@ jobs:
       # `pull: never` finds them.
       PBPS_TEST_PG_SCRATCH_IMAGE: "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
       PBPS_TEST_PG_OLD_SCRATCH_IMAGE: "postgres@sha256:485935f94cc7165afa896978809c37b592dc07f0a37d2c8f645f12412d0212c8"
+      PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - uses: dtolnay/rust-toolchain@stable
-      # Keyed by variant: each builds different targets, and under one key
-      # the first to finish would save a cache the other three cannot use.
+      # Flow shares build the same target and restore the existing flow-rest cache.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: ${{ matrix.suite }}
+          key: ${{ startsWith(matrix.suite, 'flow-') && 'flow-rest' || matrix.suite }}
       # Thirty seconds of this is one test waiting out `CONNECT_TIMEOUT` on
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
@@ -641,14 +642,7 @@ jobs:
       # seam in `engine.rs`. Serial, because each test creates and drops a
       # database of its own.
       #
-      # Split by name, into the cases about programmable objects and grants
-      # and everything else; the second is the first's exact complement, so a
-      # new case lands in one of them whatever it is called.
-      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 trigger routine function grant
-        if: matrix.suite == 'flow-programs'
-        env:
-          PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
-          PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
+      # A fixed rule over the full list assigns new cases exactly once (DEC-2434.1).
       # pg_partman for `partitions: external` (#1533, DEC-1533.1), which
       # `pull` reads from pg_partman's own catalog: the cases install the
       # extension in a database of their own, and the package must be on both
@@ -658,7 +652,7 @@ jobs:
       # Both at once, each `wait`ed on by its own pid so either failing
       # fails the step: the two downloads, not the work, are the cost.
       - name: Install pg_partman on both servers
-        if: matrix.suite == 'flow-rest'
+        if: startsWith(matrix.suite, 'flow-')
         run: |
           set -euo pipefail
           pids=()
@@ -668,20 +662,49 @@ jobs:
             pids+=($!)
           done
           for pid in "${pids[@]}"; do wait "$pid"; done
-      - run: cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 --skip trigger --skip routine --skip function --skip grant
-        if: matrix.suite == 'flow-rest'
+      - run: python3 scripts/live-shards.py ci 0/3 test -p pbps-cli --test flow_pg -- --ignored
+        if: matrix.suite == 'flow-0'
+      - run: python3 scripts/live-shards.py ci 1/3 test -p pbps-cli --test flow_pg -- --ignored
+        if: matrix.suite == 'flow-1'
+      - run: python3 scripts/live-shards.py ci 2/3 test -p pbps-cli --test flow_pg -- --ignored
+        if: matrix.suite == 'flow-2'
+
+  # Browser package downloads must not extend a serial flow_pg shard (DEC-2434.1).
+  viewer:
+    needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Pinned by digest, for the reason the SQL Server one is: PostgreSQL
+        # 18.6 (Debian 18.6-1.pgdg13+2). Bump deliberately, and run
+        # `scripts/live-tests-pg.sh` against the new digest before pushing it.
+        image: postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
         env:
-          PBPS_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
-          PBPS_TEST_PG_OLD_CONTAINER: ${{ job.services.postgres-old.id }}
+          POSTGRES_PASSWORD: "Pbps!Ci12345"
+          POSTGRES_DB: pbps_test
+        ports:
+          - 54320:5432
+        # TCP excludes the socket-only initialization server (#1471).
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d pbps_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v7
-        if: matrix.suite == 'flow-rest'
         with:
           node-version: 24
       - name: Build the actual viewer executable
-        if: matrix.suite == 'flow-rest'
         run: cargo build --locked -p pbps-cli --bin pbps --target-dir "$RUNNER_TEMP/pbps-ui-build"
       - name: Shipped viewer in Chromium
-        if: matrix.suite == 'flow-rest'
         env:
           PBPS_TEST_UI_PG_URL: "postgresql://postgres:Pbps!Ci12345@127.0.0.1:54320/pbps_test?sslmode=disable"
         run: |
@@ -929,7 +952,7 @@ jobs:
 
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, resolver-mssql, resolver-localdb, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
+    needs: [approve, lint, quick, windows, live, resolver-mssql, resolver-localdb, live-transport-mssql, live-editions, live-pg, viewer, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -954,5 +977,5 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
-          PR_OMITTED: live live-pg resolver-mssql release-windows
+          PR_OMITTED: live live-pg viewer resolver-mssql release-windows
         run: python3 scripts/ci_gate_verdict.py

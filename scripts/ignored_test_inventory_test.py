@@ -585,6 +585,20 @@ class WorkflowKeySpellings(unittest.TestCase):
 
 
 class CargoSelectors(unittest.TestCase):
+
+    def test_ci_shards_are_real_owners_and_invalid_wrappers_are_refused(self):
+        cargo = ["test", "-p", "demo", "--lib", "--", "--ignored"]
+        expected = audit.cargo_selection(["cargo", *cargo])
+        for index in range(3):
+            self.assertEqual(audit.cargo_selection(
+                ["python3", "scripts/live-shards.py", "ci", f"{index}/3", *cargo]), expected)
+        for selector in ("3/3", "0/0", "bad", "0/"):
+            with self.subTest(selector=selector):
+                with self.assertRaises(audit.InventoryError):
+                    audit.cargo_selection(["python3", "scripts/live-shards.py", "ci", selector, *cargo])
+        self.assertIsNone(audit.cargo_selection(
+            ["python3", "unrelated.py", "ci", "0/3", *cargo]))
+
     def test_ambiguous_or_unsupported_cargo_arguments_supply_no_owner(self):
         for arguments in (["--profile"], ["--profile", "--lib"], ["--profile="],
                           ["--package"], ["--test"], ["--bin"], ["--offline", "--offline"],

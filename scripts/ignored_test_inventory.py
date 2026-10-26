@@ -821,6 +821,13 @@ def shell_commands(script):
 
 
 def cargo_selection(command):
+    # CI's wrapper partitions the complete list and refuses incomplete results.
+    if command[:3] == ["python3", "scripts/live-shards.py", "ci"]:
+        require(len(command) > 4 and re.fullmatch(r"[0-9]+/[1-9][0-9]*", command[3]),
+                "invalid CI shard selector")
+        index, count = map(int, command[3].split("/"))
+        require(index < count, "CI shard index must be less than its count")
+        command = ["cargo", *command[4:]]
     if command[:2] != ["cargo", "test"] or "--" not in command: return None
     split = command.index("--"); build, args = command[2:split], command[split + 1:]
     if "--no-run" in build: return None

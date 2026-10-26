@@ -56,6 +56,129 @@ def job_commands(workflow, job):
     return []
 
 
+class CIShardedExecution(unittest.TestCase):
+    def test_round_robin_sorts_the_full_list_and_new_names_have_one_share(self):
+        names = ["zebra", "alpha", "future_case", "function_called", "beta", "猫"]
+        groups = SHARDS.partition(names, 3, "", None, round_robin=True)
+        self.assertEqual(groups, [sorted(names)[i::3] for i in range(3)])
+        for name in ("new_trigger", "a", "another_case"):
+            expanded = names + [name]
+            assigned = SHARDS.partition(expanded, 3, "", None, round_robin=True)
+            SHARDS.verify_union(expanded, assigned)
+            self.assertEqual(sum(name in group for group in assigned), 1)
+        for broken in (groups[1:], [*groups, [names[0]]]):
+            with self.assertRaisesRegex(ValueError, "shard union"):
+                SHARDS.verify_union(names, broken)
+
+    def run_ci(self, value="0/3", mode="ok", extra=()):
+        with tempfile.TemporaryDirectory(prefix="pbps-ci-shard-") as temporary:
+            root = Path(temporary)
+            client = root / "cargo"
+            client.write_text(f"#!{sys.executable}\n" + r"""
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["PBPS_CI_CALLS"]).open("a") as f:
+    f.write(json.dumps(args) + "\n")
+mode = os.environ["PBPS_CI_MODE"]
+names = ["zebra", "alpha", "future_case", "function_called", "beta", "猫"]
+if "--list" in args:
+    if mode == "list-failed": sys.exit(4)
+    if mode == "empty": names = []
+    if mode == "short": names = names[:1]
+    if mode == "unreadable":
+        print("unreadable"); sys.exit(0)
+    for name in names: print(name + ": test")
+    print(f"\n{len(names)} tests, 0 benchmarks")
+else:
+    tail = args[args.index("--") + 1:]
+    names = [a for a in tail if not a.startswith("-")]
+    if mode == "missing": names = names[:-1]
+    if mode == "duplicate": names.append(names[0])
+    if mode == "extra": names.append("unassigned_case")
+    print(f"\nrunning {len(names)} tests")
+    failed = 0
+    for name in names:
+        status = "FAILED" if mode == "failed" and not failed else "ok"
+        failed += status == "FAILED"
+        print(f"test {name} ... {status}")
+    print(f"\ntest result: {'FAILED' if failed else 'ok'}. {len(names)-failed} passed; "
+          f"{failed} failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")
+    sys.exit(bool(failed))
+""", encoding="utf-8")
+            client.chmod(0o755)
+            calls = root / "calls"
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       PBPS_CI_CALLS=str(calls), PBPS_CI_MODE=mode)
+            result = subprocess.run(
+                [sys.executable, str(SHARDS.SCRIPT), "ci", value, "test",
+                 "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", *extra],
+                cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
+            recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+            return result, recorded
+
+    def test_ci_runs_each_exact_share_serially_without_fixture_operations(self):
+        expected = sorted(["zebra", "alpha", "future_case", "function_called", "beta", "猫"])
+        actual = []
+        for index in range(3):
+            result, calls = self.run_ci(f"{index}/3")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(f"ci shard {index}/3: 2/6 tests", result.stdout)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("--list", calls[0])
+            self.assertIn("--exact", calls[1])
+            self.assertIn("--test-threads=1", calls[1])
+            assigned = [a for a in calls[1][calls[1].index("--") + 1:] if not a.startswith("-")]
+            self.assertEqual(assigned, expected[index::3])
+            actual.extend(assigned)
+        self.assertEqual(sorted(actual), expected)
+
+    def test_ci_does_not_enter_container_provisioning_or_cleanup(self):
+        listing = subprocess.CompletedProcess([], 0, "b: test\na: test\n2 tests, 0 benchmarks\n")
+        with mock.patch.object(SHARDS, "FixtureRun", side_effect=AssertionError("fixture lifecycle")), \
+             mock.patch.object(SHARDS, "fixture_env", side_effect=AssertionError("fixture rewrite")), \
+             mock.patch.object(SHARDS, "drive", side_effect=AssertionError("local driver")), \
+             mock.patch.object(SHARDS.shutil, "which", return_value="/fake/cargo"), \
+             mock.patch.object(SHARDS.subprocess, "run", return_value=listing) as enumerate_tests, \
+             mock.patch.object(SHARDS, "run_tests", return_value=({}, 0, 0, True)) as execute, \
+             mock.patch.object(sys, "argv", ["live-shards.py", "ci", "0/2", "test",
+                                            "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored"]), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(SHARDS.main(), 0)
+        enumerate_tests.assert_called_once()
+        self.assertEqual(enumerate_tests.call_args.args[0][0], "/fake/cargo")
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[1], ["a"])
+
+    def test_ci_refuses_zero_total_empty_share_unreadable_list_and_failed_discovery(self):
+        for value, mode, message in (("0/3", "empty", "zero tests"),
+                                     ("1/3", "short", "no assigned tests"),
+                                     ("0/3", "unreadable", "unreadable or incomplete"),
+                                     ("0/3", "list-failed", "cargo --list failed")):
+            with self.subTest(mode=mode):
+                result, calls = self.run_ci(value, mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(len(calls), 1)
+
+    def test_ci_refuses_missing_duplicate_extra_and_failed_execution(self):
+        for mode in ("missing", "duplicate", "extra", "failed"):
+            with self.subTest(mode=mode):
+                result, calls = self.run_ci(mode=mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(len(calls), 2)
+                if mode != "failed":
+                    self.assertIn("not reported exactly once", result.stderr)
+
+    def test_ci_refuses_filtered_input_and_invalid_selectors_before_running_cargo(self):
+        for value, extra in (("3/3", ()), ("0/0", ()), ("bad", ()),
+                             ("0/3", ("--skip", "future")), ("0/3", ("trigger",))):
+            with self.subTest(value=value, extra=extra):
+                result, calls = self.run_ci(value, extra=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+
+
 class ShardedExecution(unittest.TestCase):
     def test_descendant_cleanup_finishes_after_its_runner_leader_exits(self):
         events, elapsed, _ = self.stop_fake_runners(["cleanup"])
@@ -1138,8 +1261,8 @@ elif command[0] != 'sleep':
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         commands = [shlex.split(value) for value in
                     re.findall(r'--health-cmd "(pg_isready[^"\n]+)"', workflow)]
-        # The target, the pre-17 server and the resolver's scratch cluster.
-        self.assertEqual(len(commands), 3)
+        # The target, pre-17 server, resolver scratch and independent viewer fixture.
+        self.assertEqual(len(commands), 4)
         for command in commands:
             with self.subTest(command=command):
                 # Socket readiness is true while docker-entrypoint.sh is
