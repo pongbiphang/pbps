@@ -198,6 +198,22 @@ fn consumer_contracts_suppressions_do_not_spill_between_unrelated_written_tables
     );
 }
 
+#[test]
+fn consumer_contracts_accept_new_written_tables_with_foreign_keys() {
+    let d = Demo::new("consumer-new-writer");
+    table(&d, "  old: {type: integer, nullable: false}\n");
+    d.table(
+        "table: app.t\ncolumns:\n  old: {type: integer, nullable: false}\nprimary_key: [old]\n",
+    );
+    ok(d.run(&["plan"]));
+    d.commit();
+    std::fs::write(d.dir.join("schema/new.yml"), "table: app.new\ncolumns:\n  old: {type: integer}\nforeign_keys:\n  fk: {columns: [old], references: app.t(old)}\n").unwrap();
+    config(&d, "consumers:\n  writer: {writes: [app.new.old]}\n");
+    ok(d.run(&["plan"]));
+    config(&d, "consumers:\n  writer: {writes: [app.t]}\n");
+    refused(&d, "consumer.unproven", &["plan"]);
+}
+
 /// Called by one owned-database case on MSSQL and both supported PG engines.
 pub(super) fn live(server: &str, pg: bool) {
     let own = OwnDatabase::new(server, "consumer2398");
@@ -216,7 +232,56 @@ pub(super) fn live(server: &str, pg: bool) {
     let contracts = "consumers:\n  billing-v41: {uses: [app.restored], writes: [app.t.old]}\n";
     config(&d, contracts);
     d.table("table: app.t\ncolumns:\n  old: {type: varchar(100)}\n  other: {type: integer}\nchecks:\n  ck: old <> ''\n");
-    ok(d.run(&["plan", "--db", connection]));
+    let restored = d.dir.join("schema/restored.yml");
+    let declaration = std::fs::read_to_string(&restored).unwrap();
+    for (case, desired) in [
+        (
+            "description",
+            declaration.replace("consumer report", "consumer report updated"),
+        ),
+        (
+            "formatting",
+            declaration.replace(
+                "definition: SELECT old FROM app.t",
+                "definition: |\n  SELECT old\n  FROM app.t",
+            ),
+        ),
+    ] {
+        std::fs::write(&restored, desired).unwrap();
+        let plan = d.dir.join(format!("{case}-restoration.json"));
+        let o = d.run(&[
+            "plan",
+            "--db",
+            connection,
+            "--format",
+            "json",
+            "--out",
+            plan.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code(&o),
+            0,
+            "{case} restoration: {}{}",
+            stdout(&o),
+            stderr(&o)
+        );
+        if !pg {
+            assert!(
+                std::fs::read_to_string(&plan)
+                    .unwrap()
+                    .contains("drop_module"),
+                "{case} must exercise a physical restoration: {}",
+                stdout(&o)
+            );
+        }
+    }
+    std::fs::write(
+        &restored,
+        declaration.replace("SELECT old FROM app.t", "SELECT other FROM app.t"),
+    )
+    .unwrap();
+    refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    std::fs::write(&restored, declaration).unwrap();
     for declaration in [
         "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: integer, nullable: false}\n",
         "table: app.t\ncolumns:\n  old: {type: varchar(50)}\n  other: {type: bigint, nullable: false}\n",
@@ -283,6 +348,66 @@ pub(super) fn live(server: &str, pg: bool) {
         ok(d.run(&["plan"]));
         d.commit();
         ok(d.run(&["plan", "--db", connection]));
+        let supplied = parent.replace(
+            "  old: {type: integer}\n",
+            "  old: {type: integer}\n  added: {type: integer, default: '0'}\n",
+        ).replace("  leaf: {from: [0], to: [10]}",
+            "  leaf:\n    from: [0]\n    to: [10]\n    columns:\n      added: {nullable: false, default: '1'}");
+        d.table(&supplied);
+        ok(d.run(&["plan", "--db", connection]));
+        d.table(
+            &supplied
+                .replace(", default: '0'", "")
+                .replace(", default: '1'", ""),
+        );
+        refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+        for attach in [false, true] {
+            let own = OwnDatabase::new(server, "consumer_transition2398");
+            let connection = own.connection();
+            on_server(connection, "CREATE SCHEMA app");
+            let d = Demo::new("consumer-attach-detach");
+            let plain = "table: app.t\ncolumns:\n  old: {type: integer}\npartition_by: [old]\npartitions: {}\n";
+            let leaf = d.dir.join("schema/leaf.yml");
+            let set = |attached: bool| {
+                d.table(if attached { parent } else { plain });
+                if attached {
+                    if leaf.exists() {
+                        std::fs::remove_file(&leaf).unwrap();
+                    }
+                } else {
+                    std::fs::write(&leaf, "table: app.leaf\ncolumns:\n  old: {type: integer}\n")
+                        .unwrap();
+                }
+            };
+            set(!attach);
+            ok(d.run(&["plan"]));
+            d.commit();
+            ok(d.run(&["bootstrap", "--db", connection]));
+            config(&d, "consumers:\n  reader: {uses: [app.leaf.old]}\n");
+            set(attach);
+            ok(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("transition.json");
+            let o = d.run(&[
+                "plan",
+                "--db",
+                connection,
+                "--format",
+                "json",
+                "--out",
+                plan.to_str().unwrap(),
+            ]);
+            ok(o);
+            assert!(std::fs::read_to_string(plan).unwrap().contains(if attach {
+                "attach_partition"
+            } else {
+                "detach_partition"
+            }));
+        }
+        let d = Demo::new("consumer-new-partition-writer");
+        d.table(parent);
+        config(&d, "consumers:\n  writer: {writes: [app.t]}\n");
+        ok(d.run(&["plan"]));
     }
     // A view-column removal and a routine-interface change are opaque, not safe.
     let d = Demo::new("consumer-modules");

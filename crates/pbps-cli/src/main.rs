@@ -2167,13 +2167,136 @@ pub fn attach_policy_findings<S: Clone>(
         };
     let mut findings = pbps_policy::plan(cs, &policies, &ctx);
     findings.extend(pbps_policy::consumers::plan(
-        cs, &bound, &sides, &policies, &ctx,
+        cs,
+        &bound,
+        &sides,
+        &policies,
+        &ctx,
+        &|before, after| {
+            pbps_diff::schema_diff::module_delta(before, after, dialect)
+                == pbps_diff::schema_diff::ModuleDelta::Unchanged
+        },
     ));
     for (_, finding) in &findings {
         out.push(policy_finding(finding));
     }
     pbps_diff::order::writebacks::findings(cs, &findings);
     out
+}
+
+#[cfg(test)]
+mod consumer_contract_tests {
+    use super::*;
+    use pbps_model::{
+        Change, ChangeSet, IdsFile, Module, ModuleKind, ModuleOptions, PlannedChange, Schema,
+    };
+    use pbps_policy::consumers::{Bindings, Consumer, Consumers, Side};
+
+    #[test]
+    fn restored_modules_use_the_differs_equivalence_for_each_dialect() {
+        let id: pbps_model::ModuleId = "app.restored".parse().unwrap();
+        let module = Module {
+            kind: ModuleKind::View,
+            definition: "SELECT old, other FROM app.t".into(),
+            description: None,
+            options: ModuleOptions::default(),
+        };
+        let before = Schema {
+            modules: [(id.clone(), module.clone())].into(),
+            ..Default::default()
+        };
+        let consumers: Consumers = [(
+            "report".into(),
+            Consumer {
+                uses: vec!["app.restored".into()],
+                ..Default::default()
+            },
+        )]
+        .into();
+        let ids = IdsFile::default();
+        let ctx = pbps_policy::Context {
+            now: 0,
+            max_rows: 1000,
+            connected: false,
+            only: None,
+            deprecated_types: &[],
+        };
+        for engine in [DialectName::Mssql, DialectName::Postgres] {
+            let dialect = dialect_for(engine);
+            for (case, restored, compatible) in [
+                (
+                    "description",
+                    Module {
+                        description: Some("report".into()),
+                        ..module.clone()
+                    },
+                    true,
+                ),
+                (
+                    "formatting",
+                    Module {
+                        definition: "SELECT old,\n    other\nFROM app.t".into(),
+                        ..module.clone()
+                    },
+                    true,
+                ),
+                (
+                    "body",
+                    Module {
+                        definition: "SELECT old FROM app.t".into(),
+                        ..module.clone()
+                    },
+                    false,
+                ),
+            ] {
+                let after = Schema {
+                    modules: [(id.clone(), restored.clone())].into(),
+                    ..Default::default()
+                };
+                let sides = [
+                    Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                ];
+                let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
+                let cs = ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(Change::DropModule {
+                            id: id.clone(),
+                            kind: module.kind,
+                        }),
+                        PlannedChange::new(Change::CreateModule {
+                            id: id.clone(),
+                            module: Box::new(restored),
+                        }),
+                    ],
+                };
+                let findings = pbps_policy::consumers::plan(
+                    &cs,
+                    &bound,
+                    &sides,
+                    &pbps_policy::Policies::default(),
+                    &ctx,
+                    &|before, after| {
+                        pbps_diff::schema_diff::module_delta(before, after, dialect.as_ref())
+                            == pbps_diff::schema_diff::ModuleDelta::Unchanged
+                    },
+                );
+                assert_eq!(
+                    findings.is_empty(),
+                    compatible,
+                    "{case} restoration: {engine:?} {findings:?}"
+                );
+                assert!(findings.iter().all(|(_, f)| f.id == "consumer.unproven"
+                    && f.severity == pbps_model::Severity::Error));
+            }
+        }
+    }
 }
 
 /// A rule's finding as the envelope carries it: the rule id is the finding id.

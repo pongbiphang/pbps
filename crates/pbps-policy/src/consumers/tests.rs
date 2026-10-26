@@ -47,6 +47,10 @@ fn context() -> Context {
         deprecated_types: &[],
     }
 }
+fn unchanged(before: &Module, after: &Module) -> bool {
+    (before.kind, &before.options, &before.definition)
+        == (after.kind, &after.options, &after.definition)
+}
 fn findings(
     before: &Schema,
     after: &Schema,
@@ -74,6 +78,7 @@ fn findings(
         &sides,
         &Policies::default(),
         &context(),
+        &unchanged,
     )
 }
 
@@ -271,14 +276,19 @@ fn suppressions_expire_at_the_configured_severity_and_never_hide_validation() {
         until: Some("2026-09-04".into()),
     });
     let mut ctx = context();
-    assert!(plan(&cs, &bound, &sides, &policies, &ctx).is_empty());
+    assert!(plan(&cs, &bound, &sides, &policies, &ctx, &unchanged).is_empty());
     ctx.now += 86400;
     assert_eq!(
-        plan(&cs, &bound, &sides, &policies, &ctx)[0].1.severity,
+        plan(&cs, &bound, &sides, &policies, &ctx, &unchanged)[0]
+            .1
+            .severity,
         Severity::Warning
     );
     policies.suppress[0].on = Some("app.other".into());
-    assert_eq!(plan(&cs, &bound, &sides, &policies, &context()).len(), 1);
+    assert_eq!(
+        plan(&cs, &bound, &sides, &policies, &context(), &unchanged).len(),
+        1
+    );
     assert!(!validate(&consumers("app.missing", false), &s, &Clone::clone).is_empty());
 }
 
@@ -814,7 +824,7 @@ fn unrelated_write_entries_keep_their_own_findings_and_suppressions() {
         })],
     };
     let mut policies = Policies::default();
-    let f = plan(&cs, &bound, &sides, &policies, &context());
+    let f = plan(&cs, &bound, &sides, &policies, &context(), &unchanged);
     assert_eq!(f.len(), 1, "only the second entry is affected: {f:?}");
     assert!(
         f[0].1
@@ -827,5 +837,262 @@ fn unrelated_write_entries_keep_their_own_findings_and_suppressions() {
         reason: "reviewed compatibility exception".into(),
         until: Some("2099-01-01".into()),
     });
-    assert!(plan(&cs, &bound, &sides, &policies, &context()).is_empty());
+    assert!(plan(&cs, &bound, &sides, &policies, &context(), &unchanged).is_empty());
+}
+
+fn partitioned() -> (Schema, IdsFile, TableName) {
+    let mut s = schema();
+    let mut i = ids();
+    let leaf: TableName = "app.leaf".parse().unwrap();
+    s.tables.get_mut(&name()).unwrap().partition_by = Some(pbps_model::PartitionBy {
+        strategy: Default::default(),
+        columns: vec!["old".into()],
+        external: false,
+    });
+    s.tables.insert(
+        leaf.clone(),
+        Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: name(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        },
+    );
+    i.tables.insert(uid("t_bbbbbb"), leaf.clone());
+    (s, i, leaf)
+}
+
+#[test]
+fn partition_column_bindings_survive_attachment_and_detachment() {
+    let (attached, inherited, leaf) = partitioned();
+    let mut detached = attached.clone();
+    let shape = schema().tables[&name()].clone();
+    detached.tables.insert(leaf.clone(), shape.clone());
+    let mut owned = inherited.clone();
+    owned.columns.insert(uid("c_bbbbbb"), leaf.column("old"));
+    for attach in [false, true] {
+        let (before, after, old, new) = if attach {
+            (&detached, &attached, &owned, &inherited)
+        } else {
+            (&attached, &detached, &inherited, &owned)
+        };
+        let change = if attach {
+            Change::AttachPartition {
+                uid: uid("t_bbbbbb"),
+                table: leaf.clone(),
+                parent: name(),
+                bound: pbps_model::PartitionBound::Default,
+                key: vec![],
+                shape: Box::new(attached.tables[&leaf].clone()),
+            }
+        } else {
+            Change::DetachPartition {
+                uid: uid("t_bbbbbb"),
+                table: leaf.clone(),
+                parent: name(),
+                names: vec![],
+                shape: Box::new(shape.clone()),
+            }
+        };
+        let cs = consumers("app.leaf.old", false);
+        assert!(findings(before, after, old, new, &cs, vec![change]).is_empty());
+        // Joining identities must not stop a parent-column break reaching the leaf.
+        let f = findings(
+            before,
+            after,
+            old,
+            new,
+            &cs,
+            vec![Change::DropColumn {
+                uid: uid("c_aaaaaa"),
+                column: name().column("old"),
+            }],
+        );
+        assert_eq!(f[0].1.id, "consumer.breaking");
+    }
+}
+
+#[test]
+fn partition_overrides_share_the_supplied_new_column_exception() {
+    let (before, old, leaf) = partitioned();
+    for parent_default in [false, true] {
+        for local_default in [false, true] {
+            let mut after = before.clone();
+            let mut new = old.clone();
+            let mut column = Column::new(ColumnType::simple("integer"));
+            if parent_default {
+                column.value_source = ValueSource::Default("0".into());
+            }
+            after
+                .tables
+                .get_mut(&name())
+                .unwrap()
+                .columns
+                .insert("added".into(), column.clone());
+            new.columns.insert(uid("c_bbbbbb"), name().column("added"));
+            after
+                .tables
+                .get_mut(&leaf)
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .insert(
+                    "added".into(),
+                    pbps_model::PartitionColumn {
+                        default: local_default.then(|| "1".into()),
+                        not_null: true,
+                    },
+                );
+            let changes = vec![
+                Change::AddColumn {
+                    uid: uid("c_bbbbbb"),
+                    table: name(),
+                    name: "added".into(),
+                    column: Box::new(column),
+                },
+                Change::SetPartitionDefault {
+                    uid: uid("t_bbbbbb"),
+                    table: leaf.clone(),
+                    parent: name(),
+                    column: "added".into(),
+                    from: None,
+                    to: local_default.then(|| "1".into()),
+                    fallback: parent_default.then(|| "0".into()),
+                },
+                Change::SetPartitionNotNull {
+                    uid: uid("t_bbbbbb"),
+                    table: leaf.clone(),
+                    column: "added".into(),
+                    not_null: true,
+                },
+            ];
+            let f = findings(
+                &before,
+                &after,
+                &old,
+                &new,
+                &consumers("app.leaf.old", true),
+                changes,
+            );
+            assert_eq!(
+                f.is_empty(),
+                parent_default || local_default,
+                "{parent_default}/{local_default}: {f:?}"
+            );
+            // A default on an existing column still changes the writer interface.
+            let f = findings(
+                &before,
+                &after,
+                &old,
+                &new,
+                &consumers("app.leaf.old", true),
+                vec![Change::SetPartitionDefault {
+                    uid: uid("t_bbbbbb"),
+                    table: leaf.clone(),
+                    parent: name(),
+                    column: "old".into(),
+                    from: None,
+                    to: Some("1".into()),
+                    fallback: None,
+                }],
+            );
+            assert_eq!(f[0].1.id, "consumer.unproven");
+        }
+    }
+}
+
+#[test]
+fn new_written_tables_have_no_old_writers_but_existing_referenced_tables_do() {
+    let (mut after, new, leaf) = partitioned();
+    let constraint = pbps_model::ForeignKey {
+        columns: vec!["old".into()],
+        references_table: name(),
+        references_columns: vec!["old".into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    };
+    after
+        .tables
+        .get_mut(&leaf)
+        .unwrap()
+        .foreign_keys
+        .insert("fk".into(), constraint.clone());
+    let create = |t: &TableName, id: &str| Change::CreateTable {
+        uid: uid(id),
+        name: t.clone(),
+        table: Box::new(after.tables[t].clone()),
+        beside_default: None,
+        moves_at_most: None,
+    };
+    for entry in ["app.t", "app.t.old", "app.leaf", "app.leaf.old"] {
+        assert!(
+            findings(
+                &Schema::default(),
+                &after,
+                &IdsFile::default(),
+                &new,
+                &consumers(entry, true),
+                vec![create(&name(), "t_aaaaaa"), create(&leaf, "t_bbbbbb")]
+            )
+            .is_empty()
+        );
+    }
+    let fk = Change::AddForeignKey {
+        table: leaf.clone(),
+        name: "fk".into(),
+        constraint: Box::new(constraint),
+    };
+    assert!(
+        findings(
+            &schema(),
+            &after,
+            &ids(),
+            &new,
+            &consumers("app.leaf", true),
+            vec![create(&leaf, "t_bbbbbb"), fk.clone()]
+        )
+        .is_empty()
+    );
+    let f = findings(
+        &schema(),
+        &after,
+        &ids(),
+        &new,
+        &consumers("app.t", true),
+        vec![create(&leaf, "t_bbbbbb"), fk],
+    );
+    assert!(
+        f.iter()
+            .any(|(at, f)| *at == 1 && f.id == "consumer.unproven")
+    );
+    // Missing baseline identity alone is no exemption: creation must be in this plan.
+    assert!(
+        !findings(
+            &Schema::default(),
+            &after,
+            &IdsFile::default(),
+            &new,
+            &consumers("app.t", true),
+            vec![create(&leaf, "t_bbbbbb")]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn ordinary_columns_require_uids_even_when_partitions_can_inherit_them() {
+    let s = schema();
+    let mut i = ids();
+    i.columns.clear();
+    let sides = [Side {
+        schema: &s,
+        ids: &i,
+    }; 2];
+    let errors =
+        Bindings::resolve(&consumers("app.t.old", false), &sides, &Clone::clone).unwrap_err();
+    assert!(errors[0].contains("has no resolved identity"), "{errors:?}");
 }

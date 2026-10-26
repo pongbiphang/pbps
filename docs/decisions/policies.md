@@ -265,7 +265,7 @@ also admits baseline objects so a removed declaration produces its consumer
 finding. Certain name losses use `consumer.breaking`; conservative uncertainty
 uses `consumer.unproven`, both default error with ordinary suppressions. A new
 NOT NULL column supplied by a DEFAULT produces neither. Module definitions
-stay opaque, so a changed view/routine interface is unproven; identical
-restoration is compatible. Contracts add no apply gate or execution language.
+stay opaque, so a changed view/routine interface is unproven; unchanged
+restoration uses the differ's `module_delta` comparison through a CLI callback. Contracts add no apply gate or execution language.
 Schema set 65 publishes the configuration and rule catalogue; other formats
 stay unchanged. Retirement explanations follow in PR 2.

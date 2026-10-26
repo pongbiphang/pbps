@@ -5,7 +5,7 @@ mod changes;
 
 use crate::{Context, Policies, evaluate::Live};
 pub use binding::Bindings;
-use pbps_model::{ChangeSet, Finding, IdsFile, ModuleId, Schema, Uid};
+use pbps_model::{ChangeSet, Finding, IdsFile, Module, ModuleId, Schema, Uid};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub type Consumers = BTreeMap<String, Consumer>;
@@ -33,6 +33,35 @@ pub struct Side<'a> {
 }
 
 impl Side<'_> {
+    // One effective definition for binding and the supplied-new-column rule.
+    // Partition-local defaults and NOT NULL refine the parent's column.
+    pub(super) fn column(
+        &self,
+        at: &pbps_model::ColumnRef,
+    ) -> Option<(pbps_model::ColumnRef, pbps_model::Column)> {
+        let source = pbps_model::Partitions::of(self.schema).column(at);
+        let mut column = self
+            .schema
+            .tables
+            .get(&source.table)?
+            .columns
+            .get(&source.name)?
+            .clone();
+        if let Some(own) = self
+            .schema
+            .tables
+            .get(&at.table)?
+            .partition_of
+            .as_ref()
+            .and_then(|of| of.columns.get(&at.name))
+        {
+            if let Some(default) = &own.default {
+                column.value_source = pbps_model::ValueSource::Default(default.clone());
+            }
+            column.nullable &= !own.not_null;
+        }
+        Some((source, column))
+    }
     pub(super) fn table(&self, uid: Option<&pbps_model::Uid>) -> Option<&pbps_model::Table> {
         self.schema.tables.get(self.ids.tables.get(uid?)?)
     }
@@ -123,6 +152,7 @@ pub fn plan(
     sides: &[Side<'_>; 2],
     policies: &Policies,
     ctx: &Context,
+    unchanged: &dyn Fn(&Module, &Module) -> bool,
 ) -> Vec<(usize, Finding)> {
     let mut out = Vec::new();
     let written = written_tables(bound, sides);
@@ -150,6 +180,13 @@ pub fn plan(
             })
         };
         for entry in &bound.0 {
+            // A table created by this plan has no pre-existing writer contract.
+            if entry.writes && entry.table().is_some_and(|uid| {
+                sides[0].table(Some(uid)).is_none() && cs.changes.iter().any(|p|
+                    matches!(&p.change, pbps_model::Change::CreateTable { uid: created, .. } if created == uid))
+            }) {
+                continue;
+            }
             let Some(class) = changes::classify(
                 p,
                 entry,
@@ -157,6 +194,7 @@ pub fn plan(
                 entry.table().and_then(|uid| written.get(uid)),
                 cs,
                 sides,
+                unchanged,
             ) else {
                 continue;
             };

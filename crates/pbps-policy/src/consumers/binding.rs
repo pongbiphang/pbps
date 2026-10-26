@@ -47,11 +47,14 @@ impl Entry {
             Target::NamedColumn { .. } | Target::Module(_) => false,
         }
     }
-    pub fn named_column(&self, name: &pbps_model::ColumnName) -> bool {
+    pub fn named_column(&self, name: &pbps_model::ColumnName, sides: &[Side<'_>]) -> bool {
         match &self.target {
             Target::Table(_) => true,
             Target::NamedColumn { name: own, .. } => own == name,
-            Target::Column { .. } | Target::Module(_) => false,
+            Target::Column { uid, .. } => sides
+                .iter()
+                .any(|s| s.ids.columns.get(uid).is_some_and(|c| &c.name == name)),
+            Target::Module(_) => false,
         }
     }
     pub fn change_text(&self, change: &Change) -> String {
@@ -111,18 +114,28 @@ impl Object {
             Self::Module(m) => format!("module {}", m.shown()),
         }
     }
-    fn key(&self, side: Side<'_>) -> Option<Target> {
+    fn key(&self, side: Side<'_>, sides: &[Side<'_>]) -> Option<Target> {
         match self {
             Self::Table(t) => side.ids.table_uid(t).cloned().map(Target::Table),
             Self::Column(c) => {
                 let table = side.ids.table_uid(&c.table)?.clone();
-                Some(match side.ids.column_uid(c) {
+                let uid = side.ids.column_uid(c).or_else(|| {
+                    // Attaching retires the leaf's column UID; detaching assigns
+                    // one. Its table UID and effective column join the two sides.
+                    side.schema.tables[&c.table].partition_of.as_ref()?;
+                    side.column(c)?;
+                    sides.iter().find_map(|s| {
+                        s.ids
+                            .column_uid(&s.ids.tables.get(&table)?.column(c.name.clone()))
+                    })
+                });
+                Some(match uid {
                     Some(uid) => Target::Column {
                         table,
                         uid: uid.clone(),
                     },
-                    None if side.schema.tables[&c.table].computed.contains_key(&c.name)
-                        || side.schema.tables[&c.table].partition_of.is_some() =>
+                    None if side.column(c).is_some_and(|(source, _)| source != *c)
+                        || side.schema.tables[&c.table].computed.contains_key(&c.name) =>
                     {
                         Target::NamedColumn {
                             table,
@@ -173,17 +186,9 @@ fn candidates(
         }
         if let Some(c) = &column
             && let Some(t) = side.schema.tables.get(&c.table)
+            && (side.column(c).is_some() || t.computed.contains_key(&c.name))
         {
-            let inherited = t
-                .partition_of
-                .as_ref()
-                .and_then(|of| side.schema.tables.get(&of.parent));
-            if t.columns.contains_key(&c.name)
-                || t.computed.contains_key(&c.name)
-                || inherited.is_some_and(|p| p.columns.contains_key(&c.name))
-            {
-                out.push((Object::Column(c.clone()), i));
-            }
+            out.push((Object::Column(c.clone()), i));
         }
         if let Some(t) = &relation {
             if side.schema.tables.contains_key(t) {
@@ -221,7 +226,7 @@ pub(super) fn entries(
                         .iter()
                         .map(|(o, i)| {
                             if bind {
-                                o.key(sides[*i]).map(Key::Bound).ok_or_else(|| {
+                                o.key(sides[*i], sides).map(Key::Bound).ok_or_else(|| {
                                     format!("{} has no resolved identity", o.label())
                                 })
                             } else {
@@ -247,15 +252,9 @@ pub(super) fn entries(
                             Object::Column(c) => {
                                 let schema = sides[*i].schema;
                                 let t = &schema.tables[&c.table];
-                                let column = t.columns.get(&c.name).or_else(|| {
-                                    t.partition_of
-                                        .as_ref()
-                                        .and_then(|of| schema.tables.get(&of.parent))?
-                                        .columns
-                                        .get(&c.name)
-                                });
+                                let column = sides[*i].column(c);
                                 t.computed.contains_key(&c.name)
-                                    || column.is_some_and(|c| {
+                                    || column.is_some_and(|(_, c)| {
                                         matches!(
                                             c.value_source,
                                             pbps_model::ValueSource::Generated(_)

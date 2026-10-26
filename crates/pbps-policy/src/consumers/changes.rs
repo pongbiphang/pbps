@@ -3,7 +3,9 @@ use super::{
     Side,
     binding::{Entry, Target},
 };
-use pbps_model::{Change, ChangeSet, PlannedChange, RiskClass, Uid, ValueSource};
+use pbps_model::{
+    Change, ChangeSet, ColumnRef, Module, PlannedChange, RiskClass, Uid, ValueSource,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
@@ -20,21 +22,24 @@ impl Class {
     }
 }
 
-fn supplied_new(uid: &Uid, cs: &ChangeSet, sides: &[Side<'_>]) -> bool {
+fn supplied_new(at: &ColumnRef, cs: &ChangeSet, sides: &[Side<'_>]) -> bool {
+    let Some(side) = sides.last() else {
+        return false;
+    };
+    let Some((source, column)) = side.column(at) else {
+        return false;
+    };
+    let Some(uid) = side.ids.column_uid(&source) else {
+        return false;
+    };
     !sides
         .first()
-        .is_some_and(|side| side.ids.columns.contains_key(uid))
+        .is_some_and(|s| s.ids.columns.contains_key(uid))
         && cs
             .changes
             .iter()
             .any(|p| matches!(&p.change, Change::AddColumn { uid: added, .. } if added == uid))
-        && sides.last().is_some_and(|side| {
-            side.ids
-                .columns
-                .get(uid)
-                .and_then(|c| side.schema.tables.get(&c.table)?.columns.get(&c.name))
-                .is_some_and(|c| !matches!(c.value_source, ValueSource::None))
-        })
+        && !matches!(column.value_source, ValueSource::None)
 }
 
 fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> bool {
@@ -58,7 +63,7 @@ fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> b
                     .any(|(c, spec)| {
                         spec.ty.type_ref() == Some(name)
                             && (matches!(entry.target, Target::Table(_))
-                                || entry.named_column(c)
+                                || entry.named_column(c, sides)
                                 || side
                                     .ids
                                     .column_uid(&t.column(c.clone()))
@@ -75,6 +80,7 @@ pub(super) fn classify(
     written: Option<&BTreeSet<Uid>>,
     cs: &ChangeSet,
     sides: &[Side<'_>],
+    unchanged: &dyn Fn(&Module, &Module) -> bool,
 ) -> Option<Class> {
     use Class::{Breaking as B, Unproven as U};
     let hit = table.is_some() && table == entry.table();
@@ -88,17 +94,23 @@ pub(super) fn classify(
                 if side.ids.table_uid(&c.table) == entry.table() {
                     return entry.column(uid);
                 }
-                // Inherited columns have their parent's column identity and their
-                // leaf's table identity; parent alterations reach them too.
                 entry
                     .table()
                     .and_then(|t| side.ids.tables.get(t))
-                    .and_then(|t| side.schema.tables.get(t))
-                    .and_then(|t| t.partition_of.as_ref())
-                    .is_some_and(|of| of.parent == c.table && entry.named_column(&c.name))
+                    .and_then(|t| side.column(&t.column(c.name.clone())))
+                    .is_some_and(|(source, _)| {
+                        side.ids.column_uid(&source) == Some(uid)
+                            && entry.named_column(&c.name, sides)
+                    })
             })
     };
-    let named = |name: &pbps_model::ColumnName| hit && entry.named_column(name);
+    let supplied = |uid: &Uid| {
+        sides
+            .last()
+            .and_then(|s| s.ids.columns.get(uid))
+            .is_some_and(|c| supplied_new(c, cs, sides))
+    };
+    let named = |name: &pbps_model::ColumnName| hit && entry.named_column(name, sides);
     let nullability = |column_hit: bool, nullable: bool| {
         if entry.writes {
             write_hit && !nullable
@@ -108,15 +120,11 @@ pub(super) fn classify(
     };
     let write = |yes| (entry.writes && yes).then_some(U);
     let unchanged_module = |id| {
-        // Descriptions are declaration metadata, absent from introspection.
         sides
             .first()
             .and_then(|s| s.schema.modules.get(id))
-            .map(|m| (m.kind, &m.options, &m.definition))
-            == sides
-                .last()
-                .and_then(|s| s.schema.modules.get(id))
-                .map(|m| (m.kind, &m.options, &m.definition))
+            .zip(sides.last().and_then(|s| s.schema.modules.get(id)))
+            .is_some_and(|(before, after)| unchanged(before, after))
     };
     let before = sides.first().and_then(|s| s.table(table));
     let after = sides.last().and_then(|s| s.table(table));
@@ -163,7 +171,7 @@ pub(super) fn classify(
         }
         Change::AddColumn {
             uid, column: spec, ..
-        } => write(write_hit && !spec.nullable && !supplied_new(uid, cs, sides)),
+        } => write(write_hit && !spec.nullable && !supplied(uid)),
         Change::AlterColumnType {
             uid,
             from_nullable,
@@ -174,14 +182,12 @@ pub(super) fn classify(
         } => (((column(uid)
             && (p.risks.contains(&RiskClass::Narrowing) || from_collation != to_collation))
             || (from_nullable != to_nullable && nullability(column(uid), *to_nullable)))
-            && !supplied_new(uid, cs, sides))
+            && !supplied(uid))
         .then_some(U),
         Change::AlterColumnNullability {
             uid, to_nullable, ..
-        } => (nullability(column(uid), *to_nullable) && !supplied_new(uid, cs, sides)).then_some(U),
-        Change::AlterColumnDefault { uid, .. } => {
-            write(column(uid) && !supplied_new(uid, cs, sides))
-        }
+        } => (nullability(column(uid), *to_nullable) && !supplied(uid)).then_some(U),
+        Change::AlterColumnDefault { uid, .. } => write(column(uid) && !supplied(uid)),
         Change::AlterColumnExpression { uid, .. } => {
             (column(uid) || (entry.writes && hit)).then_some(U)
         }
@@ -212,10 +218,17 @@ pub(super) fn classify(
                 }
             }
         }
-        Change::SetPartitionDefault { .. } => write(hit),
+        Change::SetPartitionDefault { table, column, .. } => {
+            write(hit && !supplied_new(&table.column(column.clone()), cs, sides))
+        }
         Change::SetPartitionNotNull {
-            column, not_null, ..
-        } => nullability(named(column), !not_null).then_some(U),
+            table,
+            column,
+            not_null,
+            ..
+        } => (nullability(named(column), !not_null)
+            && !supplied_new(&table.column(column.clone()), cs, sides))
+        .then_some(U),
         // A dependent restoration can carry the engine's spelling. Compare
         // the logical before/after declarations, never that physical payload.
         Change::SetPrimaryKey { to, .. } => write(
