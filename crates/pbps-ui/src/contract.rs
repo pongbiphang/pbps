@@ -146,6 +146,12 @@ pub struct Rehearsal {
     pub layout: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spelling: Vec<String>,
+    /// `rehearsed`, or `not-rehearsed` where the plan's role, grant and
+    /// row-security policy changes did not run, with the reason beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
