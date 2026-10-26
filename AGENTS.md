@@ -51,6 +51,10 @@ Read before changing things:
 - Treat the issue as the specification. Fix what it says, at the size it says.
 - Work in a git worktree, never in the main checkout. Remove the worktree after
   merge.
+- Record the issue and the hot files it will change (format versions,
+  `schema_diff.rs`, `plan.rs`, decision topic files) on the coordination board
+  (`~/pbps-workers/board.md`) before starting. Do not start an issue whose hot
+  files overlap one in progress; ask the coordinating session (DEC-2415.1).
 - Use one branch per issue, cut from `origin/master`, named
   `fix/issue-<n>-<slug>`.
 - Push the issue branch without asking. Never push to `master` or to another
@@ -89,20 +93,22 @@ Read before changing things:
     `cargo test --workspace --all-targets --no-fail-fast`;
   - then `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`, run directly
     or through the sharded driver (DEC-2357.1).
-- Run the full gate on every head that can be queued (DEC-1838.1). All green,
-  then push:
-  - before the first push of the branch;
+- Run the full gate on every head that can be queued (DEC-1838.1,
+  DEC-2415.1). All green, then push:
   - before marking the PR ready;
   - before every push in the ready phase;
   - before pushing a rebase, except a docs-only rebase (DEC-2000.1).
-- Every other push (draft-round fixes) runs the **round gate**:
+- Every other push (the first push and draft-round fixes) runs the
+  **round gate**:
   - the two decision checks and the two raw-in-messages checks;
   - `fmt` and warning-free `clippy`;
-  - the tests that pin the round's fixes, live ones included when a fix is
-    engine-facing.
+  - the tests that pin the change or the round's fixes, live ones included
+    when it is engine-facing.
   - A round fix that breaks something it did not touch is found by the full
     gate before ready.
 - A docs-only push runs only the two decision checks.
+- Before queueing a full gate, confirm the head merges cleanly with
+  `origin/master`. Rebase a conflicting head first.
 - Use the Python version CI pins.
 - Register every new `#[ignore]` test in `scripts/ignored-test-owners.json`.
 - Never run two live suites against the same containers at once. Each makes
@@ -286,7 +292,10 @@ Follow DEC-1473.1 and DEC-1475.1; they define the evidence below.
 
 ## The issue loop
 
-- Take one issue at a time. Claim the next only after the current PR merges.
+- Hold at most two issues per agent: one waiting on a gate, a review or the
+  queue, and one in progress (DEC-2415.1).
+- Start the second only when it is independent of the first. Never build on
+  a head that has not passed its gate.
 - Take a next issue only when the user asked for a continuous or multi-wave
   loop.
 - The nightly `master` run is not a gate. Read a red one before calling it a
