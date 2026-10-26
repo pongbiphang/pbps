@@ -1087,6 +1087,7 @@ mod tests {
             pbps_model::Module {
                 kind: pbps_model::ModuleKind::View,
                 description: None,
+                options: Default::default(),
                 definition: String::new(),
             },
         );
