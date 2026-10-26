@@ -6721,10 +6721,15 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
 
     // The partitioned table cannot be adopted; its declaration goes. The
     // readable ones are adopted as they stand, and the refusal is gone.
-    // Its uid was only ever minted locally, never recorded, so the identity
-    // file is minted again rather than asked to drop a table no ledger has.
+    // Although never deployed, its UID is in the committed Git baseline.
+    // Record its retirement rather than reminting every tracked identity.
     std::fs::remove_file(d.dir.join("schema/app.p.yml")).unwrap();
-    std::fs::remove_file(d.dir.join("schema.ids.json")).unwrap();
+    succeeds(d.run(&[
+        "drop-table",
+        "app.p",
+        "--reason",
+        "do not adopt the partitioned table",
+    ]));
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt-existing"]));
