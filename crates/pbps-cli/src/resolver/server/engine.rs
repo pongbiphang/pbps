@@ -691,7 +691,7 @@ pub(super) use postgres::{generation_version, reconstruction, release_supplied};
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.
 pub(super) struct Docker {
-    driver: Driver,
+    pub driver: Driver,
     pub environment: Vec<String>,
     pub port: u16,
     pub readiness_query: &'static str,
