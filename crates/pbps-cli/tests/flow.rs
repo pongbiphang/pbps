@@ -34,40 +34,49 @@ mod dev587;
 #[path = "support/recovery2410_mssql.rs"]
 mod recovery2410_mssql;
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_run_owned_sql_server_run_killed_after_creating_its_database_is_recovered_by_the_next_run() {
-    recovery2410_mssql::run_owned_after_creation();
-}
+/// These kill a real `pbps plan` against the resolver's second SQL Server
+/// (`PBPS_TEST_MSSQL_SCRATCH_DB`), which only the `resolver-mssql` job
+/// starts. The module path is how that job selects them and how the `live`
+/// job, which has no second instance, skips them.
+mod recovery2410 {
+    use super::recovery2410_mssql;
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_run_owned_sql_server_run_killed_in_the_reference_window_is_recovered_by_the_next_run() {
-    recovery2410_mssql::run_owned_in_the_reference_window();
-}
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_run_owned_sql_server_run_killed_after_creating_its_database_is_recovered_by_the_next_run()
+    {
+        recovery2410_mssql::run_owned_after_creation();
+    }
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_run_owned_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
-    recovery2410_mssql::run_owned_during_use();
-}
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_run_owned_sql_server_run_killed_in_the_reference_window_is_recovered_by_the_next_run() {
+        recovery2410_mssql::run_owned_in_the_reference_window();
+    }
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_supplied_sql_server_run_killed_after_its_sandbox_is_recovered_by_the_next_run() {
-    recovery2410_mssql::supplied_after_the_sandbox();
-}
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_run_owned_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
+        recovery2410_mssql::run_owned_during_use();
+    }
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_supplied_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
-    recovery2410_mssql::supplied_during_use();
-}
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_supplied_sql_server_run_killed_after_its_sandbox_is_recovered_by_the_next_run() {
+        recovery2410_mssql::supplied_after_the_sandbox();
+    }
 
-#[test]
-#[ignore = "needs live mssql"]
-fn a_supplied_sql_server_database_a_live_run_holds_is_refused_and_left_alone() {
-    recovery2410_mssql::supplied_held_by_a_live_run();
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_supplied_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run() {
+        recovery2410_mssql::supplied_during_use();
+    }
+
+    #[test]
+    #[ignore = "needs live mssql"]
+    fn a_supplied_sql_server_database_a_live_run_holds_is_refused_and_left_alone() {
+        recovery2410_mssql::supplied_held_by_a_live_run();
+    }
 }
 #[path = "support/refusal_next_steps.rs"]
 mod refusal_next_steps;

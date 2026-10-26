@@ -320,6 +320,28 @@
         "test",
         "flow"
       ],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "recovery2410::a_run_owned_sql_server_run_killed_after_creating_its_database_is_recovered_by_the_next_run",
+        "recovery2410::a_run_owned_sql_server_run_killed_in_the_reference_window_is_recovered_by_the_next_run",
+        "recovery2410::a_run_owned_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_run_killed_after_its_sandbox_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
+        "recovery2410::a_supplied_sql_server_database_a_live_run_holds_is_refused_and_left_alone"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow"
+      ],
       "owner": "mssql",
       "validate_on": "linux",
       "ignored_on": [
@@ -328,12 +350,6 @@
         "darwin"
       ],
       "cases": [
-        "a_run_owned_sql_server_run_killed_after_creating_its_database_is_recovered_by_the_next_run",
-        "a_run_owned_sql_server_run_killed_in_the_reference_window_is_recovered_by_the_next_run",
-        "a_run_owned_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
-        "a_supplied_sql_server_run_killed_after_its_sandbox_is_recovered_by_the_next_run",
-        "a_supplied_sql_server_run_killed_inside_its_externals_file_is_recovered_by_the_next_run",
-        "a_supplied_sql_server_database_a_live_run_holds_is_refused_and_left_alone",
         "dependencies2322::readable_dependencies_compare_exact_shapes_and_name_each_refusal",
         "dependencies2322::unreadable_dependencies_are_reported_without_claiming_comparison",
         "dependencies2322::apply_binds_dependencies_transactionally_without_repeating_the_comparison",
