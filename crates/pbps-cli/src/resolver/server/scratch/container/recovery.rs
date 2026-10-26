@@ -316,7 +316,7 @@ impl Adapter for Containers<'_> {
         Ok(lives)
     }
 
-    async fn remove(&mut self, resource: &Resource) -> Result<(), Failed> {
+    async fn remove(&mut self, _: &str, resource: &Resource) -> Result<(), Failed> {
         remove_named(&resource.names[0])
             .await
             .map_err(|left| left.join("; ").into())
