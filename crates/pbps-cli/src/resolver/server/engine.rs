@@ -20,7 +20,8 @@ pub(super) mod mssql;
 mod postgres;
 #[cfg(test)]
 pub(super) use postgres::{
-    externals_for_test, release_run_owned, reset_for_test, sweep_cluster_on,
+    for_tests::{externals_for_test, reset_for_test, stop_after_cleanup, sweep_cluster_on},
+    release_run_owned,
 };
 
 // These are logical planning records, not a raw engine capture or a verifier.
@@ -650,9 +651,7 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
 use postgres::compile_failed;
 
 #[cfg(test)]
-pub(super) use postgres::{
-    generation_version, reconstruction, release_supplied, stop_after_cleanup,
-};
+pub(super) use postgres::{generation_version, reconstruction, release_supplied};
 
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.

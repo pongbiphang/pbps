@@ -3210,9 +3210,8 @@ pub(crate) fn catalogued_as(
 
 /// Prints what [`refuse_misspelt`] could not ask, for a command whose
 /// warnings go to stderr.
-/// The sweeps this command made for scratch that killed runs left (#2410),
-/// as the findings the JSON envelope carries: a note for what was removed, a
-/// warning with the removing statement for what was not.
+/// What this command's sweeps found (#2410), as findings: a note for what was
+/// removed, a warning with the removing statement for what was not.
 fn recovery_findings() -> Vec<crate::output::Finding> {
     let collected = pbps_cli::resolver::server::scratch::recovery::take();
     let mut findings = Vec::new();

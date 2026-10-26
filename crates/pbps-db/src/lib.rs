@@ -670,9 +670,8 @@ impl Conn {
         }
     }
 
-    /// [`Conn::connect`] naming the session `application_name` from its
-    /// first packet. PostgreSQL only; SQL Server marks its sessions with a
-    /// temporary table instead and connects as [`Conn::connect`] does.
+    /// [`Conn::connect`] naming the session `application_name` from its first
+    /// packet. SQL Server marks its sessions with a temporary table instead.
     pub async fn connect_named(
         driver: Driver,
         connection_string: &str,

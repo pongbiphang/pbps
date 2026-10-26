@@ -129,9 +129,8 @@ pub async fn produce_unsealed(
     let mut target = Conn::connect(driver, target_connection)
         .await
         .map_err(|error| unusable(format!("the target could not be connected: {error}")))?;
-    // Generated before the scratch session connects: the session is named by
-    // the token from its first packet, and the token is in the name of every
-    // resource the run creates (#2410).
+    // Before the scratch session connects, which carries it from its first
+    // packet (#2410).
     let tokens = Tokens::generate();
     let mut admin = engine::connect_scratch(driver, scratch, &tokens).await?;
     let (provisioning, state) = engine::scratch(
@@ -212,10 +211,8 @@ fn unusable(reason: impl Into<String>) -> ProduceError {
 /// The run's two session tokens: run-generated, so a token found in
 /// `pg_stat_activity` is this run's session and no other.
 ///
-/// `scratch` is also the run's token (#2410): the scratch session that stays
-/// open for the whole run carries it, and every resource the run creates is
-/// named with it, so a later run can tell from the live sessions whether the
-/// owner of a leftover is gone.
+/// `scratch` is also the run's token (#2410): its keeper session and every
+/// resource it creates carry it.
 pub(super) struct Tokens {
     pub(super) target: String,
     pub(super) scratch: String,

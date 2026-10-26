@@ -20,42 +20,41 @@ use pbps_pg::resolver::{draft, externals};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod recovery;
-#[cfg(test)]
-pub(in crate::resolver::server) use recovery::sweep_cluster_on;
 
-/// Databases whose supplied release stops after the cleanup commit and before
-/// the privileges are put back, as a kill between the two would.
+/// Entry points and stop points for the tests that drive a release or a
+/// sweep without a run around it.
 #[cfg(test)]
-static STOPPED_AFTER_CLEANUP: std::sync::Mutex<BTreeSet<String>> =
-    std::sync::Mutex::new(BTreeSet::new());
+pub(super) mod for_tests {
+    pub(in crate::resolver::server) use super::recovery::for_tests::sweep_cluster_on;
+    use super::*;
 
-#[cfg(test)]
-pub(in crate::resolver::server) fn stop_after_cleanup(database: &str, stop: bool) {
-    let mut stopped = STOPPED_AFTER_CLEANUP.lock().unwrap();
-    if stop {
-        stopped.insert(database.to_owned());
-    } else {
-        stopped.remove(database);
+    /// Databases whose supplied release stops after the cleanup commit and
+    /// before the privileges are put back, as a kill between the two would.
+    static STOPPED_AFTER_CLEANUP: std::sync::Mutex<BTreeSet<String>> =
+        std::sync::Mutex::new(BTreeSet::new());
+
+    pub(in crate::resolver::server) fn stop_after_cleanup(database: &str, stop: bool) {
+        let mut stopped = STOPPED_AFTER_CLEANUP.lock().unwrap();
+        if stop {
+            stopped.insert(database.to_owned());
+        } else {
+            stopped.remove(database);
+        }
     }
-}
 
-#[cfg(test)]
-fn stopped_after_cleanup(database: &str) -> bool {
-    STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
-}
+    pub(super) fn stopped_after_cleanup(database: &str) -> bool {
+        STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
+    }
 
-/// The two places a session's settings are reset, for the test that the
-/// keeper's survive them.
-#[cfg(test)]
-pub(in crate::resolver::server) async fn reset_for_test(session: &mut Conn) {
-    reset_settings(session, "the test").await.unwrap();
-}
+    pub(in crate::resolver::server) async fn reset_for_test(session: &mut Conn) {
+        reset_settings(session, "the test").await.unwrap();
+    }
 
-#[cfg(test)]
-pub(in crate::resolver::server) async fn externals_for_test(session: &mut Conn) {
-    run_externals(session, "SELECT 1", OutsideWrites::Refused)
-        .await
-        .unwrap();
+    pub(in crate::resolver::server) async fn externals_for_test(session: &mut Conn) {
+        run_externals(session, "SELECT 1", OutsideWrites::Refused)
+            .await
+            .unwrap();
+    }
 }
 
 /// Where the scratch session is relative to the target's. Each session marks
@@ -198,13 +197,10 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     /// next is read.
     externals: Option<&'a str>,
     provenance: &'a Provenance,
-    /// The run's token: in every name it creates, and on the session that
-    /// stays open for the run (#2410).
+    /// The run's token: in every name it creates and on its keeper (#2410).
     token: String,
     created: Created,
-    /// Whether this session holds the supplied database's lock, taken before
-    /// the claim is read and released once the run's own claim is made, or on
-    /// any error before (`recovery`).
+    /// Whether this session holds the supplied database's lock (`recovery`).
     holds_lock: bool,
 }
 
@@ -255,8 +251,7 @@ impl Scratch<'_> {
         };
         let recipe = scope::recipe(driver, target_catalog)
             .map_err(|error| Error::Scope(error.to_string()))?;
-        // Every name carries the run's token, so a later run can find what
-        // this one leaves if it is killed (#2410).
+        // Every name carries the run's token (#2410).
         let names = super::super::names_for(&self.token)?;
         let login = names.login().to_owned();
         let map = scope::Principals::generate(authorization, &request.planned, &login, &self.token);
@@ -428,10 +423,8 @@ impl Scratch<'_> {
         };
         let map =
             scope::Principals::supplied(authorization, &principal.login).map_err(Error::Scope)?;
-        // The first object the run creates here, and its record: who it is,
-        // and the state its release puts back. A run killed after this is
-        // found and cleaned by the next one (`recovery`, #2410); two runs
-        // that start together cannot both make it.
+        // The first object the run creates here, and its record: a run killed
+        // after it is found and cleaned by the next one (`recovery`, #2410).
         let claimed = record::claim(
             admin,
             &record::Claim::new(&self.token, defaults.clone(), acl.clone()),
@@ -616,10 +609,8 @@ impl Scratch<'_> {
     }
 }
 
-/// Drops a run-owned run's database, run-local roles and login, in that order,
-/// and names what is left. The login is the run's record (`recovery`): it
-/// goes last, and stays while anything it names does, so that a later run
-/// still finds what is left.
+/// Drops a run-owned run's database, roles and login, in that order, and names
+/// what is left. The login is the record: it stays while anything else does.
 pub(in crate::resolver::server) async fn release_run_owned(
     admin: &mut Conn,
     names: &ScratchNames,
@@ -638,14 +629,11 @@ pub(in crate::resolver::server) async fn release_run_owned(
             .into_iter()
             .map(|role| format!("role {}", role.shown())),
     );
-    if remaining.is_empty() {
-        if pbps_pg::resolver::drop_login(admin, names.login())
+    if !remaining.is_empty()
+        || pbps_pg::resolver::drop_login(admin, names.login())
             .await
             .is_err()
-        {
-            remaining.push(format!("role {}", names.login()));
-        }
-    } else {
+    {
         remaining.push(format!("role {}", names.login()));
     }
     remaining
@@ -664,10 +652,8 @@ pub(in crate::resolver::server) async fn release_supplied(
 ) -> Result<(), Vec<String>> {
     let cleaned = sql::drop_owned(admin, backend).await;
     #[cfg(test)]
-    if stopped_after_cleanup(database) {
-        return Err(vec![format!(
-            "stopped after the cleanup of database {database}, as a kill would"
-        )]);
+    if for_tests::stopped_after_cleanup(database) {
+        return Err(vec!["stopped after the cleanup, as a kill would".into()]);
     }
     let mut remaining = match cleaned {
         Ok((_, 0)) => Ok(()),
@@ -719,15 +705,12 @@ pub(in crate::resolver::server) async fn release_supplied(
             "the scratch account's own defaults, unreadable after the run ({error})"
         )),
     }
-    // The record goes last: until every step above has succeeded it is what
-    // lets a later run finish them, with the state it holds. A release that
-    // stops anywhere above leaves it.
+    // The record goes last: until every step above has succeeded it lets a
+    // later run finish them (DEC-2410.1).
     if remaining.is_empty()
         && let Err(error) = record::remove(admin).await
     {
-        remaining.push(format!(
-            "the scratch database's claim, which records what the run found ({error})"
-        ));
+        remaining.push(format!("the scratch database's claim ({error})"));
     }
     if remaining.is_empty() {
         Ok(())
@@ -1547,7 +1530,7 @@ impl Scratch<'_> {
                         .await
                 }
                 .await;
-                // Released right after the claim; this ends every error
+                // Normally released after the claim; this covers every error
                 // before it.
                 self.unlock_database(admin).await;
                 prepared
@@ -1960,8 +1943,7 @@ impl Binding {
     }
 }
 
-/// The keeper's settings on a session whose `RESET ALL` or `DISCARD ALL` took
-/// them (`sql::keep`).
+/// Sends the keeper's settings again after a `RESET ALL` or `DISCARD ALL`.
 async fn keep_alive(session: &mut Conn) -> Result<(), Error> {
     sql::keep(session)
         .await

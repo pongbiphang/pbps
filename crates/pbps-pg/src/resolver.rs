@@ -288,12 +288,10 @@ pub async fn drop_scratch(
     database.and(login)
 }
 
-/// Drops a run-owned database. `force` closes sessions still connected to
-/// it, which only the run that owns it may do; a later run removing a dead
-/// run's database does not, so that a session the engine still shows
-/// connected makes the drop fail, as a second guard behind the decision that
-/// the run is gone (`recovery`, #2410; measured on 16 and 18: `database is
-/// being accessed by other users`).
+/// Drops a run-owned database. Only the owning run forces; a later run
+/// removing a dead run's does not, so a session the engine still shows
+/// connected refuses the drop, a second guard behind the decision that the
+/// run is gone (`recovery`, #2410).
 pub async fn drop_database(
     conn: &mut impl ExecuteConnection,
     database: &str,
@@ -306,8 +304,7 @@ pub async fn drop_database(
     .await
 }
 
-/// Drops the run's login. It goes last: it is the record by which a later
-/// run finds what an interrupted release left (`recovery`).
+/// Drops the run's login, its record: it goes last (`recovery`).
 pub async fn drop_login(conn: &mut impl ExecuteConnection, login: &str) -> Result<(), DbError> {
     conn.execute(&format!("DROP ROLE IF EXISTS \"{login}\""))
         .await

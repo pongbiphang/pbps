@@ -1,32 +1,25 @@
 //! Recovering what a killed scratch run left behind (#2410, DEC-2410.1).
 //!
-//! A run that ends removes what it made. A run that is killed removes
-//! nothing, and its release obligations died with its memory. This module is
-//! the engine-neutral half of the answer: given an [`Adapter`] that can list
-//! the resources other runs left, say whether their owners are provably gone,
-//! and remove them, it decides, removes, and reports.
+//! The engine-neutral half: an [`Adapter`] lists the resources other runs
+//! left, says whether their owners are provably gone, and removes them; this
+//! decides, removes and reports.
 //!
-//! # What it will and will not do
-//!
-//! - It removes a run's resources only when the adapter proves the run is
-//!   gone. A run it cannot prove anything about is **kept** and reported:
-//!   keeping is the safe error, because removing a live run's resources is
-//!   the failure this exists to prevent.
-//! - It never fails the run that called it. A leftover it cannot remove is a
-//!   warning that names the resource, why, and the statement that removes it.
-//!   The adapter's own layout may still refuse the run for what is left (a
-//!   supplied database that is not empty), as it did before.
-//! - It removes in the order the adapter lists, and after the first failure
-//!   keeps the rest of that run's resources: the record of a run (its login
-//!   or claim) is listed last, and must outlive anything it names.
+//! - A run's resources go only when the adapter proves the run gone. One it
+//!   cannot prove anything about is kept and reported: removing a live run's
+//!   resources is the failure this prevents.
+//! - It never fails the run that called it. What it cannot remove is a warning
+//!   naming the resource, why, and the statement that removes it. The layout
+//!   may still refuse the run for what is left, as before.
+//! - It removes in the adapter's order and, after the first failure, keeps the
+//!   rest of that run's resources: the run's record is listed last and must
+//!   outlive what it names.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use serde::Serialize;
 
-/// Some resources of one kind, removed together: a database, the run-local
-/// roles, the login.
+/// Resources of one kind, removed together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Resource {
     pub kind: &'static str,
@@ -53,12 +46,11 @@ impl Resource {
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .join(", ");
-                let more = names.len().saturating_sub(SHOWN);
-                if more == 0 {
-                    format!("{} {}s ({head})", names.len(), self.kind)
-                } else {
-                    format!("{} {}s ({head} and {more} more)", names.len(), self.kind)
-                }
+                let more = match names.len().saturating_sub(SHOWN) {
+                    0 => String::new(),
+                    more => format!(" and {more} more"),
+                };
+                format!("{} {}s ({head}{more})", names.len(), self.kind)
             }
         }
     }
@@ -93,19 +85,17 @@ pub struct Group {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub groups: Vec<Group>,
-    /// Tokens whose owners are alive, and whose resources were not touched.
+    /// Tokens whose owners are alive; their resources were not touched.
     pub live: Vec<String>,
     /// Why the sweep could not look, when it could not.
     pub unread: Option<String>,
 }
 
-/// Why a removal did not finish, and which names it left: a batch of roles
-/// can drop all but one.
+/// Why a removal did not finish; a batch of roles can drop all but one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failed {
     pub why: String,
-    /// The names still there, when some of the resource's went; `None` when
-    /// all of them are still there.
+    /// The names still there; `None` when all are.
     pub left: Option<Vec<String>>,
 }
 
@@ -121,8 +111,7 @@ impl From<String> for Failed {
     reason = "every adapter is used by value in one function; no caller needs a Send bound"
 )]
 pub trait Adapter {
-    /// The resources of every run but the caller's own, by run token, in the
-    /// order they must be removed, the run's record last.
+    /// Every other run's resources by token, in removal order, record last.
     async fn leftovers(&mut self) -> Result<BTreeMap<String, Vec<Resource>>, String>;
 
     /// Whether each of `tokens` has an owner.
@@ -254,7 +243,7 @@ impl Report {
     }
 }
 
-/// What the sweeps this process made found, for the command's JSON to carry.
+/// What this process's sweeps found, for the command's JSON.
 #[derive(Debug, Default)]
 pub struct Collected {
     pub groups: Vec<Group>,

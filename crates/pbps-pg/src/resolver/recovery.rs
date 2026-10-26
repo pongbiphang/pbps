@@ -1,47 +1,16 @@
 //! What a killed run leaves in a PostgreSQL cluster, and how a later run
-//! tells that the run is gone (#2410, DEC-2410.1).
+//! tells that the run is gone (#2410; DEC-2410.1 has the reasoning).
 //!
-//! # The record is the name
-//!
-//! A run-owned run creates its login first, then its database, then its
-//! run-local roles, and every one of them is named with the run's token
-//! (`pbps_run_<T>`, `pbps_scratch_<T>`, `pbps_role_<n>_<T>`, and the roles a
-//! rehearsal maps the target's to, `pbps_rehearsal_<n>_<T>`, #2379). A name needs no
-//! write of its own and cannot be missed by a listing, so there is no moment
-//! at which a resource exists without its record. The login is the anchor:
-//! it is created before the rest and dropped after it, so a token with no
-//! login has nothing the run left unfinished, and a name that merely has the
-//! shape of one (another version's, another tool's) is never touched.
-//!
-//! # The proof is a session
-//!
-//! A run keeps one session open from before its first write to its release,
-//! named `pbps-<T>` in `application_name` (`scratch::mark` writes the same
-//! value). Every role sees every session's `application_name` in
-//! `pg_stat_activity` (measured on 16 and 18), the view is cluster-wide where
-//! an advisory lock is private to one database (measured: held in one
-//! database, free in another), and no clock is involved. A token whose
-//! session is not there is dead. A reader that cannot see its own session
-//! cannot say anything about another's, and proves nothing.
-//!
-//! # A supplied database holds a claim
-//!
-//! The supplied layout creates nothing at cluster level; what it leaves is
-//! inside the database the account owns. Its record is a schema, the first
-//! object the run creates, whose comment carries the token and the state the
-//! release needs to restore. Creating it is the arbitration between two runs
-//! that start together.
-//!
-//! Cleaning a dead claim is not covered by that: two runs can read the same
-//! one, and the second's cleanup would empty the first's objects. The
-//! database lock ([`lock`]) is held from before the claim is read to the
-//! moment the run's own is made. And the claim is the last thing a release
-//! removes ([`remove`]): the cleanup's `DROP OWNED` puts it back ([`keep`]),
-//! so a kill before the privileges are restored leaves the snapshot to
-//! restore them from.
+//! A run-owned run names its login, database and run-local roles with its
+//! token, so none needs a record of its own; the login is created first and
+//! dropped last, so it anchors the rest. The proof of death is a session named
+//! `pbps-<T>` in `application_name`, which every role sees in the
+//! cluster-wide `pg_stat_activity`. A supplied run's record is the
+//! [`CLAIM`] schema, the first object it creates.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_db::resolver::is_run_token;
 use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 
@@ -93,7 +62,6 @@ pub async fn leftovers(
     own: &str,
 ) -> Result<BTreeMap<String, Leftover>, DbError> {
     let mut found: BTreeMap<String, Leftover> = BTreeMap::new();
-    let mut unanchored: BTreeMap<String, Leftover> = BTreeMap::new();
     for row in conn.query(FOUND).await? {
         let name = text(&row, "name")?;
         let token = token_of(&name).to_owned();
@@ -101,18 +69,14 @@ pub async fn leftovers(
             continue;
         }
         let kind = text(&row, "kind")?;
-        let entry = unanchored.entry(token).or_default();
+        let entry = found.entry(token).or_default();
         match kind.as_str() {
             "login" => entry.login = name,
             "database" => entry.database = Some(name),
             _ => entry.roles.push(name),
         }
     }
-    for (token, leftover) in unanchored {
-        if !leftover.login.is_empty() {
-            found.insert(token, leftover);
-        }
-    }
+    found.retain(|_, leftover| !leftover.login.is_empty());
     Ok(found)
 }
 
@@ -123,13 +87,7 @@ pub async fn alive(
     own: &str,
     tokens: &[String],
 ) -> Result<Option<BTreeSet<String>>, DbError> {
-    let hex = |token: &str| {
-        token.len() == TOKEN_LEN
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
-    if !hex(own) || !tokens.iter().all(|token| hex(token)) {
+    if !is_run_token(own) || !tokens.iter().all(|token| is_run_token(token)) {
         return Err(DbError::BadRow(
             "a run token was not 32 lowercase hexadecimal digits".into(),
         ));
@@ -162,11 +120,12 @@ pub async fn alive(
     Ok(own_seen.then_some(sessions))
 }
 
-/// The advisory lock that serialises runs in one supplied database: a pair of
-/// integers, `"pbps"` and the issue that introduced it. An advisory lock is
-/// private to the database it is taken in, which is why #2410 rejected it for
-/// what is cluster-wide (liveness) and is the scope this needs.
+/// The advisory lock that serialises runs in one supplied database: `"pbps"`
+/// and the issue. It is private to its database, the scope wanted here.
 pub const LOCK: (i32, i32) = (0x7062_7073, 2410);
+
+/// How long a run waits for the lock before it refuses.
+const LOCK_WAIT: &str = "60s";
 
 /// Why the database lock could not be taken.
 #[derive(Debug)]
@@ -176,48 +135,45 @@ pub enum LockError {
     Db(DbError),
 }
 
-/// How long a run waits for the lock before it refuses. The holder is a run
-/// between its start and its claim, or one cleaning a dead claim.
-const LOCK_WAIT: &str = "60s";
-
-/// Takes the lock, or gives up after [`LOCK_WAIT`]. Session-level: it
-/// outlives the transaction it is asked in, and a session that ends releases
-/// it. `lock_timeout` is local to that transaction, so the session's own
-/// settings are not touched.
-pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<(), LockError> {
+fn advisory(function: &str) -> String {
     let (class, object) = LOCK;
-    conn.execute("BEGIN").await.map_err(LockError::Db)?;
-    let taken = async {
-        conn.execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
-            .await?;
-        conn.execute(&format!(
-            "SELECT pg_catalog.pg_advisory_lock({class}, {object})"
-        ))
-        .await
-    }
-    .await;
-    match taken {
-        Ok(()) => conn.execute("COMMIT").await.map_err(LockError::Db),
+    format!("SELECT pg_catalog.{function}({class}, {object})")
+}
+
+/// Runs `body` in a transaction, rolled back when it fails.
+async fn transaction<C: ExecuteConnection>(
+    conn: &mut C,
+    body: impl AsyncFnOnce(&mut C) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    conn.execute("BEGIN").await?;
+    match body(conn).await {
+        Ok(()) => conn.execute("COMMIT").await,
         Err(error) => {
             let _ = conn.execute("ROLLBACK").await;
-            // lock_not_available
-            if error.server_error_code().as_deref() == Some("55P03") {
-                Err(LockError::Busy)
-            } else {
-                Err(LockError::Db(error))
-            }
+            Err(error)
         }
     }
 }
 
-/// Releases the lock this session holds. A session that never held it, or
-/// lost it, has nothing to release.
-pub async fn unlock(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
-    let (class, object) = LOCK;
-    conn.execute(&format!(
-        "SELECT pg_catalog.pg_advisory_unlock({class}, {object})"
-    ))
+/// Takes the lock for the session, or gives up after [`LOCK_WAIT`].
+/// `lock_timeout` is local to the transaction, so the session's settings are
+/// untouched.
+pub async fn lock(conn: &mut impl ExecuteConnection) -> Result<(), LockError> {
+    transaction(conn, async |conn| {
+        conn.execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'"))
+            .await?;
+        conn.execute(&advisory("pg_advisory_lock")).await
+    })
     .await
+    .map_err(|error| match error.server_error_code().as_deref() {
+        Some("55P03") => LockError::Busy,
+        _ => LockError::Db(error),
+    })
+}
+
+/// Releases the lock; a session that does not hold it has nothing to release.
+pub async fn unlock(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&advisory("pg_advisory_unlock")).await
 }
 
 /// What a supplied run records in its database before it creates anything
@@ -256,23 +212,20 @@ pub enum ClaimError {
 pub async fn claim(conn: &mut impl ExecuteConnection, claim: &Claim) -> Result<(), ClaimError> {
     let json =
         serde_json::to_string(claim).map_err(|e| ClaimError::Db(DbError::BadRow(e.to_string())))?;
-    conn.execute("BEGIN").await.map_err(ClaimError::Db)?;
-    match create(conn, &json).await {
-        Ok(()) => conn.execute("COMMIT").await.map_err(ClaimError::Db),
-        Err(error) => {
-            let _ = conn.execute("ROLLBACK").await;
-            if error.server_error_code().as_deref() == Some("42P06") {
-                Err(ClaimError::Taken)
-            } else {
-                Err(ClaimError::Db(error))
-            }
-        }
-    }
+    transaction(conn, async |conn| create(conn, &json).await)
+        .await
+        .map_err(|error| match error.server_error_code().as_deref() {
+            Some("42P06") => ClaimError::Taken,
+            _ => ClaimError::Db(error),
+        })
 }
 
-/// The claim schema and its comment, inside the transaction the caller
-/// opened.
-async fn create(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), DbError> {
+/// The claim schema and its comment, inside the caller's transaction. A
+/// cleanup that took the claim uses it to put the same one back.
+pub(crate) async fn create(
+    conn: &mut impl ExecuteConnection,
+    comment: &str,
+) -> Result<(), DbError> {
     // The literal below doubles quotes and nothing else, which is whole only
     // while backslashes are literal.
     conn.execute("SET LOCAL standard_conforming_strings = on")
@@ -285,34 +238,26 @@ async fn create(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), 
     .await
 }
 
-/// The text of the claim's comment, `None` when there is no claim or it has
-/// none. Read inside the cleanup's transaction, so [`keep`] can put the same
-/// claim back.
-pub async fn comment(conn: &mut impl QueryConnection) -> Result<Option<String>, DbError> {
+/// Removes the claim: the last step of a release.
+pub async fn remove(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&format!("DROP SCHEMA IF EXISTS {CLAIM}"))
+        .await
+}
+
+/// The claim schema's comment: `None` when there is no claim, `Some(None)`
+/// when it has none.
+pub(crate) async fn comment(
+    conn: &mut impl QueryConnection,
+) -> Result<Option<Option<String>>, DbError> {
     let rows = conn
         .query(&format!(
             "SELECT pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment \
                FROM pg_catalog.pg_namespace n WHERE n.nspname = '{CLAIM}'"
         ))
         .await?;
-    Ok(match rows.first() {
-        Some(row) => row.try_get::<&str>("comment")?.map(str::to_owned),
-        None => None,
-    })
-}
-
-/// Puts back a claim the cleanup's `DROP OWNED` took with everything else,
-/// in the same transaction, so no moment shows a database without it: the
-/// run's record stays until its last step has succeeded ([`remove`]).
-pub async fn keep(conn: &mut impl ExecuteConnection, comment: &str) -> Result<(), DbError> {
-    create(conn, comment).await
-}
-
-/// Removes the claim: the last thing a release does, once every other step
-/// has succeeded.
-pub async fn remove(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
-    conn.execute(&format!("DROP SCHEMA IF EXISTS {CLAIM}"))
-        .await
+    rows.first()
+        .map(|row| Ok(row.try_get::<&str>("comment")?.map(str::to_owned)))
+        .transpose()
 }
 
 /// The claim in this database: `None` when there is none, `Err` with why when
@@ -320,28 +265,17 @@ pub async fn remove(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
 pub async fn read_claim(
     conn: &mut impl QueryConnection,
 ) -> Result<Option<Result<Claim, String>>, DbError> {
-    let rows = conn
-        .query(&format!(
-            "SELECT pg_catalog.obj_description(n.oid, 'pg_namespace') AS comment \
-               FROM pg_catalog.pg_namespace n WHERE n.nspname = '{CLAIM}'"
-        ))
-        .await?;
-    let Some(row) = rows.first() else {
+    let Some(comment) = comment(conn).await? else {
         return Ok(None);
     };
-    let comment = row.try_get::<&str>("comment")?.unwrap_or_default();
     Ok(Some(
-        serde_json::from_str::<Claim>(comment)
+        serde_json::from_str::<Claim>(&comment.unwrap_or_default())
             .map_err(|e| format!("its comment is not a claim this version reads ({e})"))
-            .and_then(|claim| {
-                if claim.v == 1 {
-                    Ok(claim)
-                } else {
-                    Err(format!(
-                        "it is version {}, which this version does not read",
-                        claim.v
-                    ))
-                }
+            .and_then(|claim| match claim.v {
+                1 => Ok(claim),
+                v => Err(format!(
+                    "it is version {v}, which this version does not read"
+                )),
             }),
     ))
 }

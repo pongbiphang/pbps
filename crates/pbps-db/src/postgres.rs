@@ -238,10 +238,8 @@ impl Conn {
         Self::connect_as(connection_string, cfg!(target_os = "linux")).await
     }
 
-    /// [`connect`] with `application_name` given as a **startup parameter**,
-    /// which a pooler's `DISCARD ALL` does not clear (measured on 16 and 18,
-    /// #2410). A string that names its own `application_name` loses it: the
-    /// name is the run's identity among the live sessions.
+    /// [`connect`] with `application_name` as a startup parameter, which
+    /// `DISCARD ALL` does not clear (#2410). The string's own name loses.
     pub(crate) async fn connect_named(
         connection_string: &str,
         application_name: &str,

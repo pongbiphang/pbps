@@ -11,13 +11,10 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use pbps_model::escape::Escaped;
 
-/// What the run's keeper session sets so the engine notices a client that
-/// vanished (#2410). `application_name` is the session's identity and is given
-/// at connection, where `DISCARD ALL` leaves it; these four are `SET`s, which
-/// `RESET ALL` and `DISCARD ALL` clear, so a session that runs either sends
-/// them again. A dead client's idle session is gone at once, a vanished
-/// host's after at most idle + interval x count seconds, and one that dies
-/// inside a long statement within the check interval.
+/// What the keeper session sets so the engine notices a vanished client
+/// (#2410). They are `SET`s, which `RESET ALL` and `DISCARD ALL` clear, so a
+/// session that runs either sends them again; `application_name` is given at
+/// connection, where `DISCARD ALL` leaves it.
 pub const KEEPER_SETTINGS: &str = "SET tcp_keepalives_idle = 30; \
      SET tcp_keepalives_interval = 10; \
      SET tcp_keepalives_count = 3; \
@@ -931,11 +928,10 @@ pub async fn drop_owned(
             "the connection now reaches another backend than the one the run checked".into(),
         ));
     }
-    // The claim is the run's record, and the release removes it last
-    // (`recovery::remove`): it goes through the cleanup and comes back in
-    // the same transaction, so no commit shows the database without it.
+    // The claim is the run's record, removed last by the release: it goes
+    // through the cleanup and comes back before the commit (DEC-2410.1).
     let claim = match super::recovery::comment(conn).await {
-        Ok(claim) => claim,
+        Ok(claim) => claim.flatten(),
         Err(error) => {
             conn.execute("ROLLBACK").await?;
             return Err(error);
@@ -943,7 +939,7 @@ pub async fn drop_owned(
     };
     conn.execute("DROP OWNED BY SESSION_USER").await?;
     if let Some(comment) = &claim
-        && let Err(error) = super::recovery::keep(conn, comment).await
+        && let Err(error) = super::recovery::create(conn, comment).await
     {
         conn.execute("ROLLBACK").await?;
         return Err(error);
