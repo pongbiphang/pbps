@@ -738,7 +738,8 @@ and a submodule's files are not in the commit. A working-tree declaration whose
 name is not UTF-8 is refused too: the name is the declaration's key. A working-tree
 path is recorded as it was traversed, never with `..` collapsed after a symlink,
 and an identity file of a version this tool does not read is unanswerable, not
-inconsistent. `baseline::ids_from` reads any failed `git show` as an empty identity
+inconsistent or malformed: the version is read before the shape, as the
+manifest's is. `baseline::ids_from` reads any failed `git show` as an empty identity
 file (#1814) and is not used here, nor fixed here. A commit with no `pbps.yml`
 is refused, not read as a project that did not exist yet, because the manifest's
 dialect must match each revision's own configuration. A working tree takes the

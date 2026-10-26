@@ -513,8 +513,9 @@ fn identity_that_is_absent_malformed_inconsistent_or_unreadable_are_four_refusal
         "{found:?}"
     );
 
-    // A version this tool cannot read is not a wrong file: it cannot be judged.
-    repo.write("schema.ids.json", "{\"version\": 99}");
+    // A version this tool cannot read is not a wrong file: it cannot be judged,
+    // including when the newer format has fields this one would call unknown.
+    repo.write("schema.ids.json", "{\"version\": 99, \"new_field\": {}}");
     let newer = repo.commit("newer format");
     repo.manifest(&newer, &[("f", &c1)], None);
     let found = refused(repo.validate());

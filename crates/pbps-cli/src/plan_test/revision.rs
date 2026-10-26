@@ -21,7 +21,7 @@ use pbps_config::test_manifest::CommitId;
 use pbps_config::{Config, DialectName};
 use pbps_model::IdsFile;
 use pbps_model::escape::Escaped;
-use pbps_model::ids::IdsError;
+use pbps_model::ids::{CURRENT_VERSION, IdsError};
 use sha2::{Digest as _, Sha256};
 
 use super::{ConsumedFile, Revision, Role};
@@ -82,7 +82,7 @@ pub(crate) enum Problem {
     )]
     IdsUnsupportedVersion {
         path: String,
-        found: u32,
+        found: u64,
         supported: u32,
     },
     #[error(
@@ -533,6 +533,19 @@ pub(super) fn assemble(
         None => IdsFile::default(),
         Some((path, bytes)) => {
             let text = utf8(path, bytes).map_err(|p| vec![p])?;
+            // The version is read before the shape, as the manifest's is: a
+            // newer format may add fields this one would refuse as unknown,
+            // and that is a format it cannot judge, not a malformed file.
+            if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(&text)
+                && let Some(found) = fields.get("version").and_then(serde_json::Value::as_u64)
+                && found != u64::from(CURRENT_VERSION)
+            {
+                return Err(vec![Problem::IdsUnsupportedVersion {
+                    path: path.clone(),
+                    found,
+                    supported: CURRENT_VERSION,
+                }]);
+            }
             let ids: IdsFile =
                 crate::artifact::decode(&text, serde_json::from_str).map_err(|e| {
                     vec![Problem::IdsMalformed {
@@ -546,7 +559,7 @@ pub(super) fn assemble(
                 if let IdsError::UnsupportedVersion { found, supported } = e {
                     return vec![Problem::IdsUnsupportedVersion {
                         path: path.clone(),
-                        found,
+                        found: u64::from(found),
                         supported,
                     }];
                 }
