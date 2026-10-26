@@ -7415,6 +7415,10 @@ pub fn cmd_plan_db(
                 hints.module_deps.insert(name.clone(), dependencies.clone());
             }
         }
+        // The rehearsal rebuilds the base as the target holds it, so a kept
+        // module is ordered by the annotation it was written under, not by
+        // this revision's (see `rehearsal::connected::Plan::base_hints`).
+        let recorded_module_deps = entry.snapshot.module_deps.clone();
         // A rebuilt enum keeps its comment, which `CREATE TYPE` does not
         // copy: it is a fact about the target, read before the differ writes
         // the swap that carries it (DEC-1635.7).
@@ -8145,6 +8149,8 @@ pub fn cmd_plan_db(
             (Course::Rehearse, Some(entry)) => {
                 let ordered = cs.clone().ordered(plan_mode(staged), dialect.as_ref());
                 let lowered = crate::statements(&ordered, &dialect)?;
+                let mut base_hints = hints.clone();
+                base_hints.module_deps.extend(recorded_module_deps.clone());
                 // The same refusal the plan meets below, before a rehearsal
                 // can meet the statement instead.
                 if !staged {
@@ -8160,6 +8166,7 @@ pub fn cmd_plan_db(
                         desired: desired_side,
                         declared: &loaded.schema,
                         hints: &hints,
+                        base_hints: &base_hints,
                         dependencies: &loaded.dependencies,
                         ordered: &ordered,
                         operations: &pbps_dialect::PlanPayload::operations(&ordered),

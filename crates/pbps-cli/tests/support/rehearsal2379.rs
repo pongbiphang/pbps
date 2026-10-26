@@ -99,6 +99,9 @@ pub struct Options<'a> {
     /// that the two declared rows the rehearsal's base inserts hold it open
     /// sixteen seconds, long enough to act on a run that is using its roles.
     pub slow: bool,
+    /// `app.f()` calls the overload `app.f(integer)`, which it names in
+    /// `depends_on:` because overloads are not ordered by the identifier scan.
+    pub overload: bool,
 }
 
 pub struct Fixture {
@@ -124,6 +127,9 @@ const TABLE: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: fal
 
 const FUNCTION: &str = "function: app.f(integer)\npublic_execute: true\n\ndefinition: |-\n  \
     (integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 + 1\n";
+
+const CALLER: &str = "function: app.f()\ndepends_on: [app.f(integer)]\n\ndefinition: |-\n  \
+    () RETURNS integer LANGUAGE sql IMMUTABLE RETURN app.f(1)\n";
 
 const VIEW: &str = "view: app.v\ndefinition: SELECT id, app.f(id) AS next, amount FROM app.t\n";
 
@@ -180,6 +186,9 @@ impl Fixture {
                 "app.t.yml",
                 &TABLE.replace("  note: {type: text}\n", "  note: {type: app.short}\n"),
             );
+        }
+        if options.overload {
+            write("app.f%28%29.function.yml", CALLER);
         }
         if options.typed {
             write("app.mood.yml", "enum: app.mood\nvalues: [sad, ok]\n");
@@ -1576,5 +1585,33 @@ pub fn a_declared_enum_is_rehearsed(server: &str) {
         "rehearsed",
         "{}",
         f.record()
+    );
+}
+
+/// A revision that drops a kept function's `depends_on:` is rehearsed on a base
+/// rebuilt under the annotation the target was written with: the old caller of
+/// an overload is created after its callee, and the plan converges.
+pub fn a_kept_module_is_rebuilt_under_its_recorded_dependencies(server: &str) {
+    let f = Fixture::new(
+        server,
+        "rehearse-hints",
+        Kind::Server,
+        &Options {
+            overload: true,
+            ..Options::default()
+        },
+    );
+    std::fs::write(
+        f.d.dir.join("schema/app.f%28%29.function.yml"),
+        "function: app.f()\n\ndefinition: |-\n  () RETURNS integer LANGUAGE sql IMMUTABLE RETURN 2\n",
+    )
+    .unwrap();
+    f.d.commit();
+    let out = f.plan(&[]);
+    assert_eq!(code(&out), 0, "{}", said(&out));
+    assert!(
+        stdout(&out).contains("Rehearsal: converged on scratch"),
+        "{}",
+        said(&out)
     );
 }

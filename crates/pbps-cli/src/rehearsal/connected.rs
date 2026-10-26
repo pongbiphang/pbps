@@ -71,6 +71,12 @@ pub struct Plan<'a, D> {
     /// The declarations, the comparison's other side.
     pub declared: &'a Schema,
     pub hints: &'a Hints,
+    /// The hints the base was written under: the snapshot's `depends_on:`
+    /// for every module it recorded. A revision that changes or drops a kept
+    /// module's annotation must not reorder the definition the target still
+    /// holds, which may need the old edge (an overload's caller does, since
+    /// overloads are never ordered by the identifier scan).
+    pub base_hints: &'a Hints,
     pub dependencies: &'a pbps_model::dependency::Dependencies,
     /// The plan as ordered, which lowers again under the run's role names.
     pub ordered: &'a pbps_diff::order::OrderedPlan<D>,
@@ -245,7 +251,7 @@ fn lowered<D: crate::emission::Engine>(
                 plan.dialect,
                 &mapping.schema(plan.base.schema),
                 &mapping.ids(plan.base.ids),
-                plan.hints,
+                plan.base_hints,
             )?;
             let ordered = plan.ordered.under_role_names(&mapping).map_err(|error| {
                 anyhow::anyhow!("the plan cannot be ordered under the run's role names: {error}")
@@ -259,8 +265,12 @@ fn lowered<D: crate::emission::Engine>(
             })
         }
         Err(why) => {
-            let (built, built_from) =
-                lower_from_empty(plan.dialect, plan.base.schema, plan.base.ids, plan.hints)?;
+            let (built, built_from) = lower_from_empty(
+                plan.dialect,
+                plan.base.schema,
+                plan.base.ids,
+                plan.base_hints,
+            )?;
             Ok(Lowered {
                 base: local_statements(&built, &built_from),
                 plan: local_statements(plan.statements, plan.operations),

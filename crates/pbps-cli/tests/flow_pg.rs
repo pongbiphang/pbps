@@ -1263,6 +1263,12 @@ fn a_project_declaring_an_enum_is_rehearsed() {
 
 #[test]
 #[ignore = "needs live postgres"]
+fn a_kept_function_whose_dependency_annotation_is_dropped_is_rehearsed() {
+    rehearsal2379::a_kept_module_is_rebuilt_under_its_recorded_dependencies(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
 fn resolver_publishes_its_rechecked_plan_in_the_exact_order() {
     resolver_publication::published(&server());
     resolver_publication::published(&old_server());
