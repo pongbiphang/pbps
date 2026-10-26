@@ -6,10 +6,6 @@
 //! report is the hash of what ran. [`Frozen::reverify`] is the recheck the
 //! ADR requires before a result is published.
 //!
-//! The commits it names are checked here too: each resolves to one id, the
-//! fixture pins form one ancestry chain that ends at the base, and the base is
-//! behind the candidate ([`validate_history`]).
-//!
 //! Nothing in this module starts a container, opens a connection, runs SQL or
 //! writes a file. Every refusal is a [`Refusal`] value, so a caller renders
 //! the same facts as text or JSON and cannot reach a database past one.
@@ -17,24 +13,29 @@
 mod chain;
 mod files;
 mod git;
+mod revision;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) use chain::{ChainProblem, ReplayChain};
 pub(crate) use files::{Frozen, freeze};
 pub(crate) use git::GitProblem;
+pub(crate) use revision::{Assembled, Problem as RevisionProblem};
 
-use pbps_config::test_manifest::{Candidate, CommitId, Entries, ManifestError};
+use pbps_config::test_manifest::{Candidate, CommitId, Entries, ManifestError, TestManifest};
 use pbps_model::escape::Escaped;
 
-/// What a consumed file is for. Declaration inputs join these when revisions
-/// are loaded.
+/// What a consumed file is for. Hints live in the declaration files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
     Manifest,
     Fixture,
     Assertion,
+    Config,
+    Declaration,
+    Ids,
 }
 
 impl std::fmt::Display for Role {
@@ -43,7 +44,37 @@ impl std::fmt::Display for Role {
             Role::Manifest => "manifest",
             Role::Fixture => "fixture",
             Role::Assertion => "assertion",
+            Role::Config => "project configuration",
+            Role::Declaration => "declaration",
+            Role::Ids => "identity file",
         })
+    }
+}
+
+/// Where a file's bytes came from: the working tree as it is, or one commit.
+/// An uncommitted working tree is `Working` even when its bytes happen to
+/// equal `HEAD`'s: it does not claim that git supplied them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Revision {
+    Working,
+    Commit(CommitId),
+}
+
+impl serde::Serialize for Revision {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Revision::Working => serializer.serialize_str("working"),
+            Revision::Commit(commit) => serializer.serialize_str(commit.as_str()),
+        }
+    }
+}
+
+impl std::fmt::Display for Revision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Revision::Working => f.write_str("the working tree"),
+            Revision::Commit(commit) => write!(f, "commit {commit}"),
+        }
     }
 }
 
@@ -53,6 +84,7 @@ impl std::fmt::Display for Role {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub(crate) struct ConsumedFile {
     pub path: String,
+    pub revision: Revision,
     pub role: Role,
     pub sha256: String,
 }
@@ -81,6 +113,10 @@ pub(crate) enum Change {
     Edited,
     #[error("now resolves to another file")]
     Retargeted,
+    #[error("was added")]
+    Added,
+    #[error("was removed")]
+    Removed,
     #[error("can no longer be used: it {0}")]
     Unusable(Problem),
 }
@@ -127,6 +163,11 @@ pub(crate) enum Refusal {
     Git { what: String, problem: GitProblem },
     #[error("{0}")]
     Chain(ChainProblem),
+    #[error("{revision}: {problem}")]
+    At {
+        revision: Revision,
+        problem: RevisionProblem,
+    },
     #[error(
         "HEAD was {captured} when the inputs were read and is {now} now; the result cannot be \
          qualified"
@@ -154,6 +195,10 @@ impl Refusal {
             }
             | Refusal::Changed { .. }
             | Refusal::HeadMoved { .. }
+            | Refusal::At {
+                problem: RevisionProblem::Unreadable { .. },
+                ..
+            }
             | Refusal::Git {
                 problem:
                     GitProblem::NoCheckout
@@ -168,7 +213,8 @@ impl Refusal {
             | Refusal::Input { .. }
             | Refusal::DuplicateFile { .. }
             | Refusal::Git { .. }
-            | Refusal::Chain(_) => Outcome::Finding,
+            | Refusal::Chain(_)
+            | Refusal::At { .. } => Outcome::Finding,
         }
     }
 }
@@ -214,20 +260,38 @@ pub(crate) struct Pin {
     pub commit: CommitId,
 }
 
-/// The commits of a run, checked and ordered, with the files the manifest
-/// names read once. Revisions' contents are not read here.
-pub(crate) struct History {
+/// What a run was given, with no password, connection string or plan in it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct InputIdentity {
+    pub tool_version: &'static str,
+    pub manifest_version: u32,
+    pub dialect: pbps_config::DialectName,
+    pub manifest: ConsumedFile,
     pub base: CommitId,
     pub pins: Vec<Pin>,
     pub candidate: CandidateIdentity,
+    /// The image as the manifest asks for it; the acquired identity is the
+    /// runner's to record.
+    pub image: String,
+    pub timeouts: pbps_config::test_manifest::Timeouts,
+    /// Every consumed file, sorted by path, revision, role and hash.
+    pub files: Vec<ConsumedFile>,
+}
+
+/// Every input of a run, read once and checked before anything is provisioned.
+pub(crate) struct Inputs {
+    pub identity: InputIdentity,
     pub chain: ReplayChain,
+    /// Each distinct pin and the base, as the loaders see them.
+    pub revisions: BTreeMap<CommitId, Assembled>,
+    pub candidate: Assembled,
     pub frozen: Frozen,
     root: PathBuf,
     /// The `HEAD` captured for a working-tree candidate.
     head: Option<CommitId>,
 }
 
-fn pin_label(manifest: &pbps_config::test_manifest::TestManifest, commit: &CommitId) -> String {
+fn pin_label(manifest: &TestManifest, commit: &CommitId) -> String {
     if *commit == manifest.base {
         return "the base".to_owned();
     }
@@ -235,21 +299,20 @@ fn pin_label(manifest: &pbps_config::test_manifest::TestManifest, commit: &Commi
         .fixtures
         .iter()
         .filter(|f| f.at == *commit)
-        .map(|f| format!("fixture `{}`", Escaped(&f.name)))
+        .map(|f| format!("`{}`", Escaped(&f.name)))
         .collect();
-    format!("the pin of {}", names.join(", "))
+    format!("the pin of fixture {}", names.join(", "))
 }
 
-/// Reads the manifest and its files, and refuses everything about the commits
-/// that can be known without reading them: each pin and the base must be a
-/// commit this repository holds, an explicit candidate must name exactly one,
-/// the pins must replay in one order that ends at the base, and the base must
-/// lie behind the candidate (or the `HEAD` a working tree sits on). Every
-/// refusal found is returned, not the first.
-pub(crate) fn validate_history(
+/// Reads the manifest and every input it leads to, and refuses everything that
+/// can be known without a database: the manifest and its files, each pin and
+/// the base as a commit with the declarations, identity and intent a replay
+/// needs, the candidate as it is now or as a commit, and the order the pins
+/// replay in. Every refusal found is returned, not the first.
+pub(crate) fn validate_inputs(
     project_root: &Path,
     manifest_path: &Path,
-) -> Result<History, Vec<Refusal>> {
+) -> Result<Inputs, Vec<Refusal>> {
     let frozen = freeze(project_root, manifest_path)?;
     let root = project_root
         .canonicalize()
@@ -260,51 +323,121 @@ pub(crate) fn validate_history(
     let pins: Vec<CommitId> = manifest.fixtures.iter().map(|f| f.at.clone()).collect();
     let distinct: std::collections::BTreeSet<&CommitId> =
         pins.iter().chain([&manifest.base]).collect();
+    let mut present = Vec::new();
     for commit in distinct {
-        if let Err(problem) = git::present(&root, commit) {
-            refusals.push(Refusal::Git {
+        match git::present(&root, commit) {
+            Ok(()) => present.push(commit.clone()),
+            Err(problem) => refusals.push(Refusal::Git {
                 what: pin_label(manifest, commit),
                 problem,
-            });
+            }),
         }
     }
 
-    // `HEAD` is read once: for a working tree it is the commit the candidate
-    // sits on, which a pin may not be newer than.
-    let (spec, what) = match &manifest.candidate {
-        Candidate::WorkingTree => (
-            "HEAD",
-            "HEAD (the commit a working-tree candidate sits on)".to_owned(),
-        ),
-        Candidate::Revision(spec) => (spec.as_str(), format!("the candidate `{}`", Escaped(spec))),
-    };
-    let tip = match git::resolve_commit(&root, spec) {
-        Ok(tip) => Some(tip),
-        Err(problem) => {
-            refusals.push(Refusal::Git { what, problem });
-            None
-        }
+    // `HEAD` once: for a working tree it is the commit the candidate sits on,
+    // and the commit a pin may not be newer than.
+    let (tip, identity, head) = match &manifest.candidate {
+        Candidate::WorkingTree => match git::resolve_commit(&root, "HEAD") {
+            Ok(head) => (
+                Some(head.clone()),
+                Some(CandidateIdentity::working_tree(head.clone())),
+                Some(head),
+            ),
+            Err(problem) => {
+                refusals.push(Refusal::Git {
+                    what: "HEAD (the commit a working-tree candidate sits on)".to_owned(),
+                    problem,
+                });
+                (None, None, None)
+            }
+        },
+        Candidate::Revision(spec) => match git::resolve_commit(&root, spec) {
+            Ok(commit) => (
+                Some(commit.clone()),
+                Some(CandidateIdentity::commit(commit)),
+                None,
+            ),
+            Err(problem) => {
+                refusals.push(Refusal::Git {
+                    what: format!("the candidate `{}`", Escaped(spec)),
+                    problem,
+                });
+                (None, None, None)
+            }
+        },
     };
 
-    let chain = match &tip {
-        Some(tip) if refusals.is_empty() => order_or_refuse(&root, manifest, &pins, tip),
-        Some(_) | None => Err(Vec::new()),
-    };
-    let chain = match chain {
-        Ok(chain) => Some(chain),
-        Err(problems) => {
-            refusals.extend(problems);
-            None
+    let mut revisions = BTreeMap::new();
+    for commit in &present {
+        let loaded = revision::read_commit(&root, commit)
+            .and_then(|raw| revision::assemble(raw, manifest.dialect, None));
+        match loaded {
+            Ok(found) => {
+                revisions.insert(commit.clone(), found);
+            }
+            Err(problems) => refusals.extend(problems.into_iter().map(|problem| Refusal::At {
+                revision: Revision::Commit(commit.clone()),
+                problem,
+            })),
         }
+    }
+    let candidate_revision = match (&manifest.candidate, &identity) {
+        (Candidate::WorkingTree, _) => Some(Revision::Working),
+        (Candidate::Revision(_), Some(identity)) => Some(Revision::Commit(identity.commit.clone())),
+        (Candidate::Revision(_), None) => None,
     };
-    let (Some(chain), Some(tip), true) = (chain, tip, refusals.is_empty()) else {
+    let candidate = candidate_revision.and_then(|revision| {
+        let raw = match &revision {
+            Revision::Working => revision::read_working(&root),
+            Revision::Commit(commit) => revision::read_commit(&root, commit),
+        };
+        match raw.and_then(|raw| revision::assemble(raw, manifest.dialect, Some(&root))) {
+            Ok(found) => Some(found),
+            Err(problems) => {
+                refusals.extend(problems.into_iter().map(|problem| Refusal::At {
+                    revision: revision.clone(),
+                    problem,
+                }));
+                None
+            }
+        }
+    });
+
+    let chain = match &tip {
+        Some(tip) if present.contains(&manifest.base) && refusals.is_empty() => chain::order(
+            &manifest.base,
+            &pins,
+            tip,
+            |a, b| git::is_ancestor(&root, a, b),
+            |a, b| git::distance(&root, a, b),
+        )
+        .map_err(|problems| {
+            refusals.extend(problems.into_iter().map(Refusal::Chain));
+        })
+        .ok(),
+        Some(_) | None => None,
+    };
+    let (Some(chain), Some(candidate), Some(candidate_identity)) = (chain, candidate, identity)
+    else {
         return Err(refusals);
     };
-    let (candidate, head) = match manifest.candidate {
-        Candidate::WorkingTree => (CandidateIdentity::working_tree(tip.clone()), Some(tip)),
-        Candidate::Revision(_) => (CandidateIdentity::commit(tip), None),
-    };
-    Ok(History {
+    if !refusals.is_empty() {
+        return Err(refusals);
+    }
+
+    let mut files: Vec<ConsumedFile> = frozen
+        .consumed()
+        .into_iter()
+        .chain(revisions.values().flat_map(|r| r.files.clone()))
+        .chain(candidate.files.clone())
+        .collect();
+    files.sort();
+    files.dedup();
+    let identity = InputIdentity {
+        tool_version: env!("CARGO_PKG_VERSION"),
+        manifest_version: pbps_config::test_manifest::SUPPORTED_VERSION,
+        dialect: manifest.dialect,
+        manifest: frozen.manifest_file.clone(),
         base: manifest.base.clone(),
         pins: manifest
             .fixtures
@@ -314,34 +447,28 @@ pub(crate) fn validate_history(
                 commit: f.at.clone(),
             })
             .collect(),
-        candidate,
+        candidate: candidate_identity,
+        image: manifest.image.to_string(),
+        timeouts: manifest.timeouts,
+        files,
+    };
+    Ok(Inputs {
+        identity,
         chain,
+        revisions,
+        candidate,
         frozen,
         root,
         head,
     })
 }
 
-fn order_or_refuse(
-    root: &Path,
-    manifest: &pbps_config::test_manifest::TestManifest,
-    pins: &[CommitId],
-    tip: &CommitId,
-) -> Result<ReplayChain, Vec<Refusal>> {
-    chain::order(
-        &manifest.base,
-        pins,
-        tip,
-        |a, b| git::is_ancestor(root, a, b),
-        |a, b| git::distance(root, a, b),
-    )
-    .map_err(|problems| problems.into_iter().map(Refusal::Chain).collect())
-}
-
-impl History {
-    /// Rechecks what the run depends on and refuses if any of it moved: the
-    /// manifest's files, and for a working-tree candidate the `HEAD` it sat on.
-    /// Run it before a result is published.
+impl Inputs {
+    /// Rereads everything the run depends on and refuses if any of it moved:
+    /// the manifest and its files, and for a working-tree candidate its
+    /// membership (a declaration added or removed), its bytes and the `HEAD`
+    /// it sat on. Run it before a result is published, so no old hash is ever
+    /// reported beside new content.
     pub(crate) fn reverify(&self) -> Result<(), Vec<Refusal>> {
         let mut refusals = self.frozen.reverify().err().unwrap_or_default();
         if let Some(captured) = &self.head {
@@ -356,6 +483,38 @@ impl History {
                     problem,
                 }),
             }
+            match revision::read_working(&self.root) {
+                Err(problems) => refusals.extend(problems.into_iter().map(|problem| Refusal::At {
+                    revision: Revision::Working,
+                    problem,
+                })),
+                Ok(raw) => {
+                    let key = |f: &ConsumedFile| (f.path.clone(), f.role);
+                    let before: BTreeMap<_, _> =
+                        self.candidate.files.iter().map(|f| (key(f), f)).collect();
+                    let now = raw.files();
+                    let after: BTreeMap<_, _> = now.iter().map(|f| (key(f), f)).collect();
+                    for (k, file) in &after {
+                        let change = match before.get(k) {
+                            None => Change::Added,
+                            Some(was) if was.sha256 != file.sha256 => Change::Edited,
+                            Some(_) => continue,
+                        };
+                        refusals.push(Refusal::Changed {
+                            path: file.path.clone(),
+                            change,
+                        });
+                    }
+                    for (k, file) in &before {
+                        if !after.contains_key(k) {
+                            refusals.push(Refusal::Changed {
+                                path: file.path.clone(),
+                                change: Change::Removed,
+                            });
+                        }
+                    }
+                }
+            }
         }
         if refusals.is_empty() {
             Ok(())
@@ -368,6 +527,6 @@ impl History {
 #[cfg(test)]
 mod chain_tests;
 #[cfg(test)]
-mod history_tests;
+mod revision_tests;
 #[cfg(test)]
 mod tests;

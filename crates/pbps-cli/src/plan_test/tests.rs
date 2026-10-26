@@ -388,6 +388,7 @@ fn reverify_names_an_edited_a_deleted_and_a_replaced_input_separately() {
                 | Refusal::DuplicateFile { .. }
                 | Refusal::Git { .. }
                 | Refusal::Chain(_)
+                | Refusal::At { .. }
                 | Refusal::HeadMoved { .. } => None,
             })
             .unwrap_or_else(|| panic!("no refusal for {path}: {found:?}"))

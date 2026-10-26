@@ -724,3 +724,28 @@ unreadable history) is never read as "not an ancestor": it is the unanswerable
 outcome, not a finding. `baseline::ancestry::check` becomes the two-commit
 `check_between` and keeps its evidence classes, so the two callers cannot
 disagree about what git said.
+
+<a id="dec-1165-6"></a>
+
+**DEC-1165.6. A revision's inputs are read once, and "clean offline" is not "will plan".**
+Config, declarations and the identity file of a commit are read through one
+tree listing and one `cat-file --batch` (the baseline reader), hashed as raw
+bytes and loaded from those same bytes. An entry git has no record of is
+absent, which is not empty; one it cannot read, a symlink or a submodule is a
+refusal. `baseline::ids_from` reads any failed `git show` as an empty identity
+file (#1814) and is not used here, nor fixed here. A commit with no `pbps.yml`
+is refused, not read as a project that did not exist yet, because the manifest's
+dialect must match each revision's own configuration. A working tree takes the
+same path from the files `plan` reads, so equal bytes give equal hashes, and its
+membership is rechecked as well as its bytes: a declaration added or removed
+after the read is as disqualifying as one edited.
+
+For every distinct revision the proof is that its declarations load, its
+dialect accepts them, and its committed identity file already equals what
+resolution would record with no decision pending: the check `plan --check` makes
+without a database. It is **not** a proof that the jump between two revisions
+plans; only the replay's database capture can say that, and the ordinary differ
+decides each hop there. The resolution's operator and date only stamp tombstones
+that would make the file differ and refuse anyway, so neither is read from the
+machine. The project's declaration policies bind the candidate alone: an older
+pin may predate a rule and must still replay.
