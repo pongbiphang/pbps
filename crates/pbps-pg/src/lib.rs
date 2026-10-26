@@ -8534,7 +8534,7 @@ mod enum_rebuild_dependents_tests {
         use pbps_model::{Change, EnumRebuildStep, RetypeConversion, RiskClass};
         let pg = Postgres::new();
         let ty = |text: &str| pg.normalize_type(&text.parse().unwrap()).unwrap();
-        let retype = |base_change| Change::EnumRebuild {
+        let retype_with = |base_change, conversion| Change::EnumRebuild {
             uid: "y_000002".parse().unwrap(),
             name: "app.d".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -8545,9 +8545,10 @@ mod enum_rebuild_dependents_tests {
                 array: false,
                 removed: vec![],
                 base_change,
-                conversion: RetypeConversion::Assign,
+                conversion,
             },
         };
+        let retype = |base_change| retype_with(base_change, RetypeConversion::Assign);
         let risks = |change| pg.change_risks(&change);
         assert_eq!(
             risks(retype(Some(Box::new((
@@ -8561,6 +8562,22 @@ mod enum_rebuild_dependents_tests {
             [RiskClass::TypeRebuild].into()
         );
         assert_eq!(risks(retype(None)), [RiskClass::TypeRebuild].into());
+        // A domain built on a rebuilt one moves its columns through text and
+        // undergoes its root's change all the same (DEC-1635.9).
+        let derived = |pair| retype_with(pair, RetypeConversion::Text);
+        assert_eq!(
+            risks(derived(Some(Box::new((
+                ty("varchar(20)"),
+                ty("varchar(10)")
+            ))))),
+            [RiskClass::TypeRebuild, RiskClass::Narrowing].into()
+        );
+        assert_eq!(
+            risks(derived(Some(Box::new((ty("varchar(20)"), ty("text")))))),
+            [RiskClass::TypeRebuild].into()
+        );
+        // And a rebuilt enum's labels are no base change.
+        assert_eq!(risks(derived(None)), [RiskClass::TypeRebuild].into());
     }
 
     #[test]

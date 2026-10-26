@@ -7903,3 +7903,69 @@ fn a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_before_any_s
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowing_allow() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS varchar(20); \
+                   CREATE DOMAIN app.d2 AS app.d; \
+                   CREATE TABLE app.t (id integer PRIMARY KEY, v app.d2); \
+                   INSERT INTO app.t VALUES (1, 'short'), (2, 'abcdefghijklmnop');";
+        let (own, d) = adopted(&server, "domain_derived_narrow4b", sql);
+        let db = own.connection();
+        let uids = type_ids(&d);
+        // Only `app.d2` is used by a column; `app.d` narrows.
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(10)\n",
+        )
+        .unwrap();
+        let path = d.dir.join("derived-narrow.plan.json");
+        // The row that does not fit is reported, by column, before anything runs.
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("app.t.v") && said.contains("cannot become character varying(10)"),
+            "{said}"
+        );
+        assert!(!path.exists());
+
+        // With the row fixed, the plan carries the narrowing and is refused
+        // without it.
+        on_server(db, "UPDATE app.t SET v = 'fits' WHERE id = 2");
+        let plan = label_plan(&d, db, &path);
+        assert!(changes_of(&plan).iter().all(|k| k == "EnumRebuild"));
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::Narrowing)),
+            "{plan:?}"
+        );
+        let refused = apply_allowing(&d, db, &path, &["type-rebuild"]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("narrowing"),
+            "{}",
+            stderr(&refused)
+        );
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert_eq!(type_ids(&d), uids);
+        assert_eq!(
+            scalar(db, "SELECT count(*) FROM app.t WHERE v::text = 'fits'"),
+            1
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}

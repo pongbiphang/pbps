@@ -3762,4 +3762,16 @@ the number of domains, not by 64, and a domain whose base could not be ordered
 is reported instead of dropped. A domain renamed in the plan that rebuilds it is
 refused by name (the rename guard compares the desired name, as the enum's
 does), also when it is rebuilt only because its base is: rename it in one plan,
-then change it in the next. This supersedes the base and collation refusals of DEC-1635.8.
+then change it in the next.
+
+Round 2 of the PR. A domain rebuilt because the one it is built on is rebuilt
+(`Why::Derived`) undergoes the change of its root's base, through every level
+between, so its columns carry the same old and new base type
+(`Replaced.effective` is inherited down the chain). The narrowing risk and the
+`cannot_become` probe then see a column that only holds the derived domain,
+exactly as for the root's own columns; the conversion stays `::text::<tmp>`.
+A derived domain over a base the engine cannot convert is refused with the root
+(#2331): the root is never planned, so nothing under it is. A collation change
+carries no base pair on either path, as before.
+`a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowing_allow`
+pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.

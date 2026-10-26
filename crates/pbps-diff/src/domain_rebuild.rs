@@ -101,6 +101,7 @@ pub(crate) fn plan(
                     removed: removed.clone(),
                     ordinal: *ordinal,
                     depth: 0,
+                    effective: None,
                 },
             );
         }
@@ -289,7 +290,13 @@ pub(crate) fn plan(
             };
             let reason = &why[uid];
             let (conversion, base_change) = match reason {
-                Why::Derived(_) => (RetypeConversion::Text, None),
+                // The columns of a domain built on a rebuilt one undergo the
+                // change of the root's base, through every level between: the
+                // narrowing is reported and gated for them too.
+                Why::Derived(_) => (
+                    RetypeConversion::Text,
+                    under.and_then(|r| r.effective.clone()),
+                ),
                 Why::Base => {
                     let (
                         ManagedType::Domain { base: from, .. },
@@ -305,6 +312,7 @@ pub(crate) fn plan(
                 }
                 Why::Collation | Why::Array => (RetypeConversion::Assign, None),
             };
+            let effective_change = base_change.clone();
             match rebuild_type(
                 base,
                 desired,
@@ -330,6 +338,7 @@ pub(crate) fn plan(
                                 removed,
                                 ordinal,
                                 depth,
+                                effective: effective_change,
                             },
                         );
                     }
@@ -360,6 +369,10 @@ struct Replaced {
     removed: Vec<String>,
     ordinal: usize,
     depth: usize,
+    /// The old and new base type the columns of this type undergo, resolved
+    /// through the chain to the root built-in type: a domain built on this
+    /// one inherits it.
+    effective: Option<(ColumnType, ColumnType)>,
 }
 
 #[cfg(test)]
@@ -439,7 +452,12 @@ mod tests {
     fn world(types: &[(&str, ManagedType)]) -> (Schema, IdsFile) {
         let t: TableName = "app.t".parse().unwrap();
         let mut table = Table::default();
-        for (name, ty) in [("id", "integer"), ("v", "app.d"), ("w", "app.d2")] {
+        for (name, ty) in [
+            ("id", "integer"),
+            ("v", "app.d"),
+            ("w", "app.d2"),
+            ("x", "app.d3"),
+        ] {
             table
                 .columns
                 .insert(name.into(), Column::new(ty.parse().unwrap()));
@@ -452,7 +470,7 @@ mod tests {
             ids.types
                 .insert(uid(n as u32 + 1), (*name).parse().unwrap());
         }
-        for column in ["id", "v", "w"] {
+        for column in ["id", "v", "w", "x"] {
             ids.columns.insert(
                 Uid::derived(UidKind::Column, column, 0),
                 ColumnRef {
@@ -802,5 +820,158 @@ mod tests {
                 .errors
                 .is_empty()
         );
+    }
+
+    /// The `base_change` of every `Retype` of a plan, by the column it moves.
+    fn base_changes(rebuilt: &Rebuilt) -> BTreeMap<String, Option<(String, String)>> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step:
+                        EnumRebuildStep::Retype {
+                            column,
+                            base_change,
+                            ..
+                        },
+                    ..
+                } => Some((
+                    column.name.raw().to_owned(),
+                    base_change
+                        .as_ref()
+                        .map(|pair| (pair.0.shown().to_string(), pair.1.shown().to_string())),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_domain_built_on_a_rebuilt_one_undergoes_its_roots_base_change() {
+        let on = |base: &str| domain(base, None, &[]);
+        // `v` is of `app.d` and `w` of `app.d2`, built on it: only `w` is
+        // held by the derived domain, and it is narrowed all the same.
+        let old = |base: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&old("varchar(20)"), &old("varchar(10)"), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            out.uids.get(&uid(3)),
+            Some(&Why::Derived("app.d".parse().unwrap()))
+        );
+        let pair = Some(("varchar(20)".to_owned(), "varchar(10)".to_owned()));
+        let changes = base_changes(&out);
+        assert_eq!(changes["v"], pair);
+        assert_eq!(
+            changes["w"], pair,
+            "the derived domain's column: {changes:?}"
+        );
+        // The conversion of the derived column is still through text.
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Text, .. },
+                ..
+            } if column.name.raw() == "w"
+        )));
+        // Through a third level, the same pair.
+        let deeper = |base: &str| {
+            let mut types = old(base);
+            types.push(("app.d3", on("app.d2")));
+            types
+        };
+        let out = run(
+            &deeper("varchar(20)"),
+            &deeper("varchar(10)"),
+            &Hints::default(),
+        );
+        let derived: Vec<_> = out
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    uid: u,
+                    step: EnumRebuildStep::Create { .. },
+                    ..
+                } => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derived.len(), 3, "{derived:?}");
+        assert_eq!(
+            base_changes(&out)["x"],
+            pair,
+            "three levels down: {:?}",
+            base_changes(&out)
+        );
+        // A widened base is carried as well: whether it narrows is the
+        // dialect's to say, and the gate and probe ask it per column.
+        let out = run(&old("varchar(20)"), &old("text"), &Hints::default());
+        assert_eq!(
+            base_changes(&out)["w"],
+            Some(("varchar(20)".to_owned(), "text".to_owned()))
+        );
+        // Negatives: a domain built on a rebuilt enum undergoes a change of
+        // labels and no change of base; nor does one beside an unchanged base.
+        let labels = |values: &[&str]| {
+            vec![
+                ("app.e", enumeration(values)),
+                ("app.d", on("app.e")),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&labels(&["a", "b"]), &labels(&["b"]), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(base_changes(&out)["v"], None);
+        assert_eq!(base_changes(&out)["w"], None);
+        let out = run(&old("varchar(20)"), &old("varchar(20)"), &Hints::default());
+        assert!(out.uids.is_empty() && base_changes(&out).is_empty());
+    }
+
+    #[test]
+    fn a_derived_domain_over_an_unconvertible_base_is_refused_like_a_direct_one() {
+        let on = |base: &str| domain(base, None, &[]);
+        let types = |base: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&types("varchar(20)"), &types("integer"), &Hints::default());
+        assert!(
+            out.changes.is_empty() && out.uids.is_empty(),
+            "{:?}",
+            out.changes
+        );
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(said.contains("app.d") && said.contains("#2331"), "{said}");
+        // A collation change alone carries no base pair, derived or not.
+        let collated = |collation: Option<&str>| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", domain("text", collation, &[])),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(
+            &collated(None),
+            &collated(Some("pg_catalog.\"C\"")),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.uids.len(), 2);
+        assert_eq!(base_changes(&out)["v"], None);
+        assert_eq!(base_changes(&out)["w"], None);
     }
 }

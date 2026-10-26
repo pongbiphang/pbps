@@ -5827,7 +5827,7 @@ mod tests {
     fn a_domains_narrowing_rebuild_counts_the_rows_that_do_not_fit() {
         let table: TableName = "app.t".parse().unwrap();
         let ty = |text: &str| crate::types::normalize(&text.parse().unwrap()).unwrap();
-        let retype = |array: bool, from: &str, to: &str| Change::EnumRebuild {
+        let retype_with = |array: bool, from: &str, to: &str, conversion| Change::EnumRebuild {
             uid: "y_000001".parse().unwrap(),
             name: "app.name".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -5838,8 +5838,11 @@ mod tests {
                 array,
                 removed: vec![],
                 base_change: Some(Box::new((ty(from), ty(to)))),
-                conversion: pbps_model::RetypeConversion::Assign,
+                conversion,
             },
+        };
+        let retype = |array, from: &str, to: &str| {
+            retype_with(array, from, to, pbps_model::RetypeConversion::Assign)
         };
         let report = preflight(&set(vec![retype(false, "varchar(20)", "varchar(10)")]));
         let [probe] = report.probes.as_slice() else {
@@ -5863,6 +5866,20 @@ mod tests {
         assert!(
             array.probes.is_empty() && !array.unchecked.is_empty(),
             "{array:#?}"
+        );
+        // A domain built on the rebuilt one moves through text and is counted
+        // all the same; its widening is not.
+        let derived =
+            |from: &str, to: &str| retype_with(false, from, to, pbps_model::RetypeConversion::Text);
+        let report = preflight(&set(vec![derived("varchar(20)", "varchar(10)")]));
+        assert!(
+            matches!(report.probes.as_slice(), [p] if p.description.contains("cannot become")),
+            "{report:#?}"
+        );
+        assert!(
+            preflight(&set(vec![derived("varchar(20)", "text")]))
+                .probes
+                .is_empty()
         );
     }
 
