@@ -30,6 +30,13 @@ pub enum Source {
     Execution,
     /// An edge a bounded search proposed (S4).
     Search,
+    /// A name matched in a text and nothing else: a guess the engine may not
+    /// need. A schedule obeys it unless it closes a cycle, and then gives the
+    /// order stated to the steps in that cycle ([`Schedule::prefer`],
+    /// DEC-2389.4).
+    ///
+    /// [`Schedule::prefer`]: super::Schedule::prefer
+    Guess,
 }
 
 /// Why an effect edge exists, so a report can say it and a reviewer can check

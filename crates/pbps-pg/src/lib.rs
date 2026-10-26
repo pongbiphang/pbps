@@ -1257,6 +1257,10 @@ impl Dialect for Postgres {
         generated::creation_text(module)
     }
 
+    fn scratch_text_edges_are_guesses(&self) -> bool {
+        true
+    }
+
     fn literals_name_objects(&self, text: &str) -> bool {
         generated::literals_name_objects(text)
     }

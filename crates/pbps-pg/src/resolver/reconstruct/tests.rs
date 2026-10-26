@@ -550,10 +550,20 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
         at("table app.plain") < at("function app.f(integer)"),
         "{order:?}"
     );
-    let why = build_reconstruction(&crate::Postgres::new(), &bootstrap(&schema(true)))
-        .unwrap_err()
-        .to_string();
-    assert!(why.contains("app.n") && why.contains("app.f"), "{why}");
+    // `f` reads the column its table waits for, so no order compiles: the
+    // edge from the table to `f` gives way (DEC-2389.4) and the plan's order
+    // is built, which the engine then refuses by name.
+    let cyclic = build_reconstruction(&crate::Postgres::new(), &bootstrap(&schema(true))).unwrap();
+    let order: Vec<_> = cyclic
+        .steps
+        .iter()
+        .map(|s| s.declaration.as_str())
+        .collect();
+    let at = |declaration: &str| order.iter().position(|d| *d == declaration).unwrap();
+    assert!(
+        at("function app.f(integer)") < at("table app.n"),
+        "{order:?}"
+    );
 }
 
 /// A partition's own default is set on scratch in its own step after its

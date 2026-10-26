@@ -2,6 +2,7 @@
 //! the schedule derives from what a part's text names. Each is measured on
 //! PostgreSQL 16 and 18 and compiled there by `scratch_rules_compile_on_both_servers`.
 use super::*;
+use crate::generated::SET_EXPRESSION_ARRIVED_IN;
 use pbps_model::{
     Column, Generated, Index, IndexColumn, IndexKey, Module, PartitionBound, PartitionBy,
     PartitionColumn, PartitionOf, Table, TableName, Uid, UidKind,
@@ -379,6 +380,16 @@ async fn scratch_rules_compile_on_both_servers() {
             create("t", held_table()),
             function("f"),
         ],
+        // A name matched by accident closes no cycle (DEC-2389.4): `VALUE` is
+        // not the domain of that name, a parameter is not the index of it.
+        vec![
+            declared_type(
+                "app.positive",
+                domain_with("integer", None, Some("VALUE > 0")),
+            ),
+            declared_type("app.value", domain_with("app.positive", None, None)),
+        ],
+        parameter_named_like_an_index(),
         // A generation that only says the name of a routine reading its table.
         vec![
             create("t", saying_a_routine()),
@@ -508,20 +519,18 @@ fn routines_that_call_each_other_late_are_no_cycle() {
     }
 }
 
-/// Negative: bodies the engine resolves at creation (`LANGUAGE sql`, measured
-/// the same with a string body, `BEGIN ATOMIC` and `RETURN`) that call each
-/// other leave no order, and stay the schedule's named refusal.
+/// Bodies the engine resolves at creation (`LANGUAGE sql`, measured the same
+/// with a string body, `BEGIN ATOMIC` and `RETURN`) that call each other have
+/// no order. Each edge rests on a name in the other's text, a guess that gives
+/// way where it closes a cycle (DEC-2389.4), so the plan's order is built and
+/// the engine names the routine it lacks (`scratch_refusals_name_what_is_missing`).
 #[test]
-fn routines_that_call_each_other_at_creation_stay_a_named_cycle() {
-    let pg = crate::Postgres::new();
-    let refused = |changes: &[Change]| match super::tests::build_reconstruction(&pg, changes) {
-        Err(ReconstructError::Cycle(message)) => message,
-        other => panic!("expected a cycle, got {:?}", other.map(|r| r.steps.len())),
-    };
-    let message = refused(&[create("t", defaulted()), sql("f", "g"), sql("g", "f")]);
+fn routines_that_call_each_other_at_creation_fall_back_to_the_plans_order() {
+    let changes = [create("t", defaulted()), sql("f", "g"), sql("g", "f")];
+    let built = order(&changes, None);
     assert!(
-        message.contains("app.f(integer)") && message.contains("app.g(integer)"),
-        "{message}"
+        at(&built, "function app.f(integer)") < at(&built, "function app.g(integer)"),
+        "{built:?}"
     );
     // Only one side resolves at creation: no cycle, and that side follows.
     let order = order(
@@ -559,12 +568,13 @@ fn a_late_routine_still_follows_what_its_header_names() {
 /// The same holds for a table: a PL/pgSQL body that reads the table of a
 /// generated column the routine itself computes is created before the table
 /// (measured: the body resolves nothing), where a `LANGUAGE sql` body that
-/// reads it leaves no order, which stays the schedule's named refusal.
+/// reads it has no order on a server that holds the table whole. The edge from
+/// the table to it is a guess and gives way (DEC-2389.4): the plan's order is
+/// built, with the routine ahead of the generation it computes.
 #[test]
 fn a_late_body_reading_a_table_does_not_follow_it() {
     let table = held_table();
     let reader = |language: &str, body: &str| routine("f", language, body);
-    let pg = crate::Postgres::new();
     for version in [None, Some(160_000)] {
         let changes = [
             create("t", table.clone()),
@@ -578,18 +588,13 @@ fn a_late_body_reading_a_table_does_not_follow_it() {
         // later the whole table, is the last step of the table.
         let last = order.iter().rposition(|d| d.contains("app.t")).unwrap();
         assert!(at(&order, "function app.f(integer)") < last, "{order:?}");
-        let pg = version.map_or_else(|| pg.clone(), |v| pg.clone().with_server_version(v));
         let changes = [
             create("t", table.clone()),
             reader("sql", " SELECT count(*)::int FROM app.t "),
         ];
-        assert!(
-            matches!(
-                super::tests::build_reconstruction(&pg, &changes),
-                Err(ReconstructError::Cycle(_))
-            ),
-            "{version:?}"
-        );
+        let sql = self::order(&changes, version);
+        let last = sql.iter().rposition(|d| d.contains("app.t")).unwrap();
+        assert!(at(&sql, "function app.f(integer)") < last, "{sql:?}");
     }
 }
 
@@ -916,12 +921,194 @@ fn a_generation_saying_a_routines_name_does_not_wait_for_it() {
         order(&[create("t", saying("u")), create("u", saying("t"))], None).len(),
         2
     );
-    // Negative: a cast to an OID-alias type names it, and the same call is the cycle.
+    // Negative: a cast to an OID-alias type names the routine, and then the
+    // table is held for it, though the routine's text reading the table is the
+    // guess that gives way.
     let named = generated("a + length('app.f(integer)'::regprocedure::text)");
     table.columns.insert("g".into(), named);
-    let pg = crate::Postgres::new();
-    assert!(matches!(
-        super::tests::build_reconstruction(&pg, &[create("t", table), reader]),
-        Err(ReconstructError::Cycle(_))
-    ));
+    let order = order(&[create("t", table), reader], None);
+    assert!(
+        at(&order, "function app.f(integer)") < at(&order, "table app.t"),
+        "{order:?}"
+    );
+}
+
+/// An index named `id` on the held table, and a routine whose parameter is
+/// `id`: the parameter is read as the index (a name matched in a text), which
+/// closes a cycle with the routine the table waits for (round 2, on 16).
+fn parameter_named_like_an_index() -> Vec<Change> {
+    let mut table = held_table();
+    table.indexes.clear();
+    table.indexes.insert("id".into(), keyed("id", false, None));
+    // The view is first, so only its edge keeps it behind the table.
+    vec![
+        module(
+            "app.v",
+            ModuleKind::View,
+            "SELECT 'app.id'::regclass::oid AS o",
+        ),
+        create("t", table),
+        module(
+            "app.f(integer)",
+            ModuleKind::Function,
+            "(id integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN id",
+        ),
+    ]
+}
+
+/// A guess that closes a cycle gives way, so the plan's order stands there
+/// (DEC-2389.4): `VALUE` in a check is not the domain `app.value`, and a
+/// parameter is not the index of that name, though the edges their names draw
+/// would close a cycle with an edge the engine does need.
+#[test]
+fn a_name_matched_by_accident_does_not_close_a_cycle() {
+    let positive = declared_type(
+        "app.positive",
+        domain_with("integer", None, Some("VALUE > 0")),
+    );
+    let value = declared_type("app.value", domain_with("app.positive", None, None));
+    for version in [None, Some(160_000)] {
+        let order = order(&[positive.clone(), value.clone()], version);
+        assert!(
+            at(&order, "type app.positive") < at(&order, "type app.value"),
+            "{order:?}"
+        );
+        let order = order_of_parameter(version);
+        // The table is held whole for the routine, which keeps the table's
+        // guess from reaching it.
+        if version == Some(160_000) {
+            assert!(
+                at(&order, "function app.f(integer)") < at(&order, "table app.t"),
+                "{order:?}"
+            );
+        }
+        // Negative: the view names the index in a cast, a guess that is in no
+        // cycle, so it still follows the table.
+        assert!(
+            at(&order, "table app.t") < at(&order, "view app.v"),
+            "{order:?}"
+        );
+    }
+}
+
+fn order_of_parameter(version: Option<i64>) -> Vec<String> {
+    order(&parameter_named_like_an_index(), version)
+}
+
+/// The same input gives the same order, whichever cycle it fell back from.
+#[test]
+fn the_fallback_gives_the_same_order_twice() {
+    let inputs = [
+        parameter_named_like_an_index(),
+        vec![
+            create("t", held_table()),
+            function("f"),
+            sql("g", "h"),
+            sql("h", "g"),
+        ],
+        vec![
+            declared_type("app.a", domain_with("text", Some("'b'"), None)),
+            declared_type("app.b", domain_with("text", Some("'a'"), None)),
+        ],
+    ];
+    for changes in inputs {
+        for version in [None, Some(160_000), Some(180_000)] {
+            assert_eq!(order(&changes, version), order(&changes, version));
+        }
+    }
+}
+
+/// Negative: a cycle of edges the engine needs by construction stays the
+/// schedule's named refusal, guesses or none: two routines each declared to
+/// need the other.
+#[test]
+fn a_cycle_of_declared_dependencies_stays_the_named_refusal() {
+    let changes = [create("t", held_table()), function("f"), function("g")];
+    let ids =
+        |name: &str| -> pbps_model::ModuleId { format!("app.{name}(integer)").parse().unwrap() };
+    let deps: pbps_model::ModuleDeps =
+        [(ids("f"), [ids("g")].into()), (ids("g"), [ids("f")].into())].into();
+    let refused = Reconstruction::with_dependencies(
+        &crate::Postgres::new(),
+        &crate::resolver::reconstruct::fixture_plan(&changes),
+        &crate::resolver::reconstruct::fixture_ids(&changes),
+        &deps,
+    );
+    match refused {
+        Err(ReconstructError::Cycle(message)) => assert!(
+            message.contains("app.f(integer)") && message.contains("app.g(integer)"),
+            "{message}"
+        ),
+        other => panic!(
+            "expected the named cycle, got {:?}",
+            other.map(|r| r.steps.len())
+        ),
+    }
+}
+
+/// What the guesses leave to the engine it refuses by name, with the way out
+/// (DEC-2389.4): routines that need each other, and a reader of a table that
+/// a server which cannot replace an expression holds back for the routine it
+/// reads through.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn scratch_refusals_name_what_is_missing() {
+    use pbps_db::{Conn, Driver};
+    let fixtures = [
+        (
+            vec![create("t", defaulted()), sql("f", "g"), sql("g", "f")],
+            "function app.g(integer)",
+        ),
+        (
+            vec![
+                create("t", held_table()),
+                routine("f", "sql", " SELECT count(*)::int FROM app.t "),
+            ],
+            "app.t",
+        ),
+    ];
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let server = std::env::var(variable).expect("both PostgreSQL endpoints are required");
+        let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        let version = crate::roles::server_version_num(&mut admin).await.unwrap();
+        let pg = crate::Postgres::new().with_server_version(version);
+        for (at, (changes, missing)) in fixtures.iter().enumerate() {
+            // A server that can replace an expression creates the table bare,
+            // and the routine reading it compiles.
+            if at == 1 && version >= SET_EXPRESSION_ARRIVED_IN {
+                continue;
+            }
+            let database = format!("pbps_s2389_refuse_{}_{at}", std::process::id());
+            admin
+                .execute(&format!("CREATE DATABASE {database} TEMPLATE template0"))
+                .await
+                .unwrap();
+            let refused: Result<(), String> = async {
+                let mut conn =
+                    Conn::connect(Driver::Postgres, &format!("{server} dbname={database}"))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                conn.execute("CREATE SCHEMA app")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                super::tests::build_reconstruction(&pg, changes)
+                    .map_err(|e| e.to_string())?
+                    .compile(&pg, &pbps_model::SessionZone::utc(), &mut conn)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            let why = refused.expect_err("the engine has no order for it");
+            assert!(
+                why.contains("does not exist")
+                    && why.contains(missing)
+                    && why.contains("`depends_on:`"),
+                "fixture {at}: {why}"
+            );
+        }
+    }
 }

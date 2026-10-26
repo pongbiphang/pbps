@@ -241,22 +241,25 @@ fn change_texts<'a>(
 
 /// Keep selection and settlement on exactly the same relation, including
 /// declared dependencies and the existing same-name exclusions (DEC-1503.5).
+/// Each edge is `(provider, consumer, declared)`: a declared one is stated by
+/// the user, and one that is only a name matched in the consumer's text is a
+/// guess (DEC-2389.4).
 fn module_dependencies(
     modules: &[ModuleStep<'_>],
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
-) -> Vec<(usize, usize)> {
+) -> Vec<(usize, usize, bool)> {
     let mut edges = Vec::new();
     for (i, id, module) in modules {
         let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
-            if i != j
-                && id.name() != provider.name()
-                && (dialect.generation_may_call(&text, provider.name())
-                    || deps.get(*id).is_some_and(|needs| needs.contains(*provider)))
-            {
-                edges.push((*j, *i));
+            if i == j || id.name() == provider.name() {
+                continue;
+            }
+            let declared = deps.get(*id).is_some_and(|needs| needs.contains(*provider));
+            if declared || dialect.generation_may_call(&text, provider.name()) {
+                edges.push((*j, *i, declared));
             }
         }
     }
@@ -315,8 +318,8 @@ fn parts_in(
                 pending.extend(
                     edges
                         .iter()
-                        .filter(|(_, consumer)| *consumer == at)
-                        .map(|(provider, _)| *provider),
+                        .filter(|(_, consumer, _)| *consumer == at)
+                        .map(|(provider, _, _)| *provider),
                 );
             }
         }
@@ -751,10 +754,15 @@ fn wait_for(
     own: &[(usize, &PlannedChange)],
     columns: &BTreeSet<String>,
     reader: usize,
+    guessed: bool,
 ) {
     let mut wait = |before: usize| {
         if before != reader {
-            out.edge(before, reader, Source::Lexical, OrderReason::Structural);
+            if guessed {
+                out.prefer(before, reader, OrderReason::Structural);
+            } else {
+                out.edge(before, reader, Source::Lexical, OrderReason::Structural);
+            }
         }
     };
     wait(first);
@@ -791,6 +799,17 @@ pub(super) fn constraints_in(
     let edge = |out: &mut Schedule, a, b| {
         if a != b {
             out.edge(a, b, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    // An edge that rests only on a name matched in a text (DEC-2389.4).
+    let guessed = scratch && dialect.scratch_text_edges_are_guesses();
+    let guess = |out: &mut Schedule, a, b| {
+        if guessed {
+            if a != b {
+                out.prefer(a, b, OrderReason::Structural);
+            }
+        } else {
+            edge(out, a, b);
         }
     };
     let modules = modules(&cs.changes);
@@ -921,7 +940,7 @@ pub(super) fn constraints_in(
                     .iter()
                     .all(|text| dialect.generation_table_name_only(text, name));
                 let shape = if name_only || whole { first } else { complete };
-                edge(&mut out, shape, i);
+                guess(&mut out, shape, i);
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -952,23 +971,27 @@ pub(super) fn constraints_in(
                 // Called readers already chose a full-shape placeholder or
                 // the whole-table hold; every consumer sees that full shape.
                 if let Some(columns) = reads(dialect, &[&text], name) {
-                    wait_for(dialect, &mut out, first, &own, &columns, *i);
+                    wait_for(dialect, &mut out, first, &own, &columns, *i, guessed);
                 } else {
-                    edge(&mut out, if whole { first } else { complete }, *i);
+                    guess(&mut out, if whole { first } else { complete }, *i);
                 }
             }
         }
     }
     if scratch {
-        scratch_rules(cs, declared, dialect, &mut out);
+        scratch_rules(cs, declared, dialect, guessed, &mut out);
     }
     if out.constraints().is_empty() {
         return Vec::new();
     }
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
-    for (provider, consumer) in module_dependencies(&modules, deps, dialect, scratch) {
-        edge(&mut out, provider, consumer);
+    for (provider, consumer, declared) in module_dependencies(&modules, deps, dialect, scratch) {
+        if declared {
+            edge(&mut out, provider, consumer);
+        } else {
+            guess(&mut out, provider, consumer);
+        }
     }
     out.constraints().iter().cloned().collect()
 }
@@ -1061,11 +1084,22 @@ fn scratch_rules(
     cs: &ChangeSet,
     declared: &Schema,
     dialect: &(impl Dialect + ?Sized),
+    guessed: bool,
     out: &mut Schedule,
 ) {
     let edge = |out: &mut Schedule, a, b| {
         if a != b {
             out.edge(a, b, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    // The edges of the rules that match a name in a text (DEC-2389.4).
+    let guess = |out: &mut Schedule, a, b| {
+        if guessed {
+            if a != b {
+                out.prefer(a, b, OrderReason::Structural);
+            }
+        } else {
+            edge(out, a, b);
         }
     };
     let readers: Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> = cs
@@ -1102,7 +1136,7 @@ fn scratch_rules(
                 .iter()
                 .any(|t| dialect.generation_may_call(t, name.name()))
             {
-                edge(out, at, *reader);
+                guess(out, at, *reader);
             }
         }
     }
@@ -1111,14 +1145,14 @@ fn scratch_rules(
             for name in early_index_names(&p.change) {
                 for (reader, texts) in &readers {
                     if texts.iter().any(|t| dialect.generation_may_call(t, name)) {
-                        edge(out, at, *reader);
+                        guess(out, at, *reader);
                     }
                 }
             }
             if matches!(&p.change, Change::AddIndex { index, .. } if index.holds_expression()) {
                 for (judged, q) in cs.changes.iter().enumerate() {
                     if is_judged(&q.change) {
-                        edge(out, judged, at);
+                        guess(out, judged, at);
                     }
                 }
             }

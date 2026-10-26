@@ -233,18 +233,24 @@ fn multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds() {
                 cyclic.modules.get_mut(&"app.f(integer)".parse().unwrap()).unwrap().definition =
                     "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT g FROM app.a LIMIT 1 $$".into();
                 let (cyclic, ids) = bootstrap(&cyclic, seed);
-                // Unknown/old engines keep the named hold and refusal. Modern
-                // placeholder behavior is pinned separately by #1503's tests.
-                let why = Reconstruction::new(
+                // `f` reads the column its own table waits for, so no order
+                // compiles. The edge from the table to `f` rests on a name in
+                // its text and gives way (DEC-2389.4): the plan's order is
+                // built, and the engine names the column it lacks.
+                let order: Vec<_> = Reconstruction::new(
                     &crate::Postgres::new(),
                     &crate::resolver::reconstruct::fixture_plan(&cyclic),
                     &ids,
                 )
-                .unwrap_err()
-                .to_string();
+                .unwrap()
+                .steps
+                .iter()
+                .map(|s| s.declaration.clone())
+                .collect();
+                let first = |d: &str| order.iter().position(|x| x == d).unwrap();
                 assert!(
-                    why.contains("app.a") && why.contains("app.f(integer)"),
-                    "{why}"
+                    first("function app.f(integer)") < first("table app.a"),
+                    "{order:?}"
                 );
             }
         }

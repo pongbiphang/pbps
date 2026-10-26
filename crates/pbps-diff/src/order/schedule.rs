@@ -271,6 +271,16 @@ impl Schedule {
         });
     }
 
+    /// `before` runs before `after` unless that closes a cycle: a guess, an
+    /// edge that rests on a name matched in a text and not on a need the caller
+    /// knows (DEC-2389.4). Settling obeys it like any edge, and when steps wait
+    /// on one another it drops the guesses between the members of that cycle
+    /// and settles again, so the order stated decides there. A cycle that
+    /// holds only edges stated with [`Schedule::edge`] is still the refusal.
+    pub fn prefer(&mut self, before: usize, after: usize, reason: OrderReason) {
+        self.edge(before, after, Source::Guess, reason);
+    }
+
     /// See [`Keep`].
     pub fn keep(&mut self, before: usize, after: usize, refusal: String) {
         self.keeps.push(Keep {
@@ -399,6 +409,9 @@ impl Schedule {
         }
         let mut kept: Vec<&Constraint> = self.constraints.iter().collect();
         let mut emitted = kahn(n, &kept, self.tie);
+        if emitted.len() < n && drop_guesses(n, &mut kept) {
+            emitted = kahn(n, &kept, self.tie);
+        }
         if emitted.len() < n {
             // A component made only of annotations is planned today, in the
             // order the module sort gave it; the policy is #2083's. Its
@@ -508,6 +521,28 @@ impl Schedule {
         }
         Ok((emitted, kept))
     }
+}
+
+/// Drops from `kept` every guess between two members of one strongly
+/// connected component, and says whether any was. Each cycle lies inside one
+/// component, so what is left of them holds no guess (DEC-2389.4); a guess
+/// between components, and outside any cycle, is kept.
+fn drop_guesses(n: usize, kept: &mut Vec<&Constraint>) -> bool {
+    let mut component = vec![usize::MAX; n];
+    for (id, members) in components(n, kept).into_iter().enumerate() {
+        if members.len() > 1 {
+            for member in members {
+                component[member] = id;
+            }
+        }
+    }
+    let before = kept.len();
+    kept.retain(|c| {
+        c.source != Source::Guess
+            || component[c.before] == usize::MAX
+            || component[c.before] != component[c.after]
+    });
+    kept.len() != before
 }
 
 /// Kahn's algorithm, the lowest position first among the steps that are
@@ -625,7 +660,7 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
         Source::Declared => OrderReason::Structural,
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,
-        Source::Effect | Source::Lexical | Source::Catalog => match &edge.because {
+        Source::Effect | Source::Lexical | Source::Catalog | Source::Guess => match &edge.because {
             Because::Boundary(_) => OrderReason::Structural,
             Because::Restores(_) => OrderReason::Restoration,
             Because::Creates(key)

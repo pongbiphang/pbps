@@ -2611,6 +2611,15 @@ pub trait Dialect {
         self.may_name(text, name)
     }
 
+    /// Whether the edges the scratch route derives only from a name matched in
+    /// a text (a call, a table, a type, an index a text mentions) are guesses
+    /// that give way where they close a cycle, and the order stated decides
+    /// there (DEC-2389.4). The default is that they are not: such an edge is
+    /// the engine's need, and a cycle of them is the schedule's named refusal.
+    fn scratch_text_edges_are_guesses(&self) -> bool {
+        false
+    }
+
     /// Whether a string literal in `text` may be read by the engine as the
     /// name of an object when it creates what holds the text (DEC-2389.3).
     /// The default is the liberal reading every caller made before this method

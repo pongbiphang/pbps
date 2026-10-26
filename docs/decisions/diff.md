@@ -8844,3 +8844,71 @@ Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
 `no_declared_column_or_domain_is_of_an_oid_alias_type`,
 `a_text_reads_its_strings_as_names_only_where_it_names_an_alias_type`, and the
 live `scratch_rules_compile_on_both_servers`.
+
+
+<a id="dec-2389-4"></a>
+
+**DEC-2389.4. A scratch edge that rests only on a name matched in a text is a
+guess, and gives way where it closes a cycle.** Part of #2389, ready-phase round
+2. The rules of DEC-2389.1 to DEC-2389.3 each read a name in a text as a
+dependency, and each time the guess closed a cycle with an edge the engine does
+need, the declaration was refused that the route they replaced created: `VALUE`
+in a domain's check read as the domain `app.value`, and a routine's parameter
+`id` read as the index `id` of a table the routine's own call holds back (on 16).
+Excluding one spelling at a time (DEC-2389.3) cannot end the class, which is
+that a name equal to another is no reference.
+
+A schedule has two kinds of edge. `Schedule::edge` states one the caller knows
+the engine needs. `Schedule::prefer` states a guess (`Source::Guess`): obeyed
+like any edge, and when steps wait on one another, `settle` drops the guesses
+whose two ends are in one strongly connected component and settles again, so the
+order stated, which here is the plan's, decides between the members. Each cycle
+lies in one component, so what is left of the cycles holds only stated edges, and
+a cycle of those is the named refusal. A guess in no cycle, or between
+components, is kept. Components, edges and ties are all in ascending order, so
+one input gives one order. The ordinary route never states a guess: its schedules
+and refusals are unchanged. `Dialect::scratch_text_edges_are_guesses` (false by
+default, true for PostgreSQL) is what makes scratch state its text-derived edges
+so; SQL Server states them as before.
+
+Which edge is which, by what it rests on:
+
+| Edge | Rests on | Kind |
+| --- | --- | --- |
+| the declared column chain, computed columns after them | the declaration | stated |
+| a table's own parts after its first part; non-column parts after the complete shape | the split | stated |
+| a consumer the model names (`uses.complete`, a seeded table's consumers) after the complete shape | the change | stated |
+| a foreign key after both tables and the referenced key; a replica identity after its index | the declaration | stated |
+| a partition's own default after its parent's | the declaration | stated |
+| a module after the modules its `depends_on:` names | the user | stated |
+| a function before the generated column, default or check part that calls it (`generation_calls`) | the call the engine needs at creation (measured, DEC-1364.1) | stated |
+| a module after the table whose complete shape or first part its text names | a name in a text | guess |
+| a part that names a table after its shape | a name in a text | guess |
+| a module after the module its text calls | a name in a text | guess |
+| a type before every change whose text names it, a domain over it included (DEC-2407.1) | a name in a text | guess |
+| a relation-namespace index before the change whose text names it (DEC-2389.1) | a name in a text | guess |
+| an index that holds an expression or a predicate after every module and generated expression | conservatism, not an engine need | guess |
+
+The plan's order carries what the guesses give up: the ordinary route already
+orders a domain after the type it is over and a table after the types of its
+columns (`type_inputs`, an effect edge), and scratch settles over the plan it is
+given. A declaration that no order creates, such as two
+`LANGUAGE sql` routines that call each other, is then reached by the engine
+instead of the schedule: the compile fails with the object it lacks
+(`42P01`, `42883`, `42704`, `42703`), and the message says that `depends_on:`
+states the order (`with_remedy`). Before this entry such a cycle was named by the
+schedule; it is now named by the engine, at the statement.
+
+Not changed: DEC-2389.3's reading of a string as a name only where an OID-alias
+type reads it. It removes edges that are no reference in any cycle or none, which
+the later-name checks still rely on.
+
+Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_orders`,
+`a_cycle_of_stated_edges_is_refused_though_guesses_share_it`,
+`the_fallback_over_guesses_is_deterministic`,
+`a_name_matched_by_accident_does_not_close_a_cycle`,
+`the_fallback_gives_the_same_order_twice`,
+`a_cycle_of_declared_dependencies_stays_the_named_refusal`,
+`routines_that_call_each_other_at_creation_fall_back_to_the_plans_order`, and the
+live `scratch_rules_compile_on_both_servers` and
+`scratch_refusals_name_what_is_missing`.

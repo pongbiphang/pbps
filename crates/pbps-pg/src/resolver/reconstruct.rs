@@ -63,9 +63,8 @@ pub enum ReconstructError {
     #[error("the scratch server cannot use the target's time zone {zone:?}: {reason}")]
     Zone { zone: String, reason: String },
     #[error(
-        "scratch cannot order the declarations: {0}. Each of them names another when the \
-         engine creates it (a generated column calling a function that reads the table, \
-         routines resolved at creation calling one another), so no order compiles them"
+        "scratch cannot order the declarations: {0}. Each of them needs another when the engine \
+         creates it, by a dependency the declarations state, so no order compiles them"
     )]
     Cycle(String),
 }
@@ -691,7 +690,7 @@ impl Reconstruction {
             for statement in group.statements() {
                 conn.execute(&statement.sql).await.map_err(|error| {
                     if judged_the_statement(&error) {
-                        failed(error.to_string())
+                        failed(with_remedy(&error))
                     } else {
                         interrupted(error.to_string())
                     }
@@ -720,6 +719,22 @@ impl Reconstruction {
             }
         }
         Ok(())
+    }
+}
+
+/// The server's refusal of a compile statement, and when it names an object
+/// that does not exist yet (`42P01` relation, `42883` function, `42704` type,
+/// `42703` column) the way out: scratch orders the declarations by the names
+/// their texts use, some of which it can only guess, and `depends_on:` states
+/// the order it should have (DEC-2389.4).
+fn with_remedy(error: &pbps_db::DbError) -> String {
+    match error.server_error_code().as_deref() {
+        Some("42P01" | "42883" | "42704" | "42703") => format!(
+            "{error}; scratch orders the declarations by the names their texts use, and this \
+             one needs an object that is not created yet: list it under `depends_on:` of the \
+             module that needs it to state the order"
+        ),
+        _ => error.to_string(),
     }
 }
 
