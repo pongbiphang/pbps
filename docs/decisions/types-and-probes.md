@@ -3575,6 +3575,13 @@ Maintainer, 2026-10-24: the second of two PRs, after the partition keys
   staged run is checked against the checkpoint's own recorded rows and needs
   nothing; the plan's read is widened from the `renamed_from` hints, which name
   the same pairs the plan's renames do.
+- **No staged plan holds a chain of renames** (measured on 16 and 18): each
+  `RenameEnumValue` is a logical change, so a chain is two or more, and
+  `plan --staged` and the apply of an artifact edited into a staged one both
+  refuse it ("a staged plan must contain exactly one logical change"), alone
+  or beside an `ensure` table's rows. The per-step reads of a staged run need
+  no scope derived from the renames still ahead: the one rename a staged plan
+  can hold is the statement before the read.
 - **The widened baseline is trimmed to what the plan still manages**
   (`trim_to_the_final_scope`): the baseline of an `ensure` table is read under
   the declared keys and the labels they held, and a chain (`b→c`, `a→b`) over
@@ -3614,7 +3621,8 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `a_staged_label_rename_under_ensure_rows_applies_and_resumes`,
 `a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key`,
 `a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table`,
-`a_takeover_under_a_renamed_key_pins_the_row_it_depends_on` and
+`a_takeover_under_a_renamed_key_pins_the_row_it_depends_on`,
+`a_staged_plan_cannot_hold_a_chain_of_label_renames` and
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.

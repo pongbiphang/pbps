@@ -7032,3 +7032,103 @@ fn a_takeover_under_a_renamed_key_pins_the_row_it_depends_on() {
         }
     }
 }
+
+/// Measured on PG 16 and 18: a chain of label renames is more than one logical
+/// change, so no staged plan holds one, alone or beside an `ensure` table's
+/// rows, and an artifact edited into a staged one is refused by the apply
+/// (the finding about the per-step reads of such a chain is unreachable).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_plan_cannot_hold_a_chain_of_label_renames() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for with_rows in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_rows_staged_chain2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-rows-staged-chain2346");
+            if with_rows {
+                enum_rows(
+                    &d,
+                    "[a, b, keep]",
+                    "ensure",
+                    "    a: {note: first}\n    b: {note: second}\n",
+                );
+            } else {
+                std::fs::write(
+                    d.dir.join("schema/app.mood.type.yml"),
+                    "enum: app.mood\nvalues: [a, b, keep]\n",
+                )
+                .unwrap();
+            }
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let chain = "[{name: b, renamed_from: a}, {name: c, renamed_from: b}, keep]";
+            if with_rows {
+                enum_rows(&d, chain, "ensure", "    b: {note: first}\n");
+            } else {
+                std::fs::write(
+                    d.dir.join("schema/app.mood.type.yml"),
+                    format!("enum: app.mood\nvalues: {chain}\n"),
+                )
+                .unwrap();
+            }
+            d.commit();
+            let path = d.dir.join("staged-chain.plan.json");
+            let out = d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]);
+            assert_ne!(code(&out), 0, "rows {with_rows}");
+            assert!(
+                stderr(&out).contains("--staged applies one logical change, and this plan has"),
+                "rows {with_rows}: {}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+
+            // A transactional plan edited into a staged one, with the
+            // fingerprint of the edit, is refused by the apply as well.
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let mut plan: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            plan["mode"] = "staged".into();
+            std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+            let checksum = plan_checksum(&path);
+            let out = d.run(&[
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--staged",
+                "--allow",
+                "rename",
+            ]);
+            assert_ne!(code(&out), 0, "rows {with_rows}");
+            let said = stderr(&out);
+            assert!(
+                said.contains("a staged plan must contain exactly one logical change"),
+                "rows {with_rows}: {said}"
+            );
+            // Nothing was applied: the labels are as they were.
+            assert_eq!(
+                text_of(
+                    db,
+                    "SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum \
+                     WHERE enumtypid = 'app.mood'::regtype"
+                ),
+                "a,b,keep"
+            );
+        }
+    }
+}
