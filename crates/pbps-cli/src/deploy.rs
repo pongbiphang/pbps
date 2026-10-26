@@ -8098,7 +8098,11 @@ pub fn cmd_plan_db(
         // one place a change window has a moment and a target to be measured
         // against. An `error` refuses the plan here, before anything is
         // written; `apply` never sees a policy.
-        let policy = crate::attach_policy_findings(&mut cs, project, dialect.as_ref(), true);
+        let policy = crate::attach_policy_findings(
+            &mut cs, project, dialect.as_ref(), true,
+            pbps_diff::Side { schema: &base, ids: &recorded_ids },
+            pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+        );
         if !json {
             for f in &policy {
                 eprintln!("{}: {} — {}", f.severity_word(), f.id, f.message);

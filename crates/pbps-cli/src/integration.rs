@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 67;
+pub const SCHEMA_VERSION: u32 = 68;
+// 68: declared external consumers and their built-in policy rules (#2398).
 // 67: the advisory domain-vet availability policy (#2309).
 // 64: recording self-reported external data work (#2402); ordered after #2432's 63.
 // 63: an environment's `rehearse:` and a connected plan's `rehearsal` (#2379).
@@ -1678,5 +1679,44 @@ mod tests {
             assert_eq!(v["x-pbps-schema-version"], SCHEMA_VERSION);
             assert_eq!(v["x-pbps-tool-version"], env!("CARGO_PKG_VERSION"));
         }
+    }
+    #[test]
+    fn consumer_schema_keeps_entries_as_strings_and_suppression_keys_unchanged() {
+        let document = schema(SchemaKind::Config);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        let valid = serde_json::json!({"dialect":"postgres", "consumers":{"billing-v41":{"owner":"billing", "note":"rolling", "uses":["app.t.old", "app.f(integer)"], "writes":["app.t"]}}});
+        assert!(validator.is_valid(&valid));
+        assert!(
+            pbps_config::Config::parse(&valid.to_string(), std::path::Path::new("pbps.yml"))
+                .is_ok()
+        );
+        for bad in [
+            serde_json::json!({"uses":[{"kind":"column","name":"app.t.old"}]}),
+            serde_json::json!({"read":["app.t"]}),
+            serde_json::json!({"writes":[1]}),
+        ] {
+            let mut value = valid.clone();
+            value["consumers"]["billing-v41"] = bad;
+            assert!(!validator.is_valid(&value));
+            if let Ok(config) =
+                pbps_config::Config::parse(&value.to_string(), std::path::Path::new("pbps.yml"))
+            {
+                // YAML scalar coercion can produce "1"; it must still fail
+                // reference validation rather than disappear from the list.
+                assert!(
+                    !pbps_policy::consumers::validate(
+                        &config.consumers,
+                        &Default::default(),
+                        &Clone::clone
+                    )
+                    .is_empty()
+                );
+            }
+        }
+        let mut suppressed = valid;
+        suppressed["policies"] = serde_json::json!({"suppress":[{"rule":"consumer.unproven","on":"app.t","reason":"rolling","until":"2026-12-01"}]});
+        assert!(validator.is_valid(&suppressed));
+        suppressed["policies"]["suppress"][0]["consumer"] = "billing-v41".into();
+        assert!(!validator.is_valid(&suppressed));
     }
 }

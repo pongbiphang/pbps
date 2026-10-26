@@ -49,13 +49,31 @@ pub const GRANT_WIDEN: &str = "grant.widen";
 pub const CHANGE_WINDOW: &str = "change.window";
 
 pub const DOMAIN_VET_UNAVAILABLE: &str = "plan.domain-vet-unavailable";
+pub const CONSUMER_BREAKING: &str = "consumer.breaking";
+pub const CONSUMER_UNPROVEN: &str = "consumer.unproven";
 
-pub const RULES: [Rule; 11] = [
+pub const RULES: [Rule; 13] = [
     Rule {
         id: DOMAIN_VET_UNAVAILABLE,
         point: Point::ConnectedPlan,
         default: Some(Severity::Warning),
         about: "the selected scratch can vet declared domain CHECK and DEFAULT code before apply",
+        params: &[],
+        required: &[],
+    },
+    Rule {
+        id: CONSUMER_BREAKING,
+        point: Point::Plan,
+        default: Some(Severity::Error),
+        about: "a declared consumer keeps the object names it still uses or writes",
+        params: &[],
+        required: &[],
+    },
+    Rule {
+        id: CONSUMER_UNPROVEN,
+        point: Point::Plan,
+        default: Some(Severity::Error),
+        about: "a declared consumer's changed interface or writes cannot be proven compatible",
         params: &[],
         required: &[],
     },

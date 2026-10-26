@@ -47,7 +47,7 @@ impl Context {
 }
 
 /// A rule's live setting, with the `off` and the suppression already applied.
-struct Live<'a> {
+pub(crate) struct Live<'a> {
     id: &'static str,
     severity: Severity,
     config: crate::config::RuleConfig,
@@ -56,7 +56,11 @@ struct Live<'a> {
 }
 
 impl Live<'_> {
-    fn of<'a>(policies: &'a Policies, id: &'static str, ctx: &Context) -> Option<Live<'a>> {
+    pub(crate) fn of<'a>(
+        policies: &'a Policies,
+        id: &'static str,
+        ctx: &Context,
+    ) -> Option<Live<'a>> {
         let effective = policies.effective(id);
         let severity = effective.severity?;
         Some(Live {
@@ -68,7 +72,11 @@ impl Live<'_> {
         })
     }
 
-    fn finding(&self, subject: Option<&str>, message: impl Into<String>) -> Option<Finding> {
+    pub(crate) fn finding(
+        &self,
+        subject: Option<&str>,
+        message: impl Into<String>,
+    ) -> Option<Finding> {
         if self.policies.suppressed(self.id, subject, &self.today) {
             return None;
         }

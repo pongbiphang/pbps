@@ -1,0 +1,273 @@
+//! These cases run with both flow harnesses; the public CLI owns the boundary.
+use super::*;
+
+fn config(d: &Demo, contracts: &str) {
+    let path = d.dir.join("pbps.yml");
+    let old = std::fs::read_to_string(&path).unwrap();
+    let dialect = old.lines().next().unwrap();
+    std::fs::write(path, format!("{dialect}\n{contracts}")).unwrap();
+}
+fn table(d: &Demo, columns: &str) {
+    d.table(&format!("table: app.t\ncolumns:\n{columns}"));
+}
+fn ok(o: Output) {
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+}
+fn refused(d: &Demo, id: &str, args: &[&str]) -> serde_json::Value {
+    let mut args = args.to_vec();
+    args.extend(["--format", "json"]);
+    let o = d.run(&args);
+    assert_eq!(code(&o), 2, "{}{}", stdout(&o), stderr(&o));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == id),
+        "{json}"
+    );
+    json
+}
+
+#[test]
+fn consumer_contracts_refuse_recorded_drops_without_publishing_and_retirement_permits_them() {
+    let d = Demo::new("consumer-drop");
+    table(&d, "  old: {type: integer}\n");
+    ok(d.run(&["plan"]));
+    d.commit();
+    config(&d, "consumers:\n  billing-v41: {uses: [app.t.old]}\n");
+    table(&d, "  kept: {type: integer}\n");
+    ok(d.run(&["drop", "app.t.old", "--reason", "retired"]));
+    let ids = d.dir.join("schema.ids.json");
+    let before = std::fs::read(&ids).unwrap();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    std::fs::write(&plan, "keep plan").unwrap();
+    std::fs::write(&sql, "keep sql").unwrap();
+    let json = refused(
+        &d,
+        "consumer.breaking",
+        &[
+            "plan",
+            "--out",
+            plan.to_str().unwrap(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ],
+    );
+    let message = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "consumer.breaking")
+        .unwrap()["message"]
+        .as_str()
+        .unwrap();
+    assert!(
+        message.contains("billing-v41")
+            && message.contains("consumers.billing-v41.uses: app.t.old")
+            && message.contains("alongside"),
+        "{message}"
+    );
+    assert_eq!(std::fs::read(&ids).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&plan).unwrap(), "keep plan");
+    assert_eq!(std::fs::read_to_string(&sql).unwrap(), "keep sql");
+    config(&d, "");
+    ok(d.run(&["plan", "--out", plan.to_str().unwrap()]));
+}
+
+#[test]
+fn consumer_contracts_follow_renamed_uids_and_distinguish_narrowing_from_widening() {
+    let d = Demo::new("consumer-rename");
+    table(&d, "  old: {type: varchar(50)}\n");
+    ok(d.run(&["plan"]));
+    d.commit();
+    table(&d, "  new: {type: varchar(50), renamed_from: old}\n");
+    config(&d, "consumers:\n  billing-v41: {uses: [app.t.new]}\n");
+    refused(&d, "consumer.breaking", &["plan"]);
+    config(&d, "");
+    ok(d.run(&["plan"]));
+    ok(d.run(&["fmt"]));
+    d.commit();
+    config(&d, "consumers:\n  billing-v41: {uses: [app.t.new]}\n");
+    table(&d, "  new: {type: varchar(20)}\n");
+    refused(&d, "consumer.unproven", &["plan"]);
+    table(
+        &d,
+        "  new: {type: varchar(100)}\n  another: {type: integer}\n",
+    );
+    ok(d.run(&["plan"]));
+}
+
+#[test]
+fn consumer_contracts_validate_every_reference_and_plain_strings_have_no_kind_escape() {
+    let d = Demo::new("consumer-validation");
+    table(&d, "  old: {type: integer}\n");
+    ok(d.run(&["plan"]));
+    d.commit();
+    config(&d, "consumers:\n  bad: {uses: [app.absent]}\n");
+    refused(&d, "consumer.invalid", &["validate", "--since", "HEAD"]);
+    config(&d, "consumers:\n  bad: {uses: [app.t.old, app.t.old]}\n");
+    refused(&d, "consumer.invalid", &["validate"]);
+    for contracts in [
+        "consumers:\n  bad: {uses: [{kind: column, name: app.t.old}]}\n",
+        "consumers:\n  bad: {uses: [app.t]}\n  bad: {uses: [app.t]}\n",
+    ] {
+        config(&d, contracts);
+        let o = d.run(&["validate"]);
+        assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    }
+    config(
+        &d,
+        "consumers:\n  good: {owner: team, note: rolling, uses: [app.t.old], writes: [app.t]}\n",
+    );
+    ok(d.run(&["validate", "--since", "HEAD"]));
+}
+
+#[test]
+fn consumer_contracts_writes_have_their_own_unproven_rule_and_default_exception() {
+    let d = Demo::new("consumer-writes");
+    table(&d, "  old: {type: integer}\n");
+    ok(d.run(&["plan"]));
+    d.commit();
+    config(&d, "consumers:\n  billing-v41: {writes: [app.t]}\n");
+    table(&d, "  old: {type: integer, nullable: false}\n");
+    let json = refused(&d, "consumer.unproven", &["plan"]);
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "consumer.unproven"
+                && f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot be proven compatible")),
+        "{json}"
+    );
+    config(
+        &d,
+        "consumers:\n  billing-v41: {writes: [app.t]}\npolicies:\n  rules: {consumer.unproven: warning}\n",
+    );
+    ok(d.run(&["plan"]));
+    config(&d, "consumers:\n  billing-v41: {writes: [app.t]}\n");
+    table(
+        &d,
+        "  old: {type: integer}\n  added: {type: integer, nullable: false, default: '0'}\n",
+    );
+    let o = d.run(&["plan", "--format", "json"]);
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(!stdout(&o).contains("consumer.unproven"));
+    table(
+        &d,
+        "  old: {type: integer}\n  added: {type: integer, nullable: false}\n",
+    );
+    refused(&d, "consumer.unproven", &["plan"]);
+}
+
+/// Called by one owned-database case on MSSQL and both supported PG engines.
+pub(super) fn live(server: &str, pg: bool) {
+    let own = OwnDatabase::new(server, "consumer2398");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("consumer-connected");
+    d.table("table: app.t\ncolumns:\n  old: {type: varchar(50)}\nchecks:\n  ck: old <> ''\n");
+    ok(d.run(&["plan"]));
+    d.commit();
+    ok(d.run(&["bootstrap", "--db", connection]));
+    let contracts = "consumers:\n  billing-v41: {writes: [app.t]}\n";
+    config(&d, contracts);
+    d.table("table: app.t\ncolumns:\n  old: {type: varchar(100)}\nchecks:\n  ck: old <> ''\n");
+    ok(d.run(&["plan", "--db", connection]));
+    for declaration in [
+        "table: app.t\ncolumns:\n  old: {type: varchar(50), nullable: false}\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nchecks:\n  ck: old <> 'blocked'\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nunique:\n  uq: [old]\n",
+        "table: app.t\ncolumns:\n  old: {type: varchar(50)}\nindexes:\n  ux: {columns: [old], unique: true}\n",
+    ] {
+        d.table(declaration);
+        refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+        config(&d, "");
+        ok(d.run(&["plan", "--db", connection]));
+        config(&d, contracts);
+    }
+    // Seal before adding a contract that would refuse the same plan now.
+    config(&d, "");
+    table(&d, "  old: {type: varchar(50), nullable: false}\n");
+    let plan = d.dir.join("sealed.json");
+    ok(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let checksum = plan_checksum(&plan);
+    config(&d, contracts);
+    refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    ok(d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &checksum,
+        "--allow",
+        "not-null",
+    ]));
+    ok(d.run(&["verify", "--db", connection]));
+    // A view-column removal and a routine-interface change are opaque, not safe.
+    let d = Demo::new("consumer-modules");
+    table(&d, "  old: {type: integer}\n");
+    let view = d.dir.join("schema/view.yml");
+    std::fs::write(&view, "view: app.v\ndefinition: SELECT 1 AS a, 2 AS b\n").unwrap();
+    let routine = d.dir.join("schema/routine.yml");
+    let (name, body, changed) = if pg {
+        (
+            "app.f(integer)",
+            "(i integer) RETURNS integer LANGUAGE sql AS $$ SELECT i $$",
+            "(i integer) RETURNS integer LANGUAGE sql AS $$ SELECT i + 1 $$",
+        )
+    } else {
+        (
+            "app.f",
+            "(@i int) RETURNS int AS BEGIN RETURN @i END",
+            "(@i int, @j int) RETURNS int AS BEGIN RETURN @i + @j END",
+        )
+    };
+    std::fs::write(
+        &routine,
+        format!("function: {name}\ndefinition: |\n  {body}\n"),
+    )
+    .unwrap();
+    ok(d.run(&["plan"]));
+    d.commit();
+    let own = OwnDatabase::new(server, "consumer_modules2398");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    ok(d.run(&["bootstrap", "--db", connection]));
+    config(
+        &d,
+        &format!(
+            "consumers:\n  report: {{uses: [app.v, '{}']}}\n",
+            if pg { "app.f(int)" } else { name }
+        ),
+    );
+    std::fs::write(&view, "view: app.v\ndefinition: SELECT 1 AS a\n").unwrap();
+    std::fs::write(
+        &routine,
+        format!("function: {name}\ndefinition: |\n  {changed}\n"),
+    )
+    .unwrap();
+    let json = refused(&d, "consumer.unproven", &["plan", "--db", connection]);
+    assert_eq!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "consumer.unproven")
+            .count(),
+        2,
+        "{json}"
+    );
+    if pg {
+        std::fs::write(&routine, "function: app.f(text)\ndefinition: (i text) RETURNS text LANGUAGE sql AS $$ SELECT i $$\n").unwrap();
+        refused(&d, "consumer.breaking", &["plan", "--db", connection]);
+    }
+}

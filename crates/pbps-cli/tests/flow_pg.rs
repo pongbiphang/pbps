@@ -36089,3 +36089,14 @@ fn data_work_does_not_replace_deployed_commit_evidence() {
 fn data_work_preserves_cli_audit_and_json_boundaries() {
     data_work::cli_boundaries(true);
 }
+
+#[path = "support/consumer_contracts.rs"]
+mod consumer_contracts;
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        consumer_contracts::live(&std::env::var(variable).unwrap(), true);
+    }
+}

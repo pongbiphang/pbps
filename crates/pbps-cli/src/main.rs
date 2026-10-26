@@ -2125,6 +2125,8 @@ pub fn attach_policy_findings<S: Clone>(
     project: &Project,
     dialect: &dyn Dialect,
     connected: bool,
+    before: Side<'_>,
+    after: Side<'_>,
 ) -> Vec<output::Finding> {
     let policies = project.config.policies();
     if !policies.check().is_empty() {
@@ -2138,7 +2140,35 @@ pub fn attach_policy_findings<S: Clone>(
     }
     let ctx = policy_context(project, dialect, connected);
     let mut out = Vec::new();
-    let findings = pbps_policy::plan(cs, &policies, &ctx);
+    let sides = [
+        pbps_policy::consumers::Side {
+            schema: before.schema,
+            ids: before.ids,
+        },
+        pbps_policy::consumers::Side {
+            schema: after.schema,
+            ids: after.ids,
+        },
+    ];
+    let bound =
+        match pbps_policy::consumers::Bindings::resolve(&project.config.consumers, &sides, &|id| {
+            policy_module_id(id, dialect)
+        }) {
+            Ok(bound) => bound,
+            Err(errors) => {
+                return errors
+                    .into_iter()
+                    .map(|message| {
+                        output::Finding::error("consumer.invalid", message)
+                            .at(project.config_file(), None)
+                    })
+                    .collect();
+            }
+        };
+    let mut findings = pbps_policy::plan(cs, &policies, &ctx);
+    findings.extend(pbps_policy::consumers::plan(
+        cs, &bound, &sides, &policies, &ctx,
+    ));
     for (_, finding) in &findings {
         out.push(policy_finding(finding));
     }
@@ -2205,6 +2235,27 @@ pub(crate) fn load_quiet(
     Ok(loaded)
 }
 
+fn policy_module_id(id: &pbps_model::ModuleId, dialect: &dyn Dialect) -> pbps_model::ModuleId {
+    match id {
+        pbps_model::ModuleId::Routine(r) => {
+            pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
+                r.name.clone(),
+                r.args
+                    .iter()
+                    .map(|a| {
+                        dialect
+                            .normalize_routine_arg(a)
+                            .unwrap_or_else(|_| a.clone())
+                    })
+                    .collect(),
+            ))
+        }
+        other @ (pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. }) => {
+            other.clone()
+        }
+    }
+}
+
 /// Every routine identity in the dialect's own spelling of its argument types.
 ///
 /// The loader is dialect-free, so `app.f(int, text)` arrives spelled as it was
@@ -2230,26 +2281,7 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
     hints: &mut pbps_model::Hints,
     dialect: &dyn Dialect,
 ) -> Vec<String> {
-    let spell = |id: &pbps_model::ModuleId| -> pbps_model::ModuleId {
-        match id {
-            pbps_model::ModuleId::Routine(r) => {
-                pbps_model::ModuleId::Routine(pbps_model::RoutineId::new(
-                    r.name.clone(),
-                    r.args
-                        .iter()
-                        .map(|a| {
-                            dialect
-                                .normalize_routine_arg(a)
-                                .unwrap_or_else(|_| a.clone())
-                        })
-                        .collect(),
-                ))
-            }
-            other @ (pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. }) => {
-                other.clone()
-            }
-        }
-    };
+    let spell = |id: &pbps_model::ModuleId| policy_module_id(id, dialect);
     let mut problems = Vec::new();
     let mut modules: std::collections::BTreeMap<pbps_model::ModuleId, pbps_model::Module> =
         std::collections::BTreeMap::new();
@@ -2746,6 +2778,15 @@ fn validate_inspected(
         // The project's own rules (ADR-0008): the declaration point. The block
         // itself is checked first — a misspelled rule id that configured
         // nothing would be the silent failure this mechanism exists to replace.
+        findings.extend(
+            pbps_policy::consumers::validate(&project.config.consumers, &l.schema, &|id| {
+                policy_module_id(id, dialect)
+            })
+            .into_iter()
+            .map(|message| {
+                output::Finding::error("consumer.invalid", message).at(project.config_file(), None)
+            }),
+        );
         let policies = project.config.policies();
         for problem in policies.check() {
             findings.push(
@@ -4169,7 +4210,20 @@ fn cmd_plan(
         // the plan file carries them to `explain`, and reported here at the
         // severity the project chose. An `error` refuses to produce the plan —
         // nothing below writes a file for it — and never reaches `apply`.
-        let policy = attach_policy_findings(&mut cs, project, dialect.as_ref(), false);
+        let policy = attach_policy_findings(
+            &mut cs,
+            project,
+            dialect.as_ref(),
+            false,
+            Side {
+                schema: &base_schema,
+                ids: &base.ids,
+            },
+            Side {
+                schema: &loaded.schema,
+                ids: &res.ids,
+            },
+        );
         let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
         findings.extend(policy);
 

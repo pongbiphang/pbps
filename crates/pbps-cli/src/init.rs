@@ -175,6 +175,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         // width, and a new project has no partitioned table to be ahead of.
         partition_runway: None,
         policies: None,
+        consumers: Default::default(),
     };
     let config_text = render_config(&config);
 
@@ -719,6 +720,7 @@ mod tests {
             max_data_rows: None,
             partition_runway: None,
             policies: None,
+            consumers: Default::default(),
         };
         let text = render_config(&config);
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");

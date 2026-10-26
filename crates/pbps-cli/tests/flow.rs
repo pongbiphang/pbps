@@ -23936,3 +23936,12 @@ fn data_work_does_not_replace_deployed_commit_evidence() {
 fn data_work_preserves_cli_audit_and_json_boundaries() {
     data_work::cli_boundaries(false);
 }
+
+#[path = "support/consumer_contracts.rs"]
+mod consumer_contracts;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
+    consumer_contracts::live(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
