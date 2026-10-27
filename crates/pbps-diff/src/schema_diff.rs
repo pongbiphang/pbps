@@ -2998,6 +2998,33 @@ fn columns_of(ids: &pbps_model::IdsIndex<'_>, table: &TableName) -> BTreeMap<Uid
         .collect()
 }
 
+fn partition_columns_by_uid<'a, T: 'a>(
+    columns: impl IntoIterator<Item = (&'a ColumnName, &'a T)>,
+    before: &TableName,
+    after: &TableName,
+    index: &Indexes<'_>,
+) -> BTreeMap<ColumnName, &'a T> {
+    // What became of each of the parent's base columns, by uid: its declared
+    // name, or `None` where the plan drops it. By uid and not by name, since
+    // one plan can drop a column and rename another into its name (#1692
+    // review). A column no identity names is taken as it stands.
+    let now_by_uid = columns_of(&index.declared, after);
+    let fate: BTreeMap<ColumnName, Option<ColumnName>> = columns_of(&index.base, before)
+        .into_iter()
+        .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
+        .collect();
+    let is_now = |c: &ColumnName| -> Option<ColumnName> {
+        match fate.get(c) {
+            Some(now) => now.clone(),
+            None => Some(c.clone()),
+        }
+    };
+    columns
+        .into_iter()
+        .filter_map(|(c, value)| Some((is_now(c)?, value)))
+        .collect()
+}
+
 /// The renames this plan performs, as a map the model can bring a base-side
 /// table's constraints forward through.
 ///
@@ -5551,33 +5578,9 @@ fn diff_partition_columns(
     };
     let parent = declared.schema.tables.get(&now.parent);
     let base_parent = base.schema.tables.get(&was.parent);
-    // What became of each of the parent's base columns, by uid: its declared
-    // name, or `None` where the plan drops it. By uid and not by name, since
-    // one plan can drop a column and rename another into its name (#1692
-    // review). A column no identity names is taken as it stands.
-    let now_by_uid = columns_of(&index.declared, &now.parent);
-    let fate: BTreeMap<ColumnName, Option<ColumnName>> = columns_of(&index.base, &was.parent)
-        .into_iter()
-        .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
-        .collect();
-    let is_now = |c: &ColumnName| -> Option<ColumnName> {
-        match fate.get(c) {
-            Some(now) => now.clone(),
-            None => Some(c.clone()),
-        }
-    };
-    let was_columns: BTreeMap<ColumnName, &pbps_model::PartitionColumn> = was
-        .columns
-        .iter()
-        .filter_map(|(c, own)| Some((is_now(c)?, own)))
-        .collect();
-    let base_of: BTreeMap<ColumnName, &pbps_model::Column> = base_parent
-        .map(|p| {
-            p.columns
-                .iter()
-                .filter_map(|(c, column)| Some((is_now(c)?, column)))
-                .collect()
-        })
+    let was_columns = partition_columns_by_uid(&was.columns, &was.parent, &now.parent, index);
+    let base_of = base_parent
+        .map(|p| partition_columns_by_uid(&p.columns, &was.parent, &now.parent, index))
         .unwrap_or_default();
     let none = pbps_model::PartitionColumn::default();
     let loosened: BTreeSet<ColumnName> = parent
@@ -7630,6 +7633,10 @@ pub fn restoration_comparison<'a>(
     dialect: &'a (impl Dialect + ?Sized),
 ) -> impl Fn(&Change, Option<&Uid>) -> bool + 'a {
     let renames = renames_of(base, declared);
+    let index = Indexes {
+        base: base.ids.index(),
+        declared: declared.ids.index(),
+    };
     let mut changed = BTreeSet::new();
     let mut partition_defaults = BTreeSet::new();
     for (uid, old) in &base.ids.tables {
@@ -7644,7 +7651,9 @@ pub fn restoration_comparison<'a>(
         let mut edits = Vec::new();
         let renamed = renames.apply(before, old);
         diff_constraints(new, &renamed, after, &mut edits);
-        if let (Some(was), Some(now)) = (&renamed.partition_of, &after.partition_of) {
+        if let (Some(was), Some(now)) = (&before.partition_of, &after.partition_of) {
+            let was_columns =
+                partition_columns_by_uid(&was.columns, &was.parent, &now.parent, &index);
             for column in declared
                 .schema
                 .tables
@@ -7658,7 +7667,7 @@ pub fn restoration_comparison<'a>(
                     .is_some_and(|id| base.ids.columns.contains_key(id));
                 if existed
                     && !defaults_differ(
-                        was.columns.get(column).and_then(|c| c.default.as_ref()),
+                        was_columns.get(column).and_then(|c| c.default.as_ref()),
                         now.columns.get(column).and_then(|c| c.default.as_ref()),
                     )
                 {
@@ -26381,6 +26390,117 @@ mod tests {
                 assert!(!compare(&unrelated, Some(&owner)));
             }
         }
+    }
+
+    fn partition_default_after_name_reuse(default: &str, unchanged: bool) {
+        use pbps_model::{PartitionBound, PartitionColumn, PartitionOf};
+        let parent: TableName = "app.parent".parse().unwrap();
+        let leaf: TableName = "app.leaf".parse().unwrap();
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let child: Uid = "t_bbbbbb".parse().unwrap();
+        let survives: Uid = "c_aaaaaa".parse().unwrap();
+        let drops: Uid = "c_bbbbbb".parse().unwrap();
+        let own = |value: &str| PartitionColumn {
+            default: Some(value.into()),
+            not_null: false,
+        };
+        let mut before = schema_of(
+            "app.parent",
+            table(&[("m", Column::new(ty("int"))), ("n", Column::new(ty("int")))]),
+        );
+        before.tables.insert(
+            leaf.clone(),
+            Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.clone(),
+                    bound: PartitionBound::Default,
+                    columns: [("m".into(), own("7")), ("n".into(), own("8"))].into(),
+                }),
+                ..Default::default()
+            },
+        );
+        let old_ids = IdsFile {
+            tables: [(owner, parent.clone()), (child.clone(), leaf.clone())].into(),
+            columns: [
+                (survives.clone(), parent.column("m")),
+                (drops.clone(), parent.column("n")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        after
+            .tables
+            .get_mut(&parent)
+            .unwrap()
+            .columns
+            .shift_remove("m");
+        after
+            .tables
+            .get_mut(&leaf)
+            .unwrap()
+            .partition_of
+            .as_mut()
+            .unwrap()
+            .columns = [("n".into(), own(default))].into();
+        let mut ids = old_ids.clone();
+        ids.columns.remove(&drops);
+        ids.columns.insert(survives, parent.column("n"));
+        let base = Side {
+            schema: &before,
+            ids: &old_ids,
+        };
+        let declared = Side {
+            schema: &after,
+            ids: &ids,
+        };
+        let compare = restoration_comparison(base, declared, &MinimalDialect);
+        let restoration = Change::SetPartitionDefault {
+            uid: child.clone(),
+            table: leaf.clone(),
+            parent,
+            column: "n".into(),
+            from: None,
+            to: Some(default.into()),
+            fallback: None,
+        };
+        assert_eq!(compare(&restoration, Some(&child)), unchanged);
+        // The callback must make the same logical decision as ordinary planning.
+        let mut changes = Vec::new();
+        let mut errors = Vec::new();
+        let index = Indexes {
+            base: old_ids.index(),
+            declared: ids.index(),
+        };
+        diff_partition_columns(
+            &child,
+            &leaf,
+            &before.tables[&leaf],
+            &after.tables[&leaf],
+            base,
+            declared,
+            &index,
+            &MinimalDialect,
+            &mut changes,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            changes.iter().any(
+                |c| matches!(c, Change::SetPartitionDefault { column, .. } if column.raw() == "n")
+            ),
+            !unchanged
+        );
+    }
+
+    #[test]
+    fn an_unchanged_partition_default_follows_the_surviving_uid_into_a_dropped_name() {
+        partition_default_after_name_reuse("7", true);
+    }
+
+    #[test]
+    fn a_changed_partition_default_cannot_hide_behind_the_dropped_columns_value() {
+        partition_default_after_name_reuse("8", false);
     }
 }
 
