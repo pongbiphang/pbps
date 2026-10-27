@@ -1,6 +1,6 @@
 //! Parse-time input paths must be judged before any original expression binds.
-//! PostgreSQL resolves literal parameters; only modifier syntax needs a coarse
-//! name check because typmodin itself runs during Parse (DEC-2378.1).
+//! PostgreSQL resolves literal parameters; modifier type positions are checked
+//! first because typmodin itself runs during Parse (DEC-2378.1).
 use pbps_db::{Conn, DbError};
 use pbps_model::{TableName, escape::Escaped};
 
@@ -63,17 +63,21 @@ pub(super) async fn before_bind(
         )
         .await
         .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
+    let spans = crate::LEXICON.string_literal_spans(expression);
     if !modifiers.is_empty() {
-        let code = [
-            crate::LEXICON.header(expression),
-            crate::LEXICON.header(source_type),
+        // The source is a type declaration, not an expression. Give it the
+        // same type-position marker as an expression's explicit cast.
+        let source = format!("::{source_type}");
+        let tokens = [
+            modifier_tokens(expression, &spans),
+            modifier_tokens(&source, &crate::LEXICON.string_literal_spans(&source)),
         ];
         for row in &modifiers {
             let name: &str = need(row, "name")
                 .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
             let schema: &str = need(row, "schema")
                 .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
-            if code.iter().any(|s| names_modifier(s, name)) {
+            if tokens.iter().any(|t| names_modifier(t, schema, name)) {
                 return Err(format!(
                     "cannot be bound safely: type `{}.{}` has a modifier routine that is not built into PostgreSQL",
                     Escaped(schema),
@@ -82,8 +86,7 @@ pub(super) async fn before_bind(
             }
         }
     }
-    let spans: Vec<_> = crate::LEXICON
-        .string_literal_spans(expression)
+    let spans: Vec<_> = spans
         .into_iter()
         .filter(|s| !matches!(expression.as_bytes()[s.start], b'b' | b'B' | b'x' | b'X'))
         .collect();
@@ -137,38 +140,138 @@ impl LiteralInputs {
     }
 }
 
-// A name immediately followed by '(' supplies modifiers (or names a function
-// already refused by the bound-tree audit). This does not resolve SQL grammar.
-// In a qualified name only its last identifier can be followed by '('.
-fn names_modifier(code: &str, name: &str) -> bool {
-    let mut chars = code.chars().peekable();
-    while let Some(ch) = chars.next() {
-        let quoted = ch == '"';
-        if !quoted && !pbps_dialect::continues_ident(ch) {
+// Only the type positions in gram.y can call typmodin; an ordinary function
+// call with a colliding name belongs to the bound-tree audit (DEC-2378.1).
+enum ModifierToken {
+    Name(String, bool), // The flag preserves quoted spelling, including keywords.
+    Cast,
+    Symbol(char),
+    Literal,
+}
+
+fn modifier_tokens(text: &str, spans: &[std::ops::Range<usize>]) -> Vec<ModifierToken> {
+    let code = crate::LEXICON.header(text);
+    let mut chars = code.char_indices().peekable();
+    let mut literals = spans.iter().peekable();
+    let mut tokens = Vec::new();
+    while let Some((at, ch)) = chars.next() {
+        if literals.peek().is_some_and(|s| s.start == at) {
+            let span = literals.next().unwrap();
+            while chars.next_if(|(at, _)| *at < span.end).is_some() {}
+            tokens.push(ModifierToken::Literal);
+        } else if ch.is_ascii_whitespace() {
+            continue;
+        } else if ch == '"' || pbps_dialect::continues_ident(ch) {
+            let quoted = ch == '"';
+            let mut name = String::new();
+            if quoted {
+                while let Some((_, c)) = chars.next() {
+                    if c == '"' && chars.next_if(|(_, c)| *c == '"').is_none() {
+                        break;
+                    }
+                    name.push(c);
+                }
+            } else {
+                name.push(ch);
+                while let Some((_, c)) = chars.next_if(|(_, c)| pbps_dialect::continues_ident(*c)) {
+                    name.push(c);
+                }
+                name.make_ascii_lowercase();
+            }
+            while name.len() > 63 {
+                name.pop();
+            }
+            tokens.push(ModifierToken::Name(name, quoted));
+        } else if ch == ':' && chars.next_if(|(_, c)| *c == ':').is_some() {
+            tokens.push(ModifierToken::Cast);
+        } else {
+            tokens.push(ModifierToken::Symbol(ch));
+        }
+    }
+    tokens
+}
+
+fn names_modifier(tokens: &[ModifierToken], schema: &str, name: &str) -> bool {
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(token, ModifierToken::Name(n, _) if n == name)
+            || !matches!(tokens.get(i + 1), Some(ModifierToken::Symbol('(')))
+        {
             continue;
         }
-        let mut token = String::new();
-        if quoted {
-            while let Some(c) = chars.next() {
-                if c == '"' && chars.next_if(|c| *c == '"').is_none() {
-                    break;
-                }
-                token.push(c);
-            }
-        } else {
-            token.push(ch);
-            while let Some(c) = chars.next_if(|c| pbps_dialect::continues_ident(*c)) {
-                token.push(c);
-            }
-            token.make_ascii_lowercase();
+        let mut start = i;
+        while start >= 2
+            && matches!(tokens[start - 1], ModifierToken::Symbol('.'))
+            && matches!(tokens[start - 2], ModifierToken::Name(..))
+        {
+            start -= 2;
         }
-        while token.len() > 63 {
-            token.pop();
+        if i > start && !matches!(&tokens[i - 2], ModifierToken::Name(s, _) if s == schema) {
+            continue;
         }
-        while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
-        if token == name && chars.peek() == Some(&'(') {
+        if start > 0
+            && (matches!(tokens[start - 1], ModifierToken::Cast)
+                || matches!(&tokens[start - 1], ModifierToken::Name(s, false) if s == "as" || s == "returning"))
+        {
             return true;
+        }
+        let mut depth = 0;
+        for (j, token) in tokens.iter().enumerate().skip(i + 1) {
+            match token {
+                ModifierToken::Symbol('(') => depth += 1,
+                ModifierToken::Symbol(')') => depth -= 1,
+                ModifierToken::Name(..)
+                | ModifierToken::Cast
+                | ModifierToken::Symbol(_)
+                | ModifierToken::Literal => {}
+            }
+            if depth == 0 {
+                if matches!(tokens.get(j + 1), Some(ModifierToken::Literal)) {
+                    return true;
+                }
+                break;
+            }
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{modifier_tokens, names_modifier};
+
+    #[test]
+    fn modifiers_are_type_positions_not_function_names() {
+        let names = |text| {
+            names_modifier(
+                &modifier_tokens(text, &crate::LEXICON.string_literal_spans(text)),
+                "app",
+                "length",
+            )
+        };
+        for text in [
+            "x::app.length(1)",
+            "CAST(x AS length(1))",
+            "TREAT(x AS app.length(1))",
+            "XMLSERIALIZE(CONTENT x AS app.length(1))",
+            "JSON_ARRAY(RETURNING app.length(1))",
+            "app.length((1)) /* gap */ '1'",
+            "length(1) E'1'",
+            "length(1) $tag$1$tag$",
+        ] {
+            assert!(names(text), "{text}");
+        }
+        for text in [
+            "length(status)",
+            "pg_catalog.length(status)",
+            "x::other.length(1)",
+            "CAST(x AS pg_catalog.length(1))",
+            "x::\"APP\".length(1)",
+            "length(')') || '1'",
+            "length((1)) + '1'",
+            "length(status) /* 'not a literal' */",
+            "'length(1)'",
+        ] {
+            assert!(!names(text), "{text}");
+        }
+    }
 }
