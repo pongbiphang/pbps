@@ -102,7 +102,10 @@ place (slice 3a, DEC-1635.6) and removed or reordered by rebuilding the enum
 under its uid (slice 3b, DEC-1635.7); a domain's checks, default and NOT NULL
 change in place (slice 4a, DEC-1635.8); its base type and collation, and the
 domains over a rebuilt enum, by rebuilding it under its uid (slice 4b,
-DEC-1635.9). References retain the current eligibility gate. References are
+DEC-1635.9). Declared routine signatures and argument defaults over a rebuilt
+enum or domain use the existing transactional module rebuild (DEC-2392.1);
+unmanaged routines and carried state the rebuild cannot restore still refuse.
+References retain the current eligibility gate. References are
 pinned at replay; retypes are refused, and so are row data and partition keys
 over them except a scalar declared enum, which carries rows and keys a LIST
 or RANGE table (#1523, DEC-1523.1, DEC-2346.1, DEC-2346.2).
