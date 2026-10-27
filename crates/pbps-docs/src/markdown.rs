@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use pbps_model::{ComputedColumn, IdsFile, Module, ModuleId, Role, Schema, Table, TableName};
+use pbps_model::{
+    ComputedColumn, IdsFile, ManagedType, Module, ModuleId, Role, Schema, Table, TableName, TypeRef,
+};
 
 use crate::erd;
 
@@ -18,9 +20,9 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     // A new schema family must be considered by every prose renderer.
     let Schema {
         tables,
+        types,
         modules,
         roles,
-        ..
     } = schema;
     let mut s = String::new();
     let _ = writeln!(s, "# {title}\n");
@@ -44,11 +46,70 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    types_section(&mut s, types);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
     graveyard(&mut s, ids);
     s
+}
+
+/// Declared types are grouped by schema; enum labels retain their authored order.
+fn types_section(s: &mut String, types: &BTreeMap<TypeRef, ManagedType>) {
+    if types.is_empty() {
+        return;
+    }
+    s.push_str("\n## Types\n");
+    let mut current_schema = None;
+    for (name, definition) in types {
+        if current_schema != Some(name.schema()) {
+            let _ = writeln!(s, "\n### {}\n", code_cell(name.schema()));
+            current_schema = Some(name.schema());
+        }
+        let _ = writeln!(s, "\n#### {}\n", code_cell(&name.raw().to_string()));
+        match definition {
+            ManagedType::Enum { values } => {
+                s.push_str("*Enum*\n\n| Label |\n|---|\n");
+                for label in values {
+                    let _ = writeln!(s, "| {} |", code_cell(label));
+                }
+            }
+            ManagedType::Domain {
+                base,
+                not_null,
+                default,
+                checks,
+                collation,
+            } => {
+                s.push_str("*Domain*\n\n| Property | Value |\n|---|---|\n");
+                let _ = writeln!(
+                    s,
+                    "| Base type | {} |\n| NOT NULL | {} |\n| Default | {} |\n| Collation | {} |",
+                    code_cell(&base.raw().to_string()),
+                    if *not_null { "yes" } else { "no" },
+                    default
+                        .as_deref()
+                        .map(code_cell)
+                        .unwrap_or_else(|| "—".into()),
+                    collation
+                        .as_ref()
+                        .map(|c| code_cell(&c.raw().to_string()))
+                        .unwrap_or_else(|| "—".into()),
+                );
+                if !checks.is_empty() {
+                    s.push_str("\n| Check | Expression |\n|---|---|\n");
+                    for (name, expression) in checks {
+                        let _ = writeln!(
+                            s,
+                            "| {} | {} |",
+                            code_cell(name.raw()),
+                            code_cell(expression)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Views, procedures, functions and triggers, with their definitions.
