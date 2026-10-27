@@ -171,7 +171,7 @@ async fn mssql_each_surface_gets_the_engines_answer() {
         ("app", "syn"),
         ("app", "typed"),
     ]);
-    let captured = capture::capture(&mut db.conn, &scope)
+    let captured = capture::capture(&mut db.conn, &scope, &crate::capture_key())
         .await
         .expect("capture");
 
@@ -229,11 +229,12 @@ async fn mssql_a_one_part_names_candidates_see_an_arrival_in_the_modules_schema_
     let first = capture::capture(
         &mut db.conn,
         &objects(&[("app", "one_part"), ("app", "bound")]),
+        &crate::capture_key(),
     )
     .await
     .expect("capture");
     let scope = first.runtime_scope();
-    let sealed = capture::capture(&mut db.conn, &scope)
+    let sealed = capture::capture(&mut db.conn, &scope, &crate::capture_key())
         .await
         .expect("capture");
     let in_app = candidate(CandidateClass::Object, "app", "price");
@@ -288,9 +289,13 @@ async fn mssql_a_schema_bound_binding_is_the_targets_observed_one() {
         ],
     )
     .await;
-    let captured = capture::capture(&mut db.conn, &objects(&[("app", "bound")]))
-        .await
-        .expect("capture");
+    let captured = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "bound")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let price = object("app", "price");
     assert!(bound(&captured, &object("app", "bound")).contains(&column(&price, "v")));
     let (_, differences) = capture::recapture(&mut db.conn, &captured)
@@ -298,7 +303,12 @@ async fn mssql_a_schema_bound_binding_is_the_targets_observed_one() {
         .expect("recapture");
     assert_eq!(differences, Vec::new(), "nothing changed");
 
-    let refused = capture::capture(&mut db.conn, &objects(&[("app", "far")])).await;
+    let refused = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "far")]),
+        &crate::capture_key(),
+    )
+    .await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("another database")),
         "{:?}",
@@ -329,7 +339,7 @@ async fn mssql_unreadable_dependency_metadata_never_verifies() {
     let scope = objects(&[("app", "v")]);
 
     let (mut neither, first) = login(&mut db, "neither", "").await;
-    let refused = capture::capture(&mut neither, &scope).await;
+    let refused = capture::capture(&mut neither, &scope, &crate::capture_key()).await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("VIEW DEFINITION")),
         "{:?}",
@@ -351,7 +361,7 @@ async fn mssql_unreadable_dependency_metadata_never_verifies() {
         .await
         .expect("the view answers");
     assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some("0"));
-    let refused = capture::capture(&mut select_only, &scope).await;
+    let refused = capture::capture(&mut select_only, &scope, &crate::capture_key()).await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("VIEW DEFINITION")),
         "{:?}",
@@ -367,9 +377,16 @@ async fn mssql_unreadable_dependency_metadata_never_verifies() {
             .as_str(),
     )
     .await;
-    let captured = capture::capture(&mut both, &scope).await.expect("capture");
+    let captured = capture::capture(&mut both, &scope, &crate::capture_key())
+        .await
+        .expect("capture");
     assert!(bound(&captured, &object("app", "v")).contains(&object("app", "price")));
-    let refused = capture::capture(&mut both, &objects(&[("app", "later")])).await;
+    let refused = capture::capture(
+        &mut both,
+        &objects(&[("app", "later")]),
+        &crate::capture_key(),
+    )
+    .await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("does not exist yet")),
         "{:?}",
@@ -410,6 +427,7 @@ async fn mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_princip
     let captured = capture::capture(
         &mut db.conn,
         &objects(&[("app", "anyone"), ("app", "fixed"), ("app", "system")]),
+        &crate::capture_key(),
     )
     .await
     .expect("capture");
@@ -434,9 +452,13 @@ async fn mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_princip
 
     // The fixed principal alone: its default schema and dbo.
     run(&mut db.conn, &["DROP PROCEDURE app.anyone;"]).await;
-    let fixed = capture::capture(&mut db.conn, &objects(&[("app", "fixed")]))
-        .await
-        .expect("capture");
+    let fixed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "fixed")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let wanted = fixed.runtime_scope().candidates;
     assert!(wanted.contains(&candidate(CandidateClass::Object, "other", "q")));
     assert!(wanted.contains(&candidate(CandidateClass::Object, "dbo", "q")));
@@ -450,7 +472,7 @@ async fn mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_princip
             candidate(CandidateClass::SystemProcedure, "sys", "q"),
         ]),
     };
-    let system = capture::capture(&mut db.conn, &asked)
+    let system = capture::capture(&mut db.conn, &asked, &crate::capture_key())
         .await
         .expect("capture");
     assert_eq!(
@@ -497,10 +519,14 @@ async fn mssql_a_recapture_finds_a_lasting_change_from_another_session_and_not_a
         ],
     )
     .await;
-    let first = capture::capture(&mut db.conn, &objects(&[("app", "one_part")]))
-        .await
-        .expect("capture");
-    let sealed = capture::capture(&mut db.conn, &first.runtime_scope())
+    let first = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "one_part")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
+    let sealed = capture::capture(&mut db.conn, &first.runtime_scope(), &crate::capture_key())
         .await
         .expect("capture");
     let mut other = connect_live(&conn_str()).await.expect("connect");
@@ -657,7 +683,7 @@ async fn mssql_a_candidate_is_matched_under_the_databases_collation() {
             retained: BTreeSet::new(),
             candidates: BTreeSet::from([asked.clone()]),
         };
-        let captured = capture::capture(&mut db.conn, &scope)
+        let captured = capture::capture(&mut db.conn, &scope, &crate::capture_key())
             .await
             .expect("capture");
         let expected = if found {
@@ -686,10 +712,19 @@ async fn mssql_an_encrypted_module_refuses_by_name() {
         ],
     )
     .await;
-    capture::capture(&mut db.conn, &objects(&[("app", "plain")]))
-        .await
-        .expect("a readable module is captured");
-    let refused = capture::capture(&mut db.conn, &objects(&[("app", "secret")])).await;
+    capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "plain")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("a readable module is captured");
+    let refused = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "secret")]),
+        &crate::capture_key(),
+    )
+    .await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("encrypted")),
         "{:?}",
@@ -716,9 +751,13 @@ async fn mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_
     for batch in build("label nvarchar(20)") {
         run(&mut db.conn, &[&batch]).await;
     }
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "takes")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "takes")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let rows = user_type("app", "rows");
     assert!(bound(&sealed, &object("app", "takes")).contains(&rows));
     assert!(bound(&sealed, &rows).contains(&user_type("sys", "nvarchar")));
@@ -750,9 +789,13 @@ async fn mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_
         ],
     )
     .await;
-    let counted = capture::capture(&mut db.conn, &objects(&[("app", "counts")]))
-        .await
-        .expect("capture");
+    let counted = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "counts")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     run(
         &mut db.conn,
         &[
@@ -793,9 +836,13 @@ async fn mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "r")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "r")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let fk = bound(&sealed, &object("app", "fk_r"));
     assert!(fk.contains(&object("app", "k")) && fk.contains(&object("app", "uq_k")));
 
@@ -823,9 +870,13 @@ async fn mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured() {
 
     // A unique index that is no constraint is the table's: its columns too.
     run(&mut db.conn, &["CREATE UNIQUE INDEX ux_b ON app.k (b);"]).await;
-    let indexed = capture::capture(&mut db.conn, &objects(&[("app", "k")]))
-        .await
-        .expect("capture");
+    let indexed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "k")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     run(
         &mut db.conn,
         &[
@@ -862,9 +913,13 @@ async fn mssql_a_checks_disabled_and_untrusted_states_are_differences() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let check = object("app", "ck_a");
     let changed = |differences: &[pbps_db::resolver::capture::CaptureDifference]| {
         differences
@@ -911,9 +966,13 @@ async fn mssql_a_checks_disabled_and_untrusted_states_are_differences() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     for (object_name, disable) in [
         ("tr_t", "DISABLE TRIGGER app.tr_t ON app.t;"),
         ("uq_a", "ALTER INDEX uq_a ON app.t DISABLE;"),
@@ -950,9 +1009,13 @@ async fn mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates()
         ],
     )
     .await;
-    let first = capture::capture(&mut db.conn, &objects(&[("app", "declares")]))
-        .await
-        .expect("capture");
+    let first = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "declares")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     assert_eq!(
         first.runtime_bound().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from([object("app", "declares")])
@@ -969,7 +1032,7 @@ async fn mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates()
             .candidates
             .contains(&candidate(CandidateClass::Type, "dbo", "amount"))
     );
-    let sealed = capture::capture(&mut db.conn, &scope)
+    let sealed = capture::capture(&mut db.conn, &scope, &crate::capture_key())
         .await
         .expect("capture");
     assert_eq!(sealed.members(&in_app), Some(&BTreeSet::new()));
@@ -1026,7 +1089,7 @@ async fn mssql_a_seal_without_its_runtime_candidates_refuses() {
         "{:?}",
         refused.err()
     );
-    let discovered = capture::capture(&mut db.conn, &short)
+    let discovered = capture::capture(&mut db.conn, &short, &crate::capture_key())
         .await
         .expect("capture");
     capture::capture_qualified(&mut db.conn, &discovered.runtime_scope(), &key, &recorded)
@@ -1067,9 +1130,13 @@ async fn mssql_an_identitys_seed_and_not_for_replication_are_differences() {
     let mut db = TestDb::create("replication2141").await;
     run(&mut db.conn, &["CREATE SCHEMA app;"]).await;
     rebuild_replicated(&mut db, "1,1", "").await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t"), ("app", "r")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t"), ("app", "r")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let t = object("app", "t");
     let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
                    what: &ObjectIdentity| {
@@ -1158,9 +1225,13 @@ async fn mssql_a_column_no_rule_names_is_compared() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let t = object("app", "t");
     let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
                    what: &ObjectIdentity| {
@@ -1246,9 +1317,13 @@ async fn mssql_a_table_types_expressions_call_no_user_function() {
         ],
     )
     .await;
-    let captured = capture::capture(&mut db.conn, &objects(&[("app", "takes")]))
-        .await
-        .expect("a table type of built-in expressions is captured");
+    let captured = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "takes")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("a table type of built-in expressions is captured");
     assert!(bound(&captured, &object("app", "takes")).contains(&user_type("app", "builtin")));
     db.drop().await;
 }
@@ -1278,9 +1353,13 @@ async fn mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compar
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t"), ("app", "takes")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t"), ("app", "takes")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let t = object("app", "t");
     let (d, r) = (object("app", "d_zero"), object("app", "r_pos"));
     assert!(bound(&sealed, &column(&t, "a")).contains(&d));
@@ -1335,9 +1414,13 @@ async fn mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compar
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let seq = object("app", "seq");
     assert!(bound(&sealed, &object("app", "df_id")).contains(&seq));
     let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
@@ -1405,6 +1488,7 @@ async fn mssql_a_partition_scheme_and_an_encryption_key_are_compared_by_definiti
     let sealed = capture::capture(
         &mut db.conn,
         &objects(&[("app", "parted"), ("app", "secret")]),
+        &crate::capture_key(),
     )
     .await
     .expect("capture");
@@ -1433,6 +1517,7 @@ async fn mssql_a_partition_scheme_and_an_encryption_key_are_compared_by_definiti
     let sealed = capture::capture(
         &mut db.conn,
         &objects(&[("app", "parted"), ("app", "secret")]),
+        &crate::capture_key(),
     )
     .await
     .expect("capture");
@@ -1470,9 +1555,13 @@ async fn mssql_a_heap_and_an_index_of_any_name_are_both_compared() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "h")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "h")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     run(
         &mut db.conn,
         &[
@@ -1517,6 +1606,7 @@ async fn mssql_a_tables_own_settings_are_compared() {
     let sealed = capture::capture(
         &mut db.conn,
         &objects(&[("app", "versioned"), ("app", "checked")]),
+        &crate::capture_key(),
     )
     .await
     .expect("capture");
@@ -1641,9 +1731,13 @@ async fn mssql_the_audits_views_are_compared() {
         ],
     )
     .await;
-    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
-        .await
-        .expect("capture");
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "t")]),
+        &crate::capture_key(),
+    )
+    .await
+    .expect("capture");
     let t = object("app", "t");
     let policy = object("app", "filter");
     assert!(
@@ -1698,7 +1792,12 @@ async fn mssql_a_numbered_procedure_group_refuses_by_name() {
         ],
     )
     .await;
-    let refused = capture::capture(&mut db.conn, &objects(&[("app", "grouped")])).await;
+    let refused = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "grouped")]),
+        &crate::capture_key(),
+    )
+    .await;
     assert!(
         matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("numbered")),
         "{:?}",
@@ -1729,6 +1828,7 @@ async fn mssql_a_modules_partition_function_and_xml_collection_are_bindings() {
     let sealed = capture::capture(
         &mut db.conn,
         &objects(&[("app", "part_of"), ("app", "typed_xml")]),
+        &crate::capture_key(),
     )
     .await
     .expect("a module binding either is captured");

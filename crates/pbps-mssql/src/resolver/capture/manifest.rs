@@ -12,14 +12,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Serialize or digest getter: a definition read here leaves only as a keyed
 /// fingerprint, and only its producer seals it.
 pub struct CapturedInputs {
+    pub(super) producer: super::identity::Producer,
     pub(super) declarations: pbps_model::dependency::Dependencies,
     major: u32,
     session: Session,
     baseline: Baseline,
     scope: CaptureScope,
     pub(super) inputs: BTreeMap<ObjectIdentity, Input>,
-    candidates: BTreeMap<CandidateSet, BTreeSet<ObjectIdentity>>,
-    runtime: BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
+    pub(super) candidates: BTreeMap<CandidateSet, BTreeSet<ObjectIdentity>>,
+    pub(super) runtime: BTreeMap<ObjectIdentity, BTreeSet<RuntimeName>>,
 }
 
 impl CapturedInputs {
@@ -43,7 +44,7 @@ impl CapturedInputs {
                 (matches!(
                     id.class.as_str(),
                     super::class::SCHEMA | super::class::OBJECT
-                ) || (id.class == super::class::TYPE
+                ) || id.class.starts_with("pbps-unnamed-") || (id.class == super::class::TYPE
                     && input.properties.get("user_defined")
                         == Some(&serde_json::Value::Bool(true))))
                     && input.properties.get("engine") != Some(&serde_json::Value::Bool(true))
@@ -93,8 +94,14 @@ impl CapturedInputs {
             .collect()
     }
 
-    pub(super) fn new(catalog: Catalog, selected: Selected, scope: CaptureScope) -> Self {
+    pub(super) fn new(
+        catalog: Catalog,
+        selected: Selected,
+        scope: CaptureScope,
+        producer: super::identity::Producer,
+    ) -> Self {
         Self {
+            producer,
             declarations: catalog.declarations,
             major: catalog.major,
             session: catalog.session,
@@ -228,6 +235,9 @@ impl CapturedInputs {
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
         ownership: &BTreeMap<ObjectIdentity, pbps_model::resolver::ObjectOwnership>,
     ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        if key.id() != self.producer.key().id() {
+            return Err(pbps_model::resolver::ManifestError::Invalid);
+        }
         use pbps_model::resolver::{
             Binding, CandidateSet as Predicate, InputManifest, Membership, ObjectOwnership,
             Prerequisite, ReadScope,

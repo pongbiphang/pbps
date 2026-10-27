@@ -58,7 +58,9 @@ impl Fixture {
         auth::PrincipalMap,
         auth::OwnerPartition,
     ) {
-        let captured = capture::capture(&mut self.target, scope).await.unwrap();
+        let captured = capture::capture(&mut self.target, scope, &crate::capture_key())
+            .await
+            .unwrap();
         let mut context = auth::read(&mut self.target, &["dbo".into()]).await.unwrap();
         let owners = auth::OwnerPartition::from_capture(&captured, &context).unwrap();
         auth::read_staged_permissions(&mut self.target, &mut context, &owners)
@@ -91,7 +93,14 @@ impl Fixture {
         roots: &BTreeSet<capture::ObjectIdentity>,
         managed: &[&pbps_model::Schema],
     ) -> Result<capture::Staged, StageError> {
-        capture::compare_staged(&mut self.scratch, &mut self.target, roots, managed).await
+        capture::compare_staged(
+            &mut self.scratch,
+            &mut self.target,
+            roots,
+            managed,
+            &crate::capture_key(),
+        )
+        .await
     }
     async fn clean(&mut self) {
         scratch::inventory::cleanup(&mut self.scratch, Some(SANDBOX))
@@ -218,7 +227,7 @@ async fn rendered_external_matches_complete_compared_shape() {
         ] {
             f.target.execute(ddl).await.unwrap();
             let scope=capture::CaptureScope { retained:BTreeSet::from([id.clone()]),candidates:BTreeSet::new() };
-            let inputs=capture::capture(&mut f.target,&scope).await.unwrap();
+            let inputs=capture::capture(&mut f.target,&scope, &crate::capture_key()).await.unwrap();
             let rendered=externals::render::render(&inputs,&id).unwrap_or_else(|e|panic!("{id:?}: {e:?}"));
             let before = externals::inventory(&mut f.scratch,SANDBOX).await.unwrap();
             for sql in rendered.statements { f.scratch.execute(&sql).await.unwrap_or_else(|e|panic!("{sql}: {e}")); }
@@ -234,7 +243,7 @@ async fn rendered_external_matches_complete_compared_shape() {
         f.target.execute("CREATE TABLE dbo.x(i int CONSTRAINT x_pk PRIMARY KEY); ALTER TABLE dbo.x ADD CONSTRAINT xt FOREIGN KEY(i) REFERENCES dbo.t(i) ON DELETE CASCADE;").await.unwrap();
         for id in [capture::object("dbo","x"),capture::object("dbo","xt")] {
             let scope=capture::CaptureScope { retained:BTreeSet::from([id.clone()]),candidates:BTreeSet::new() };
-            let inputs=capture::capture(&mut f.target,&scope).await.unwrap();
+            let inputs=capture::capture(&mut f.target,&scope, &crate::capture_key()).await.unwrap();
             for sql in externals::render::render(&inputs,&id).unwrap().statements { f.scratch.execute(&sql).await.unwrap_or_else(|e|panic!("{sql}: {e}")); }
         }
         f.compare(&roots(&["t","x","xt"]),&[]).await.unwrap();
@@ -271,7 +280,7 @@ async fn rendered_alias_type_explicit_and_inherited_owners_are_accepted() {
             candidates: BTreeSet::new(),
         };
         let (context, map, owners) = f.type_owners(&scope).await;
-        let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+        let inputs = capture::capture(&mut f.target, &scope, &crate::capture_key()).await.unwrap();
         let before = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
         for id in &scope.retained {
             for sql in externals::render::render(&inputs, id).unwrap().statements {
@@ -284,7 +293,7 @@ async fn rendered_alias_type_explicit_and_inherited_owners_are_accepted() {
         auth::reconstruct_owners(&mut f.scratch, &map, &owners.restricted_to(&rendered))
             .await
             .unwrap();
-        let current = capture::capture(&mut f.scratch, &scope).await.unwrap();
+        let current = capture::capture(&mut f.scratch, &scope, &crate::capture_key()).await.unwrap();
         owners
             .verify(&auth::OwnerPartition::from_capture(&current, &context).unwrap())
             .unwrap();
@@ -308,7 +317,7 @@ async fn file_alias_type_wrong_owner_is_never_repaired() {
         let from_file = f.file("CREATE TYPE dbo.file_alias FROM int NULL;").await.unwrap();
         assert_eq!(from_file, BTreeSet::from([alias("file_alias")]));
         let middle = externals::inventory(&mut f.scratch, SANDBOX).await.unwrap();
-        let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+        let inputs = capture::capture(&mut f.target, &scope, &crate::capture_key()).await.unwrap();
         for sql in externals::render::render(&inputs, &alias("rendered_alias")).unwrap().statements {
             f.scratch.execute(&sql).await.unwrap();
         }
@@ -321,7 +330,7 @@ async fn file_alias_type_wrong_owner_is_never_repaired() {
         let rows = f.scratch.query("SELECT principal_id FROM sys.types WHERE user_type_id=TYPE_ID(N'dbo.file_alias');").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].try_get::<i32>("principal_id").unwrap().is_none());
-        let current = capture::capture(&mut f.scratch, &scope).await.unwrap();
+        let current = capture::capture(&mut f.scratch, &scope, &crate::capture_key()).await.unwrap();
         let error = owners.verify(&auth::OwnerPartition::from_capture(&current, &context).unwrap()).unwrap_err();
         assert!(error.to_string().contains("file-supplied ownership is not repaired"));
         refused(f.compare(&scope.retained, &[]).await, "owner_group");
@@ -341,7 +350,9 @@ async fn unsupported_renderer_shape_refuses_by_name() {
             retained: BTreeSet::from([id.clone()]),
             candidates: BTreeSet::new(),
         };
-        let captured = capture::capture(&mut f.target, &scope).await.unwrap();
+        let captured = capture::capture(&mut f.target, &scope, &crate::capture_key())
+            .await
+            .unwrap();
         let error = externals::render::render(&captured, &id).unwrap_err();
         assert!(format!("{error:?}").contains("nonnull"));
         assert!(format!("{error:?}").contains("non-nullable"));
@@ -454,7 +465,7 @@ async fn external_depending_on_managed_object_refuses_by_name() {
         managed.tables.insert(pbps_model::TableName::new("dbo","managed"),table);
         let error=format!("{:?}",f.compare(&created,&[&managed]).await.unwrap_err());
         assert!(error.contains("x_managed") && error.contains("managed") && error.contains("#2376"),"{error}");
-        let required=capture::required_externals(&mut f.target,&[&managed]).await.unwrap();
+        let required=capture::required_externals(&mut f.target,&[&managed], &crate::capture_key()).await.unwrap();
         let error=externals::render::missing(&required,&created).unwrap_err().join(";");
         assert!(error.contains("x_managed") && error.contains("#2376"),"{error}");
         let more=f.file("CREATE TABLE dbo.managed(i int CONSTRAINT managed_pk PRIMARY KEY,CONSTRAINT to_a FOREIGN KEY(i) REFERENCES dbo.a(i) ON DELETE CASCADE); ALTER TABLE dbo.x ADD CONSTRAINT x_managed FOREIGN KEY(i) REFERENCES dbo.managed(i) ON DELETE CASCADE;").await.unwrap();

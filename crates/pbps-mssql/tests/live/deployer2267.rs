@@ -104,7 +104,9 @@ async fn owners_in_scope(
     context: &auth::AuthorizationContext,
     scope: &capture::CaptureScope,
 ) -> auth::OwnerPartition {
-    let captured = capture::capture(conn, scope).await.unwrap();
+    let captured = capture::capture(conn, scope, &crate::capture_key())
+        .await
+        .unwrap();
     auth::OwnerPartition::from_capture(&captured, context).unwrap()
 }
 
@@ -458,7 +460,9 @@ fn alias_scope() -> capture::CaptureScope {
 
 async fn render_alias(f: &mut Fixture) -> Vec<String> {
     let scope = alias_scope();
-    let inputs = capture::capture(&mut f.target, &scope).await.unwrap();
+    let inputs = capture::capture(&mut f.target, &scope, &crate::capture_key())
+        .await
+        .unwrap();
     pbps_mssql::resolver::externals::render::render(&inputs, scope.retained.first().unwrap())
         .unwrap()
         .statements

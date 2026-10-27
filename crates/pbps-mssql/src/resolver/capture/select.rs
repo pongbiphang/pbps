@@ -48,6 +48,7 @@ pub(super) struct Input {
 }
 
 pub(super) struct Selected {
+    pub object_ids: BTreeSet<i64>,
     pub inputs: BTreeMap<ObjectIdentity, Input>,
     pub candidates: BTreeMap<CandidateSet, BTreeSet<ObjectIdentity>>,
     /// Modules with a runtime-bound name, and the names.
@@ -57,7 +58,12 @@ pub(super) struct Selected {
 /// The names `scope` asks the engine to match.
 pub(super) fn lookups(scope: &CaptureScope) -> Lookups {
     let mut lookups = Lookups::default();
-    for object in &scope.retained {
+    for root in &scope.retained {
+        let object = if root.class.starts_with("pbps-unnamed-") {
+            root.signature.first().unwrap_or(root)
+        } else {
+            root
+        };
         if let [schema, name] = object.name.as_slice() {
             match object.class.as_str() {
                 class::OBJECT => {
@@ -103,6 +109,7 @@ pub(super) type Lookup<'a> = Index<'a>;
 
 pub(super) struct Index<'a> {
     catalog: &'a Catalog,
+    identities: super::identity::Identities,
     schemas: BTreeMap<i64, &'a str>,
     principals: BTreeMap<i64, &'a str>,
     objects: BTreeMap<i64, &'a Object>,
@@ -110,8 +117,9 @@ pub(super) struct Index<'a> {
 }
 
 impl<'a> Index<'a> {
-    fn new(catalog: &'a Catalog) -> Self {
-        Self {
+    fn new(catalog: &'a Catalog, producer: &super::identity::Producer) -> Result<Self, Uncovered> {
+        Ok(Self {
+            identities: super::identity::Identities::new(catalog, producer)?,
             catalog,
             schemas: catalog
                 .schemas
@@ -125,7 +133,7 @@ impl<'a> Index<'a> {
                 .collect(),
             objects: catalog.objects.iter().map(|o| (o.id, o)).collect(),
             types: catalog.types.iter().map(|t| (t.id, t)).collect(),
-        }
+        })
     }
 
     pub(super) fn schema_identity(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
@@ -156,11 +164,41 @@ impl<'a> Index<'a> {
     }
 
     fn object(&self, object: &Object) -> Result<ObjectIdentity, Uncovered> {
+        if let Some(id) = self.identities.object(object)? {
+            return Ok(id);
+        }
         Ok(identity(
             class::OBJECT,
             vec![self.schema(object.schema)?.into(), object.name.clone()],
             Vec::new(),
         ))
+    }
+
+    pub(super) fn index_identity(
+        &self,
+        table: i64,
+        index: i64,
+    ) -> Result<Option<ObjectIdentity>, Uncovered> {
+        for row in self
+            .catalog
+            .whole
+            .get("key_constraints")
+            .into_iter()
+            .flatten()
+        {
+            let number = |name| {
+                row.get(name)
+                    .and_then(Option::as_deref)
+                    .and_then(|v| v.parse::<i64>().ok())
+            };
+            if number("parent_object_id") == Some(table)
+                && number("unique_index_id") == Some(index)
+                && let Some(object) = number("object_id").and_then(|id| self.objects.get(&id))
+            {
+                return self.identities.object(object);
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn type_identity(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
@@ -947,9 +985,13 @@ impl Builder<'_> {
     }
 }
 
-pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected, Uncovered> {
+pub(super) fn select(
+    catalog: &Catalog,
+    scope: &CaptureScope,
+    producer: &super::identity::Producer,
+) -> Result<Selected, Uncovered> {
     let mut builder = Builder {
-        index: Index::new(catalog),
+        index: Index::new(catalog, producer)?,
         whole: super::whole::Whole::new(catalog),
         pending: VecDeque::new(),
         seen: BTreeSet::new(),
@@ -957,6 +999,7 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
         types_done: BTreeSet::new(),
         engine: BTreeSet::new(),
         result: Selected {
+            object_ids: BTreeSet::new(),
             inputs: BTreeMap::new(),
             candidates: BTreeMap::new(),
             runtime: BTreeMap::new(),
@@ -1003,6 +1046,20 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
                 (schema.clone(), name.clone())
             }
             (class::SCHEMA | class::PRINCIPAL, [_]) if object.signature.is_empty() => continue,
+            _ if object.class.starts_with("pbps-unnamed-") && object.signature.len() == 1 => {
+                let parent = &object.signature[0];
+                for candidate in &catalog.objects {
+                    if let Some(on) = candidate
+                        .parent
+                        .and_then(|id| builder.index.objects.get(&id))
+                        && builder.index.object(on)? == *parent
+                        && builder.index.object(candidate)? == *object
+                    {
+                        builder.enqueue(candidate.id);
+                    }
+                }
+                continue;
+            }
             _ => {
                 return Err(Uncovered::object(
                     object,
@@ -1088,6 +1145,7 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
                 bindings: BTreeSet::new(),
             });
     }
+    builder.result.object_ids = builder.seen;
     Ok(builder.result)
 }
 

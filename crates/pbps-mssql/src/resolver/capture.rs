@@ -24,8 +24,11 @@
 //! Scratch, separation, the externals comparison and assessment are #2142;
 //! nothing here is wired into planning yet (#2143).
 
+mod assess;
 mod catalog;
 mod columns;
+mod compiled;
+mod identity;
 mod manifest;
 mod object_properties;
 mod ownership;
@@ -35,6 +38,7 @@ mod select;
 mod staged;
 mod whole;
 
+pub use compiled::{BindingRecord, CompiledCapture, capture_desired_for_plan};
 pub use manifest::CapturedInputs;
 pub use object_properties::{OBJECT_PROPERTIES, PropertyDisposition, property_disposition};
 pub use ownership::RecordedOwnership;
@@ -50,7 +54,7 @@ use std::collections::BTreeSet;
 /// change to what a property means, or to which properties are read, is a
 /// new rule: an old seal then reads as a version difference, never as a
 /// match under different semantics.
-pub const RULE: &str = "mssql-capture-v3";
+pub const RULE: &str = "mssql-capture-v4";
 
 /// The identity classes this capture produces, by the catalog each comes from.
 pub mod class {
@@ -171,8 +175,9 @@ pub fn managed_scope(sides: &[&pbps_model::Schema]) -> CaptureScope {
 pub async fn capture(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<CapturedInputs, CaptureError> {
-    capture_declared(connection, scope, &Default::default()).await
+    capture_declared(connection, scope, &Default::default(), key).await
 }
 
 /// Capture with the explicitly declared cross-database reference boundary.
@@ -181,29 +186,28 @@ pub async fn capture_declared(
     connection: &mut impl pbps_db::transport::QueryConnection,
     scope: &CaptureScope,
     declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<CapturedInputs, CaptureError> {
+    let producer = identity::Producer::new(key);
     let mut catalog = read::read(connection, &select::lookups(scope)).await?;
     catalog.declarations = declarations.clone();
-    let selected = select::select(&catalog, scope)?;
+    let scope = identity::scope(&catalog, scope, &producer)?;
+    let selected = select::select(&catalog, &scope, &producer)?;
     // Only reached objects are asked about: an unrelated broken module must
     // not turn a scoped capture into a database-wide refusal.
-    let schemas: std::collections::BTreeMap<_, _> = catalog
-        .schemas
-        .iter()
-        .map(|s| (s.id, s.name.as_str()))
-        .collect();
     let objects: Vec<_> = catalog
         .objects
         .iter()
-        .filter(|o| {
-            schemas
-                .get(&o.schema)
-                .is_some_and(|schema| selected.inputs.contains_key(&object(schema, &o.name)))
-        })
+        .filter(|o| selected.object_ids.contains(&o.id))
         .collect();
     catalog.object_properties = object_properties::read(connection, &objects).await?;
-    let selected = select::select(&catalog, scope)?;
-    Ok(CapturedInputs::new(catalog, selected, scope.clone()))
+    let selected = select::select(&catalog, &scope, &producer)?;
+    Ok(CapturedInputs::new(
+        catalog,
+        selected,
+        scope.clone(),
+        producer,
+    ))
 }
 
 /// [`capture`], then the qualified ownership of each declared object, and the
@@ -228,7 +232,7 @@ pub async fn capture_qualified_declared(
     key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     recorded: &RecordedOwnership<'_>,
 ) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
-    let captured = capture_declared(connection, scope, declarations).await?;
+    let captured = capture_declared(connection, scope, declarations, key).await?;
     captured
         .require_runtime_candidates()
         .map_err(CaptureError::Coverage)?;
@@ -252,7 +256,13 @@ pub async fn recapture(
     ),
     CaptureError,
 > {
-    let current = capture_declared(connection, previous.scope(), &previous.declarations).await?;
+    let current = capture_declared(
+        connection,
+        previous.scope(),
+        &previous.declarations,
+        previous.producer.key(),
+    )
+    .await?;
     let differences = previous.compare(&current);
     Ok((current, differences))
 }

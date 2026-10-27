@@ -3,12 +3,57 @@ use std::collections::BTreeSet;
 
 /// A logical address, independent of any particular database's object numbers.
 /// Components stay separate: a dot inside an identifier is not qualification.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectIdentity {
     pub class: String,
     pub name: Vec<String>,
     pub signature: Vec<ObjectIdentity>,
+}
+
+impl ObjectIdentity {
+    /// Anonymous declaration addresses carry only a keyed token. Diagnostics
+    /// show its short prefix and the declaring table, never private source.
+    pub fn unnamed_diagnostic(&self) -> Option<String> {
+        let kind = self.class.strip_prefix("pbps-unnamed-")?;
+        if !matches!(
+            kind,
+            "PRIMARY KEY" | "UNIQUE" | "CHECK" | "DEFAULT" | "FOREIGN KEY"
+        ) {
+            return None;
+        }
+        let [token] = self.name.as_slice() else {
+            return None;
+        };
+        let [table] = self.signature.as_slice() else {
+            return None;
+        };
+        let [schema, name] = table.name.as_slice() else {
+            return None;
+        };
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(format!(
+            "an unnamed {kind} `#{}` on `{}.{}`; hint: name the constraint (`CONSTRAINT <name> {kind} (...)`) and pbps will identify it by name",
+            &token[..8],
+            crate::escape::Escaped(schema),
+            crate::escape::Escaped(name)
+        ))
+    }
+}
+
+impl std::fmt::Debug for ObjectIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(name) = self.unnamed_diagnostic() {
+            return f.write_str(&name);
+        }
+        f.debug_struct("ObjectIdentity")
+            .field("class", &self.class)
+            .field("name", &self.name)
+            .field("signature", &self.signature)
+            .finish()
+    }
 }
 
 /// One occurrence in an engine-observed binding tree. Keeping its node/path

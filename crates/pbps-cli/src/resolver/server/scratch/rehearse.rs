@@ -117,6 +117,7 @@ pub async fn with_session<T, E>(
                 &scope_schemas,
                 binding,
                 &request.write_path_extras,
+                None,
             )
             .await?;
         // The externals the base and the plan read are the target's, as for

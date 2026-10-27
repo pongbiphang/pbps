@@ -181,7 +181,7 @@ pub(super) fn classify(
                     .inputs
                     .keys()
                     .filter(|id| {
-                        id.class == class::OBJECT
+                        (id.class == class::OBJECT || id.class.starts_with("pbps-unnamed-"))
                             && property(capture, id, "type").and_then(Value::as_str) == Some("D")
                             && parent(capture, id).as_ref() == Some(&table_id)
                             && property(capture, id, "column")
@@ -252,7 +252,7 @@ pub(super) fn classify(
                 .inputs
                 .keys()
                 .filter(|id| {
-                    id.class == class::OBJECT
+                    (id.class == class::OBJECT || id.class.starts_with("pbps-unnamed-"))
                         && property(capture, id, "type").and_then(Value::as_str) == Some("PK")
                         && parent(capture, id).as_ref() == Some(&table_id)
                 })

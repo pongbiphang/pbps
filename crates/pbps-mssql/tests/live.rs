@@ -124,6 +124,34 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
     pbps_db::Conn::connect(pbps_db::Driver::Mssql, connection).await
 }
 
+#[cfg(unix)]
+fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = std::env::temp_dir().join(format!("pbps2375-key-{}-{}", std::process::id(), {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).unwrap();
+    file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+        .unwrap();
+    drop(file);
+    let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    key
+}
+
+#[cfg(not(unix))]
+fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    pbps_db::fingerprint::EnvironmentFingerprintKey::from_env("PBPS_TEST_FINGERPRINT_KEY")
+        .expect("the LocalDB runner supplies the environment key")
+}
+
 fn conn_str() -> String {
     std::env::var("PBPS_TEST_DB").expect(
         "PBPS_TEST_DB is not set; these tests need a live SQL Server (see scripts/live-tests.sh)",

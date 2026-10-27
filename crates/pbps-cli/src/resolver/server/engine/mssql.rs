@@ -569,6 +569,7 @@ impl Scratch<'_> {
         authorization: &scope::Authorization,
         schemas: &[String],
         binding: &BindingRequest<'_>,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
     ) -> Result<Prepared, Error> {
         if self.placement == Some(sql::Placement::SeparateInstance)
             && provisioning == Provisioning::Supplied
@@ -594,10 +595,14 @@ impl Scratch<'_> {
             .acquire(provisioning, admin, &recipe, Some(&mut dependency_inputs))
             .await?;
         let managed = [binding.base, binding.desired];
-        let required =
-            capture::required_externals_declared(target_connection, &managed, binding.dependencies)
-                .await
-                .map_err(capture_error)?;
+        let required = capture::required_externals_declared(
+            target_connection,
+            &managed,
+            binding.dependencies,
+            key,
+        )
+        .await
+        .map_err(capture_error)?;
         let waiting = required.waiting();
         if !waiting.is_empty() {
             return Err(Error::Externals(waiting));
@@ -619,10 +624,14 @@ impl Scratch<'_> {
             retained: required.roots().clone(),
             candidates: BTreeSet::new(),
         };
-        let initial =
-            capture::capture_declared(target_connection, &external_scope, binding.dependencies)
-                .await
-                .map_err(capture_error)?;
+        let initial = capture::capture_declared(
+            target_connection,
+            &external_scope,
+            binding.dependencies,
+            key,
+        )
+        .await
+        .map_err(capture_error)?;
         let initial_owners = auth::OwnerPartition::from_capture(&initial, &context)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
@@ -664,6 +673,7 @@ impl Scratch<'_> {
             &from_file,
             &[],
             binding.dependencies,
+            key,
         )
         .await
         .map_err(stage_error)?;
@@ -692,7 +702,7 @@ impl Scratch<'_> {
             candidates: BTreeSet::new(),
         };
         let target_inputs =
-            capture::capture_declared(target_connection, &target_scope, binding.dependencies)
+            capture::capture_declared(target_connection, &target_scope, binding.dependencies, key)
                 .await
                 .map_err(capture_error)?;
         let target_owners = auth::OwnerPartition::from_capture(&target_inputs, &context)
@@ -718,7 +728,7 @@ impl Scratch<'_> {
                 .ok_or_else(|| Error::Scope("no mapped deployer".into()))?;
         }
         let current_inputs =
-            capture::capture_declared(&mut owner, &target_scope, binding.dependencies)
+            capture::capture_declared(&mut owner, &target_scope, binding.dependencies, key)
                 .await
                 .map_err(capture_error)?;
         let current_owners = auth::OwnerPartition::from_capture(&current_inputs, &local)
@@ -748,6 +758,7 @@ impl Scratch<'_> {
             &created,
             &managed,
             binding.dependencies,
+            key,
         )
         .await
         .map_err(stage_error)?;
@@ -1023,10 +1034,22 @@ pub(in crate::resolver::server) struct Binding {
     declarations: pbps_model::dependency::Dependencies,
 }
 
+impl Closing {
+    pub(super) fn planning_records(
+        &self,
+    ) -> Result<Vec<capture::BindingRecord>, pbps_model::resolver::ManifestError> {
+        self.captured.planning_records()
+    }
+    pub(super) fn seal_for_plan(
+        self,
+    ) -> Result<pbps_model::resolver::InputManifest, pbps_model::resolver::ManifestError> {
+        self.captured.seal_for_plan()
+    }
+}
+
 /// The compiled scratch capture and the exact scope its opening read uses.
 pub(in crate::resolver::server) struct Closing {
-    #[expect(dead_code, reason = "#2375 assesses the compiled scratch capture")]
-    captured: capture::CapturedInputs,
+    captured: capture::CompiledCapture,
     /// The target's own roots and the candidates both sides settled on.
     target_scope: capture::CaptureScope,
     namespaces: BTreeSet<String>,
@@ -1115,10 +1138,11 @@ impl Binding {
             .extend(staged.scope().candidates.iter().cloned());
         let mut settled = None;
         for _ in 0..SETTLING_READS {
-            let on_scratch = capture::capture_declared(&mut scratch, &scope, &self.declarations)
-                .await
-                .map_err(super::catalog_read_failed)?;
-            let on_target = capture::capture_declared(target, &scope, &self.declarations)
+            let on_scratch =
+                capture::capture_declared(&mut scratch, &scope, &self.declarations, key)
+                    .await
+                    .map_err(super::catalog_read_failed)?;
+            let on_target = capture::capture_declared(target, &scope, &self.declarations, key)
                 .await
                 .map_err(super::catalog_read_failed)?;
             let mut next = on_scratch.runtime_scope();
@@ -1140,27 +1164,32 @@ impl Binding {
             ids: desired.ids,
             namespaces: &namespaces,
         };
-        let (captured, _) = capture::capture_qualified_declared(
+        let captured = capture::capture_desired_for_plan(
             &mut scratch,
             &scratch_scope,
             &self.declarations,
             key,
             &recorded,
+            &self.reconstruction,
         )
         .await
         .map_err(super::catalog_read_failed)?;
-        let present: BTreeSet<_> = captured.objects().collect();
-        if let Some(made) = self.reconstruction.absent_from(&present).first() {
-            return Err(Error::Read(format!(
-                "the compiled {:?} is absent from the scratch capture",
-                made.name
-            )));
-        }
         Ok(Closing {
             captured,
             target_scope,
             namespaces,
         })
+    }
+
+    pub(super) fn assess(
+        &self,
+        closing: &Closing,
+        current: &capture::CapturedInputs,
+        staged: &capture::Staged,
+    ) -> pbps_db::resolver::capture::Assessment {
+        closing
+            .captured
+            .assess_staged(current, &self.managed, &self.reconstruction, staged)
     }
 
     pub(super) async fn capture_opening(

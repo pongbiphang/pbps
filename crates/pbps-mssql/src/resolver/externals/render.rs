@@ -142,7 +142,13 @@ pub fn render(captured: &CapturedInputs, id: &ObjectIdentity) -> Result<Renderab
     let p = captured
         .properties(id)
         .ok_or_else(|| Uncovered::object(id, "the external shape is unreadable"))?;
-    let name = qualified(id)?;
+    let name = qualified(if id.class.starts_with("pbps-unnamed-") {
+        id.signature
+            .first()
+            .ok_or_else(|| Uncovered::object(id, "an unnamed constraint has no parent"))?
+    } else {
+        id
+    })?;
     let refused = |why| Uncovered::object(id, why);
     let mut statements = Vec::new();
     if id.class == class::TYPE {
@@ -364,13 +370,25 @@ pub fn render(captured: &CapturedInputs, id: &ObjectIdentity) -> Result<Renderab
                     Some("NO_ACTION") => Ok("NO ACTION"),
                     _ => Err(refused("the cascade action has no qualified template")),
                 };
-                statements.push(format!("ALTER TABLE {} WITH {} ADD CONSTRAINT {} FOREIGN KEY({}) REFERENCES {}({}) ON DELETE {} ON UPDATE {}{};", qualified(&parent)?, if fk["trusted"] == true { "CHECK" } else { "NOCHECK" }, ident(&id.name[1]), a.join(","), qualified(&referenced)?, b.join(","), action("on_delete")?,action("on_update")?, if fk["not_for_replication"] == true { " NOT FOR REPLICATION" } else { "" }));
+                statements.push(format!("ALTER TABLE {} WITH {} ADD {}FOREIGN KEY({}) REFERENCES {}({}) ON DELETE {} ON UPDATE {}{};", qualified(&parent)?, if fk["trusted"] == true { "CHECK" } else { "NOCHECK" }, constraint_prefix(id), a.join(","), qualified(&referenced)?, b.join(","), action("on_delete")?,action("on_update")?, if fk["not_for_replication"] == true { " NOT FOR REPLICATION" } else { "" }));
                 if fk["disabled"] == true {
-                    statements.push(format!(
-                        "ALTER TABLE {} NOCHECK CONSTRAINT {};",
-                        qualified(&parent)?,
-                        ident(&id.name[1])
-                    ));
+                    if id.class.starts_with("pbps-unnamed-") {
+                        let create = statements.pop().expect("the foreign key was just emitted");
+                        statements.push(disable_created(
+                            &create,
+                            &qualified(&parent)?,
+                            "foreign_keys",
+                            "object_id",
+                            "parent_object_id",
+                            true,
+                        ));
+                    } else {
+                        statements.push(format!(
+                            "ALTER TABLE {} NOCHECK CONSTRAINT {};",
+                            qualified(&parent)?,
+                            ident(&id.name[1])
+                        ));
+                    }
                 }
             }
             _ => {
@@ -410,12 +428,14 @@ fn indexes(
     name: &str,
     sql: &mut Vec<String>,
 ) -> Result<(), Uncovered> {
-    for index in p
+    let mut indexes: Vec<_> = p
         .get("sys.indexes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
+        .collect();
+    indexes.sort_by_key(|index| if index["index"]["type"] == "1" { 0 } else { 1 });
+    for index in indexes {
         let row = &index["index"];
         if row["is_unique"] != "1" {
             continue;
@@ -436,7 +456,9 @@ fn indexes(
                 "filtered-index expressions are never replayed",
             ));
         }
-        let index_name = text(index, "name", id)?;
+        let index_name = index
+            .get("name")
+            .ok_or_else(|| Uncovered::object(id, "unreadable index identity"))?;
         let mut keys = Vec::new();
         let mut included = Vec::new();
         for c in index["columns"]
@@ -472,7 +494,6 @@ fn indexes(
                     && cp
                         .get("sys.key_constraints")
                         .and_then(|k| k.get("unique_index_id"))
-                        .and_then(Value::as_str)
                         == Some(index_name)
             })
         });
@@ -508,14 +529,22 @@ fn indexes(
                 .and_then(Value::as_str)
                 == Some("PK");
             sql.push(format!(
-                "ALTER TABLE {name} ADD CONSTRAINT {} {} {kind} ({key_columns}) {options};",
-                ident(&child.name[1]),
+                "ALTER TABLE {name} ADD {}{} {kind} ({key_columns}) {options};",
+                if child.class.starts_with("pbps-unnamed-") {
+                    String::new()
+                } else {
+                    format!("CONSTRAINT {} ", ident(&child.name[1]))
+                },
                 if pk { "PRIMARY KEY" } else { "UNIQUE" }
             ));
         } else {
             sql.push(format!(
                 "CREATE UNIQUE {kind} INDEX {} ON {name} ({key_columns}){} {options};",
-                ident(index_name),
+                ident(
+                    index_name
+                        .as_str()
+                        .ok_or_else(|| Uncovered::object(id, "unreadable named index"))?
+                ),
                 if included.is_empty() {
                     String::new()
                 } else {
@@ -524,13 +553,65 @@ fn indexes(
             ));
         }
         if row["is_disabled"] == "1" {
-            sql.push(format!(
-                "ALTER INDEX {} ON {name} DISABLE;",
-                ident(index_name)
-            ));
+            if index_name.is_object() {
+                let create = sql.pop().expect("the index was just emitted");
+                sql.push(disable_created(
+                    &create,
+                    name,
+                    "indexes",
+                    "index_id",
+                    "object_id",
+                    false,
+                ));
+            } else {
+                sql.push(format!(
+                    "ALTER INDEX {} ON {name} DISABLE;",
+                    ident(
+                        index_name
+                            .as_str()
+                            .ok_or_else(|| Uncovered::object(id, "unreadable named index"))?
+                    )
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn constraint_prefix(id: &ObjectIdentity) -> String {
+    if id.class.starts_with("pbps-unnamed-") {
+        String::new()
+    } else {
+        format!("CONSTRAINT {} ", ident(&id.name[1]))
+    }
+}
+
+// The engine chose the new name. Read precisely the one new catalog child
+// around its CREATE, rather than guessing its name or disabling its siblings.
+fn disable_created(
+    create: &str,
+    table: &str,
+    view: &str,
+    key: &str,
+    parent: &str,
+    foreign: bool,
+) -> String {
+    let table_literal = crate::ident::literal(table);
+    let alter = if foreign {
+        format!("ALTER TABLE {table} NOCHECK CONSTRAINT ")
+    } else {
+        "ALTER INDEX ".into()
+    };
+    let suffix = if foreign {
+        String::new()
+    } else {
+        format!(" ON {table} DISABLE;")
+    };
+    format!(
+        "DECLARE @before TABLE(id int); INSERT @before SELECT {key} FROM sys.{view} WHERE {parent}=OBJECT_ID({table_literal}); {create} DECLARE @child sysname; SELECT @child=name FROM sys.{view} WHERE {parent}=OBJECT_ID({table_literal}) AND {key} NOT IN (SELECT id FROM @before); IF @@ROWCOUNT<>1 THROW 50000, 'the rendered child cannot be identified', 1; DECLARE @sql nvarchar(max)={} + QUOTENAME(@child) + {}; EXEC(@sql);",
+        crate::ident::literal(&alter),
+        crate::ident::literal(&suffix)
+    )
 }
 
 #[cfg(test)]

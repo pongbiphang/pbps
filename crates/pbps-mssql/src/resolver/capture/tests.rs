@@ -139,15 +139,15 @@ fn scope() -> CaptureScope {
 }
 
 fn condition(catalog: &Catalog) -> &'static str {
-    match select::select(catalog, &scope()) {
+    match select::select(catalog, &scope(), &producer()) {
         Ok(_) => panic!("the capture was expected to refuse"),
         Err(refusal) => refusal.condition,
     }
 }
 
 fn captured(catalog: Catalog, scope: CaptureScope) -> CapturedInputs {
-    let selected = select::select(&catalog, &scope).expect("select");
-    CapturedInputs::new(catalog, selected, scope)
+    let selected = select::select(&catalog, &scope, &producer()).expect("select");
+    CapturedInputs::new(catalog, selected, scope, producer())
 }
 
 fn set(class: CandidateClass, schema: &str, name: &str) -> CandidateSet {
@@ -320,7 +320,7 @@ fn only_declared_three_part_objects_leave_the_local_capture_boundary() {
                 .into(),
             },
         );
-        let selected = select::select(&source, &scope()).unwrap();
+        let selected = select::select(&source, &scope(), &producer()).unwrap();
         let bindings = &selected.inputs[&object("app", "v")].bindings;
         assert!(
             bindings
@@ -379,7 +379,7 @@ fn a_dependency_of_a_table_types_own_objects_refuses() {
     catalog
         .types_named
         .insert(("app".into(), "rows".into()), BTreeSet::from([400]));
-    match select::select(&catalog, &scope) {
+    match select::select(&catalog, &scope, &producer()) {
         Ok(_) => panic!("the capture was expected to refuse"),
         Err(refusal) => assert_eq!(
             refusal.condition,
@@ -418,7 +418,7 @@ fn a_system_procedure_set_naming_another_schema_refuses() {
     scope
         .candidates
         .insert(set(CandidateClass::SystemProcedure, "dbo", "sp_who"));
-    match select::select(&catalog(), &scope) {
+    match select::select(&catalog(), &scope, &producer()) {
         Ok(_) => panic!("the capture was expected to refuse"),
         Err(refusal) => assert_eq!(
             refusal.condition,
@@ -469,7 +469,7 @@ fn a_retained_identity_the_capture_cannot_look_up_refuses() {
             name: vec!["v".into()],
             signature: vec![object("app", "v")],
         });
-    match select::select(&catalog(), &scope) {
+    match select::select(&catalog(), &scope, &producer()) {
         Ok(_) => panic!("the capture was expected to refuse"),
         Err(refusal) => assert_eq!(
             refusal.condition,
@@ -664,7 +664,7 @@ fn reported_identity_properties_preserve_the_later_observation() {
             ("SchemaId".into(), serde_json::json!(APP)),
         ]),
     );
-    let selected = select::select(&catalog, &scope).unwrap();
+    let selected = select::select(&catalog, &scope, &producer()).unwrap();
     let input = &selected.inputs[&object("dbo", "price")];
     let properties = &input.properties["OBJECTPROPERTYEX"];
     let owner: super::ObjectIdentity =
@@ -683,7 +683,7 @@ fn reported_identity_properties_preserve_the_later_observation() {
         .get_mut(&PRICE)
         .unwrap()
         .insert("OwnerId".into(), serde_json::Value::Null);
-    let selected = select::select(&catalog, &scope).unwrap();
+    let selected = select::select(&catalog, &scope, &producer()).unwrap();
     assert!(
         selected.inputs[&object("dbo", "price")].properties["OBJECTPROPERTYEX"]["OwnerId"]
             .is_null()
@@ -693,7 +693,7 @@ fn reported_identity_properties_preserve_the_later_observation() {
         .get_mut(&PRICE)
         .unwrap()
         .insert("SchemaId".into(), serde_json::json!("unreadable"));
-    assert!(select::select(&catalog, &scope).is_err());
+    assert!(select::select(&catalog, &scope, &producer()).is_err());
 }
 
 #[test]
@@ -721,6 +721,7 @@ fn skipped_children_do_not_enter_authorization_ownership_without_being_roots() {
         CapturedInputs::new(
             catalog(),
             select::Selected {
+                object_ids: BTreeSet::new(),
                 inputs: BTreeMap::from([
                     (
                         parent.clone(),
@@ -747,6 +748,7 @@ fn skipped_children_do_not_enter_authorization_ownership_without_being_roots() {
                 retained: roots,
                 candidates: BTreeSet::new(),
             },
+            producer(),
         )
     };
     for kind in ["C", "D", "F", "TR"] {
@@ -821,4 +823,37 @@ fn the_managed_scope_names_the_roots_of_both_sides_and_nothing_else() {
         super::managed_scope(&[&Schema::default()]),
         CaptureScope::default()
     );
+}
+
+#[cfg(unix)]
+fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = std::env::temp_dir().join(format!("pbps2375-key-{}-{}", std::process::id(), {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).unwrap();
+    file.write_all(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+        .unwrap();
+    drop(file);
+    let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    key
+}
+
+fn producer() -> super::identity::Producer {
+    #[cfg(unix)]
+    {
+        super::identity::Producer::new(&capture_key())
+    }
+    #[cfg(not(unix))]
+    {
+        super::identity::Producer::Process
+    }
 }

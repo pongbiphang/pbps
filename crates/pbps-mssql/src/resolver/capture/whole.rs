@@ -253,6 +253,22 @@ impl<'a> Whole<'a> {
     ) -> Result<Value, Uncovered> {
         let mut out = Map::new();
         for (column, value) in row {
+            if column == "name" {
+                let anonymous = if view == "indexes" {
+                    match (number(row, "object_id"), number(row, "index_id")) {
+                        (Some(table), Some(id)) => index.index_identity(table, id)?.is_some(),
+                        _ => false,
+                    }
+                } else {
+                    number(row, "object_id")
+                        .and_then(|id| index.object_by_id(id))
+                        .transpose()?
+                        .is_some_and(|id| id.class.starts_with("pbps-unnamed-"))
+                };
+                if anonymous {
+                    continue;
+                }
+            }
             let Some(rule) = columns::rule(view, column) else {
                 if !columns::comparable_raw(column) {
                     return Err(Uncovered::class(
@@ -313,11 +329,7 @@ impl<'a> Whole<'a> {
                 },
                 Rule::Index(source) => {
                     let object = number(row, source).ok_or_else(|| Self::unknown(view))?;
-                    json!(
-                        self.index_names
-                            .get(&(object, id))
-                            .ok_or_else(|| Self::unknown(view))?
-                    )
+                    self.index_name(object, id, index)?
                 }
                 Rule::DataSpace => match id {
                     0 => Value::Null,
@@ -381,6 +393,22 @@ impl<'a> Whole<'a> {
         ))
     }
 
+    fn index_name(
+        &self,
+        object: i64,
+        id: i64,
+        index: &super::select::Lookup<'_>,
+    ) -> Result<Value, Uncovered> {
+        if let Some(canonical) = index.index_identity(object, id)? {
+            return Ok(json!(canonical));
+        }
+        Ok(json!(
+            self.index_names
+                .get(&(object, id))
+                .ok_or_else(|| Self::unknown("indexes"))?
+        ))
+    }
+
     /// The indexes of one object, by name, each with its columns in order.
     fn indexes_of(
         &self,
@@ -392,12 +420,9 @@ impl<'a> Whole<'a> {
         let mut out = Vec::new();
         for row in self.indexes.get(&object).into_iter().flatten() {
             let id = number(row, "index_id").ok_or_else(|| Self::unknown("indexes"))?;
-            let name = self
-                .index_names
-                .get(&(object, id))
-                .ok_or_else(|| Self::unknown("indexes"))?;
+            let name = self.index_name(object, id, index)?;
             out.push((
-                name.clone(),
+                serde_json::to_string(&name).expect("identity serializes"),
                 json!({
                     "name": name,
                     "kinds": self.index_kinds(object, id, index)?,
