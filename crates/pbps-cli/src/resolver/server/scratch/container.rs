@@ -407,7 +407,9 @@ impl Container {
     /// volume it failed to delete, so a container gone proves nothing of
     /// them (#1843 review).
     async fn remove(mut self) -> Result<(), Vec<String>> {
-        let removed = remove_named(&self.id).await;
+        // By the id once the runtime returned it: the name can be taken by
+        // another container by now.
+        let removed = remove_named(self.removal_target()).await;
         if removed.is_ok() {
             self.removed = true;
         }

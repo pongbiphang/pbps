@@ -123,8 +123,13 @@ fn private_dir(path: &Path) -> Result<(), Error> {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| state(parent, e))?;
             }
-            let made = std::fs::DirBuilder::new().mode(0o700).create(path);
-            made.map_err(|e| state(path, e))?;
+            // Another invocation may have just made it: what exists is
+            // judged below, whoever made it.
+            match std::fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(state(path, e)),
+            }
         }
         Err(e) => return Err(state(path, e)),
     }
