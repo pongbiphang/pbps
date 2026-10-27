@@ -50,8 +50,11 @@ mod test_pg;
 #[path = "../../pbps-model/tests/support/plan_ids.rs"]
 mod test_plan_ids;
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "#1165 PR D wires the `test` command")
+    any(not(test), not(target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "#1165 PR D wires the `test` command; only Linux builds its tests"
+    )
 )]
 mod test_scratch;
 
