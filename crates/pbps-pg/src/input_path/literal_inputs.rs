@@ -1,6 +1,6 @@
 //! Literal input can run during parse analysis, before a bound tree exists.
-//! Read the unsafe catalog closure first; inspect text only when it matters
-//! (DEC-2378.1). The shared lexer still owns literals, comments and quoting.
+//! Literal-free text needs no catalog read; otherwise read the unsafe closure
+//! before inspecting names (DEC-2378.1). The shared lexer owns literal syntax.
 
 use std::collections::BTreeSet;
 
@@ -54,17 +54,17 @@ pub(super) async fn check(
     table: &TableName,
     expression: &str,
 ) -> Result<(), String> {
-    let unreadable =
-        || "could not be vetted: the literal-input catalog could not be read".to_owned();
-    let types = unsafe_types(conn).await;
-    // An ordinary database pays for no text inspection, and an expression with
-    // no literal is never refused by this guard, even with extensions installed.
-    if types.as_ref().is_ok_and(Vec::is_empty)
-        || crate::LEXICON.string_literals(expression).is_empty()
-    {
+    // A failed catalog query aborts the transaction, so literal-free text must
+    // return before any query rather than ignore an error afterwards.
+    if crate::LEXICON.string_literals(expression).is_empty() {
         return Ok(());
     }
-    let types = types.map_err(|_| unreadable())?;
+    let unreadable =
+        || "could not be vetted: the literal-input catalog could not be read".to_owned();
+    let types = unsafe_types(conn).await.map_err(|_| unreadable())?;
+    if types.is_empty() {
+        return Ok(());
+    }
     // Column-name/reserved keywords (CAST, COALESCE, TRIM, ...) are grammar,
     // not bare function-style type casts. Ask this server's keyword catalog.
     let keywords = conn
@@ -164,9 +164,11 @@ pub(super) async fn check(
                         }
                 }) || (visible && implied(&tokens, name, true))
             }
-            "c" => names
-                .iter()
-                .any(|n| n.name == name && !n.called(&tokens, &keywords) && !n.cast(&tokens)),
+            "c" => names.iter().any(|n| {
+                n.name == name
+                    && tokens.get(n.last + 1).is_none_or(|t| t.text != "(")
+                    && !n.cast(&tokens)
+            }),
             _ => return Err(unreadable()),
         };
         if touched {
