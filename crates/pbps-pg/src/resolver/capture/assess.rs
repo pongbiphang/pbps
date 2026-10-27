@@ -863,6 +863,9 @@ fn compiled_early(
     routines: &BTreeMap<ObjectIdentity, super::manifest::Input>,
     paths: &Paths,
 ) -> bool {
+    let Some(_completed) = order.observations() else {
+        return true;
+    };
     let owner = owner(object);
     // A generated expression has its own installation step after creation
     // parts expand: found by its column (DEC-1503.1, #1778).
@@ -936,6 +939,110 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL 16 and 18"]
+    #[allow(clippy::wildcard_enum_match_arm)]
+    async fn actual_success_order_detects_early_staged_bindings_across_ranges() {
+        use crate::resolver::reconstruct::trial_tests as f;
+        use pbps_model::{ModuleKind, SessionZone};
+        for server in f::servers() {
+            for split in [false, true] {
+                let (mut admin, mut conn, name, _) = f::database(&server).await;
+                conn.execute("CREATE SCHEMA ext; CREATE TABLE ext.t(a integer)")
+                    .await
+                    .unwrap();
+                let pg = crate::Postgres::with_write_path_extras(vec!["ext".into()]);
+                let changes = [
+                    f::table("app.f(z)"),
+                    f::module("app.v", ModuleKind::View, "SELECT * FROM t"),
+                    f::module(
+                        "app.f(integer)",
+                        ModuleKind::Function,
+                        "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+                    ),
+                ];
+                let mut order = f::build(&pg, &changes, &Default::default(), false);
+                if split {
+                    // Complete prefix contains view and provider; the original
+                    // table is deliberately the suffix, not pulled across.
+                    let changes = [changes[1].clone(), changes[2].clone(), changes[0].clone()];
+                    order = f::build(&pg, &changes, &Default::default(), false);
+                    order.expect_fill_at(2);
+                    order
+                        .compile_steps_in(&pg, &SessionZone::utc(), &mut conn, 0..2)
+                        .await
+                        .unwrap();
+                    conn.execute("CREATE DOMAIN ext.filled AS integer")
+                        .await
+                        .unwrap();
+                    order.created_before(
+                        2,
+                        vec![(
+                            crate::resolver::reconstruct::Nameable::Type,
+                            "ext".into(),
+                            "filled".into(),
+                        )],
+                    );
+                    order
+                        .compile_steps_in(&pg, &SessionZone::utc(), &mut conn, 2..order.len())
+                        .await
+                        .unwrap();
+                } else {
+                    order
+                        .compile(&pg, &SessionZone::utc(), &mut conn)
+                        .await
+                        .unwrap();
+                }
+                let managed = super::super::Managed::from_schema(&{
+                    let mut schema = pbps_model::Schema::default();
+                    for c in &changes {
+                        match c {
+                            pbps_model::Change::CreateTable { name, table, .. } => {
+                                schema.tables.insert(name.clone(), *table.clone());
+                            }
+                            pbps_model::Change::CreateModule { id, module } => {
+                                schema.modules.insert(id.clone(), *module.clone());
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    schema
+                });
+                let captured =
+                    super::super::capture(&mut conn, &super::super::managed_scope(&managed))
+                        .await
+                        .unwrap();
+                let view = id("pg_class", &["app", "v"], vec![]);
+                let object = id("pg_rewrite", &["_RETURN"], vec![view.clone()]);
+                let input = &captured.inputs[&object];
+                assert!(
+                    input.bindings.iter().any(|b| b.target.name == ["ext", "t"]),
+                    "the actual view must retain its ext.t binding"
+                );
+                assert!(order.later_names(&view).unwrap().contains(&(
+                    crate::resolver::reconstruct::Nameable::Relation,
+                    "app",
+                    "t"
+                )));
+                if split {
+                    assert!(order.later_names(&view).unwrap().contains(&(
+                        crate::resolver::reconstruct::Nameable::Type,
+                        "ext",
+                        "filled"
+                    )));
+                }
+                assert!(compiled_early(
+                    &object,
+                    input,
+                    &order,
+                    &captured.inputs,
+                    &Paths::new(vec!["ext".into()], Default::default())
+                ));
+                f::remove(&mut admin, &name).await;
+            }
+        }
+    }
+
     /// Literal guesses change which declarations compile later, but only an
     /// actual engine binding to that name can make the earlier surface suspect.
     #[test]
@@ -986,12 +1093,13 @@ mod tests {
         };
         for version in [160_000, 180_000] {
             let pg = crate::Postgres::new().with_server_version(version);
-            let order = crate::resolver::reconstruct::Reconstruction::new(
+            let mut order = crate::resolver::reconstruct::Reconstruction::new(
                 &pg,
                 &crate::resolver::reconstruct::fixture_plan(&changes),
                 &crate::resolver::reconstruct::fixture_ids(&changes),
             )
             .unwrap();
+            order.observe_blueprint_fixture();
             assert_eq!(
                 order
                     .later_names_generated("app", "t", "g")

@@ -128,7 +128,7 @@ pub async fn with_session<T, E>(
             let mut reconstruction = state
                 .reconstruction(&mut target, binding, desired.ids, &hints.module_deps)
                 .await?;
-            if prepared.split(&reconstruction).is_some() {
+            if prepared.split(&mut reconstruction).is_some() {
                 return Err(Error::Externals(vec![
                     "the externals fill reads managed relations, which a rehearsal cannot \
                      create between its statements; turn the rehearsal off with \

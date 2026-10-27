@@ -8095,16 +8095,16 @@ existing responsibilities. Lowering retains immutable operation groups; emit,
 render, writer and execution entry points require the certified input rather
 than replaceable raw changes or statements.
 
-The scratch route must retain source-mapped, SQL-free blueprint parts until its existing
-function/phase and generated-constraint settlements finish separately. Private
-emitter probes may answer finite lexical metadata questions and preserve the
-original emission-refusal timing; they grant no executable statement collection.
-Only the completed blueprint is lowered. Engine-generated name observations and
-trials remain connection-local and cannot permute that blueprint. The cfg(test)
-frozen oracle compares SQL and every Step field through both old settlements.
-PostgreSQL and SQL Server fixture oracles pin SQL, artifact bytes and checksums;
-compiler-negative doctests must run explicitly in CI because `--all-targets`
-does not run them.
+The scratch route retains source-mapped, SQL-free blueprint parts until its
+canonical constraint settlement finishes. Private emitter probes preserve
+emission-refusal timing and grant no executable collection. Only the completed
+blueprint is lowered. DEC-2465.1 extends PostgreSQL scratch execution: order
+issues a PG-branded trial program, enforcing every hard prerequisite while
+allowing whole immutable groups to overtake guesses inside the authorized
+range. Consumers cannot submit a permutation or recertify copied statements.
+Committed observations record actual success order separately from blueprint
+coordinates. SQL Server and deployment retain their certified sequence.
+Compiler-negative doctests run explicitly because `--all-targets` omits them.
 
 The implementation is delivered as three stacked PRs. PR5a owns immutable
 producer results, source/proof write-backs and existing normalization, with
@@ -8826,12 +8826,11 @@ match on PostgreSQL scratch is a guess, including a function name found only
 inside an expression's literal. Creation-text reduction for late PL/pgSQL
 bodies stays as DEC-2389.2 specifies; ordinary planning is unchanged.
 
-A hard own-part call has a different reader: its position must be outside a
-literal (DEC-2389.4). Otherwise `length('f')` beside a later SQL function f
-reading the table would put f before its table on 16. Blanking literals only
-for this call reader leaves the reference guess available, and the table
-compiles first. The prepared-edge tests distinguish the genuine Lexical call,
-the literal-only Guess, and the table-to-view Guess.
+The call-position reader blanks literals: a position inside data is no call.
+DEC-2465.1 now makes even a code-position PG scratch call a Guess, since names
+and overloads can still be wrong. Reference reading retains literals. The
+length-f fixture remains valid and real OID-alias positives retain their hints;
+engine trials establish feasibility while actual bindings remain checked.
 
 Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
 `data_strings_do_not_make_oid_alias_readers_unorderable`,
@@ -8839,7 +8838,7 @@ Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
 `a_data_string_cannot_make_a_generation_unorderable`,
 `a_real_oid_alias_function_reference_keeps_its_binding_order`,
 `a_literal_relation_reader_follows_a_table_held_for_its_function`,
-`a_literal_function_name_is_only_a_guess_and_a_code_call_stays_lexical`,
+`a_literal_function_name_and_a_code_call_are_scratch_guesses`,
 `no_declared_column_or_domain_is_of_an_oid_alias_type`, and the live
 `scratch_rules_compile_on_both_servers`.
 
@@ -8898,7 +8897,7 @@ Which edge is which, by what it rests on:
 | a foreign key after both tables and the referenced key; a replica identity after its index | the declaration | stated |
 | a partition's own default after its parent's | the declaration | stated |
 | a module after the modules its `depends_on:` names | the user | stated |
-| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | a function matched in expression code outside literals; retained hard until #2465 as explained below | stated |
+| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | a function matched in expression code outside literals; demoted by DEC-2465.1 | guess (PG scratch) |
 | a function named only inside an expression's literal before its part | a possible reference, never a code call position | guess |
 | a view, a trigger or a procedure before a part whose text, expression or user-defined type spelling, names it | a name in a text | guess |
 | a module after the table whose complete shape or first part its text names | a name in a text | guess |
@@ -8908,7 +8907,7 @@ Which edge is which, by what it rests on:
 | a relation-namespace index before the change whose text names it (DEC-2389.1) | a name in a text | guess |
 | an index that holds an expression or a predicate after every module and generated expression | conservatism, not an engine need | guess |
 
-The call edge is stated only where both halves hold: the provider is a function
+The original hard call edge required both halves: the provider is a function
 (a view, a trigger or a procedure is never called by an expression) and the text
 is code in one of the part's expressions (`expressions`, never a column's type
 spelling, the type of a row, or a name inside a literal). On PostgreSQL scratch
@@ -8928,7 +8927,8 @@ declared ones. SQL Server and the ordinary route state both kinds as stated edge
 so their edges are the same as before.
 
 The genuine-call edge is still an over-approximation: identifier, schema and
-overload matches can be wrong. It nevertheless stays **hard until #2465**.
+overload matches can be wrong. It stayed **hard until #2465**; DEC-2465.1
+now demotes it together with engine-corrected trials.
 Measured demotion of that edge made the parameter/index fixture fail on 16:
 the table really calls `app.f(z)`, but f's parameter `id` also guessed a
 reference to the table's index `id`. With both directions guessed, the
@@ -8936,8 +8936,8 @@ backward-first fallback discarded f-before-table and kept the accidental
 index-before-f edge, creating the table before f (`42883`). Keeping the code
 call hard discards the parameter guess and preserves this previously valid
 fixture. Literal blanking applies the positional rule without repeating that
-demotion. #2465 owns the general solution; this change adds no retry or broader
-call parser.
+demotion. DEC-2465.1 supplies the general solution through bounded creation trials,
+without a broader call parser.
 
 The plan's order carries what the guesses give up: the ordinary route already
 orders a domain after the type it is over and a table after the types of its
@@ -8950,7 +8950,7 @@ states the order (`with_remedy`). Before this entry such a cycle was named by th
 schedule; it is now named by the engine, at the statement.
 
 DEC-2389.3 retains literals in reference guesses. `later_names` and
-`later_names_generated` follow the settled compile positions, so the data-only
+`later_names_generated` now follow committed actual success positions (DEC-2465.1), so the data-only
 length expression can precede f on 16. `compiled_early` still checks actual
 engine bindings, not guessed text matches: a binding to built-in `length` does
 not become an early binding to f merely because its argument says `'f'`.
@@ -8965,7 +8965,7 @@ Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_order
 `a_cycle_of_declared_dependencies_stays_the_named_refusal`,
 `a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it`,
 `a_routine_an_expression_calls_still_precedes_it_though_named_like_a_type`,
-`a_call_edge_is_stated_only_for_a_function_an_expression_calls`,
+`a_scratch_function_call_is_a_guess_even_in_expression_code`,
 `a_built_in_type_spelling_names_nothing_and_a_qualified_one_names_what_it_spells`,
 `a_function_is_not_named_by_a_type_spelling`,
 `an_index_is_not_named_by_a_type_spelling`,
@@ -8976,3 +8976,56 @@ Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_order
 `routines_that_call_each_other_at_creation_fall_back_to_the_plans_order`, and the
 live `scratch_rules_compile_on_both_servers` and
 `scratch_refusals_name_what_is_missing`.
+
+
+<a id="dec-2465-1"></a>
+
+**DEC-2465.1. PostgreSQL scratch corrects guesses by bounded creation trials,
+and publishes observations only after commit.** Part of #2465, PR 1. Text,
+including a code-position call, cannot prove a creation dependency: a column,
+parameter, staged function or another overload can explain the same spelling.
+The PG own-part call edge is therefore a Guess. Fixture 15 still requires a
+real provider before the held table; the engine's refusal supplies the missing
+scheduling information. Ordinary planning, SQL Server, typed type-input rules,
+saved admission, checksums and resolver evidence versions stay unchanged.
+
+The canonical scratch route issues an engine-branded trial program over stable
+lowered group IDs. It projects every non-Guess constraint, including paths
+through operations without a compiled part, and refuses hard cycles before SQL.
+Existing explicit ModuleDeps use full identity, including same-leaf overloads.
+Before every attempt all hard predecessors must have succeeded in this range
+or a committed prefix. Lowest blueprint rank breaks ties. A failed candidate
+waits for another group's success; no-progress scans terminate. Checked
+n(n+1)/2 bounds group attempts. Opaque cursor tokens select groups; neither an
+external permutation nor a custom engine grants PG execution authority.
+
+Only already-admitted transactional creation groups are retried, under one
+savepoint per complete group. Statement SQLSTATEs 42P01, 42883, 42704, 42703
+and 3F000 are candidates; 42830 is eligible only for a typed FK creation part.
+They do not prove a provider or a cycle. PG16's observed scratch major permits
+one 42601 deferral, with one recovery attempt only after ordinary quiescence
+and intervening in-range success. A recovery failure is terminal and preserves
+the original diagnosis first plus the new refusal. PG18 syntax is immediate.
+Messages are never parsed to classify errors. Readback and transaction-control
+failures, cancellation, connection and resource failures are terminal. Each
+stalled declaration retains its last SQLSTATE or its hard-block reason.
+Detailed provenance and diagnostics are the separate PR 2.
+
+Successful readbacks and stable IDs form a private per-range delta. Only an
+acknowledged COMMIT publishes metadata and actual order, into preallocated
+storage; rejected or unknown commits invalidate the run. Failed ranges publish
+nothing. Assessment requires completed observations, never a blueprint fallback.
+Later-name checks scan actual successes and committed fill boundaries, including
+an earlier range's view that bound staged ext.t before app.t existed.
+`after_creating` and `len` keep blueprint coordinates. Existing chained-fill
+cuts are fixed: a suffix provider cannot rescue a prefix refusal. A suffix
+failure retains its committed prefix privately and grants no final assessment.
+
+Retries can repeat user callbacks. Savepoints roll back transactional group
+DDL, including earlier statements, but cannot undo sequence advancement or
+external effects. Scratch remains disposable under the existing separation and
+cleanup contract. DML, grants, setup, externals, fill, nontransactional work and
+target execution receive no retry. This extends DEC-1959.5's scratch clause
+and the lowering wording without changing deployment execution. #2376 was not
+merged at this PR's base: its later join must project Auxiliary steps from
+`steps()` as hard interleaved boundaries, with no implicit retry or crossing.

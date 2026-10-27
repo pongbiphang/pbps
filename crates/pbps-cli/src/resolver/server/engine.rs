@@ -337,7 +337,7 @@ impl Prepared {
             Self::Mssql(_) => false,
         }
     }
-    pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
+    pub(super) fn split(&mut self, binding: &mut Binding) -> Option<usize> {
         match (self, binding) {
             (Self::Postgres(prepared), Binding::Postgres(binding)) => prepared.split(binding),
             (Self::Mssql(_), _) | (Self::Postgres(_), Binding::Mssql(_)) => None,

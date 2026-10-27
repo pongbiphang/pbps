@@ -74,8 +74,9 @@ pub struct Step<'a> {
 ///
 /// One `Lowered` is one indivisible group: its statements run in this order
 /// with no other operation's between them. A scheduler places operations,
-/// never statements, and nothing reorders after emission (#1776), so the
-/// group is the type rather than a range a caller could split.
+/// never statements. Deployment preserves the certified sequence (#1776).
+/// PG scratch alone may trial whole groups through order's branded program
+/// (DEC-2465.1); the group is never a range a caller could split.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lowered {
     operation: OperationId,

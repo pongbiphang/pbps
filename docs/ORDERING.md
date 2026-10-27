@@ -31,6 +31,11 @@ opaque associated input prevents a caller-defined engine from manufacturing
 its scratch result. LoweredPlan keeps immutable operation groups, source IDs
 and statements and is branded by the emitter, so a mock emitter cannot supply
 a real engine's executable collection. Planning probes return metadata only.
+PostgreSQL additionally receives order's branded trial program (DEC-2465.1):
+all non-Guess predecessors constrain every whole-group attempt, while guesses
+may be overtaken after creation refusals. Actual committed successes and fill
+events drive binding assessment; partial execution grants no completion proof.
+The blueprint and its fixed chained-fill range cuts remain immutable.
 The completed shared declaration/catalog route lives in `order::deployment`.
 A successful differ result retains its preceding sort/rename provenance;
 raw proposals remain non-executable even after all shared stages. Existing
@@ -105,7 +110,9 @@ the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
    statements form an indivisible group in emitter order, with source IDs and
    execution/name metadata. Scratch first settles its opaque SQL-free
    blueprint. Neither rendering nor apply can accept a reordered raw
-   `ChangeSet`, and nothing reorders statements after lowering.
+   `ChangeSet`. Deployment preserves that sequence after lowering; PG scratch
+   alone may select whole immutable groups through its order-issued trial
+   cursor inside fixed ranges (DEC-2465.1).
 6. **Verification and sealing.** Operation replay checks requirements against
    the baseline after settlement; statement-level name checks use the emitter's
    intermediate-name metadata. These independent checks run in tests/debug
@@ -639,7 +646,7 @@ and the expression-bearing changes that need a function.
 | Type created → every change whose text names it, a domain over it included | content, over-approximated | scratch only: a column, routine or domain over an absent type is `42704`; the module is read through `module_creation_text` | ✓ DEC-2389.1, DEC-2407.1 |
 | Module → module, table or index its text names | content, over-approximated | scratch only: read through the text the engine resolves at creation (`module_creation_text`): a PL/pgSQL body is a reference only where it declares a type, a `LANGUAGE sql` body, view, trigger and every header are | ✓ DEC-2389.2 |
 | A string in a text → the object it names | content, over-approximated | PostgreSQL scratch retains literal names as reference guesses, including implicit OID-alias arguments such as `pg_relation_size('app.t')`; data matches cannot make a valid declaration unorderable, since cyclic guesses give way | ✓ DEC-2389.3 |
-| Kinds of scratch edge | stated or guess | scratch only: an edge the engine needs by construction (the column chain, own parts, keys, replica identity, partition defaults, `depends_on:`, a function before the part whose expression code calls it, a type spelling, literal or view never being a hard call) is stated; one that rests only on a name matched in a text (a table, module, type or index a text names, an expression index after modules) is a guess. Where steps wait on one another `settle` first drops the guesses inside the cycle that run against the plan's order and settles again, then the rest of them if it must, so the plan's order decides there; a guess reads expressions and user-defined type spellings, never a built-in one; a cycle of stated edges is the named refusal. The engine reports what a guess missed, with the `depends_on:` remedy | ✓ DEC-2389.4 |
+| Kinds of scratch edge | stated or guess | scratch only: an edge the engine needs by construction (the column chain, own parts, keys, replica identity, partition defaults, `depends_on:`, explicit module prerequisites by full identity) is stated; one that rests only on a name matched in a text (a table, module, type or index a text names, an expression index after modules) is a guess. Where steps wait on one another `settle` first drops the guesses inside the cycle that run against the plan's order and settles again, then the rest of them if it must, so the plan's order decides there; a guess reads expressions and user-defined type spellings, never a built-in one; a cycle of stated edges is the named refusal. PG scratch trials correct missed guesses while enforcing hard readiness; code-call spellings are also guesses. Stalls retain actual refusals; adding a hard cycle is no remedy | ✓ DEC-2389.4, DEC-2465.1 |
 
 ### Something removed before what it blocks
 

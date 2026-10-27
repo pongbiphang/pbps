@@ -933,8 +933,8 @@ pub(super) fn constraints_in(
             // function (DEC-2389.4).
             let read = change_texts(&p.change, dialect, scratch);
             let expressions = expressions(&p.change);
-            // A hard call position is in code. A name inside a literal can
-            // still supply a reference guess, but cannot establish a call.
+            // Call-position hints read code only; literals remain reference
+            // guesses. PG trials resolve both hints (DEC-2465.1).
             let called: Vec<_> = expressions
                 .iter()
                 .map(|text| {
@@ -949,7 +949,13 @@ pub(super) fn constraints_in(
                 if module.kind == ModuleKind::Function
                     && called.iter().any(|t| dialect.generation_calls(t, id))
                 {
-                    edge(&mut out, *function, *i);
+                    // A call spelling can also be a parameter or a column.
+                    // PG scratch resolves the guess by trials (DEC-2465.1).
+                    if guessed {
+                        guess(&mut out, *function, *i);
+                    } else {
+                        edge(&mut out, *function, *i);
+                    }
                 } else if module.kind == ModuleKind::Function
                     && guessed
                     && expressions.iter().any(|t| dialect.generation_calls(t, id))

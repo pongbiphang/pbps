@@ -1701,7 +1701,18 @@
         "resolver::standard::tests::a_trial_names_what_the_engine_refuses_and_writes_nothing",
         "resolver::standard::tests::enforce_issues_no_statement_on_a_standard_database",
         "resolver::standard::tests::enforce_puts_back_every_covered_change_and_the_kept_database_acl",
-        "resolver::environment::tests::a_schema_with_a_backslash_is_on_the_path_whatever_the_string_mode"
+        "resolver::environment::tests::a_schema_with_a_backslash_is_on_the_path_whatever_the_string_mode",
+        "resolver::reconstruct::trial_tests::missing_guesses_do_not_prevent_the_round9_view_from_compiling",
+        "resolver::reconstruct::trial_tests::hard_predecessors_block_independently_executable_steps",
+        "resolver::reconstruct::trial_tests::percent_type_waits_for_all_ordinary_providers_before_one_recovery",
+        "resolver::reconstruct::trial_tests::stalls_name_every_pending_declaration_and_respect_range_barriers",
+        "resolver::reconstruct::trial_tests::rejected_ranges_publish_no_metadata_and_cannot_be_reused",
+        "resolver::reconstruct::trial_tests::suffix_failure_keeps_prefix_private_and_fill_at_the_committed_boundary",
+        "resolver::reconstruct::trial_tests::terminal_statement_errors_do_not_retry_or_attempt_a_later_provider",
+        "resolver::reconstruct::trial_tests::genuine_syntax_is_refused_with_its_original_diagnosis",
+        "resolver::reconstruct::trial_tests::retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects",
+        "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",
+        "resolver::capture::assess::tests::actual_success_order_detects_early_staged_bindings_across_ranges"
       ]
     },
     {

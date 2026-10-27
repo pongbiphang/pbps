@@ -1852,7 +1852,7 @@ impl Prepared {
         Ok(conn)
     }
 
-    pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
+    pub(super) fn split(&mut self, binding: &mut Binding) -> Option<usize> {
         // Where the chained shapes go: just after the last step that creates
         // a managed relation they name. A shape waiting for one scratch never
         // creates is not filled, and its chain stays a finding; the others
@@ -1862,9 +1862,13 @@ impl Prepared {
         if self.staging.chained.is_empty() {
             None
         } else {
-            binding
+            let split = binding
                 .reconstruction
-                .after_creating(&self.staging.chained_after)
+                .after_creating(&self.staging.chained_after);
+            if let Some(at) = split {
+                binding.reconstruction.expect_fill_at(at);
+            }
+            split
         }
     }
 
@@ -1999,6 +2003,11 @@ impl Binding {
         desired: pbps_diff::Side<'_>,
         staged: &Staged,
     ) -> Result<Closing, Error> {
+        if self.reconstruction.observations().is_none() {
+            return Err(Error::Binding(
+                "scratch compilation has no complete committed observations".into(),
+            ));
+        }
         let capture = prepared.sessions.capture(admin);
         let dropped =
             dropped_signatures(extras, self.base_managed.dropped_by(&self.desired_managed))
