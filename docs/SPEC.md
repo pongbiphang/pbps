@@ -3203,6 +3203,10 @@ live-database introspection can never produce:
 | The ids file's tombstones | A graveyard: who dropped what, when, and why |
 | FK declarations | The edges of the ERD |
 
+The Markdown and HTML documents also group declared types by schema. Enums
+list labels in declared order; domains show their base type, NOT NULL, default,
+collation and named checks.
+
 Output targets: Markdown, a single self-contained HTML file (no CDN
 dependencies — the air-gap rule applies to artifacts too), and a Mermaid
 `erDiagram`, which GitLab and GitHub render natively. Output is

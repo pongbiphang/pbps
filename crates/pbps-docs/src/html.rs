@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use pbps_model::{IdsFile, Module, ModuleId, Role, Schema, Table, TableName};
+use pbps_model::{IdsFile, ManagedType, Module, ModuleId, Role, Schema, Table, TableName, TypeRef};
 
 use crate::erd;
 
@@ -64,9 +64,9 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
     // A new schema family must be considered by every prose renderer.
     let Schema {
         tables,
+        types,
         modules,
         roles,
-        ..
     } = schema;
     let mut s = String::new();
     let _ = write!(
@@ -97,6 +97,7 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
         one_table(&mut s, name, table);
     }
 
+    types_section(&mut s, types);
     modules_section(&mut s, modules);
     roles_section(&mut s, roles);
     deprecated_section(&mut s, schema);
@@ -104,6 +105,64 @@ pub fn render(schema: &Schema, ids: &IdsFile, title: &str) -> String {
 
     s.push_str("</body>\n</html>\n");
     s
+}
+
+/// Types have no document ids: this section introduces no new link namespace.
+fn types_section(s: &mut String, types: &BTreeMap<TypeRef, ManagedType>) {
+    if types.is_empty() {
+        return;
+    }
+    s.push_str("<h2>Types</h2>\n");
+    let mut current_schema = None;
+    for (name, definition) in types {
+        if current_schema != Some(name.schema()) {
+            let _ = writeln!(s, "<h3>{}</h3>", code(name.schema()));
+            current_schema = Some(name.schema());
+        }
+        let _ = writeln!(s, "<h4>{}</h4>", code(&name.raw().to_string()));
+        match definition {
+            ManagedType::Enum { values } => {
+                s.push_str("<p class=\"muted\">Enum</p>\n<table>\n<tr><th>Label</th></tr>\n");
+                for label in values {
+                    let _ = writeln!(s, "<tr><td>{}</td></tr>", code(label));
+                }
+                s.push_str("</table>\n");
+            }
+            ManagedType::Domain {
+                base,
+                not_null,
+                default,
+                checks,
+                collation,
+            } => {
+                s.push_str("<p class=\"muted\">Domain</p>\n<table>\n<tr><th>Property</th><th>Value</th></tr>\n");
+                let _ = writeln!(
+                    s,
+                    "<tr><td>Base type</td><td>{}</td></tr>\n<tr><td>NOT NULL</td><td>{}</td></tr>\n<tr><td>Default</td><td>{}</td></tr>\n<tr><td>Collation</td><td>{}</td></tr>",
+                    code(&base.raw().to_string()),
+                    if *not_null { "yes" } else { "no" },
+                    default.as_deref().map(code).unwrap_or_else(dash),
+                    collation
+                        .as_ref()
+                        .map(|c| code(&c.raw().to_string()))
+                        .unwrap_or_else(dash),
+                );
+                s.push_str("</table>\n");
+                if !checks.is_empty() {
+                    s.push_str("<table>\n<tr><th>Check</th><th>Expression</th></tr>\n");
+                    for (name, expression) in checks {
+                        let _ = writeln!(
+                            s,
+                            "<tr><td>{}</td><td>{}</td></tr>",
+                            code(name.raw()),
+                            code(expression)
+                        );
+                    }
+                    s.push_str("</table>\n");
+                }
+            }
+        }
+    }
 }
 
 /// Views, procedures, functions and triggers, with their definitions — which

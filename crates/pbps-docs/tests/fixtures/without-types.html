@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legacy schema</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 16px/1.6 system-ui, -apple-system, Segoe UI, sans-serif;
+       max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+h1, h2 { border-bottom: 1px solid #8884; padding-bottom: .2em; }
+h3 { margin-top: 2em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #8884; padding: .35em .6em; text-align: left;
+         vertical-align: top; }
+th { background: #8881; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+code { background: #8882; padding: .1em .3em; border-radius: 3px; }
+pre { background: #8881; padding: 1em; overflow-x: auto; border-radius: 4px; }
+.dep { text-decoration: line-through; opacity: .7; }
+.muted { opacity: .65; }
+</style>
+</head>
+<body>
+<h1>Legacy schema</h1>
+<p class="muted">1 table(s), 2 column(s), 1 module(s).</p>
+<h2>Diagram</h2>
+<p class="muted">Mermaid source — paste it into a Markdown view that renders Mermaid (GitLab, GitHub). This file carries no scripts, so it renders identically offline.</p>
+<pre>erDiagram
+    t_app_s_customer[&quot;app.customer&quot;] {
+        bigint id PK
+        text retired &quot;Legacy contact information.&quot;
+    }
+</pre>
+<h2>Tables</h2>
+<h3 id="app.customer"><code>app.customer</code></h3>
+<p>Customer records.</p>
+<table>
+<tr><th>Column</th><th>Type</th><th>Null</th><th>Default</th><th>Description</th></tr>
+<tr><td><code>id</code> <strong>PK</strong></td><td><code>bigint</code></td><td>no</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><span class="dep"><code>retired</code></span></td><td><code>text</code></td><td>yes</td><td>&mdash;</td><td>Legacy contact information.</td></tr>
+</table>
+<ul>
+<li><strong>Primary key</strong> <code>pk_customer</code>: <code>id</code></li>
+</ul>
+<h2>Views, procedures, functions and triggers</h2>
+<h3 id="app.active_customer">app.active_customer</h3>
+<p class="muted">view</p>
+<p>Active customers.</p>
+<pre>SELECT id FROM app.customer</pre>
+<h2>Roles</h2>
+<h3><code>reporter</code></h3>
+<p>Reporting access.</p>
+<table>
+<tr><th>Granted on</th><th>Permissions</th></tr>
+<tr><td><code>app.customer</code></td><td>select</td></tr>
+</table>
+<h2>Do not use</h2>
+<p>These columns still exist but are on their way out.</p>
+<table>
+<tr><th>Column</th><th>Reason</th></tr>
+<tr><td><code>app.customer.retired</code></td><td>Use the contact service.</td></tr>
+</table>
+<h2>Graveyard</h2>
+<p>Dropped objects, kept so an audit can be answered.</p>
+<table>
+<tr><th>Was</th><th>Dropped</th><th>By</th><th>Reason</th></tr>
+<tr><td><code>app.customer.legacy</code></td><td>2026-01-05</td><td>operator</td><td>No longer collected.</td></tr>
+</table>
+</body>
+</html>
