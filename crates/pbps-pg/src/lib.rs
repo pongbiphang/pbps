@@ -1203,7 +1203,12 @@ impl pbps_dialect::PlanDialect for Postgres {
 
     fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit(self, &planned.change, planned.strategy)
+        emit::emit_in(
+            self,
+            &planned.change,
+            planned.strategy,
+            &emit::RowDefaults::at(pbps_dialect::PlanPayload::changes(plan), position),
+        )
     }
 
     fn emit_staged(
@@ -1212,7 +1217,12 @@ impl pbps_dialect::PlanDialect for Postgres {
         position: usize,
     ) -> Result<Vec<Statement>, DialectError> {
         let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
-        emit::emit_staged(self, &planned.change, planned.strategy)
+        emit::emit_staged_in(
+            self,
+            &planned.change,
+            planned.strategy,
+            &emit::RowDefaults::at(pbps_dialect::PlanPayload::changes(plan), position),
+        )
     }
 }
 

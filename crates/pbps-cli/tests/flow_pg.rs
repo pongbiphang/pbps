@@ -25,6 +25,9 @@ mod domain_vet2309;
 #[path = "support/managed_types.rs"]
 mod managed_types;
 
+#[path = "support/mixed_cast_defaults2456.rs"]
+mod mixed_cast_defaults2456;
+
 #[path = "support/default_grouping.rs"]
 mod default_grouping;
 

@@ -62,6 +62,8 @@ use crate::{Postgres, quote, types};
 
 type Sql = Result<Vec<Statement>, DialectError>;
 pub(crate) mod rebuild;
+mod row_defaults;
+pub(crate) use row_defaults::RowDefaults;
 
 #[cfg(test)]
 mod declared_type_emission_tests {
@@ -3703,13 +3705,22 @@ name = pbps_model::escape::Escaped(&name),))
 }
 
 pub(crate) fn emit_staged(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
+    emit_staged_in(pg, change, strategy, &RowDefaults::default())
+}
+
+pub(crate) fn emit_staged_in(
+    pg: &Postgres,
+    change: &Change,
+    strategy: Strategy,
+    defaults: &RowDefaults,
+) -> Sql {
     if let Some((operation, table)) = change.pending_rebuild() {
         return Err(DialectError::RebuildUnavailable {
             operation,
             table: table.clone(),
         });
     }
-    staged_attach(change).unwrap_or_else(|| emit(pg, change, strategy))
+    staged_attach(change).unwrap_or_else(|| emit_in(pg, change, strategy, defaults))
 }
 
 /// One half of an in-place domain alteration, from `(from, to, half)` alone
@@ -3797,7 +3808,18 @@ fn add_key_sql(table: &TableName, clause: &str, only: bool) -> Result<String, Di
     ))
 }
 
+// Raw single-change paths count statements and build scratch inputs; they have
+// no executed rename prefix. Certified emission supplies it explicitly below.
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
+    emit_in(pg, change, strategy, &RowDefaults::default())
+}
+
+pub(crate) fn emit_in(
+    pg: &Postgres,
+    change: &Change,
+    strategy: Strategy,
+    row_defaults: &RowDefaults,
+) -> Sql {
     match change {
         Change::BuildPartitionedIndex(recipe) => rebuild::build_partitioned_index(pg, recipe),
         Change::CopyTableRows(copy) => rebuild::copy_table_rows(pg, copy),
@@ -4904,6 +4926,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 row,
                 defaults,
                 types,
+                row_defaults,
             )?),
         ),
         Change::UpdateRow {
@@ -4930,6 +4953,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 types,
                 after_types,
                 key_type.as_ref(),
+                row_defaults,
             )?),
         ),
         Change::DeleteRow {
@@ -4953,6 +4977,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 types,
                 after_types,
                 key_type.as_ref(),
+                row_defaults,
             )?),
         ),
     }
@@ -6367,6 +6392,7 @@ fn recorded_cell(
     column: &str,
     cell: &Cell,
     ty: Option<Held<'_>>,
+    renames: Option<&crate::type_refs::renames::TypeRenames>,
 ) -> Result<Option<String>, DialectError> {
     let quoted = quote(column)?;
     let Some(ty) = ty else {
@@ -6385,7 +6411,7 @@ fn recorded_cell(
                 binary(&crate::rows::read_expr(&expected))
             ))
         }
-        Cell::Default(d) => defaulted_cell(column, d, Some(ty))?,
+        Cell::Default(d) => defaulted_cell(column, d, Some(ty), renames)?,
     })
 }
 
@@ -6411,6 +6437,7 @@ fn defaulted_cell(
     column: &str,
     default: &str,
     ty: Option<Held<'_>>,
+    renames: Option<&crate::type_refs::renames::TypeRenames>,
 ) -> Result<Option<String>, DialectError> {
     let quoted = quote(column)?;
     let Some(ty) = ty else {
@@ -6423,12 +6450,13 @@ fn defaulted_cell(
     // the same line, so a trailing line comment would swallow the rest
     // (DECISIONS 281).
     //
-    // A default that is a literal welded to a declared type (`'sad'::app.mood`,
-    // as the catalog deparses an enum label) is held by its literal alone: the
-    // cast to the column's type below is the engine's own, and the welded cast
-    // names a type the plan may rename before this statement runs, which then
-    // no longer exists (DEC-2346.2, rebuild review). One rule for every site
-    // that embeds recorded default text, in place of a remap of each.
+    // Keep DEC-2346.2's literal-only declared-cast reduction, but preserve
+    // mixed built-in conversions. Their catalog casts must first follow the
+    // executed rename prefix (DEC-2456.1).
+    // Catalog expectations bind on the base side; newly written defaults
+    // already use after-side names, including names recycled by another UID.
+    let forwarded = renames.map(|renames| renames.expression(default));
+    let default = forwarded.as_deref().unwrap_or(default);
     let expr = format!("({})", verbatim(without_declared_type_casts(default)));
     // **Through the column's type first, and this is not decoration.** Both
     // sides are compared as text, and the stored side went through the
@@ -6606,6 +6634,7 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
 /// on the primary key, in someone else's code, after the deployment. `validate`
 /// refuses the declaration; this is the second lock on the same door, for a
 /// plan that arrived some other way.
+#[allow(clippy::too_many_arguments)]
 fn insert_row(
     table: &TableName,
     key_column: &str,
@@ -6614,6 +6643,7 @@ fn insert_row(
     row: &Row,
     defaults: &BTreeMap<ColumnName, String>,
     types: &BTreeMap<ColumnName, ColumnType>,
+    defaults_context: &RowDefaults,
 ) -> Result<String, DialectError> {
     if identity_key {
         return Err(invalid(format!(
@@ -6641,6 +6671,7 @@ fn insert_row(
             column.raw(),
             &Cell::Value(v.clone()),
             types.get(column).map(Held::same),
+            None,
         )?;
         cells.push(match (held, v) {
             (Some(held), _) => held,
@@ -6663,7 +6694,12 @@ fn insert_row(
             continue;
         }
         cells.extend(match defaults.get(column) {
-            Some(default) => defaulted_cell(column.raw(), default, Some(Held::same(ty)))?,
+            Some(default) => defaulted_cell(
+                column.raw(),
+                default,
+                Some(Held::same(ty)),
+                defaults_context.after(table, column),
+            )?,
             None => Some(format!("{} IS NULL", quote(column.raw())?)),
         });
     }
@@ -6710,6 +6746,7 @@ fn update_row(
     types: &BTreeMap<ColumnName, ColumnType>,
     after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
+    defaults_context: &RowDefaults,
 ) -> Result<String, DialectError> {
     let before_ty = |column: &ColumnName| Held::of(types.get(column), after_types.get(column));
     let after_ty = |column: &ColumnName| {
@@ -6729,10 +6766,20 @@ fn update_row(
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{quoted} = {rhs}"));
-        recorded.extend(recorded_cell(column.raw(), from, before_ty(column))?);
+        recorded.extend(recorded_cell(
+            column.raw(),
+            from,
+            before_ty(column),
+            Some(&defaults_context.base),
+        )?);
     }
     for (column, held) in unchanged {
-        recorded.extend(recorded_cell(column.raw(), held, before_ty(column))?);
+        recorded.extend(recorded_cell(
+            column.raw(),
+            held,
+            before_ty(column),
+            Some(&defaults_context.base),
+        )?);
     }
     // An empty `SET` is not valid SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -6761,10 +6808,20 @@ fn update_row(
     // being read back as the plan's own result.
     let mut cells = Vec::new();
     for (column, (_, to)) in columns {
-        cells.extend(recorded_cell(column.raw(), to, after_ty(column))?);
+        cells.extend(recorded_cell(
+            column.raw(),
+            to,
+            after_ty(column),
+            defaults_context.after(table, column),
+        )?);
     }
     for (column, held) in unchanged {
-        cells.extend(recorded_cell(column.raw(), held, after_ty(column))?);
+        cells.extend(recorded_cell(
+            column.raw(),
+            held,
+            after_ty(column),
+            Some(&defaults_context.base),
+        )?);
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
@@ -6779,6 +6836,7 @@ fn update_row(
 /// recorded cell is compared the way the read-back rendered it, exactly as an
 /// update's precondition does; a cell whose type has no comparison is carried
 /// and not held (DECISIONS 143).
+#[allow(clippy::too_many_arguments)]
 fn delete_row(
     table: &TableName,
     key_column: &str,
@@ -6787,6 +6845,7 @@ fn delete_row(
     types: &BTreeMap<ColumnName, ColumnType>,
     after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
+    defaults_context: &RowDefaults,
 ) -> Result<String, DialectError> {
     let mut predicates = vec![key_equals(key_column, key, key_type)?];
     for (column, cell) in row {
@@ -6794,6 +6853,7 @@ fn delete_row(
             column.raw(),
             cell,
             Held::of(types.get(column), after_types.get(column)),
+            Some(&defaults_context.base),
         )?);
     }
     let sql = format!(
@@ -11193,7 +11253,7 @@ mod tests {
         let guard = |default: &str, read: &str, now: Option<&str>| {
             let (read, now): (ColumnType, Option<ColumnType>) =
                 (read.parse().unwrap(), now.map(|n| n.parse().unwrap()));
-            defaulted_cell("next", default, Held::of(Some(&read), now.as_ref()))
+            defaulted_cell("next", default, Held::of(Some(&read), now.as_ref()), None)
                 .unwrap()
                 .expect("a constant default is held")
         };

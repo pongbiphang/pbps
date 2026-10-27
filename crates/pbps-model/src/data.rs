@@ -219,7 +219,9 @@ pub enum Cell {
     /// The column's declared default — the expression as declared, because
     /// *which* default matters: when it changes, a row that omits the column
     /// should hold the new one, and `ALTER` does not backfill. Compared as
-    /// text, like the defaults themselves are.
+    /// text, like the defaults themselves are. After semantic comparison,
+    /// executable row guards carry the approved catalog spelling for retained
+    /// defaults; newly written defaults retain after-side text (DEC-2456.1).
     Default(String),
 }
 

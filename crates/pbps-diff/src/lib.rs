@@ -16,6 +16,7 @@ pub mod managed;
 pub mod order;
 pub mod rebuild;
 pub mod resolver;
+pub mod row_defaults;
 pub mod schema_diff;
 
 pub use identity::{

@@ -6598,6 +6598,7 @@ pub fn cmd_bootstrap(
             // bootstrap emit a dependent module first and fail on declarations that
             // plan perfectly well.
             &pbps_model::Hints {
+                row_guard_defaults: Default::default(),
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 enum_comments: Default::default(),
                 domain_array_holders: Default::default(),
@@ -7547,6 +7548,7 @@ pub fn cmd_plan_db(
         // `depends_on:` edge. The newest snapshot keeps those baseline
         // annotations so connected planning can still drop dependents first.
         let mut hints = loaded.hints.clone();
+        hints.record_row_defaults(&entry.snapshot.schema);
         for (name, dependencies) in &entry.snapshot.module_deps {
             if !loaded.schema.modules.contains_key(name) {
                 hints.module_deps.insert(name.clone(), dependencies.clone());
