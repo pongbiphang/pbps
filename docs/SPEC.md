@@ -1388,7 +1388,7 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
   (DEC-2378.1). Parse analysis can call those routines before a bound tree
   exists. With an unsafe input type installed, typed-literal syntax or an
   undeterminable parameter may be refused with its SQLSTATE and the remedy
-  `CAST('…' AS type)` or `'…'::type`. The pre-flight evaluates
+  `CAST('...' AS type)` or `'...'::type`. The pre-flight evaluates
   the expression over every stored row before the first statement, and a row it cannot convert refuses the
   plan with the SQLSTATE and runs nothing. A conversion that names its zone
   (`ts AT TIME ZONE 'UTC'`) makes a zone-dependent change allowed.
