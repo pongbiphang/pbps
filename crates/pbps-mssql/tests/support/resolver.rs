@@ -4,8 +4,22 @@ use pbps_db::resolver::{Candidate, DiscoveryCompatibility};
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn resolver_discovery_reads_product_database_and_restricted_session_without_writes() {
-    let mut db = TestDb::create("resolver597").await;
-    db.conn.execute(&format!("ALTER DATABASE [{}] COLLATE Latin1_General_100_BIN2; ALTER DATABASE [{}] SET COMPATIBILITY_LEVEL = 150; CREATE USER resolver_reader WITHOUT LOGIN; EXECUTE AS USER = 'resolver_reader'; SET QUOTED_IDENTIFIER OFF; SET ARITHABORT ON; SET DATEFIRST 3;", db.name, db.name)).await.unwrap();
+    let mut db = TestDb::create_collated("resolver597", "Latin1_General_100_BIN2").await;
+    // A second connection keeps the database in use through discovery. Setup
+    // must not need exclusive access after handing out the fixture (#2253).
+    let mut observer = connect_live(&format!("{};Database={}", conn_str(), db.name))
+        .await
+        .unwrap();
+    let initial = observer
+        .query("SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation')) AS collation;")
+        .await
+        .unwrap();
+    db.conn.execute(&format!("ALTER DATABASE [{}] SET COMPATIBILITY_LEVEL = 150; CREATE USER resolver_reader WITHOUT LOGIN; EXECUTE AS USER = 'resolver_reader'; SET QUOTED_IDENTIFIER OFF; SET ARITHABORT ON; SET DATEFIRST 3;", db.name)).await.unwrap();
+    assert_eq!(
+        initial[0].try_get::<&str>("collation").unwrap(),
+        Some("Latin1_General_100_BIN2"),
+        "the collation is correct before creating objects or restricting the session"
+    );
     let discovery = pbps_mssql::resolver::discover(&mut db.conn).await.unwrap();
     assert_eq!(discovery.compatibility, DiscoveryCompatibility::Unverified);
     assert_eq!(
@@ -66,6 +80,7 @@ async fn resolver_discovery_reads_product_database_and_restricted_session_withou
         "a session returning no catalog rows must not become a successful empty report"
     );
     db.conn.execute("SET NOEXEC OFF").await.unwrap();
+    drop(observer);
     db.drop().await;
 }
 
@@ -291,13 +306,12 @@ mod scope611 {
     #[tokio::test]
     #[ignore = "needs live SQL Server"]
     async fn scope_facts_are_the_deployment_sessions_own_and_the_rule_names_each_difference() {
-        let mut db = TestDb::create("scope611").await;
+        let mut db = TestDb::create_collated("scope611", "Latin1_General_100_CS_AS").await;
         let pid = std::process::id();
         let login = format!("pbps_scope611_{pid}");
         db.conn
             .execute(&format!(
-                "ALTER DATABASE [{0}] COLLATE Latin1_General_100_CS_AS; \
-                 ALTER DATABASE [{0}] SET COMPATIBILITY_LEVEL = 160; \
+                "ALTER DATABASE [{0}] SET COMPATIBILITY_LEVEL = 160; \
                  ALTER DATABASE [{0}] SET ANSI_PADDING ON;",
                 db.name
             ))

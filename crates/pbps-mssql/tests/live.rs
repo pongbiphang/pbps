@@ -1125,6 +1125,8 @@ impl TestDb {
     }
 
     /// The same, with a default collation of the test's choosing (#1175).
+    /// Set it at creation: a later ALTER needs exclusive database access even
+    /// before the fixture has any objects (#2253).
     async fn create_collated(tag: &str, collation: &str) -> TestDb {
         let name = test_database_name(tag);
         let mut conn = connect_live(&conn_str()).await.expect("connect");
@@ -1739,13 +1741,9 @@ async fn pull_warns_about_what_it_cannot_express() {
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn pull_reports_the_source_default_once_when_character_columns_exist() {
     for collation in ["Latin1_General_CI_AS", "Latin1_General_CS_AS"] {
-        let mut db = TestDb::create("default_collation").await;
+        let mut db = TestDb::create_collated("default_collation", collation).await;
         db.conn
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];
-                 CREATE TABLE dbo.numeric_only (amount int NULL);",
-                db.name
-            ))
+            .execute("CREATE TABLE dbo.numeric_only (amount int NULL);")
             .await
             .expect("create numeric control under the chosen default");
         let numeric = pbps_mssql::catalog::introspect(&mut db.conn)
@@ -4882,14 +4880,7 @@ async fn a_project_table_the_collation_folds_onto_an_ordinary_ledger_name_is_ref
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn a_differently_cased_table_on_a_case_sensitive_database_is_not_the_ledger() {
-    let mut db = TestDb::create("ledger_cs894").await;
-    db.conn
-        .execute(&format!(
-            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
-            db.name
-        ))
-        .await
-        .expect("a case-sensitive database");
+    let mut db = TestDb::create_collated("ledger_cs894", "Latin1_General_CS_AS").await;
     db.conn
         .execute(
             "CREATE TABLE dbo.__PBPS_STATE (id int NOT NULL);
@@ -4972,14 +4963,7 @@ async fn constraints_share_a_schemas_namespace_with_tables_and_routines() {
     }
     db.drop().await;
 
-    let mut db = TestDb::create("constraintns496cs").await;
-    db.conn
-        .execute(&format!(
-            "USE master; ALTER DATABASE [{0}] COLLATE Latin1_General_CS_AS; USE [{0}];",
-            db.name
-        ))
-        .await
-        .expect("a case-sensitive database");
+    let mut db = TestDb::create_collated("constraintns496cs", "Latin1_General_CS_AS").await;
     db.conn
         .execute(
             "CREATE TABLE dbo.a (id int CONSTRAINT c CHECK (id > 0));
@@ -6371,11 +6355,8 @@ async fn unicode_capacity_verdict(
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn unicode_capacity_matches_alter_under_supplementary_character_collations() {
-    let mut db = TestDb::create("unicode_capacity461").await;
-    db.conn
-        .execute("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS_SC_UTF8;")
-        .await
-        .expect("select supplementary-character-aware default");
+    let mut db =
+        TestDb::create_collated("unicode_capacity461", "Latin1_General_100_CI_AS_SC_UTF8").await;
     let rows = db.conn
         .query("SELECT LEN(CONVERT(nvarchar(max),0x3DD800DE)), DATALENGTH(CONVERT(nvarchar(max),0x3DD800DE));")
         .await
@@ -6869,11 +6850,8 @@ async fn unicode_to_varchar_probes_character_loss() {
     // Under a UTF-8 database default the characters survive, but varchar(4)
     // holds only the first three-byte character. LEN still answers 3 <= 4;
     // the round trip catches the byte truncation that makes ALTER refuse.
-    let mut utf8 = TestDb::create("unicode_narrow_utf8").await;
-    utf8.conn
-        .execute("ALTER DATABASE CURRENT COLLATE Latin1_General_100_CI_AS_SC_UTF8;")
-        .await
-        .unwrap();
+    let mut utf8 =
+        TestDb::create_collated("unicode_narrow_utf8", "Latin1_General_100_CI_AS_SC_UTF8").await;
     utf8.conn
         .execute(
             "CREATE TABLE dbo.t (label nvarchar(20) NULL);\n\
@@ -9217,14 +9195,7 @@ async fn a_reused_column_name_is_found_by_the_databases_collation() {
         ("SQL_Latin1_General_CP1_CI_AS", "label", "LABEL", true),
         ("Latin1_General_CS_AS", "label", "Label", false),
     ] {
-        let mut db = TestDb::create("doctorcolumn676").await;
-        db.conn
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
-                db.name
-            ))
-            .await
-            .expect("set the database collation");
+        let mut db = TestDb::create_collated("doctorcolumn676", collation).await;
         let found = pbps_mssql::catalog::tables_reusing_a_column_name(
             &mut db.conn,
             &[(0, added.to_owned()), (1, "other".to_owned())],
@@ -9261,14 +9232,7 @@ async fn a_reused_name_collides_by_the_databases_collation_not_by_a_case_fold() 
             false,
         ),
     ] {
-        let mut db = TestDb::create("doctorcollation384").await;
-        db.conn
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
-                db.name
-            ))
-            .await
-            .expect("set the database collation");
+        let mut db = TestDb::create_collated("doctorcollation384", collation).await;
         db.conn
             .execute("IF SCHEMA_ID(N'app') IS NULL EXEC(N'CREATE SCHEMA app;');")
             .await
@@ -9360,14 +9324,7 @@ async fn a_managed_table_under_another_spelling_is_not_asked_about_twice() {
         ("SQL_Latin1_General_CP1_CI_AS", true),
         ("Latin1_General_CS_AS", false),
     ] {
-        let mut db = TestDb::create("doctorspelling673").await;
-        db.conn
-            .execute(&format!(
-                "USE master; ALTER DATABASE [{0}] COLLATE {collation}; USE [{0}];",
-                db.name
-            ))
-            .await
-            .expect("set the database collation");
+        let mut db = TestDb::create_collated("doctorspelling673", collation).await;
         db.conn
             .execute("IF SCHEMA_ID(N'app') IS NULL EXEC(N'CREATE SCHEMA app;');")
             .await

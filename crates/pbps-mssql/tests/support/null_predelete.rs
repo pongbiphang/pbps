@@ -273,14 +273,7 @@ async fn a_known_null_decides_only_its_own_rows_foreign_key_tuple() {
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_check_does_not_read_the_column_giving_up_its_name() {
-    let mut db = TestDb::create("vacated_check1771").await;
-    db.conn
-        .execute(&format!(
-            "ALTER DATABASE [{}] COLLATE Latin1_General_100_CI_AI;",
-            db.name
-        ))
-        .await
-        .unwrap();
+    let mut db = TestDb::create_collated("vacated_check1771", "Latin1_General_100_CI_AI").await;
     let table = TableName::new("dbo", "t");
     let rename = |from: &str, to: &str| Change::RenameColumn {
         uid: Uid::generate(pbps_model::UidKind::Column),
