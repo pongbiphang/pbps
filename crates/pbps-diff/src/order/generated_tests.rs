@@ -869,8 +869,11 @@ fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptin
     assert!(constraints.iter().any(|e| e.before == 4 && e.after == 1));
     assert!(constraints.iter().any(|e| e.before == 4 && e.after == 2));
     assert!(!constraints.iter().any(|e| e.before == 4 && e.after == 3));
-    assert_eq!(super::texts(&cs.changes[1].change), vec!["g > 0", "g < 10"]);
-    assert!(super::texts(&cs.changes[2].change).is_empty());
+    assert_eq!(
+        super::gather(&cs.changes[1].change, super::Types::All),
+        vec!["g > 0", "g < 10"]
+    );
+    assert!(super::gather(&cs.changes[2].change, super::Types::All).is_empty());
 }
 
 #[test]

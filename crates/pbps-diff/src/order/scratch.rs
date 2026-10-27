@@ -1,38 +1,17 @@
-//! Scratch's canonical source-mapped blueprint route. Both existing
-//! settlements finish before lowering; their constraints stay separate.
+//! Scratch's canonical source-mapped blueprint route. The new tables are split
+//! into the parts the engine creates one at a time, and one `Schedule`
+//! settles the constraints `prepare` states over them (DEC-2389.1).
 use super::{Constraint, Schedule};
 use pbps_dialect::Dialect;
-use pbps_model::operation::{ModuleEdits, Operations, Origin};
-use pbps_model::{Change, ChangeSet, PlannedChange, TableName};
-use std::collections::BTreeSet;
+use pbps_model::operation::{ModuleEdits, Operations};
+use pbps_model::{Change, ChangeSet, PlannedChange};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Phase {
-    /// Declared enums and domains: every table and routine that names one
-    /// needs it first, and nothing a bootstrap makes is needed by a type.
-    Types,
-    Tables,
-    Keys,
-    Modules,
-    Expressions,
-}
-#[derive(Debug, Clone)]
-pub struct HeldTable {
-    pub table: TableName,
-    pub steps: std::ops::Range<usize>,
-    pub generated: Vec<String>,
-}
+/// One operation of the prepared plan as the engine compiles it. An
+/// operation is at most one part, and one the engine does not compile is none.
 #[derive(Debug, Clone)]
 pub struct Part<M> {
     pub operation: usize,
-    /// Assigned by Input, before either settlement.
-    pub slot: usize,
     pub change: PlannedChange,
-    pub phase: Phase,
-    pub declaration: String,
-    pub names: Vec<String>,
-    pub calls: BTreeSet<String>,
-    pub tables: BTreeSet<TableName>,
     pub metadata: M,
 }
 /// The real engine chooses an opaque input. A caller-defined engine gets a
@@ -41,7 +20,6 @@ pub trait Engine: Dialect + Sized {
     type Input;
     type Metadata: Clone + std::fmt::Debug;
     fn blueprint(&self, input: Self::Input) -> Input<Self::Metadata>;
-    fn phase(metadata: &mut Self::Metadata, phase: Phase);
 }
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -56,8 +34,9 @@ impl Prepared {
         &self.edges
     }
 }
-/// The same initial generated expansion and settlement as reconstruction,
-/// retaining the differ's sources while dropping its deployment-only metadata.
+/// The generated expansion of reconstruction, with every new table split as
+/// the engine's scratch parts say, and the constraints on the result. It
+/// retains the differ's sources while dropping its deployment-only metadata.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     input: &super::PlanningPlan<S>,
@@ -88,9 +67,8 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     let mut changes =
         super::PlanningPlan::new(payload, input.origins.clone(), input.logical, proof);
     changes.boundaries = input.boundaries.clone();
-    super::generated::expand(&mut changes, ids, dependencies, dialect)?;
-    super::generated::settle(&mut changes, &declared, dependencies, dialect)?;
-    let edges = super::generated::constraints(&changes, &declared, dependencies, dialect);
+    super::generated::expand_in(&mut changes, ids, dependencies, dialect, true)?;
+    let edges = super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
     Ok(Prepared { changes, edges })
 }
 /// Logical blueprint facts supplied by the engine's opaque input. There is no
@@ -99,33 +77,10 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
 pub struct Input<M> {
     prepared: Prepared,
     parts: Vec<Part<M>>,
-    late: Vec<HeldTable>,
-    functions: Vec<(usize, String)>,
-    foreign: BTreeSet<usize>,
 }
 impl<M> Input<M> {
-    pub fn new(
-        prepared: Prepared,
-        parts: Vec<Part<M>>,
-        late: Vec<HeldTable>,
-        functions: Vec<(usize, String)>,
-        foreign: BTreeSet<usize>,
-    ) -> Self {
-        let parts = parts
-            .into_iter()
-            .enumerate()
-            .map(|(slot, mut part)| {
-                part.slot = slot;
-                part
-            })
-            .collect();
-        Self {
-            prepared,
-            parts,
-            late,
-            functions,
-            foreign,
-        }
+    pub fn new(prepared: Prepared, parts: Vec<Part<M>>) -> Self {
+        Self { prepared, parts }
     }
 }
 /// Completed scratch input, branded by its engine. It cannot become the
@@ -139,15 +94,11 @@ impl<M> Input<M> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ScratchPlan<E: Engine> {
-    first: Vec<Part<E::Metadata>>,
     parts: Vec<Part<E::Metadata>>,
     operations: Operations,
     changes: ChangeSet,
 }
 impl<E: Engine> ScratchPlan<E> {
-    pub fn first(&self) -> &[Part<E::Metadata>] {
-        &self.first
-    }
     pub fn parts(&self) -> &[Part<E::Metadata>] {
         &self.parts
     }
@@ -163,71 +114,59 @@ impl<E: Engine> pbps_dialect::PlanPayload for ScratchPlan<E> {
         self.operations.clone()
     }
 }
-/// The complete scratch route: canonical function/phase compatibility, then
-/// the existing generated constraints, never a union or an empty finalizer.
+/// The complete scratch route: one schedule over the constraints `prepare`
+/// stated, each between the two operations it names. A cycle is the
+/// schedule's named refusal, and an order is its lowest position first among
+/// what is ready, so a part waits only where a constraint holds it.
 pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, String> {
-    let Input {
-        prepared,
-        parts,
-        late,
-        functions,
-        foreign,
-    } = engine.blueprint(input);
+    let Input { prepared, parts } = engine.blueprint(input);
     let source = &prepared.changes;
-    let mut part_counts = vec![0; source.changes.len()];
-    for part in &parts {
-        part_counts[part.operation] += 1;
+    let mut at = vec![None; source.changes.len()];
+    for (position, part) in parts.iter().enumerate() {
+        assert!(
+            at[part.operation].replace(position).is_none(),
+            "an operation is at most one part"
+        );
     }
     let operations = Operations::expanded(
         source.logical(),
         parts.iter().map(|part| {
-            // Scratch decomposition has the same source and after-change
-            // spelling as other splits, before either settlement moves it.
-            let mut origin = source.origins()[part.operation].clone();
-            if part_counts[part.operation] > 1
-                && let Origin::Whole(source) = origin
-            {
-                origin = Origin::SplitPart(source);
-            }
-            (origin, part.change.clone())
+            (
+                source.origins()[part.operation].clone(),
+                part.change.clone(),
+            )
         }),
         ModuleEdits::InPlace,
     );
-    // Retain IDs assigned before either settlement; do not renumber split parts.
-    let first = function_edges::<E>(parts, late, &functions, &foreign, source, engine)?;
-    let mut schedule = Schedule::new(first.len());
+    let mut schedule = Schedule::new(source.changes.len());
     for edge in prepared.edges {
-        let before = first.iter().rposition(|p| p.operation == edge.before);
-        let after = first.iter().position(|p| p.operation == edge.after);
-        if let (Some(before), Some(after)) = (before, after) {
-            schedule.edge(before, after, edge.source, edge.reason);
-        }
+        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
-    let names = names_for(source, &first);
+    let names = ChangeSet {
+        changes: source
+            .changes
+            .iter()
+            .map(|p| PlannedChange::new(p.change.clone()))
+            .collect(),
+    };
     let settled = schedule
         .settle_raw(names.clone())
         .map_err(|e| e.describe(&names))?;
-    let sequence = first.iter().map(|p| p.slot).collect::<Vec<_>>();
-    let original = super::reordered_operations(&operations, &sequence);
-    let operations = super::reordered_operations(&original, &settled.sequence);
-    let parts = permute(first.clone(), &settled.sequence);
+    let sequence: Vec<usize> = settled
+        .sequence
+        .iter()
+        .filter_map(|&operation| at[operation])
+        .collect();
+    let operations = super::reordered_operations(&operations, &sequence);
+    let parts = permute(parts, &sequence);
     let changes = ChangeSet {
         changes: parts.iter().map(|p| p.change.clone()).collect(),
     };
     Ok(ScratchPlan {
-        first,
         parts,
         operations,
         changes,
     })
-}
-fn names_for<M>(source: &super::PlanningPlan, parts: &[Part<M>]) -> ChangeSet {
-    ChangeSet {
-        changes: parts
-            .iter()
-            .map(|p| PlannedChange::new(source.changes[p.operation].change.clone()))
-            .collect(),
-    }
 }
 fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
     let mut taken: Vec<_> = items.into_iter().map(Some).collect();
@@ -237,162 +176,11 @@ fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
         .collect()
 }
 
-fn edge(schedule: &mut super::Schedule, before: usize, after: usize) {
-    schedule.edge(
-        before,
-        after,
-        super::Source::Lexical,
-        pbps_model::resolver::OrderReason::Structural,
-    );
-}
-
-/// Peers keep their input order, and a block follows the preceding block.
-/// These are compatibility edges, not a new priority or a pre-sort.
-fn block(schedule: &mut super::Schedule, previous: &mut Option<usize>, peers: &[usize]) {
-    for &at in peers {
-        if let Some(before) = *previous {
-            edge(schedule, before, at);
-        }
-        *previous = Some(at);
-    }
-}
-
-fn function_edges<E: Engine>(
-    mut steps: Vec<Part<E::Metadata>>,
-    late: Vec<HeldTable>,
-    functions: &[(usize, String)],
-    foreign: &BTreeSet<usize>,
-    source: &super::PlanningPlan,
-    engine: &E,
-) -> Result<Vec<Part<E::Metadata>>, String> {
-    let late: Vec<_> = late
-        .into_iter()
-        .filter_map(|table| {
-            let called: Vec<usize> = functions
-                .iter()
-                .filter(|(_, name)| {
-                    table
-                        .generated
-                        .iter()
-                        .any(|text| engine.generation_may_call(text, name))
-                })
-                .map(|(at, _)| *at)
-                .collect();
-            (!called.is_empty()).then_some((table, called))
-        })
-        .collect();
-    let names = |at: usize, name: &str| steps[at].calls.contains(name);
-    let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
-    let keys: Vec<_> = foreign
-        .iter()
-        .copied()
-        .filter(|&at| late.iter().any(|(table, _)| names(at, &table.table.name)))
-        .collect();
-    // The projection contains metadata positions only. Each subsequent order
-    // is produced by Schedule, never by splicing this list around a callee.
-    let mut modules: Vec<_> = (0..steps.len())
-        .filter(|&at| steps[at].phase == Phase::Modules)
-        .collect();
-    let mut placed: BTreeSet<_> = modules.iter().copied().collect();
-    let mut delayed = BTreeSet::new();
-    for (table, called) in &late {
-        let group: Vec<_> = table
-            .steps
-            .clone()
-            .filter(|&at| early(at) && !keys.contains(&at))
-            .collect();
-        let point = modules
-            .iter()
-            .rposition(|at| {
-                called.contains(at)
-                    || (delayed.contains(at)
-                        && steps[*at]
-                            .names
-                            .iter()
-                            .any(|name| group.iter().any(|&own| names(own, name))))
-            })
-            .map_or(0, |position| position + 1);
-        let mut held = BTreeSet::from([table.table.name.clone()]);
-        let mut free = Vec::new();
-        let mut readers = Vec::new();
-        for &at in &modules[..point] {
-            if held.iter().any(|name| {
-                if name == &table.table.name {
-                    steps[at].tables.contains(&table.table)
-                } else {
-                    names(at, name)
-                }
-            }) {
-                if called.contains(&at) {
-                    return Err(format!(
-                        "table {} ({})",
-                        table.table.shown(),
-                        steps[at].declaration
-                    ));
-                }
-                held.extend(steps[at].names.iter().cloned());
-                readers.push(at);
-            } else {
-                free.push(at);
-            }
-        }
-        let mut schedule = super::Schedule::new(steps.len());
-        let mut previous = None;
-        // The last callee (or a delayed name it uses) stays before the table.
-        // Readers follow the complete group; later peers keep following those
-        // readers, as the old hold did. Sink alone would not retain that barrier.
-        block(&mut schedule, &mut previous, &free);
-        block(&mut schedule, &mut previous, &group);
-        block(&mut schedule, &mut previous, &readers);
-        block(&mut schedule, &mut previous, &modules[point..]);
-        placed.extend(group.iter().copied());
-        delayed.extend(group);
-        modules = schedule
-            .sequence()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|at| placed.contains(at))
-            .collect();
-    }
-    placed.extend(keys.iter().copied());
-    for &at in &placed {
-        steps[at].phase = Phase::Modules;
-        E::phase(&mut steps[at].metadata, Phase::Modules);
-    }
-
-    let mut schedule = super::Schedule::new(steps.len());
-    let mut previous = None;
-    for phase in [
-        Phase::Types,
-        Phase::Tables,
-        Phase::Keys,
-        Phase::Modules,
-        Phase::Expressions,
-    ] {
-        if phase == Phase::Modules {
-            block(&mut schedule, &mut previous, &modules);
-            block(&mut schedule, &mut previous, &keys);
-        } else {
-            let peers: Vec<_> = (0..steps.len())
-                .filter(|&at| steps[at].phase == phase)
-                .collect();
-            block(&mut schedule, &mut previous, &peers);
-        }
-    }
-    // Phase compatibility is settled before generated-part constraints, which
-    // may legitimately move a key across a phase boundary (DEC-1959.3).
-    let names = names_for(source, &steps);
-    let settled = schedule
-        .settle_raw(names.clone())
-        .map_err(|e| e.describe(&names))?;
-    Ok(permute(steps, &settled.sequence))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pbps_dialect::PlanPayload;
-    use pbps_model::operation::{Source as LogicalSource, Spelling};
+    use pbps_model::operation::{Origin, Source as LogicalSource, Spelling};
     use pbps_model::plan_names::At;
     use pbps_model::resolver::OrderReason;
 
@@ -402,7 +190,6 @@ mod tests {
         fn blueprint(&self, input: Self::Input) -> Input<usize> {
             input
         }
-        fn phase(_metadata: &mut usize, _phase: Phase) {}
     }
     fn role(name: &str) -> PlannedChange {
         PlannedChange::new(Change::CreateRole {
@@ -410,158 +197,20 @@ mod tests {
             name: name.into(),
         })
     }
-    fn parts(changes: &[PlannedChange], phases: &[Phase]) -> Vec<Part<usize>> {
-        phases
+    /// One part for each of `operations`, the metadata being the operation.
+    fn parts(changes: &[PlannedChange], operations: &[usize]) -> Vec<Part<usize>> {
+        operations
             .iter()
-            .enumerate()
-            .map(|(slot, &phase)| Part {
-                operation: slot.min(changes.len() - 1),
-                slot: usize::MAX,
-                change: changes[slot.min(changes.len() - 1)].clone(),
-                phase,
-                declaration: format!("part {slot}"),
-                names: Vec::new(),
-                calls: BTreeSet::new(),
-                tables: BTreeSet::new(),
-                metadata: slot,
+            .map(|&operation| Part {
+                operation,
+                change: changes[operation].clone(),
+                metadata: operation,
             })
             .collect()
     }
-    #[test]
-    fn equal_parts_keep_their_original_ids_when_phase_order_moves_them() {
-        let change = role("one");
+    fn prepared(changes: &[PlannedChange], edges: &[(usize, usize)]) -> Prepared {
         let source = super::super::propose(ChangeSet {
-            changes: vec![change.clone()],
-        });
-        let prepared = prepare(
-            &source,
-            &Default::default(),
-            &Default::default(),
-            &pbps_dialect::MinimalDialect,
-        )
-        .unwrap();
-        let plan = settle(
-            &pbps_dialect::MinimalDialect,
-            Input::new(
-                prepared,
-                parts(
-                    &[change],
-                    &[Phase::Expressions, Phase::Tables, Phase::Modules],
-                ),
-                Vec::new(),
-                Vec::new(),
-                BTreeSet::new(),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.parts().iter().map(|p| p.metadata).collect::<Vec<_>>(),
-            [1, 2, 0]
-        );
-        let ids = plan
-            .operations()
-            .iter()
-            .map(|op| (op.id().source(), op.id().part()))
-            .collect::<Vec<_>>();
-        assert_eq!(ids, [(0, 1), (0, 2), (0, 0)]);
-        for operation in plan.operations().iter() {
-            assert_eq!(operation.origin(), &Origin::SplitPart(0));
-            assert_eq!(operation.origin().source(), LogicalSource::Change(0));
-            assert_eq!(operation.origin().spelling(), Spelling::At(At::After(0)));
-        }
-        assert_eq!(plan.changes().changes.len(), 3);
-    }
-    #[test]
-    fn unsplit_operations_keep_their_whole_origins_when_phases_move_them() {
-        let changes = vec![role("one"), role("two")];
-        let source = super::super::propose(ChangeSet {
-            changes: changes.clone(),
-        });
-        let prepared = prepare(
-            &source,
-            &Default::default(),
-            &Default::default(),
-            &pbps_dialect::MinimalDialect,
-        )
-        .unwrap();
-        let plan = settle(
-            &pbps_dialect::MinimalDialect,
-            Input::new(
-                prepared,
-                parts(&changes, &[Phase::Modules, Phase::Tables]),
-                Vec::new(),
-                Vec::new(),
-                BTreeSet::new(),
-            ),
-        )
-        .unwrap();
-        let operations = plan.operations();
-        for (operation, source) in operations.iter().zip([1, 0]) {
-            assert_eq!(operation.id().to_string(), format!("{source}.0"));
-            assert_eq!(operation.origin(), &Origin::Whole(source));
-            assert_eq!(
-                operation.origin().spelling(),
-                Spelling::At(At::Before(source))
-            );
-        }
-        assert_eq!(operations.len(), 2);
-    }
-    #[test]
-    fn scratch_splits_keep_the_prepared_logical_source_and_existing_roles() {
-        let source = super::super::propose(ChangeSet {
-            changes: vec![role("other"), role("split")],
-        });
-        let mut schedule = Schedule::new(2);
-        schedule.edge(1, 0, super::super::Source::Effect, OrderReason::Structural);
-        let source = schedule.settle(source).unwrap().into_planning();
-        assert_eq!(source.origins(), [Origin::Whole(1), Origin::Whole(0)]);
-        for (origin, expected) in [
-            (Origin::Whole(1), Origin::SplitPart(1)),
-            (Origin::SplitPart(1), Origin::SplitPart(1)),
-            (
-                Origin::Teardown(LogicalSource::Change(1)),
-                Origin::Teardown(LogicalSource::Change(1)),
-            ),
-            (
-                Origin::Restoration(LogicalSource::Change(1)),
-                Origin::Restoration(LogicalSource::Change(1)),
-            ),
-        ] {
-            let mut prepared = prepare(
-                &source,
-                &Default::default(),
-                &Default::default(),
-                &pbps_dialect::MinimalDialect,
-            )
-            .unwrap();
-            // Existing expansion roles must survive any further blueprint split.
-            prepared.changes.origins[0] = origin;
-            let plan = settle(
-                &pbps_dialect::MinimalDialect,
-                Input::new(
-                    prepared,
-                    parts(&source.changes[..1], &[Phase::Expressions, Phase::Tables]),
-                    Vec::new(),
-                    Vec::new(),
-                    BTreeSet::new(),
-                ),
-            )
-            .unwrap();
-            let operations = plan.operations();
-            assert_eq!(operations.len(), 2);
-            for (operation, part) in operations.iter().zip([1, 0]) {
-                assert_eq!(operation.id().to_string(), format!("1.{part}"));
-                assert_eq!(operation.origin(), &expected);
-                assert_eq!(operation.origin().source(), LogicalSource::Change(1));
-                assert_eq!(operation.origin().spelling(), expected.spelling());
-            }
-        }
-    }
-    #[test]
-    fn a_generated_cycle_is_refused_with_its_original_change_names() {
-        let changes = vec![role("reader"), role("writer")];
-        let source = super::super::propose(ChangeSet {
-            changes: changes.clone(),
+            changes: changes.to_vec(),
         });
         let mut prepared = prepare(
             &source,
@@ -570,26 +219,120 @@ mod tests {
             &pbps_dialect::MinimalDialect,
         )
         .unwrap();
-        prepared.edges = [(0, 1), (1, 0)]
-            .into_iter()
-            .map(|(before, after)| Constraint {
+        prepared.edges = edges
+            .iter()
+            .map(|&(before, after)| Constraint {
                 before,
                 after,
-                source: super::super::Source::Effect,
+                source: super::super::Source::Lexical,
                 reason: OrderReason::Structural,
             })
             .collect();
+        prepared
+    }
+    #[test]
+    fn a_constraint_moves_a_part_and_the_operations_keep_their_original_ids() {
+        let changes = vec![role("one"), role("two"), role("three")];
+        let plan = settle(
+            &pbps_dialect::MinimalDialect,
+            Input::new(prepared(&changes, &[(2, 0)]), parts(&changes, &[0, 1, 2])),
+        )
+        .unwrap();
+        // The lowest position that is ready goes first: `one` waits for
+        // `three`, and `two` does not wait for either.
+        assert_eq!(
+            plan.parts().iter().map(|p| p.metadata).collect::<Vec<_>>(),
+            [1, 2, 0]
+        );
+        let operations = plan.operations();
+        for (operation, source) in operations.iter().zip([1, 2, 0]) {
+            assert_eq!(operation.id().to_string(), format!("{source}.0"));
+            assert_eq!(operation.origin(), &Origin::Whole(source));
+            assert_eq!(
+                operation.origin().spelling(),
+                Spelling::At(At::Before(source))
+            );
+        }
+        assert_eq!(plan.changes().changes.len(), 3);
+    }
+    #[test]
+    fn an_order_through_an_operation_that_is_no_part_is_kept() {
+        let changes = vec![role("one"), role("two"), role("three")];
+        // `two` is compiled by no part, but `three` still precedes `one`
+        // through it.
+        let plan = settle(
+            &pbps_dialect::MinimalDialect,
+            Input::new(
+                prepared(&changes, &[(2, 1), (1, 0)]),
+                parts(&changes, &[0, 2]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.parts().iter().map(|p| p.metadata).collect::<Vec<_>>(),
+            [2, 0]
+        );
+        // Negative: with no constraint the order is the one given.
+        let plan = settle(
+            &pbps_dialect::MinimalDialect,
+            Input::new(prepared(&changes, &[]), parts(&changes, &[0, 2])),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.parts().iter().map(|p| p.metadata).collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+    #[test]
+    fn scratch_parts_keep_the_prepared_logical_source_and_existing_roles() {
+        let changes = vec![role("other"), role("split")];
+        for (origin, spelling) in [
+            (Origin::Whole(1), Spelling::At(At::Before(1))),
+            (Origin::SplitPart(1), Spelling::At(At::After(1))),
+            (
+                Origin::Teardown(LogicalSource::Change(1)),
+                Origin::Teardown(LogicalSource::Change(1)).spelling(),
+            ),
+            (
+                Origin::Restoration(LogicalSource::Change(1)),
+                Origin::Restoration(LogicalSource::Change(1)).spelling(),
+            ),
+        ] {
+            let mut prepared = prepared(&changes, &[]);
+            // Existing expansion roles must survive any settlement.
+            prepared.changes.origins[1] = origin.clone();
+            let plan = settle(
+                &pbps_dialect::MinimalDialect,
+                Input::new(prepared, parts(&changes, &[0, 1])),
+            )
+            .unwrap();
+            let operations = plan.operations();
+            let operation = operations.iter().nth(1).unwrap();
+            assert_eq!(operation.origin(), &origin);
+            assert_eq!(operation.origin().source(), LogicalSource::Change(1));
+            assert_eq!(operation.origin().spelling(), spelling);
+        }
+    }
+    #[test]
+    fn a_generated_cycle_is_refused_with_its_original_change_names() {
+        let changes = vec![role("reader"), role("writer")];
         let why = settle(
             &pbps_dialect::MinimalDialect,
             Input::new(
-                prepared,
-                parts(&changes, &[Phase::Tables, Phase::Modules]),
-                Vec::new(),
-                Vec::new(),
-                BTreeSet::new(),
+                prepared(&changes, &[(0, 1), (1, 0)]),
+                parts(&changes, &[0, 1]),
             ),
         )
         .unwrap_err();
         assert!(why.contains("reader") && why.contains("writer"), "{why}");
+    }
+    #[test]
+    #[should_panic(expected = "an operation is at most one part")]
+    fn two_parts_of_one_operation_are_refused() {
+        let changes = vec![role("one")];
+        let _ = settle(
+            &pbps_dialect::MinimalDialect,
+            Input::new(prepared(&changes, &[]), parts(&changes, &[0, 0])),
+        );
     }
 }

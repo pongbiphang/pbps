@@ -512,3 +512,167 @@ fn ordering_refusals_show_raw_subject_keys_once_without_changing_the_keys() {
         assert_eq!(raw, format!("role {name}"));
     }
 }
+
+/// DEC-2389.4: a guess, an edge that rests on a name matched in a text, is
+/// obeyed like any edge until it closes a cycle, and then the order given
+/// decides between the members of that cycle. The proof holds the edges that
+/// ordered, not the guesses that gave way.
+#[test]
+fn a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_orders() {
+    // `b` before `a` is stated and `a` before `b` guessed: the stated edge
+    // holds, though the order given is the other.
+    let settled = schedule(2, &[(1, 0, Source::Effect), (0, 1, Source::Guess)])
+        .settle_raw(plan(&["a", "b"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["b", "a"]);
+    assert_eq!(settled.proof.edges().len(), 1);
+    // Two guesses that face each other: the one that runs against the order
+    // given goes, the one that runs with it stays.
+    let settled = schedule(2, &[(1, 0, Source::Guess), (0, 1, Source::Guess)])
+        .settle_raw(plan(&["a", "b"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["a", "b"]);
+    assert_eq!(settled.proof.edges().len(), 1);
+    // A guess in no cycle is kept: `c` waits for nothing, `a` waits for `c`.
+    let settled = schedule(3, &[(2, 0, Source::Guess)])
+        .settle_raw(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["b", "c", "a"]);
+    assert_eq!(settled.proof.edges().len(), 1);
+    // Nor is one between two components, each with a guess against the order
+    // that gives way: `c` and `d` face each other, `a` and `b` too, `d` precedes `a`.
+    let settled = schedule(
+        4,
+        &[
+            (0, 1, Source::Guess),
+            (1, 0, Source::Guess),
+            (2, 3, Source::Guess),
+            (3, 2, Source::Guess),
+            (3, 0, Source::Guess),
+        ],
+    )
+    .settle_raw(plan(&["a", "b", "c", "d"]))
+    .unwrap();
+    assert_eq!(names(&settled.changes), ["c", "d", "a", "b"]);
+}
+
+/// DEC-2389.4: in a cycle the guesses that run against the order given go
+/// first, so a guess that runs with it, which may be the real one, is kept.
+/// `t` is held behind `f` by a stated edge; the view `v` guesses `t` before it
+/// (a spurious name match, against the order) and `t` before `v` (real, with it).
+/// Dropping both would put `v` first, as before this step.
+#[test]
+fn a_cycle_gives_up_the_guesses_against_the_order_given_before_the_others() {
+    // 0 = t, 1 = v, 2 = f.
+    let edges = [
+        (2, 0, Source::Effect),
+        (1, 0, Source::Guess),
+        (0, 1, Source::Guess),
+    ];
+    let settled = schedule(3, &edges)
+        .settle_raw(plan(&["t", "v", "f"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["f", "t", "v"]);
+    // The real guess is in the proof, the spurious one is not.
+    assert_eq!(settled.proof.edges().len(), 2);
+    // Only guesses, every one against the order, or none with it: nothing is kept.
+    let settled = schedule(2, &[(1, 0, Source::Guess)])
+        .settle_raw(plan(&["a", "b"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["b", "a"]);
+}
+
+/// The second step is reached only when the first is not enough: here the edge
+/// against the order is stated, no guess runs against it, and every guess in
+/// the cycle goes together; with one that does, the forward guesses stay.
+#[test]
+fn every_guess_in_a_cycle_goes_only_when_the_backward_ones_are_not_enough() {
+    // 0 -> 1 -> 2 are guesses with the order and 2 -> 0 is stated against it.
+    let enough_not = [
+        (0, 1, Source::Guess),
+        (1, 2, Source::Guess),
+        (2, 0, Source::Effect),
+    ];
+    let settled = schedule(3, &enough_not)
+        .settle_raw(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["b", "c", "a"]);
+    assert_eq!(settled.proof.edges().len(), 1);
+    // Add a guess against the order: the cycle 0 -> 1 -> 0 loses it alone, the
+    // other cycle goes at the second step, and nothing else is lost.
+    let both = [
+        (0, 1, Source::Guess),
+        (1, 0, Source::Guess),
+        (1, 2, Source::Guess),
+        (2, 0, Source::Effect),
+    ];
+    let settled = schedule(3, &both)
+        .settle_raw(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["b", "c", "a"]);
+    // A cycle of stated edges is still the named refusal.
+    let stated = [
+        (0, 1, Source::Effect),
+        (1, 0, Source::Effect),
+        (0, 1, Source::Guess),
+    ];
+    assert!(matches!(
+        schedule(2, &stated).settle_raw(plan(&["a", "b"])),
+        Err(Refusal::Cycle { .. })
+    ));
+}
+
+/// Negative: a cycle that holds edges stated with `edge` is still the named
+/// refusal, and it names those edges, not the guesses that were in it.
+#[test]
+fn a_cycle_of_stated_edges_is_refused_though_guesses_share_it() {
+    let edges = [
+        (0, 1, Source::Effect),
+        (1, 2, Source::Effect),
+        (2, 0, Source::Effect),
+        (2, 1, Source::Guess),
+        (0, 2, Source::Guess),
+    ];
+    match schedule(3, &edges).settle_raw(plan(&["a", "b", "c"])) {
+        Err(Refusal::Cycle {
+            members,
+            edges: shown,
+            ..
+        }) => {
+            assert_eq!(members, [0, 1, 2]);
+            assert_eq!(shown.len(), 3);
+            assert!(shown.iter().all(|c| c.source == Source::Effect));
+        }
+        other => panic!("{other:?}"),
+    }
+    // Without a guess in it the refusal is the one it always was.
+    let stated = &edges[..3];
+    assert!(matches!(
+        schedule(3, stated).settle_raw(plan(&["a", "b", "c"])),
+        Err(Refusal::Cycle { .. })
+    ));
+}
+
+/// The fallback is deterministic: the order edges are stated in changes nothing,
+/// and a settled plan settles to itself.
+#[test]
+fn the_fallback_over_guesses_is_deterministic() {
+    let edges = [
+        (0, 1, Source::Guess),
+        (1, 2, Source::Guess),
+        (2, 0, Source::Guess),
+        (3, 1, Source::Effect),
+        (2, 4, Source::Guess),
+    ];
+    let given = plan(&["a", "b", "c", "d", "e"]);
+    let first = schedule(5, &edges).settle_raw(given.clone()).unwrap();
+    let mut reversed = edges;
+    reversed.reverse();
+    let again = schedule(5, &reversed).settle_raw(given.clone()).unwrap();
+    assert_eq!(first.sequence, again.sequence);
+    assert_eq!(first.proof, again.proof);
+    assert_eq!(
+        first.sequence,
+        schedule(5, &edges).settle_raw(given).unwrap().sequence
+    );
+}

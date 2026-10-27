@@ -23,9 +23,10 @@ each existing settlement records its own edges, without a constraint union.
 `OrderedPlan` has a private constructor and no public downgrade or generic
 empty-schedule finalizer (DEC-1959.5).
 
-Scratch settles an engine-owned, SQL-free blueprint before lowering.
-Function/phase compatibility and
-generated constraints retain their separate settlements. The real engine's
+Scratch settles an engine-owned, SQL-free blueprint before lowering: every
+new table is split into the parts the engine creates one at a time, and one
+schedule orders them by the generated constraints and the scratch rules, with
+no phase and no retained hold (DEC-2389.1). The real engine's
 opaque associated input prevents a caller-defined engine from manufacturing
 its scratch result. LoweredPlan keeps immutable operation groups, source IDs
 and statements and is branded by the emitter, so a mock emitter cannot supply
@@ -632,6 +633,13 @@ and the expression-bearing changes that need a function.
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
 | Function created → a new table's generated column calling it | content, over-approximated | shared creation parts keep the prefix before the function, then add the suffix in declaration order; a suffix partition key or a generation reading a later column instead uses SET EXPRESSION on connected PostgreSQL 17+, retaining the whole-table hold otherwise | ✓ DEC-1503.1 |
+| Index created → a change whose text names it by an OID-alias literal | content, over-approximated | scratch only, where indexes share the namespace of tables: the table's own step, a unique constraint, a primary key or a part holds no expression, and the reader follows it (`42P01` otherwise) | ✓ DEC-2389.1 |
+| Parent's default set → a partition's own default on that column | value | scratch only: the parts of the two defaults, and of every ancestor's | ✓ DEC-2389.1 |
+| Module or generated expression → an index that holds an expression or a predicate | position | scratch only: the index follows every one, so each counts it among the names made resolvable after it | ✓ DEC-2389.1 |
+| Type created → every change whose text names it, a domain over it included | content, over-approximated | scratch only: a column, routine or domain over an absent type is `42704`; the module is read through `module_creation_text` | ✓ DEC-2389.1, DEC-2407.1 |
+| Module → module, table or index its text names | content, over-approximated | scratch only: read through the text the engine resolves at creation (`module_creation_text`): a PL/pgSQL body is a reference only where it declares a type, a `LANGUAGE sql` body, view, trigger and every header are | ✓ DEC-2389.2 |
+| A string in a text → the object it names | content, over-approximated | PostgreSQL scratch retains literal names as reference guesses, including implicit OID-alias arguments such as `pg_relation_size('app.t')`; data matches cannot make a valid declaration unorderable, since cyclic guesses give way | ✓ DEC-2389.3 |
+| Kinds of scratch edge | stated or guess | scratch only: an edge the engine needs by construction (the column chain, own parts, keys, replica identity, partition defaults, `depends_on:`, a function before the part whose expression code calls it, a type spelling, literal or view never being a hard call) is stated; one that rests only on a name matched in a text (a table, module, type or index a text names, an expression index after modules) is a guess. Where steps wait on one another `settle` first drops the guesses inside the cycle that run against the plan's order and settles again, then the rest of them if it must, so the plan's order decides there; a guess reads expressions and user-defined type spellings, never a built-in one; a cycle of stated edges is the named refusal. The engine reports what a guess missed, with the `depends_on:` remedy | ✓ DEC-2389.4 |
 
 ### Something removed before what it blocks
 

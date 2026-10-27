@@ -1300,11 +1300,37 @@ impl Dialect for Postgres {
             functions,
             needs_complete_shape,
             self.server_version_num,
+            false,
+        )
+    }
+
+    fn scratch_table_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        generated::parts(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            self.server_version_num,
+            true,
         )
     }
 
     fn generation_may_call(&self, text: &str, name: &str) -> bool {
         generated::may_call(text, name)
+    }
+
+    fn module_creation_text<'a>(&self, module: &'a pbps_model::Module) -> Cow<'a, str> {
+        generated::creation_text(module)
+    }
+
+    fn scratch_text_edges_are_guesses(&self) -> bool {
+        true
     }
 
     fn generation_names_table(&self, text: &str, table: &TableName) -> bool {

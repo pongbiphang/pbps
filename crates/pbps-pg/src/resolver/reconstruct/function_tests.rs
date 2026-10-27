@@ -1,5 +1,5 @@
-//! Retained whole-table holds and their phase compatibility, beside the
-//! frozen scratch mover (DEC-1959.3).
+//! Whole-table holds and the readers behind them, as the constraints on the
+//! parts order them (DEC-1959.3, DEC-2389.1).
 use super::*;
 use pbps_model::{
     Column, ForeignKey, Generated, IdsFile, Module, PrimaryKey, Schema, Table, TableName, Uid,
@@ -151,8 +151,13 @@ fn bootstrap(schema: &Schema, seed: u32) -> (Vec<Change>, IdsFile) {
     (changes, ids)
 }
 
+/// Every table's generation waits for its function, whatever order the plan
+/// and the seed give; what reads a table follows it, what reads that follows
+/// the reader, and a key follows both tables it joins (DEC-1274.2). A server
+/// that cannot replace an expression holds the table whole; one that can
+/// creates it bare and finishes its generation after the function.
 #[test]
-fn multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds() {
+fn multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds() {
     for seed in 0..32 {
         for reference in [false, true] {
             let schema = schema(reference, "");
@@ -167,28 +172,85 @@ fn multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds() {
                     &ids,
                 )
                 .unwrap();
+                let order: Vec<_> = reconstruction
+                    .steps
+                    .iter()
+                    .map(|s| s.declaration.as_str())
+                    .collect();
+                let first = |d: &str| order.iter().position(|x| *x == d).unwrap();
+                let last = |d: &str| order.iter().rposition(|x| *x == d).unwrap();
+                let held = version.is_none_or(|v| v < 170_000);
+                // The step after which a table is complete.
+                let complete = |table: &str| {
+                    if held {
+                        first(&format!("table app.{table}"))
+                    } else {
+                        first(&format!("generation of app.{table}.g"))
+                    }
+                };
+                for (table, function) in [("a", "f"), ("b", "h")] {
+                    let function = format!("function app.{function}(integer)");
+                    assert!(first(&function) < complete(table), "{order:?}");
+                    assert_eq!(
+                        first(&format!("table app.{table}")) < first(&function),
+                        !held,
+                        "{order:?}"
+                    );
+                }
+                // A reader needs the table's name and its columns, which a
+                // bare table has, with its generation still a placeholder.
+                assert!(first("table app.a") < first("view app.reader"), "{order:?}");
+                assert!(first("view app.reader") < first("view app.consumer"));
+                assert!(first("table app.b") < first("view app.other"), "{order:?}");
+                if held {
+                    assert!(complete("a") < first("view app.reader"), "{order:?}");
+                }
+                // The key joins both tables, so it follows both.
                 assert!(
-                    reconstruction
-                        .steps
-                        .iter()
-                        .any(|s| s.declaration == "table app.a")
+                    complete("a").max(complete("b")) < last("table app.b"),
+                    "{order:?}"
                 );
+                if reference {
+                    assert!(first("table app.a") < complete("b"), "{order:?}");
+                }
+                // Negative: a view that reads no table waits for none, so it
+                // stays ahead of a reader the plan gave it precedence over.
+                let given = |name: &str| {
+                    changes
+                        .iter()
+                        .position(
+                            |c| matches!(c, Change::CreateModule { id, .. } if id.name() == name),
+                        )
+                        .unwrap()
+                };
+                if given("free") < given("reader") {
+                    assert!(
+                        first("view app.free") < first("view app.reader"),
+                        "{order:?}"
+                    );
+                }
                 let mut cyclic = schema.clone();
                 cyclic.modules.get_mut(&"app.f(integer)".parse().unwrap()).unwrap().definition =
                     "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT g FROM app.a LIMIT 1 $$".into();
                 let (cyclic, ids) = bootstrap(&cyclic, seed);
-                // Unknown/old engines keep the named hold and refusal. Modern
-                // placeholder behavior is pinned separately by #1503's tests.
-                let why = Reconstruction::new(
+                // `f` reads the column its own table waits for, so no order
+                // compiles. The edge from the table to `f` rests on a name in
+                // its text and gives way (DEC-2389.4): the plan's order is
+                // built, and the engine names the column it lacks.
+                let order: Vec<_> = Reconstruction::new(
                     &crate::Postgres::new(),
                     &crate::resolver::reconstruct::fixture_plan(&cyclic),
                     &ids,
                 )
-                .unwrap_err()
-                .to_string();
+                .unwrap()
+                .steps
+                .iter()
+                .map(|s| s.declaration.clone())
+                .collect();
+                let first = |d: &str| order.iter().position(|x| x == d).unwrap();
                 assert!(
-                    why.contains("app.a") && why.contains("app.f(integer)"),
-                    "{why}"
+                    first("function app.f(integer)") < first("table app.a"),
+                    "{order:?}"
                 );
             }
         }

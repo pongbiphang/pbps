@@ -1,5 +1,12 @@
 //! A new relation's name exists before its generated expressions bind
 //! (DEC-1503.1). All callers lower these same typed parts.
+//!
+//! The resolver's scratch reconstruction splits every new table
+//! (DEC-2389.1): the bare table, then each foreign key, default, check and
+//! index that holds an expression, and a partition's own default, as a part
+//! of its own, so that the constraints on the parts, and nothing else, decide
+//! the order they compile in. What holds no expression stays with the table:
+//! it names nothing a module could bind, and it is there when the table is.
 
 use pbps_dialect::DialectError;
 use pbps_model::{Change, ColumnName, ColumnRef, IdsFile, ModuleId, ValueSource};
@@ -10,6 +17,7 @@ pub(crate) fn parts(
     functions: &[ModuleId],
     needs_complete_shape: bool,
     version: Option<i64>,
+    scratch: bool,
 ) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
@@ -22,10 +30,13 @@ pub(crate) fn parts(
         return Ok(None);
     };
     let calls = |text: &str| functions.iter().any(|id| super::may_call(text, id.name()));
-    let Some(cut) = table.columns.values().position(|c| {
+    let calling = table.columns.values().position(|c| {
         matches!(&c.value_source,
         ValueSource::Generated(g) if calls(&g.expression))
-    }) else {
+    });
+    // A table that generates nothing from a planned function is split only
+    // on scratch, and then there is no suffix.
+    let Some(cut) = calling.or(scratch.then_some(table.columns.len())) else {
         return Ok(None);
     };
     let suffix: Vec<_> = table.columns.keys().skip(cut).cloned().collect();
@@ -45,9 +56,17 @@ pub(crate) fn parts(
         .as_ref()
         .is_some_and(|key| key.columns.iter().any(|c| suffix.contains(c)));
     let placeholder = partition_key || later_input || needs_complete_shape;
-    if placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN) {
+    let held = placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN);
+    if held && !scratch {
         return Ok(None);
     }
+    // Scratch keeps such a table whole, as it always has, and only the
+    // function its generation calls holds it back.
+    let (cut, suffix, placeholder) = if held {
+        (table.columns.len(), Vec::new(), false)
+    } else {
+        (cut, suffix, placeholder)
+    };
     let pending = if placeholder {
         table
             .columns
@@ -62,7 +81,8 @@ pub(crate) fn parts(
     };
     let late_column = |column: &ColumnName| pending.iter().any(|c| c == column);
     let late_text = |text: &str| {
-        calls(text)
+        scratch
+            || calls(text)
             || pending.iter().any(|c| super::may_read(text, c.raw()))
             || (super::names_table(text, name) && !super::table_name_only(text, name))
     };
@@ -186,17 +206,63 @@ pub(crate) fn parts(
     }
     for (column, spec) in &mut bare.columns {
         if let ValueSource::Default(text) = &mut spec.value_source
-            && calls(text)
+            && (scratch || calls(text))
         {
             let to = std::mem::take(text);
             spec.value_source = ValueSource::None;
             tail.push(Change::AlterColumnDefault {
-                uid: column_uid(column)?,
+                // Scratch has no use for a recorded identity, and a table
+                // given none is still reconstructed.
+                uid: if scratch {
+                    ids.column_uid(&name.column(column))
+                        .cloned()
+                        .unwrap_or_else(|| uid.clone())
+                } else {
+                    column_uid(column)?
+                },
                 column: name.column(column),
                 from: None,
                 to: Some(to),
             });
         }
+    }
+    // A partition's own default is set after its parent's, which reaches
+    // every partition (DEC-1578.1), so it is a part of its own too.
+    if scratch {
+        for (column, own) in bare.partition_of.iter_mut().flat_map(|of| &mut of.columns) {
+            if let Some(default) = own.default.take() {
+                tail.push(Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: name.column(column),
+                    from: None,
+                    to: Some(default),
+                });
+            }
+        }
+    }
+
+    if scratch {
+        // Peers keep the order the declarations give them (DEC-2389.1).
+        let kinds = |part: &Change| {
+            [
+                matches!(
+                    part,
+                    Change::AddColumn { .. } | Change::AlterColumnExpression { .. }
+                ),
+                matches!(
+                    part,
+                    Change::SetPrimaryKey { .. } | Change::AddUnique { .. }
+                ),
+                matches!(part, Change::AddForeignKey { .. }),
+                matches!(part, Change::AlterColumnDefault { .. }),
+                matches!(part, Change::AddCheck { .. }),
+                matches!(part, Change::AddIndex { .. }),
+            ]
+            .iter()
+            .position(|kind| *kind)
+            .unwrap_or(6)
+        };
+        tail.sort_by_key(kinds);
     }
     let mut parts = vec![Change::CreateTable {
         uid: uid.clone(),

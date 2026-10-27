@@ -7856,6 +7856,9 @@ the existing column/row/partition/literal/declared-dependency negatives, and
 `callable_columns_precede_their_readers_and_real_cycles_are_refused_on_both_servers`
 on the pinned PostgreSQL 16 and 18 fixtures.
 
+*Amended by [DEC-2389.1](#dec-2389-1): PostgreSQL's scratch route has no
+phases and no retained hold. Its parts are ordered by constraints alone.*
+
 
 <a id="dec-1959-4"></a>
 
@@ -8638,3 +8641,338 @@ The shared callee matcher refines both `Final` and baseline `BeforeRewrite`
 requirements; view matching remains lexical (#2143). No rank, wire format or
 release verifier is added. The module-only SQL Server regression measures
 accent, width and case sensitivity, the reversed verifier order and 3729.
+<a id="dec-2389-1"></a>
+
+**DEC-2389.1. PostgreSQL's scratch route orders its parts by constraints
+alone; each rule that is not a dependency is named and measured.** The
+resolver's scratch route split a new table itself and put each piece in one of
+four phases (tables, keys, modules, expressions), chained the phases, and held
+a table whose generation calls a function after that function. It is now the
+route SQL Server takes (DEC-1503.1, DEC-1959.6): `Dialect::scratch_table_parts`
+splits every new table into the parts the engine creates one at a time, and
+one `Schedule` settles the constraints `generated::constraints_in` states over
+them, each between the two operations it names, with the order the plan gives
+as its tie-break. `Phase`, the function hold, `HeldTable` and `Engine::phase`
+are gone, and a cycle is `Schedule`'s named refusal. SQL Server and the
+ordinary route are byte for byte what they were.
+
+What the table keeps with it is what holds no expression: its columns, key,
+unique constraints and plain indexes (a relation each, so a name of the table's
+step), and an identity on one of those. What holds an expression is a part of
+its own: a foreign key, a default, a check, an index with a predicate or an
+expression key, and a partition's own default. A table the engine cannot split
+(a generation reading a later column or keyed by a suffix column, before
+PostgreSQL 17) is one part, held by the function it calls and holding what
+reads it, as before.
+
+Rules the schedule states beyond what a text names, measured on PostgreSQL
+16.15 and 18.6 (the answers are the same on both):
+
+- **An index precedes the reader that names it** (#1042). `'app.ix'::regclass`
+  in a view, a SQL function body or a default is `42P01` while the index is
+  absent, and not an error in a PL/pgSQL body, which is not read until it runs.
+  The names are those of an index that holds no expression, a unique
+  constraint and a primary key, taken from the table's own step or a part.
+  Kept as a rule because the reader names the index, not its table. In an
+  engine whose indexes do not share the namespace of tables there is none.
+- **A partition's own default follows its parent's, and its ancestors'.** The
+  parent's `SET DEFAULT` after the partition's own replaces it (the partition
+  shows the parent's default), and before it does not. Kept because the two
+  defaults share no text.
+- **An index that holds an expression or a predicate follows every module and
+  every generated expression.** The engine needs only the routines it calls
+  (`42883` without them; an unrelated module after it is no error). Kept
+  because what the resolver judges, a module or a generated expression, counts
+  the names made resolvable after it (`later_names`), and an index made after
+  it is a name it could not have bound; the schedule alone would put the
+  index before a module the plan places later.
+- **A created type precedes every change whose text names it** (#2407,
+  DEC-2407.1). The engine refuses a column, a routine or a domain over a type
+  that does not exist (`42704`), and a type is needed by nothing a bootstrap
+  makes, so a domain over an enum follows the enum and no type waits for a
+  table. It was a `Types` phase before the phases went (#2407 merged first).
+
+Rules of the phases that no constraint reproduces, each measured and dropped:
+
+- *Every table before every module.* A module waits for the table it names
+  (and a table row type it casts to), as it does for a function; one that
+  names none keeps the plan's order. Compiled on both servers, none of
+  the 1,200 compiles (600 generated schemas on each) succeeded before and fails
+  now.
+- *Foreign keys after the modules for a held table; keys before modules
+  otherwise.* A key names only tables, so it follows the complete shape of the
+  two it joins (`42P01`, `42830` and `42703` otherwise) and nothing else.
+- *Every default and check after every module.* Each waits for the routine its
+  text names; an unrelated module after it is no error.
+- *Triggers last.* A trigger needs its function and its table; defaults,
+  checks and indexes are no error before or after it.
+- *A replica identity after the index it names* is kept, as it was: inline in
+  the table's statements, or by the constraint between the index and the part.
+- *The chain of peers within a phase* is the plan's order.
+
+`later_names` is a check on what the engine bound, not a constraint, and does
+not change; neither does the identity read back after a routine or a relation
+compiles. What changes is the order it is asked about: a module can lose a
+name of a module the plan places before it, a table's generated expression
+the plain index of an earlier table (made with that table now), and any
+module gains the names of the indexes that hold an expression. A module that
+names a plain index of a held table by literal now compiles; it failed with
+`42P01` (five of 1,200 compiles).
+
+PostgreSQL does not give `generation_column_names`, so `wait_for` and
+`Dialect::generation_column_key` are not reached and two quoted columns that
+differ in case are never merged; a dialect that gives them owns that key.
+
+Pinned by `a_reader_naming_an_index_follows_the_table_that_keeps_it`,
+`an_index_that_holds_a_predicate_follows_every_module_and_generation`,
+`a_partitions_own_default_follows_its_parents_when_the_parents_waits`,
+`multiple_holds_and_their_readers_follow_their_functions_for_32_uid_seeds`,
+and the live `scratch_rules_compile_on_both_servers` and
+`held_tables_and_readers_compile_with_their_keys_on_both_servers`.
+
+
+<a id="dec-2389-2"></a>
+
+**DEC-2389.2. The scratch route orders a module by what the engine resolves
+when it creates it.** Part of #2389, draft rounds 1 and 2. Splitting every new table
+(DEC-2389.1) makes `generated::constraints_in` non-empty for every plan, so the
+module dependencies it adds (a function moved past a held table must not pass a
+module it calls) now reached plans that never had a generated column. They read
+the whole definition, a PL/pgSQL body included, and two PL/pgSQL routines that
+call each other by name closed a cycle between them that the engine does not
+have: the declaration reconstructed before, and a table with a plain default
+beside the two refused it.
+
+Measured on PostgreSQL 16.15 and 18.6, which agree, with
+`check_function_bodies = on` (pinned by the transaction framing). Created while
+a routine, table or index the body names is absent: a PL/pgSQL body that calls,
+performs, selects from or names by literal or `REINDEX`, and whose declared
+variable has a default calling it. Refused with `42883`, `42P01` or `42704`
+while it is absent: a `LANGUAGE sql` body (string, `BEGIN ATOMIC`, `RETURN`),
+including a literal inside it (`'app.ix'::regclass`); a view; a trigger; and,
+in any language, the header (a parameter default, `RETURNS`, `SUPPORT`). A
+PL/pgSQL body does resolve what its `DECLARE` sections name (round 2): the type
+of a variable (`r app.v%ROWTYPE`, `app.v`, `app.t.c%TYPE`, an array of it, a
+`COLLATE`), in any block, and the parameter types of a cursor (`42704`,
+`42P01`; `42601` on 16 for an absent `%TYPE`). Created while absent: a
+variable's default, a cursor's query, an `ALIAS`, every statement. No other
+language is created in the pinned images (`plperl` and the like are `42704`).
+
+In scratch the text of a module that orders it is `Dialect::module_creation_text`
+(the whole definition by default). PostgreSQL answers the definition with a
+PL/pgSQL body reduced to the types its declarations name, and with a
+`LANGUAGE sql` string body returned as code, so that the literals in it are the
+text's literals and its OID-alias literals count. It is read by the module
+dependencies, by the modules that read a table, the choice of a table to hold,
+and the rule that an index precedes the reader naming it. Declared dependencies are unchanged. The ordinary route reads the
+whole definition, as it did.
+
+A cycle of routines resolved at creation (two `LANGUAGE sql` bodies calling
+each other: neither is creatable in any order, measured) remains
+`Schedule`'s named refusal, and its message no longer speaks of a generated
+column only.
+
+A sweep for the same shape found one edge the first commit missed: the index
+rule did not see an OID-alias literal inside a `LANGUAGE sql` string body, whose
+literal was one string to the scan, so the function could precede the table and
+fail with `42P01` where the phases made it follow. It is read as code now.
+
+Compared with the previous head on 600 generated schemas on each server (1,200
+compiles): no regression, and the same five that compile now. Statement
+multisets and the names made resolvable after each step are unchanged; the
+order of 582 cases differs where a module no longer waits on a body that only
+runs later. Declarations that compile now and were refused in both routes: a
+held table whose function reads it from a PL/pgSQL body, and two PL/pgSQL
+routines calling each other beside a generated column.
+
+Pinned by `routines_that_call_each_other_late_are_no_cycle`,
+`routines_that_call_each_other_at_creation_stay_a_named_cycle`,
+`a_late_routine_still_follows_what_its_header_names`,
+`a_late_body_reading_a_table_does_not_follow_it`,
+`a_late_body_naming_an_index_does_not_follow_the_table_keeping_it`,
+`a_sql_body_naming_an_index_and_a_table_by_literal_follows_both`, the
+`creation_text` tests, and the live `scratch_rules_compile_on_both_servers`.
+
+
+<a id="dec-2389-3"></a>
+
+**DEC-2389.3. Scratch retains names inside literals as reference guesses.**
+Part of #2389, ready-phase rounds 1 and 9. Two independent text domains
+`app.a AS text DEFAULT 'b'` and `app.b AS text DEFAULT 'a'` must remain
+orderable: those defaults are data, and the engine creates them in either
+order. Their name matches may supply `Source::Guess` edges; the cycle fallback
+of DEC-2389.4 gives way instead of refusing the valid declaration.
+
+Measured on PostgreSQL 16.15 and 18.6, with the named object absent: ordinary
+text defaults, checks and views are created, while a literal cast to an
+OID-alias type is resolved at creation (`42704`, `42P01`, `42883` or `3F000`).
+This includes `'app.b'::regtype`, `regtype 'app.b'`, `regtype('app.b')`,
+`CAST('app.b' AS regtype)`, qualified types and routine-parameter defaults.
+Those real reference-order positives stay covered. A generated expression
+`a + 'app.f(integer)'::regprocedure::oid::integer` is immutable and binds the
+function at creation: both engines refuse it with `42883` before f exists and
+create it after f. The earlier test's route through `regprocedure::text` is
+not a valid generation (`42P17`, expression not immutable), so it cannot stand
+in for that negative.
+
+A literal can also bind without an OID-alias spelling in its own text:
+`pg_relation_size('app.t')` takes a relation identity through its signature.
+Erasing the string lost the table-to-view edge in the round-9 example, and on
+16 the view compiled before a table held for `app.f(z)` with z declared later.
+There is no sound text-only allowlist of which literals are data. Removed
+`literals_name_objects`, its dialect hook and `OID_ALIASES`; the reference
+readers for tables, modules, types and indexes retain literals. Every such
+match on PostgreSQL scratch is a guess, including a function name found only
+inside an expression's literal. Creation-text reduction for late PL/pgSQL
+bodies stays as DEC-2389.2 specifies; ordinary planning is unchanged.
+
+A hard own-part call has a different reader: its position must be outside a
+literal (DEC-2389.4). Otherwise `length('f')` beside a later SQL function f
+reading the table would put f before its table on 16. Blanking literals only
+for this call reader leaves the reference guess available, and the table
+compiles first. The prepared-edge tests distinguish the genuine Lexical call,
+the literal-only Guess, and the table-to-view Guess.
+
+Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
+`data_strings_do_not_make_oid_alias_readers_unorderable`,
+`a_data_string_cannot_make_an_index_reader_unorderable`,
+`a_data_string_cannot_make_a_generation_unorderable`,
+`a_real_oid_alias_function_reference_keeps_its_binding_order`,
+`a_literal_relation_reader_follows_a_table_held_for_its_function`,
+`a_literal_function_name_is_only_a_guess_and_a_code_call_stays_lexical`,
+`no_declared_column_or_domain_is_of_an_oid_alias_type`, and the live
+`scratch_rules_compile_on_both_servers`.
+
+
+<a id="dec-2389-4"></a>
+
+**DEC-2389.4. A scratch reference guess gives way where it closes a cycle.**
+Part of #2389, ready-phase rounds 2 to 9. The rules of DEC-2389.1 to DEC-2389.3 each read a name in a text as a
+dependency, and each time the guess closed a cycle with an edge the engine does
+need, the declaration was refused that the route they replaced created: `VALUE`
+in a domain's check read as the domain `app.value`, and a routine's parameter
+`id` read as the index `id` of a table the routine's own call holds back (on 16).
+Excluding one spelling at a time (DEC-2389.3) cannot end the class, which is
+that a name equal to another is no reference.
+
+A schedule has two kinds of edge. `Schedule::edge` states one the caller knows
+the engine needs. `Schedule::prefer` states a guess (`Source::Guess`): obeyed
+like any edge, and when steps wait on one another, `settle` drops the guesses
+whose two ends are in one strongly connected component and settles again, so the
+order stated, which here is the plan's, decides between the members. That is two
+steps (round 4). First only the guesses that run against the order given go
+(`after` earlier than `before`): the order given is one the ordinary route proved
+valid, so every cycle has an edge against it, and a guess that runs with it, which
+is the real one when a name collides, stays. Only if steps still wait on one
+another does the second step drop the remaining guesses inside the components
+that are still cyclic. Each cycle lies in one component, so what is left of the
+cycles holds only stated edges, and a cycle of those is the named refusal. A guess in no cycle, or between
+components, is kept. Components, edges and ties are all in ascending order, so
+one input gives one order. The ordinary route never states a guess: its schedules
+and refusals are unchanged. `Dialect::scratch_text_edges_are_guesses` (false by
+default, true for PostgreSQL) is what makes scratch state its text-derived edges
+so; SQL Server states them as before.
+
+Which text an edge reads depends on the position a name occurs in (round 4).
+A column's type spelling is a type position, and a name there names a type, which
+is an enum, a domain, or the row type of a table or view (measured on 16 and 18:
+`x app.a` with `app.a` a table or view that is absent is `42704`, and present it
+is created). A built-in spelling such as `text` binds the engine's own type
+(`pg_catalog` comes first) whatever a view or table `app.text` is, so it names
+nothing a declaration made; `ColumnType::type_ref` is what tells them apart (a
+qualified spelling is `Some`). So scratch's guesses read the type spellings that
+are user-defined and the expressions, never a built-in spelling
+(`Types::Named`); the rule for early indexes reads expressions alone (an index
+is no type); a function is never named by a type spelling, so a function is
+matched in expressions only; the type rule reads the user-defined spellings, as
+it must. Where guesses are not read this way (the ordinary route, SQL Server)
+every spelling is read, as before.
+
+Which edge is which, by what it rests on:
+
+| Edge | Rests on | Kind |
+| --- | --- | --- |
+| the declared column chain, computed columns after them | the declaration | stated |
+| a table's own parts after its first part; non-column parts after the complete shape | the split | stated |
+| a consumer the model names (`uses.complete`, a seeded table's consumers) after the complete shape | the change | stated |
+| a foreign key after both tables and the referenced key; a replica identity after its index | the declaration | stated |
+| a partition's own default after its parent's | the declaration | stated |
+| a module after the modules its `depends_on:` names | the user | stated |
+| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | a function matched in expression code outside literals; retained hard until #2465 as explained below | stated |
+| a function named only inside an expression's literal before its part | a possible reference, never a code call position | guess |
+| a view, a trigger or a procedure before a part whose text, expression or user-defined type spelling, names it | a name in a text | guess |
+| a module after the table whose complete shape or first part its text names | a name in a text | guess |
+| a part that names a table after its shape | a name in a text | guess |
+| a module after the module its text calls | a name in a text | guess |
+| a type before every change whose text names it, a domain over it included (DEC-2407.1) | a name in a text | guess |
+| a relation-namespace index before the change whose text names it (DEC-2389.1) | a name in a text | guess |
+| an index that holds an expression or a predicate after every module and generated expression | conservatism, not an engine need | guess |
+
+The call edge is stated only where both halves hold: the provider is a function
+(a view, a trigger or a procedure is never called by an expression) and the text
+is code in one of the part's expressions (`expressions`, never a column's type
+spelling, the type of a row, or a name inside a literal). On PostgreSQL scratch
+only, this call reader uses `Lexicon::code_only`; the unblanked expression is
+still read for reference guesses. Round 3 found the boundary: for a table `app.t(x text)`
+and a view `app.text` that reads it, the type `text` matched the view by leaf
+name, a stated view-before-table edge outweighed the guess that the table comes
+first, and the view was created before its table. A reference outside the hard
+call positions supplies a guess where its kind can be read: a function inside
+an expression's literal still suggests an order, but a function named only by a
+type spelling supplies none. The sweep of the stated edges found no other whose
+evidence is a name match: the column chain,
+own parts, complete-shape consumers (`table_use`), foreign keys, replica identity
+(`name == target`), partition defaults (the declared parent and column) and
+`depends_on:` all read typed fields, and `module_dependencies` states only the
+declared ones. SQL Server and the ordinary route state both kinds as stated edges,
+so their edges are the same as before.
+
+The genuine-call edge is still an over-approximation: identifier, schema and
+overload matches can be wrong. It nevertheless stays **hard until #2465**.
+Measured demotion of that edge made the parameter/index fixture fail on 16:
+the table really calls `app.f(z)`, but f's parameter `id` also guessed a
+reference to the table's index `id`. With both directions guessed, the
+backward-first fallback discarded f-before-table and kept the accidental
+index-before-f edge, creating the table before f (`42883`). Keeping the code
+call hard discards the parameter guess and preserves this previously valid
+fixture. Literal blanking applies the positional rule without repeating that
+demotion. #2465 owns the general solution; this change adds no retry or broader
+call parser.
+
+The plan's order carries what the guesses give up: the ordinary route already
+orders a domain after the type it is over and a table after the types of its
+columns (`type_inputs`, an effect edge), and scratch settles over the plan it is
+given. A declaration that no order creates, such as two
+`LANGUAGE sql` routines that call each other, is then reached by the engine
+instead of the schedule: the compile fails with the object it lacks
+(`42P01`, `42883`, `42704`, `42703`), and the message says that `depends_on:`
+states the order (`with_remedy`). Before this entry such a cycle was named by the
+schedule; it is now named by the engine, at the statement.
+
+DEC-2389.3 retains literals in reference guesses. `later_names` and
+`later_names_generated` follow the settled compile positions, so the data-only
+length expression can precede f on 16. `compiled_early` still checks actual
+engine bindings, not guessed text matches: a binding to built-in `length` does
+not become an early binding to f merely because its argument says `'f'`.
+`a_data_literal_is_not_an_early_binding_to_the_function_it_names` pins both
+that negative and the retained check of a real binding to a later homonym.
+
+Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_orders`,
+`a_cycle_of_stated_edges_is_refused_though_guesses_share_it`,
+`the_fallback_over_guesses_is_deterministic`,
+`a_name_matched_by_accident_does_not_close_a_cycle`,
+`the_fallback_gives_the_same_order_twice`,
+`a_cycle_of_declared_dependencies_stays_the_named_refusal`,
+`a_type_spelling_is_no_call_of_a_view_or_routine_named_like_it`,
+`a_routine_an_expression_calls_still_precedes_it_though_named_like_a_type`,
+`a_call_edge_is_stated_only_for_a_function_an_expression_calls`,
+`a_built_in_type_spelling_names_nothing_and_a_qualified_one_names_what_it_spells`,
+`a_function_is_not_named_by_a_type_spelling`,
+`an_index_is_not_named_by_a_type_spelling`,
+`a_view_named_like_a_builtin_type_follows_the_table_it_reads`,
+`a_view_named_like_a_called_function_still_follows_the_table_it_reads`,
+`a_cycle_gives_up_the_guesses_against_the_order_given_before_the_others`,
+`every_guess_in_a_cycle_goes_only_when_the_backward_ones_are_not_enough`,
+`routines_that_call_each_other_at_creation_fall_back_to_the_plans_order`, and the
+live `scratch_rules_compile_on_both_servers` and
+`scratch_refusals_name_what_is_missing`.

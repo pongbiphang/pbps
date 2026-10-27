@@ -183,22 +183,65 @@ fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
         .collect()
 }
 
+/// What a module's text names for the order. In `scratch` that is the text the
+/// engine resolves when it creates the module (DEC-2389.2): two routines whose
+/// bodies call each other are created in either order, and an edge for a call
+/// the engine makes later would close a cycle between them that is no order's
+/// fault. Otherwise the whole definition, as the ordinary route has it.
+fn named_text<'a>(
+    module: &'a Module,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> std::borrow::Cow<'a, str> {
+    if scratch {
+        dialect.module_creation_text(module)
+    } else {
+        std::borrow::Cow::Borrowed(module.definition.as_str())
+    }
+}
+
+/// The texts of one change, with scratch's typed-position policy.
+fn change_texts<'a>(
+    change: &'a Change,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<&'a str> {
+    gather(change, reading_types(dialect, scratch))
+}
+
+/// The type spellings scratch's guesses read: only those that name a
+/// user-defined type, since a built-in spelling such as `text` binds the
+/// engine's own type whatever a view or routine of that name is (DEC-2389.4).
+/// Every spelling where the edges are stated, as the ordinary route reads them.
+fn reading_types(dialect: &(impl Dialect + ?Sized), scratch: bool) -> Types {
+    if scratch && dialect.scratch_text_edges_are_guesses() {
+        Types::Named
+    } else {
+        Types::All
+    }
+}
+
 /// Keep selection and settlement on exactly the same relation, including
 /// declared dependencies and the existing same-name exclusions (DEC-1503.5).
+/// Each edge is `(provider, consumer, declared)`: a declared one is stated by
+/// the user, and one that is only a name matched in the consumer's text is a
+/// guess (DEC-2389.4).
 fn module_dependencies(
     modules: &[ModuleStep<'_>],
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
-) -> Vec<(usize, usize)> {
+    scratch: bool,
+) -> Vec<(usize, usize, bool)> {
     let mut edges = Vec::new();
     for (i, id, module) in modules {
+        let text = named_text(module, dialect, scratch);
         for (j, provider, _) in modules {
-            if i != j
-                && id.name() != provider.name()
-                && (dialect.generation_may_call(&module.definition, provider.name())
-                    || deps.get(*id).is_some_and(|needs| needs.contains(*provider)))
-            {
-                edges.push((*j, *i));
+            if i == j || id.name() == provider.name() {
+                continue;
+            }
+            let declared = deps.get(*id).is_some_and(|needs| needs.contains(*provider));
+            if declared || dialect.generation_may_call(&text, provider.name()) {
+                edges.push((*j, *i, declared));
             }
         }
     }
@@ -211,7 +254,6 @@ pub fn is_part(p: &PlannedChange) -> bool {
         .is_some_and(|origin| origin.rule == RULE)
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 pub fn parts(
     planned: &PlannedChange,
     ids: &IdsFile,
@@ -219,19 +261,35 @@ pub fn parts(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Option<Vec<PlannedChange>>, String> {
+    parts_in(planned, ids, changes, deps, dialect, false)
+}
+
+/// [`parts`], for the resolver's scratch reconstruction when `scratch`: the
+/// engine splits every new table, not only one whose generation needs a
+/// planned function (DEC-2389.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn parts_in(
+    planned: &PlannedChange,
+    ids: &IdsFile,
+    changes: &[PlannedChange],
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
     // settlement uses rather than predicting a different call graph here.
     let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
         let modules = modules(changes);
-        let edges = module_dependencies(&modules, deps, dialect);
+        let edges = module_dependencies(&modules, deps, dialect, scratch);
         let mut pending: Vec<_> = modules
             .iter()
             .filter(|(_, id, module)| {
                 module.kind == ModuleKind::Function
                     && table.columns.values().any(|c| {
                         matches!(&c.value_source,
-                ValueSource::Generated(g) if dialect.generation_may_call(&g.expression, id.name()))
+                ValueSource::Generated(g) if dialect.generation_may_call(
+                    &g.expression, id.name()))
                     })
             })
             .map(|(i, _, _)| *i)
@@ -242,23 +300,28 @@ pub fn parts(
                 pending.extend(
                     edges
                         .iter()
-                        .filter(|(_, consumer)| *consumer == at)
-                        .map(|(provider, _)| *provider),
+                        .filter(|(_, consumer, _)| *consumer == at)
+                        .map(|(provider, _, _)| *provider),
                 );
             }
         }
-        modules.iter().any(|(i, _, module)| {
-            reached.contains(i)
-                && dialect.generation_names_table(&module.definition, name)
-                && !dialect.generation_table_name_only(&module.definition, name)
-        })
+        modules
+            .iter()
+            .filter(|(i, _, _)| reached.contains(i))
+            .any(|(_, _, module)| {
+                let text = named_text(module, dialect, scratch);
+                dialect.generation_names_table(&text, name)
+                    && !dialect.generation_table_name_only(&text, name)
+            })
     } else {
         false
     };
-    let Some(parts) = dialect
-        .generated_table_parts(&planned.change, ids, &functions, table_reader)
-        .map_err(|e| e.to_string())?
-    else {
+    let split = if scratch {
+        dialect.scratch_table_parts(&planned.change, ids, &functions, table_reader)
+    } else {
+        dialect.generated_table_parts(&planned.change, ids, &functions, table_reader)
+    };
+    let Some(parts) = split.map_err(|e| e.to_string())? else {
         return Ok(None);
     };
     Ok(Some(
@@ -472,14 +535,27 @@ pub fn expand(
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<usize, String> {
+    expand_in(plan, ids, deps, dialect, false)
+}
+
+/// [`expand`], splitting as the scratch reconstruction does when `scratch`.
+pub(super) fn expand_in(
+    plan: &mut super::PlanningPlan,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Result<usize, String> {
     let mut expanded = Vec::new();
     let mut origins = Vec::new();
     let mut added = 0;
     for (p, origin) in plan.changes.iter().zip(&plan.origins) {
-        match parts(p, ids, &plan.changes, deps, dialect)? {
+        match parts_in(p, ids, &plan.changes, deps, dialect, scratch)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 let part_origin = match origin.source() {
+                    // A table that scratch leaves whole is still one part.
+                    pbps_model::operation::Source::Change(_) if parts.len() == 1 => origin.clone(),
                     pbps_model::operation::Source::Change(at) => {
                         pbps_model::operation::Origin::SplitPart(at)
                     }
@@ -500,14 +576,54 @@ pub fn expand(
     Ok(added)
 }
 
-fn texts(change: &Change) -> Vec<&str> {
-    fn column(c: &pbps_model::Column) -> Vec<&str> {
+/// The texts of `change` that are expressions: a default, a generated or
+/// computed expression, a check, an index expression or predicate, a policy.
+/// What names an index or a routine is read here and nowhere else a type
+/// spelling is (DEC-2389.4).
+fn expressions(change: &Change) -> Vec<&str> {
+    gather(change, Types::Omit)
+}
+
+/// Which type spellings a read of the texts of a change includes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Types {
+    /// None: only the expressions.
+    Omit,
+    /// Those that name a user-defined type ([`named`]).
+    Named,
+    /// Every one, as the ordinary route reads them.
+    All,
+}
+
+fn spelling(ty: &pbps_model::ColumnType, types: Types) -> Option<&str> {
+    match types {
+        Types::Omit => None,
+        Types::Named => named(ty),
+        Types::All => Some(ty.base.as_str()),
+    }
+}
+
+/// The spelling of `ty` where it names something a declaration made: a type
+/// qualified by its schema, which is an enum, a domain or the row type of a
+/// table or view (measured on 16 and 18: absent, `42704`). A built-in spelling
+/// such as `text` binds the engine's own type whatever a view or table of that
+/// name is, so it names nothing here.
+fn named(ty: &pbps_model::ColumnType) -> Option<&str> {
+    ty.type_ref()
+        .filter(|r| r.schema() != "pg_catalog")
+        .map(|_| ty.base.as_str())
+}
+
+/// The texts of `change`: its expressions and the type spellings `types` says.
+fn gather(change: &Change, types: Types) -> Vec<&str> {
+    fn column(c: &pbps_model::Column, types: Types) -> Vec<&str> {
         let expression = match &c.value_source {
             ValueSource::Default(t) => Some(t.as_str()),
             ValueSource::Generated(g) => Some(g.expression.as_str()),
             ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
         };
-        std::iter::once(c.ty.base.as_str())
+        spelling(&c.ty, types)
+            .into_iter()
             .chain(expression)
             .collect()
     }
@@ -523,12 +639,16 @@ fn texts(change: &Change) -> Vec<&str> {
             | pbps_model::PartitionIndexDefinition::Unique(_) => Vec::new(),
         },
         Change::RebuildPartitionedTable(_) | Change::AnalyzeTableTree(_) => Vec::new(),
-        Change::CopyTableRows(c) => c.columns.iter().map(|p| p.cast.base.as_str()).collect(),
+        Change::CopyTableRows(c) => c
+            .columns
+            .iter()
+            .filter_map(|p| spelling(&p.cast, types))
+            .collect(),
 
         Change::CreateTable { table, .. } => table
             .columns
             .values()
-            .flat_map(column)
+            .flat_map(|c| column(c, types))
             .chain(table.computed.values().map(|c| c.expression.as_str()))
             .chain(table.checks.values().map(|c| c.expression.as_str()))
             .chain(
@@ -545,14 +665,17 @@ fn texts(change: &Change) -> Vec<&str> {
                     .chain(ix.columns.iter().filter_map(|c| c.key.expression()))
             }))
             .collect(),
-        Change::AddColumn { column: c, .. } => column(c),
+        Change::AddColumn { column: c, .. } => column(c, types),
         Change::AddComputedColumn { computed, .. } => vec![&computed.expression],
         Change::AlterColumnExpression { to, .. } => vec![to],
         Change::AlterColumnDefault { to, .. } => to.as_deref().into_iter().collect(),
         Change::SetPartitionDefault { to, fallback, .. } => {
             to.as_deref().or(fallback.as_deref()).into_iter().collect()
         }
-        Change::AlterColumnType { from, to, .. } => vec![&from.base, &to.base],
+        Change::AlterColumnType { from, to, .. } => [from, to]
+            .into_iter()
+            .filter_map(|t| spelling(t, types))
+            .collect(),
         Change::AddCheck { constraint, .. } => vec![&constraint.expression],
         Change::CreatePolicy { policy, .. } => policy
             .using
@@ -567,28 +690,30 @@ fn texts(change: &Change) -> Vec<&str> {
             .chain(index.columns.iter().filter_map(|c| c.key.expression()))
             .collect(),
         Change::InsertRow {
-            defaults, types, ..
+            defaults,
+            types: row,
+            ..
         } => defaults
             .values()
             .map(String::as_str)
-            .chain(types.values().map(|t| t.base.as_str()))
+            .chain(row.values().filter_map(|t| spelling(t, types)))
             .collect(),
         Change::UpdateRow {
-            types,
+            types: row,
             after_types,
             key_type,
             ..
         }
         | Change::DeleteRow {
-            types,
+            types: row,
             after_types,
             key_type,
             ..
-        } => types
+        } => row
             .values()
             .chain(after_types.values())
             .chain(key_type.iter())
-            .map(|t| t.base.as_str())
+            .filter_map(|t| spelling(t, types))
             .collect(),
         Change::DropTable { .. }
         | Change::DetachPartition { .. }
@@ -661,10 +786,15 @@ fn wait_for(
     own: &[(usize, &PlannedChange)],
     columns: &BTreeSet<String>,
     reader: usize,
+    guessed: bool,
 ) {
     let mut wait = |before: usize| {
         if before != reader {
-            out.edge(before, reader, Source::Lexical, OrderReason::Structural);
+            if guessed {
+                out.prefer(before, reader, OrderReason::Structural);
+            } else {
+                out.edge(before, reader, Source::Lexical, OrderReason::Structural);
+            }
         }
     };
     wait(first);
@@ -677,17 +807,41 @@ fn wait_for(
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 pub fn constraints(
     cs: &ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
     dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Constraint> {
+    constraints_in(cs, declared, deps, dialect, false)
+}
+
+/// [`constraints`], and when `scratch` the rules only the resolver's scratch
+/// reconstruction has (DEC-2389.1), over parts that every new table was split
+/// into.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(super) fn constraints_in(
+    cs: &ChangeSet,
+    declared: &Schema,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+    scratch: bool,
+) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
         if a != b {
             out.edge(a, b, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    // An edge that rests only on a name matched in a text (DEC-2389.4).
+    let guessed = scratch && dialect.scratch_text_edges_are_guesses();
+    let guess = |out: &mut Schedule, a, b| {
+        if guessed {
+            if a != b {
+                out.prefer(a, b, OrderReason::Structural);
+            }
+        } else {
+            edge(out, a, b);
         }
     };
     let modules = modules(&cs.changes);
@@ -773,12 +927,41 @@ pub fn constraints(
                     }
                 }
             }
-            for (function, id, _) in &modules {
-                if texts(&p.change)
-                    .iter()
-                    .any(|t| dialect.generation_calls(t, id))
+            // The engine needs a routine before the expression that calls it.
+            // A name matched anywhere else (a type spelling `text` beside a
+            // view `app.text`) is a guess, and so is a name that is no
+            // function (DEC-2389.4).
+            let read = change_texts(&p.change, dialect, scratch);
+            let expressions = expressions(&p.change);
+            // A hard call position is in code. A name inside a literal can
+            // still supply a reference guess, but cannot establish a call.
+            let called: Vec<_> = expressions
+                .iter()
+                .map(|text| {
+                    if guessed {
+                        std::borrow::Cow::Owned(dialect.lexicon().code_only(text))
+                    } else {
+                        std::borrow::Cow::Borrowed(*text)
+                    }
+                })
+                .collect();
+            for (function, id, module) in &modules {
+                if module.kind == ModuleKind::Function
+                    && called.iter().any(|t| dialect.generation_calls(t, id))
                 {
                     edge(&mut out, *function, *i);
+                } else if module.kind == ModuleKind::Function
+                    && guessed
+                    && expressions.iter().any(|t| dialect.generation_calls(t, id))
+                {
+                    guess(&mut out, *function, *i);
+                } else if (module.kind != ModuleKind::Function || !guessed)
+                    && read.iter().any(|t| dialect.generation_calls(t, id))
+                {
+                    // A view or table can be named as a type, a function
+                    // cannot: where guesses are read exactly, a function in
+                    // a type spelling is no reference at all.
+                    guess(&mut out, *function, *i);
                 }
             }
         }
@@ -811,7 +994,7 @@ pub fn constraints(
                     }
                 }
             }
-            let references: Vec<_> = texts(&p.change)
+            let references: Vec<_> = change_texts(&p.change, dialect, scratch)
                 .into_iter()
                 .filter(|text| dialect.generation_names_table(text, name))
                 .collect();
@@ -820,7 +1003,7 @@ pub fn constraints(
                     .iter()
                     .all(|text| dialect.generation_table_name_only(text, name));
                 let shape = if name_only || whole { first } else { complete };
-                edge(&mut out, shape, i);
+                guess(&mut out, shape, i);
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -846,26 +1029,227 @@ pub fn constraints(
             }
         }
         for (i, _, module) in &modules {
-            if dialect.generation_names_table(&module.definition, name) {
+            let text = named_text(module, dialect, scratch);
+            if dialect.generation_names_table(&text, name) {
                 // Called readers already chose a full-shape placeholder or
                 // the whole-table hold; every consumer sees that full shape.
-                if let Some(columns) = reads(dialect, &[module.definition.as_str()], name) {
-                    wait_for(dialect, &mut out, first, &own, &columns, *i);
+                if let Some(columns) = reads(dialect, &[&text], name) {
+                    wait_for(dialect, &mut out, first, &own, &columns, *i, guessed);
                 } else {
-                    edge(&mut out, if whole { first } else { complete }, *i);
+                    guess(&mut out, if whole { first } else { complete }, *i);
                 }
             }
         }
+    }
+    if scratch {
+        scratch_rules(cs, declared, dialect, guessed, &mut out);
     }
     if out.constraints().is_empty() {
         return Vec::new();
     }
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
-    for (provider, consumer) in module_dependencies(&modules, deps, dialect) {
-        edge(&mut out, provider, consumer);
+    for (provider, consumer, declared) in module_dependencies(&modules, deps, dialect, scratch) {
+        if declared {
+            edge(&mut out, provider, consumer);
+        } else {
+            guess(&mut out, provider, consumer);
+        }
     }
     out.constraints().iter().cloned().collect()
+}
+
+/// The indexes a change creates and keeps nameable before any module, by
+/// name: an index that holds no expression, a unique constraint and a primary
+/// key are each a relation of that name where indexes share the namespace of
+/// tables, and a new table brings the ones it keeps inline.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn early_index_names(change: &Change) -> Vec<&str> {
+    match change {
+        Change::AddIndex { name, index, .. } if !index.holds_expression() => vec![name.raw()],
+        Change::AddUnique { name, .. } => vec![name.raw()],
+        Change::SetPrimaryKey { to: Some(key), .. } => key.name.iter().map(|n| n.raw()).collect(),
+        Change::CreateTable { table, .. } => table
+            .primary_key
+            .iter()
+            .flat_map(|key| key.name.iter())
+            .map(|n| n.raw())
+            .chain(table.unique.keys().map(|n| n.raw()))
+            .chain(
+                table
+                    .indexes
+                    .iter()
+                    .filter(|(_, index)| !index.holds_expression())
+                    .map(|(name, _)| name.raw()),
+            )
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the resolver judges what this change binds against the names made
+/// resolvable after it: a module, and a generated expression, wherever the
+/// engine installs it.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn is_judged(change: &Change) -> bool {
+    match change {
+        Change::CreateModule { .. }
+        | Change::AlterModule { .. }
+        | Change::AlterColumnExpression { .. } => true,
+        Change::AddColumn { column, .. } => {
+            matches!(column.value_source, ValueSource::Generated(_))
+        }
+        Change::CreateTable { table, .. } => table
+            .columns
+            .values()
+            .any(|c| matches!(c.value_source, ValueSource::Generated(_))),
+        _ => false,
+    }
+}
+
+/// What a domain's definition names: its default and checks, and the base type
+/// as `types` says.
+fn domain_texts(definition: &pbps_model::ManagedType, types: Types) -> Vec<&str> {
+    match definition {
+        pbps_model::ManagedType::Domain {
+            base,
+            default,
+            checks,
+            ..
+        } => spelling(base, types)
+            .into_iter()
+            .chain(default.as_deref())
+            .chain(checks.values().map(String::as_str))
+            .collect(),
+        pbps_model::ManagedType::Enum { .. } => Vec::new(),
+    }
+}
+
+/// What the resolver's scratch reconstruction orders beyond the lexical and
+/// structural constraints above, each measured on PostgreSQL 16 and 18
+/// (DEC-2389.1), in an engine whose indexes share the namespace of tables:
+///
+/// - an index is a relation that a reader may name by an OID-alias literal
+///   (`'app.ix'::regclass`), and the engine refuses the reader while the
+///   index does not exist (SQLSTATE 42P01): an index that holds no
+///   expression precedes every change whose text names it;
+/// - an index that holds an expression or a predicate follows every module
+///   and generated expression, and the modules it may call are what the
+///   engine needs before it (SQLSTATE 42883 without them): what is judged
+///   then counts the index among the names made resolvable after it;
+/// - a partition's own default follows the default its parent sets on the
+///   same column, because the parent's `SET DEFAULT` reaches every partition
+///   and replaces the partition's own;
+/// - a declared enum or domain precedes every change whose text names it,
+///   a domain over it included (DEC-2407.1): the engine refuses a column,
+///   routine or domain over a type that does not exist, and a type is
+///   needed by nothing a bootstrap makes.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn scratch_rules(
+    cs: &ChangeSet,
+    declared: &Schema,
+    dialect: &(impl Dialect + ?Sized),
+    guessed: bool,
+    out: &mut Schedule,
+) {
+    let edge = |out: &mut Schedule, a, b| {
+        if a != b {
+            out.edge(a, b, Source::Lexical, OrderReason::Structural);
+        }
+    };
+    // The edges of the rules that match a name in a text (DEC-2389.4).
+    let guess = |out: &mut Schedule, a, b| {
+        if guessed {
+            if a != b {
+                out.prefer(a, b, OrderReason::Structural);
+            }
+        } else {
+            edge(out, a, b);
+        }
+    };
+    // What each change reads, with the type spellings `types` says: a name in
+    // a type position names a type, so the type rule reads them and the rule
+    // for indexes, which are no type, does not (DEC-2389.4).
+    let readers = |types: Types| -> Vec<(usize, Vec<std::borrow::Cow<'_, str>>)> {
+        cs.changes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let module = match &p.change {
+                    Change::CreateModule { module, .. } | Change::AlterModule { module, .. } => {
+                        Some(dialect.module_creation_text(module))
+                    }
+                    _ => None,
+                };
+                let domain = match &p.change {
+                    Change::CreateType { definition, .. } => domain_texts(definition, types),
+                    _ => Vec::new(),
+                };
+                let all = gather(&p.change, types)
+                    .into_iter()
+                    .chain(domain)
+                    .map(std::borrow::Cow::Borrowed)
+                    .chain(module)
+                    .collect();
+                (i, all)
+            })
+            .collect()
+    };
+    let type_readers = readers(reading_types(dialect, true));
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::CreateType { name, .. } = &p.change else {
+            continue;
+        };
+        for (reader, texts) in &type_readers {
+            if texts
+                .iter()
+                .any(|t| dialect.generation_may_call(t, name.name()))
+            {
+                guess(out, at, *reader);
+            }
+        }
+    }
+    if dialect.indexes_share_namespace_with_tables() {
+        let name_readers = readers(if guessed { Types::Omit } else { Types::All });
+        for (at, p) in cs.changes.iter().enumerate() {
+            for name in early_index_names(&p.change) {
+                for (reader, texts) in &name_readers {
+                    if texts.iter().any(|t| dialect.generation_may_call(t, name)) {
+                        guess(out, at, *reader);
+                    }
+                }
+            }
+            if matches!(&p.change, Change::AddIndex { index, .. } if index.holds_expression()) {
+                for (judged, q) in cs.changes.iter().enumerate() {
+                    if is_judged(&q.change) {
+                        guess(out, judged, at);
+                    }
+                }
+            }
+        }
+    }
+    for (at, p) in cs.changes.iter().enumerate() {
+        let Change::AlterColumnDefault { column, .. } = &p.change else {
+            continue;
+        };
+        let mut table = &column.table;
+        let mut seen = BTreeSet::new();
+        while let Some(of) = declared
+            .tables
+            .get(table)
+            .and_then(|t| t.partition_of.as_ref())
+            && seen.insert(table)
+        {
+            for (parent, q) in cs.changes.iter().enumerate() {
+                if matches!(&q.change, Change::AlterColumnDefault { column: c, .. }
+                    if c.table == of.parent && c.name == column.name)
+                {
+                    edge(out, parent, at);
+                }
+            }
+            table = &of.parent;
+        }
+    }
 }
 
 /// The generated schedule consumes and returns only an owned intermediate.
