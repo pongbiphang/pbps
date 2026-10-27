@@ -2190,6 +2190,241 @@ mod consumer_contract_tests {
     use pbps_policy::consumers::{Bindings, Consumer, Consumers, Side};
 
     #[test]
+    fn rebuilt_domains_share_column_effects_through_derived_domains() {
+        use pbps_model::{Column, ColumnType, ManagedType, Table, TableName, Uid};
+        let domain = |base: &str,
+                      not_null,
+                      default: Option<&str>,
+                      check: Option<&str>,
+                      coll: Option<&str>| ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: check.into_iter().map(|s| ("ck".into(), s.into())).collect(),
+            collation: coll.map(|s| s.parse().unwrap()),
+        };
+        let plain = |base| domain(base, false, None, None, None);
+        let dialect = dialect_for(DialectName::Postgres);
+        let table: TableName = "app.t".parse().unwrap();
+        let t: Uid = "t_aaaaaa".parse().unwrap();
+        let c: Uid = "c_aaaaaa".parse().unwrap();
+        let ctx = pbps_policy::Context {
+            now: 0,
+            max_rows: 1000,
+            connected: false,
+            only: None,
+            deprecated_types: &[],
+        };
+        // Literal cells are reader/writer findings. Every domain row forces
+        // a rebuild; the safe widening isolates the accompanying attributes.
+        for (label, from, to, expected) in [
+            (
+                "narrowing",
+                plain("varchar(80)"),
+                plain("varchar(20)"),
+                [true, true],
+            ),
+            (
+                "widening",
+                plain("varchar(20)"),
+                plain("varchar(80)"),
+                [false, false],
+            ),
+            (
+                "collation",
+                plain("text"),
+                domain("text", false, None, None, Some("pg_catalog.\"C\"")),
+                [true, true],
+            ),
+            (
+                "CHECK added",
+                plain("varchar(20)"),
+                domain("varchar(80)", false, None, Some("length(VALUE) > 0"), None),
+                [false, true],
+            ),
+            (
+                "CHECK replaced",
+                domain("varchar(20)", false, None, Some("length(VALUE) > 0"), None),
+                domain("varchar(80)", false, None, Some("length(VALUE) > 1"), None),
+                [false, true],
+            ),
+            (
+                "CHECK removed",
+                domain("varchar(20)", false, None, Some("length(VALUE) > 0"), None),
+                plain("varchar(80)"),
+                [false, false],
+            ),
+            (
+                "NOT NULL tightened",
+                plain("varchar(20)"),
+                domain("varchar(80)", true, None, None, None),
+                [false, true],
+            ),
+            (
+                "nullability loosened",
+                domain("varchar(20)", true, None, None, None),
+                plain("varchar(80)"),
+                [true, false],
+            ),
+            (
+                "DEFAULT replaced",
+                domain("varchar(20)", false, Some("'a'"), None, None),
+                domain("varchar(80)", false, Some("'b'"), None, None),
+                [false, true],
+            ),
+            (
+                "DEFAULT removed",
+                domain("varchar(20)", false, Some("'a'"), None, None),
+                plain("varchar(80)"),
+                [false, true],
+            ),
+            (
+                "enum removed",
+                ManagedType::Enum {
+                    values: vec!["a".into(), "b".into()],
+                },
+                ManagedType::Enum {
+                    values: vec!["b".into()],
+                },
+                [true, true],
+            ),
+            (
+                "enum reordered",
+                ManagedType::Enum {
+                    values: vec!["a".into(), "b".into()],
+                },
+                ManagedType::Enum {
+                    values: vec!["b".into(), "a".into()],
+                },
+                [false, false],
+            ),
+        ] {
+            for ty in [
+                "app.root",
+                "app.derived",
+                "app.nested",
+                "app.other",
+                "integer",
+            ] {
+                let mut shape = Table::default();
+                shape
+                    .columns
+                    .insert("v".into(), Column::new(ty.parse::<ColumnType>().unwrap()));
+                let before = Schema {
+                    tables: [(table.clone(), shape)].into(),
+                    types: [
+                        ("app.root".parse().unwrap(), from.clone()),
+                        ("app.derived".parse().unwrap(), plain("app.root")),
+                        ("app.nested".parse().unwrap(), plain("app.derived")),
+                        ("app.other".parse().unwrap(), plain("integer")),
+                    ]
+                    .into(),
+                    ..Default::default()
+                };
+                let mut after = before.clone();
+                after.types.insert("app.root".parse().unwrap(), to.clone());
+                let ids = IdsFile {
+                    tables: [(t.clone(), table.clone())].into(),
+                    columns: [(c.clone(), table.column("v"))].into(),
+                    types: ["root", "derived", "nested", "other"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            (
+                                format!("y_{i:06}").parse().unwrap(),
+                                format!("app.{n}").parse().unwrap(),
+                            )
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                let base = pbps_diff::Side {
+                    schema: &before,
+                    ids: &ids,
+                };
+                let desired = pbps_diff::Side {
+                    schema: &after,
+                    ids: &ids,
+                };
+                let diff = pbps_diff::schema_diff::diff(
+                    base,
+                    desired,
+                    dialect.as_ref(),
+                    &Default::default(),
+                )
+                .unwrap_or_else(|e| panic!("{label}/{ty}: {e:?}"));
+                let cs = ChangeSet {
+                    changes: diff
+                        .changes()
+                        .changes
+                        .iter()
+                        .map(|p| {
+                            let mut p = p.clone();
+                            p.risks = dialect.change_risks(&p.change);
+                            p
+                        })
+                        .collect(),
+                };
+                assert!(
+                    cs.changes
+                        .iter()
+                        .any(|p| matches!(&p.change, Change::EnumRebuild { .. })),
+                    "{label}/{ty}: {cs:?}"
+                );
+                let sides = [
+                    Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                ];
+                for (writes, expect) in [false, true].into_iter().zip(expected) {
+                    let consumers: Consumers = [(
+                        "client".into(),
+                        Consumer {
+                            uses: if writes {
+                                vec![]
+                            } else {
+                                vec!["app.t.v".into()]
+                            },
+                            writes: if writes {
+                                vec!["app.t.v".into()]
+                            } else {
+                                vec![]
+                            },
+                            ..Default::default()
+                        },
+                    )]
+                    .into();
+                    let bound = Bindings::resolve(&consumers, &sides, &Clone::clone).unwrap();
+                    let findings = pbps_policy::consumers::plan(
+                        &cs,
+                        &bound,
+                        &sides,
+                        &Default::default(),
+                        &ctx,
+                        &pbps_diff::schema_diff::restoration_comparison(
+                            base,
+                            desired,
+                            dialect.as_ref(),
+                        ),
+                    );
+                    let related = !["app.other", "integer"].contains(&ty);
+                    assert_eq!(
+                        !findings.is_empty(),
+                        expect && related,
+                        "{label}/{ty}, writes={writes}: {findings:?}"
+                    );
+                    assert!(findings.iter().all(|(_, f)| f.id == "consumer.unproven"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn restored_parts_share_the_differs_decisions_for_each_dialect() {
         use pbps_model::{
             CheckConstraint, Column, ColumnType, ComputedColumn, ForeignKey, Index, IndexColumn,

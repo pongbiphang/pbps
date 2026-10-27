@@ -1436,3 +1436,60 @@ fn domain_checks_reach_sibling_writers_and_usage_on_either_side() {
         );
     }
 }
+
+#[test]
+fn derived_domain_overrides_keep_effective_column_attributes() {
+    let root: pbps_model::TypeRef = "app.domain".parse().unwrap();
+    let derived: pbps_model::TypeRef = "app.derived".parse().unwrap();
+    for (from, to, half) in [
+        (
+            domain(true, None, None),
+            domain(false, None, None),
+            pbps_model::DomainHalf::Loosen,
+        ),
+        (
+            domain(false, Some("1"), None),
+            domain(false, Some("2"), None),
+            pbps_model::DomainHalf::Loosen,
+        ),
+    ] {
+        let mut before = schema();
+        before
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("old")
+            .unwrap()
+            .ty = ColumnType::reference(derived.clone());
+        let mut local = domain(true, Some("3"), None);
+        let pbps_model::ManagedType::Domain { base, .. } = &mut local else {
+            unreachable!()
+        };
+        *base = ColumnType::reference(root.clone());
+        before.types.insert(root.clone(), from.clone());
+        before.types.insert(derived.clone(), local);
+        let mut after = before.clone();
+        after.types.insert(root.clone(), to.clone());
+        let change = Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: root.clone(),
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        for writes in [false, true] {
+            assert!(
+                findings(
+                    &before,
+                    &after,
+                    &ids(),
+                    &ids(),
+                    &consumers("app.t.old", writes),
+                    vec![change.clone()]
+                )
+                .is_empty()
+            );
+        }
+    }
+}

@@ -43,6 +43,45 @@ fn supplied_new(at: &ColumnRef, cs: &ChangeSet, sides: &[Side<'_>]) -> bool {
         && !matches!(column.value_source, ValueSource::None)
 }
 
+// A derived domain carries the base domain's restrictions, unless its own
+// attributes (or the column's) already supply the stronger/local definition.
+fn domain_column(
+    mut column: pbps_model::Column,
+    name: &pbps_model::TypeRef,
+    schema: &pbps_model::Schema,
+) -> Option<pbps_model::Column> {
+    let mut ty = column.ty.clone();
+    for _ in 0..=schema.types.len() {
+        let reference = ty.type_ref()?;
+        if reference == name {
+            return Some(column);
+        }
+        let pbps_model::ManagedType::Domain {
+            base,
+            not_null,
+            default,
+            collation,
+            ..
+        } = schema.types.get(reference)?
+        else {
+            return None;
+        };
+        column.nullable &= !not_null;
+        if matches!(column.value_source, ValueSource::None) {
+            column.value_source = default
+                .clone()
+                .map_or(ValueSource::None, ValueSource::Default);
+        }
+        column.collation = column.collation.or_else(|| {
+            collation
+                .as_ref()
+                .map(|c| pbps_model::Collation::new(c.raw().to_string()))
+        });
+        ty = base.clone();
+    }
+    None
+}
+
 fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> bool {
     if entry.table().is_none() {
         return false;
@@ -51,7 +90,7 @@ fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> b
         side.schema.tables.keys().any(|owner| {
             side.ids.table_uid(owner) == entry.table()
                 && side.columns(owner).any(|(at, _, spec)| {
-                    spec.ty.type_ref() == Some(name)
+                    domain_column(spec, name, side.schema).is_some()
                         && (matches!(entry.target, Target::Table(_))
                             || entry.named_column(&at.name, sides)
                             || side
@@ -108,6 +147,11 @@ pub(super) fn classify(
             column_hit && nullable
         }
     };
+    let retype = |uid: &Uid, nullable: bool, collation: bool| {
+        (((column(uid) && (p.risks.contains(&RiskClass::Narrowing) || collation)) || nullable)
+            && !supplied(uid))
+        .then_some(U)
+    };
     let write = |yes| (entry.writes && yes).then_some(U);
     match &p.change {
         Change::RebuildPartitionedTable(_) => hit.then_some(U),
@@ -137,10 +181,21 @@ pub(super) fn classify(
                 side.schema.tables.keys().find_map(|owner| {
                     let table = side.ids.table_uid(owner);
                     side.columns(owner).find_map(|(at, source, spec)| {
-                        if spec.ty.type_ref() != Some(name) {
-                            return None;
-                        }
+                        let spec = domain_column(spec, name, side.schema)?;
                         let uid = side.ids.column_uid(&source)?;
+                        let (
+                            pbps_model::ManagedType::Domain { collation: was, .. },
+                            pbps_model::ManagedType::Domain { collation: now, .. },
+                        ) = (from.as_ref(), to.as_ref())
+                        else {
+                            return None;
+                        };
+                        if *half == DomainHalf::Tighten
+                            && let Some(class) =
+                                retype(uid, false, spec.collation.is_none() && was != now)
+                        {
+                            return Some(class);
+                        }
                         let mut effects = Vec::new();
                         if *half == DomainHalf::Tighten {
                             for (name, text) in &delta.add_checks {
@@ -201,14 +256,41 @@ pub(super) fn classify(
                 })
             })
         }
-        Change::EnumRebuild { step, .. } => match step {
+        Change::EnumRebuild {
+            uid, name, step, ..
+        } => match step {
             pbps_model::EnumRebuildStep::Retype {
-                column_uid,
-                removed,
-                ..
-            } => (column(column_uid) && !removed.is_empty()).then_some(U),
-            pbps_model::EnumRebuildStep::Create { .. }
-            | pbps_model::EnumRebuildStep::Swap { .. } => None,
+                column_uid, values, ..
+            } => match values.as_ref() {
+                pbps_model::ValueChange::Relabel { removed } => {
+                    (column(column_uid) && !removed.is_empty()).then_some(U)
+                }
+                pbps_model::ValueChange::Cast { .. } => retype(column_uid, false, false),
+            },
+            pbps_model::EnumRebuildStep::Create { definition, .. } => {
+                let before = sides.first()?;
+                let from = before.schema.types.get(before.ids.types.get(uid)?)?;
+                [DomainHalf::Loosen, DomainHalf::Tighten]
+                    .into_iter()
+                    .find_map(|half| {
+                        classify(
+                            &PlannedChange::new(Change::AlterDomain {
+                                uid: uid.clone(),
+                                name: name.clone(),
+                                from: Box::new(from.clone()),
+                                to: definition.clone(),
+                                half,
+                            }),
+                            entry,
+                            table,
+                            written,
+                            cs,
+                            sides,
+                            unchanged,
+                        )
+                    })
+            }
+            pbps_model::EnumRebuildStep::Swap { .. } => None,
         },
         Change::CreateTable { table: shape, .. } => {
             write(shape.partition_of.as_ref().is_some_and(|of| {
@@ -236,11 +318,11 @@ pub(super) fn classify(
             from_collation,
             to_collation,
             ..
-        } => (((column(uid)
-            && (p.risks.contains(&RiskClass::Narrowing) || from_collation != to_collation))
-            || (from_nullable != to_nullable && nullability(column(uid), *to_nullable)))
-            && !supplied(uid))
-        .then_some(U),
+        } => retype(
+            uid,
+            from_nullable != to_nullable && nullability(column(uid), *to_nullable),
+            from_collation != to_collation,
+        ),
         Change::AlterColumnNullability {
             uid, to_nullable, ..
         } => (nullability(column(uid), *to_nullable) && !supplied(uid)).then_some(U),
