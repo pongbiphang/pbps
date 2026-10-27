@@ -472,13 +472,26 @@ pub async fn remove_named(id: &str) -> Result<(), Vec<String>> {
 /// A run that ends some other way (a panic, a cancelled future) still asks
 /// for its container's removal, best effort. The command is started and not
 /// waited for: an unresponsive runtime must not hold the executor.
+impl Container {
+    /// What the best-effort removal names: the runtime's id once `docker run`
+    /// returned it, because a name can come to belong to another container
+    /// (a cancelled teardown must not delete the one that took it).
+    fn removal_target(&self) -> &str {
+        if self.immutable.is_empty() {
+            &self.id
+        } else {
+            &self.immutable
+        }
+    }
+}
+
 impl Drop for Container {
     fn drop(&mut self) {
         if self.removed {
             return;
         }
         let _ = std::process::Command::new("docker")
-            .args(["rm", "--force", "--volumes", &self.id])
+            .args(["rm", "--force", "--volumes", self.removal_target()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -671,6 +684,21 @@ mod tests {
             Err(vec!["the docker volume v".into()]),
         ));
         assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn the_fallback_removal_names_the_id_once_it_is_known() {
+        let mut container = Container {
+            id: "pbps-scratch-t".into(),
+            immutable: String::new(),
+            connection: String::new(),
+            engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
+            removed: true,
+            password: String::new(),
+        };
+        assert_eq!(container.removal_target(), "pbps-scratch-t");
+        container.immutable = "f".repeat(64);
+        assert_eq!(container.removal_target(), "f".repeat(64));
     }
 
     #[test]

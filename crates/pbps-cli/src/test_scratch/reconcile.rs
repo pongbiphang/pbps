@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use super::owner::{self, Owner};
-use super::record::{Daemon, Record, StateDir};
+use super::record::{Daemon, Record, State, StateDir};
 use super::runtime::{Fail, Inspected, Runtime};
 use super::{CleanupFailure, FailureKind};
 
@@ -138,6 +138,49 @@ async fn remove_verified(
     })
 }
 
+/// A pending record's container, once the label listing found it: verified
+/// as the run's, then recorded with its id and volumes **before** anything is
+/// removed, so that a removal that dies halfway leaves evidence of what it
+/// started on and not a pending record that finds nothing.
+async fn adopt(
+    dir: &StateDir,
+    record: &Record,
+    rt: &impl Runtime,
+    id: &str,
+) -> Result<Record, CleanupFailure> {
+    let what = format!("the container {id}");
+    let Some(found) = rt
+        .inspect(id)
+        .await
+        .map_err(|f| from_fail(dir, &record.run_id, &what, f))?
+    else {
+        return Ok(record.clone());
+    };
+    let mut adopted = record.clone();
+    adopted.container.id = Some(id.to_owned());
+    adopted.volumes.clone_from(&found.volumes);
+    ours(&adopted, &found).map_err(|why| {
+        failure(
+            dir,
+            &record.run_id,
+            FailureKind::Conflict,
+            vec![what.clone()],
+            why,
+        )
+    })?;
+    adopted.state = State::Removing;
+    dir.write(&adopted).map_err(|e| {
+        failure(
+            dir,
+            &record.run_id,
+            FailureKind::Unprovable,
+            vec![what],
+            e.to_string(),
+        )
+    })?;
+    Ok(adopted)
+}
+
 /// Removes everything the record names and confirms it gone: `Ok` only when
 /// the runtime says so. A record that never got a container id is resolved by
 /// listing the exact run label, and an unreadable listing is not an empty one.
@@ -146,6 +189,7 @@ pub(super) async fn clean(
     record: &Record,
     rt: &impl Runtime,
 ) -> Result<(), CleanupFailure> {
+    let mut record = record.clone();
     let ids = match &record.container.id {
         Some(id) => vec![id.clone()],
         None => rt
@@ -154,7 +198,10 @@ pub(super) async fn clean(
             .map_err(|f| from_fail(dir, &record.run_id, "the containers of the run", f))?,
     };
     for id in ids {
-        remove_verified(dir, record, rt, &id).await?;
+        if record.container.id.is_none() {
+            record = adopt(dir, &record, rt, &id).await?;
+        }
+        remove_verified(dir, &record, rt, &id).await?;
     }
     // The container being gone says nothing of its volumes: a removal that
     // died between the two leaves them, and the record is their only owner.

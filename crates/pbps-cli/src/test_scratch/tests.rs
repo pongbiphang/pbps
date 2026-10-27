@@ -10,17 +10,31 @@ use super::runtime::{Fail, Inspected, Runtime};
 use super::{FailureKind, TestScratch, state_dir};
 
 /// A state directory in its own temporary directory, removed with it.
+///
+/// Tests that hold a run lock run one at a time: a lock belongs to the open
+/// file, not the process, so a `docker` child forked by a concurrent test while
+/// the lock is held keeps it held until the child execs, and the next
+/// reconciliation would read a dead run as live.
 struct Dir {
     base: PathBuf,
     dir: StateDir,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Dir {
     fn new() -> Self {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let base =
             std::env::temp_dir().join(format!("pbps-test-scratch-{:032x}", rand::random::<u128>()));
         let dir = StateDir::open(base.join("test-runs")).unwrap();
-        Self { base, dir }
+        Self {
+            base,
+            dir,
+            _serial: serial,
+        }
     }
 }
 
@@ -529,6 +543,50 @@ mod recovery {
             assert!(rt.removed.borrow().is_empty() && kept(&d, &run('c')));
             d.dir.remove(&run('c')).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_pending_records_container_and_volumes_are_recorded_before_it_is_removed() {
+        let d = Dir::new();
+        d.dir
+            .write(&record(&run('a'), State::Pending, None))
+            .unwrap();
+        // The removal dies halfway: the record must now say what it started on.
+        let rt = Fake {
+            cannot_remove: Some(vec!["the docker volume vol1".into()]),
+            ..Fake::holding(&container(&run('a'), &id('b')))
+        };
+        assert_eq!(reconciled(&d, &rt).await.failures.len(), 1);
+        let kept = d.dir.read(&run('a')).unwrap().unwrap();
+        assert_eq!(kept.container.id, Some(id('b')));
+        assert_eq!(
+            (kept.volumes.clone(), kept.state),
+            (vec!["vol1".to_owned()], State::Removing)
+        );
+        // The next pass finds the container gone and still removes its volume.
+        let rt = Fake {
+            orphans: vec!["vol1".into()],
+            ..Fake::default()
+        };
+        let done = reconciled(&d, &rt).await;
+        let said = format!("{done:?}");
+        assert_eq!(
+            (done.removed, rt.removed.borrow().clone()),
+            (vec![run('a')], vec!["vol1".to_owned()]),
+            "{said}"
+        );
+        // Negative: a stranger carrying the label is refused and recorded nowhere.
+        d.dir
+            .write(&record(&run('c'), State::Pending, None))
+            .unwrap();
+        let mut stranger = container(&run('c'), &id('d'));
+        stranger.name = "someone-elses".into();
+        let rt = Fake::holding(&stranger);
+        assert_eq!(
+            reconciled(&d, &rt).await.failures[0].kind,
+            FailureKind::Conflict
+        );
+        assert_eq!(d.dir.read(&run('c')).unwrap().unwrap().container.id, None);
     }
 
     #[tokio::test]
