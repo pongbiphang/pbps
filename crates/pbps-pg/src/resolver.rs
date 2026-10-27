@@ -9,6 +9,7 @@ pub mod externals;
 pub mod reconstruct;
 pub mod recovery;
 pub mod scratch;
+pub mod session;
 pub mod standard;
 
 // Live, and in the library target on purpose: a capture refuses any
