@@ -789,6 +789,9 @@ evidence (container id and volumes) is persisted before any removal, and a
 record is deleted only after confirmed absence of the container and of every
 recorded volume. A finding that a path forgets or misjudges evidence is fixed
 in that function, never beside it.
+A removal that reports names it cannot identify (the start's own, before the
+container's id is known) leaves them on the record as `leftovers`, and such a
+record is never forgotten automatically: only a person resolves it.
 
 Absence, an unreadable inspection and a timeout are three results. Only the
 runtime saying "no such container" and "no such volume" is absence; the record

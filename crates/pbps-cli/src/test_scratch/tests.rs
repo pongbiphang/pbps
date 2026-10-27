@@ -72,6 +72,7 @@ fn record(run_id: &str, state: State, id: Option<&str>) -> Record {
             id: id.map(str::to_owned),
         },
         volumes: vec!["vol1".into()],
+        leftovers: Vec::new(),
         labels: BTreeMap::from([
             ("pbps.resolver".to_owned(), "scratch".to_owned()),
             (RUN_LABEL.to_owned(), run_id.to_owned()),
@@ -494,6 +495,15 @@ mod recovery {
         let left = ProduceError::Cleanup(vec!["the docker volume vol1".into()]);
         let failed = settle_failed_start(&d.dir, &rec, &left, &Fake::default()).await;
         assert_eq!(failed.unwrap_err().kind, FailureKind::NotRemoved);
+        // The names it reported are kept on the record, and a later pass that
+        // lists nothing still refuses to forget the run.
+        assert_eq!(
+            d.dir.read(&run('a')).unwrap().unwrap().leftovers,
+            ["the docker volume vol1"]
+        );
+        let later = reconciled(&d, &Fake::default()).await;
+        assert_eq!(later.failures[0].kind, FailureKind::NotRemoved);
+        assert!(later.removed.is_empty() && kept(&d, &run('a')));
         // Negative: a start that only failed, with nothing found, owes nothing.
         let refused = ProduceError::Acquire("no image".into());
         assert!(

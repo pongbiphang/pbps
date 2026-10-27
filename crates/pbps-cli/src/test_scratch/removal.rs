@@ -137,6 +137,15 @@ pub(super) async fn remove_run(
     let run_id = record.run_id.as_str();
     let fail = |kind, resources, detail: String| failure(dir, run_id, kind, resources, detail);
     let unread = |what: &str, f: Fail| unread(dir, run_id, what, f);
+    // Reported by a removal that could not say what it left; only a person can.
+    if !record.leftovers.is_empty() {
+        let note = "an earlier removal left these unconfirmed; remove them by hand".to_owned();
+        return Err(fail(
+            FailureKind::NotRemoved,
+            record.leftovers.clone(),
+            note,
+        ));
+    }
     let ids = match &record.container.id {
         Some(id) => vec![id.clone()],
         None => rt

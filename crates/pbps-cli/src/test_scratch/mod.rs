@@ -117,14 +117,20 @@ async fn settle_failed_start(
     error: &ProduceError,
     rt: &impl Runtime,
 ) -> Result<(), CleanupFailure> {
-    if matches!(error, ProduceError::Cleanup(_)) {
-        let detail = "the start's own removal was not confirmed".into();
+    if let ProduceError::Cleanup(names) = error {
+        let mut kept = record.clone();
+        kept.leftovers.clone_from(names);
+        let note = "the start's own removal was not confirmed";
+        let why = dir
+            .write(&kept)
+            .err()
+            .map_or(note.into(), |e| format!("{note}; and {e}"));
         return Err(failure(
             dir,
             &record.run_id,
             FailureKind::NotRemoved,
-            Vec::new(),
-            detail,
+            names.clone(),
+            why,
         ));
     }
     remove_run(dir, record, rt).await
@@ -243,6 +249,7 @@ impl<'d> TestScratch<'d> {
                 id: None,
             },
             volumes: Vec::new(),
+            leftovers: Vec::new(),
             labels,
             state: State::Pending,
         };

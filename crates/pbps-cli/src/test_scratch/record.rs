@@ -53,6 +53,10 @@ pub(super) struct Record {
     /// The name asked for, and the id once the runtime returned it.
     pub container: Container,
     pub volumes: Vec<String>,
+    /// What a removal reported as not confirmed gone but did not identify (the
+    /// start's own, before the container's id was known): kept, so that a later
+    /// pass cannot read an empty listing as "nothing was left".
+    pub leftovers: Vec<String>,
     /// The labels the container was asked to carry.
     pub labels: BTreeMap<String, String>,
     pub state: State,
