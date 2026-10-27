@@ -936,6 +936,91 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Literal guesses change which declarations compile later, but only an
+    /// actual engine binding to that name can make the earlier surface suspect.
+    #[test]
+    fn a_data_literal_is_not_an_early_binding_to_the_function_it_names() {
+        use pbps_model::{
+            Change, Column, Generated, Module, ModuleKind, Table, TableName, Uid, UidKind,
+            ValueSource,
+        };
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("integer".parse().unwrap()));
+        let mut generated = Column::new("integer".parse().unwrap());
+        generated.value_source = ValueSource::Generated(Generated {
+            expression: "a + length('f')".into(),
+            stored: true,
+        });
+        table.columns.insert("g".into(), generated);
+        let changes = [
+            Change::CreateTable {
+                uid: Uid::derived(UidKind::Table, "t", 0), name: TableName::new("app", "t"),
+                table: Box::new(table), beside_default: None, moves_at_most: None,
+            },
+            Change::CreateModule {
+                id: "app.f(integer)".parse().unwrap(), module: Box::new(Module {
+                    kind: ModuleKind::Function, description: None,
+                    definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT count(*)::int FROM app.t $$".into(),
+                    options: Default::default(),
+                }),
+            },
+        ];
+        let object = id(
+            "pg_attrdef",
+            &[],
+            vec![id(
+                "column",
+                &["g"],
+                vec![id("pg_class", &["app", "t"], Vec::new())],
+            )],
+        );
+        let bound = |schema, name| Input {
+            properties: BTreeMap::new(),
+            bindings: vec![Binding {
+                node: "FUNCEXPR".into(),
+                path: vec!["funcid".into()],
+                target: id("pg_proc", &[schema, name], Vec::new()),
+            }],
+        };
+        for version in [160_000, 180_000] {
+            let pg = crate::Postgres::new().with_server_version(version);
+            let order = crate::resolver::reconstruct::Reconstruction::new(
+                &pg,
+                &crate::resolver::reconstruct::fixture_plan(&changes),
+                &crate::resolver::reconstruct::fixture_ids(&changes),
+            )
+            .unwrap();
+            assert_eq!(
+                order
+                    .later_names_generated("app", "t", "g")
+                    .unwrap()
+                    .contains(&(crate::resolver::reconstruct::Nameable::Routine, "app", "f")),
+                version < 180_000
+            );
+            assert!(!compiled_early(
+                &object,
+                &bound("pg_catalog", "length"),
+                &order,
+                &BTreeMap::new(),
+                &Paths::default()
+            ));
+            // A real binding to a homonym is still checked against the later
+            // declaration; a guessed string must not disable that protection.
+            assert_eq!(
+                compiled_early(
+                    &object,
+                    &bound("ext", "f"),
+                    &order,
+                    &BTreeMap::new(),
+                    &Paths::default()
+                ),
+                version < 180_000
+            );
+        }
+    }
+
     fn keys(sets: BTreeMap<CandidateSet, bool>) -> BTreeSet<CandidateSet> {
         sets.into_keys().collect()
     }

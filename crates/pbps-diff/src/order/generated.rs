@@ -193,51 +193,19 @@ fn named_text<'a>(
     scratch: bool,
 ) -> std::borrow::Cow<'a, str> {
     if scratch {
-        reading(dialect, dialect.module_creation_text(module))
+        dialect.module_creation_text(module)
     } else {
         std::borrow::Cow::Borrowed(module.definition.as_str())
     }
 }
 
-/// `text` as the order reads it in `scratch` (DEC-2389.3): a string that no
-/// OID-alias type reads is data, not the name of an object, so it is blanked.
-/// A routine body stays code, as the scans read it.
-fn reading<'a>(
-    dialect: &(impl Dialect + ?Sized),
-    text: std::borrow::Cow<'a, str>,
-) -> std::borrow::Cow<'a, str> {
-    if dialect.literals_name_objects(&text) {
-        text
-    } else {
-        std::borrow::Cow::Owned(dialect.lexicon().code_only(&text))
-    }
-}
-
-fn change_text<'a>(
-    text: &'a str,
-    dialect: &(impl Dialect + ?Sized),
-    scratch: bool,
-) -> std::borrow::Cow<'a, str> {
-    let text = std::borrow::Cow::Borrowed(text);
-    if scratch {
-        reading(dialect, text)
-    } else {
-        text
-    }
-}
-
-/// The texts of one change as `scratch` reads them, otherwise as `texts` has
-/// them.
+/// The texts of one change, with scratch's typed-position policy.
 fn change_texts<'a>(
     change: &'a Change,
     dialect: &(impl Dialect + ?Sized),
     scratch: bool,
-) -> Vec<std::borrow::Cow<'a, str>> {
-    read_texts(
-        gather(change, reading_types(dialect, scratch)),
-        dialect,
-        scratch,
-    )
+) -> Vec<&'a str> {
+    gather(change, reading_types(dialect, scratch))
 }
 
 /// The type spellings scratch's guesses read: only those that name a
@@ -250,17 +218,6 @@ fn reading_types(dialect: &(impl Dialect + ?Sized), scratch: bool) -> Types {
     } else {
         Types::All
     }
-}
-
-fn read_texts<'a>(
-    texts: Vec<&'a str>,
-    dialect: &(impl Dialect + ?Sized),
-    scratch: bool,
-) -> Vec<std::borrow::Cow<'a, str>> {
-    texts
-        .into_iter()
-        .map(|text| change_text(text, dialect, scratch))
-        .collect()
 }
 
 /// Keep selection and settlement on exactly the same relation, including
@@ -331,7 +288,7 @@ fn parts_in(
                     && table.columns.values().any(|c| {
                         matches!(&c.value_source,
                 ValueSource::Generated(g) if dialect.generation_may_call(
-                    &change_text(&g.expression, dialect, scratch), id.name()))
+                    &g.expression, id.name()))
                     })
             })
             .map(|(i, _, _)| *i)
@@ -973,12 +930,29 @@ pub(super) fn constraints_in(
             // view `app.text`) is a guess, and so is a name that is no
             // function (DEC-2389.4).
             let read = change_texts(&p.change, dialect, scratch);
-            let called = read_texts(expressions(&p.change), dialect, scratch);
+            let expressions = expressions(&p.change);
+            // A hard call position is in code. A name inside a literal can
+            // still supply a reference guess, but cannot establish a call.
+            let called: Vec<_> = expressions
+                .iter()
+                .map(|text| {
+                    if guessed {
+                        std::borrow::Cow::Owned(dialect.lexicon().code_only(text))
+                    } else {
+                        std::borrow::Cow::Borrowed(*text)
+                    }
+                })
+                .collect();
             for (function, id, module) in &modules {
                 if module.kind == ModuleKind::Function
                     && called.iter().any(|t| dialect.generation_calls(t, id))
                 {
                     edge(&mut out, *function, *i);
+                } else if module.kind == ModuleKind::Function
+                    && guessed
+                    && expressions.iter().any(|t| dialect.generation_calls(t, id))
+                {
+                    guess(&mut out, *function, *i);
                 } else if (module.kind != ModuleKind::Function || !guessed)
                     && read.iter().any(|t| dialect.generation_calls(t, id))
                 {
@@ -1214,7 +1188,6 @@ fn scratch_rules(
                     .chain(domain)
                     .map(std::borrow::Cow::Borrowed)
                     .chain(module)
-                    .map(|text| reading(dialect, text))
                     .collect();
                 (i, all)
             })

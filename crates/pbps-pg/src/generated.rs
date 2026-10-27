@@ -143,48 +143,6 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
-/// The types whose input reads a string as the name of an object.
-const OID_ALIASES: [&str; 11] = [
-    "regclass",
-    "regcollation",
-    "regconfig",
-    "regdictionary",
-    "regnamespace",
-    "regoper",
-    "regoperator",
-    "regproc",
-    "regprocedure",
-    "regrole",
-    "regtype",
-];
-
-/// Whether a string literal in `text` may name an object to the engine when
-/// it creates what holds the text (DEC-2389.3). Measured on 16.15 and 18.6
-/// with every named object absent, the engine resolves a literal only where an
-/// OID-alias type reads it: a cast (`'app.b'::regtype`, `regtype 'app.b'`,
-/// `regtype('app.b')`, `CAST('app.b' AS regtype)`) and the default of a
-/// parameter of such a type (`42704`, `42P01`, `42883`, `3F000`). A literal
-/// of any other text is data: a domain `AS text DEFAULT 'b'` or a view
-/// selecting `'b'` is created with no `b`, and so is `'app.b'::text::regtype`
-/// or `to_regtype('app.b')`, which look the name up when they run.
-///
-/// No declared column or domain is of such a type (the type table refuses it),
-/// so the reader of a literal is the text itself: it names one in code.
-/// An over-approximation: a text that names the type keeps every literal it
-/// holds. Not read: a literal handed bare to a function whose parameter is of
-/// such a type (`nextval('app.s')`, measured resolved), which needs the
-/// function's signature.
-pub(crate) fn literals_name_objects(text: &str) -> bool {
-    crate::LEXICON
-        .code_only(text)
-        .split(|c| !pbps_dialect::continues_ident(c))
-        .any(|word| {
-            OID_ALIASES
-                .iter()
-                .any(|alias| word.eq_ignore_ascii_case(alias))
-        })
-}
-
 /// The text of `module` the engine resolves when it creates it (DEC-2389.2).
 /// Measured on 16.15 and 18.6 with `check_function_bodies = on`, which the
 /// transaction framing pins: a view, a trigger, a `LANGUAGE sql` body and a
@@ -612,35 +570,6 @@ mod tests {
             ));
         }
         out
-    }
-
-    /// A literal is read as a name only where a text names an OID-alias type
-    /// in code (DEC-2389.3); a word in a string or a comment is no type.
-    #[test]
-    fn a_text_reads_its_strings_as_names_only_where_it_names_an_alias_type() {
-        for alias in super::OID_ALIASES {
-            for text in [
-                format!("'app.b'::{alias}"),
-                format!("{} 'app.b'", alias.to_uppercase()),
-                format!("{alias}('app.b')"),
-                format!("CAST('app.b' AS pg_catalog.{alias})"),
-                format!("(x \"{alias}\" DEFAULT 'app.b')"),
-            ] {
-                assert!(super::literals_name_objects(&text), "{text}");
-            }
-        }
-        for text in [
-            "'b'",
-            "VALUE <> 'regtype'",
-            "x text DEFAULT 'app.b'",
-            "'app.b'::text::oid",
-            "to_regtype('app.b')",
-            "1 /* regclass */",
-            "-- regproc\n'x'",
-            "regtype_of('x')",
-        ] {
-            assert!(!super::literals_name_objects(text), "{text}");
-        }
     }
 
     #[test]

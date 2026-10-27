@@ -2620,16 +2620,6 @@ pub trait Dialect {
         false
     }
 
-    /// Whether a string literal in `text` may be read by the engine as the
-    /// name of an object when it creates what holds the text (DEC-2389.3).
-    /// The default is the liberal reading every caller made before this method
-    /// existed: every literal may be. An engine that binds a name in a literal
-    /// only where an OID-alias type reads it answers `false` for a text that
-    /// names none, so that data equal to an object's name is no reference.
-    fn literals_name_objects(&self, _text: &str) -> bool {
-        true
-    }
-
     /// [`Dialect::generation_may_call`] for a declared function known by its
     /// full identity, asked of the text of a table's own part (a computed
     /// expression, a default, a check). The default is the leaf-name test

@@ -8796,61 +8796,58 @@ Pinned by `routines_that_call_each_other_late_are_no_cycle`,
 
 <a id="dec-2389-3"></a>
 
-**DEC-2389.3. The scratch route reads a string as the name of an object only
-where an OID-alias type reads it.** Part of #2389, ready-phase round 1. The
-type rule (DEC-2407.1) and the index rule read every string in a text as a
-possible name, as `generation_may_call` does (DEC-1364.1): two independent text
-domains `app.a AS text DEFAULT 'b'` and `app.b AS text DEFAULT 'a'` got an
-edge each way, and `settle` refused them as a cycle although neither default
-names a type. The route they replaced created both.
+**DEC-2389.3. Scratch retains names inside literals as reference guesses.**
+Part of #2389, ready-phase rounds 1 and 9. Two independent text domains
+`app.a AS text DEFAULT 'b'` and `app.b AS text DEFAULT 'a'` must remain
+orderable: those defaults are data, and the engine creates them in either
+order. Their name matches may supply `Source::Guess` edges; the cycle fallback
+of DEC-2389.4 gives way instead of refusing the valid declaration.
 
-Measured on PostgreSQL 16.15 and 18.6, which agree, with every named object
-absent. Created: a domain over `text` whose default or check holds `'app.b'`;
-a table, view, index, trigger `WHEN` or routine default holding the same
-string; a `LANGUAGE sql` body selecting it; `('app.b'::text)::regtype`;
-`to_regtype('app.b')`. Refused with `42704`, `42P01`, `42883` or `3F000`: the
-string cast to an OID-alias type (`'app.b'::regtype`, `regtype 'app.b'`,
-`regtype('app.b')`, `CAST('app.b' AS regtype)`, a `pg_catalog.`-qualified
-type, an array of them), for each of the eleven the pinned servers have
-(`regclass`, `regcollation`, `regconfig`, `regdictionary`, `regnamespace`,
-`regoper`, `regoperator`, `regproc`, `regprocedure`, `regrole`, `regtype`;
-there is no `regdatabase`); the default of a column, a domain or a routine
-parameter of such a type; a string handed bare to a function whose parameter is
-of such a type (`nextval('app.s')`). A comparison of such a column with a string
-is refused as an OID (`22P02`) whether or not the name exists, so it is no
-reference.
+Measured on PostgreSQL 16.15 and 18.6, with the named object absent: ordinary
+text defaults, checks and views are created, while a literal cast to an
+OID-alias type is resolved at creation (`42704`, `42P01`, `42883` or `3F000`).
+This includes `'app.b'::regtype`, `regtype 'app.b'`, `regtype('app.b')`,
+`CAST('app.b' AS regtype)`, qualified types and routine-parameter defaults.
+Those real reference-order positives stay covered. A generated expression
+`a + 'app.f(integer)'::regprocedure::oid::integer` is immutable and binds the
+function at creation: both engines refuse it with `42883` before f exists and
+create it after f. The earlier test's route through `regprocedure::text` is
+not a valid generation (`42P17`, expression not immutable), so it cannot stand
+in for that negative.
 
-`Dialect::literals_name_objects(text)`, true by default, is false for
-PostgreSQL's text that names none of those types in code, and the scratch
-route then reads the text with its strings blanked (`Lexicon::code_only`): the
-readers of the type and index rules, the module texts of the module
-dependencies and of the choice of a table to hold, a change's texts for the
-tables and routines they name, and a generated expression's call of a planned
-function. A text that names the type keeps every string it holds. No declared
-column or domain is of such a type (the type table refuses it), so the reader of
-a string is always the text itself, never a type declared elsewhere. The
-ordinary route is unchanged.
+A literal can also bind without an OID-alias spelling in its own text:
+`pg_relation_size('app.t')` takes a relation identity through its signature.
+Erasing the string lost the table-to-view edge in the round-9 example, and on
+16 the view compiled before a table held for `app.f(z)` with z declared later.
+There is no sound text-only allowlist of which literals are data. Removed
+`literals_name_objects`, its dialect hook and `OID_ALIASES`; the reference
+readers for tables, modules, types and indexes retain literals. Every such
+match on PostgreSQL scratch is a guess, including a function name found only
+inside an expression's literal. Creation-text reduction for late PL/pgSQL
+bodies stays as DEC-2389.2 specifies; ordinary planning is unchanged.
 
-Not read: a string handed bare to a function with a parameter of such a type,
-which needs the function's signature and was not found in a declaration that
-matters (a default `nextval('app.s')` names a sequence, which no name here is).
-A text that names such a function loses an edge it had, so a plan that creates
-the named object after the reader has no edge to hold it.
+A hard own-part call has a different reader: its position must be outside a
+literal (DEC-2389.4). Otherwise `length('f')` beside a later SQL function f
+reading the table would put f before its table on 16. Blanking literals only
+for this call reader leaves the reference guess available, and the table
+compiles first. The prepared-edge tests distinguish the genuine Lexical call,
+the literal-only Guess, and the table-to-view Guess.
 
 Pinned by `a_string_equal_to_an_objects_name_is_data_and_no_cycle`,
-`a_string_an_oid_alias_type_reads_still_orders`,
-`a_string_equal_to_an_indexs_name_does_not_follow_its_table`,
-`a_generation_saying_a_routines_name_does_not_wait_for_it`,
-`no_declared_column_or_domain_is_of_an_oid_alias_type`,
-`a_text_reads_its_strings_as_names_only_where_it_names_an_alias_type`, and the
-live `scratch_rules_compile_on_both_servers`.
+`data_strings_do_not_make_oid_alias_readers_unorderable`,
+`a_data_string_cannot_make_an_index_reader_unorderable`,
+`a_data_string_cannot_make_a_generation_unorderable`,
+`a_real_oid_alias_function_reference_keeps_its_binding_order`,
+`a_literal_relation_reader_follows_a_table_held_for_its_function`,
+`a_literal_function_name_is_only_a_guess_and_a_code_call_stays_lexical`,
+`no_declared_column_or_domain_is_of_an_oid_alias_type`, and the live
+`scratch_rules_compile_on_both_servers`.
 
 
 <a id="dec-2389-4"></a>
 
-**DEC-2389.4. A scratch edge that rests only on a name matched in a text is a
-guess, and gives way where it closes a cycle.** Part of #2389, ready-phase round
-2. The rules of DEC-2389.1 to DEC-2389.3 each read a name in a text as a
+**DEC-2389.4. A scratch reference guess gives way where it closes a cycle.**
+Part of #2389, ready-phase rounds 2 to 9. The rules of DEC-2389.1 to DEC-2389.3 each read a name in a text as a
 dependency, and each time the guess closed a cycle with an edge the engine does
 need, the declaration was refused that the route they replaced created: `VALUE`
 in a domain's check read as the domain `app.value`, and a routine's parameter
@@ -8901,7 +8898,8 @@ Which edge is which, by what it rests on:
 | a foreign key after both tables and the referenced key; a replica identity after its index | the declaration | stated |
 | a partition's own default after its parent's | the declaration | stated |
 | a module after the modules its `depends_on:` names | the user | stated |
-| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | the call the engine needs at creation (measured, DEC-1364.1); the provider is a function and the text an expression | stated |
+| a function before the part whose default, generated or computed expression, check, index expression or predicate, or policy calls it (`generation_calls`) | a function matched in expression code outside literals; retained hard until #2465 as explained below | stated |
+| a function named only inside an expression's literal before its part | a possible reference, never a code call position | guess |
 | a view, a trigger or a procedure before a part whose text, expression or user-defined type spelling, names it | a name in a text | guess |
 | a module after the table whose complete shape or first part its text names | a name in a text | guess |
 | a part that names a table after its shape | a name in a text | guess |
@@ -8912,19 +8910,34 @@ Which edge is which, by what it rests on:
 
 The call edge is stated only where both halves hold: the provider is a function
 (a view, a trigger or a procedure is never called by an expression) and the text
-is one of the part's expressions (`expressions`, never a column's type spelling
-or the type of a row). Round 3 found the boundary: for a table `app.t(x text)`
+is code in one of the part's expressions (`expressions`, never a column's type
+spelling, the type of a row, or a name inside a literal). On PostgreSQL scratch
+only, this call reader uses `Lexicon::code_only`; the unblanked expression is
+still read for reference guesses. Round 3 found the boundary: for a table `app.t(x text)`
 and a view `app.text` that reads it, the type `text` matched the view by leaf
 name, a stated view-before-table edge outweighed the guess that the table comes
-first, and the view was created before its table. A match that fails either half
-is a guess, not dropped, so the order it suggests still applies where no cycle
-forms (an idle function named `text` still goes ahead of the table). The sweep of
-the stated edges found no other whose evidence is a name match: the column chain,
+first, and the view was created before its table. A reference outside the hard
+call positions supplies a guess where its kind can be read: a function inside
+an expression's literal still suggests an order, but a function named only by a
+type spelling supplies none. The sweep of the stated edges found no other whose
+evidence is a name match: the column chain,
 own parts, complete-shape consumers (`table_use`), foreign keys, replica identity
 (`name == target`), partition defaults (the declared parent and column) and
 `depends_on:` all read typed fields, and `module_dependencies` states only the
 declared ones. SQL Server and the ordinary route state both kinds as stated edges,
 so their edges are the same as before.
+
+The genuine-call edge is still an over-approximation: identifier, schema and
+overload matches can be wrong. It nevertheless stays **hard until #2465**.
+Measured demotion of that edge made the parameter/index fixture fail on 16:
+the table really calls `app.f(z)`, but f's parameter `id` also guessed a
+reference to the table's index `id`. With both directions guessed, the
+backward-first fallback discarded f-before-table and kept the accidental
+index-before-f edge, creating the table before f (`42883`). Keeping the code
+call hard discards the parameter guess and preserves this previously valid
+fixture. Literal blanking applies the positional rule without repeating that
+demotion. #2465 owns the general solution; this change adds no retry or broader
+call parser.
 
 The plan's order carries what the guesses give up: the ordinary route already
 orders a domain after the type it is over and a table after the types of its
@@ -8936,9 +8949,13 @@ instead of the schedule: the compile fails with the object it lacks
 states the order (`with_remedy`). Before this entry such a cycle was named by the
 schedule; it is now named by the engine, at the statement.
 
-Not changed: DEC-2389.3's reading of a string as a name only where an OID-alias
-type reads it. It removes edges that are no reference in any cycle or none, which
-the later-name checks still rely on.
+DEC-2389.3 retains literals in reference guesses. `later_names` and
+`later_names_generated` follow the settled compile positions, so the data-only
+length expression can precede f on 16. `compiled_early` still checks actual
+engine bindings, not guessed text matches: a binding to built-in `length` does
+not become an early binding to f merely because its argument says `'f'`.
+`a_data_literal_is_not_an_early_binding_to_the_function_it_names` pins both
+that negative and the retained check of a real binding to a later homonym.
 
 Pinned by `a_guess_in_a_cycle_gives_way_to_the_order_given_and_one_outside_orders`,
 `a_cycle_of_stated_edges_is_refused_though_guesses_share_it`,

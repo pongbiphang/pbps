@@ -422,10 +422,7 @@ async fn scratch_rules_compile_on_both_servers() {
             routine("text", "sql", " SELECT $1 + 1 "),
         ],
         // A generation that only says the name of a routine reading its table.
-        vec![
-            create("t", saying_a_routine()),
-            routine("f", "sql", " SELECT count(*)::int FROM app.t "),
-        ],
+        literal_generation_and_reader(),
         // A declared type is resolved at creation and a body or default is not.
         delayed_view(declaring(
             "r app.v%ROWTYPE; c CURSOR (p app.v) FOR SELECT 1;",
@@ -444,6 +441,23 @@ async fn scratch_rules_compile_on_both_servers() {
                 " BEGIN REINDEX INDEX app.t_ix; \
                   RETURN (SELECT count(*) FROM app.t)::int; END ",
             ),
+        ],
+        a_literal_relation_reader(),
+        literal_function_binding(),
+        data_index_reader(),
+        vec![
+            module(
+                "app.f(text)",
+                ModuleKind::Function,
+                "(x text DEFAULT 'app.b') RETURNS integer LANGUAGE sql RETURN 1",
+            ),
+            declared_type("app.b", mood()),
+        ],
+        vec![
+            module("app.v", ModuleKind::View, "SELECT 'app.w' AS o"),
+            module("app.w", ModuleKind::View, "SELECT 1 AS n"),
+            create("t", held_table()),
+            function("f"),
         ],
     ];
     for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
@@ -465,12 +479,46 @@ async fn scratch_rules_compile_on_both_servers() {
                 conn.execute("CREATE SCHEMA app")
                     .await
                     .map_err(|e| e.to_string())?;
-                let mut reconstruction =
-                    super::tests::build_reconstruction(&pg, changes).map_err(|e| e.to_string())?;
+                let mut reconstruction = if changes == &a_literal_relation_reader()
+                    || changes == &literal_generation_and_reader()
+                {
+                    let (plan, ids) = literal_plan(changes, &pg);
+                    Reconstruction::new(&pg, &plan, &ids)
+                } else {
+                    super::tests::build_reconstruction(&pg, changes)
+                }
+                .map_err(|e| e.to_string())?;
                 reconstruction
                     .compile(&pg, &pbps_model::SessionZone::utc(), &mut conn)
                     .await
                     .map_err(|e| e.to_string())?;
+                if changes == &a_literal_relation_reader() {
+                    let rows = conn
+                        .query("SELECT n >= 0 AS bound FROM app.v")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(rows[0].try_get::<bool>("bound").unwrap(), Some(true));
+                    let view = ObjectIdentity {
+                        class: "pg_class".into(),
+                        name: vec!["app".into(), "v".into()],
+                        signature: Vec::new(),
+                    };
+                    assert!(!reconstruction.later_names(&view).unwrap().contains(&(
+                        Nameable::Relation,
+                        "app",
+                        "t"
+                    )));
+                }
+                if changes == &literal_generation_and_reader() {
+                    conn.execute("INSERT INTO app.t(a) VALUES (1)")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let rows = conn
+                        .query("SELECT g = 2 AND app.f(0) = 1 AS bound FROM app.t")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    assert_eq!(rows[0].try_get::<bool>("bound").unwrap(), Some(true));
+                }
                 let rows = conn
                     .query(
                         "SELECT coalesce((SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
@@ -777,11 +825,8 @@ fn defaulting(ty: &str, default: &str) -> Table {
     table
 }
 
-/// What a string says is data unless an OID-alias type reads it (DEC-2389.3,
-/// measured on 16.15 and 18.6, every named object absent): a domain
-/// `AS text DEFAULT 'b'` or a view selecting `'b'` is created with no `b`. So
-/// domains, views and routines whose strings equal one another's names are no
-/// cycle, though the engine creates them in either order.
+/// A data string may suggest an edge, but cannot make declarations that the
+/// engine creates in either order unorderable (DEC-2389.3, DEC-2389.4).
 #[test]
 fn a_string_equal_to_an_objects_name_is_data_and_no_cycle() {
     let domains = [
@@ -822,7 +867,7 @@ fn a_string_equal_to_an_objects_name_is_data_and_no_cycle() {
 /// names its object, in each spelling that reads it and in a parameter's
 /// default.
 #[test]
-fn a_string_an_oid_alias_type_reads_still_orders() {
+fn data_strings_do_not_make_oid_alias_readers_unorderable() {
     let reads = [
         "'app.b'::regtype::text",
         "(regtype 'app.b')::text",
@@ -843,26 +888,28 @@ fn a_string_an_oid_alias_type_reads_still_orders() {
             );
         }
         // A routine's parameter of such a type, in a header.
-        let header = |parameter: &str| {
+        let header = |signature: &str, parameter: &str| {
             [
                 module(
-                    "app.f(regtype)",
+                    &format!("app.f({signature})"),
                     ModuleKind::Function,
                     &format!("(x {parameter}) RETURNS integer LANGUAGE sql RETURN 1"),
                 ),
                 declared_type("app.b", mood()),
             ]
         };
-        let typed = order(&header("regtype DEFAULT 'app.b'"), version);
+        let typed = order(&header("regtype", "regtype DEFAULT 'app.b'"), version);
         assert!(
             at(&typed, "type app.b") < at(&typed, "function app.f(regtype)"),
             "{typed:?}"
         );
-        let text = order(&header("text DEFAULT 'app.b'"), version);
-        assert!(
-            at(&text, "function app.f(regtype)") < at(&text, "type app.b"),
-            "{text:?}"
-        );
+        // Data can add a guess without preventing either declaration. Its
+        // exact position relative to the independent type is immaterial.
+        let data_header = header("text", "text DEFAULT 'app.b'");
+        let text = order(&data_header, version);
+        assert!(text.iter().any(|d| d == "function app.f(text)"));
+        assert!(text.iter().any(|d| d == "type app.b"));
+        assert_eq!(text, order(&data_header, version));
         // The same strings in a module, behind a table held for its function.
         let held = |view: &str| {
             [
@@ -878,28 +925,44 @@ fn a_string_an_oid_alias_type_reads_still_orders() {
             "{named:?}"
         );
         let data = order(&held("SELECT 'app.w' AS o"), version);
-        assert!(
-            at(&data, "view app.v") < at(&data, "view app.w"),
-            "{data:?}"
-        );
+        assert!(data.iter().any(|d| d == "view app.v"));
+        assert!(data.iter().any(|d| d == "view app.w"));
+        assert_eq!(data, order(&held("SELECT 'app.w' AS o"), version));
     }
 }
 
-/// A string equal to an index's name is data as well: the view that selects
-/// it keeps its place before the table that is held back (and
-/// `a_reader_naming_an_index_follows_the_table_that_keeps_it` is the cast).
+/// A literal may suggest that a data-only view follow an index, but must
+/// leave the actual function-before-generation requirement orderable.
 #[test]
-fn a_string_equal_to_an_indexs_name_does_not_follow_its_table() {
-    let changes = [
+fn a_data_string_cannot_make_an_index_reader_unorderable() {
+    let changes = data_index_reader();
+    for version in [None, Some(160_000), Some(180_000)] {
+        let pg = version.map_or_else(crate::Postgres::new, |v| {
+            crate::Postgres::new().with_server_version(v)
+        });
+        let reconstruction = super::tests::build_reconstruction(&pg, &changes).unwrap();
+        let function = reconstruction
+            .steps
+            .iter()
+            .position(|s| s.declaration == "function app.f(integer)")
+            .unwrap();
+        assert!(function < generation_position(&reconstruction));
+        assert!(
+            reconstruction
+                .steps
+                .iter()
+                .any(|s| s.declaration == "view app.v")
+        );
+        assert_eq!(order(&changes, version), order(&changes, version));
+    }
+}
+
+fn data_index_reader() -> Vec<Change> {
+    vec![
         module("app.v", ModuleKind::View, "SELECT 'app.t_ix' AS o"),
         create("t", held_table()),
         function("f"),
-    ];
-    let order = order(&changes, None);
-    assert!(
-        at(&order, "view app.v") < at(&order, "table app.t"),
-        "{order:?}"
-    );
+    ]
 }
 
 /// The premise of reading the strings of a text alone: no declared column or
@@ -925,43 +988,218 @@ fn saying_a_routine() -> Table {
     table
 }
 
-/// A generated column whose expression only says the name of a routine that
-/// reads its table is no call of it: the routine would wait for the whole
-/// table and the column for the routine, a cycle the engine does not have.
+/// A guessed name inside data cannot put the table-reading function before
+/// its table. No fixed expansion shape is required (DEC-2389.3).
 #[test]
-fn a_generation_saying_a_routines_name_does_not_wait_for_it() {
-    let mut table = saying_a_routine();
-    let reader = routine("f", "sql", " SELECT count(*)::int FROM app.t ");
-    for version in [None, Some(160_000)] {
-        let order = order(&[create("t", table.clone()), reader.clone()], version);
-        assert_eq!(order.len(), 3, "{order:?}");
+fn a_data_string_cannot_make_a_generation_unorderable() {
+    let changes = literal_generation_and_reader();
+    for version in [160_000, 180_000] {
+        let pg = crate::Postgres::new().with_server_version(version);
+        let (plan, ids) = literal_plan(&changes, &pg);
+        let reconstruction = Reconstruction::new(&pg, &plan, &ids).unwrap();
+        let declarations: Vec<_> = reconstruction
+            .steps
+            .iter()
+            .map(|s| s.declaration.clone())
+            .collect();
         assert!(
-            at(&order, "column app.t.g") < at(&order, "function app.f(integer)"),
-            "{order:?}"
+            at(&declarations, "table app.t") < at(&declarations, "function app.f(integer)"),
+            "PG{version}: {declarations:?}"
+        );
+        let later = reconstruction
+            .later_names_generated("app", "t", "g")
+            .unwrap();
+        assert_eq!(
+            later.contains(&(Nameable::Routine, "app", "f")),
+            version < SET_EXPRESSION_ARRIVED_IN
         );
     }
-    // Two tables whose generations only say each other's names.
     let saying = |other: &str| {
-        let mut t = Table::default();
-        t.columns.insert("a".into(), int());
-        t.columns
+        let mut table = Table::default();
+        table.columns.insert("a".into(), int());
+        table
+            .columns
             .insert("g".into(), generated(&format!("a + length('{other}')")));
-        t
+        table
     };
-    assert_eq!(
-        order(&[create("t", saying("u")), create("u", saying("t"))], None).len(),
-        2
+    for version in [None, Some(160_000), Some(180_000)] {
+        let changes = [create("t", saying("u")), create("u", saying("t"))];
+        assert_eq!(order(&changes, version).len(), 2);
+    }
+}
+
+fn literal_generation_and_reader() -> Vec<Change> {
+    vec![
+        create("t", saying_a_routine()),
+        routine("f", "sql", " SELECT count(*)::int FROM app.t "),
+    ]
+}
+
+/// Casting the parsed OID to integer is immutable; going through regprocedure's
+/// text output is not (42P17 on 16 and 18). The independent function must
+/// precede the expression that resolves its identity, even inside a literal.
+fn literal_function_binding() -> Vec<Change> {
+    let mut table = Table::default();
+    table.columns.insert("a".into(), int());
+    table.columns.insert(
+        "g".into(),
+        generated("a + 'app.f(integer)'::regprocedure::oid::integer"),
     );
-    // Negative: a cast to an OID-alias type names the routine, and then the
-    // table is held for it, though the routine's text reading the table is the
-    // guess that gives way.
-    let named = generated("a + length('app.f(integer)'::regprocedure::text)");
-    table.columns.insert("g".into(), named);
-    let order = order(&[create("t", table), reader], None);
-    assert!(
-        at(&order, "function app.f(integer)") < at(&order, "table app.t"),
-        "{order:?}"
-    );
+    vec![create("t", table), function("f")]
+}
+
+#[test]
+fn a_real_oid_alias_function_reference_keeps_its_binding_order() {
+    for version in [None, Some(160_000), Some(180_000)] {
+        let pg = version.map_or_else(crate::Postgres::new, |v| {
+            crate::Postgres::new().with_server_version(v)
+        });
+        let reconstruction =
+            super::tests::build_reconstruction(&pg, &literal_function_binding()).unwrap();
+        let function = reconstruction
+            .steps
+            .iter()
+            .position(|s| s.declaration == "function app.f(integer)")
+            .unwrap();
+        assert!(function < generation_position(&reconstruction));
+    }
+}
+
+fn generation_position(reconstruction: &Reconstruction) -> usize {
+    reconstruction
+        .steps
+        .iter()
+        .position(|step| step.generated.iter().any(|column| column.raw() == "g"))
+        .unwrap()
+}
+
+fn a_literal_relation_reader() -> Vec<Change> {
+    let mut table = Table::default();
+    table.columns.insert("a".into(), int());
+    table.columns.insert("g".into(), generated("app.f(z)"));
+    table.columns.insert("z".into(), int());
+    vec![
+        create("t", table),
+        module(
+            "app.v",
+            ModuleKind::View,
+            "SELECT pg_relation_size('app.t') AS n",
+        ),
+        function("f"),
+    ]
+}
+
+// Exercise the real differ as well as the matrix's raw fixture input.
+// These literal fixtures intentionally declare only tables and modules.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn literal_plan(
+    changes: &[Change],
+    pg: &crate::Postgres,
+) -> (pbps_diff::order::DiffPlan, pbps_model::IdsFile) {
+    let mut schema = pbps_model::Schema::default();
+    for change in changes {
+        match change {
+            Change::CreateTable { name, table, .. } => {
+                schema.tables.insert(name.clone(), *table.clone());
+            }
+            Change::CreateModule { id, module } => {
+                schema.modules.insert(id.clone(), *module.clone());
+            }
+            _ => panic!("literal fixtures declare only tables and modules"),
+        }
+    }
+    let ids = pbps_diff::resolve(
+        &schema,
+        &Default::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "literal-order-test".into(),
+            today: "2026-10-27".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let plan = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Default::default(),
+            ids: &Default::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        pg,
+        &Default::default(),
+    )
+    .unwrap();
+    (plan, ids)
+}
+
+#[test]
+fn a_literal_relation_reader_follows_a_table_held_for_its_function() {
+    use pbps_diff::order::Source;
+    for version in [160_000, 180_000] {
+        let pg = crate::Postgres::new().with_server_version(version);
+        let (plan, ids) = literal_plan(&a_literal_relation_reader(), &pg);
+        let prepared =
+            pbps_diff::order::scratch::prepare(&plan, &ids, &Default::default(), &pg).unwrap();
+        let changes = &prepared.changes().changes;
+        let table = changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateTable { .. }))
+            .unwrap();
+        let view = changes.iter().position(|p| matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::View)).unwrap();
+        assert!(
+            prepared
+                .edges()
+                .iter()
+                .any(|e| e.before == table && e.after == view && e.source == Source::Guess)
+        );
+        let reconstruction = Reconstruction::new(&pg, &plan, &ids).unwrap();
+        let order: Vec<_> = reconstruction
+            .steps
+            .iter()
+            .map(|s| s.declaration.clone())
+            .collect();
+        assert!(
+            at(&order, "table app.t") < at(&order, "view app.v"),
+            "PG{version}: {order:?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_function_name_is_only_a_guess_and_a_code_call_stays_lexical() {
+    use pbps_diff::order::Source;
+    for version in [160_000, 180_000] {
+        for (changes, expected) in [
+            (a_literal_relation_reader(), Source::Lexical),
+            (literal_generation_and_reader(), Source::Guess),
+        ] {
+            let pg = crate::Postgres::new().with_server_version(version);
+            let (plan, ids) = literal_plan(&changes, &pg);
+            let prepared =
+                pbps_diff::order::scratch::prepare(&plan, &ids, &Default::default(), &pg).unwrap();
+            let steps = &prepared.changes().changes;
+            let function = steps.iter().position(|p| matches!(&p.change, Change::CreateModule { module, .. } if module.kind == ModuleKind::Function)).unwrap();
+            let carrying = steps
+                .iter()
+                .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+                .unwrap_or_else(|| {
+                    steps
+                        .iter()
+                        .position(|p| matches!(p.change, Change::CreateTable { .. }))
+                        .unwrap()
+                });
+            let sources: Vec<_> = prepared
+                .edges()
+                .iter()
+                .filter(|e| e.before == function && e.after == carrying)
+                .map(|e| e.source)
+                .collect();
+            assert_eq!(sources, [expected], "PG{version}");
+        }
+    }
 }
 
 /// An index named `id` on the held table, and a routine whose parameter is

@@ -1261,10 +1261,6 @@ impl Dialect for Postgres {
         true
     }
 
-    fn literals_name_objects(&self, text: &str) -> bool {
-        generated::literals_name_objects(text)
-    }
-
     fn generation_names_table(&self, text: &str, table: &TableName) -> bool {
         generated::names_table(text, table)
     }
