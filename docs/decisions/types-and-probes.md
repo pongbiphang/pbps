@@ -3041,8 +3041,9 @@ the YAML it would have to be deleted by hand once every environment moved.
   reference only the column and the result cannot depend on another column's
   retype. The tree then goes through DEC-2181.1's decoder: no function, operator
   or cast that a role wrote, none on `RUNS_SQL`, no user-defined or domain type.
-  No text scanner (DEC-1635.4). A refusal names the code and the SQLSTATE and
-  never the server's text.
+  DEC-2378.1 adds a pre-binding literal-input check; the bound-tree audit
+  stays authoritative for execution (DEC-1635.4). A refusal names the code and
+  the SQLSTATE and never the server's text.
 - **Applied.** The change is classified `destructive` in addition to whatever
   its pair of types says, through the ordinary `--allow`. The whole expression
   is in the plan, `--sql` and `explain`. The pre-flight evaluates it over every
@@ -3893,3 +3894,40 @@ The project may raise that finding to error through policies. This deliberately
 differs from DEC-1515.1: a binding question has no fallback because its answer
 is needed for correctness; this code vet is advisory because apply still runs
 unchanged in-transaction declared::vet and its owner and closing checks.
+
+<a id="dec-2378-1"></a>
+
+**DEC-2378.1. Refuse a literal's unsafe input path before binding a recorded
+conversion (#2378).** PostgreSQL may call a base type's input routine while
+coercing an unknown literal during parse analysis. Reading the bound tree is
+too late, and rolling back is not containment: measured on 16.15 and 18.6,
+a type whose input aliases the internal `pg_advisory_unlock_all` entry point
+releases a session advisory lock while the temporary CHECK is bound, and the
+lock stays released after rollback.
+
+In the vetter's existing transaction, read one catalog closure: base types
+whose input routine is outside `pg_catalog`, then arrays, domains, composites,
+ranges and multiranges containing one of them. An empty closure skips text
+inspection altogether. With no string or typed literal, this guard adds no
+refusal. Otherwise the shared lexer removes comments and literals from code;
+whole identifier tokens preserve quoted names and qualification. Name-only
+target lookups carry no type modifiers and keep built-in aliases distinct
+from same-spelled extension types. No lexer
+features or SQL parser dependency are added.
+
+Refuse before binding when a literal can reach a type in that closure through
+an explicit cast, typed literal or function-style type cast, a referenced
+column of the table, or an argument of a named routine/operator. All visible
+overloads count, including SQL grammar's implied comparison operators; a
+qualified reference considers only its namespace. Choosing an overload before
+binding would reproduce the engine's resolver. A catalog read failure is
+unreadable evidence and refuses a literal-bearing expression. Refusals name
+the unsafe type, with catalog names escaped as prose. The expression itself
+is unchanged; the single-statement protocol, temporary-table shape check and
+DEC-2181.1 bound-tree audit still run afterwards.
+
+This adds no scratch requirement and changes no saved format or offline
+`convert` recording. Connected plan and apply use the same vetter. A database
+with an unrelated extension type still admits `status = 'active'` on a text
+column. A session-lock witness pins refusal before the input runs on both
+supported majors; removing the guard loses that lock and fails the test.

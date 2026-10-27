@@ -1382,8 +1382,10 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
   the plan, `--sql` and `explain`, gated as `destructive` (7.2) beside whatever
   the pair of types says. Before anything runs it, the apply binds it against a
   table of the one column and refuses code a role wrote (DEC-2181.1), so it may
-  use only the column itself. The pre-flight evaluates the expression over every
-  stored row before the first statement, and a row it cannot convert refuses the
+  use only the column itself. Before binding, it refuses literals that could
+  reach an extension base type's input routine (DEC-2378.1); parse analysis
+  can run that routine before a bound tree exists. The pre-flight evaluates
+  the expression over every stored row before the first statement, and a row it cannot convert refuses the
   plan with the SQLSTATE and runs nothing. A conversion that names its zone
   (`ts AT TIME ZONE 'UTC'`) makes a zone-dependent change allowed.
 
