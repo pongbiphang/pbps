@@ -1044,6 +1044,28 @@ class LiveExecution(unittest.TestCase):
                 self.assertIn(["docker", "logs", "lane.failed"], calls)
                 self.assertFalse(any(c[0] == "cargo" or c[:2] == ["docker", "rm"] for c in calls))
 
+    def test_resolver_readiness_failures_do_not_start_a_slow_client_per_retry(self):
+        names = {"PBPS_TEST_MSSQL_NAME": "lane.slow.primary",
+                 "PBPS_TEST_MSSQL_SCRATCH_NAME": "lane.slow.scratch"}
+        for failing in names.values():
+            with self.subTest(failing=failing):
+                # 180 Python clients at 0.2s each exceed the unchanged 30s
+                # budget even on an idle host; shell-built-in mocks do not.
+                result, calls, _ = self.named_fixture_script(
+                    "resolver", names, existing=names.values(), failing=failing,
+                    client_delay=0.2)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(["docker", "logs", failing], calls)
+                self.assertEqual(self.builtin_calls.count("docker"), 90)
+                self.assertEqual(self.builtin_calls.count("sleep"), 90)
+                self.assertEqual(sum(c[:3] == ["docker", "exec", failing]
+                                     for c in calls), 90)
+                self.assertEqual([c for c in calls if c[0] == "sleep"],
+                                 [["sleep", "2"]] * 90)
+                self.assertFalse(self.started_names(calls))
+                self.assertFalse(any(c[0] == "cargo" or c[:2] == ["docker", "rm"]
+                                     for c in calls))
+
     @staticmethod
     def fixture_names(runner, prefix="", suffix=""):
         keys = list(FIXTURE_NAMES)
@@ -1056,23 +1078,25 @@ class LiveExecution(unittest.TestCase):
     def started_names(calls):
         return [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
 
-    def named_fixture_script(self, runner, overrides=None, existing=(), failing=""):
+    def named_fixture_script(self, runner, overrides=None, existing=(), failing="", *,
+                             client_delay=0):
         # Exercise the real scripts, including the sourced helper. Every Docker,
         # checker, transport and cargo invocation is intercepted before execution.
         with tempfile.TemporaryDirectory(prefix="pbps-fixture-names-") as directory:
             root = Path(directory)
             fake = root / "client"
             fake.write_text(f"#!{sys.executable}\n" + r'''
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 root = Path(os.environ["PBPS_NAMES_CONTROL"])
 command = [Path(sys.argv[0]).name, *sys.argv[1:]]
-record = {"command": command}
+time.sleep(float(os.environ["PBPS_NAMES_CLIENT_DELAY"]))
+with (root / "calls").open("ab") as log:
+    log.write(os.fsencode("\0".join([str(len(command)), *command, ""])))
 if command[0] == "cargo":
-    record["environment"] = {key: os.environ.get(key) for key in
-                             ("PBPS_TEST_PG_CONTAINER", "PBPS_TEST_PG_OLD_CONTAINER")}
-with (root / "calls").open("a") as log:
-    log.write(json.dumps(record) + "\n")
+    with (root / "environments").open("a") as log:
+        log.write(json.dumps({key: os.environ.get(key) for key in
+                             ("PBPS_TEST_PG_CONTAINER", "PBPS_TEST_PG_OLD_CONTAINER")}) + "\n")
 if command[:2] == ["docker", "ps"]:
     print(os.environ["PBPS_NAMES_EXISTING"])
     if (root / "started").exists():
@@ -1093,8 +1117,30 @@ elif command[0] not in ("cargo", "python3", "sleep"):
             fake.chmod(0o755)
             for client in ("docker", "cargo", "python3", "sleep"):
                 (root / client).symlink_to(fake)
+            builtins = root / "builtins"
+            # A failed wait must exercise every retry, but starting Python for
+            # each probe and no-op sleep made that test depend on host load.
+            # Counts plus NUL-separated arguments let Bash log the same calls
+            # without a serializer process, including empty or multiline args.
+            builtins.write_text(r'''
+pbps_test_names_record() {
+    printf '%s\0' "$#" "$@" >> "$PBPS_NAMES_CONTROL/calls"
+    printf '%s\n' "$1" >> "$PBPS_NAMES_CONTROL/builtin-calls"
+}
+docker() {
+    if [[ ${1-} == exec && ${2-} == "$PBPS_NAMES_FAILING" ]]; then
+        pbps_test_names_record docker "$@"
+        return 1
+    fi
+    command docker "$@"
+}
+sleep() {
+    pbps_test_names_record sleep "$@"
+}
+''')
             env = fixture_environment(
                 PATH=str(root) + os.pathsep + os.environ["PATH"],
+                BASH_ENV=str(builtins), PBPS_NAMES_CLIENT_DELAY=str(client_delay),
                 PBPS_NAMES_CONTROL=str(root), PBPS_NAMES_EXISTING="\n".join(existing),
                 PBPS_NAMES_FAILING=failing)
             env.update(overrides or {})
@@ -1104,9 +1150,13 @@ elif command[0] not in ("cargo", "python3", "sleep"):
                         "--exact", "fixture case"])
             result = subprocess.run(command, cwd=ROOT, env=env, text=True,
                                     capture_output=True, timeout=30)
-            records = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
-            return result, [r["command"] for r in records], [r["environment"] for r in records
-                                                            if "environment" in r]
+            fields = iter((root / "calls").read_bytes().split(b"\0")[:-1])
+            calls = [[os.fsdecode(next(fields)) for _ in range(int(count))] for count in fields]
+            builtin_calls = root / "builtin-calls"
+            self.builtin_calls = builtin_calls.read_text().splitlines() if builtin_calls.exists() else []
+            environments = root / "environments"
+            return result, calls, [json.loads(line) for line in environments.read_text().splitlines()] \
+                if environments.exists() else []
 
     def test_resolver_fixtures_inherit_the_primary_name_and_reuse_exact_matches(self):
         for primary in (None, "pbps2236.fixture"):
