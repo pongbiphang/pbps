@@ -62,6 +62,41 @@ impl Side<'_> {
         }
         Some((source, column))
     }
+    // Enumerate one table's effective columns in the same order for type and
+    // domain checks; column() applies inherited and partition-local attributes.
+    pub(super) fn columns<'a>(
+        &'a self,
+        owner: &'a pbps_model::TableName,
+    ) -> impl Iterator<
+        Item = (
+            pbps_model::ColumnRef,
+            pbps_model::ColumnRef,
+            pbps_model::Column,
+        ),
+    > + 'a {
+        self.schema
+            .tables
+            .get(owner)
+            .into_iter()
+            .flat_map(move |table| {
+                table
+                    .columns
+                    .keys()
+                    .chain(
+                        table
+                            .partition_of
+                            .as_ref()
+                            .and_then(|of| self.schema.tables.get(&of.parent))
+                            .into_iter()
+                            .flat_map(|parent| parent.columns.keys()),
+                    )
+                    .filter_map(move |name| {
+                        let at = owner.column(name.clone());
+                        self.column(&at)
+                            .map(|(source, column)| (at, source, column))
+                    })
+            })
+    }
     pub(super) fn table(&self, uid: Option<&pbps_model::Uid>) -> Option<&pbps_model::Table> {
         self.schema.tables.get(self.ids.tables.get(uid?)?)
     }
