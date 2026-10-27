@@ -158,7 +158,7 @@ impl StateDir {
         &self.path
     }
 
-    fn file(&self, run_id: &str, extension: &str) -> PathBuf {
+    pub(super) fn file(&self, run_id: &str, extension: &str) -> PathBuf {
         self.path.join(format!("{run_id}.{extension}"))
     }
 
@@ -274,18 +274,5 @@ impl StateDir {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => Err(state(&path, e)),
         }
-    }
-
-    /// Deletes the run's record, temporary and lock, once absence is confirmed.
-    pub(super) fn remove(&self, run_id: &str) -> Result<(), Error> {
-        for extension in ["json", "json.tmp", "lock"] {
-            let path = self.file(run_id, extension);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(state(&path, e)),
-            }
-        }
-        Ok(())
     }
 }

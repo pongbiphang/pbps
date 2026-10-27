@@ -12,6 +12,7 @@
 mod owner;
 mod reconcile;
 mod record;
+mod removal;
 mod runtime;
 
 use std::fs::File;
@@ -23,10 +24,10 @@ use pbps_cli::resolver::server::ProduceError;
 use pbps_cli::resolver::server::scratch::container::{Held, Owner as ContainerOwner};
 
 pub(crate) use reconcile::Reconciliation;
-use reconcile::{RUN_LABEL, clean, failure, ours};
 pub(crate) use record::StateDir;
 use record::default_dir;
 use record::{Container, Record, State, VERSION};
+use removal::{RUN_LABEL, failure, ours, remove_run};
 use runtime::{Docker, Runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -126,7 +127,7 @@ async fn settle_failed_start(
             detail,
         ));
     }
-    clean(dir, record, rt).await
+    remove_run(dir, record, rt).await
 }
 
 /// A run's record and lock, advanced as the run advances.
@@ -267,10 +268,7 @@ impl<'d> TestScratch<'d> {
                 // the runtime confirms nothing of the run exists.
                 let cleaned = settle_failed_start(dir, &journal.record, &error, &Docker).await;
                 Err(Error::Start(match cleaned {
-                    Ok(()) => {
-                        dir.remove(&run_id)?;
-                        error.to_string()
-                    }
+                    Ok(()) => error.to_string(),
                     Err(unconfirmed) => format!("{error}; {unconfirmed}"),
                 }))
             }
@@ -293,23 +291,12 @@ impl<'d> TestScratch<'d> {
         self.finish_with(&Docker).await
     }
 
-    async fn finish_with(mut self, rt: &impl Runtime) -> Result<(), CleanupFailure> {
-        let _ = self.journal.advance(|r| r.state = State::Removing);
-        let cleaned = clean(self.journal.dir, &self.journal.record, rt).await;
+    async fn finish_with(self, rt: &impl Runtime) -> Result<(), CleanupFailure> {
+        let removed = remove_run(self.journal.dir, &self.journal.record, rt).await;
         // Confirmed or not, nothing may be removed by name any more: the drop
         // guard stands down and the keeper session closes with the handle.
         self.held.disown();
-        cleaned?;
-        let run_id = &self.journal.record.run_id;
-        self.journal.dir.remove(run_id).map_err(|e| {
-            failure(
-                self.journal.dir,
-                run_id,
-                FailureKind::Unprovable,
-                Vec::new(),
-                e.to_string(),
-            )
-        })
+        removed
     }
 }
 

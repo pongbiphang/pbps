@@ -783,6 +783,13 @@ container now holding the recorded name is not the original and is left alone.
 The runtime recorded must be the runtime asked: its endpoint and an identity
 read with the first `info` template that works (Podman 5.7 rejects `{{.ID}}`).
 
+One function, `removal::remove_run`, does every removal and every record
+deletion (normal teardown, recovery, a failed start), and states the rule once:
+evidence (container id and volumes) is persisted before any removal, and a
+record is deleted only after confirmed absence of the container and of every
+recorded volume. A finding that a path forgets or misjudges evidence is fixed
+in that function, never beside it.
+
 Absence, an unreadable inspection and a timeout are three results. Only the
 runtime saying "no such container" and "no such volume" is absence; the record
 is deleted after that and not before. Anything else is a `CleanupFailure` naming

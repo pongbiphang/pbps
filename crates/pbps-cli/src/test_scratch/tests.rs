@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::owner::{self, Owner, Process};
-use super::reconcile::{RUN_LABEL, reconcile};
+use super::reconcile::reconcile;
 use super::record::{self, Container, Daemon, Record, State, StateDir, VERSION};
+use super::removal::RUN_LABEL;
 use super::runtime::{Fail, Inspected, Runtime};
 use super::{FailureKind, TestScratch, settle_failed_start, state_dir};
 
@@ -408,7 +409,6 @@ mod records {
                 drop(held.expect("the lock is made"));
             });
             assert!(d.dir.try_lock_existing(&id).unwrap().is_some());
-            d.dir.remove(&id).unwrap();
         }
     }
 
@@ -585,15 +585,17 @@ mod recovery {
             },
         ];
         let kinds = [FailureKind::NotRemoved, FailureKind::Conflict];
+        drop(d);
         for (rt, kind) in cases.into_iter().zip(kinds) {
+            let d = Dir::new();
+            let cid = run('c');
             d.dir
-                .write(&record(&run('c'), State::Created, Some(&id('d'))))
+                .write(&record(&cid, State::Created, Some(&id('d'))))
                 .unwrap();
             let done = reconciled(&d, &rt).await;
             assert_eq!(done.failures.len(), 1, "{done:?}");
             assert_eq!(done.failures[0].kind, kind);
-            assert!(rt.removed.borrow().is_empty() && kept(&d, &run('c')));
-            d.dir.remove(&run('c')).unwrap();
+            assert!(rt.removed.borrow().is_empty() && kept(&d, &cid));
         }
     }
 
