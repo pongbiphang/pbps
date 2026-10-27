@@ -32,7 +32,7 @@ pub struct ResolverDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_instance: Option<&'static str>,
     /// Per-dependency observed placement, separate from the declaration's outcome.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencyDetail>,
     /// The compatibility rule the scratch was qualified under.
     pub rule: String,
