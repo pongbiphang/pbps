@@ -340,7 +340,7 @@ async fn modifier_lock_witness(index: usize) {
     vet_conversion(&mut db.conn, &column, &ty, "CAST(status AS varchar(3))")
         .await
         .unwrap();
-    for name in ["modtype", "ModType"] {
+    for name in ["modtype", "ModType", "length"] {
         let q = format!("\"{name}\"");
         db.sql(&format!("CREATE TYPE app.{q};
             CREATE FUNCTION app.{q}(cstring) RETURNS app.{q} AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
@@ -348,11 +348,24 @@ async fn modifier_lock_witness(index: usize) {
             CREATE FUNCTION app.{q}(cstring[]) RETURNS integer AS 'pg_advisory_unlock_all' LANGUAGE internal IMMUTABLE STRICT;
             CREATE TYPE app.{q}(INPUT=app.{q}, OUTPUT=app.{q}, TYPMOD_IN=app.{q}, INTERNALLENGTH=8, PASSEDBYVALUE, ALIGNMENT=double)")).await;
     }
+    db.sql("SET search_path = app, pg_catalog").await;
+    for using in ["length(status)", "pg_catalog.length(status)"] {
+        vet_conversion(&mut db.conn, &column, &ty, using)
+            .await
+            .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
+    }
     for (using, name) in [
         ("status::app.MODTYPE(1)", "modtype"),
         (r#"status::app."ModType"(1)"#, "ModType"),
         ("'x'::app.modtype(1)", "modtype"),
         ("CAST(status AS app.modtype(1))", "modtype"),
+        ("status::app.length(1)", "length"),
+        ("CAST(status AS length(1))", "length"),
+        ("TREAT(status AS app.length(1))", "length"),
+        ("XMLSERIALIZE(CONTENT NULL::xml AS app.length(1))", "length"),
+        ("length(1) '1'", "length"),
+        ("app.length((1)) /* gap */ E'1'", "length"),
+        ("JSON_ARRAY(RETURNING app.length(1))", "length"),
         ("NULL::app.modtype(1)[]", "modtype"),
         (r#"status::app."modtype" /* gap */ (1)"#, "modtype"),
         (r#"status::app.U&"modt\0079pe"(1)"#, "modtype"),
@@ -383,6 +396,11 @@ async fn modifier_lock_witness(index: usize) {
             .await
             .unwrap();
     }
+    let why = vet_conversion(&mut db.conn, &column, &ty, "status::pg_catalog.length(1)")
+        .await
+        .unwrap_err();
+    assert!(!why.contains("modifier routine"), "{why}");
+    assert!(why.contains("42704"), "{why}");
     // Quoted spelling is exact: this type does not exist, and binding (rather
     // than the modifier guard) must say so, without calling either routine.
     let why = vet_conversion(&mut db.conn, &column, &ty, r#"status::app."MODTYPE"(1)"#)

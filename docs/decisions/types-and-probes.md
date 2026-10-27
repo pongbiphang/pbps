@@ -3919,8 +3919,8 @@ Parse/Describe, never executing it or supplying parameter values. PostgreSQL
 itself decides each parameter type. A parameter in the unsafe closure refuses
 before the original expression binds, naming that type with escaped prose.
 The original CHECK statement, shape check and DEC-2181.1 bound-tree audit
-remain authoritative afterwards. There is no local SQL resolver, overload
-scan or grammar-keyword list.
+remain authoritative afterwards. Literal types are not inferred by a local
+SQL resolver, overload scan or grammar-keyword list.
 
 A failed preparation refuses only when that closure is non-empty and a
 string literal is present. The refusal carries its SQLSTATE and the remedy
@@ -3933,17 +3933,33 @@ These are explicit limitations of this pre-binding check, not guesses about a ty
 Type modifiers need a separate guard: Parse itself calls `typmodin` even
 without literals. Read the small set of types whose modifier-input routine
 is outside `pg_catalog` before any bind or prepare; an empty set skips the
-name check. In the shared lexer's code-only header, refuse an identifier
-matching one of those type names immediately followed by `(`. Unquoted names
-fold as PostgreSQL does, quoted names are exact, and only the last component
-of a qualified name can be followed by `(`. This deliberately coarse match
-also catches a same-named user function such as PostGIS `geometry(...)`:
-DEC-2181.1 already refuses non-built-in types and routines, so the guard moves
-that refusal before Parse can call the modifier routine. It names the type
-and says its modifier routine is not built in. The source type used to make
-the temporary table is checked too. A failed catalog read is unreadable
-evidence, never an empty set. A failed modifier-set read refuses every conversion
-while that read fails, including conversions without literals.
+name check. Use the shared lexer's code-only header and literal spans to
+match a modifier-set type followed by `(` only in a type position: after
+`::`, after unquoted `AS` or `RETURNING`, or when the matching `)` is followed
+by a string literal. Parentheses inside literals and quoted identifiers do
+not count. Unquoted names fold as PostgreSQL does, quoted names are exact,
+and a qualified type must name the catalog row's schema too. The source type
+used to make the temporary table is itself a type position and is checked
+before that table binds. The refusal names the type and says its modifier
+routine is not built in.
+
+Grammar references are PostgreSQL's [16 gram.y](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/parser/gram.y)
+and [18 gram.y](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y):
+`a_expr` and `b_expr` use `TYPECAST`; `func_expr_common_subexpr` covers
+CAST/TREAT/XMLSERIALIZE; `AexprConst` covers a modifier list followed by a
+string; and `json_output_clause_opt` (16) / `json_returning_clause_opt` (18)
+introduce the JSON result type. An ordinary function call, including
+`length(status)` or `pg_catalog.length(status)` beside an unrelated
+`app.length` modifier type, is left to the bound-tree audit. A same-named
+user routine is still refused by DEC-2181.1 there.
+
+Measured on 16.15 and 18.6, XMLSERIALIZE and JSON_ARRAY RETURNING resolve the
+fixture's modifier before refusing its custom result type with SQLSTATE
+42846: the session lock is already released. The guard and its lock witness
+therefore cover those positions even though this fixture cannot be a
+successful JSON or XML result type. A failed catalog read is unreadable
+evidence, never an empty set. A failed modifier-set read refuses every
+conversion while that read fails, including conversions without literals.
 
 This adds no scratch requirement and changes no saved format or offline
 `convert` recording. Connected plan and apply share the same vetter. The
