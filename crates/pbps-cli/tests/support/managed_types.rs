@@ -3417,8 +3417,10 @@ fn enum_new_labels_admit_deferred_plpgsql_bodies_and_staged_add_and_rename_resum
 fn enum_data_and_list_keys_keep_named_refusals_before_label_use_checks() {
     for ty in ["app.e", "app.e[]", "app.d"] {
         for partition in [false, true] {
-            // A scalar declared enum keys a partitioned table (DEC-2346.1).
-            if partition && ty == "app.e" {
+            // A scalar declared enum keys a partitioned table (DEC-2346.1) and
+            // carries rows (DEC-2346.2); a label added in the plan and used by
+            // either is refused as 3a refuses it, and those tests are theirs.
+            if ty == "app.e" {
                 continue;
             }
             let d = Demo::new("enum-surfaces-deferred2346");
@@ -6207,6 +6209,1097 @@ fn a_domain_default_or_check_naming_a_renamed_label_runs_after_the_rename() {
             succeeds(apply_allowing(&d, db, &path, allow));
             assert!(label_plan(&d, db, &path).changes.is_empty(), "case {n}");
             assert!(no_unvalidated_domain_check(db));
+        }
+    }
+}
+
+/// A lookup table keyed by an enum, with an enum column, as `data:` declares
+/// it (DEC-2346.2).
+fn enum_rows(d: &Demo, labels: &str, mode: &str, rows: &str) {
+    std::fs::write(
+        d.dir.join("schema/app.mood.type.yml"),
+        format!("enum: app.mood\nvalues: {labels}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.moods.yml"),
+        format!(
+            "table: app.moods\ncolumns:\n  m: {{type: app.mood, nullable: false}}\n  next: {{type: app.mood}}\n  note: {{type: text}}\nprimary_key: [m]\ndata:\n  mode: {mode}\n  rows:\n{rows}"
+        ),
+    )
+    .unwrap();
+}
+
+const TWO_MOODS: &str = "    sad: {next: ok, note: low}\n    ok: {next: happy}\n";
+
+const MOOD_ROWS: &str = "    sad: {next: ok, note: low}\n    ok: {next: happy}\n    happy: {}\n";
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_lookup_table_over_enums_converges_updates_and_deletes_its_rows() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        enum_rows(&d, "[sad, ok, happy]", "exact", MOOD_ROWS);
+        // The type, the table keyed by it and its rows are one plan and one
+        // apply.
+        let path = connected_artifact(&d, db, false);
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let kinds = changes_of(&plan);
+        let count = |kind: &str| kinds.iter().filter(|k| *k == kind).count();
+        assert_eq!(
+            (
+                count("CreateType"),
+                count("CreateTable"),
+                count("InsertRow")
+            ),
+            (1, 1, 3),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &[]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 3);
+        assert_eq!(
+            text_of(db, "SELECT next::text FROM app.moods WHERE m = 'sad'"),
+            "ok"
+        );
+        let again = d.dir.join("again.plan.json");
+        assert!(label_plan(&d, db, &again).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+
+        // A changed cell is one `UpdateRow` behind the gate.
+        enum_rows(
+            &d,
+            "[sad, ok, happy]",
+            "exact",
+            "    sad: {next: ok, note: low}\n    ok: {next: sad}\n    happy: {}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let updated = label_plan(&d, db, &again);
+        assert_eq!(changes_of(&updated), ["UpdateRow"], "{updated:?}");
+        let refused = approved_apply(&d, db, &again, &[]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("data-update"),
+            "{}",
+            stderr(&refused)
+        );
+        succeeds(approved_apply(&d, db, &again, &["--allow", "data-update"]));
+        assert_eq!(
+            text_of(db, "SELECT next::text FROM app.moods WHERE m = 'ok'"),
+            "sad"
+        );
+        assert!(label_plan(&d, db, &again).changes.is_empty());
+
+        // A row an `exact` table no longer declares is deleted behind the gate.
+        enum_rows(
+            &d,
+            "[sad, ok, happy]",
+            "exact",
+            "    sad: {next: ok, note: low}\n    ok: {next: sad}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let deleted = label_plan(&d, db, &again);
+        assert_eq!(changes_of(&deleted), ["DeleteRow"], "{deleted:?}");
+        let refused = approved_apply(&d, db, &again, &[]);
+        assert_ne!(code(&refused), 0);
+        let said = stderr(&refused);
+        let class = ["data-delete", "destructive"]
+            .into_iter()
+            .find(|c| said.contains(c))
+            .unwrap_or_else(|| panic!("{said}"));
+        succeeds(approved_apply(&d, db, &again, &["--allow", class]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+        assert!(label_plan(&d, db, &again).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn pulled_enum_rows_recreate_and_re_pull_the_same() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let source = OwnDatabase::new(&server, "enum_rows_pull2346");
+        on_server(
+            source.connection(),
+            "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad', 'ok', 'happy'); \
+             CREATE TABLE app.moods (m app.mood PRIMARY KEY, next app.mood, note text); \
+             INSERT INTO app.moods VALUES ('sad', 'ok', 'low'), ('ok', 'happy', NULL), ('happy', NULL, NULL);",
+        );
+        let pulled = Demo::new("enum-rows-pull2346");
+        succeeds(pulled.run(&["pull", "--db", source.connection(), "--data", "app.moods"]));
+        let first = std::fs::read_to_string(pulled.dir.join("schema/app.moods.yml")).unwrap();
+        assert!(
+            first.contains("mode: exact")
+                && first.contains("sad: {next: ok, note: low}")
+                && first.contains("happy: {}"),
+            "{first}"
+        );
+
+        // Recreated from the pulled files in an empty database.
+        let target = OwnDatabase::new(&server, "enum_rows_recreate2346");
+        let db = target.connection();
+        on_server(db, "CREATE SCHEMA app");
+        succeeds(pulled.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        let path = connected_artifact(&pulled, db, false);
+        succeeds(approved_apply(&pulled, db, &path, &[]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 3);
+        let again = pulled.dir.join("again.plan.json");
+        assert!(label_plan(&pulled, db, &again).changes.is_empty());
+
+        // And pulled again, it is the file it was.
+        let re_pulled = Demo::new("enum-rows-re-pull2346");
+        succeeds(re_pulled.run(&["pull", "--db", db, "--data", "app.moods"]));
+        assert_eq!(
+            std::fs::read_to_string(re_pulled.dir.join("schema/app.moods.yml")).unwrap(),
+            first
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_label_rename_under_rows_plans_no_row_change_and_finds_the_renamed_key() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (mode, staged) in [("exact", false), ("ensure", false), ("exact", true)] {
+            let own = OwnDatabase::new(&server, "enum_rows_rename2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-rows-rename2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            enum_rows(
+                &d,
+                "[sad, ok, happy]",
+                mode,
+                "    sad: {next: ok}\n    ok: {next: sad}\n    happy: {next: sad}\n",
+            );
+            let path = connected_artifact(&d, db, false);
+            succeeds(approved_apply(&d, db, &path, &[]));
+
+            // The engine renames the label in the rows that hold it, so the
+            // rename is the whole plan (measured on 16 and 18).
+            enum_rows(
+                &d,
+                "[{name: blue, renamed_from: sad}, ok, happy]",
+                mode,
+                "    blue: {next: ok}\n    ok: {next: blue}\n    happy: {next: blue}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let renamed = if staged {
+                succeeds(d.run(&[
+                    "plan",
+                    "--db",
+                    db,
+                    "--staged",
+                    "--out",
+                    path.to_str().unwrap(),
+                ]));
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+            } else {
+                label_plan(&d, db, &path)
+            };
+            // An `ensure` table also records its new key set, which is
+            // bookkeeping and not a row change.
+            let expected: &[&str] = if mode == "ensure" {
+                &["RenameEnumValue", "SetEnsureKeys"]
+            } else {
+                &["RenameEnumValue"]
+            };
+            assert_eq!(changes_of(&renamed), expected, "{mode}: {renamed:?}");
+            let allow: &[&str] = if staged {
+                &["--staged", "--allow", "rename"]
+            } else {
+                &["--allow", "rename"]
+            };
+            succeeds(approved_apply(&d, db, &path, allow));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.moods WHERE m = 'blue' AND next = 'ok'"
+                ),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 3);
+            assert!(label_plan(&d, db, &path).changes.is_empty(), "{mode}");
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_cell_that_is_not_a_declared_label_or_uses_a_new_one_is_refused_and_the_split_applies() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_labels2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-labels2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        enum_rows(&d, "[sad, ok, happy]", "ensure", TWO_MOODS);
+        let path = connected_artifact(&d, db, false);
+        succeeds(approved_apply(&d, db, &path, &[]));
+
+        // Not a label of the enum: refused where the declarations are read,
+        // naming the table, the row, the column and the label.
+        for (rows, row, column, label) in [
+            ("    sad: {next: glad}\n", "sad", "next", "glad"),
+            ("    bogus: {}\n", "bogus", "m", "bogus"),
+        ] {
+            enum_rows(&d, "[sad, ok, happy]", "ensure", rows);
+            let out = d.run(&["validate"]);
+            assert_ne!(code(&out), 0, "{rows}");
+            let said = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(
+                said.contains("app.moods")
+                    && said.contains(&format!("row `{row}`"))
+                    && said.contains(&format!("column `{column}`"))
+                    && said.contains(&format!("holds `{label}`"))
+                    && said.contains("not a label of `app.mood`")
+                    && said.contains("`sad`, `ok`, `happy`"),
+                "{rows}: {said}"
+            );
+        }
+
+        // A label this plan adds cannot be used by a cell of the same plan
+        // (measured on 16 and 18: `unsafe use of new value`), as a cell or as
+        // a key; and the read that precedes the plan does not abort on a key
+        // the database does not hold as a label yet.
+        for rows in [
+            "    sad: {next: joy}\n",
+            "    joy: {note: new}\n",
+            "    happy: {next: joy}\n",
+        ] {
+            enum_rows(&d, "[sad, ok, happy, joy]", "ensure", rows);
+            d.commit();
+            let refused = path.with_file_name("refused.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", refused.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{rows}");
+            let said = stderr(&out);
+            assert!(
+                said.contains("joy")
+                    && said.contains("apply the label first, then the rest")
+                    && !said.contains("invalid input value for enum"),
+                "{rows}: {said}"
+            );
+            assert!(!refused.exists());
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_enum WHERE enumtypid = 'app.mood'::regtype AND enumlabel = 'joy'"
+                ),
+                0
+            );
+        }
+
+        // The two-plan split: the label first, then the rows that use it.
+        enum_rows(&d, "[sad, ok, happy, joy]", "ensure", TWO_MOODS);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let first = label_plan(&d, db, &path);
+        assert_eq!(changes_of(&first), ["AddEnumValue"], "{first:?}");
+        succeeds(approved_apply(&d, db, &path, &[]));
+        enum_rows(
+            &d,
+            "[sad, ok, happy, joy]",
+            "ensure",
+            "    sad: {next: joy, note: low}\n    ok: {next: happy}\n    happy: {}\n    joy: {note: new}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let second = label_plan(&d, db, &path);
+        let kinds = changes_of(&second);
+        assert!(
+            kinds.contains(&"UpdateRow".to_owned()) && kinds.contains(&"InsertRow".to_owned()),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "data-update"]));
+        assert_eq!(
+            text_of(db, "SELECT next::text FROM app.moods WHERE m = 'sad'"),
+            "joy"
+        );
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 4);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+fn every_other_reference_keeps_the_data_refusal_beside_a_declared_enum() {
+    // (the column's type, the type files declared beside it, the refusal)
+    let reference = |ty: &str| format!("the user-defined type reference `{ty}` on column `c`");
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], String);
+    let cases: [Case<'_>; 6] = [
+        (
+            "app.dmood",
+            &[("app.dmood.type.yml", "domain: app.dmood\ntype: app.mood\n")],
+            reference("app.dmood"),
+        ),
+        (
+            "app.dtxt",
+            &[("app.dtxt.type.yml", "domain: app.dtxt\ntype: text\n")],
+            reference("app.dtxt"),
+        ),
+        ("ext.status", &[], reference("ext.status")),
+        ("app.pair", &[], reference("app.pair")),
+        ("app.mood[]", &[], reference("app.mood[]")),
+        ("text[]", &[], "an array column".to_owned()),
+    ];
+    for (ty, files, refusal) in cases {
+        let d = Demo::new("enum-rows-refusals2346");
+        std::fs::write(
+            d.dir.join("schema/app.mood.type.yml"),
+            "enum: app.mood\nvalues: [sad, ok]\n",
+        )
+        .unwrap();
+        for (file, text) in files {
+            std::fs::write(d.dir.join("schema").join(file), text).unwrap();
+        }
+        std::fs::write(
+            d.dir.join("schema/app.t.yml"),
+            format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false}}\n  c: {{type: '{ty}'}}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n    1: {{}}\n"
+            ),
+        )
+        .unwrap();
+        let out = d.run(&["validate"]);
+        assert_ne!(code(&out), 0, "{ty}");
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("`data:` cannot be declared on a table with") && said.contains(&refusal),
+            "{ty}: {said}"
+        );
+    }
+    // The declared enum itself is admitted beside them (DEC-2346.2).
+    let d = Demo::new("enum-rows-admitted2346");
+    std::fs::write(
+        d.dir.join("schema/app.mood.type.yml"),
+        "enum: app.mood\nvalues: [sad, ok]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  c: {type: app.mood}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n    1: {c: ok}\n",
+    )
+    .unwrap();
+    let out = d.run(&["validate"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_rebuild2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-rebuild2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        enum_rows(&d, "[sad, ok, happy]", "exact", MOOD_ROWS);
+        let path = connected_artifact(&d, db, false);
+        succeeds(approved_apply(&d, db, &path, &[]));
+
+        // A reorder rebuilds the enum (slice 3b); the rows over it, the key
+        // included, come through `col::text::tmp` and the plan is then empty.
+        enum_rows(&d, "[happy, ok, sad]", "exact", MOOD_ROWS);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let reordered = label_plan(&d, db, &path);
+        assert!(
+            changes_of(&reordered).iter().any(|k| k == "EnumRebuild"),
+            "{reordered:?}"
+        );
+        assert!(
+            !changes_of(&reordered).iter().any(|k| k.ends_with("Row")),
+            "{reordered:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "type-rebuild"]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 3);
+        assert_eq!(
+            text_of(db, "SELECT next::text FROM app.moods WHERE m = 'sad'"),
+            "ok"
+        );
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum \
+                 WHERE enumtypid = 'app.mood'::regtype"
+            ),
+            "happy,ok,sad"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+
+        // A label removed while a live row still holds it is refused by the
+        // rebuild's own row probe, whatever the declarations say about the
+        // row, and nothing is applied.
+        enum_rows(
+            &d,
+            "[ok, sad]",
+            "exact",
+            "    sad: {next: ok, note: low}\n    ok: {next: sad}\n",
+        );
+        d.commit();
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            code(&out) != 0 && said.contains("holding a label this plan removes (happy)"),
+            "code {}: {said}",
+            code(&out)
+        );
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 3);
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_default2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-default2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        let declare = |labels: &str, default: &str, key: &str, second: &str| {
+            std::fs::write(
+                d.dir.join("schema/app.mood.type.yml"),
+                format!("enum: app.mood\nvalues: {labels}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                d.dir.join("schema/app.moods.yml"),
+                format!(
+                    "table: app.moods\ncolumns:\n  id: {{type: integer, nullable: false}}\n  m: {{type: app.mood, default: \"'{default}'\"}}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n    1: {{m: {key}}}\n    2: {{m: {second}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        declare("[sad, ok]", "sad", "ok", "sad");
+        let path = connected_artifact(&d, db, false);
+        succeeds(approved_apply(&d, db, &path, &[]));
+        // The default names the label the plan renames: the declared text
+        // casts to a label the database does not hold yet.
+        declare(
+            "[{name: blue, renamed_from: sad}, ok]",
+            "blue",
+            "ok",
+            "blue",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let renamed = label_plan(&d, db, &path);
+        // The read did not abort, and the rename is no row's change. A row
+        // that omits the column would be restated at the default whose text
+        // names the old label (DEC-2346.2), so this one writes its cell.
+        let kinds = changes_of(&renamed);
+        assert!(
+            kinds.contains(&"RenameEnumValue".to_owned())
+                && !kinds.iter().any(|k| k.ends_with("Row")),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+        assert_eq!(
+            text_of(db, "SELECT m::text FROM app.moods WHERE id = 2"),
+            "blue"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rows_taken_over_under_a_renamed_key_are_found_by_the_label_they_hold() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let (own, d) = adopted(
+            &server,
+            "enum_rows_takeover2346",
+            "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad', 'ok'); \
+             CREATE TABLE app.moods (m app.mood PRIMARY KEY, next app.mood, note text); \
+             INSERT INTO app.moods VALUES ('sad', 'ok', 'low'), ('ok', NULL, NULL);",
+        );
+        let db = own.connection();
+        // The rows were never declared, so the plan's read asks for the key
+        // the declarations now spell, and the row holds the label it had.
+        enum_rows(
+            &d,
+            "[{name: blue, renamed_from: sad}, ok]",
+            "ensure",
+            "    blue: {next: ok, note: low}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = d.dir.join("takeover.plan.json");
+        let plan = label_plan(&d, db, &path);
+        let kinds = changes_of(&plan);
+        assert!(
+            kinds.contains(&"RenameEnumValue".to_owned())
+                && !kinds.iter().any(|k| k.ends_with("Row")),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_label_rename_under_ensure_rows_applies_and_resumes() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for resumed in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_rows_staged2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-rows-staged2346");
+            // The declared rows do not include the renamed label as a key,
+            // so the plan is the rename alone: one logical change.
+            enum_rows(
+                &d,
+                "[sad, ok, happy]",
+                "ensure",
+                "    ok: {next: sad}\n    happy: {next: sad}\n",
+            );
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let path = d.dir.join("staged-rows.plan.json");
+            on_server(db, "INSERT INTO app.moods(m, next) VALUES ('sad', 'ok')");
+
+            enum_rows(
+                &d,
+                "[{name: blue, renamed_from: sad}, ok, happy]",
+                "ensure",
+                "    ok: {next: blue}\n    happy: {next: blue}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]));
+            let plan: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(changes_of(&plan), ["RenameEnumValue"], "{plan:?}");
+            let checksum = plan_checksum(&path);
+            let mut args = vec![
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--staged",
+                "--allow",
+                "rename",
+            ];
+            if resumed {
+                // The rename is durable and its checkpoint is not the end of
+                // the run: resume from it.
+                let _checkpoint =
+                    super::abrupt_recovery::interrupt_after_type_checkpoint(db, &d, &args);
+                args.push("--resume");
+            }
+            succeeds(d.run(&args));
+            succeeds(d.run(&["verify", "--db", db]));
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE m = 'blue'"),
+                1
+            );
+            assert_eq!(
+                text_of(db, "SELECT next::text FROM app.moods WHERE m = 'ok'"),
+                "blue"
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+/// Measured: a rename of the label an `ensure` table's row is keyed by also
+/// replaces the table's recorded key set, a second logical change, so the
+/// plan is not a staged one; the row is renamed by the transactional apply,
+/// which the rename test above covers.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_staged_key2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-staged-key2346");
+        enum_rows(
+            &d,
+            "[sad, ok]",
+            "ensure",
+            "    sad: {next: ok}\n    ok: {next: sad}\n",
+        );
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        enum_rows(
+            &d,
+            "[{name: blue, renamed_from: sad}, ok]",
+            "ensure",
+            "    blue: {next: ok}\n    ok: {next: blue}\n",
+        );
+        d.commit();
+        let path = d.dir.join("staged-key.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            db,
+            "--staged",
+            "--out",
+            path.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("--staged applies one logical change, and this plan has 2"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let own = OwnDatabase::new(&server, "enum_rows_chain2346");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app");
+        let d = Demo::new("enum-rows-chain2346");
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+        enum_rows(
+            &d,
+            "[a, b, keep]",
+            "ensure",
+            "    a: {note: first}\n    b: {note: second}\n",
+        );
+        let path = connected_artifact(&d, db, false);
+        succeeds(approved_apply(&d, db, &path, &[]));
+        // `b` becomes `c` and `a` becomes `b`; only `b` stays declared, so the
+        // row that was `b` is `c` and no longer managed. It still exists.
+        enum_rows(
+            &d,
+            "[{name: b, renamed_from: a}, {name: c, renamed_from: b}, keep]",
+            "ensure",
+            "    b: {note: first}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let renamed = label_plan(&d, db, &path);
+        let kinds = changes_of(&renamed);
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "RenameEnumValue").count(),
+            2,
+            "{kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|k| k == "InsertRow" || k == "DeleteRow"),
+            "{kinds:?}"
+        );
+        succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+        assert_eq!(
+            text_of(db, "SELECT note FROM app.moods WHERE m = 'b'"),
+            "first"
+        );
+        assert_eq!(
+            text_of(db, "SELECT note FROM app.moods WHERE m = 'c'"),
+            "second"
+        );
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_takeover_under_a_renamed_key_pins_the_row_it_depends_on() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // The unmanaged row `sad` is taken over under `ensure` as `blue`; the
+        // plan is the rename alone, and the row it depends on is in the
+        // baseline the checksum pins (DEC-2346.2).
+        for outside in [
+            Some("UPDATE app.moods SET note = 'changed' WHERE m = 'sad'"),
+            Some("DELETE FROM app.moods WHERE m = 'sad'"),
+            None,
+        ] {
+            let (own, d) = adopted(
+                &server,
+                "enum_rows_pinned2346",
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad', 'ok'); \
+                 CREATE TABLE app.moods (m app.mood PRIMARY KEY, next app.mood, note text); \
+                 INSERT INTO app.moods VALUES ('sad', 'ok', 'low'), ('ok', NULL, NULL);",
+            );
+            let db = own.connection();
+            enum_rows(
+                &d,
+                "[{name: blue, renamed_from: sad}, ok]",
+                "ensure",
+                "    blue: {next: ok, note: low}\n",
+            );
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("pinned.plan.json");
+            let plan = label_plan(&d, db, &path);
+            assert!(
+                changes_of(&plan).contains(&"RenameEnumValue".to_owned())
+                    && !changes_of(&plan).iter().any(|k| k.ends_with("Row")),
+                "{plan:?}"
+            );
+            if let Some(sql) = outside {
+                on_server(db, sql);
+                let out = approved_apply(&d, db, &path, &["--allow", "rename"]);
+                assert_ne!(code(&out), 0, "{sql}");
+                assert!(
+                    stderr(&out).contains("no longer the database this plan was computed against"),
+                    "{sql}: {}",
+                    stderr(&out)
+                );
+                // Nothing was applied, and no success is recorded: the refusal
+                // is a `failed` entry beside the baseline, the state advances
+                // by none.
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM public.__pbps_state WHERE kind = 'apply'"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM pg_enum WHERE enumtypid = 'app.mood'::regtype AND enumlabel = 'blue'"
+                    ),
+                    0
+                );
+            } else {
+                succeeds(approved_apply(&d, db, &path, &["--allow", "rename"]));
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM app.moods WHERE m = 'blue' AND note = 'low'"
+                    ),
+                    1
+                );
+                assert!(label_plan(&d, db, &path).changes.is_empty());
+                succeeds(d.run(&["verify", "--db", db]));
+            }
+        }
+    }
+}
+
+/// Measured on PG 16 and 18: a chain of label renames is more than one logical
+/// change, so no staged plan holds one, alone or beside an `ensure` table's
+/// rows, and an artifact edited into a staged one is refused by the apply
+/// (the finding about the per-step reads of such a chain is unreachable).
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_staged_plan_cannot_hold_a_chain_of_label_renames() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for with_rows in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_rows_staged_chain2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-rows-staged-chain2346");
+            if with_rows {
+                enum_rows(
+                    &d,
+                    "[a, b, keep]",
+                    "ensure",
+                    "    a: {note: first}\n    b: {note: second}\n",
+                );
+            } else {
+                std::fs::write(
+                    d.dir.join("schema/app.mood.type.yml"),
+                    "enum: app.mood\nvalues: [a, b, keep]\n",
+                )
+                .unwrap();
+            }
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            let chain = "[{name: b, renamed_from: a}, {name: c, renamed_from: b}, keep]";
+            if with_rows {
+                enum_rows(&d, chain, "ensure", "    b: {note: first}\n");
+            } else {
+                std::fs::write(
+                    d.dir.join("schema/app.mood.type.yml"),
+                    format!("enum: app.mood\nvalues: {chain}\n"),
+                )
+                .unwrap();
+            }
+            d.commit();
+            let path = d.dir.join("staged-chain.plan.json");
+            let out = d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--staged",
+                "--out",
+                path.to_str().unwrap(),
+            ]);
+            assert_ne!(code(&out), 0, "rows {with_rows}");
+            assert!(
+                stderr(&out).contains("--staged applies one logical change, and this plan has"),
+                "rows {with_rows}: {}",
+                stderr(&out)
+            );
+            assert!(!path.exists());
+
+            // A transactional plan edited into a staged one, with the
+            // fingerprint of the edit, is refused by the apply as well.
+            succeeds(d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]));
+            let mut plan: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            plan["mode"] = "staged".into();
+            std::fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+            let checksum = plan_checksum(&path);
+            let out = d.run(&[
+                "apply",
+                "--db",
+                db,
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+                "--staged",
+                "--allow",
+                "rename",
+            ]);
+            assert_ne!(code(&out), 0, "rows {with_rows}");
+            let said = stderr(&out);
+            assert!(
+                said.contains("a staged plan must contain exactly one logical change"),
+                "rows {with_rows}: {said}"
+            );
+            // Nothing was applied: the labels are as they were.
+            assert_eq!(
+                text_of(
+                    db,
+                    "SELECT string_agg(enumlabel, ',' ORDER BY enumsortorder) FROM pg_enum \
+                     WHERE enumtypid = 'app.mood'::regtype"
+                ),
+                "a,b,keep"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // A rename in place, and a move to another schema.
+        for target in ["app.feeling", "moved.feeling"] {
+            let own = OwnDatabase::new(&server, "enum_type_rename_rows2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app; CREATE SCHEMA moved");
+            let d = Demo::new("enum-type-rename-rows2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            enum_rows(
+                &d,
+                "[sad, ok, happy]",
+                "exact",
+                "    sad: {next: ok, note: low}\n    ok: {next: happy}\n",
+            );
+            let path = connected_artifact(&d, db, false);
+            succeeds(approved_apply(&d, db, &path, &[]));
+
+            // The type is renamed and, in the same plan, a text cell changes in a
+            // row that holds enum cells, a row is inserted and a row is deleted.
+            // The rename runs first, so every guard must name the type as it is
+            // then (DEC-2346.2).
+            std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+            std::fs::write(
+                d.dir.join(format!("schema/{target}.type.yml")),
+                format!("enum: {target}\nrenamed_from: app.mood\nvalues: [sad, ok, happy]\n"),
+            )
+            .unwrap();
+            std::fs::write(
+            d.dir.join("schema/app.moods.yml"),
+            format!("table: app.moods\ncolumns:\n  m: {{type: {target}, nullable: false}}\n  next: {{type: {target}}}\n  note: {{type: text}}\nprimary_key: [m]\ndata:\n  mode: exact\n  rows:\n    sad: {{next: ok, note: high}}\n    happy: {{next: sad}}\n"),
+        )
+        .unwrap();
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let renamed = label_plan(&d, db, &path);
+            let kinds = changes_of(&renamed);
+            for kind in ["RenameType", "UpdateRow", "InsertRow", "DeleteRow"] {
+                assert!(kinds.iter().any(|k| k == kind), "{kind}: {kinds:?}");
+            }
+            let refused = approved_apply(&d, db, &path, &[]);
+            assert_ne!(code(&refused), 0);
+            assert!(
+                stderr(&refused).contains("data-update"),
+                "{}",
+                stderr(&refused)
+            );
+            let allow = ["--allow", "rename,data-update,data-delete"];
+            succeeds(approved_apply(&d, db, &path, &allow));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.moods WHERE m = 'sad' AND note = 'high' AND next = 'ok'"
+                ),
+                1
+            );
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE m = 'happy'"),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                0
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        // Two runs: the guards hold, and a row changed outside pbps is refused.
+        for outside in [false, true] {
+            let own = OwnDatabase::new(&server, "enum_default_rename2346");
+            let db = own.connection();
+            on_server(db, "CREATE SCHEMA app");
+            let d = Demo::new("enum-default-rename2346");
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            let declare = |ty: &str, default: &str, rows: &str| {
+                let name = ty.rsplit('.').next().unwrap();
+                std::fs::write(
+                    d.dir.join(format!("schema/{ty}.type.yml")),
+                    format!(
+                        "enum: {ty}\nvalues: [sad, ok]\n{}",
+                        if name == "feeling" {
+                            "renamed_from: app.mood\n"
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    d.dir.join("schema/app.moods.yml"),
+                    format!(
+                        "table: app.moods\ncolumns:\n  m: {{type: {ty}, nullable: false}}\n  next: {{type: {ty}, default: \"{default}\"}}\n  note: {{type: text}}\nprimary_key: [m]\ndata:\n  mode: exact\n  rows:\n{rows}"
+                    ),
+                )
+                .unwrap();
+            };
+            // `next` is omitted in every row: its default applies.
+            declare(
+                "app.mood",
+                "'sad'::app.mood",
+                "    sad: {note: a}\n    ok: {note: b}\n",
+            );
+            let path = connected_artifact(&d, db, false);
+            succeeds(approved_apply(&d, db, &path, &[]));
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM app.moods WHERE next = 'sad'"),
+                2
+            );
+            // The type is renamed and its default respelled; one row is
+            // updated and one deleted, both still omitting the cell.
+            std::fs::remove_file(d.dir.join("schema/app.mood.type.yml")).unwrap();
+            declare("app.feeling", "'sad'::app.feeling", "    ok: {note: c}\n");
+            succeeds(d.run(&["plan", "--no-dev"]));
+            d.commit();
+            let plan = label_plan(&d, db, &path);
+            let kinds = changes_of(&plan);
+            for kind in ["RenameType", "UpdateRow", "DeleteRow"] {
+                assert!(kinds.iter().any(|k| k == kind), "{kind}: {kinds:?}");
+            }
+            let allow = ["--allow", "rename,data-update,data-delete"];
+            if outside {
+                // A cell changed by someone else is still caught by the guard:
+                // the apply is refused and nothing is applied.
+                on_server(db, "UPDATE app.moods SET next = 'ok' WHERE m = 'ok'");
+                let refused = approved_apply(&d, db, &path, &allow);
+                assert_ne!(code(&refused), 0);
+                let said = stderr(&refused);
+                assert!(!said.contains("does not exist"), "{said}");
+                assert_eq!(
+                    scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                    1,
+                    "nothing applied"
+                );
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 2);
+                continue;
+            }
+            succeeds(approved_apply(&d, db, &path, &allow));
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM app.moods WHERE m = 'ok' AND note = 'c'"
+                ),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.moods"), 1);
+            assert_eq!(
+                scalar(db, "SELECT count(*) FROM pg_type WHERE typname = 'mood'"),
+                0
+            );
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+            succeeds(d.run(&["verify", "--db", db]));
         }
     }
 }

@@ -3502,3 +3502,167 @@ function ran), `a_tightening_is_refused_by_name_while_an_array_or_composite_of_t
 `a_loosening_comes_before_the_columns_the_plan_adds_and_a_tightening_after` pin
 it on 16 and 18, with unit tests for the delta, the emitter, the sort, the
 replay and the per-statement checks.
+
+<a id="dec-2346-2"></a>
+
+**DEC-2346.2. A scalar declared enum may carry `data:` rows; every other reference keeps DEC-1523.1's refusal (#2346 part 2).**
+Maintainer, 2026-10-24: the second of two PRs, after the partition keys
+(DEC-2346.1). It narrows DEC-1523.1 and nothing else of it.
+
+- **Admission** is DEC-2346.1's lookup by name: a column whose type is a
+  scalar reference to a declared enum, on the same side, may carry rows as a
+  data column or as the primary key. A domain (over an enum or over anything),
+  a composite, an external or unknown name and every array keep the refusal
+  and its text, and the row reader refuses any array column whatever its type
+  (#1167). `Dialect::validate_table_in_schema` carries the declared types to
+  the validation, and `pull --data` calls it with the pulled ones; the row
+  reader takes them as `query_in_schema`, `query` seeing none.
+- **A cell is a declared label.** A cell, or the row key of an enum key, is one
+  of the enum's `values`, or NULL where the column is nullable. Anything else
+  is refused where the declarations are read, naming the table, the row, the
+  column and the label, beside the check of a partition bound. No engine is
+  asked: the spelling probes skip these cells and keys, so a type created in
+  the same plan is judged as a standing one.
+- **A read by key compares an enum key as text** (design M1, measured on 16
+  and 18): `k IN ('nonesuch')` over an enum is the error `invalid input value
+  for enum`, and the plan's read runs before the plan's `ADD VALUE` or `RENAME
+  VALUE`, so a declared key naming a label this plan adds or renames would
+  abort the plan with the engine's message. `CAST(k AS text) IN (…)` is no
+  row, and the same for the key aliases. Writes run after the type's changes
+  and keep the native comparison.
+- **A label added in the plan cannot be used by a row of it** (the label is
+  unusable in the transaction that adds it: `unsafe use of new value`). The
+  key or a changed cell of an `InsertRow` or `UpdateRow` naming it joins the
+  surfaces `unsafe_uses` reads, with its message and remedy, "apply the label
+  first, then the rest"; a cell an update leaves, and a text column holding the
+  same string, are no use.
+- **A rename carries the rows.** The engine renames a label in the rows that
+  hold it (measured on 16 and 18), and the declarations spell the final
+  label. The observed rows are therefore carried through the plan's own
+  `RenameEnumValue` pairs, by exact label and in the order they run (a chain
+  `b→c`, `a→b` takes `b` to `c` and `a` to `b`), the key and the cells of
+  columns over the renamed enum, before they are compared with the declared
+  ones: the differ plans no `UpdateRow`, delete or insert for a rename, and
+  the apply's movement check carries the baseline the same way
+  (`forwarded_rows`, beside `forwarded_bound`; the single label walk is
+  `carried_label`, which `carried_bound` uses too). The rows a scoped read
+  must find are named by the labels they hold: the apply asks the declared
+  keys and the labels they had before the plan's renames
+  (`scopes_before_the_plan`), and the plan's own read, taken before any plan
+  exists, asks for the labels a declared key was renamed from
+  (`read_before_the_renames`, from `renamed_from`). An `ensure` table whose
+  recorded key set is replaced records it as a `SetEnsureKeys`, which is
+  bookkeeping and not a row change.
+- **Every apply asks the held keys, staged or not** (`held_before_the_plan`):
+  the transactional baseline, the staged baseline of a fresh run and of a
+  resume, and the checkpoint read name the declared keys and the labels they
+  held before the plan's renames, so a row is found whichever side of the
+  rename statement the read falls on. The rename of the label an `ensure`
+  table's row is keyed by also replaces the table's recorded key set
+  (`SetEnsureKeys`), a second logical change, so such a plan is not a staged
+  one (measured); a staged plan can rename a label that rows hold in a
+  cell, or that no declared row names, and those apply and resume.
+- **The checksum pins the row a takeover under a renamed key depends on**
+  (`pinned_baseline_scopes`): the plan's baseline checksum is taken over the
+  recorded scopes and the planned ones, and the planned ones are widened by the
+  labels their keys hold before the plan's renames, on the side that pins
+  (`plan`) and the side that verifies (`apply`, transactional and staged,
+  fresh) through the one function. Without it the row `sad` that a takeover
+  renames to `blue` was in the comparison but not in the checksum, and a change
+  or a delete of it between `plan` and `apply` passed unseen into the baseline
+  the apply recorded (SPEC 7.6). A plan that renames no label a key holds pins
+  exactly `pinned_scopes`, so its checksum does not change. The resume of a
+  staged run is checked against the checkpoint's own recorded rows and needs
+  nothing; the plan's read is widened from the `renamed_from` hints, which name
+  the same pairs the plan's renames do.
+- **No staged plan holds a chain of renames** (measured on 16 and 18): each
+  `RenameEnumValue` is a logical change, so a chain is two or more, and
+  `plan --staged` and the apply of an artifact edited into a staged one both
+  refuse it ("a staged plan must contain exactly one logical change"), alone
+  or beside an `ensure` table's rows. The per-step reads of a staged run need
+  no scope derived from the renames still ahead: the one rename a staged plan
+  can hold is the statement before the read.
+- **The widened baseline is trimmed to what the plan still manages**
+  (`trim_to_the_final_scope`): the baseline of an `ensure` table is read under
+  the declared keys and the labels they held, and a chain (`b→c`, `a→b`) over
+  a table that declares only `b` reads the rows `a` and `b`, which the plan
+  leaves as `b` and `c`. The closing read asks for `b` alone, so `c` still
+  exists but is not managed, and the baseline keeps a row only when its key,
+  carried forward through the renames, is a key of the plan's scope; the
+  rows keep their labels and the comparison carries them. The per-step reads
+  of a staged run ask the plan's own keys, as the closing read does, since
+  a widened one would read an unmanaged row that a swap of labels leaves
+  under a held name.
+- **Slice 3b needs nothing**: a rebuild converts a column of the enum, a key
+  among them, through `col::text::tmp`, and its row probe counts the live
+  rows that hold a label the plan removes, a declared row of an `exact` table
+  that is no longer declared included; the declared-label check refuses a
+  declared row that names a removed label before that.
+- **Limits.** A row that omits a column whose default names a label the plan
+  renames is restated by the default's changed text, and its guard names the
+  old label in the engine, which no longer has it: the apply is rolled back.
+  Writing the cell explicitly (`m: blue`) is the remedy. Rows under an
+  enum array or a domain stay refused until #1167's array codec exists and
+  the domain's operators do (a domain over an enum has no `=`).
+
+A type this plan renames or moves (ready round 2). The rename runs before any
+row change, and the recorded cells are held by casting through the column's
+type, so a guard that named the type the rename retires failed at apply and
+rolled a valid plan back. The row changes keep `types` on the base side and
+`after_types` on the desired side, which the type pins depend on; the emitter's
+`Held::of` decides: a declared type read as one type and held as another reads
+the recorded text as `text` and goes to the type the column then has, never
+through the retired name. A rename is thereby no conversion; a retype to a
+built-in type goes through text the same way; a built-in retype keeps its
+cast chain. Verdict per row statement: an insert carries the declared types
+(execution-time names); an update's set values use `after_types` before
+`types`, its guard is fixed here; a delete's guard is fixed here; the key is
+held by the declared `key_type`; `ensure` keys emit no SQL and compare by
+`key_type` at read; the label-rename forwarding rewrites recorded text only and
+casts nothing. A schema move of the enum is the same case.
+
+Rebase review: a default. A row that omits an enum cell is held to the default
+the column then gives, and the recorded default is text the catalog deparsed
+with its type welded on (`'sad'::app.mood`), which the guard embedded as it
+stood; the type is renamed before the row statement runs, so the cast named a
+type that no longer exists. One rule for every site that embeds recorded
+default text (the update's and the delete's guard, the unchanged cells and the
+insert's postcondition all go through `defaulted_cell`): when every cast a
+default ends in is to a declared, schema-qualified type, array or not, the
+guard holds the literal alone and the column's own cast, the engine's, reads
+it; any other default keeps its text and its built-in cast. Measured, identical
+on 16 and 18: after the rename the catalog spells the default
+`'sad'::feeling`, and `column::text = CAST(CAST('sad' AS text) AS feeling)::text`
+is true for an untouched row, false for one changed outside pbps, and holds for
+`'{sad,ok}'::mood[]`, a domain over the enum and a `numeric(5,2)` default (which
+keeps its cast). Sites: explicit cells carry no type text; default cells in
+guards and the postcondition are this rule; keys are compared with the declared
+`key_type`; `SET … = DEFAULT` is the keyword; the label-rename forwarding
+rewrites recorded values and casts nothing. A default naming a label the plan
+renames stays the limit above.
+`rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type`
+pins it on 16 and 18, including a row changed outside pbps still refused.
+
+Tests: `only_a_scalar_declared_enum_carries_data_rows`,
+`a_cell_over_an_enum_column_names_declared_labels_only` and
+`a_declared_enum_is_read_and_its_key_is_compared_as_text` (pbps-pg),
+`a_row_using_a_label_added_in_the_same_plan_is_refused`,
+`observed_rows_are_carried_through_the_plans_label_renames`,
+`a_scope_names_the_labels_its_keys_have_before_the_plan` and
+`rows_that_follow_a_label_rename_are_no_change_of_rows` (pbps-diff), and, on 16
+and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
+`pulled_enum_rows_recreate_and_re_pull_the_same`,
+`a_label_rename_under_rows_plans_no_row_change_and_finds_the_renamed_key`,
+`a_cell_that_is_not_a_declared_label_or_uses_a_new_one_is_refused_and_the_split_applies`,
+`rows_taken_over_under_a_renamed_key_are_found_by_the_label_they_hold`,
+`a_default_naming_a_renamed_label_does_not_abort_the_read_of_the_rows`,
+`a_staged_label_rename_under_ensure_rows_applies_and_resumes`,
+`a_staged_plan_cannot_hold_the_rename_of_an_ensure_tables_key`,
+`a_chain_of_label_renames_leaves_an_unmanaged_row_alone_in_a_narrow_ensure_table`,
+`a_takeover_under_a_renamed_key_pins_the_row_it_depends_on`,
+`a_staged_plan_cannot_hold_a_chain_of_label_renames`,
+`rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name`
+(a rename and a schema move; pbps-pg `row_guards_cast_a_renamed_declared_type_by_its_new_name_only`) and
+`a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
+with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
+for the refusals.

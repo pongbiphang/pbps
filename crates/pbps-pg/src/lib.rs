@@ -364,6 +364,77 @@ fn bound_label_problems(
     found
 }
 
+/// A cell over a declared enum column, the row key included, is one of the
+/// enum's labels or NULL, which is the whole check: no engine is asked, so a
+/// type this plan creates is judged as a standing one is (DEC-2346.2). The
+/// refusal names the table, the row key, the column and the label.
+fn cell_label_problems(
+    name: &TableName,
+    table: &Table,
+    schema: &pbps_model::Schema,
+) -> Vec<DialectError> {
+    use pbps_model::Value;
+    let Some(data) = &table.data else {
+        return Vec::new();
+    };
+    let key = table
+        .primary_key
+        .as_ref()
+        .and_then(|pk| match pk.columns.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        });
+    let mut found = Vec::new();
+    let mut refuse = |row: &pbps_model::RowKey,
+                      column: &pbps_model::ColumnName,
+                      ty: &pbps_model::ColumnType,
+                      label: &str,
+                      labels: &[String]| {
+        found.push(DialectError::Invalid {
+            dialect: crate::types::DIALECT,
+            message: format!(
+                "table `{name}` row `{row}`: column `{column}` holds `{label}`, which is not a \
+                 label of `{ty}`; the declared labels are {labels}",
+                name = name.shown(),
+                row = pbps_model::escape::Escaped(row.as_str()),
+                column = column.shown(),
+                label = pbps_model::escape::Escaped(label),
+                ty = ty.shown(),
+                labels = labels
+                    .iter()
+                    .map(|l| format!("`{}`", pbps_model::escape::Escaped(l)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        });
+    };
+    for (column, spec) in &table.columns {
+        let Some(labels) = declared_enum_labels(&spec.ty, &schema.types) else {
+            continue;
+        };
+        for (row_key, row) in &data.rows {
+            if key == Some(column) {
+                if !labels.iter().any(|l| l == row_key.as_str()) {
+                    refuse(row_key, column, &spec.ty, row_key.as_str(), labels);
+                }
+                continue;
+            }
+            match row.get(column.raw()) {
+                None | Some(Value::Null) => {}
+                Some(Value::Text(label)) if labels.contains(label) => {}
+                Some(other) => {
+                    let label = match other {
+                        Value::Text(label) => label.clone(),
+                        Value::Null | Value::Bool(_) | Value::Int(_) => other.to_string(),
+                    };
+                    refuse(row_key, column, &spec.ty, &label, labels);
+                }
+            }
+        }
+    }
+    found
+}
+
 fn identity_problems(
     column: &str,
     declared: &pbps_model::Column,
@@ -1813,8 +1884,12 @@ impl Dialect for Postgres {
         // bounds (`'[0:1]={1,2}'` is not `'{1,2}'`): rows are not held in a
         // table with an array column until a codec for them is (#1167).
         if table.data.is_some() {
+            // A scalar declared enum carries rows (DEC-2346.2); every other
+            // reference keeps DEC-1523.1's refusal.
             for (column, spec) in &table.columns {
-                if spec.ty.type_ref().is_some() {
+                if spec.ty.type_ref().is_some()
+                    && declared_enum_labels(&spec.ty, &schema.types).is_none()
+                {
                     found.push(DialectError::InvalidVerbatim {
                         dialect: types::DIALECT,
                         message: format!(
@@ -1842,6 +1917,7 @@ impl Dialect for Postgres {
         }
         found.extend(partition_problems(table, &schema.types));
         found.extend(bound_label_problems(name, table, schema));
+        found.extend(cell_label_problems(name, table, schema));
         // SQL Server's (#1176). PostgreSQL has no system-versioned table.
         if table.system_time.is_some() {
             found.push(DialectError::Invalid {
@@ -8243,6 +8319,157 @@ mod enum_partition_key_tests {
         };
         assert!(check(&schema, "app.r", two("not a label", "ok")).is_empty());
         assert_eq!(check(&schema, "app.r", two("1", "zzz")).len(), 1);
+    }
+
+    /// A lookup table keyed by `key` with the column `m` of type `ty`, whose
+    /// rows are given as `(row key, cell of m)`.
+    fn with_rows(ty: &str, key: &str, rows: &[(&str, pbps_model::Value)]) -> Table {
+        let mut table = Table::default();
+        for (name, column_ty) in [("code", "text"), ("m", ty)] {
+            let mut column = pbps_model::Column::new(column_ty.parse().unwrap());
+            column.nullable = name == "m" && key != "m";
+            table.columns.insert(name.into(), column);
+        }
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            columns: vec![key.into()],
+            name: None,
+            storage_parameters: Default::default(),
+        });
+        table.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: rows
+                .iter()
+                .map(|(k, cell)| {
+                    // The key is the map key, never repeated in the row.
+                    let cells = if key == "m" {
+                        Default::default()
+                    } else {
+                        [("m".into(), cell.clone())].into()
+                    };
+                    ((*k).into(), pbps_model::Row(cells))
+                })
+                .collect(),
+        });
+        table
+    }
+
+    /// DEC-2346.2: a scalar reference to a declared enum carries `data:`
+    /// rows, and every other reference keeps DEC-1523.1's refusal and text.
+    #[test]
+    fn only_a_scalar_declared_enum_carries_data_rows() {
+        use pbps_model::Value;
+        let schema = Schema {
+            types: declared(),
+            ..Default::default()
+        };
+        let text = |l: &str| Value::Text(l.into());
+        for (ty, admitted) in [
+            ("app.mood", true),
+            ("app.mood[]", false),
+            ("app.dmood", false),
+            ("app.dtxt", false),
+            ("ext.mood", false),
+            ("app.pair", false),
+        ] {
+            let table = with_rows(ty, "code", &[("a", text("ok"))]);
+            let found = problems(&table, &schema);
+            if admitted {
+                assert!(found.is_empty(), "{ty}: {found:?}");
+            } else {
+                assert!(
+                    found.iter().any(|m| m.contains(&format!(
+                        "`data:` cannot be declared on a table with the user-defined type \
+                         reference `{ty}` on column `m`"
+                    ))),
+                    "{ty}: {found:?}"
+                );
+            }
+            // Beside no declaration nothing is admitted.
+            assert!(
+                !problems(&table, &Schema::default()).is_empty(),
+                "{ty}: the declaration is on the other side"
+            );
+        }
+        // A native array stays refused whatever the declarations say.
+        let native = with_rows("text[]", "code", &[("a", text("x"))]);
+        assert!(
+            problems(&native, &schema)
+                .iter()
+                .any(|m| m.contains("an array column")),
+            "{:?}",
+            problems(&native, &schema)
+        );
+    }
+
+    /// DEC-2346.2: a cell, or the key, over a declared enum column is one of
+    /// its labels or NULL; the refusal names the table, the row, the column
+    /// and the label, and a column that is not an enum is not read as labels.
+    #[test]
+    fn a_cell_over_an_enum_column_names_declared_labels_only() {
+        use pbps_model::Value;
+        let schema = Schema {
+            types: declared(),
+            ..Default::default()
+        };
+        let text = |l: &str| Value::Text(l.into());
+        // The enum column as a cell.
+        let ok = with_rows(
+            "app.mood",
+            "code",
+            &[("a", text("sad")), ("b", Value::Null)],
+        );
+        assert!(
+            problems(&ok, &schema).is_empty(),
+            "{:?}",
+            problems(&ok, &schema)
+        );
+        let bad = with_rows("app.mood", "code", &[("a", text("nonesuch"))]);
+        let found = problems(&bad, &schema);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("table `app.t`")
+                && found[0].contains("row `a`")
+                && found[0].contains("column `m`")
+                && found[0].contains("holds `nonesuch`")
+                && found[0].contains("not a label of `app.mood`")
+                && found[0].contains("`sad`, `ok`, `happy`"),
+            "{found:?}"
+        );
+        // A label is exact: another case is another label; a number is none.
+        assert_eq!(
+            problems(
+                &with_rows("app.mood", "code", &[("a", text("OK"))]),
+                &schema
+            )
+            .len(),
+            1
+        );
+        assert!(
+            problems(
+                &with_rows("app.mood", "code", &[("a", Value::Int(1))]),
+                &schema
+            )
+            .iter()
+            .any(|m| m.contains("holds `1`")),
+        );
+        // The enum column as the key: the row key is the label.
+        let keyed_ok = with_rows("app.mood", "m", &[("ok", text("ok"))]);
+        assert!(
+            problems(&keyed_ok, &schema).is_empty(),
+            "{:?}",
+            problems(&keyed_ok, &schema)
+        );
+        let keyed_bad = with_rows("app.mood", "m", &[("nonesuch", text("ok"))]);
+        let found = problems(&keyed_bad, &schema);
+        assert!(
+            found
+                .iter()
+                .any(|m| m.contains("row `nonesuch`") && m.contains("column `m`")),
+            "{found:?}"
+        );
+        // Text beside it is no label.
+        let plain = with_rows("text", "code", &[("a", text("nonesuch"))]);
+        assert!(problems(&plain, &schema).is_empty());
     }
 
     /// DEC-2346.1 (#2112): the staged attach's CHECK spells its bound with bare

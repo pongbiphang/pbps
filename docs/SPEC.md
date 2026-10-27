@@ -269,9 +269,9 @@ indexes:
   is the engine's: PostgreSQL refuses a part over 63 bytes, which the server
   would truncate without an error (#2021). PostgreSQL admits references to
   existing enums, domains and standalone composites; SQL Server refuses them
-  by name. Retypes and `data:` over references are refused (DEC-1523.1), and
-  so is a partition key, except a scalar declared enum as a LIST or RANGE key
-  (DEC-2346.1).
+  by name. Retypes are refused (DEC-1523.1), and so are `data:` and a
+  partition key, except that a scalar declared enum may carry rows and key a
+  LIST or RANGE table (DEC-2346.1, DEC-2346.2).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent
@@ -689,6 +689,18 @@ can imply.
   no default fills it. `validate` refuses a row that omits a `NOT NULL` column
   with no default, and one that sets a `NOT NULL` column to `null` whatever
   its default.
+- **A scalar column of a declared enum carries rows (PostgreSQL, DEC-2346.2),**
+  as a data column or as the primary key. A cell, or the key, is one of the
+  enum's declared labels, or NULL where the column is nullable; anything else
+  is refused where the declarations are read, naming the table, the row, the
+  column and the label, with no engine asked. A domain (over an enum or not),
+  a composite, an undeclared enum and any array keep the refusal of
+  DEC-1523.1. A plan that adds a label cannot use it in a row of the same
+  plan, which is slice 3a's refusal ("apply the label first"). A label
+  renamed in the plan renames itself in the rows that hold it, so the rows
+  are compared after the rename and the plan restates none of them. A read
+  by key compares an enum key as text, so a declared key that names a label
+  the database does not hold yet is no row and not an error.
 - **A non-integer number must be quoted.** The exact decimal form written is
   the literal that reaches the column, and reading `1.10` through a binary
   float does not promise to give it back. Quoted, it is text, and the engine
@@ -883,9 +895,11 @@ commit; #2354 tracks an engine-typed, scan-free approach. Plan-time expression
 probes defer by the resolved enum type when its label is renamed, including
 arrays and domains. The engine enforces the declaration at apply, with the
 existing vet and readback checks.
-`data:` rows over user-defined references remain refused by DEC-1523.1 before
-the label-use check can arise; #2346 tracks admitting them. A partition key may
-be a declared enum (DEC-2346.1): its bounds are declared labels, a bound naming
+`data:` rows over a user-defined reference remain refused by DEC-1523.1 except
+over a scalar declared enum (DEC-2346.2): a row's key or cell naming a label
+added in the same plan is refused as above, and a label rename carries the
+rows that hold it. A partition key may be a declared enum (DEC-2346.1): its
+bounds are declared labels, a bound naming
 a label added in the same plan is refused as above, a label rename carries the
 bounds that name it, and a removal or reorder of its labels is refused by name.
 Arrays also remain refused under `data:`.

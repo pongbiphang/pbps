@@ -6043,10 +6043,29 @@ impl<'a> Held<'a> {
     /// one. `None` is not "no type" — it is "the same one".
     fn of(read: Option<&'a ColumnType>, now: Option<&'a ColumnType>) -> Option<Self> {
         let read = read?;
-        Some(Held {
-            read,
-            now: now.filter(|n| *n != read),
-        })
+        let now = now.filter(|n| *n != read);
+        // A declared type, retyped here or renamed or moved by this plan: the
+        // rename runs before any row change, so a cast through the name it
+        // retires names a type that no longer exists, and a rename is no
+        // conversion. The recorded text is the label or value itself (it is
+        // what the retype's own `USING col::text::...` maps), so it is read as
+        // text and goes to the type the column has when the statement runs
+        // (DEC-2346.2, round 2).
+        if let Some(now) = now
+            && read.type_ref().is_some()
+        {
+            static TEXT: std::sync::LazyLock<(ColumnType, ColumnType)> =
+                std::sync::LazyLock::new(|| {
+                    let text: ColumnType = "text".parse().expect("text parses");
+                    let array = text.clone().into_array();
+                    (text, array)
+                });
+            return Some(Held {
+                read: if read.is_array() { &TEXT.1 } else { &TEXT.0 },
+                now: Some(now),
+            });
+        }
+        Some(Held { read, now })
     }
 
     fn read(self) -> ColumnType {
@@ -6092,6 +6111,20 @@ impl<'a> Held<'a> {
         }
         self.converted(&format!("CAST({recorded} AS {})", self.read().raw()))
     }
+}
+
+/// A default's text with the casts it ends in dropped, when every one of them
+/// is to a declared (schema-qualified) type, array or not: what is left is the
+/// literal, which the column's own type then reads. Any other default is
+/// returned as it is, so a built-in cast stays where the catalog put it.
+fn without_declared_type_casts(default: &str) -> &str {
+    let (core, casts) = crate::rows::unwrapped_with_casts(default);
+    let declared = !casts.is_empty()
+        && casts.iter().all(|cast| {
+            cast.parse::<ColumnType>()
+                .is_ok_and(|ty| ty.type_ref().is_some())
+        });
+    if declared { core } else { default }
 }
 
 /// One cell as a predicate holding the row to it, by the rendering that read
@@ -6169,7 +6202,14 @@ fn defaulted_cell(
     // The expression is the user's text and the emitter's syntax follows it on
     // the same line, so a trailing line comment would swallow the rest
     // (DECISIONS 281).
-    let expr = format!("({})", verbatim(default));
+    //
+    // A default that is a literal welded to a declared type (`'sad'::app.mood`,
+    // as the catalog deparses an enum label) is held by its literal alone: the
+    // cast to the column's type below is the engine's own, and the welded cast
+    // names a type the plan may rename before this statement runs, which then
+    // no longer exists (DEC-2346.2, rebuild review). One rule for every site
+    // that embeds recorded default text, in place of a remap of each.
+    let expr = format!("({})", verbatim(without_declared_type_casts(default)));
     // **Through the column's type first, and this is not decoration.** Both
     // sides are compared as text, and the stored side went through the
     // column's type on the way in while the declared expression did not.
@@ -10803,6 +10843,155 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("IF pbps.pbps_rows <> 1 THEN"), "{sql}");
+    }
+
+    /// A declared type this plan renames or moves is renamed before any row
+    /// changes, so the guards on the cells that hold it never cast through the
+    /// name the plan retires, and a rename is no conversion. Not a rename (no
+    /// retyped column, or a built-in one) leaves each guard as it was
+    /// (DEC-2346.2, round 2).
+    #[test]
+    fn row_guards_cast_a_renamed_declared_type_by_its_new_name_only() {
+        let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
+        let texts = |kind: &str, now: Option<&str>| {
+            let types: BTreeMap<ColumnName, ColumnType> =
+                [("kind".into(), ty(kind)), ("note".into(), ty("text"))].into();
+            let after_types: BTreeMap<ColumnName, ColumnType> =
+                now.map(|n| ("kind".into(), ty(n))).into_iter().collect();
+            let update = Change::UpdateRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                columns: [(
+                    "note".into(),
+                    (
+                        Cell::Value(Value::Text("low".into())),
+                        Cell::Value(Value::Text("high".into())),
+                    ),
+                )]
+                .into(),
+                unchanged: [("kind".into(), Cell::Value(Value::Text("ok".into())))].into(),
+                types: types.clone(),
+                after_types: after_types.clone(),
+                key_type: None,
+            };
+            let delete = Change::DeleteRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: BTreeMap::new(),
+                row: [
+                    ("kind".into(), Cell::Value(Value::Text("ok".into()))),
+                    ("note".into(), Cell::Value(Value::Text("low".into()))),
+                ]
+                .into(),
+                types,
+                after_types,
+                key_type: None,
+            };
+            [&update, &delete].map(|c| sql_of(&Postgres::new(), c).join("\n"))
+        };
+        // Renamed, moved, and an array of it: the old name is nowhere.
+        for (old, new) in [
+            ("app.mood", "app.feeling"),
+            ("app.mood", "moved.mood"),
+            ("app.mood[]", "app.feeling[]"),
+        ] {
+            for sql in texts(old, Some(new)) {
+                assert!(
+                    !sql.contains("mood\"") || new.contains("mood"),
+                    "{old}: {sql}"
+                );
+                assert!(
+                    !sql.contains(&format!("AS {}", ty(old).raw()))
+                        && !sql.contains("\"app\".\"mood\""),
+                    "{old} -> {new}: {sql}"
+                );
+                assert!(sql.contains("E'ok'"), "{sql}");
+            }
+        }
+        // No rename: no cast at all, as before.
+        for sql in texts("app.mood", None) {
+            assert!(!sql.contains("CAST(CAST("), "{sql}");
+        }
+        // A built-in column retyped keeps the conversion through the old type.
+        let numeric = {
+            let types: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("numeric(5,2)"))].into();
+            let after: BTreeMap<ColumnName, ColumnType> = [("n".into(), ty("integer"))].into();
+            let change = Change::DeleteRow {
+                table: "app.moods".parse().expect("a table name"),
+                key_column: "m".into(),
+                key: RowKey::from("sad"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                dropped: BTreeMap::new(),
+                row: [("n".into(), Cell::Value(Value::Text("1.50".into())))].into(),
+                types,
+                after_types: after,
+                key_type: None,
+            };
+            sql_of(&Postgres::new(), &change).join("\n")
+        };
+        assert!(
+            numeric.contains("AS numeric(5, 2)") && numeric.contains("AS integer"),
+            "{numeric}"
+        );
+        // A declared type retyped to a built-in one goes through text, never
+        // through the name it had.
+        for sql in texts("app.mood", Some("text")) {
+            assert!(!sql.contains("\"mood\""), "{sql}");
+        }
+    }
+
+    /// A recorded default welded to a declared type (`'sad'::app.mood`, as the
+    /// catalog deparses it) is held by its literal: the type may be renamed
+    /// before the row statement runs, and the engine's own cast to the
+    /// column's type is the one that reads it (DEC-2346.2, rebuild review).
+    /// Anything else keeps its text and its cast.
+    #[test]
+    fn a_default_welded_to_a_declared_type_is_held_by_its_literal() {
+        let held = |default: &str| without_declared_type_casts(default).to_owned();
+        // Declared types, scalar, array, quoted and parenthesised.
+        assert_eq!(held("'sad'::app.mood"), "'sad'");
+        assert_eq!(held("('sad'::app.mood)"), "'sad'");
+        assert_eq!(held("'{sad,ok}'::app.mood[]"), "'{sad,ok}'");
+        assert_eq!(held("'sad'::\"app\".\"mood\""), "'sad'");
+        assert_eq!(held("NULL::app.mood"), "NULL");
+        // Negatives: a built-in cast, no cast, a mix, and an expression the
+        // guard does not hold at all keep their text.
+        for kept in [
+            "1",
+            "'a'::text",
+            "'1'::numeric(5,2)",
+            "'sad'::text::app.mood",
+            "'x'::character varying",
+            "app.f()",
+        ] {
+            assert_eq!(held(kept), kept, "{kept}");
+        }
+        // And the guard built from it never names the type.
+        let guard = |default: &str, read: &str, now: Option<&str>| {
+            let (read, now): (ColumnType, Option<ColumnType>) =
+                (read.parse().unwrap(), now.map(|n| n.parse().unwrap()));
+            defaulted_cell("next", default, Held::of(Some(&read), now.as_ref()))
+                .unwrap()
+                .expect("a constant default is held")
+        };
+        let renamed = guard("'sad'::app.mood", "app.mood", Some("app.feeling"));
+        assert!(
+            !renamed.contains("mood") && renamed.contains("'sad'") && renamed.contains("feeling"),
+            "{renamed}"
+        );
+        let kept = guard("'sad'::app.mood", "app.mood", None);
+        assert!(
+            !kept.contains("::app.mood") && kept.contains("'sad'"),
+            "{kept}"
+        );
+        let array = guard("'{sad}'::app.mood[]", "app.mood[]", Some("app.feeling[]"));
+        assert!(!array.contains("mood"), "{array}");
+        // A built-in default keeps the cast to the column's type.
+        let numeric = guard("1", "numeric(5,2)", None);
+        assert!(numeric.contains("AS numeric(5, 2)"), "{numeric}");
     }
 
     /// A delete is keyed *and* held to the recorded row, and it asks whether

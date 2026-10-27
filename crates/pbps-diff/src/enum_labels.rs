@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ChangeSet, ColumnType, EnumPlacement, EnumRebuildStep, Hints, IdsFile, ManagedType,
-    Schema, TypeRef, Uid, ValueSource,
+    Cell, Change, ChangeSet, ColumnName, ColumnType, EnumPlacement, EnumRebuildStep, Hints,
+    IdsFile, ManagedType, Schema, TableName, TypeRef, Uid, Value, ValueSource,
 };
 
 use crate::{
@@ -668,6 +668,222 @@ pub enum Carry {
     Backward,
 }
 
+/// One label carried through the renames of its enum, in the order they run
+/// forwards and in the reverse order backwards, by exact match: a chain
+/// (`b→c`, then `a→b`) takes `b` to `c` and `a` to `b`.
+pub fn carried_label(pairs: &[(usize, &str, &str)], label: &str, way: Carry) -> String {
+    match way {
+        Carry::Forward => pairs.iter().fold(label.to_owned(), |now, (_, from, to)| {
+            if now == *from { (*to).to_owned() } else { now }
+        }),
+        Carry::Backward => pairs
+            .iter()
+            .rev()
+            .fold(label.to_owned(), |now, (_, from, to)| {
+                if now == *to { (*from).to_owned() } else { now }
+            }),
+    }
+}
+
+/// A standing table's observed rows as the plan's label renames leave them
+/// (DEC-2346.2). The engine renames a label in the rows that hold it
+/// (measured on 16 and 18), so the observed key and the observed cells of a
+/// column over a renamed enum are carried through the renames, by exact label,
+/// to be compared with the declared ones: a rename then changes no row.
+/// `None` when no column of the table is over an enum the plan renames.
+pub fn forwarded_rows(
+    table: &pbps_model::Table,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &LabelRenames<'_>,
+) -> Option<pbps_model::Table> {
+    let data = table.data.as_ref().filter(|_| !renames.is_empty())?;
+    let pairs: BTreeMap<&pbps_model::ColumnName, &Vec<(usize, &str, &str)>> = table
+        .columns
+        .iter()
+        .filter(|(_, c)| !c.ty.is_array())
+        .filter_map(|(name, c)| {
+            let reference = c.ty.type_ref()?;
+            match resolver.resolve(side, reference) {
+                TypeIdentity::Declared(uid) => renames.get(uid).map(|pairs| (name, pairs)),
+                TypeIdentity::ExternalOrUnrecorded(_) => None,
+            }
+        })
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    let key = table
+        .primary_key
+        .as_ref()
+        .and_then(|pk| match pk.columns.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        });
+    let carry = |column: &pbps_model::ColumnName, label: &str| match pairs.get(column) {
+        Some(pairs) => carried_label(pairs, label, Carry::Forward),
+        None => label.to_owned(),
+    };
+    let rows = data
+        .rows
+        .iter()
+        .map(|(row_key, row)| {
+            let row_key = match key {
+                Some(column) => pbps_model::RowKey(carry(column, row_key.as_str())),
+                None => row_key.clone(),
+            };
+            let cells = row
+                .0
+                .iter()
+                .map(|(column, value)| match value {
+                    Value::Text(label) => (column.clone(), Value::Text(carry(column, label))),
+                    Value::Null | Value::Bool(_) | Value::Int(_) => (column.clone(), value.clone()),
+                })
+                .collect();
+            (row_key, pbps_model::Row(cells))
+        })
+        .collect();
+    let mut forwarded = table.clone();
+    forwarded.data = Some(pbps_model::TableData {
+        mode: data.mode,
+        rows,
+    });
+    Some(forwarded)
+}
+
+/// The renames of the enum a table's single-column primary key is over, if
+/// it is a scalar column of an enum the plan renames labels of.
+fn key_renames<'a>(
+    table: &pbps_model::Table,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &'a LabelRenames<'_>,
+) -> Option<&'a Vec<(usize, &'a str, &'a str)>> {
+    let column = table
+        .primary_key
+        .as_ref()
+        .and_then(|pk| match pk.columns.as_slice() {
+            [only] => table.columns.get(only),
+            _ => None,
+        })
+        .filter(|c| !c.ty.is_array())?;
+    match resolver.resolve(side, column.ty.type_ref()?) {
+        TypeIdentity::Declared(uid) => renames.get(uid),
+        TypeIdentity::ExternalOrUnrecorded(_) => None,
+    }
+}
+
+/// The observed rows of a keyed `ensure` table, kept to those the plan still
+/// manages once its renames have run (DEC-2346.2): the baseline is read under
+/// the widened scope, and a chain (`b→c`, `a→b`) over a table that declares
+/// only `b` reads the rows `a` and `b`, which the plan leaves as `b` and
+/// `c`. The closing read asks for `b` alone, so `c` is not managed and must not
+/// be compared as if it were. A row is kept when its key, carried forward
+/// through the renames, is in the scope. The rows themselves stay as read; the
+/// comparison carries them. `exact` tables read every row and are left alone,
+/// as is any table whose key is not over a renamed enum.
+pub fn trim_to_the_final_scope(
+    schema: &mut Schema,
+    scopes: &pbps_model::DataScopes,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &LabelRenames<'_>,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    for (name, table) in &mut schema.tables {
+        let Some(scope) = scopes
+            .get(name)
+            .filter(|s| s.mode == pbps_model::DataMode::Ensure)
+        else {
+            continue;
+        };
+        let Some(pairs) = key_renames(table, (resolver, side), renames) else {
+            continue;
+        };
+        if let Some(data) = &mut table.data {
+            data.rows.retain(|key, _| {
+                scope.keys.contains(&pbps_model::RowKey(carried_label(
+                    pairs,
+                    key.as_str(),
+                    Carry::Forward,
+                )))
+            });
+        }
+    }
+}
+
+/// The scopes of the tables keyed by an enum, widened with the labels their
+/// keys have before the plan's renames (DEC-2346.2): a declared key is a label
+/// the plan leaves, and the database holds the label it has now, so a read by
+/// the declared key alone would not find the row the rename carries along.
+/// The declared keys stay; a chain (`b→c`, `a→b`) takes `b` back to `a`.
+/// `schema` is the observed side, whose type references `side` resolves.
+pub fn scopes_before_the_plan(
+    scopes: &pbps_model::DataScopes,
+    schema: &Schema,
+    (resolver, side): (&TypeResolver<'_>, TypeSide),
+    renames: &LabelRenames<'_>,
+) -> pbps_model::DataScopes {
+    let mut out = scopes.clone();
+    if renames.is_empty() {
+        return out;
+    }
+    for (name, scope) in &mut out {
+        let Some(pairs) = schema
+            .tables
+            .get(name)
+            .and_then(|table| key_renames(table, (resolver, side), renames))
+        else {
+            continue;
+        };
+        let before: Vec<_> = scope
+            .keys
+            .iter()
+            .map(|key| pbps_model::RowKey(carried_label(pairs, key.as_str(), Carry::Backward)))
+            .collect();
+        scope.keys.extend(before);
+    }
+    out
+}
+
+/// The same widening for a plan's own read, which is taken before the plan
+/// exists: the labels a declared key was renamed from (`renamed_from` on the
+/// label) are asked as well, to the first of a chain and back (DEC-2346.2).
+/// `schema` is the declarations under the names the database has now. Only a
+/// read by key is widened; a read of every row finds the renamed row anyway.
+pub fn read_before_the_renames(
+    read: &mut BTreeMap<pbps_model::TableName, pbps_model::RowScope>,
+    schema: &Schema,
+    hints: &Hints,
+) {
+    for (name, scope) in read {
+        let pbps_model::RowScope::Keys(keys) = scope else {
+            continue;
+        };
+        let Some(origins) = schema
+            .tables
+            .get(name)
+            .and_then(|table| table.primary_key.as_ref())
+            .and_then(|pk| match pk.columns.as_slice() {
+                [only] => schema.tables[name].columns.get(only),
+                _ => None,
+            })
+            .filter(|c| !c.ty.is_array())
+            .and_then(|c| hints.enum_value_renames.get(c.ty.type_ref()?))
+        else {
+            continue;
+        };
+        // `origins` is keyed by the new label.
+        let mut frontier: Vec<String> = keys.iter().map(|k| k.as_str().to_owned()).collect();
+        while let Some(label) = frontier.pop() {
+            if let Some(from) = origins.get(&label)
+                && keys.insert(pbps_model::RowKey(from.clone()))
+            {
+                frontier.push(from.clone());
+            }
+        }
+    }
+}
+
 /// A partition's bound with every label of an enum key carried through the
 /// plan's renames of that enum (DEC-2346.1). `renames_of` gives, for a key
 /// position, the renames of the enum that column has, in the order they run;
@@ -682,19 +898,9 @@ pub fn carried_bound<'a>(
 ) -> pbps_model::PartitionBound {
     use pbps_model::{BoundDatum, ListDatum, PartitionBound};
     let carry = |at: usize, label: &String| -> String {
-        let Some(pairs) = renames_of(at) else {
-            return label.clone();
-        };
-        match way {
-            Carry::Forward => pairs.iter().fold(label.clone(), |now, (_, from, to)| {
-                if now == *from { (*to).to_owned() } else { now }
-            }),
-            Carry::Backward => pairs
-                .iter()
-                .rev()
-                .fold(label.clone(), |now, (_, from, to)| {
-                    if now == *to { (*from).to_owned() } else { now }
-                }),
+        match renames_of(at) {
+            Some(pairs) => carried_label(pairs, label, way),
+            None => label.clone(),
         }
     };
     let datum = |at: usize, datum: &BoundDatum| match datum {
@@ -894,8 +1100,46 @@ pub(crate) fn unsafe_uses(
             }) || (has_enum && table.checks.values().any(|c| text(&c.expression)))
                 || bound_uses(table)
         };
+        // A row's cell, or its key, over a column of this enum: the label is
+        // unusable in the transaction that adds it, as in a default (measured
+        // on 16 and 18: `unsafe use of new value`, DEC-2346.2). A scalar
+        // declared enum is the only enum column a row can carry.
+        let column_uses = |table: &TableName, column: &ColumnName| {
+            desired
+                .schema
+                .tables
+                .get(table)
+                .and_then(|t| t.columns.get(column))
+                .is_some_and(|c| typed(&c.ty))
+        };
+        let cell_uses = |cell: &Value| matches!(cell, Value::Text(t) if t == value);
         for step in &changes.changes {
             let used = match &step.change {
+                Change::InsertRow {
+                    table,
+                    key_column,
+                    key,
+                    row,
+                    ..
+                } => {
+                    (key.as_str() == value && column_uses(table, key_column))
+                        || row
+                            .columns()
+                            .any(|(column, v)| cell_uses(v) && column_uses(table, column))
+                }
+                Change::UpdateRow {
+                    table,
+                    key_column,
+                    key,
+                    columns,
+                    ..
+                } => {
+                    (key.as_str() == value && column_uses(table, key_column))
+                        || columns.iter().any(|(column, (_, after))| {
+                            matches!(after, Cell::Value(v) if cell_uses(v))
+                                && column_uses(table, column)
+                        })
+                }
                 Change::CreateTable { table, .. }
                 | Change::AttachPartition { shape: table, .. } => table_uses(table),
                 Change::AddColumn { column, .. } => {
@@ -2261,6 +2505,374 @@ mod tests {
             &pbps_dialect::MinimalDialect,
         );
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// `app.t(m app.e PRIMARY KEY, next app.e, note text)`: the shape of a
+    /// lookup table whose rows are over an enum (DEC-2346.2).
+    fn lookup(schema: &mut Schema) {
+        let mut table = Table::default();
+        for (name, ty) in [("m", "app.e"), ("next", "app.e"), ("note", "text")] {
+            table
+                .columns
+                .insert(name.into(), Column::new(ty.parse().unwrap()));
+        }
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["m".into()],
+            storage_parameters: Default::default(),
+        });
+        schema.tables.insert("app.t".parse().unwrap(), table);
+    }
+
+    fn row(cells: &[(&str, &str)]) -> pbps_model::Row {
+        pbps_model::Row(
+            cells
+                .iter()
+                .map(|(c, v)| ((*c).into(), Value::Text((*v).into())))
+                .collect(),
+        )
+    }
+
+    fn rename(from: &str, to: &str, ordinal: usize) -> Change {
+        Change::RenameEnumValue {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.e".parse().unwrap(),
+            from: from.into(),
+            to: to.into(),
+            ordinal,
+            definition: Box::new(enumeration(&["a"])),
+        }
+    }
+
+    /// DEC-2346.2: a row's key or cell over the enum is a use of the label,
+    /// and a cell of another column, or one the update leaves, is not.
+    #[test]
+    fn a_row_using_a_label_added_in_the_same_plan_is_refused() {
+        let insert = |key: &str, cells: &[(&str, &str)]| Change::InsertRow {
+            table: "app.t".parse().unwrap(),
+            key_column: "m".into(),
+            identity_key: false,
+            key: key.into(),
+            row: row(cells),
+            defaults: Default::default(),
+            types: Default::default(),
+        };
+        let update =
+            |key: &str, changed: &[(&str, &str, &str)], held: &[(&str, &str)]| Change::UpdateRow {
+                table: "app.t".parse().unwrap(),
+                key_column: "m".into(),
+                key: key.into(),
+                columns: changed
+                    .iter()
+                    .map(|(c, before, after)| {
+                        (
+                            (*c).into(),
+                            (
+                                Cell::Value(Value::Text((*before).into())),
+                                Cell::Value(Value::Text((*after).into())),
+                            ),
+                        )
+                    })
+                    .collect(),
+                unchanged: held
+                    .iter()
+                    .map(|(c, v)| ((*c).into(), Cell::Value(Value::Text((*v).into()))))
+                    .collect(),
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: None,
+            };
+        let cases: Vec<(&str, Change, bool)> = vec![
+            ("a new label as a key", insert("new", &[]), true),
+            (
+                "a new label in an enum cell",
+                insert("old", &[("next", "new")]),
+                true,
+            ),
+            (
+                "an existing label",
+                insert("old", &[("next", "old")]),
+                false,
+            ),
+            (
+                "the same text in a text column",
+                insert("old", &[("note", "new")]),
+                false,
+            ),
+            (
+                "an update to a new label",
+                update("old", &[("next", "old", "new")], &[]),
+                true,
+            ),
+            (
+                "an update keyed by a new label",
+                update("new", &[("note", "a", "b")], &[]),
+                true,
+            ),
+            (
+                "a cell the update leaves",
+                update("old", &[("note", "a", "b")], &[("next", "new")]),
+                false,
+            ),
+            (
+                "an update to an existing label",
+                update("old", &[("next", "new", "old")], &[]),
+                false,
+            ),
+        ];
+        for (what, change, refused) in cases {
+            let (mut steps, errors, mut schema, ids) = planned(&["old"], &["old", "new"], &[]);
+            assert!(errors.is_empty());
+            lookup(&mut schema);
+            steps.changes.push(PlannedChange::new(change));
+            let errors = unsafe_uses(
+                &steps,
+                Side {
+                    schema: &schema,
+                    ids: &ids,
+                },
+                &pbps_dialect::MinimalDialect,
+            );
+            assert_eq!(!errors.is_empty(), refused, "{what}: {errors:?}");
+        }
+        // The label of another enum is no use of this one's.
+        let (mut steps, _, mut schema, ids) = planned(&["old"], &["old", "new"], &[]);
+        lookup(&mut schema);
+        schema
+            .tables
+            .get_mut(&"app.t".parse().unwrap())
+            .unwrap()
+            .columns["next"]
+            .ty = "app.other".parse().unwrap();
+        steps
+            .changes
+            .push(PlannedChange::new(insert("old", &[("next", "new")])));
+        let errors = unsafe_uses(
+            &steps,
+            Side {
+                schema: &schema,
+                ids: &ids,
+            },
+            &pbps_dialect::MinimalDialect,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// DEC-2346.2: the observed rows are carried through the plan's renames,
+    /// the key and the cells of the enum's columns, by exact label.
+    #[test]
+    fn observed_rows_are_carried_through_the_plans_label_renames() {
+        let (mut schema, ids) = world(&["a", "b", "c"]);
+        lookup(&mut schema);
+        let table = schema.tables.get_mut(&"app.t".parse().unwrap()).unwrap();
+        table.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Exact,
+            rows: [
+                ("a".into(), row(&[("next", "b"), ("note", "a")])),
+                ("b".into(), row(&[("next", "c")])),
+                ("z".into(), row(&[])),
+            ]
+            .into(),
+        });
+        let resolver = TypeResolver::new(&ids, &ids);
+        let forwarded = |changes: &[Change]| {
+            forwarded_rows(
+                &schema.tables[&"app.t".parse::<pbps_model::TableName>().unwrap()],
+                (&resolver, TypeSide::Base),
+                &label_renames(changes),
+            )
+        };
+        // A chain: `b` becomes `c`, then `a` becomes `b`.
+        let chain = forwarded(&[rename("b", "c", 0), rename("a", "b", 1)]).unwrap();
+        let rows = chain.data.unwrap().rows;
+        assert_eq!(
+            rows.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            ["b", "c", "z"]
+        );
+        // `a`'s row is now `b`, and its cell `b` is now `c`; the text column
+        // holding `a` is not a label and stays.
+        assert_eq!(rows[&"b".into()], row(&[("next", "c"), ("note", "a")]));
+        assert_eq!(rows[&"c".into()], row(&[("next", "c")]));
+        // A swap through a temporary label comes out where the engine puts it.
+        let swap = forwarded(&[
+            rename("a", "t", 0),
+            rename("b", "a", 1),
+            rename("t", "b", 2),
+        ])
+        .unwrap();
+        let rows = swap.data.unwrap().rows;
+        assert_eq!(rows[&"b".into()], row(&[("next", "a"), ("note", "a")]));
+        // Negatives: no rename, another enum's rename, and a table of no enum
+        // leave the rows alone.
+        assert!(forwarded(&[]).is_none());
+        let mut other = rename("a", "b", 0);
+        if let Change::RenameEnumValue { uid, .. } = &mut other {
+            *uid = "y_000009".parse().unwrap();
+        }
+        assert!(forwarded(&[other]).is_none());
+        let mut plain = schema.tables[&"app.t".parse::<pbps_model::TableName>().unwrap()].clone();
+        for column in plain.columns.values_mut() {
+            column.ty = "text".parse().unwrap();
+        }
+        assert!(
+            forwarded_rows(
+                &plain,
+                (&resolver, TypeSide::Base),
+                &label_renames(&[rename("a", "b", 0)])
+            )
+            .is_none()
+        );
+    }
+
+    /// DEC-2346.2: the scope of an enum-keyed table also names the labels its
+    /// keys have before the plan, so the rows a rename carries are read.
+    #[test]
+    fn a_scope_names_the_labels_its_keys_have_before_the_plan() {
+        let (mut schema, ids) = world(&["a", "b", "c"]);
+        lookup(&mut schema);
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let scopes: pbps_model::DataScopes = [(
+            name.clone(),
+            pbps_model::DataScope {
+                mode: pbps_model::DataMode::Ensure,
+                keys: ["b".into(), "c".into()].into(),
+            },
+        )]
+        .into();
+        let resolver = TypeResolver::new(&ids, &ids);
+        let keys = |changes: &[Change]| -> Vec<String> {
+            scopes_before_the_plan(
+                &scopes,
+                &schema,
+                (&resolver, TypeSide::Base),
+                &label_renames(changes),
+            )[&name]
+                .keys
+                .iter()
+                .map(|k| k.as_str().to_owned())
+                .collect()
+        };
+        // `b→c`, `a→b`: the declared `b` is held under `a`, `c` under `b`.
+        assert_eq!(
+            keys(&[rename("b", "c", 0), rename("a", "b", 1)]),
+            ["a", "b", "c"]
+        );
+        assert_eq!(keys(&[rename("a", "b", 0)]), ["a", "b", "c"]);
+        // No rename: the keys are as declared.
+        assert_eq!(keys(&[]), ["b", "c"]);
+
+        // The plan's own read, before any plan exists, asks from the hints.
+        let mut read: BTreeMap<pbps_model::TableName, pbps_model::RowScope> = [(
+            name.clone(),
+            pbps_model::RowScope::Keys(["b".into(), "c".into()].into()),
+        )]
+        .into();
+        let hints = Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                [
+                    ("b".to_owned(), "a".to_owned()),
+                    ("c".to_owned(), "b".to_owned()),
+                ]
+                .into(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        read_before_the_renames(&mut read, &schema, &hints);
+        assert_eq!(
+            read[&name]
+                .known()
+                .iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        // Negatives: a read of every row finds the renamed row anyway, and no
+        // hint leaves the read alone.
+        let mut every: BTreeMap<_, _> = [(
+            name.clone(),
+            pbps_model::RowScope::Every {
+                known: ["c".into()].into(),
+            },
+        )]
+        .into();
+        read_before_the_renames(&mut every, &schema, &hints);
+        assert_eq!(every[&name].known().len(), 1);
+        let mut none: BTreeMap<_, _> = [(
+            name.clone(),
+            pbps_model::RowScope::Keys(["b".into()].into()),
+        )]
+        .into();
+        read_before_the_renames(&mut none, &schema, &Hints::default());
+        assert_eq!(none[&name].known().len(), 1);
+    }
+
+    /// DEC-2346.2: the baseline of an `ensure` table is read under the widened
+    /// scope and then kept to the rows the plan still manages: a chain
+    /// (`b→c`, `a→b`) over a table that declares only `b` reads `a` and `b`,
+    /// and `b` is left as `c`, which the closing read does not ask for.
+    #[test]
+    fn the_baseline_is_kept_to_the_rows_the_plan_still_manages() {
+        let (mut schema, ids) = world(&["a", "b", "c"]);
+        lookup(&mut schema);
+        let name: pbps_model::TableName = "app.t".parse().unwrap();
+        let rows = |keys: &[&str]| pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: keys.iter().map(|k| ((*k).into(), row(&[]))).collect(),
+        };
+        schema.tables.get_mut(&name).unwrap().data = Some(rows(&["a", "b", "z"]));
+        let scopes = |mode, keys: &[&str]| -> pbps_model::DataScopes {
+            [(
+                name.clone(),
+                pbps_model::DataScope {
+                    mode,
+                    keys: keys.iter().map(|k| (*k).into()).collect(),
+                },
+            )]
+            .into()
+        };
+        let resolver = TypeResolver::new(&ids, &ids);
+        let kept = |scope: &pbps_model::DataScopes, changes: &[Change]| -> Vec<String> {
+            let mut state = schema.clone();
+            trim_to_the_final_scope(
+                &mut state,
+                scope,
+                (&resolver, TypeSide::Base),
+                &label_renames(changes),
+            );
+            state.tables[&name]
+                .data
+                .as_ref()
+                .unwrap()
+                .rows
+                .keys()
+                .map(|k| k.as_str().to_owned())
+                .collect()
+        };
+        let chain = [rename("b", "c", 0), rename("a", "b", 1)];
+        // Only `b` is declared: the row `a` becomes `b` and is managed, the row
+        // `b` becomes `c` and is not, and `z` is outside the widened read.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b"]), &chain),
+            ["a"]
+        );
+        // Both declared: both rows are managed.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b", "c"]), &chain),
+            ["a", "b"]
+        );
+        // Negatives: no rename leaves the rows; an `exact` table reads every
+        // row and keeps them; a table with no scope keeps them.
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Ensure, &["b"]), &[]),
+            ["a", "b", "z"]
+        );
+        assert_eq!(
+            kept(&scopes(pbps_model::DataMode::Exact, &["b"]), &chain),
+            ["a", "b", "z"]
+        );
+        assert_eq!(kept(&Default::default(), &chain), ["a", "b", "z"]);
     }
 }
 
