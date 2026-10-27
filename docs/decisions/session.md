@@ -791,7 +791,11 @@ recorded volume. A finding that a path forgets or misjudges evidence is fixed
 in that function, never beside it.
 A removal that reports names it cannot identify (the start's own, before the
 container's id is known) leaves them on the record as `leftovers`, and such a
-record is never forgotten automatically: only a person resolves it.
+record is never forgotten automatically: only a person resolves it. A start
+whose record already holds the id and volumes is an ordinary retry instead, and
+until the id is recorded the container's drop fallback stands down
+(`Owner::recoverable`), so a cancelled start leaves the container for the
+label listing and never one half-removed with its volume unnamed.
 
 Absence, an unreadable inspection and a timeout are three results. Only the
 runtime saying "no such container" and "no such volume" is absence; the record

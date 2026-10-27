@@ -117,7 +117,11 @@ async fn settle_failed_start(
     error: &ProduceError,
     rt: &impl Runtime,
 ) -> Result<(), CleanupFailure> {
-    if let ProduceError::Cleanup(names) = error {
+    // Only what the record cannot identify: with an id and volumes recorded the
+    // ordinary retry confirms them, and a passing outage must not block it.
+    if let ProduceError::Cleanup(names) = error
+        && record.container.id.is_none()
+    {
         let mut kept = record.clone();
         kept.leftovers.clone_from(names);
         let note = "the start's own removal was not confirmed";
@@ -169,6 +173,10 @@ impl ContainerOwner for RunOwner<'_, '_> {
             .filter(|(key, _)| key.starts_with("pbps.test."))
             .map(|(key, value)| format!("{key}={value}"))
             .collect()
+    }
+
+    fn recoverable(&self) -> bool {
+        true
     }
 
     async fn before_create(&mut self) -> Result<(), String> {

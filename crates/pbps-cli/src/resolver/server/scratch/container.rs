@@ -155,6 +155,13 @@ pub trait Owner {
     fn token(&self) -> String;
     /// Further `key=value` labels for the container.
     fn labels(&self) -> Vec<String>;
+    /// Whether a later run can find the container by its labels from what
+    /// `before_create` recorded. Then the drop fallback stands down until
+    /// `created` has recorded its id and volumes: a fallback that removed the
+    /// container first could leave a volume nothing names.
+    fn recoverable(&self) -> bool {
+        false
+    }
     /// Called before `docker run`; an error stops the start.
     async fn before_create(&mut self) -> Result<(), String>;
     /// Called with the id `docker run` returned, before anything connects; an
@@ -281,6 +288,7 @@ impl Container {
             .before_create()
             .await
             .map_err(|why| ProduceError::Acquire(format!("before starting {image}: {why}")))?;
+        container.removed = owner.recoverable();
         let args = run_args(
             &container.id,
             token,
@@ -313,6 +321,10 @@ impl Container {
             }
             Err(error) => Err(error),
         };
+        // Its id and volumes are recorded now: the drop fallback may remove it.
+        if started.is_ok() {
+            container.removed = false;
+        }
         let port = match started {
             Ok(_) => docker(&[
                 "port",

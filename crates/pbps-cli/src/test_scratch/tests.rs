@@ -495,6 +495,12 @@ mod recovery {
         let left = ProduceError::Cleanup(vec!["the docker volume vol1".into()]);
         let failed = settle_failed_start(&d.dir, &rec, &left, &Fake::default()).await;
         assert_eq!(failed.unwrap_err().kind, FailureKind::NotRemoved);
+        // Negative: with the id and volumes already recorded the same error is
+        // an ordinary retry, and the confirmed-absent run is forgotten.
+        let identified = record(&run('e'), State::Created, Some(&id('f')));
+        d.dir.write(&identified).unwrap();
+        let retried = settle_failed_start(&d.dir, &identified, &left, &Fake::default()).await;
+        assert!(retried.is_ok() && !kept(&d, &run('e')));
         // The names it reported are kept on the record, and a later pass that
         // lists nothing still refuses to forget the run.
         assert_eq!(
@@ -1004,6 +1010,80 @@ mod live {
         d.dir.write(&dead).unwrap();
         assert_eq!(recover(&d).await.removed, vec![run_id]);
         assert!(!exists(&cid).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
+    async fn a_start_cancelled_before_its_id_is_recorded_leaves_the_container_for_recovery() {
+        use pbps_cli::resolver::server::scratch::container::{Held, Owner};
+        /// An owner whose record never completes: the start is cancelled there.
+        struct Stuck(String, bool);
+        impl Owner for Stuck {
+            fn token(&self) -> String {
+                self.0.clone()
+            }
+            fn labels(&self) -> Vec<String> {
+                vec![format!("{RUN_LABEL}={}", self.0)]
+            }
+            fn recoverable(&self) -> bool {
+                self.1
+            }
+            async fn before_create(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn created(&mut self, _: &str) -> Result<(), String> {
+                std::future::pending().await
+            }
+        }
+        /// Removes the containers by their exact names, whatever the test found.
+        struct Made(Vec<String>);
+        impl Drop for Made {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    let _ = std::process::Command::new("docker")
+                        .args(["rm", "--force", "--volumes", name])
+                        .output();
+                }
+            }
+        }
+        let _serial = Dir::new();
+        let (recorded, anonymous) = (record::new_run_id(), record::new_run_id());
+        let _made = Made(vec![
+            format!("pbps-scratch-{recorded}"),
+            format!("pbps-scratch-{anonymous}"),
+        ]);
+        for (token, recoverable) in [(&recorded, true), (&anonymous, false)] {
+            let (image, mut owner) = (image(), Stuck(token.clone(), recoverable));
+            let start = Held::start_owned(Driver::Postgres, &image, PullPolicy::Never, &mut owner);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(20), start)
+                    .await
+                    .is_err()
+            );
+        }
+        // The drop fallback is a spawned `docker rm`: give it the time it needs.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let listed = |token: &String| {
+            let name = format!("pbps-scratch-{token}");
+            async move {
+                !Docker
+                    .list(&format!(
+                        "{RUN_LABEL}={}",
+                        name.trim_start_matches("pbps-scratch-")
+                    ))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            }
+        };
+        assert!(
+            listed(&recorded).await,
+            "a recoverable start's container waits for recovery"
+        );
+        assert!(
+            !listed(&anonymous).await,
+            "the resolver's own start still removes its container"
+        );
     }
 
     #[tokio::test]
