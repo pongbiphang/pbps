@@ -266,7 +266,8 @@
         "test_scratch::tests::live::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
         "test_scratch::tests::live::a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record",
         "test_scratch::tests::live::a_pending_record_finds_its_container_by_label_and_a_stranger_by_name_is_kept",
-        "test_scratch::tests::live::a_start_cancelled_before_its_id_is_recorded_leaves_the_container_for_recovery"
+        "test_scratch::tests::live::a_start_cancelled_before_its_id_is_recorded_leaves_the_container_for_recovery",
+        "test_scratch::tests::live::a_start_whose_record_fails_leaves_the_container_to_the_journaled_removal"
       ]
     },
     {

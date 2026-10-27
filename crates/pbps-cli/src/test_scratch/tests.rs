@@ -1102,6 +1102,65 @@ mod live {
 
     #[tokio::test]
     #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
+    async fn a_start_whose_record_fails_leaves_the_container_to_the_journaled_removal() {
+        use pbps_cli::resolver::server::scratch::container::{Held, Owner};
+        /// An owner that cannot record the container it was just given.
+        struct Refusing(String, bool);
+        impl Owner for Refusing {
+            fn token(&self) -> String {
+                self.0.clone()
+            }
+            fn labels(&self) -> Vec<String> {
+                vec![format!("{RUN_LABEL}={}", self.0)]
+            }
+            fn recoverable(&self) -> bool {
+                self.1
+            }
+            async fn before_create(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn created(&mut self, _: &str) -> Result<(), String> {
+                Err("the record could not be written".into())
+            }
+        }
+        struct Made(Vec<String>);
+        impl Drop for Made {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    let _ = std::process::Command::new("docker")
+                        .args(["rm", "--force", "--volumes", name])
+                        .output();
+                }
+            }
+        }
+        let _serial = Dir::new();
+        let (recorded, anonymous) = (record::new_run_id(), record::new_run_id());
+        let _made = Made(vec![
+            format!("pbps-scratch-{recorded}"),
+            format!("pbps-scratch-{anonymous}"),
+        ]);
+        for (token, recoverable) in [(&recorded, true), (&anonymous, false)] {
+            let mut owner = Refusing(token.clone(), recoverable);
+            let started =
+                Held::start_owned(Driver::Postgres, &image(), PullPolicy::Never, &mut owner).await;
+            assert!(started.is_err());
+        }
+        let listed = |token: &String| {
+            let label = format!("{RUN_LABEL}={token}");
+            async move { !Docker.list(&label).await.unwrap().is_empty() }
+        };
+        assert!(
+            listed(&recorded).await,
+            "the owner's removal, not the resolver's, takes it"
+        );
+        assert!(
+            !listed(&anonymous).await,
+            "the resolver's own start still removes at once"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
     async fn a_pending_record_finds_its_container_by_label_and_a_stranger_by_name_is_kept() {
         /// Removes the two containers by their exact names, whatever the test found.
         struct Made(Vec<String>);

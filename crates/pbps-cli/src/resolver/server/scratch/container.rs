@@ -301,6 +301,12 @@ impl Container {
             Ok(started) => {
                 started.map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")))
             }
+            // A run that cannot be found by its labels removes at once; one that
+            // can leaves it to its owner's journaled removal, which records the
+            // evidence first.
+            Err(why) if owner.recoverable() => {
+                return Err(ProduceError::Acquire(format!("starting {image}: {why}")));
+            }
             Err(why) => {
                 let name = container.id.clone();
                 return Err(unfinished_start(&name, &why, container.remove().await));
@@ -322,7 +328,8 @@ impl Container {
             Err(error) => Err(error),
         };
         // Its id and volumes are recorded now: the drop fallback may remove it.
-        if started.is_ok() {
+        let unrecorded = started.is_err();
+        if !unrecorded {
             container.removed = false;
         }
         let port = match started {
@@ -340,6 +347,7 @@ impl Container {
         };
         let port = match port {
             Ok(port) => port,
+            Err(error) if unrecorded && owner.recoverable() => return Err(error),
             Err(error) => {
                 return match container.remove().await {
                     Ok(()) => Err(error),
