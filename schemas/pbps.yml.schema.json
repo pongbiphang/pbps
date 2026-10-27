@@ -823,6 +823,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 63,
+  "x-pbps-schema-version": 64,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -307,6 +307,13 @@ pub async fn deployed_revision(
     }
 }
 
+pub async fn has_applied_plan(conn: &mut Conn, checksum: &str) -> Result<bool, LedgerError> {
+    match conn.driver() {
+        Driver::Mssql => pbps_mssql::state::has_applied_plan(conn, checksum).await,
+        Driver::Postgres => pbps_pg::state::has_applied_plan(conn, checksum).await,
+    }
+}
+
 pub async fn entry(
     conn: &mut Conn,
     id: Option<i64>,

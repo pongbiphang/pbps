@@ -140,7 +140,10 @@ use crate::schema::Schema;
 /// Version 32 records authored domain expressions beside catalog definitions (DEC-1635.4).
 /// Version 33 records a module's `options`: a view's `WITH SCHEMABINDING` and its
 /// indexes (DEC-2329.1, DEC-2329.3).
-pub const CURRENT_VERSION: u32 = 33;
+/// Version 34 adds self-reported data work; earlier snapshots truthfully have none
+/// (DEC-2402.1). Older clients must refuse the new kind rather than treat its
+/// reporting checkout as deployed schema evidence.
+pub const CURRENT_VERSION: u32 = 34;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -245,9 +248,40 @@ pub enum StateKind {
     /// An apply or bootstrap attempt failed. The schema and ids in this entry
     /// remain the last known current state; `reason` records the failure.
     Failed,
+    /// External work reported by a job; the managed state is copied unchanged.
+    DataWork,
 }
 
 impl StateKind {
+    pub const ALL: [Self; Self::DataWork.position() + 1] = [
+        Self::Apply,
+        Self::Baseline,
+        Self::Bootstrap,
+        Self::Staged,
+        Self::Failed,
+        Self::DataWork,
+    ];
+
+    // Keep ALL in this exhaustive order so a new kind requires a nearby edit.
+    const fn position(self) -> usize {
+        match self {
+            Self::Apply => 0,
+            Self::Baseline => 1,
+            Self::Bootstrap => 2,
+            Self::Staged => 3,
+            Self::Failed => 4,
+            Self::DataWork => 5,
+        }
+    }
+
+    /// Decide provenance for every new kind at compile time (DEC-2402.1).
+    pub const fn establishes_schema(self) -> bool {
+        match self {
+            Self::Apply | Self::Baseline | Self::Bootstrap | Self::Staged => true,
+            Self::Failed | Self::DataWork => false,
+        }
+    }
+
     /// The value stored in the ledger's `kind` column, matching the serde
     /// representation so the column and `state_json` cannot disagree.
     pub const fn as_str(self) -> &'static str {
@@ -257,6 +291,7 @@ impl StateKind {
             StateKind::Bootstrap => "bootstrap",
             StateKind::Staged => "staged",
             StateKind::Failed => "failed",
+            StateKind::DataWork => "data_work",
         }
     }
 }
@@ -280,6 +315,10 @@ pub struct StateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_evidence: Option<crate::baseline_evidence::BaselineEvidence>,
     pub kind: StateKind,
+
+    /// Self-reported external work, never a change to the managed state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_work: Option<crate::DataWorkRecord>,
 
     /// The schema that environment actually has.
     pub schema: Schema,
@@ -369,6 +408,7 @@ impl StateSnapshot {
             version: CURRENT_VERSION,
             baseline_evidence: None,
             kind,
+            data_work: None,
             schema,
             ids,
             module_deps: ModuleDeps::default(),
@@ -378,6 +418,56 @@ impl StateSnapshot {
             reason: None,
             staged: None,
             declared: Declared::default(),
+        }
+    }
+
+    /// Copy the previous managed state rather than reconstructing it from the
+    /// reporting checkout, which may be on another branch (DEC-2402.1).
+    pub fn recording_data_work(
+        &self,
+        work: crate::DataWorkRecord,
+        operator: String,
+        reason: crate::Reason,
+        git_sha: Option<crate::Text>,
+    ) -> Result<Self, crate::DataWorkError> {
+        self.check_version().map_err(crate::DataWorkError)?;
+        if self.staged.is_some() {
+            return Err(crate::DataWorkError(
+                "finish the staged deployment or baseline before recording data work".into(),
+            ));
+        }
+        let mut next = self.clone();
+        next.version = CURRENT_VERSION;
+        next.kind = StateKind::DataWork;
+        next.data_work = Some(work);
+        next.operator = operator;
+        next.reason = Some(reason.to_string().into());
+        next.git_sha = git_sha;
+        next.plan_checksum = None;
+        next.validate_data_work()?;
+        Ok(next)
+    }
+
+    /// Enforce the new kind's invariants on both serialized input and writes.
+    /// Historical reasons remain opaque; only the new kind requires one.
+    pub fn validate_data_work(&self) -> Result<(), crate::DataWorkError> {
+        use crate::DataWorkError;
+        match (&self.kind, &self.data_work) {
+            (StateKind::DataWork, Some(work)) => {
+                if self.version < 34 || self.staged.is_some() || self.plan_checksum.is_some() {
+                    return Err(DataWorkError("data work requires snapshot version 34 or later, no staged progress and no applied-plan checksum".into()));
+                }
+                crate::Reason::new(self.reason.as_ref().map_or("", crate::Text::raw))
+                    .map_err(|e| DataWorkError(e.to_string()))?;
+                work.validate()
+            }
+            (StateKind::DataWork, None) => {
+                Err(DataWorkError("data-work entry has no work record".into()))
+            }
+            (_, Some(_)) => Err(DataWorkError(
+                "only a data-work entry can carry a work record".into(),
+            )),
+            (_, None) => Ok(()),
         }
     }
 
@@ -438,7 +528,12 @@ impl StateSnapshot {
         let envelope: Envelope =
             serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
         check_version_number(envelope.version).map_err(Unreadable::UnsupportedVersion)?;
-        serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))
+        let snapshot: Self =
+            serde_json::from_str(json).map_err(|e| Unreadable::Malformed(e.to_string()))?;
+        snapshot
+            .validate_data_work()
+            .map_err(|e| Unreadable::Malformed(e.to_string()))?;
+        Ok(snapshot)
     }
 }
 
@@ -626,7 +721,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 33);
+        assert_eq!(CURRENT_VERSION, 34);
     }
 
     fn schema_with(ty: &str) -> Schema {
@@ -731,15 +826,18 @@ mod tests {
     /// without parsing JSON; the two spellings must be the same one.
     #[test]
     fn the_kind_column_matches_the_json_spelling() {
-        for kind in [
-            StateKind::Apply,
-            StateKind::Baseline,
-            StateKind::Bootstrap,
-            StateKind::Staged,
-            StateKind::Failed,
-        ] {
+        for kind in StateKind::ALL {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
+        }
+    }
+
+    #[test]
+    fn every_kind_has_its_exhaustive_position_in_all() {
+        assert_eq!(StateKind::ALL.len(), 6); // One entry per position match arm.
+        for (position, kind) in StateKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.position(), position);
+            assert_eq!(StateKind::ALL[kind.position()], kind);
         }
     }
 

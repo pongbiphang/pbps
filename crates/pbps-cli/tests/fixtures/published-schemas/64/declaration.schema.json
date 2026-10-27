@@ -1,0 +1,1838 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pbps declaration",
+  "description": "One pbps declaration file: a table, module, role, enum or domain.\nThe leading key is both the kind and the name.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/DependencyDto"
+    },
+    {
+      "$ref": "#/$defs/TableDto"
+    },
+    {
+      "$ref": "#/$defs/ModuleDto"
+    },
+    {
+      "$ref": "#/$defs/RoleDto"
+    },
+    {
+      "$ref": "#/$defs/EnumTypeDto"
+    },
+    {
+      "$ref": "#/$defs/DomainTypeDto"
+    }
+  ],
+  "$defs": {
+    "DependencyDto": {
+      "type": "object",
+      "properties": {
+        "dependency": {
+          "$ref": "#/$defs/DependencyName"
+        },
+        "kind": {
+          "$ref": "#/$defs/DependencyKind"
+        },
+        "columns": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/DependencyColumnDto"
+          },
+          "minProperties": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dependency",
+        "kind",
+        "columns"
+      ]
+    },
+    "DependencyName": {
+      "type": "string",
+      "pattern": "^[^.]+\\.[^.]+\\.[^.]+$"
+    },
+    "DependencyKind": {
+      "type": "string",
+      "enum": [
+        "table",
+        "view"
+      ]
+    },
+    "DependencyColumnDto": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "nullable": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "TableDto": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent: the name this table was renamed from. Removed from the\nfile once `pbps plan` has absorbed it into the identity file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "strategy": {
+          "description": "Execution hints (ADR-0003). Persistent, unlike `renamed_from`: `fmt`\nkeeps it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StrategyDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "columns": {
+          "description": "`IndexMap` preserves the declaration order in the document, which decides\nthe column layout of `CREATE TABLE`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ColumnDto"
+          }
+        },
+        "computed": {
+          "description": "SQL Server computed columns: `{expression: \"a * 2\", persisted: true}`.\nNo type: the engine infers it (#1174).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ComputedDto"
+          }
+        },
+        "primary_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PrimaryKeyDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unique": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/UniqueDto"
+          }
+        },
+        "foreign_keys": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ForeignKeyDto"
+          }
+        },
+        "checks": {
+          "description": "Constraint name to check expression.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "indexes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/IndexDto"
+          }
+        },
+        "clustered": {
+          "description": "Which index holds the table's rows, on SQL Server: `heap`, `{unique:\n<constraint>}` or `{index: <index>}`. Absent means the primary key is\nthe clustered index, or the table is a heap if it has no primary key.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClusteredDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replica_identity": {
+          "description": "What logical replication carries to name an old row, on PostgreSQL:\n`full`, `nothing`, `primary_key`, `{unique: <constraint>}` or\n`{index: <index>}`. Absent means the default: the primary key, or\nnothing without one.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplicaIdentityDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "storage_parameters": {
+          "description": "PostgreSQL heap storage parameters, by name: `fillfactor: 70`,\n`autovacuum_enabled: false`, `autovacuum_vacuum_scale_factor: 0.05`,\n`vacuum_index_cleanup: auto`. Absent is every parameter at its\ndefault.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        },
+        "unlogged": {
+          "description": "A PostgreSQL `UNLOGGED` table: `true` skips the write-ahead log, so a\ncrash empties it. Absent, or `false`, is a permanent table.",
+          "type": "boolean",
+          "default": false
+        },
+        "row_security": {
+          "description": "PostgreSQL's independent ENABLE and FORCE row-security flags.",
+          "$ref": "#/$defs/RowSecurityDto"
+        },
+        "row_policies": {
+          "description": "Table-local PostgreSQL policies, including policies on a disabled table.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RowPolicyDto"
+          }
+        },
+        "partition_by": {
+          "description": "A PostgreSQL partitioned parent's key columns: `[ts]` for RANGE, or\n`{list: [k]}` or `{hash: [a, b]}` (#1632).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionByDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "partitions": {
+          "description": "The parent's partitions, by name (qualified when in another schema):\n`{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`\nfor an unbounded end, or `default`. Or `external`: another tool, such\nas pg_partman, creates and drops them, and pbps manages the parent\nalone.",
+          "$ref": "#/$defs/PartitionsDto"
+        },
+        "system_time": {
+          "description": "SQL Server `PERIOD FOR SYSTEM_TIME` and system versioning:\n`{period: [valid_from, valid_to], hidden: true, versioning: {history:\ndbo.orders_history, retention: 6 months}}`. Absent is an ordinary\ntable.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SystemTimeDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "data": {
+          "description": "Declared reference data (ADR-0004). Absent on almost every table: it is\nthe opt-in that lets the tool touch rows at all.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DataDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "columns"
+      ]
+    },
+    "StrategyDto": {
+      "description": "`deny_unknown_fields` is what turns a typo into an error instead of a\nsilent no-op — the whole point of ADR-0003's \"validate rejects unknown keys\".",
+      "type": "object",
+      "properties": {
+        "online": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ColumnDto": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Absent is `true`, except on a `serial`, which PostgreSQL makes NOT NULL.",
+          "type": "boolean",
+          "default": null
+        },
+        "default": {
+          "description": "The default-value expression, kept verbatim.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "identity": {
+          "description": "`[seed, increment]`, or a mapping where the identity's sequence has\nmore to say: `{seed, increment, min, max, cycle, cache}` (PostgreSQL,\n#1921).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentityDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sequence": {
+          "description": "What a `serial` column's sequence says other than `serial`'s own: its\n`start`, its `increment`, and a `name` other than the engine's\n`<table>_<column>_seq` (PostgreSQL). Only beside a `type: serial`,\n`bigserial` or `smallserial`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SequenceDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generated": {
+          "description": "A generation expression (PostgreSQL): `{expression: \"a * 2\", stored:\ntrue}`. The value is computed from the row on every write, where a\ndefault is computed once; never both. `stored` is required, because a\ngeneration expression with no kind is a virtual one on PostgreSQL 18.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeneratedDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collation": {
+          "description": "An explicit collation, on SQL Server (`Latin1_General_CS_AS`). Absent\nmeans the collation of the database the column is created in.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "deprecated": {
+          "description": "Present means deprecated; the value is the reason. The date comes from\ngit and is not written here.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`TableDto::renamed_from`].",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ]
+    },
+    "IdentityDto": {
+      "description": "A column's `identity:`: `[seed, increment]`, or a mapping (#1921).",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "$ref": "#/$defs/IdentityOptionsDto"
+        }
+      ]
+    },
+    "IdentityOptionsDto": {
+      "description": "An `identity:` written as a mapping, with its sequence's options\n(PostgreSQL, #1921).",
+      "type": "object",
+      "properties": {
+        "seed": {
+          "description": "The first value. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "increment": {
+          "description": "The step. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "min": {
+          "description": "The lowest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max": {
+          "description": "The highest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "cycle": {
+          "description": "Whether the sequence starts again at the other bound once it reaches\none. Absent is `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "cache": {
+          "description": "How many numbers a session takes at once. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "SequenceDto": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "description": "The first value. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "increment": {
+          "description": "The step. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "name": {
+          "description": "The sequence's name in the table's schema, where it is not the one the\nengine generates.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "min": {
+          "description": "The lowest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max": {
+          "description": "The highest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "cycle": {
+          "description": "Whether the sequence starts again at the other bound once it reaches\none. Absent is `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "cache": {
+          "description": "How many numbers a session takes at once. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "GeneratedDto": {
+      "type": "object",
+      "properties": {
+        "expression": {
+          "description": "The expression, kept verbatim.",
+          "type": "string"
+        },
+        "stored": {
+          "description": "`true` for a value computed on write and stored. PostgreSQL holds only\nstored generated columns in this model.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "expression",
+        "stored"
+      ]
+    },
+    "ComputedDto": {
+      "description": "How a generated column is computed (DEC-1168.1).\nA SQL Server computed column (#1174).",
+      "type": "object",
+      "properties": {
+        "expression": {
+          "description": "The expression, kept verbatim.",
+          "type": "string"
+        },
+        "persisted": {
+          "description": "`true` for a value computed on write and stored (`PERSISTED`).",
+          "type": "boolean",
+          "default": false
+        },
+        "not_null": {
+          "description": "`true` for `PERSISTED NOT NULL`. Requires `persisted`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "expression"
+      ]
+    },
+    "PrimaryKeyDto": {
+      "description": "A primary key may be written as a bare column list, leaving the name to the\ndatabase, or with an explicit constraint name.\n\nThe named form is not there for looks: when `pbps pull` reverse-generates from\nan existing database, losing the original constraint name would make the next\ndiff want to rename it.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "$ref": "#/$defs/PrimaryKeySpecDto"
+        }
+      ]
+    },
+    "PrimaryKeySpecDto": {
+      "description": "A primary key written out: its columns, and optionally its constraint\nname and its index's storage parameters (PostgreSQL B-tree:\n`fillfactor`, `deduplicate_items`).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "storage_parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "columns"
+      ]
+    },
+    "StorageValueDto": {
+      "description": "A storage parameter's value as written. Any of the four, since the\nparameters are booleans, integers, reals and one word list; `convert`\nreads each into its canonical spelling by the engine's own rules, so\n`off`, `false` and `0` are one value (DEC-1441.1).",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "UniqueDto": {
+      "description": "A UNIQUE constraint: its column list, or written out with its index's\nstorage parameters (PostgreSQL B-tree: `fillfactor`,\n`deduplicate_items`).",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "$ref": "#/$defs/UniqueSpecDto"
+        }
+      ]
+    },
+    "UniqueSpecDto": {
+      "type": "object",
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "storage_parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "columns"
+      ]
+    },
+    "ForeignKeyDto": {
+      "type": "object",
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "references": {
+          "description": "`dbo.region(region_id)` or `dbo.region(a, b)`.",
+          "type": "string"
+        },
+        "on_delete": {
+          "$ref": "#/$defs/ReferentialAction",
+          "default": "no_action"
+        },
+        "on_update": {
+          "$ref": "#/$defs/ReferentialAction",
+          "default": "no_action"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "columns",
+        "references"
+      ]
+    },
+    "ReferentialAction": {
+      "description": "`JsonSchema` is derived here and nowhere else in the model.\n\nThis enum is not merely a domain value: it is a set of literal words a user\ntypes into a declaration file, and the editor schema of SPEC §14.1 is\ngenerated from the loader's own types precisely so the two cannot drift.\nMirroring the variants in `pbps-load` to avoid the derive would recreate the\ndrift the generation exists to prevent.",
+      "type": "string",
+      "enum": [
+        "no_action",
+        "restrict",
+        "cascade",
+        "set_null",
+        "set_default"
+      ]
+    },
+    "IndexDto": {
+      "type": "object",
+      "properties": {
+        "columns": {
+          "description": "The keys, where every one is a column. Each entry is `column`,\noptionally followed by an operator class (PostgreSQL), then optionally\nby `asc` or `desc`: `column`, `column desc`, `body jsonb_path_ops`.\nAn index names its keys here or under `keys:`, not both.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "keys": {
+          "description": "The keys, one mapping each, where any is an expression (PostgreSQL):\n`{column: id}` or `{expression: \"lower(email)\"}`, each with optional\n`opclass:` and `order: asc|desc`. An index names its keys here or\nunder `columns:`, not both.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IndexKeyDto"
+          }
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "unique": {
+          "type": "boolean",
+          "default": false
+        },
+        "where": {
+          "description": "The filtered-index predicate. The YAML key is `where`, which is a Rust\nkeyword, hence the rename.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "method": {
+          "description": "The access method: `btree` (the default, and what an absent key\nmeans) or `gin` (PostgreSQL, over `jsonb` columns).",
+          "$ref": "#/$defs/IndexMethod",
+          "default": "btree"
+        },
+        "storage_parameters": {
+          "description": "The index's storage parameters, by its method (PostgreSQL): a B-tree\ntakes `fillfactor` and `deduplicate_items`, a GIN index `fastupdate`\nand `gin_pending_list_limit`.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexKeyDto": {
+      "description": "One index key under `keys:`: a column or an expression, and which of the\ntwo is what its key says, never inferred from parentheses (DEC-1169.2). A\nmapping of named fields and not a string-or-mapping list entry: read\nwithout a type, a plain `n` or `on` is a YAML boolean, and a column may be\nnamed either.",
+      "type": "object",
+      "properties": {
+        "column": {
+          "description": "A column of the table.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "expression": {
+          "description": "An expression over the table's columns, kept verbatim.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "opclass": {
+          "description": "The operator class, where it is not the key's default.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "order": {
+          "description": "`asc`, the default, or `desc`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IndexOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "IndexOrder": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "IndexMethod": {
+      "description": "How an index is built. A closed list: a method this model does not name is\nleft out of a pull and reported, never stood in for by one it does.",
+      "oneOf": [
+        {
+          "description": "The default B-tree.",
+          "type": "string",
+          "const": "btree"
+        },
+        {
+          "description": "PostgreSQL's generalized inverted index, over `jsonb` in this model.",
+          "type": "string",
+          "const": "gin"
+        }
+      ]
+    },
+    "ClusteredDto": {
+      "description": "A table layout other than the default, on SQL Server: no clustered index\nalthough the table has a primary key (`heap`), or the named UNIQUE\nconstraint (`{unique: <name>}`) or index (`{index: <name>}`) as the\nclustered one.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "heap"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "unique": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "unique"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "index"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ReplicaIdentityDto": {
+      "description": "A PostgreSQL replica identity other than the default: every old column\n(`full`), none (`nothing`), or the index of the primary key\n(`primary_key`), of the named UNIQUE constraint (`{unique: <name>}`) or\nthe named unique index (`{index: <name>}`).",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "full",
+            "nothing",
+            "primary_key"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "unique": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "unique"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "index"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "RowSecurityDto": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "forced": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RowPolicyDto": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/PolicyCommandDto"
+        },
+        "restrictive": {
+          "type": "boolean",
+          "default": false
+        },
+        "to": {
+          "$ref": "#/$defs/PolicyRolesDto"
+        },
+        "using": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "with_check": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "enum": [
+                  "select",
+                  "delete"
+                ]
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "with_check": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "insert"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "using": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PolicyCommandDto": {
+      "type": "string",
+      "enum": [
+        "all",
+        "select",
+        "insert",
+        "update",
+        "delete"
+      ]
+    },
+    "PolicyRolesDto": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PolicyPublicDto"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "not": {
+              "enum": [
+                "public",
+                "current_user",
+                "session_user",
+                "current_role"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PolicyPublicDto": {
+      "type": "string",
+      "enum": [
+        "public"
+      ]
+    },
+    "PartitionByDto": {
+      "description": "A parent's `partition_by:` (#1632): a column list, which is RANGE, or a\nmapping naming LIST or HASH.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "$ref": "#/$defs/PartitionStrategyDto"
+        }
+      ]
+    },
+    "PartitionStrategyDto": {
+      "description": "`{list: [k]}` or `{hash: [a, b]}`: one of the two.",
+      "type": "object",
+      "properties": {
+        "list": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "hash": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "list": {
+              "type": "array"
+            },
+            "hash": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "list"
+          ]
+        },
+        {
+          "properties": {
+            "hash": {
+              "type": "array"
+            },
+            "list": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "hash"
+          ]
+        }
+      ]
+    },
+    "PartitionsDto": {
+      "description": "A parent's `partitions:`: its partitions by name, or `external` (#1533).",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PartitionDto"
+          }
+        },
+        {
+          "description": "`external`: any other word is refused by the loader, by name, as a\npartition's `default` is.",
+          "const": "external"
+        }
+      ]
+    },
+    "PartitionDto": {
+      "description": "A partition: `default`, or a mapping of its bound, `{from: [...], to:\n[...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,\nremainder: r}` (#1632), or `default: true`, and what it has of its own\nbeside its parent's: `checks:` and `indexes:` (#1577) and `foreign_keys:`\n(#1632), written as a table's.",
+      "anyOf": [
+        {
+          "description": "`default`.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/PartitionEntryDto"
+        }
+      ]
+    },
+    "PartitionEntryDto": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/BoundValueDto"
+          }
+        },
+        "to": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/BoundValueDto"
+          }
+        },
+        "in": {
+          "description": "A LIST partition's values (#1632); `NULL` takes the rows whose key\nis NULL.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ListValueDto"
+          }
+        },
+        "modulus": {
+          "description": "A HASH partition's modulus (#1632), with `remainder:`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "remainder": {
+          "description": "A HASH partition's remainder (#1632), with `modulus:`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "default": {
+          "description": "The DEFAULT partition, written as a mapping so that it can carry what\nit has of its own.",
+          "type": "boolean",
+          "default": false
+        },
+        "checks": {
+          "description": "Constraint name to check expression, the partition's own.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "indexes": {
+          "description": "The partition's own indexes; the parent's reach it without being\nwritten here.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/IndexDto"
+          }
+        },
+        "foreign_keys": {
+          "description": "The partition's own foreign keys (#1632); the parent's reach it as\nclones without being written here, and one equal to a parent's is\nrefused, since the engine may take it for the parent's clone.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ForeignKeyDto"
+          }
+        },
+        "columns": {
+          "description": "What the partition holds of its parent's columns otherwise than its\nparent: a default, a NOT NULL (#1578). Never a type, which is the\nparent's.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PartitionColumnDto"
+          }
+        },
+        "unlogged": {
+          "description": "The partition's own persistence, as a table's (#1580): the parent\nhas none to give it.",
+          "type": "boolean",
+          "default": false
+        },
+        "storage_parameters": {
+          "description": "The partition's own heap storage parameters, as a table's (#1580):\nthe parent takes none.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/StorageValueDto"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "from": {
+              "type": "array"
+            },
+            "to": {
+              "type": "array"
+            },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
+            "default": {
+              "const": false
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ]
+        },
+        {
+          "properties": {
+            "default": {
+              "const": true
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "in": {
+              "type": "array"
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
+            "default": {
+              "const": false
+            }
+          },
+          "required": [
+            "in"
+          ]
+        },
+        {
+          "properties": {
+            "modulus": {
+              "type": "integer"
+            },
+            "remainder": {
+              "type": "integer"
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
+            "default": {
+              "const": false
+            }
+          },
+          "required": [
+            "modulus",
+            "remainder"
+          ]
+        }
+      ]
+    },
+    "BoundValueDto": {
+      "description": "One key column's end of a range: a value as text or a whole number, or\n`MINVALUE`/`MAXVALUE`. Not a decimal or a boolean, whose YAML reading is\nnot the text the engine prints: quote those.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        }
+      ]
+    },
+    "ListValueDto": {
+      "description": "One value of a LIST partition (#1632): text, a whole number, a boolean,\nor YAML's `null`, which is SQL's `NULL`.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "PartitionColumnDto": {
+      "description": "One of a partition's columns, where it is not as its parent's (#1578):\n`default:` of its own, `nullable: false` where the parent's is nullable.\n`nullable: true` would undo a NOT NULL the parent's column has, which the\nengine does not let a partition do, so the schema takes `false` alone.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "The default-value expression, kept verbatim, where it is not the\nparent's.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "nullable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null,
+          "enum": [
+            false,
+            null
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "default": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "default"
+          ]
+        },
+        {
+          "properties": {
+            "nullable": {
+              "const": false
+            }
+          },
+          "required": [
+            "nullable"
+          ]
+        }
+      ]
+    },
+    "SystemTimeDto": {
+      "description": "`system_time:` on a SQL Server table (#1176).",
+      "type": "object",
+      "properties": {
+        "period": {
+          "description": "The period's start and end columns, in that order, each declared\nunder `columns:` as `datetime2(p)`, not nullable.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "hidden": {
+          "description": "Both period columns `HIDDEN`, left out of `SELECT *`.",
+          "type": "boolean",
+          "default": false
+        },
+        "versioning": {
+          "description": "`SYSTEM_VERSIONING = ON`. Absent is the period alone.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersioningDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "period"
+      ]
+    },
+    "VersioningDto": {
+      "description": "`versioning:` under `system_time:`.",
+      "type": "object",
+      "properties": {
+        "history": {
+          "description": "The history table, `schema.name`.",
+          "type": "string"
+        },
+        "retention": {
+          "description": "`HISTORY_RETENTION_PERIOD`, as `6 months` or `1 year`. Absent is\nINFINITE.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "history"
+      ]
+    },
+    "DataDto": {
+      "description": "The `data:` block.\n\n`mode` is required rather than defaulted. The two modes differ by whether a\nrow the declaration does not mention is deleted, and a default would decide\nthat for the user in the file where it is least visible.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "rows": {
+          "description": "Primary-key value to the row's other columns.\n\nThe key is read as a string whatever the YAML scalar looked like, which\nis why an integer key (`1:`) works: the primary-key column's declared\ntype is what says how to render it, and it says so in one place\n(`pbps_model::RowKey`).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/$defs/ValueDto"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "rows"
+      ]
+    },
+    "ValueDto": {
+      "description": "One cell, as written: `null`, a boolean, an integer, or text. A decimal\nmust be quoted (`'1.50'`) — see `pbps_model::Value` for why.\n\nThe variants are tried in order and the order is the whole design. `Text`\nis last so that it catches only what nothing else did; `Float` sits ahead\nof it so that a bare `1.50` is *caught and refused* rather than silently\nbecoming the string `\"1.50\"` in some YAML parsers and the number 1.5 in\nothers. `convert` turns that arm into a diagnostic asking for quotes.",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "ModuleDto": {
+      "description": "One view, procedure, function or trigger (ADR-0002).\n\nThe leading key is both the kind and the name — `view: dbo.active_customer`\n— for the same reason `table:` is: the file name carries no meaning, so the\nidentity has to be inside the file.",
+      "type": "object",
+      "properties": {
+        "view": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "procedure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "function": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "trigger": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "on": {
+          "description": "The table a trigger is on. Meaningless — and rejected — on anything else.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "schemabinding": {
+          "description": "Makes a SQL Server view `WITH SCHEMABINDING` (DEC-2329.1). Meaningless\non anything else and rejected there: a function states the option in\nits own header text, and the other kinds have none.\n\nWritten by `fmt` only when `true`, as `public_execute:` is.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "indexes": {
+          "description": "An indexed view's indexes, as a table declares them: plain column keys\nunder `columns:` or `keys:` (each optionally `desc`, or `order:` under\n`keys:`), `include:` and `unique:`. A view's index takes no expression\nkey, `opclass:`, `where:`, `method:` or `storage_parameters:`; the\ndialect refuses them.\nMeaningless without `schemabinding: true`, and rejected on every kind\nbut a view (DEC-2329.3).",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/IndexDto"
+          }
+        },
+        "clustered": {
+          "description": "The name of the unique index among `indexes:` that is clustered: the\nengine wants one first, and says nothing about which it is.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "definition": {
+          "description": "The body. What it starts with depends on the kind; see\n[`pbps_model::Module`].",
+          "type": "string"
+        },
+        "depends_on": {
+          "description": "Modules that must be created first, where the identifier scan cannot see\nthe dependency. Persistent, like `strategy:`, and preserved by `fmt`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "public_execute": {
+          "description": "Opts this routine back in to the engine's default `EXECUTE` to\n`PUBLIC`, where the engine has one (ADR-0010 §5). Persistent, like\n`depends_on:`, and preserved by `fmt`.\n\nAbsent — the common case — means the plan takes that default away as\npart of creating the routine. Writing `false` says the same thing out\nloud and is accepted, so that a declaration can record the decision\nwhere a reader sees it.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "definition"
+      ],
+      "oneOf": [
+        {
+          "properties": {
+            "view": {
+              "type": "string"
+            },
+            "procedure": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "view"
+          ]
+        },
+        {
+          "properties": {
+            "procedure": {
+              "type": "string"
+            },
+            "view": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "procedure"
+          ]
+        },
+        {
+          "properties": {
+            "function": {
+              "type": "string"
+            },
+            "view": {
+              "type": "null"
+            },
+            "procedure": {
+              "type": "null"
+            },
+            "trigger": {
+              "type": "null"
+            },
+            "on": {
+              "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "function"
+          ]
+        },
+        {
+          "properties": {
+            "trigger": {
+              "type": "string"
+            },
+            "on": {
+              "type": "string"
+            },
+            "view": {
+              "type": "null"
+            },
+            "procedure": {
+              "type": "null"
+            },
+            "function": {
+              "type": "null"
+            },
+            "schemabinding": {
+              "type": "null"
+            },
+            "indexes": {
+              "type": "null"
+            },
+            "clustered": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "trigger",
+            "on"
+          ]
+        }
+      ]
+    },
+    "RoleDto": {
+      "description": "One database role and its grants (ADR-0005).\n\n`role: app_reader` names it — unqualified, because a role is a principal\nand not an object in a schema. Grants are a map of target to permission\nlist: `dbo.customer: [select]`, or `schema::dbo: [select]` for a whole\nschema.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "renamed_from": {
+          "description": "One-shot intent, as for [`TableDto::renamed_from`]: the role keeps its\nmembership through the rename, which is why it is intent and not\ndrop + add.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "grants": {
+          "description": "Target to permissions. Order carries no meaning; `fmt` sorts both.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "anyOf": [
+                {
+                  "enum": [
+                    "select",
+                    "insert",
+                    "update",
+                    "delete",
+                    "references",
+                    "execute",
+                    "alter",
+                    "view-definition",
+                    "usage",
+                    "create",
+                    "truncate",
+                    "trigger",
+                    "maintain"
+                  ]
+                },
+                {
+                  "pattern": "^[\t\n\u000b\f\r                  　]*([Ss][Ee][Ll][Ee][Cc][Tt]|[Ii][Nn][Ss][Ee][Rr][Tt]|[Uu][Pp][Dd][Aa][Tt][Ee]|[Dd][Ee][Ll][Ee][Tt][Ee]|[Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee][Ss]|[Ee][Xx][Ee][Cc][Uu][Tt][Ee]|[Aa][Ll][Tt][Ee][Rr]|[Vv][Ii][Ee][Ww][-_ ][Dd][Ee][Ff][Ii][Nn][Ii][Tt][Ii][Oo][Nn]|[Uu][Ss][Aa][Gg][Ee]|[Cc][Rr][Ee][Aa][Tt][Ee]|[Tt][Rr][Uu][Nn][Cc][Aa][Tt][Ee]|[Tt][Rr][Ii][Gg][Gg][Ee][Rr]|[Mm][Aa][Ii][Nn][Tt][Aa][Ii][Nn])[\t\n\u000b\f\r                  　]*$"
+                }
+              ]
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "role"
+      ]
+    },
+    "EnumTypeDto": {
+      "description": "A shared enum: label order is semantic state.",
+      "type": "object",
+      "properties": {
+        "enum": {
+          "type": "string"
+        },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnumValueDto"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enum",
+        "values"
+      ]
+    },
+    "EnumValueDto": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/EnumValueIntentDto"
+        }
+      ]
+    },
+    "EnumValueIntentDto": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "DomainTypeDto": {
+      "description": "A shared domain, with its column-style base type and named checks.",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string"
+        },
+        "renamed_from": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "type": {
+          "type": "string"
+        },
+        "not_null": {
+          "type": "boolean",
+          "default": false
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "checks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "collation": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "type"
+      ]
+    }
+  },
+  "x-pbps-schema-version": 64,
+  "x-pbps-tool-version": "0.0.0"
+}

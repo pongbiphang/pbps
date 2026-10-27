@@ -36043,3 +36043,43 @@ fn failed_attempts_do_not_replace_deployed_commit_evidence() {
         stale_checkout::failed_attempt(&server, true);
     }
 }
+
+#[path = "support/data_work.rs"]
+mod data_work;
+
+#[test]
+#[ignore = "needs live postgres"]
+fn data_work_records_preserve_schema_and_plan() {
+    for server in [server(), old_server()] {
+        data_work::acceptance(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn data_work_refuses_missing_and_unreadable_evidence() {
+    for server in [server(), old_server()] {
+        data_work::refusals(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn data_work_serializes_writers_and_preserves_staged_checkpoints() {
+    for server in [server(), old_server()] {
+        data_work::locked_and_staged(&server, true);
+    }
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn data_work_does_not_replace_deployed_commit_evidence() {
+    for server in [server(), old_server()] {
+        data_work::ancestry(&server, true);
+    }
+}
+
+#[test]
+fn data_work_preserves_cli_audit_and_json_boundaries() {
+    data_work::cli_boundaries(true);
+}

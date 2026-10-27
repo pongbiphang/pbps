@@ -1402,10 +1402,10 @@ fetching history first; shallow clones get the `fetch-depth: 0` remedy. Git
 read failures refuse with a repair remedy, rather than pretending no evidence
 exists. Additions, modifications and identity-preserving renames are unaffected.
 
-The commit evidence is the newest non-failed ledger row at or before the latest
+The commit evidence is the newest schema-establishing ledger row at or before the latest
 snapshot read by the planner. Failed attempts name the attempted checkout and
 must not replace deployed provenance. A selected row with NULL `git_sha`, no
-retained non-failed row, or a planning project without Git keeps the existing
+retained schema-establishing row, or a planning project without Git keeps the existing
 planning behavior with an explicit human/JSON note. It does not search older
 rows for a non-NULL SHA and does not infer per-object provenance. Connected
 planning still changes neither declarations nor identities on disk.
@@ -1799,7 +1799,7 @@ check reads the rows the statements ran.
 CREATE TABLE dbo.__pbps_state (
     id               BIGINT IDENTITY PRIMARY KEY,
     applied_at       DATETIME2(3)   NOT NULL,
-    kind             VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap | staged | failed
+    kind             VARCHAR(16)    NOT NULL,   -- apply | baseline | bootstrap | staged | failed | data_work
     git_sha          VARCHAR(40)    NULL,
     plan_checksum    CHAR(64)       NULL,
     state_json       NVARCHAR(MAX)  NOT NULL,   -- the whole schema snapshot plus the
@@ -1824,6 +1824,38 @@ CREATE TABLE dbo.__pbps_lock (
     locked_at  DATETIME2(3)  NOT NULL
 );
 ```
+
+**External data work (DEC-2402.1):** `pbps state record-data-work` records a
+self-reported event after an expand plan was applied in this environment. It
+requires exactly one of `--script PATH` (project-relative or absolute path plus
+SHA-256 of the file's current bytes) or `--external-version TEXT`, the
+`--expand-checksum`, `--outcome completed|failed`, a nonblank `--reason`, and
+optional `--notes`. External versions are bounded to 1024 UTF-8 bytes; notes to
+4096 UTF-8 bytes. Overflow refuses, never truncates. The ordinary state commands'
+`--env`/`--db` selectors choose the target; `--format human|json` chooses output.
+A successfully recorded failed outcome exits 0.
+
+The command takes the same lock as apply and baseline, re-reads the previous
+entry, and checks for a retained successful `apply` with this expand checksum
+in this ledger. Missing/pruned apply evidence refuses. An absent, empty,
+unreadable or unsupported ledger refuses with its own diagnosis; a staged
+checkpoint must be finished or baselined. It copies the previous managed schema,
+ids, declared inputs, module dependencies and baseline evidence unchanged.
+The new audit entry has kind `data_work`, reporting operator/reason/Git SHA,
+no applied-plan checksum, and a `data_work` JSON payload holding identity,
+expand checksum, outcome and notes. It runs no user SQL and changes no business
+or reference-data rows. A script hash identifies bytes read while recording,
+not proof that those bytes ran. Contract assertions (#2401), constraints and
+drop preconditions check truth separately.
+
+Snapshot version 34 carries this payload. Versions 6–33 stay readable as their
+original versions; appending upgrades by copying into a new version-34 entry,
+without rewriting history. Both engines need no new SQL columns. Older clients
+refuse the new snapshot version. Data-work and failed-attempt rows do not
+establish deployed-schema commit evidence; Apply, Baseline, Bootstrap and
+Staged do. List shows the event kind, operator and reason using projections;
+show's human/JSON output exposes the complete payload. Drift, verify and the
+next plan still compare the copied managed state.
 
 **Operator provenance (DEC-2330.1):** CLI commands that create ledger entries
 or identity intent take the operator from `PBPS_OPERATOR` when set. It must
@@ -2069,6 +2101,7 @@ full state.
 | `pbps baseline --reason ...` | Reset the state baseline; operator provenance follows §8.1 |
 | `pbps bootstrap` | Generate the complete CREATE script from the declarations (DR, new environments) |
 | `pbps state list` | This environment's history, newest first |
+| `pbps state record-data-work` | Record self-reported external work after a retained successful expand apply; never execute it |
 | `pbps state show <id>` | Read an entry's full schema snapshot and metadata; `--format json` uses the findings envelope |
 | `pbps state diff <id> [<id>]` | Compare recorded entries using typed changes; the destination defaults to the newest entry |
 | `pbps state export <id>` | Write historical declarations for review, commit and a new forward plan; `--force` replaces existing declaration files |
@@ -3486,6 +3519,12 @@ copy blesses files the loader refuses, and does it quietly.
 Every read-only command — `plan` (offline, including `--check`, or connected
 with `--db`/`--env`), `validate`, `fmt`, `explain`, `doctor`, `verify`, `status`,
 `state list` — takes `--format human|json` and, in JSON, emits one envelope.
+
+The recording command `state record-data-work` also uses this envelope. Its
+successful payload identifies the recorded entry and external-work report and
+marks it `self_reported: true`; recording a reported failed outcome is success.
+Usage errors exit 2, missing apply/state evidence is a finding (exit 2), and
+unreadable ledger/connection/file failures are unanswerable (exit 1).
 
 The confined scratch command `test` (§9.9) uses that same envelope with a
 `command: "test"` branch, even though it writes to its own disposable database.

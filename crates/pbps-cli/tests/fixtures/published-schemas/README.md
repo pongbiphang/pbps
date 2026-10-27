@@ -65,3 +65,4 @@ DECISIONS 465).
 - `53/` adds trusted roles and reviewed input-path routines for existing PostgreSQL type references (#1523, #2181).
 - `62/` adds a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).
 - `63/` adds an environment's `rehearse:` and `explain`'s and a plan's `rehearsal` output field (issue #2379).
+- `64/` adds the `state record-data-work` envelope and its typed self-reported work payload (#2402), ordered after #2432's version 63.

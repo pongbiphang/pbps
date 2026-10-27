@@ -7132,7 +7132,7 @@ pub fn cmd_plan_db(
                 );
             };
             refuse_mid_deployment(&entry, &target.label)?;
-            let revision = if entry.snapshot.kind == StateKind::Failed {
+            let revision = if !entry.snapshot.kind.establishes_schema() {
                 crate::engine::deployed_revision(&mut conn, entry.id).await?
             } else {
                 Some(pbps_db::ledger::StateRevision {
@@ -8955,6 +8955,7 @@ fn failed_apply_snapshot(
 ) -> StateSnapshot {
     let is_staged_checkpoint = current.staged.is_some();
     current.kind = StateKind::Failed;
+    current.data_work = None;
     current.operator = operator.to_owned();
     if !is_staged_checkpoint {
         current.git_sha = attempted_git_sha;
@@ -24550,5 +24551,48 @@ mod held_before_the_plan_tests {
             (&schema, &ids),
         );
         assert_eq!(keys(&widened), ["blue", "ok", "sad", "zed"]);
+    }
+}
+
+#[cfg(test)]
+mod data_work_failure_tests {
+    #[test]
+    fn a_failed_apply_clears_the_previous_data_work_payload() {
+        let before = pbps_model::StateSnapshot::new(
+            pbps_model::StateKind::Apply,
+            pbps_model::Schema::default(),
+            pbps_model::IdsFile::default(),
+            "deployer",
+        );
+        let work = pbps_model::DataWorkRecord {
+            identity: pbps_model::DataWorkIdentity::ExternalVersion {
+                version: "v7".into(),
+            },
+            expand_checksum: "a".repeat(64),
+            outcome: pbps_model::DataWorkOutcome::Failed,
+            notes: None,
+        };
+        let current = before
+            .recording_data_work(
+                work,
+                "reporter".into(),
+                pbps_model::Reason::new("backfill").unwrap(),
+                None,
+            )
+            .unwrap();
+        let failed = super::failed_apply_snapshot(
+            pbps_db::Driver::Mssql,
+            current,
+            "deployer",
+            None,
+            &"b".repeat(64),
+            &anyhow::anyhow!("refused"),
+        );
+        assert_eq!(failed.kind, pbps_model::StateKind::Failed);
+        assert!(failed.data_work.is_none());
+        assert_eq!(failed.schema, before.schema);
+        assert!(
+            pbps_model::StateSnapshot::from_json(&serde_json::to_string(&failed).unwrap()).is_ok()
+        );
     }
 }

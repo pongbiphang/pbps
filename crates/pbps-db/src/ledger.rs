@@ -61,9 +61,9 @@ pub struct LedgerEntry {
     pub snapshot: StateSnapshot,
 }
 
-/// Provenance of the newest non-failed row, without decoding historical state.
-/// A failed attempt carries the attempted checkout, not the deployed revision
-/// (DEC-2397.1). `None` from the reader means no such row remains; a NULL SHA
+/// Provenance of the newest schema-establishing row, without decoding historical state.
+/// Failed attempts and data-work reports carry their reporting checkout, not
+/// the deployed revision (DEC-2397.1, DEC-2402.1). `None` from the reader means no such row remains; a NULL SHA
 /// on a selected row is a different, known absence of commit evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateRevision {

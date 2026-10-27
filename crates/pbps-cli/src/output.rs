@@ -1,4 +1,4 @@
-//! One machine-readable shape for every read-only command (SPEC §14.1).
+//! One machine-readable shape for reporting commands (SPEC §14.1).
 //!
 //! # Why one shape rather than one per command
 //!

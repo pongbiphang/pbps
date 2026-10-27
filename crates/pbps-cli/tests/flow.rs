@@ -23904,3 +23904,35 @@ fn stale_checkouts_cannot_remove_target_managed_objects() {
 fn failed_attempts_do_not_replace_deployed_commit_evidence() {
     stale_checkout::failed_attempt(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[path = "support/data_work.rs"]
+mod data_work;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn data_work_records_preserve_schema_and_plan() {
+    data_work::acceptance(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn data_work_refuses_missing_and_unreadable_evidence() {
+    data_work::refusals(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn data_work_serializes_writers_and_preserves_staged_checkpoints() {
+    data_work::locked_and_staged(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+#[ignore = "needs live mssql"]
+fn data_work_does_not_replace_deployed_commit_evidence() {
+    data_work::ancestry(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
+#[test]
+fn data_work_preserves_cli_audit_and_json_boundaries() {
+    data_work::cli_boundaries(false);
+}
