@@ -102,6 +102,8 @@
 //! `search_path` of its own. A pass that differs from the one before it is
 //! [`Unreadable::Failed`].
 
+mod literal_inputs;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -839,12 +841,14 @@ async fn pass(
         .collect())
 }
 
-/// Binds a recorded conversion's expression, and judges what it bound, before
+/// Checks literal input paths, binds a recorded conversion's expression, and judges it before
 /// anything evaluates it (#2331, DEC-2331.1).
 ///
 /// The expression runs as the deploying role, in the pre-flight over every row
 /// and then in the `ALTER`, so non-built-in code in it would run before anyone
-/// had judged it. It is bound first against a temporary table holding the one
+/// had judged it. DEC-2378.1 checks possible literal inputs before binding,
+/// because input conversion can run during parse analysis. It is then bound
+/// against a temporary table holding the one
 /// column, wrapped as `CHECK (((<using>) IS NULL) OR true)`: the engine parses
 /// and resolves it as it will in the `ALTER`, keeps the whole tree unsimplified
 /// in `conbin` (measured on 16 and 18: the user function's `funcid` stays), and
@@ -871,7 +875,7 @@ pub async fn vet_conversion(
         .to_string();
     let quoted = crate::quote(column.name.raw())
         .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
-    let (column, ty) = (quoted.as_str(), ty.as_str());
+    let (quoted, ty) = (quoted.as_str(), ty.as_str());
     const WRITABLE: pbps_dialect::TransactionFraming = pbps_dialect::TransactionFraming {
         begin: std::borrow::Cow::Borrowed("BEGIN ISOLATION LEVEL REPEATABLE READ;"),
         commit: std::borrow::Cow::Borrowed("COMMIT;"),
@@ -881,7 +885,13 @@ pub async fn vet_conversion(
     conn.begin(&WRITABLE)
         .await
         .map_err(|_| unvetted("could not be vetted: no transaction to bind it in".into()))?;
-    let result = vet_in_transaction(conn, column, ty, using, shown).await;
+    let result = async {
+        literal_inputs::check(conn, &column.table, using)
+            .await
+            .map_err(unvetted)?;
+        vet_in_transaction(conn, quoted, ty, using, shown).await
+    }
+    .await;
     let closed = conn.rollback(&WRITABLE).await;
     result?;
     closed.map_err(|_| unvetted("could not be vetted: its transaction did not close".into()))
