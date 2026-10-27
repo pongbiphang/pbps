@@ -238,7 +238,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             assert_eq!(held, 1, "PG{} {using}: input ran: {result:?}", server.label);
             let why = result.unwrap_err();
             assert!(
-                why.contains(code) && why.contains("CAST('…' AS type) or '…'::type"),
+                why.contains(code) && why.contains("CAST('...' AS type) or '...'::type"),
                 "PG{} {using}: {why}",
                 server.label
             );

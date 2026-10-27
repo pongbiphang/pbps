@@ -135,7 +135,7 @@ impl LiteralInputs {
         let sql = format!("SELECT (({}) IS NULL) OR true FROM {table}", self.rewritten);
         let prepared = conn.prepare_query(&sql).await.map_err(|e| {
             let code = e.server_error_code().unwrap_or_else(|| "unknown".into());
-            format!("could not be vetted: literal parameter preparation failed (SQLSTATE {code}); write the literal as CAST('…' AS type) or '…'::type")
+            format!("could not be vetted: literal parameter preparation failed (SQLSTATE {code}); write the literal as CAST('...' AS type) or '...'::type")
         })?;
         for oid in prepared.parameter_type_ids() {
             if let Some((_, schema, name)) = self.types.iter().find(|t| t.0 == i64::from(oid)) {

@@ -3895,8 +3895,8 @@ SQL resolver, overload scan or grammar-keyword list.
 
 A failed preparation refuses only when that closure is non-empty and a
 string literal is present. The refusal carries its SQLSTATE and the remedy
-`CAST('…' AS type)` or `'…'::type`. Measured, typed-literal syntax such as
-`date '…'` becomes invalid as `date $1` (42601), and an unconstrained literal
+`CAST('...' AS type)` or `'...'::type`. Measured, typed-literal syntax such as
+`date '...'` becomes invalid as `date $1` (42601), and an unconstrained literal
 in this wrapper leaves an undeterminable parameter (42P18). A function-style
 type cast can also lose its unknown-constant special case and report 42883.
 These are explicit limitations of this pre-binding check, not guesses about a type name.
