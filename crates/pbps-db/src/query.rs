@@ -46,6 +46,12 @@ impl PreparedQuery<'_> {
         self.prepared.type_ids()
     }
 
+    /// PostgreSQL catalog OIDs inferred by Parse/Describe, in parameter order.
+    /// Reading these does not bind values or execute the described statement.
+    pub fn parameter_type_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.prepared.parameter_type_ids()
+    }
+
     /// Runner-owned catalog reads, before executing the described statement.
     pub async fn query(&mut self, sql: &str) -> Result<Vec<crate::Row>, crate::DbError> {
         Ok(self
