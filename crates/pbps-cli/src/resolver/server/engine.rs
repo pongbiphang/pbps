@@ -266,17 +266,6 @@ impl Scratch<'_> {
         }
     }
 
-    pub(super) async fn restore_settings(
-        &self,
-        admin: &mut Conn,
-        authorization: &scope::Authorization,
-    ) -> Result<(), Error> {
-        match self {
-            Self::Postgres(scratch) => scratch.restore_settings(admin, authorization).await,
-            Self::Mssql(_) => Err(unsupported()),
-        }
-    }
-
     /// See `postgres::Scratch::naming`. SQL Server has no connected rehearsal
     /// yet.
     pub(super) fn naming(&self) -> Result<Naming, Error> {
@@ -332,10 +321,7 @@ impl Prepared {
     /// where the scratch account compiles as itself.
     pub(super) fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
         match self {
-            Self::Postgres(prepared) => match prepared.compile.as_mut() {
-                Some(compile) => compile,
-                None => admin,
-            },
+            Self::Postgres(prepared) => prepared.session(admin),
             Self::Mssql(_) => admin,
         }
     }
@@ -347,7 +333,7 @@ impl Prepared {
     }
     pub(super) fn supplied(&self) -> bool {
         match self {
-            Self::Postgres(prepared) => prepared.compile.is_none() && prepared.capture.is_none(),
+            Self::Postgres(prepared) => prepared.supplied(),
             Self::Mssql(_) => false,
         }
     }
@@ -404,10 +390,7 @@ impl Binding {
     ) -> Result<(), Error> {
         match (self, prepared) {
             (Self::Postgres(binding), Prepared::Postgres(prepared)) => {
-                let compile = match prepared.compile.as_mut() {
-                    Some(compile) => compile,
-                    None => &mut *admin,
-                };
+                let compile = prepared.compiling(admin, zone)?;
                 binding.compile(extras, driver, zone, compile, steps).await
             }
             (Self::Mssql(binding), Prepared::Mssql(prepared)) => {

@@ -21,6 +21,50 @@ use std::collections::{BTreeMap, BTreeSet};
 
 mod recovery;
 
+use pbps_pg::resolver::session::{Reset, SessionState};
+
+struct Session {
+    conn: Conn,
+    state: SessionState,
+}
+
+impl Session {
+    fn new(conn: Conn, role: Option<pbps_model::RoleName>) -> Self {
+        Self {
+            conn,
+            state: SessionState::new(role),
+        }
+    }
+}
+
+enum Sessions {
+    RunOwned {
+        compile: Session,
+        capture: Box<Session>,
+    },
+    Supplied(SessionState),
+}
+
+impl Sessions {
+    fn compiling<'a>(&'a mut self, admin: &'a mut Conn) -> (&'a mut Conn, &'a mut SessionState) {
+        match self {
+            Self::RunOwned { compile, .. } => (&mut compile.conn, &mut compile.state),
+            Self::Supplied(state) => (admin, state),
+        }
+    }
+
+    fn setup<'a>(&'a mut self, admin: &'a mut Conn) -> (&'a mut Conn, &'a SessionState) {
+        match self {
+            Self::RunOwned { capture, .. } => (&mut capture.conn, &capture.state),
+            Self::Supplied(state) => (admin, state),
+        }
+    }
+
+    fn capture<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        self.setup(admin).0
+    }
+}
+
 /// Entry points and stop points for the tests that drive a release or a
 /// sweep without a run around it.
 #[cfg(test)]
@@ -46,12 +90,36 @@ pub(super) mod for_tests {
         STOPPED_AFTER_CLEANUP.lock().unwrap().contains(database)
     }
 
+    // Key the fault to the borrowed connection, without adding an observation
+    // before RESET: a script's timeout must never affect test-only I/O.
+    static FAIL_RESTORE: std::sync::Mutex<BTreeSet<usize>> = std::sync::Mutex::new(BTreeSet::new());
+
+    pub(super) fn after_externals(session: &Conn, script: &str) {
+        if script == "SELECT 1 /* fail_restore_2133 */" {
+            FAIL_RESTORE
+                .lock()
+                .unwrap()
+                .insert(session as *const Conn as usize);
+        }
+    }
+
+    pub(super) fn restore_fails(session: &Conn) -> bool {
+        FAIL_RESTORE
+            .lock()
+            .unwrap()
+            .remove(&(session as *const Conn as usize))
+    }
+
     pub(in crate::resolver::server) async fn reset_for_test(session: &mut Conn) {
-        reset_settings(session, "the test").await.unwrap();
+        let state = SessionState::checked(sql::backend(session).await.unwrap(), None);
+        reset_and_restore(session, &state, Reset::All, "the test")
+            .await
+            .unwrap();
     }
 
     pub(in crate::resolver::server) async fn externals_for_test(session: &mut Conn) {
-        run_externals(session, "SELECT 1", OutsideWrites::Refused)
+        let state = SessionState::checked(sql::backend(session).await.unwrap(), None);
+        run_externals(session, &state, "SELECT 1", OutsideWrites::Refused)
             .await
             .unwrap();
     }
@@ -249,11 +317,7 @@ impl Naming {
 /// The scratch side, provisioned and qualified: the session the declarations
 /// compile in, the session that captures what they bound, and the scope.
 pub(in crate::resolver::server) struct Prepared {
-    /// `None` when the run compiles on the scratch connection its checks
-    /// were made on.
-    pub(super) compile: Option<Conn>,
-    /// `None` when captures read through the compiling session itself.
-    pub(super) capture: Option<Conn>,
+    sessions: Sessions,
     pub(super) scratch_catalog: CatalogFacts,
     pub(super) map: scope::Principals,
     /// Authorization keys the reproduction did not reproduce.
@@ -353,12 +417,25 @@ impl Scratch<'_> {
             .execute("SET ROLE NONE")
             .await
             .map_err(db("the externals file session's role"))?;
+        let setup_state = SessionState::new(None);
         if let Some(statements) = self.externals {
-            run_externals(&mut setup, statements, self.provenance.outside_writes).await?;
+            run_externals(
+                &mut setup,
+                &setup_state,
+                statements,
+                self.provenance.outside_writes,
+            )
+            .await?;
         }
         let mid = inventory(&mut owner).await?;
         let staging = fill.staging(&identities(&externals::created(&before, &mid)));
-        run_fill(&mut setup, &staging.ahead, self.provenance.outside_writes).await?;
+        run_fill(
+            &mut setup,
+            &setup_state,
+            &staging.ahead,
+            self.provenance.outside_writes,
+        )
+        .await?;
         drop(setup);
         let after = inventory(&mut owner).await?;
         let created = externals::created(&before, &after);
@@ -401,8 +478,10 @@ impl Scratch<'_> {
         .await
         .map_err(db("the scratch analysis scope"))?;
         Ok(Prepared {
-            compile: Some(session),
-            capture: Some(owner),
+            sessions: Sessions::RunOwned {
+                compile: Session::new(session, deployer),
+                capture: Box::new(Session::new(owner, None)),
+            },
             scratch_catalog,
             map,
             differences,
@@ -499,13 +578,10 @@ impl Scratch<'_> {
         // any usage, on the checked connection like every write here
         // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
         // compile that follows on this same session.
+        let mut state = SessionState::checked(self.backend.clone(), None);
         let before = inventory(admin).await?;
         if let Some(statements) = self.externals {
-            run_externals(admin, statements, self.provenance.outside_writes).await?;
-            admin
-                .execute("SET ROLE NONE")
-                .await
-                .map_err(db("the scratch session's role"))?;
+            run_externals(admin, &state, statements, self.provenance.outside_writes).await?;
             // An allowed externals file may change the login's own defaults
             // (#1674). Those are kept, so the release compares the
             // compile's changes with what the externals file left.
@@ -522,7 +598,13 @@ impl Scratch<'_> {
         // connection (DEC-1778.2).
         let mid = inventory(admin).await?;
         let staging = fill.staging(&identities(&externals::created(&before, &mid)));
-        run_fill(admin, &staging.ahead, self.provenance.outside_writes).await?;
+        run_fill(
+            admin,
+            &state,
+            &staging.ahead,
+            self.provenance.outside_writes,
+        )
+        .await?;
         pinned(admin, &self.backend).await?;
         let after = inventory(admin).await?;
         let created = externals::created(&before, &after);
@@ -546,7 +628,8 @@ impl Scratch<'_> {
                 usable.join("; ")
             )));
         }
-        pbps_pg::resolver::authorization::apply_session_settings(admin, context)
+        state
+            .install_settings(admin, context)
             .await
             .map_err(db("the deployer's settings"))?;
         let scratch_catalog =
@@ -557,8 +640,7 @@ impl Scratch<'_> {
         // before anything compiles; the cleanup checks again on its own.
         pinned(admin, &self.backend).await?;
         Ok(Prepared {
-            compile: None,
-            capture: None,
+            sessions: Sessions::Supplied(state),
             scratch_catalog,
             map,
             differences: Vec::new(),
@@ -991,10 +1073,7 @@ impl Scratch<'_> {
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
-        let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
-            (Some(capture), _) | (None, Some(capture)) => capture,
-            (None, None) => &mut *admin,
-        };
+        let capture = prepared.sessions.capture(admin);
         let staged = pbps_pg::resolver::capture::compare_staged(
             capture,
             target,
@@ -1020,13 +1099,13 @@ impl Scratch<'_> {
         let wanted = externals::usage(target, &schemas).await.map_err(db(
             "the target deployer's usage of the externals file's schemas",
         ))?;
-        match (provisioning, &prepared.grantee, prepared.capture.as_mut()) {
-            (Provisioning::RunOwned, Some(grantee), Some(owner)) => {
-                externals::reproduce_usage(owner, grantee, &wanted)
+        match (provisioning, &prepared.grantee, &mut prepared.sessions) {
+            (Provisioning::RunOwned, Some(grantee), Sessions::RunOwned { capture: owner, .. }) => {
+                externals::reproduce_usage(&mut owner.conn, grantee, &wanted)
                     .await
                     .map_err(db("the deployer's usage of the externals file's schemas"))?;
             }
-            (Provisioning::Supplied, None, None) => {
+            (Provisioning::Supplied, None, Sessions::Supplied(_)) => {
                 // The account owns what its externals file created, so it already
                 // has USAGE; it gives up what the deployer lacks.
                 let unusable: Vec<String> = wanted
@@ -1051,10 +1130,7 @@ impl Scratch<'_> {
                 ));
             }
         }
-        let compile = match prepared.compile.as_mut() {
-            Some(compile) => compile,
-            None => &mut *admin,
-        };
+        let compile = prepared.sessions.compiling(admin).0;
         let reproduced = externals::usage(compile, &schemas)
             .await
             .map_err(db("the reproduced usage of the externals file's schemas"))?;
@@ -1129,23 +1205,28 @@ fn descriptions(created: &externals::Created) -> BTreeSet<String> {
         .collect()
 }
 
-/// Resets every setting of `session` for a shared-state read, then pins its
-/// path empty again, as every pbps session's is (DEC-1564.1). The pin is the
-/// session's, not the transaction's: `pbps-db` sets it with a plain `SET`,
-/// which `RESET ALL` clears, and what runs on the session after the commit
-/// (the backend check's `::text`, the compile) relies on it, where a type the
-/// script or fill created may be named `text`. A rollback restores the pin
-/// with the rest.
-async fn reset_settings(session: &mut Conn, which: &str) -> Result<(), Error> {
-    for statement in ["RESET ALL", "SET search_path = ''"] {
-        session
-            .execute(statement)
-            .await
-            .map_err(|error| Error::Read(format!("{which}'s settings: {error}")))?;
+/// The engine owns the reset recipe; lifecycle failures still use the run's
+/// ordinary cleanup path and preserve backend-replacement refusals.
+async fn reset_and_restore(
+    session: &mut Conn,
+    state: &SessionState,
+    reset: Reset,
+    which: &str,
+) -> Result<(), Error> {
+    #[cfg(test)]
+    if for_tests::restore_fails(session) {
+        return Err(Error::Read("injected session restoration failure".into()));
     }
-    // `RESET ALL` took the keeper's settings too (`sql::keep`).
-    keep_alive(session).await?;
-    Ok(())
+    pbps_pg::resolver::session::reset_and_restore(session, state, reset)
+        .await
+        .map_err(|error| match error {
+            pbps_pg::resolver::session::RestoreError::MovedBackend => {
+                Error::Unusable(error.to_string())
+            }
+            pbps_pg::resolver::session::RestoreError::Database(error) => {
+                Error::Read(format!("{which}'s settings: {error}"))
+            }
+        })
 }
 
 /// Sends fill's statements on `session` in one `REPEATABLE READ`
@@ -1158,6 +1239,7 @@ async fn reset_settings(session: &mut Conn, which: &str) -> Result<(), Error> {
 /// own.
 async fn run_fill(
     session: &mut Conn,
+    state: &SessionState,
     sql: &str,
     outside_writes: OutsideWrites,
 ) -> Result<(), Error> {
@@ -1177,7 +1259,13 @@ async fn run_fill(
         // second read's reset drops, and a role's `VALID UNTIL` would then
         // read as changed.
         if checked {
-            reset_settings(session, "the fill session").await?;
+            reset_and_restore(
+                session,
+                &state.observation(),
+                Reset::All,
+                "the fill session",
+            )
+            .await?;
         }
         let before = if checked {
             externals::shared_state(session)
@@ -1200,7 +1288,13 @@ async fn run_fill(
         if !checked {
             return Ok(());
         }
-        reset_settings(session, "the fill session").await?;
+        reset_and_restore(
+            session,
+            &state.observation(),
+            Reset::All,
+            "the fill session",
+        )
+        .await?;
         let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
@@ -1237,7 +1331,7 @@ async fn run_fill(
     // A `SET` an event trigger made on fill's statements outlasts the
     // commit, as the externals file's own do, and what runs next on this
     // session must not inherit it; the role is left as it is.
-    reset_settings(session, "the fill session").await
+    reset_and_restore(session, state, Reset::All, "the fill session").await
 }
 
 /// Every object in the scratch database initdb did not create.
@@ -1258,6 +1352,7 @@ async fn inventory(conn: &mut Conn) -> Result<externals::Inventory, Error> {
 /// file changes outside the database is kept, and is the operator's (#1674).
 async fn run_externals(
     session: &mut Conn,
+    state: &SessionState,
     sql: &str,
     outside_writes: OutsideWrites,
 ) -> Result<(), Error> {
@@ -1269,6 +1364,9 @@ async fn run_externals(
         .await
         .map_err(read("the externals file's transaction"))?;
     let outcome = async {
+        if checked {
+            reset_and_restore(session, &state.observation(), Reset::All, "the externals file session").await?;
+        }
         let before = if checked {
             externals::shared_state(session)
                 .await
@@ -1300,6 +1398,8 @@ async fn run_externals(
             }
             return Err(Error::Externals(vec![finding]));
         }
+        #[cfg(test)]
+        for_tests::after_externals(session, sql);
         // Under the settings the first read had, not the script's: its
         // `SET`s last on this session until `DISCARD ALL`, and a time zone
         // renders a role's expiry differently, a timeout can cancel the
@@ -1308,7 +1408,7 @@ async fn run_externals(
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
         // type the script creates may be named `text`: for the session, not
         // the transaction, as what runs after the commit relies on it too.
-        reset_settings(session, "the externals file session").await?;
+        reset_and_restore(session, &state.observation(), Reset::All, "the externals file session").await?;
         if !checked {
             return record::rebase(session)
                 .await
@@ -1345,20 +1445,7 @@ async fn run_externals(
         .execute("COMMIT")
         .await
         .map_err(read("the externals file's transaction"))?;
-    // Its `SET`s outlast the transaction; the supplied layout compiles on
-    // this same session next. The discard clears the empty path too, which
-    // is pinned again.
-    session
-        .execute("DISCARD ALL")
-        .await
-        .map_err(read("the externals file session's settings"))?;
-    session
-        .execute("SET search_path = ''")
-        .await
-        .map_err(read("the externals file session's path"))?;
-    // The discard took the keeper's settings too (`sql::keep`).
-    keep_alive(session).await?;
-    Ok(())
+    reset_and_restore(session, state, Reset::Discard, "the externals file session").await
 }
 
 // The readers also serve raw comparisons. Only the descriptions entering a
@@ -1673,19 +1760,6 @@ impl Scratch<'_> {
             }
         }
     }
-
-    pub(super) async fn restore_settings(
-        &self,
-        admin: &mut Conn,
-        authorization: &scope::Authorization,
-    ) -> Result<(), Error> {
-        if let scope::Authorization::Postgres(context) = authorization {
-            pbps_pg::resolver::authorization::apply_session_settings(admin, context)
-                .await
-                .map_err(|error| Error::Read(format!("the deployer's settings: {error}")))?;
-        }
-        pinned(admin, &self.backend).await
-    }
 }
 
 /// The private reconstruction and the target links it is compared against.
@@ -1757,6 +1831,27 @@ impl Scratch<'_> {
 }
 
 impl Prepared {
+    pub(super) fn supplied(&self) -> bool {
+        matches!(&self.sessions, Sessions::Supplied(_))
+    }
+
+    pub(super) fn session<'a>(&'a mut self, admin: &'a mut Conn) -> &'a mut Conn {
+        self.sessions.compiling(admin).0
+    }
+
+    pub(super) fn compiling<'a>(
+        &'a mut self,
+        admin: &'a mut Conn,
+        zone: Option<&pbps_model::SessionZone>,
+    ) -> Result<&'a mut Conn, Error> {
+        let zone = zone.ok_or_else(|| {
+            Error::Scope("the target reported no session time zone to compile in".into())
+        })?;
+        let (conn, state) = self.sessions.compiling(admin);
+        state.compiling(zone);
+        Ok(conn)
+    }
+
     pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
         // Where the chained shapes go: just after the last step that creates
         // a managed relation they name. A shape waiting for one scratch never
@@ -1855,16 +1950,13 @@ impl Binding {
         split: usize,
         outside_writes: OutsideWrites,
     ) -> Result<externals::Created, Error> {
-        let setup = match prepared.capture.as_mut() {
-            Some(owner) => owner,
-            None => &mut *admin,
-        };
+        let (setup, state) = prepared.sessions.setup(admin);
         let sql = &prepared.staging.chained;
         let db = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"))
         };
         let before = inventory(setup).await?;
-        run_fill(setup, sql, outside_writes).await?;
+        run_fill(setup, state, sql, outside_writes).await?;
         let after = inventory(setup).await?;
         // A module compiled before the split may have bound a name these
         // shapes take, as a routine call one of them now turns into a
@@ -1883,10 +1975,7 @@ impl Binding {
         target: &mut Conn,
         chained: &externals::Created,
     ) -> Result<Staged, Error> {
-        let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
-            (Some(capture), _) | (None, Some(capture)) => capture,
-            (None, None) => &mut *admin,
-        };
+        let capture = prepared.sessions.capture(admin);
         capture::compare_staged(
             capture,
             target,
@@ -1910,10 +1999,7 @@ impl Binding {
         desired: pbps_diff::Side<'_>,
         staged: &Staged,
     ) -> Result<Closing, Error> {
-        let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
-            (Some(capture), _) | (None, Some(capture)) => capture,
-            (None, None) => &mut *admin,
-        };
+        let capture = prepared.sessions.capture(admin);
         let dropped =
             dropped_signatures(extras, self.base_managed.dropped_by(&self.desired_managed))
                 .map_err(Error::Binding)?;
@@ -2077,13 +2163,6 @@ impl Binding {
         pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
             .map_err(|error| Error::Binding(error.to_string()))
     }
-}
-
-/// Sends the keeper's settings again after a `RESET ALL` or `DISCARD ALL`.
-async fn keep_alive(session: &mut Conn) -> Result<(), Error> {
-    sql::keep(session)
-        .await
-        .map_err(|error| Error::Read(format!("the session's keepalive settings: {error}")))
 }
 
 /// Makes the scratch session the run's keeper (#2410).

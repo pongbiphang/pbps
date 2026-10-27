@@ -6168,3 +6168,5 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
 mod recovery2410_tests;
 
 mod docker2410_tests;
+
+mod session2133_tests;

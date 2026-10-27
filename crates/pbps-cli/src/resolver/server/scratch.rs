@@ -412,13 +412,6 @@ impl Run<'_> {
             let chained = reconstruction
                 .fill_chained(&mut prepared, admin, split, outside_writes)
                 .await?;
-            // The supplied layout compiles on the session fill ran in, and
-            // fill's check ends in `RESET ALL`: the deployer's settings
-            // reproduced there are set again before anything compiles on
-            // it, as the first part compiled under them.
-            if prepared.supplied() {
-                self.state.restore_settings(admin, &authorization).await?;
-            }
             reconstruction
                 .compile(
                     &mut prepared,
