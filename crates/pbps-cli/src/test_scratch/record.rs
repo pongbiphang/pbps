@@ -163,16 +163,26 @@ impl StateDir {
     }
 
     /// Creates the run's lock and holds it. Fails when the lock cannot be taken:
-    /// a run id is never reused.
+    /// a run id is never reused. The file is locked **before** it appears under
+    /// its name (a hard link is atomic and fails on an existing name), so a
+    /// recovery that finds the name always finds a lock that is held, and never
+    /// one it could take and delete from under a run that is just starting.
     pub(super) fn lock(&self, run_id: &str) -> Result<File, Error> {
         let path = self.file(run_id, "lock");
+        let hidden = self.path.join(format!(".{run_id}.lock"));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
-            .map_err(|e| state(&path, e))?;
-        file.try_lock().map_err(|e| state(&path, e))?;
-        Ok(file)
+            .open(&hidden)
+            .map_err(|e| state(&hidden, e))?;
+        let published = file
+            .try_lock()
+            .map_err(|e| state(&hidden, e))
+            .and_then(|()| std::fs::hard_link(&hidden, &path).map_err(|e| state(&path, e)));
+        // Either way the hidden name has done its work; a kill between the two
+        // leaves one file named by 128 random bits, which nothing reads.
+        let _ = std::fs::remove_file(&hidden);
+        published.map(|()| file)
     }
 
     /// Replaces the run's record: written to a temporary file, flushed,

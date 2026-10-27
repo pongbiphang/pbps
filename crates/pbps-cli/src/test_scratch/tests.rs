@@ -7,7 +7,7 @@ use super::owner::{self, Owner, Process};
 use super::reconcile::{RUN_LABEL, reconcile};
 use super::record::{self, Container, Daemon, Record, State, StateDir, VERSION};
 use super::runtime::{Fail, Inspected, Runtime};
-use super::{FailureKind, TestScratch, state_dir};
+use super::{FailureKind, TestScratch, settle_failed_start, state_dir};
 
 /// A state directory in its own temporary directory, removed with it.
 ///
@@ -378,6 +378,40 @@ mod records {
         assert!(d.dir.try_lock_existing(&run('a')).unwrap().is_some());
     }
 
+    /// A recovery that finds the lock by name never finds one it can take while
+    /// the run that made it is alive, even as that run is only starting.
+    #[test]
+    fn a_lock_is_never_visible_before_it_is_held() {
+        let d = Dir::new();
+        for round in 0..3000 {
+            let id = format!("{round:032x}");
+            let path = d.dir.path().join(format!("{id}.lock"));
+            let (done, watcher_id) = (std::sync::atomic::AtomicBool::new(false), id.clone());
+            std::thread::scope(|scope| {
+                let spy = scope.spawn(|| {
+                    // Recovery's own move: take any lock it can see, and delete it.
+                    let mut stolen = 0;
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        if path.exists()
+                            && let Some(file) = d.dir.try_lock_existing(&watcher_id).unwrap()
+                        {
+                            stolen += 1;
+                            drop(file);
+                        }
+                    }
+                    stolen
+                });
+                let held = d.dir.lock(&id);
+                // Stop the spy before anything can panic, or the scope never ends.
+                done.store(true, std::sync::atomic::Ordering::Release);
+                assert_eq!(spy.join().unwrap(), 0, "a recovery took a live run's lock");
+                drop(held.expect("the lock is made"));
+            });
+            assert!(d.dir.try_lock_existing(&id).unwrap().is_some());
+            d.dir.remove(&id).unwrap();
+        }
+    }
+
     #[test]
     fn the_state_directory_follows_the_xdg_rule() {
         let env = |pairs: &'static [(&str, &str)]| {
@@ -448,6 +482,24 @@ mod recovery {
         assert_eq!(
             d.dir.read(&run('a')).unwrap().unwrap().state,
             State::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_that_reported_leftovers_keeps_its_record_whatever_the_listing_says() {
+        use pbps_cli::resolver::server::ProduceError;
+        let d = Dir::new();
+        let rec = record(&run('a'), State::Pending, None);
+        d.dir.write(&rec).unwrap();
+        let left = ProduceError::Cleanup(vec!["the docker volume vol1".into()]);
+        let failed = settle_failed_start(&d.dir, &rec, &left, &Fake::default()).await;
+        assert_eq!(failed.unwrap_err().kind, FailureKind::NotRemoved);
+        // Negative: a start that only failed, with nothing found, owes nothing.
+        let refused = ProduceError::Acquire("no image".into());
+        assert!(
+            settle_failed_start(&d.dir, &rec, &refused, &Fake::default())
+                .await
+                .is_ok()
         );
     }
 

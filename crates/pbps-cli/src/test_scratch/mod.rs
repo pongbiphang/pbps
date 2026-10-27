@@ -19,6 +19,7 @@ use std::fs::File;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::Driver;
 
+use pbps_cli::resolver::server::ProduceError;
 use pbps_cli::resolver::server::scratch::container::{Held, Owner as ContainerOwner};
 
 pub(crate) use reconcile::Reconciliation;
@@ -104,6 +105,28 @@ pub(crate) async fn recover(
         .map_err(|_| Error::Runtime("the runtime did not answer before the deadline".into()))?
         .map_err(|f| Error::Runtime(f.to_string()))?;
     reconcile::reconcile(dir, &Docker, &daemon, deadline).await
+}
+
+/// What a failed start owes before its record may go. The start's own removal
+/// reports what it left (a volume, say) in the error alone, and the record does
+/// not hold it yet, so an empty listing must not be read as "gone" then.
+async fn settle_failed_start(
+    dir: &StateDir,
+    record: &Record,
+    error: &ProduceError,
+    rt: &impl Runtime,
+) -> Result<(), CleanupFailure> {
+    if matches!(error, ProduceError::Cleanup(_)) {
+        let detail = "the start's own removal was not confirmed".into();
+        return Err(failure(
+            dir,
+            &record.run_id,
+            FailureKind::NotRemoved,
+            Vec::new(),
+            detail,
+        ));
+    }
+    clean(dir, record, rt).await
 }
 
 /// A run's record and lock, advanced as the run advances.
@@ -242,7 +265,7 @@ impl<'d> TestScratch<'d> {
             Err(error) => {
                 // A start that failed leaves a record; it is deleted only once
                 // the runtime confirms nothing of the run exists.
-                let cleaned = clean(dir, &journal.record, &Docker).await;
+                let cleaned = settle_failed_start(dir, &journal.record, &error, &Docker).await;
                 Err(Error::Start(match cleaned {
                     Ok(()) => {
                         dir.remove(&run_id)?;
