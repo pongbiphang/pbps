@@ -3876,11 +3876,12 @@ a type whose input aliases the internal `pg_advisory_unlock_all` entry point
 releases a session advisory lock while the temporary CHECK is bound, and the
 lock stays released after rollback.
 
-In the vetter's existing transaction, read one catalog closure: base types
+With no string or typed literal, return before querying the catalog so that
+an unreadable catalog cannot abort a literal-free bind's transaction. Otherwise,
+in the vetter's existing transaction, read one catalog closure: base types
 whose input routine is outside `pg_catalog`, then arrays, domains, composites,
-ranges and multiranges containing one of them. An empty closure skips text
-inspection altogether. With no string or typed literal, this guard adds no
-refusal. Otherwise the shared lexer removes comments and literals from code;
+ranges and multiranges containing one of them. An empty closure skips name
+inspection. Otherwise the shared lexer removes comments and literals from code;
 whole identifier tokens preserve quoted names and qualification. Name-only
 target lookups carry no type modifiers and keep built-in aliases distinct
 from same-spelled extension types. No lexer

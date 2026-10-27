@@ -35,6 +35,7 @@ async fn install(db: &mut Scratch) {
         CREATE FUNCTION app.unary(app.unsafe) RETURNS text LANGUAGE sql AS 'SELECT NULL::text';
         CREATE OPERATOR app.+ (RIGHTARG=app.unsafe, FUNCTION=app.unary);
         ALTER TABLE app.t ADD COLUMN secret app.unsafe;
+        ALTER TABLE app.t ADD COLUMN \"coalesce\" app.unsafe;
         ALTER TABLE app.t ADD COLUMN \"Unsafe Type Extended\" text;
         SET search_path = app, pg_catalog",
     )
@@ -97,6 +98,7 @@ async fn literal_input_lock_witness(index: usize) {
             ("status OPERATOR(app.@@) 'x'", "app.unsafe"),
             ("status @@ 'x'", "app.unsafe"),
             ("status=+'x'", "app.unsafe"),
+            (r#"COALESCE("coalesce", 'x')"#, "app.unsafe"),
             (r#"'x'::app."Unsafe Type""#, "app.Unsafe Type"),
         ] {
             db.sql("SELECT pg_advisory_lock(2378)").await;
@@ -153,7 +155,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             "CAST(status AS text)",
             "CAST(status AS integer)",
             "status::double precision",
-            "COALESCE(status, 'active')",
+            "COALESCE(status, 'x')",
             "length(status || 'x')",
             "status IS NULL",
             "status || 'app.unsafe' /* app.accepts('x') */",
@@ -223,6 +225,13 @@ async fn an_unreadable_literal_input_catalog_is_a_refusal() {
             .await;
         let mut conn = db.as_role(&role).await;
         let column: ColumnRef = "app.t.status".parse().unwrap();
+        let literal_free = vet_conversion(
+            &mut conn,
+            &column,
+            &ColumnType::simple("text"),
+            "status::integer",
+        )
+        .await;
         let result = vet_conversion(
             &mut conn,
             &column,
@@ -232,6 +241,12 @@ async fn an_unreadable_literal_input_catalog_is_a_refusal() {
         .await;
         drop(conn);
         db.drop().await;
+        literal_free.unwrap_or_else(|why| {
+            panic!(
+                "PG{}: literal-free conversion must not read the closure: {why}",
+                server.label
+            )
+        });
         assert!(
             result
                 .unwrap_err()
