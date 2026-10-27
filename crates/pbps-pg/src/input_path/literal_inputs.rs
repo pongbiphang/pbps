@@ -100,7 +100,7 @@ pub(super) async fn before_bind(
     let mut end = 0;
     for (index, span) in spans.iter().enumerate() {
         rewritten.push_str(&expression[end..span.start]);
-        rewritten.push_str(&format!("${}", index + 1));
+        rewritten.push_str(&format!(" ${} ", index + 1));
         end = span.end;
     }
     rewritten.push_str(&expression[end..]);

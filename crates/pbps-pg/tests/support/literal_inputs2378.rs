@@ -392,3 +392,25 @@ async fn modifier_lock_witness(index: usize) {
     assert!(why.contains("42704"), "{why}");
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn replacement_parameters_keep_neighboring_tokens_separate() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "boundaries2378").await;
+        db.sql("CREATE SCHEMA app; CREATE TABLE app.t (status text)")
+            .await;
+        install(&mut db).await;
+        let column: ColumnRef = "app.t.status".parse().unwrap();
+        for using in [
+            "status = 'active'OR status IS NULL",
+            "'a'||'b'",
+            "CASE WHEN status = 'active'THEN'a'ELSE'b'END",
+        ] {
+            vet_conversion(&mut db.conn, &column, &ColumnType::simple("text"), using)
+                .await
+                .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
+        }
+        db.drop().await;
+    }
+}
