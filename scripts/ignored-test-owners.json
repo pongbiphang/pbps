@@ -625,6 +625,7 @@
         "unreadable_cluster_identity_allows_deployment_but_keeps_the_parent_refusal",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "domain_vet2309::domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_warn",
+        "domain_vet2309::domain_vet2309_xml_fragments_use_deployment_pins_with_database_and_role_defaults",
         "domain_vet2309::domain_vet2309_refuses_check_default_operator_and_nested_types_before_writing",
         "domain_vet2309::domain_vet2309_compliant_staged_and_no_resolver_plans_keep_apply_vetting",
         "domain_vet2309::domain_vet2309_unavailable_warns_policy_escalates_and_unrelated_plans_do_not_acquire",

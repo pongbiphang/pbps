@@ -4,6 +4,7 @@ use super::{Provenance, Standard, Tokens};
 use crate::resolver::scope;
 use pbps_db::resolver::environment::Verdict;
 use pbps_db::{Conn, Driver};
+use pbps_dialect::Dialect;
 use pbps_model::{Hints, IdsFile, PlanMode, Schema};
 
 /// An answered refusal is distinct from a scratch that could not answer.
@@ -113,7 +114,16 @@ pub async fn vet(
         if catalog.observations.get(version) != prepared.catalog().observations.get(version) {
             return Err(run(Error::Incompatible(vec![version.into()])));
         }
+        let zone = target.session_zone().cloned().ok_or_else(|| {
+            run(Error::Scope("the target reported no session time zone to vet in".into()))
+        })?;
         let session = prepared.session(&mut admin);
+        // Compile under the same pins as binding reconstruction and apply,
+        // rather than the database/role defaults reproduced on scratch.
+        // Session pins also survive the bound-tree reader's transactions.
+        if let Some(pins) = dialect.session_pins(&zone) {
+            session.execute(&pins).await.map_err(read)?;
+        }
         for statement in lowered.groups().iter().flat_map(|g| g.statements()) {
             if let Err(error) = session.execute(&statement.sql).await {
                 let Some(annotation) = &statement.declared_type else {

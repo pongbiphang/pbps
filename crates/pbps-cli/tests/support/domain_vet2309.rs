@@ -458,3 +458,98 @@ fn domain_vet2309_managed_missing_functions_are_named_and_other_compile_errors_w
         assert!(!stdout(&out).contains("plan.domain-code"));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domain_vet2309_xml_fragments_use_deployment_pins_with_database_and_role_defaults() {
+    for var in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let server = std::env::var(var).unwrap();
+        for role_default in [false, true] {
+            let own = OwnDatabase::new(&server, "domain2309xml");
+            let db = own.connection();
+            on_server(
+                &server,
+                &format!(
+                    "ALTER DATABASE {} SET xmloption = document; ALTER DATABASE {} SET TimeZone = 'America/New_York'",
+                    own.name, own.name
+                ),
+            );
+            if role_default {
+                on_server(
+                    &server,
+                    &format!(
+                        "ALTER ROLE postgres IN DATABASE {} SET xmloption = document",
+                        own.name
+                    ),
+                );
+            }
+            // The premise must hold on a fresh target session, including when
+            // a database-specific role default supplies the ambient setting.
+            assert_eq!(
+                text_of(db, "SELECT current_setting('xmloption')"),
+                "document"
+            );
+            assert_eq!(
+                text_of(db, "SELECT current_setting('TimeZone')"),
+                "America/New_York"
+            );
+            assert!(try_on_server(db, "SELECT '<a/><b/>'::xml").is_err());
+            on_server(db, "CREATE SCHEMA app");
+            on_server(db, EXTERNALS);
+            let scratch = Scratch::new(&server);
+            // Pinned settings are excluded from authorization reproduction.
+            // Give supplied scratch an ambient document parser too, so its
+            // clean server default cannot hide a missing deployment pin.
+            let scratch_connection =
+                format!("{} options='-c xmloption=document'", scratch.connection);
+            assert_eq!(
+                text_of(&scratch_connection, "SELECT current_setting('xmloption')"),
+                "document"
+            );
+            let d = Demo::new("domain2309xml");
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "empty database"]));
+            std::fs::write(d.dir.join("externals.sql"), "").unwrap();
+            declaration(
+                &d,
+                "domain: app.d\ntype: xml\ndefault: \"'<a/><b/>'::xml\"\nchecks: {compliant: 'VALUE IS NOT NULL'}\n",
+            );
+            let path = d.dir.join("vet.plan.json");
+            for policy in [
+                "",
+                "policies:\n  rules:\n    plan.domain-vet-unavailable: error\n",
+            ] {
+                config(&d, policy);
+                let report = json_output(succeeds(plan(&d, db, &scratch_connection, &[])));
+                scratch.released();
+                assert!(
+                    !report["findings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|finding| finding["id"] == "plan.domain-vet-unavailable"),
+                    "{var}, role default {role_default}: {report}"
+                );
+                assert!(path.exists());
+                std::fs::remove_file(&path).unwrap();
+            }
+            // Pinning the parser must not admit user-written code. Keep the
+            // XML default so a missing pin would mask the named refusal with
+            // an advisory compile failure instead.
+            std::fs::write(d.dir.join("externals.sql"), EXTERNALS).unwrap();
+            declaration(
+                &d,
+                "domain: app.d\ntype: xml\ndefault: \"'<a/><b/>'::xml\"\nchecks: {user_check: 'ext.bad(VALUE::text)'}\n",
+            );
+            let refused = plan(&d, db, &scratch_connection, &[]);
+            scratch.released();
+            let said = format!("{}{}", stdout(&refused), stderr(&refused));
+            assert_ne!(code(&refused), 0, "{said}");
+            for expected in ["app.d", "CHECK `user_check`", "ext.bad"] {
+                assert!(said.contains(expected), "{expected}: {said}");
+            }
+            assert!(!said.contains("plan.domain-vet-unavailable"), "{said}");
+            assert!(!path.exists());
+        }
+    }
+}
