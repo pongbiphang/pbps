@@ -45,6 +45,36 @@ async fn trustworthy_off(conn: &mut impl QueryConnection) -> Result<(), DbError>
     Ok(())
 }
 
+/// The cleanup capability uses the same irreversible owner entry as the
+/// captured-dbo deployer, without inventing a target authorization context.
+pub(crate) async fn enter_cleanup_owner(
+    conn: &mut impl ExecuteConnection,
+    scope: &SandboxScope<'_>,
+) -> Result<SandboxDeployer, DbError> {
+    let row = super::super::scratch::one(
+        conn.query("SELECT USER_NAME() AS name, DB_NAME() AS db;")
+            .await?,
+        "bounded dbo entry",
+    )?;
+    if required(&row, "name", "the sandbox user")? != scope.sandbox
+        || required(&row, "db", "the scratch database")? != scope.scratch
+    {
+        return Err(DbError::Refused(
+            "bounded dbo entry requires the original sandbox".into(),
+        ));
+    }
+    trustworthy_off(conn).await?;
+    conn.execute("EXECUTE AS USER=N'dbo' WITH NO REVERT;")
+        .await?;
+    trustworthy_off(conn).await?;
+    let entered = SandboxDeployer {
+        name: RoleName::from("dbo"),
+        dbo: true,
+    };
+    super::super::scratch::deployer_checks(conn, scope.databases, scope.scratch, &entered).await?;
+    Ok(entered)
+}
+
 /// Enters the target's database identity and restores the captured session.
 /// Both entry kinds use NO REVERT; target dbo uses scratch's own dbo, whose
 /// owner exemptions a db_owner member cannot reproduce.
@@ -72,25 +102,22 @@ pub async fn enter_sandbox_deployer(
             "the captured dbo identity contradicts its owner flag".into(),
         ));
     }
-    let name = if dbo {
-        trustworthy_off(conn).await?;
-        RoleName::from("dbo")
+    let entered = if dbo {
+        enter_cleanup_owner(conn, scope).await?
     } else {
-        map.deployer(context)
-            .ok_or_else(|| DbError::BadRow("no run-local deployer was mapped".into()))?
+        let name = map
+            .deployer(context)
+            .ok_or_else(|| DbError::BadRow("no run-local deployer was mapped".into()))?;
+        conn.execute(&format!(
+            "EXECUTE AS USER = {} WITH NO REVERT;",
+            literal(name.raw())
+        ))
+        .await?;
+        let entered = SandboxDeployer { name, dbo: false };
+        super::super::scratch::deployer_checks(conn, scope.databases, scope.scratch, &entered)
+            .await?;
+        entered
     };
-    conn.execute(&format!(
-        "EXECUTE AS USER = {} WITH NO REVERT;",
-        literal(name.raw())
-    ))
-    .await?;
-    if dbo {
-        // An administrator can change this option between acquisition and
-        // entry. Check on the entered connection before any compile DDL.
-        trustworthy_off(conn).await?;
-    }
-    let entered = SandboxDeployer { name, dbo };
-    super::super::scratch::deployer_checks(conn, scope.databases, scope.scratch, &entered).await?;
     if facts.settings.get("language").map(|setting| &setting.value) != Some(&context.language) {
         return Err(DbError::BadRow(
             "the captured language and authorization context disagree".into(),

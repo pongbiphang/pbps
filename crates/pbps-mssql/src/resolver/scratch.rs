@@ -10,6 +10,7 @@ pub mod inventory;
 pub mod options;
 pub mod recovery;
 mod system;
+pub mod visibility;
 
 pub(crate) fn literal(value: &str) -> String {
     format!("N'{}'", value.replace('\'', "''"))

@@ -2410,6 +2410,10 @@
         "darwin"
       ],
       "cases": [
+        "resolver::server::scratch::mssql_live_tests::visibility2314::supplied_visibility_repair_restores_exact_acl_and_reuses_the_database",
+        "resolver::server::scratch::mssql_live_tests::visibility2314::cancelled_file_before_inventory_uses_retained_visibility",
+        "resolver::server::scratch::mssql_live_tests::visibility2314::changed_identity_marker_trust_or_connection_never_certifies_repair",
+        "resolver::server::scratch::mssql_live_tests::visibility2314::repair_triggers_are_bounded_and_drops_return_to_the_original_sandbox",
         "resolver::server::scratch::mssql_live_tests::mssql_dbo_compile_session_keeps_the_marker_and_cleans_through_a_fresh_sandbox",
         "resolver::server::scratch::mssql_live_tests::mssql_externals_file_failure_and_partial_commit_release_owned_resources",
         "resolver::server::scratch::mssql_live_tests::mssql_prepare_renders_missing_external_and_returns_entered_compile_connection",

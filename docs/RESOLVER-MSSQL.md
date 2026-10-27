@@ -264,6 +264,11 @@ for a moment keeps that type.
   - the declared objects run as the reproduced deployer (§5), an ordinary
     loginless user or scratch's own dbo, entered from the sandbox
     `WITH NO REVERT` (DEC-2267.1).
+  - supplied-scratch release retains a separate bounded dbo connection only
+    for visibility repair (DEC-2314.1). It records the pre-file visibility
+    inputs, restores them under the same TRUSTWORTHY-OFF and token checks,
+    then irreversibly re-enters the original sandbox for ordinary cleanup.
+    Repair never executes through the provisioning login.
 
   The ordinary deployer is loginless and carries its captured database
   authority. The dbo route
@@ -519,6 +524,15 @@ They cannot be schema-bound, creation does not execute their reads, and
 the loginless `db_owner` sandbox can grant, deny and revoke them itself.
 Every other permission on a system object must be absent. A denied catalog
 read refuses by catalog name; it never certifies emptiness (DEC-2236.1).
+
+On supplied scratch, acquisition records these catalog SELECT ACLs before
+untrusted execution, including accepted residual grants/denies and their
+grantors/options. Release restores that visibility baseline before its
+ordinary inventory (DEC-2314.1), so a file-made public DENY cannot survive
+a successful cleanup and blind the next run. This does not turn a hidden
+post-file read into an empty inventory or recreate unrelated missing built-ins.
+A changed recovery identity, lost session, TRUSTWORTHY ON or failed repair
+retains the existing named cleanup failure.
 
 **How the inventory is read.** Securable classes and an explicit sweep of
 non-securable catalogs supply the inventory. A
