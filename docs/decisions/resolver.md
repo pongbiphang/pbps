@@ -4973,3 +4973,43 @@ containers an earlier version left are removed by hand once. Removal is the
 run's own (`kill`, `rm --force --volumes`, and a read that confirms the
 container and its volumes gone), and a failure is a warning, never a refusal.
 
+
+<a id="dec-2314-1"></a>
+
+**DEC-2314.1. Supplied-scratch release restores a recorded visibility baseline through a retained bounded dbo session before returning to the original sandbox.**
+A fresh connection under the same principal retains database-persistent DENYs;
+reading as the provisioning login also fails to establish the sandbox's
+visibility and would lend its server authority to file-created DDL triggers.
+After the accepted empty inventory, acquisition retains a dedicated connection,
+enters the sandbox and then dbo irreversibly through the same TRUSTWORTHY-OFF
+and token checks as DEC-2267.1, and records the closed visibility ACL set.
+It covers database/schema CONTROL, SELECT and definition visibility, object
+CONTROL/VIEW DEFINITION, and SELECT on ms-shipped catalog views. Baseline
+rows retain securable, grantee, grantor and grant/deny/grant-option state.
+Release removes file changes, restores only recorded rows (including grants
+lost to CASCADE), and restores the run-created sandbox's db_owner-only role
+membership. It leaves unrelated permissions and the ordinary inventory's
+unrestorable-built-in rules alone. The capability binds its retained backend,
+live marker, database GUID/owner and original sandbox ID/SID/creation time;
+every repair statement checks these and TRUSTWORTHY before and after execution.
+Failure certifies no cleanup and takes the existing named-residual path.
+After exact baseline verification, the connection irreversibly re-enters the
+original sandbox and passes its ordinary strict context checks. Only then does
+the existing inventory order and guarded DROP cleanup run; the fresh supplied
+account drops the sandbox only after its existing empty checks. No file SQL
+runs on the repair connection. Hidden post-file inventories still refuse.
+This is in-process release recovery, not recovery after losing the process.
+
+Measured on the pinned SQL Server: direct/public/inherited catalog denials,
+revoked grant-option chains and covering CONTROL denials repair to the exact
+original ACL. Guest can be a catalog grantor; REVOKE of a DENY can erase the
+original GRANT, so a generic unconditional GRANT is insufficient. Database DDL
+triggers see dbo without server or outside-database authority during repair,
+then the original sandbox during DROP, for sa-owned and ordinary-owned
+databases. Re-entering the sandbox removes dbo's deny-only system-token extras
+and passes the existing separation checks. A retained execution context does
+not prevent DROP USER, so checking the original principal is mandatory.
+
+The inventory's table-valued `sys.fn_builtin_permissions` is server-scoped:
+SQL Server rejects a scratch-local SELECT DENY with 4629. Its permissions
+belong to master's existing separation contract, not this database repair set.

@@ -32,6 +32,7 @@ use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod sandbox;
+pub(crate) use sandbox::enter_cleanup_owner;
 mod staged;
 pub use sandbox::{SandboxDeployer, SandboxScope, apply_session_settings, enter_sandbox_deployer};
 pub use staged::{

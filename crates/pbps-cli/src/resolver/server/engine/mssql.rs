@@ -34,6 +34,8 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     backend: sql::Backend,
     created: Created,
     entered: bool,
+    // Staging futures borrow Scratch across awaits; only release takes the socket.
+    visibility: Option<tokio::sync::Mutex<(Conn, sql::visibility::Visibility)>>,
     acquired: Option<sql::Database>,
     externals: Option<&'a str>,
     request: &'a ScopeRequest,
@@ -159,6 +161,7 @@ pub(in crate::resolver::server) async fn preview<'a>(
         backend,
         created: Created::Nothing,
         entered: false,
+        visibility: None,
         acquired: None,
         externals: None,
         request,
@@ -302,6 +305,7 @@ pub(super) async fn scratch<'a>(
             backend,
             created: Created::Nothing,
             entered: false,
+            visibility: None,
             acquired: None,
             externals,
             request,
@@ -536,6 +540,16 @@ impl Scratch<'_> {
                 "the sandbox inventory is not empty: {}",
                 inventory.names().join(", ")
             )));
+        }
+        if provisioning == Provisioning::Supplied {
+            let mut repair = Conn::connect(Driver::Mssql, self.connection)
+                .await
+                .map_err(read)?;
+            let baseline =
+                sql::visibility::Visibility::retain(&mut repair, &self.mark, &sandbox, &databases)
+                    .await
+                    .map_err(read)?;
+            self.visibility = Some(tokio::sync::Mutex::new((repair, baseline)));
         }
         Ok(Acquired {
             owner,
@@ -934,6 +948,11 @@ impl Scratch<'_> {
                     verified.map_err(|error| vec![error.to_string()])?;
                     if entered {
                         let result = async {
+                            if let Some(retained) = self.visibility.take() {
+                                let (mut bounded, baseline) = retained.into_inner();
+                                baseline.restore(&mut bounded).await?;
+                                return Ok(bounded);
+                            }
                             let mut bounded = Conn::connect(Driver::Mssql, self.connection).await?;
                             if !sql::marked(&mut bounded, &self.mark).await?
                                 || sql::database(&mut bounded).await? != database
