@@ -4394,6 +4394,15 @@ Contract verification has three layers, with different timing and guarantees
 | 2 | A row precondition on recorded drop intent (`--require`, #2400), vetted like a recorded conversion | A pbps-generated check under the apply lock immediately before that drop; no plan-to-drop window |
 | 3 | Reviewed read-only target assertions (#2401), using ADR-0019's format | Plan time; path/hash/outcome enter the plan checksum, `explain` and ledger; failure/error publishes no plan |
 
+SQL Server's standalone row-predicate core (#2400 PR 2a) accepts a closed
+subset of expressions over the target table's bare columns and allowlisted
+built-ins; it regenerates only after scope and engine/compatibility vetting
+(DEC-2400.20–47). PR 2b will connect it to recorded intent and the check under
+the apply lock. Session dependence, including DATEFIRST/DATEFORMAT and similar
+settings, remains; the parser does not analyse it. PR 2b may pin session settings
+for the check statement. Unsupported forms name both remedies: a plan-time
+assertion (#2401, planned), or a CHECK constraint for the transition.
+
 Layer 3 accepts the window between plan and apply. It is not re-executed by
 `apply` and cannot replace a constraint or layer-2 predicate that must hold at
 the drop itself. SQL Server's target boundary is the separate least-privilege

@@ -1077,3 +1077,204 @@ unchanged declaration text and clean plans on both versions:
 `added_column_defaults_accept_full_expressions_and_converge_on_18`,
 `domain_defaults_accept_full_expressions_and_converge_on_16`,
 `domain_defaults_accept_full_expressions_and_converge_on_18`.
+
+
+<a id="dec-2400-20"></a>
+
+**DEC-2400.20. Closed SQL Server row-predicate core.**
+PR 2a supplies a standalone parser, vetter and regenerator; PR 2b supplies
+recording and the check under the apply lock. The private scalar/condition AST
+has only bare columns, no qualified reference, subquery, statement or raw SQL.
+A target-table-only resolver supplies engine-owned name binding; no offline
+collation guess is made. Only a scope- and capability-vetted AST can regenerate.
+Quoted identifiers use the existing lexical rules and regenerate as brackets;
+plain and national strings retain their prefix and double embedded quotes.
+The sole shared lexical extraction is the doubled-delimiter piece reader.
+
+The grammar accepts arithmetic and `+` concatenation, comparisons (including
+`!=`, `!<`, `!>`), NULL tests, IN lists, BETWEEN, LIKE with optional ESCAPE,
+NOT/AND/OR, and simple/searched CASE. Multiplication/division/modulus precede
+unary and binary signs, then comparisons, NOT, AND and OR; IN/BETWEEN/LIKE
+form complete search-condition atoms. Binary literals and bitwise operators,
+variables, other calls and type targets, and trailing tokens refuse with both
+remedies: a plan-time assertion (#2401, planned), or a transition CHECK.
+Built-in cast parameters reuse SQL Server type validation; omitted cast lengths
+are 30 (measured), not column declarations' 1. CASE allows ten nested levels.
+The input and tree depth are bounded. The engine still decides operand-type
+compatibility and runtime errors; this is a closed-syntax proof, not a type
+inference engine.
+
+Session dependence (DATEFIRST, DATEFORMAT, language, collation and similar
+settings) remains: no analyser claims independence. PR 2b may pin the session
+settings for its check statement. Current-image tests compare native and
+regenerated TRUE/FALSE/UNKNOWN, including plain versus national Unicode,
+quoted names, precedence, both CASE forms and the measured session differences.
+Historical engine boundaries are unit-only; the current image also measures
+compatibility 150/160. Tests: `grouping_quoting_and_plain_strings_preserve_native_results`,
+`datefirst_and_dateformat_remain_session_dependent`,
+`current_engine_and_compatibility_facts_gate_new_function_shapes`, and
+`engine_and_compatibility_matrix_gates_every_newer_shape`.
+
+<a id="dec-2400-21"></a>
+
+**DEC-2400.21. Predicate CAST.**
+Shape and gate: one scalar AS validated built-in type; baseline major 10.
+Live: `cast_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-22"></a>
+
+**DEC-2400.22. Predicate CONVERT.**
+Shape and gate: validated type, scalar, optional integer style; baseline major 10.
+Live: `convert_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-23"></a>
+
+**DEC-2400.23. Predicate COALESCE.**
+Shape and gate: two or more scalars (one argument is refused live); baseline major 10.
+Live: `coalesce_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-24"></a>
+
+**DEC-2400.24. Predicate ISNULL.**
+Shape and gate: two scalars; baseline major 10.
+Live: `isnull_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-25"></a>
+
+**DEC-2400.25. Predicate NULLIF.**
+Shape and gate: two scalars; baseline major 10.
+Live: `nullif_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-26"></a>
+
+**DEC-2400.26. Predicate LEFT.**
+Shape and gate: two scalars; baseline major 10.
+Live: `left_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-27"></a>
+
+**DEC-2400.27. Predicate RIGHT.**
+Shape and gate: two scalars; baseline major 10.
+Live: `right_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-28"></a>
+
+**DEC-2400.28. Predicate SUBSTRING.**
+Shape and gate: three scalars at major 10; two scalars require major 17.
+Live: `substring_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-29"></a>
+
+**DEC-2400.29. Predicate CHARINDEX.**
+Shape and gate: two or three scalars; baseline major 10.
+Live: `charindex_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-30"></a>
+
+**DEC-2400.30. Predicate REPLACE.**
+Shape and gate: three scalars; baseline major 10.
+Live: `replace_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-31"></a>
+
+**DEC-2400.31. Predicate LOWER.**
+Shape and gate: one scalar; baseline major 10.
+Live: `lower_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-32"></a>
+
+**DEC-2400.32. Predicate UPPER.**
+Shape and gate: one scalar; baseline major 10.
+Live: `upper_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-33"></a>
+
+**DEC-2400.33. Predicate LTRIM.**
+Shape and gate: one scalar at major 10; two require major 16 and compatibility 160.
+Live: `ltrim_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-34"></a>
+
+**DEC-2400.34. Predicate RTRIM.**
+Shape and gate: one scalar at major 10; two require major 16 and compatibility 160.
+Live: `rtrim_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-35"></a>
+
+**DEC-2400.35. Predicate TRIM.**
+Shape and gate: [characters FROM] scalar at major 14; LEADING/TRAILING/BOTH
+require major 16 and compatibility 160, and an explicit characters FROM clause
+(measured: omitting the characters or FROM is refused).
+Live: `trim_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-36"></a>
+
+**DEC-2400.36. Predicate LEN.**
+Shape and gate: one scalar; baseline major 10.
+Live: `len_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-37"></a>
+
+**DEC-2400.37. Predicate CONCAT.**
+Shape and gate: 2–254 scalars; major 11.
+Live: `concat_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-38"></a>
+
+**DEC-2400.38. Predicate ROUND.**
+Shape and gate: two or three scalars; baseline major 10.
+Live: `round_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-39"></a>
+
+**DEC-2400.39. Predicate FLOOR.**
+Shape and gate: one scalar; baseline major 10.
+Live: `floor_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-40"></a>
+
+**DEC-2400.40. Predicate CEILING.**
+Shape and gate: one scalar; baseline major 10.
+Live: `ceiling_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-41"></a>
+
+**DEC-2400.41. Predicate ABS.**
+Shape and gate: one scalar; baseline major 10.
+Live: `abs_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-42"></a>
+
+**DEC-2400.42. Predicate DATEADD.**
+Shape and gate: allowlisted datepart keyword and two scalars; baseline major 10.
+Live: `dateadd_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-43"></a>
+
+**DEC-2400.43. Predicate DATEDIFF.**
+Shape and gate: allowlisted datepart keyword and two scalars; baseline major 10.
+Live: `datediff_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-44"></a>
+
+**DEC-2400.44. Predicate DATEPART.**
+Shape and gate: allowlisted datepart keyword and one scalar (also TZOFFSET/ISO_WEEK); baseline major 10.
+Live: `datepart_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-45"></a>
+
+**DEC-2400.45. Predicate DATEFROMPARTS.**
+Shape and gate: three scalars; major 11.
+Live: `datefromparts_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-46"></a>
+
+**DEC-2400.46. Predicate JSON_VALUE.**
+Shape and gate: two scalars; major 13 with a literal path, major 14 with an expression path.
+Live: `json_value_regeneration_matches_native_three_valued_logic`.
+
+<a id="dec-2400-47"></a>
+
+**DEC-2400.47. Predicate CASE.**
+Shape and gate: simple or searched, at least one WHEN arm, optional ELSE, at most ten nested levels; baseline major 10.
+Live: `case_regeneration_matches_native_three_valued_logic`.

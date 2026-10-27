@@ -2544,6 +2544,44 @@
         "resolver::server::scratch::localdb_live_tests::localdb2271_a_missing_or_stopped_instance_fails_by_name_within_the_bound",
         "resolver::server::scratch::localdb_live_tests::localdb2271_a_restart_invalidates_the_old_run_and_a_fresh_run_requalifies"
       ]
+    },
+    {
+      "target": ["pbps-mssql", "test", "live"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": [
+        "predicate2400::cast_regeneration_matches_native_three_valued_logic",
+        "predicate2400::convert_regeneration_matches_native_three_valued_logic",
+        "predicate2400::coalesce_regeneration_matches_native_three_valued_logic",
+        "predicate2400::isnull_regeneration_matches_native_three_valued_logic",
+        "predicate2400::nullif_regeneration_matches_native_three_valued_logic",
+        "predicate2400::left_regeneration_matches_native_three_valued_logic",
+        "predicate2400::right_regeneration_matches_native_three_valued_logic",
+        "predicate2400::substring_regeneration_matches_native_three_valued_logic",
+        "predicate2400::charindex_regeneration_matches_native_three_valued_logic",
+        "predicate2400::replace_regeneration_matches_native_three_valued_logic",
+        "predicate2400::lower_regeneration_matches_native_three_valued_logic",
+        "predicate2400::upper_regeneration_matches_native_three_valued_logic",
+        "predicate2400::ltrim_regeneration_matches_native_three_valued_logic",
+        "predicate2400::rtrim_regeneration_matches_native_three_valued_logic",
+        "predicate2400::trim_regeneration_matches_native_three_valued_logic",
+        "predicate2400::len_regeneration_matches_native_three_valued_logic",
+        "predicate2400::concat_regeneration_matches_native_three_valued_logic",
+        "predicate2400::round_regeneration_matches_native_three_valued_logic",
+        "predicate2400::floor_regeneration_matches_native_three_valued_logic",
+        "predicate2400::ceiling_regeneration_matches_native_three_valued_logic",
+        "predicate2400::abs_regeneration_matches_native_three_valued_logic",
+        "predicate2400::dateadd_regeneration_matches_native_three_valued_logic",
+        "predicate2400::datediff_regeneration_matches_native_three_valued_logic",
+        "predicate2400::datepart_regeneration_matches_native_three_valued_logic",
+        "predicate2400::datefromparts_regeneration_matches_native_three_valued_logic",
+        "predicate2400::json_value_regeneration_matches_native_three_valued_logic",
+        "predicate2400::case_regeneration_matches_native_three_valued_logic",
+        "predicate2400::grouping_quoting_and_plain_strings_preserve_native_results",
+        "predicate2400::current_engine_and_compatibility_facts_gate_new_function_shapes",
+        "predicate2400::datefirst_and_dateformat_remain_session_dependent"
+      ]
     }
   ]
 }
