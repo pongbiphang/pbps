@@ -494,7 +494,7 @@ pub fn no_such_container(error: &str) -> bool {
 }
 
 /// And a missing volume (measured on #1674: `no such volume` on both).
-fn no_such_volume(error: &str) -> bool {
+pub fn no_such_volume(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such volume")
 }
 

@@ -96,8 +96,12 @@ pub(crate) async fn recover(
     dir: &StateDir,
     deadline: std::time::Instant,
 ) -> Result<Reconciliation, Error> {
-    let daemon = runtime::current()
+    // Discovery is bounded by the same deadline as the cleanup it serves.
+    let discovery =
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), runtime::current());
+    let daemon = discovery
         .await
+        .map_err(|_| Error::Runtime("the runtime did not answer before the deadline".into()))?
         .map_err(|f| Error::Runtime(f.to_string()))?;
     reconcile::reconcile(dir, &Docker, &daemon, deadline).await
 }
@@ -286,5 +290,19 @@ impl<'d> TestScratch<'d> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+/// Everywhere else the records refuse, by one typed error (the tests above are
+/// Linux-only because they use the same `/proc` the records do).
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported {
+    #[test]
+    fn run_records_refuse_off_linux() {
+        let dir = std::env::temp_dir().join("pbps-test-runs-unsupported");
+        assert!(matches!(
+            super::StateDir::open(dir),
+            Err(super::Error::Unsupported)
+        ));
+    }
+}

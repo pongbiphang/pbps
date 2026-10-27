@@ -85,6 +85,9 @@ struct Fake {
     inspect_fails: Option<Fail>,
     volume_users: BTreeMap<String, Vec<String>>,
     cannot_remove: Option<Vec<String>>,
+    /// Volumes the runtime still holds after their container went.
+    orphans: Vec<String>,
+    cannot_remove_volume: bool,
     removed: RefCell<Vec<String>>,
 }
 
@@ -133,6 +136,16 @@ impl Runtime for Fake {
 
     async fn users(&self, volume: &str) -> Result<Vec<String>, Fail> {
         Ok(self.volume_users.get(volume).cloned().unwrap_or_default())
+    }
+
+    async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
+        if self.cannot_remove_volume {
+            return Err(vec![format!("the docker volume {volume}")]);
+        }
+        if self.orphans.iter().any(|v| v == volume) {
+            self.removed.borrow_mut().push(volume.to_owned());
+        }
+        Ok(())
     }
 
     async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
@@ -425,6 +438,17 @@ mod recovery {
     }
 
     #[tokio::test]
+    async fn daemon_discovery_is_bounded_by_the_recovery_deadline() {
+        let d = Dir::new();
+        // An expired deadline ends the discovery, whatever the daemon is doing.
+        let error = super::super::recover(&d.dir, Instant::now())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("deadline"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_kill_before_the_create_leaves_nothing_and_the_record_goes() {
         let d = Dir::new();
         d.dir
@@ -462,6 +486,49 @@ mod recovery {
             (vec![run('a')], vec![id('b')])
         );
         assert!(!kept(&d, &run('a')));
+    }
+
+    #[tokio::test]
+    async fn a_volume_left_after_its_container_is_removed_or_keeps_the_record() {
+        let d = Dir::new();
+        d.dir
+            .write(&record(&run('a'), State::Created, Some(&id('b'))))
+            .unwrap();
+        // The container is gone and its recorded volume is not.
+        let rt = Fake {
+            orphans: vec!["vol1".into()],
+            ..Fake::default()
+        };
+        let done = reconciled(&d, &rt).await;
+        assert_eq!(
+            (done.removed, rt.removed.borrow().clone()),
+            (vec![run('a')], vec!["vol1".to_owned()])
+        );
+        // Negative: a volume the runtime will not drop, or another container
+        // now uses, keeps the record, and the latter is never removed.
+        let cases = [
+            Fake {
+                orphans: vec!["vol1".into()],
+                cannot_remove_volume: true,
+                ..Fake::default()
+            },
+            Fake {
+                volume_users: BTreeMap::from([("vol1".to_owned(), vec![id('f')])]),
+                orphans: vec!["vol1".into()],
+                ..Fake::default()
+            },
+        ];
+        let kinds = [FailureKind::NotRemoved, FailureKind::Conflict];
+        for (rt, kind) in cases.into_iter().zip(kinds) {
+            d.dir
+                .write(&record(&run('c'), State::Created, Some(&id('d'))))
+                .unwrap();
+            let done = reconciled(&d, &rt).await;
+            assert_eq!(done.failures.len(), 1, "{done:?}");
+            assert_eq!(done.failures[0].kind, kind);
+            assert!(rt.removed.borrow().is_empty() && kept(&d, &run('c')));
+            d.dir.remove(&run('c')).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -788,6 +855,9 @@ mod live {
             }
             async fn users(&self, volume: &str) -> Result<Vec<String>, Fail> {
                 Docker.users(volume).await
+            }
+            async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
+                Docker.remove_volume(volume).await
             }
             async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
                 Err(vec![format!("the container {id}")])

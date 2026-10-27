@@ -156,6 +156,34 @@ pub(super) async fn clean(
     for id in ids {
         remove_verified(dir, record, rt, &id).await?;
     }
+    // The container being gone says nothing of its volumes: a removal that
+    // died between the two leaves them, and the record is their only owner.
+    for volume in &record.volumes {
+        let what = format!("the volume {volume}");
+        let users = rt
+            .users(volume)
+            .await
+            .map_err(|f| from_fail(dir, &record.run_id, &what, f))?;
+        if !users.is_empty() {
+            let detail = format!("the volume is used by {}", users.join(", "));
+            return Err(failure(
+                dir,
+                &record.run_id,
+                FailureKind::Conflict,
+                vec![what],
+                detail,
+            ));
+        }
+        rt.remove_volume(volume).await.map_err(|left| {
+            failure(
+                dir,
+                &record.run_id,
+                FailureKind::NotRemoved,
+                left,
+                "removal was not confirmed".into(),
+            )
+        })?;
+    }
     Ok(())
 }
 

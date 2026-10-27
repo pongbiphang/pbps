@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use pbps_cli::resolver::server::scratch::container::{docker, no_such_container, remove_named};
+use pbps_cli::resolver::server::scratch::container::{
+    docker, no_such_container, no_such_volume, remove_named,
+};
 
 use super::record::Daemon;
 
@@ -56,6 +58,9 @@ pub(super) trait Runtime {
     async fn inspect(&self, id: &str) -> Result<Option<Inspected>, Fail>;
     /// The ids of the containers that mount `volume`.
     async fn users(&self, volume: &str) -> Result<Vec<String>, Fail>;
+    /// Removes a volume the run recorded, if the runtime still has it; the
+    /// names still there when it cannot confirm it gone.
+    async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>>;
     /// Removes the container with its volumes and confirms both gone; the
     /// names still there when it cannot.
     async fn remove(&self, id: &str) -> Result<(), Vec<String>>;
@@ -133,6 +138,15 @@ impl Runtime for Docker {
 
     async fn remove(&self, id: &str) -> Result<(), Vec<String>> {
         remove_named(id).await
+    }
+
+    async fn remove_volume(&self, volume: &str) -> Result<(), Vec<String>> {
+        match docker(&["volume", "rm", volume]).await {
+            Err(why) if !no_such_volume(&why) => {
+                Err(vec![format!("the docker volume {volume}: {why}")])
+            }
+            _ => Ok(()),
+        }
     }
 }
 
