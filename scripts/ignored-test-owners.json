@@ -2137,6 +2137,8 @@
         "literal_inputs2378::unrelated_extension_types_and_absent_literals_do_not_add_refusals",
         "literal_inputs2378::an_unreadable_literal_input_catalog_is_a_refusal",
         "literal_inputs2378::replacement_parameters_keep_neighboring_tokens_separate",
+        "literal_inputs2378::recorded_conversions_bind_probe_and_apply_on_one_empty_path_on_postgres_16",
+        "literal_inputs2378::recorded_conversions_bind_probe_and_apply_on_one_empty_path_on_postgres_18",
         "literal_inputs2378::modifiers_are_refused_before_parse_can_release_a_session_lock_on_postgres_16",
         "literal_inputs2378::modifiers_are_refused_before_parse_can_release_a_session_lock_on_postgres_18",
         "input_path_tests::a_null_fill_checks_domains_but_not_composite_attributes_array_elements_or_range_bounds",

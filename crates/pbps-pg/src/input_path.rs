@@ -869,10 +869,9 @@ pub async fn vet_conversion(
 ) -> Result<(), String> {
     let shown = column.shown().to_string();
     let shown = shown.as_str();
-    let ty = crate::types::normalize(from)
-        .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?
-        .raw()
-        .to_string();
+    let normalized = crate::types::normalize(from)
+        .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
+    let ty = normalized.raw().to_string();
     let quoted = crate::quote(column.name.raw())
         .map_err(|e| format!("the conversion of {shown} cannot be vetted: {e}"))?;
     let (quoted, ty) = (quoted.as_str(), ty.as_str());
@@ -886,7 +885,11 @@ pub async fn vet_conversion(
         .await
         .map_err(|_| unvetted("could not be vetted: no transaction to bind it in".into()))?;
     let result = async {
-        if let Some(inputs) = literal_inputs::before_bind(conn, using, ty).await.map_err(unvetted)? {
+        // Every binding must resolve exactly as the emitted conversion and row
+        // pre-flight do, independently of the caller's session (DEC-2378.2).
+        conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
+            .await.map_err(|_| unvetted("could not be vetted: its resolution path could not be pinned".into()))?;
+        if let Some(inputs) = literal_inputs::before_bind(conn, using, &normalized).await.map_err(unvetted)? {
             // Keep the original CHECK statement and its shape audit unchanged.
             // This separate empty table only supplies column types to Describe.
             conn.execute_with(&format!(
@@ -910,9 +913,6 @@ async fn vet_in_transaction(
     shown: &str,
 ) -> Result<(), String> {
     let refuse = |why: &str| format!("the conversion `USING {using}` of {shown} {why}");
-    // The write path the statement runs under is the session's own, set by the
-    // apply's pins, so a name binds here as it will there.
-    //
     // **One statement, by the protocol and not by reading the text** (round 3
     // review). `execute` is a simple-protocol batch, and text such as
     // `NULL) IS NULL) OR true)); COMMIT; SELECT f(); --` closes this statement

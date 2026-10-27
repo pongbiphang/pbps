@@ -3931,38 +3931,74 @@ type cast can also lose its unknown-constant special case and report 42883.
 These are explicit limitations of this pre-binding check, not guesses about a type name.
 
 Type modifiers need a separate guard: Parse itself calls `typmodin` even
-without literals. Read the small set of types whose modifier-input routine
-is outside `pg_catalog` before any bind or prepare; an empty set skips the
-name check. Use the shared lexer's code-only header and literal spans to
-match a modifier-set type followed by `(` only in a type position: after
-`::`, after unquoted `AS` or `RETURNING`, or when the matching `)` is followed
-by a string literal. Parentheses inside literals and quoted identifiers do
-not count. Unquoted names fold as PostgreSQL does, quoted names are exact,
-and a qualified type must name the catalog row's schema too. The source type
-used to make the temporary table is itself a type position and is checked
-before that table binds. The refusal names the type and says its modifier
-routine is not built in.
+without literals. Read the small set of type OIDs whose modifier-input routine
+is outside `pg_catalog` before any bind or prepare. An empty set skips name
+collection. Otherwise collect every identifier or qualified identifier chain
+from the shared lexer's code-only header, independently of its grammar
+position. Fold unquoted parts, preserve quoted parts, then quote every part
+for a bound name-only `to_regtype` lookup: `"as"` is a name, not a keyword,
+and `"app"."length"` cannot be confused with a builtin. No modifiers enter the
+lookup, so it cannot call `typmodin`. Compare catalog OIDs, including the
+normalized source type with its arguments removed structurally and its array
+identity retained, before creating either temporary table.
 
-Grammar references are PostgreSQL's [16 gram.y](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/parser/gram.y)
-and [18 gram.y](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y):
-`a_expr` and `b_expr` use `TYPECAST`; `func_expr_common_subexpr` covers
-CAST/TREAT/XMLSERIALIZE; `AexprConst` covers a modifier list followed by a
-string; and `json_output_clause_opt` (16) / `json_returning_clause_opt` (18)
-introduce the JSON result type. An ordinary function call, including
-`length(status)` or `pg_catalog.length(status)` beside an unrelated
-`app.length` modifier type, is left to the bound-tree audit. A same-named
-user routine is still refused by DEC-2181.1 there.
+Every lookup runs under the same empty search path as execution
+(DEC-2378.2). A bare name can resolve in `pg_catalog` or `pg_temp`, but an
+unrelated `app.length` or `app.numeric` cannot shadow builtin use. Only an
+explicit reference resolving to a modifier-set type refuses, naming that
+type and its non-built-in modifier routine. DEC-2181.1's bound-tree audit
+already refuses such types: this changes when they are refused, not which
+conversion it admits. SETOF, RETURNING and future type positions need no
+special rule. Literal and comment contents contribute no names. Grammar
+aliases such as `int` may yield no catalog name when quoted; builtins are
+never in this unsafe set. An absent candidate is harmless; an absent source,
+unreadable lookup or unreadable modifier catalog refuses. A failed modifier-set
+read refuses every conversion, including those without literals.
 
-Measured on 16.15 and 18.6, XMLSERIALIZE and JSON_ARRAY RETURNING resolve the
-fixture's modifier before refusing its custom result type with SQLSTATE
-42846: the session lock is already released. The guard and its lock witness
-therefore cover those positions even though this fixture cannot be a
-successful JSON or XML result type. A failed catalog read is unreadable
-evidence, never an empty set. A failed modifier-set read refuses every
-conversion while that read fails, including conversions without literals.
+Measured on 16.15 and 18.6, XMLSERIALIZE, SETOF and JSON_ARRAY RETURNING can
+resolve the fixture's modifier before a later refusal: without the guard the
+session lock has already been released. Name-only resolution retains that
+lock. Builtin `length`, numeric modifiers and numeric source OIDs remain
+admitted beside same-named app types.
 
 This adds no scratch requirement and changes no saved format or offline
 `convert` recording. Connected plan and apply share the same vetter. The
 literal and modifier lock witnesses run on both supported majors; removing
 either protection releases the lock. An unrelated unsafe type, sibling column
 or name in literal/comment text adds no refusal to ordinary built-in use.
+
+
+<a id="dec-2378-2"></a>
+
+**DEC-2378.2. A recorded conversion has one empty resolution path from vetting
+through execution (#2378).** The vetter pins `search_path` locally to empty
+before either pre-binding guard or the original CHECK binds. Its rollback
+restores the caller's path. Row pre-flight already pins the session to empty
+before vetting and probe execution. The emitted recorded-conversion ALTER now
+explicitly sets that same empty path; ordinary ALTERs keep their schema path.
+A session SET before the ALTER also pins standalone `--sql` replay: unscoped
+statements already assume the empty path, and scoped statements set their own.
+The lowered statement is shared by apply, staged execution, connected/dev
+rehearsal and `--sql` output, so none can reintroduce a schema-scoped resolution
+of the approved expression. The plan-test preparation in this tree assembles
+revisions and fixtures without binding or evaluating conversions; it has no
+independent execution path to pin. Any replay of the lowered SQL retains the
+statement-local pin.
+
+Measured on PostgreSQL 16.15 and 18.6, with a custom `app.length` type using
+`int8in`/`int8out`, `length('123')::text::integer` is admitted by the vetter
+under an empty path and evaluates to 3. The old schema-scoped ALTER instead
+resolves it as a cast to that type and stores 123, reaching an input routine
+the vetter never judged. The empty-path ALTER stores 3. Unqualified user types
+and functions that only bind on the session's app path now fail binding; their
+non-built-in targets were already forbidden by the final audit. Qualified
+references retain their ordinary guard/audit refusals. This does not pin
+arbitrary declared expressions to empty or change formats or scratch policy.
+
+Tests: `recorded_conversions_bind_probe_and_apply_on_one_empty_path` runs both
+majors, checks caller-path restoration, session-only name refusals and row
+pre-flight, then executes the real lowered SQL and requires 3. Reverting the
+ALTER pin stores 123; reverting the vetter pin resolves a user function and
+refuses valid builtin use. `modifiers_are_refused_before_parse_can_release_a_session_lock`
+covers type-name OIDs, builtin collisions, quoted names, SETOF/RETURNING,
+source arrays and unreadable name resolution on both supported majors.
