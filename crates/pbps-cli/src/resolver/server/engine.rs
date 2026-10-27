@@ -333,6 +333,25 @@ impl Scratch<'_> {
 }
 
 impl Prepared {
+    pub(super) fn completed_staged(&self) -> Option<Staged> {
+        match self {
+            Self::Mssql(prepared) => Some(Staged::Mssql(prepared.staged.clone())),
+            Self::Postgres(_) => None,
+        }
+    }
+
+    pub(super) fn dependency_placements(
+        &self,
+    ) -> std::collections::BTreeMap<
+        pbps_model::dependency::DependencyName,
+        pbps_model::resolver::DependencyPlacement,
+    > {
+        match self {
+            Self::Postgres(_) => Default::default(),
+            Self::Mssql(prepared) => prepared.dependency_placements(),
+        }
+    }
+
     pub(super) fn catalog(&self) -> &CatalogFacts {
         match self {
             Self::Postgres(prepared) => &prepared.scratch_catalog,
@@ -422,7 +441,7 @@ impl Binding {
             }
             (Self::Mssql(binding), Prepared::Mssql(prepared), Staged::Mssql(_)) => {
                 let len = binding.len();
-                binding.compile(prepared, 0..len).await
+                binding.compile(prepared, target, 0..len).await
             }
             _ => Err(unsupported()),
         }

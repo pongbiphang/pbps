@@ -4443,6 +4443,10 @@ pub async fn check_data_write(
 pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()> {
     plan.validate_analysis()?;
     if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+        evidence
+            .qualification()
+            .runtime
+            .validate_dependencies(&plan.dialect, plan.dependencies.keys())?;
         match plan.dialect.as_str() {
             "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
             engine => anyhow::bail!(

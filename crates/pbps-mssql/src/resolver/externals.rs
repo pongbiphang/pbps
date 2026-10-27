@@ -11,6 +11,39 @@ pub mod render;
 /// Only ordinary GO is a client command. Preserve every other byte, including
 /// comments on either side of a separator, for the engine's own parser.
 pub fn batches(script: &str) -> Result<Vec<&str>, DbError> {
+    Ok(scan(script)?.batches)
+}
+
+/// The marker is a complete line outside quotes and comments, not a token
+/// searched inside source text (DEC-2376.1).
+pub const DEFERRED_MARKER: &str = "-- pbps:deferred";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Sections<'a> {
+    pub immediate: &'a str,
+    pub deferred: Option<&'a str>,
+}
+
+pub fn sections(script: &str) -> Result<Sections<'_>, DbError> {
+    let scan = scan(script)?;
+    Ok(match scan.marker {
+        Some(marker) => Sections {
+            immediate: &script[..marker.start],
+            deferred: Some(&script[marker.end..]),
+        },
+        None => Sections {
+            immediate: script,
+            deferred: None,
+        },
+    })
+}
+
+struct Scan<'a> {
+    batches: Vec<&'a str>,
+    marker: Option<std::ops::Range<usize>>,
+}
+
+fn scan(script: &str) -> Result<Scan<'_>, DbError> {
     #[derive(Clone, Copy)]
     enum State {
         Sql,
@@ -21,7 +54,25 @@ pub fn batches(script: &str) -> Result<Vec<&str>, DbError> {
     let mut offset = 0;
     let mut start = 0;
     let mut result = Vec::new();
-    for line in script.split_inclusive('\n') {
+    let mut marker = None;
+    let mut lines = script.split_inclusive(['\r', '\n']).peekable();
+    while let Some(line) = lines.next() {
+        let line = if line.ends_with('\r') && lines.peek() == Some(&"\n") {
+            lines.next();
+            &script[offset..offset + line.len() + 1]
+        } else {
+            line
+        };
+
+        if matches!(state, State::Sql) && line.trim() == DEFERRED_MARKER {
+            if marker.replace(offset..offset + line.len()).is_some() {
+                return Err(DbError::Refused(
+                    "the externals file has a second deferred marker".into(),
+                ));
+            }
+            offset += line.len();
+            continue;
+        }
         let mut visible = if matches!(state, State::Quote(_)) {
             "x".into()
         } else {
@@ -97,7 +148,10 @@ pub fn batches(script: &str) -> Result<Vec<&str>, DbError> {
     if !script[start..].trim().is_empty() {
         result.push(&script[start..]);
     }
-    Ok(result)
+    Ok(Scan {
+        batches: result,
+        marker,
+    })
 }
 
 /// The caller has already entered its dedicated sandbox session. Execute
@@ -207,6 +261,36 @@ mod tests {
         assert!(batches("go -1 -- no").is_err());
         assert_eq!(batches("GO\r\nSELECT 1;").unwrap(), ["\r\nSELECT 1;"]);
     }
+    #[test]
+    fn deferred_section_uses_one_top_level_marker() {
+        let initial = "SELECT N'x\n-- pbps:deferred\nx';\n/* outer\n/* nested */\n-- pbps:deferred\n*/\nSELECT [a\n-- pbps:deferred\na];\n";
+        let script = format!("{initial}  {DEFERRED_MARKER}\r\nSELECT 2;");
+        let parts = sections(&script).unwrap();
+        assert_eq!(parts.immediate, initial);
+        assert_eq!(parts.deferred, Some("SELECT 2;"));
+        assert_eq!(sections(initial).unwrap().deferred, None);
+        for newline in ["\n", "\r\n", "\r"] {
+            let text = format!("SELECT 1;{newline}{DEFERRED_MARKER}{newline}SELECT 2;");
+            let sections = sections(&text).unwrap();
+            assert_eq!(sections.immediate, format!("SELECT 1;{newline}"));
+            assert_eq!(sections.deferred, Some("SELECT 2;"));
+        }
+
+        assert!(
+            sections(&format!("{DEFERRED_MARKER}\n{DEFERRED_MARKER}"))
+                .unwrap_err()
+                .to_string()
+                .contains("second deferred marker")
+        );
+        assert!(sections(&format!("{DEFERRED_MARKER}\n:r forbidden.sql")).is_err());
+        assert_eq!(
+            sections("-- pbps:deferred extra\nSELECT 1;")
+                .unwrap()
+                .deferred,
+            None
+        );
+    }
+
     #[test]
     fn sqlcmd_directive_refuses() {
         for text in [

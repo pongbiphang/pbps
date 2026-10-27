@@ -13,6 +13,7 @@ use pbps_mssql::resolver::{
 };
 use sql::recovery as record;
 
+mod chained;
 mod recovery;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,35 +53,52 @@ pub(in crate::resolver::server) struct Scratch<'a> {
     /// (`recovery::lock`): from before it reads what a dead run left until its
     /// own sandbox user exists.
     locked: bool,
+    chained: Option<capture::ExternalInputs>,
+    deferred: bool,
 }
 
 pub(in crate::resolver::server) struct Prepared {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#2376 seals dependency rehearsal placement")
-    )]
     pub(in crate::resolver::server) dependencies: dependencies::Rehearsals,
     /// The reproduced deployer, entered from the sandbox: the declarations
     /// compile here and nowhere else. It cannot leave its context, so a read
     /// that needs more than the deployer may see opens [`Reach::open`].
     pub(in crate::resolver::server) compile: Conn,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the principal map is sealed by #2143")
-    )]
     pub(in crate::resolver::server) map: scope::Principals,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the accepted inventory is sealed by #2143")
-    )]
     pub(in crate::resolver::server) inventory: externals::Inventory,
     pub(in crate::resolver::server) staged: capture::Staged,
     pub(super) scratch_catalog: CatalogFacts,
     pub(super) differences: Vec<String>,
     reach: Reach,
+    chaining: Box<chained::Chaining>,
 }
 
 impl Prepared {
+    pub(super) fn dependency_placements(
+        &self,
+    ) -> BTreeMap<pbps_model::dependency::DependencyName, pbps_model::resolver::DependencyPlacement>
+    {
+        use pbps_model::resolver::{DependencyPlacement, DependencyShape};
+        self.dependencies
+            .iter()
+            .map(|(name, rehearsal)| {
+                let placement = match rehearsal {
+                    dependencies::Rehearsal::BoundAgainstRealDatabase => {
+                        DependencyPlacement::Bound {}
+                    }
+                    dependencies::Rehearsal::CompanionRendered { source, .. } => {
+                        DependencyPlacement::Companion {
+                            shape: match source {
+                                dependencies::ShapeSource::Catalog => DependencyShape::Compared,
+                                dependencies::ShapeSource::Declaration => DependencyShape::Declared,
+                            },
+                        }
+                    }
+                };
+                (name.clone(), placement)
+            })
+            .collect()
+    }
+
     /// A copy of what reopens the scratch: `Prepared` holds the deployer's
     /// connection, so a borrow of it cannot be held across an await.
     pub(super) fn reach(&self) -> Reach {
@@ -171,6 +189,8 @@ pub(in crate::resolver::server) async fn preview<'a>(
         token,
         recorded: Vec::new(),
         locked: false,
+        chained: None,
+        deferred: false,
     };
     // Before the run creates anything: what runs killed earlier left.
     scratch.recover(provisioning, admin).await?;
@@ -315,6 +335,8 @@ pub(super) async fn scratch<'a>(
             token: tokens.scratch.clone(),
             recorded: Vec::new(),
             locked: false,
+        chained: None,
+        deferred: false,
         };
         // After the placement verdict and before the run's first write: what
         // runs killed earlier left (#2410).
@@ -579,6 +601,12 @@ impl Scratch<'_> {
                 "dependency `{}` requires a companion database; supplied scratch on another instance cannot create it", name.shown()
             )).collect()));
         }
+        let sections = self
+            .externals
+            .map(externals::sections)
+            .transpose()
+            .map_err(|e| Error::Externals(vec![e.to_string()]))?;
+        self.deferred = sections.as_ref().is_some_and(|s| s.deferred.is_some());
         let real = self.placement == Some(sql::Placement::SameInstance);
         let mut dependency_inputs =
             dependencies::read(target_connection, binding.dependencies, real)
@@ -603,10 +631,15 @@ impl Scratch<'_> {
         )
         .await
         .map_err(capture_error)?;
-        let waiting = required.waiting();
-        if !waiting.is_empty() {
-            return Err(Error::Externals(waiting));
-        }
+        let pending = required
+            .prerequisites()
+            .into_keys()
+            .collect::<BTreeSet<_>>();
+        let excluded = required
+            .managed()
+            .union(&pending)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut context = match authorization {
             scope::Authorization::Mssql(context) => auth::read(
                 target_connection,
@@ -632,7 +665,7 @@ impl Scratch<'_> {
         )
         .await
         .map_err(capture_error)?;
-        let initial_owners = auth::OwnerPartition::from_capture(&initial, &context)
+        let initial_owners = auth::OwnerPartition::for_staging(&initial, &context, &excluded)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         auth::read_staged_permissions(target_connection, &mut context, &initial_owners)
             .await
@@ -654,7 +687,8 @@ impl Scratch<'_> {
         let before = externals::inventory(&mut owner, &sandbox)
             .await
             .map_err(read)?;
-        if let Some(script) = self.externals {
+        if let Some(section) = &sections {
+            let script = section.immediate;
             let mut file = self.bounded(&database, &sandbox, &databases).await?;
             externals::run(&mut file, script)
                 .await
@@ -667,17 +701,19 @@ impl Scratch<'_> {
         let from_file = externals::created(&before, &middle);
         // Validate all file roots before filling; absence/overlap and hidden
         // shape errors name the file's object rather than a renderer failure.
-        capture::compare_staged_declared(
+        capture::compare_staged_pending(
             &mut owner,
             target_connection,
             &from_file,
             &[],
             binding.dependencies,
             key,
+            &pending,
         )
         .await
         .map_err(stage_error)?;
-        let items = externals::render::missing(&required, &from_file).map_err(Error::Externals)?;
+        let items = externals::render::missing_ready(&required, &from_file, &pending)
+            .map_err(Error::Externals)?;
         auth::reconstruct_missing_schemas(&mut owner, &map, &context)
             .await
             .map_err(read)?;
@@ -698,14 +734,18 @@ impl Scratch<'_> {
             // Inventory carries children with their new parent. Keep explicit
             // external roots too, including cascade/trigger barriers that
             // authorization must still compare (DEC-2270.2).
-            retained: created.union(required.roots()).cloned().collect(),
+            retained: created
+                .union(required.roots())
+                .filter(|id| !pending.contains(*id))
+                .cloned()
+                .collect(),
             candidates: BTreeSet::new(),
         };
         let target_inputs =
             capture::capture_declared(target_connection, &target_scope, binding.dependencies, key)
                 .await
                 .map_err(capture_error)?;
-        let target_owners = auth::OwnerPartition::from_capture(&target_inputs, &context)
+        let target_owners = auth::OwnerPartition::for_staging(&target_inputs, &context, &excluded)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         auth::read_staged_permissions(target_connection, &mut context, &target_owners)
             .await
@@ -731,7 +771,7 @@ impl Scratch<'_> {
             capture::capture_declared(&mut owner, &target_scope, binding.dependencies, key)
                 .await
                 .map_err(capture_error)?;
-        let current_owners = auth::OwnerPartition::from_capture(&current_inputs, &local)
+        let current_owners = auth::OwnerPartition::for_staging(&current_inputs, &local, &excluded)
             .map_err(|e| Error::Externals(vec![format!("{e:?}")]))?;
         target_owners.verify(&current_owners).map_err(read)?;
         let file_schemas = from_file
@@ -752,13 +792,14 @@ impl Scratch<'_> {
         )
         .await
         .map_err(read)?;
-        let staged = capture::compare_staged_declared(
+        let staged = capture::compare_staged_pending(
             &mut owner,
             target_connection,
             &created,
             &managed,
             binding.dependencies,
             key,
+            &pending,
         )
         .await
         .map_err(stage_error)?;
@@ -796,6 +837,17 @@ impl Scratch<'_> {
         let scratch_catalog = scope::read_catalog(&mut compile, Driver::Mssql, schemas, &[])
             .await
             .map_err(read)?;
+        let managed_ids = required.managed().clone();
+        self.chained = Some(required);
+        let chaining = chained::Chaining {
+            key: key.clone(),
+            pending,
+            managed_ids,
+            deferred: sections.and_then(|s| s.deferred.map(str::to_owned)),
+            managed: managed.iter().map(|s| (*s).clone()).collect(),
+            context,
+            token,
+        };
         Ok(Prepared {
             dependencies: dependency_inputs.rehearsals(),
             compile,
@@ -805,6 +857,7 @@ impl Scratch<'_> {
             scratch_catalog,
             differences,
             reach: self.reach(&database, &sandbox, &databases),
+            chaining: Box::new(chaining),
         })
     }
 
@@ -1082,9 +1135,15 @@ impl Scratch<'_> {
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
-        let reconstruction =
-            Reconstruction::new(&pbps_mssql::Mssql, binding.bootstrap, ids, dependencies)
-                .map_err(compile_failed)?;
+        let reconstruction = Reconstruction::with_chained(
+            &pbps_mssql::Mssql,
+            binding.bootstrap,
+            ids,
+            dependencies,
+            self.chained.as_ref(),
+            self.deferred,
+        )
+        .map_err(compile_failed)?;
         Ok(Binding {
             reconstruction,
             managed: capture::managed_scope(&[binding.base, binding.desired]),
@@ -1103,12 +1162,20 @@ impl Binding {
     pub(super) async fn compile(
         &self,
         prepared: &mut Prepared,
+        target: &mut Conn,
         steps: std::ops::Range<usize>,
     ) -> Result<(), Error> {
-        self.reconstruction
-            .compile_steps(&mut prepared.compile, steps)
-            .await
-            .map_err(compile_failed)
+        for at in steps {
+            if self.reconstruction.auxiliary(at).is_some() {
+                chained::execute(self, prepared, target, at).await?;
+            } else {
+                self.reconstruction
+                    .compile_steps(&mut prepared.compile, at..at + 1)
+                    .await
+                    .map_err(compile_failed)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads the compiled scratch on a fresh bounded sandbox connection: the

@@ -106,9 +106,23 @@ pub fn missing(
     if !waiting.is_empty() {
         return Err(waiting);
     }
+    missing_ready(inputs, present, &BTreeSet::new())
+}
+
+/// Missing independent roots only; native reconstruction steps hold pending
+/// shapes until their managed prerequisites exist.
+pub fn missing_ready(
+    inputs: &ExternalInputs,
+    present: &BTreeSet<ObjectIdentity>,
+    pending: &BTreeSet<ObjectIdentity>,
+) -> Result<Vec<Renderable>, Vec<String>> {
     let mut items = Vec::new();
     let mut refused = Vec::new();
-    for id in inputs.roots.difference(present) {
+    for id in inputs
+        .roots
+        .difference(present)
+        .filter(|id| !pending.contains(*id))
+    {
         match render(&inputs.captured, id) {
             Ok(item) => items.push(item),
             Err(error) => refused.push(format!("{error:?}; supply a matching externals file")),

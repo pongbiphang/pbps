@@ -2,6 +2,7 @@
 //! into the parts the engine creates one at a time, and one `Schedule`
 //! settles the constraints `prepare` states over them (DEC-2389.1).
 use super::{Constraint, Schedule};
+mod auxiliary;
 mod fill;
 mod trial;
 pub use fill::{FillDependency, FillNode, FillProgram, FillWork};
@@ -24,6 +25,7 @@ pub struct EdgeWhy {
     pub rule: EdgeRule,
 }
 
+pub use auxiliary::{Auxiliary, Node, Step};
 use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations};
 use pbps_model::{Change, ChangeSet, PlannedChange};
@@ -152,10 +154,21 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
 pub struct Input<M> {
     prepared: Prepared,
     parts: Vec<Part<M>>,
+    auxiliary: Vec<Auxiliary<M>>,
 }
 impl<M> Input<M> {
     pub fn new(prepared: Prepared, parts: Vec<Part<M>>) -> Self {
-        Self { prepared, parts }
+        Self {
+            prepared,
+            parts,
+            auxiliary: Vec::new(),
+        }
+    }
+
+    /// Scratch-only nodes, not changes or borrowed managed origins.
+    pub fn with_auxiliary(mut self, auxiliary: Vec<Auxiliary<M>>) -> Self {
+        self.auxiliary = auxiliary;
+        self
     }
 }
 /// Completed scratch input, branded by its engine. It cannot become the
@@ -173,8 +186,16 @@ pub struct ScratchPlan<E: Engine> {
     operations: Operations,
     changes: ChangeSet,
     trial: Option<TrialProgram<E>>,
+    steps: Vec<Step<E::Metadata>>,
 }
 impl<E: Engine> ScratchPlan<E> {
+    /// The execution sequence within compile ranges. Auxiliary positions are
+    /// hard boundaries: a trial of managed groups cannot overtake or retry
+    /// them unless their executor explicitly opts in (DEC-2376.1).
+    pub fn steps(&self) -> &[Step<E::Metadata>] {
+        &self.steps
+    }
+
     pub fn parts(&self) -> &[Part<E::Metadata>] {
         &self.parts
     }
@@ -198,7 +219,11 @@ impl<E: Engine> pbps_dialect::PlanPayload for ScratchPlan<E> {
 /// schedule's named refusal, and an order is its lowest position first among
 /// what is ready, so a part waits only where a constraint holds it.
 pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, String> {
-    let Input { prepared, parts } = engine.blueprint(input);
+    let Input {
+        prepared,
+        parts,
+        auxiliary,
+    } = engine.blueprint(input);
     let source = &prepared.changes;
     let mut at = vec![None; source.changes.len()];
     for (position, part) in parts.iter().enumerate() {
@@ -217,10 +242,6 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         }),
         ModuleEdits::InPlace,
     );
-    let mut schedule = Schedule::new(source.changes.len());
-    for edge in &prepared.edges {
-        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
-    }
     let names = ChangeSet {
         changes: source
             .changes
@@ -229,11 +250,8 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
             .collect(),
     };
     let mut dropped = Vec::new();
-    let settled = schedule
-        .settle_scratch(names.clone(), &mut dropped)
-        .map_err(|e| e.describe(&names))?;
+    let (settled, steps) = auxiliary::settle(&prepared, &at, &auxiliary, &mut dropped)?;
     let sequence: Vec<usize> = settled
-        .sequence
         .iter()
         .filter_map(|&operation| at[operation])
         .collect();
@@ -255,6 +273,7 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         operations,
         changes,
         trial,
+        steps,
     })
 }
 fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
@@ -268,6 +287,7 @@ fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod auxiliary_tests;
     use pbps_dialect::PlanPayload;
     use pbps_model::operation::{Origin, Source as LogicalSource, Spelling};
     use pbps_model::plan_names::At;

@@ -6,8 +6,9 @@
 use pbps_model::Text;
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::{
-    ObjectIdentity, OrderReason, OutsideWrites, Prerequisite, ResolverEvidence, ResolverRuntime,
-    SameInstance, ScratchLayout, ScratchSource, Surface, SurfaceResolution,
+    DependencyPlacement, DependencyShape, ObjectIdentity, OrderReason, OutsideWrites, Prerequisite,
+    ResolverEvidence, ResolverRuntime, SameInstance, ScratchLayout, ScratchSource, Surface,
+    SurfaceResolution,
 };
 
 /// What `explain` shows of a resolved plan's evidence.
@@ -30,6 +31,9 @@ pub struct ResolverDetail {
     /// The SQL Server same-instance file policy; omitted for PostgreSQL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub same_instance: Option<&'static str>,
+    /// Per-dependency observed placement, separate from the declaration's outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<DependencyDetail>,
     /// The compatibility rule the scratch was qualified under.
     pub rule: String,
     /// The identifier of the fingerprint key the evidence is keyed with.
@@ -46,6 +50,35 @@ pub struct ResolverDetail {
     /// The catalog records the bindings read, by identity: the target's,
     /// and those the plan itself installs.
     pub prerequisites: Vec<PrerequisiteDetail>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct DependencyDetail {
+    pub name: Text,
+    pub placement: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<&'static str>,
+}
+
+fn dependency(
+    name: &pbps_model::dependency::DependencyName,
+    placement: &DependencyPlacement,
+) -> DependencyDetail {
+    let (placement, shape) = match placement {
+        DependencyPlacement::Bound {} => ("bound", None),
+        DependencyPlacement::Companion { shape } => (
+            "companion",
+            Some(match shape {
+                DependencyShape::Compared => "compared",
+                DependencyShape::Declared => "declared, not compared",
+            }),
+        ),
+    };
+    DependencyDetail {
+        name: name.raw().into(),
+        placement,
+        shape,
+    }
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -115,6 +148,7 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
         layout,
         outside_writes,
         same_instance,
+        dependencies,
     } = &q.runtime;
     let (scratch, image) = match scratch {
         ScratchSource::Server {} => ("server", None),
@@ -146,6 +180,10 @@ pub fn detail(evidence: &ResolverEvidence) -> ResolverDetail {
             SameInstance::Refused => Some("refused"),
             SameInstance::Allowed => Some("allowed"),
         },
+        dependencies: dependencies
+            .iter()
+            .map(|(name, placement)| dependency(name, placement))
+            .collect(),
         rule: q.rule.clone(),
         key_id: evidence.before().key_id().to_owned(),
         sealed: vec![
@@ -299,6 +337,16 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
             ));
         }
     }
+    for dependency in &detail.dependencies {
+        out.push_str(&format!(
+            "  dependency {}: {}{}\n",
+            dependency.name.shown(),
+            dependency.placement,
+            dependency
+                .shape
+                .map_or_else(String::new, |shape| format!(" ({shape})"))
+        ));
+    }
     out.push_str("  surfaces\n");
     for surface in &detail.surfaces {
         out.push_str(&format!(
@@ -426,6 +474,7 @@ mod tests {
             layout: "run-owned",
             outside_writes: writes,
             same_instance: None,
+            dependencies: Vec::new(),
             rule: String::new(),
             key_id: String::new(),
             sealed: Vec::new(),
@@ -434,6 +483,38 @@ mod tests {
             order: Vec::new(),
             prerequisites: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dependency_placement_is_shown_in_human_and_json_output() {
+        let mut shown = detail("server", None, "refused");
+        let name = "otherdb.dbo.t".parse().unwrap();
+        shown.dependencies = [
+            DependencyPlacement::Bound {},
+            DependencyPlacement::Companion {
+                shape: DependencyShape::Compared,
+            },
+            DependencyPlacement::Companion {
+                shape: DependencyShape::Declared,
+            },
+        ]
+        .iter()
+        .map(|p| dependency(&name, p))
+        .collect();
+        let text = render(&shown, &pbps_model::ChangeSet::default());
+        assert!(text.contains("otherdb.dbo.t: bound"));
+        assert!(text.contains("otherdb.dbo.t: companion (compared)"));
+        assert!(text.contains("otherdb.dbo.t: companion (declared, not compared)"));
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["dependencies"][1]["shape"], "compared");
+        assert_eq!(json["dependencies"][2]["shape"], "declared, not compared");
+        shown.dependencies.clear();
+        assert!(
+            serde_json::to_value(&shown)
+                .unwrap()
+                .get("dependencies")
+                .is_none()
+        );
     }
 
     #[test]

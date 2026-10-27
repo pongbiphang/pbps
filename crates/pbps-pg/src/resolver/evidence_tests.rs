@@ -42,6 +42,7 @@ fn evidence() -> ResolverEvidence {
                 layout: ScratchLayout::Supplied,
                 outside_writes: OutsideWrites::Refused,
                 same_instance: pbps_model::resolver::SameInstance::NotApplicable,
+                dependencies: Default::default(),
             },
         },
         AuthorizationCondition {

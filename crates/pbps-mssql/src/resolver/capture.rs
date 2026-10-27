@@ -45,7 +45,7 @@ pub use ownership::RecordedOwnership;
 pub use pbps_db::resolver::capture::{CaptureError, ObjectIdentity, Uncovered};
 pub use staged::{
     ExternalInputs, StageError, Staged, cascade_scope, compare_staged, compare_staged_declared,
-    required_externals, required_externals_declared,
+    compare_staged_pending, required_externals, required_externals_declared,
 };
 
 use std::collections::BTreeSet;

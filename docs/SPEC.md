@@ -1109,11 +1109,15 @@ fallback cause. If even that fallback cannot supply an index, a managed
 index hint or `NOEXPAND` can fail rehearsal by name; apply still binds the
 real object under the ordinary transaction boundary.
 
-The per-dependency placement, shape source and verification outcome live in
-SQL Server's typed preparation handoff (DEC-2323.1). This adds no saved-plan
-field or Schema member; #2376 carries the outcome into sealed evidence. The resolver's refusal
-of undeclared managed three-part references and DEC-619.3's sandbox boundary
-are unchanged. Apply continues to bind the real objects in its transaction.
+The per-dependency placement and shape source travel from SQL Server's typed
+preparation handoff into resolver scratch runtime evidence (DEC-2376.2):
+`Bound`, or `Companion` with `Compared`/`Declared` shape. The runtime map is
+omitted when empty, with no format-version change. A SQL Server artifact
+reader requires exactly the plan's declared dependency keys; a PostgreSQL
+reader refuses any placement record. Explain shows each observation. This
+adds no Schema member or apply query. The resolver still refuses undeclared
+managed three-part references, and DEC-619.3's sandbox boundary is unchanged.
+Apply continues to bind the real objects in its transaction.
 
 ## 5. The identity file (`schema.ids.json`)
 

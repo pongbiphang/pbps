@@ -49,7 +49,63 @@ pub enum ResolverRuntime {
         /// must require an applicable value; absence is never consent (#2270).
         #[serde(default, skip_serializing_if = "SameInstance::is_not_applicable")]
         same_instance: SameInstance,
+        /// Observed rehearsal placement, distinct from file-admission policy.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        dependencies: BTreeMap<crate::dependency::DependencyName, DependencyPlacement>,
     },
+}
+
+/// How this run supplied one declared cross-database dependency (DEC-2376.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DependencyPlacement {
+    Bound {},
+    Companion { shape: DependencyShape },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DependencyShape {
+    Compared,
+    Declared,
+}
+
+impl ResolverRuntime {
+    /// Artifact admission compares exact key sets. Absence never means bound,
+    /// and another engine cannot carry a SQL Server rehearsal record.
+    pub fn validate_dependencies<'a>(
+        &self,
+        dialect: &str,
+        declared: impl IntoIterator<Item = &'a crate::dependency::DependencyName>,
+    ) -> Result<(), EvidenceError> {
+        let Self::Scratch { dependencies, .. } = self;
+        if dialect != "mssql" {
+            if !dependencies.is_empty() {
+                return Err(EvidenceError::Placement(
+                    "dependency placement belongs to SQL Server".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let declared: BTreeSet<_> = declared.into_iter().collect();
+        for name in &declared {
+            if !dependencies.contains_key(*name) {
+                return Err(EvidenceError::Placement(format!(
+                    "dependency `{}` has no placement record",
+                    name.shown()
+                )));
+            }
+        }
+        for name in dependencies.keys() {
+            if !declared.contains(name) {
+                return Err(EvidenceError::Placement(format!(
+                    "dependency `{}` has an extra placement record",
+                    name.shown()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How the run held its scratch database (#1517).
@@ -183,6 +239,8 @@ pub struct ResolverEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvidenceError {
+    #[error("invalid resolver dependency placement: {0}")]
+    Placement(String),
     #[error("unsupported resolver evidence version or qualification")]
     Version,
     /// The compared set of facts moves with the rule's identifier, so evidence
@@ -692,6 +750,7 @@ mod tests {
                     layout: ScratchLayout::Supplied,
                     outside_writes: OutsideWrites::Refused,
                     same_instance: SameInstance::NotApplicable,
+                    dependencies: Default::default(),
                 },
             },
             AuthorizationCondition {
@@ -825,6 +884,64 @@ mod tests {
                     "{pointer}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dependency_placements_round_trip_and_require_exact_declared_keys() {
+        let plan = plan();
+        let PlanAnalysis::Resolved(evidence) = &plan.analysis else {
+            unreachable!()
+        };
+        let name: crate::dependency::DependencyName = "otherdb.dbo.t".parse().unwrap();
+        for placement in [
+            DependencyPlacement::Bound {},
+            DependencyPlacement::Companion {
+                shape: DependencyShape::Compared,
+            },
+            DependencyPlacement::Companion {
+                shape: DependencyShape::Declared,
+            },
+        ] {
+            let mut runtime = evidence.qualification.runtime.clone();
+            let ResolverRuntime::Scratch { dependencies, .. } = &mut runtime;
+            dependencies.insert(name.clone(), placement);
+            runtime.validate_dependencies("mssql", [&name]).unwrap();
+            assert!(
+                runtime
+                    .validate_dependencies("mssql", [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("extra")
+            );
+            assert!(runtime.validate_dependencies("postgres", [&name]).is_err());
+            let json = serde_json::to_value(&runtime).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ResolverRuntime>(json).unwrap(),
+                runtime
+            );
+        }
+        let runtime = &evidence.qualification.runtime;
+        assert!(
+            runtime
+                .validate_dependencies("mssql", [&name])
+                .unwrap_err()
+                .to_string()
+                .contains("no placement")
+        );
+        runtime.validate_dependencies("mssql", []).unwrap();
+        assert!(
+            serde_json::to_value(runtime)
+                .unwrap()
+                .get("dependencies")
+                .is_none()
+        );
+        for invalid in [
+            json!({"kind":"bound", "shape":"declared"}),
+            json!({"kind":"companion"}),
+            json!({"kind":"companion", "shape":"unknown"}),
+        ] {
+            assert!(serde_json::from_value::<DependencyPlacement>(invalid).is_err());
         }
     }
 
@@ -1117,6 +1234,7 @@ mod tests {
             layout: ScratchLayout::RunOwned,
             outside_writes: OutsideWrites::Allowed,
             same_instance: SameInstance::NotApplicable,
+            dependencies: Default::default(),
         };
         evidence.validate(&plan.changes).unwrap();
         assert_eq!(
@@ -1140,6 +1258,7 @@ mod tests {
                 layout: ScratchLayout::RunOwned,
                 outside_writes: OutsideWrites::Refused,
                 same_instance: SameInstance::NotApplicable,
+                dependencies: Default::default(),
             };
             assert_eq!(
                 evidence.validate(&plan.changes),

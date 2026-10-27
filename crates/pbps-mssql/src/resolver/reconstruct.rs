@@ -29,6 +29,9 @@ use pbps_diff::order::scratch::{Input, Part};
 use pbps_model::{Change, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod chained;
+pub use chained::AuxiliaryStep;
+
 /// Why the desired namespace could not be built on scratch. A named limit,
 /// never a partially compiled namespace that evidence could be read from.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +66,7 @@ pub struct Metadata {
     /// The roots this step creates: a table, a module or a type. A child
     /// arrives with its parent and is not listed.
     created: Vec<ObjectIdentity>,
+    auxiliary: Option<chained::Kind>,
 }
 
 /// SQL-free lowering input. The lexical observations are finite answers from
@@ -96,6 +100,8 @@ impl pbps_dialect::lower::Lowering for ScratchEmitter {
 pub struct Reconstruction {
     steps: Vec<Metadata>,
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
+    execution: Vec<pbps_diff::order::scratch::Step<Metadata>>,
+    external: BTreeMap<ObjectIdentity, Result<Vec<String>, String>>,
 }
 
 type Draft = Part<Metadata>;
@@ -120,6 +126,7 @@ fn part(
         metadata: Metadata {
             declaration,
             created,
+            auxiliary: None,
         },
     })
 }
@@ -142,6 +149,18 @@ impl Reconstruction {
         bootstrap: &pbps_diff::order::PlanningPlan<S>,
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
+    ) -> Result<Self, ReconstructError> {
+        Self::with_chained(dialect, bootstrap, ids, dependencies, None, false)
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn with_chained<S: pbps_diff::order::RouteState<Mssql>>(
+        dialect: &Mssql,
+        bootstrap: &pbps_diff::order::PlanningPlan<S>,
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
+        externals: Option<&super::capture::ExternalInputs>,
+        deferred: bool,
     ) -> Result<Self, ReconstructError> {
         let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
@@ -219,17 +238,82 @@ impl Reconstruction {
                 }
             }
         }
-        let input = ScratchBlueprint(Input::new(prepared, steps));
+        let auxiliary = chained::blueprint(&prepared, &steps, externals, deferred)?;
+        let input = ScratchBlueprint(Input::new(prepared, steps).with_auxiliary(auxiliary));
         let ordered =
             pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle)?;
         let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter)
             .expect("the identical private probes already validated these lowering parts");
-        let steps = ordered
-            .parts()
+        let execution = ordered.steps().to_vec();
+        let steps = execution
             .iter()
-            .map(|part| part.metadata.clone())
+            .map(|step| match step {
+                pbps_diff::order::scratch::Step::Managed { part } => {
+                    ordered.parts()[*part].metadata.clone()
+                }
+                pbps_diff::order::scratch::Step::Auxiliary { metadata } => metadata.clone(),
+            })
             .collect();
-        Ok(Self { steps, lowered })
+        // Template lowering follows settlement; no executable catalog text
+        // enters the shared blueprint. A deferred file may supply a shape
+        // for which automatic rendering has no template.
+        let external = externals
+            .map(|inputs| {
+                inputs
+                    .prerequisites()
+                    .keys()
+                    .map(|id| {
+                        let sql = super::externals::render::render(inputs.captured(), id)
+                            .map(|item| item.statements)
+                            .map_err(|e| {
+                                format!("{e:?}; supply a matching deferred externals section")
+                            });
+                        (id.clone(), sql)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            steps,
+            lowered,
+            execution,
+            external,
+        })
+    }
+
+    pub fn auxiliary(&self, at: usize) -> Option<AuxiliaryStep<'_>> {
+        self.steps[at].auxiliary.as_ref().map(|kind| match kind {
+            chained::Kind::Rendered(id) => AuxiliaryStep::Rendered(id),
+            chained::Kind::Deferred => AuxiliaryStep::Deferred,
+        })
+    }
+
+    pub async fn compile_external(
+        &self,
+        conn: &mut impl pbps_db::transport::ExecuteConnection,
+        at: usize,
+    ) -> Result<(), ReconstructError> {
+        let Some(AuxiliaryStep::Rendered(id)) = self.auxiliary(at) else {
+            return Err(ReconstructError::Unsupported(
+                "not a rendered external step".into(),
+            ));
+        };
+        let declaration = format!("external {id:?}");
+        let sql = self.external[id]
+            .as_ref()
+            .map_err(|reason| ReconstructError::Compile {
+                declaration: declaration.clone(),
+                reason: reason.clone(),
+            })?;
+        for statement in sql {
+            conn.execute(statement)
+                .await
+                .map_err(|error| ReconstructError::Compile {
+                    declaration: declaration.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -272,10 +356,14 @@ impl Reconstruction {
         conn: &mut impl pbps_db::transport::ExecuteConnection,
         range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
-        for (step, group) in self.steps[range.clone()]
-            .iter()
-            .zip(&self.lowered.groups()[range])
-        {
+        for at in range {
+            let pbps_diff::order::scratch::Step::Managed { part } = self.execution[at] else {
+                return Err(ReconstructError::Unsupported(
+                    "an auxiliary step requires its setup executor".into(),
+                ));
+            };
+            let step = &self.steps[at];
+            let group = &self.lowered.groups()[part];
             for statement in group.statements() {
                 conn.execute(&statement.sql).await.map_err(|error| {
                     let declaration = step.declaration.clone();
