@@ -7073,13 +7073,31 @@ pub fn cmd_plan_db(
             carried.clone_from(&checkout_findings);
         }
 
-        let mut resolved = match pbps_diff::resolve_with_annotations(
-            &loaded.schema,
-            &ids,
-            &loaded.intents,
-            loaded.intents.len(),
-            &crate::context(project.root())?,
-        ) {
+        // Identity and the eventual diff use the same recorded snapshot: a
+        // missing checkout UID supplies no drop reason (DEC-2414.1).
+        let context = crate::context(project.root())?;
+        let resolution = match checked_target.as_ref() {
+            Ok((_, entry)) => pbps_diff::identity::resolve_with_baseline(
+                &loaded.schema,
+                &ids,
+                &loaded.intents,
+                loaded.intents.len(),
+                pbps_diff::Side {
+                    schema: &entry.snapshot.schema,
+                    ids: &entry.snapshot.ids,
+                },
+                &context,
+            ),
+            // The target read's saved error still prevents a plan below.
+            Err(_) => pbps_diff::resolve_with_annotations(
+                &loaded.schema,
+                &ids,
+                &loaded.intents,
+                loaded.intents.len(),
+                &context,
+            ),
+        };
+        let mut resolved = match resolution {
             Ok(r) => r,
             Err(blockers) => {
                 if json {

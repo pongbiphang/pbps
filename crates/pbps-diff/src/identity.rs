@@ -36,6 +36,7 @@ use pbps_model::{
     ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
 };
 
+pub mod removals;
 pub mod type_refs;
 
 /// A situation that cannot be decided automatically and needs a human.
@@ -272,6 +273,44 @@ pub fn resolve_with_annotations(
     resolve_with_provenance(declared, ids, intents, annotation_count, ctx)
 }
 
+/// Resolve against both the reviewed checkout and what the baseline holds.
+/// A checkout may never have recorded a deployed UID; its absence is not a
+/// drop decision. Keep that diagnosis in identity resolution (DEC-2414.1).
+pub fn resolve_with_baseline(
+    declared: &Schema,
+    ids: &IdsFile,
+    intents: &[Intent],
+    annotation_count: usize,
+    baseline: crate::Side<'_>,
+    ctx: &Context,
+) -> Result<Resolution, Vec<Blocker>> {
+    let resolved = resolve_with_annotations(declared, ids, intents, annotation_count, ctx)?;
+    let blockers: Vec<_> = removals::inventory(baseline, &resolved.ids, declared, &[])
+        .into_iter()
+        .filter_map(|removal| {
+            use removals::Removal;
+            let (uid, blocker) = match removal {
+                Removal::Table { uid, name } => {
+                    (uid, Blocker::DropTableNeedsReason { table: name })
+                }
+                Removal::Column { uid, name } => {
+                    (uid, Blocker::DropColumnNeedsReason { column: name })
+                }
+                Removal::Role { uid, name } => (uid, Blocker::DropRoleNeedsReason { role: name }),
+                Removal::Type { uid, name } => (uid, Blocker::DropTypeNeedsReason { name }),
+                // Computed columns keep their non-UID boundary (DEC-1174.1).
+                Removal::ComputedColumn { .. } => return None,
+            };
+            (!resolved.ids.tombstones.contains_key(&uid)).then_some(blocker)
+        })
+        .collect();
+    if blockers.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(blockers)
+    }
+}
+
 /// `annotation_count` is how many leading `intents` came from declaration
 /// annotations; every later one is a current decision. A plain count, not an
 /// `Option`: an unknown provenance is the state #403 found each gate reading
@@ -438,7 +477,14 @@ fn resolve_with_provenance(
         // against, the declarations in the namespace the user wrote: a table
         // rename moves the first and not the second, so the two halves of one
         // question take two spellings of one intent.
-        let source = if current_decision {
+        let source = if current_decision
+            && matches!(
+                intent,
+                Intent::RenameTable { .. }
+                    | Intent::RenameColumn { .. }
+                    | Intent::RenameType { .. }
+                    | Intent::RenameRole { .. }
+            ) {
             RenameSource::Vacated
         } else {
             RenameSource::of(intent, declared)
@@ -449,7 +495,8 @@ fn resolve_with_provenance(
         // reading a source absent from the ids file as "already vacated"
         // let a current `pbps rename` from a newly declared name onto an
         // identified one report success and record nothing (#973). A current
-        // drop still asks the ids file, which is the one fact it has.
+        // drop needs a recorded retirement, and a redeclared name prevents
+        // that historical fact from excusing the current command.
         let absorbed = match intent {
             Intent::RenameTable { .. }
             | Intent::RenameColumn { .. }
@@ -662,8 +709,8 @@ struct Conflicting {
 ///
 /// The test is whether the world is already in the shape the intent asks for: for
 /// a rename, the target name exists and the source name is no longer one this
-/// rename has to vacate ([`RenameSource`]); for a drop, the object is already
-/// gone from the identity file.
+/// rename has to vacate ([`RenameSource`]); for a drop, a tombstone records
+/// its retirement and the name has not been redeclared (DEC-2414.1).
 ///
 /// Public because `pbps fmt` shares this exact judgement: an annotation whose
 /// intent is absorbed is redundant and gets stripped, while a pending one must
@@ -676,25 +723,35 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
     // declarations ask for that name again: what holds it then is the new
     // object, not the one this rename is still waiting to move.
     let vacated = |live: bool| !live || source == RenameSource::Redeclared;
+    let retired = |kind: UidKind, name: &str| {
+        source == RenameSource::Vacated
+            && ids
+                .tombstones
+                .iter()
+                .any(|(uid, tombstone)| uid.kind() == kind && tombstone.was == name)
+    };
 
     match intent {
         Intent::RenameTable { from, to } => has_table(to) && vacated(has_table(from)),
         Intent::RenameColumn { table, from, to } => {
             has_column(&table.column(to)) && vacated(has_column(&table.column(from)))
         }
-        // A drop asks this question about one name, and no declaration file can
-        // carry one: `renamed_from` is the only annotation that becomes an
-        // intent, so every drop here is a current command. Reading the
-        // declarations for it would silence `pbps drop` against a column that
-        // is still declared, which is a contradiction the author must hear.
-        Intent::DropTable { table, .. } => !has_table(table),
-        Intent::DropColumn { column, .. } => !has_column(column),
+        // An absent mapping alone proves no prior drop. Historical retirement
+        // also cannot excuse a command against a newly declared object.
+        Intent::DropTable { table, .. } => {
+            !has_table(table) && retired(UidKind::Table, &table.raw().to_string())
+        }
+        Intent::DropColumn { column, .. } => {
+            !has_column(column) && retired(UidKind::Column, &column.raw().to_string())
+        }
         Intent::RenameType { from, to } => {
             ids.type_uid(to).is_some() && vacated(ids.type_uid(from).is_some())
         }
-        Intent::DropType { name, .. } => ids.type_uid(name).is_none(),
+        Intent::DropType { name, .. } => {
+            ids.type_uid(name).is_none() && retired(UidKind::Type, &name.raw().to_string())
+        }
         Intent::RenameRole { from, to } => has_role(to) && vacated(has_role(from)),
-        Intent::DropRole { role, .. } => !has_role(role),
+        Intent::DropRole { role, .. } => !has_role(role) && retired(UidKind::Role, role.raw()),
         // Recorded already, with this bound.
         Intent::MoveRows {
             table, max_rows, ..
@@ -722,7 +779,7 @@ pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameSource {
     /// The declarations do not ask for the source name -- or the caller cannot
-    /// see the declarations, or is judging an explicit command, which must be
+    /// see the declarations, or is judging an explicit rename, which must be
     /// reported when it matched nothing whatever they say. The identity file
     /// answers alone, which keeps an annotation rather than stripping one that
     /// cannot be proved redundant.
@@ -747,13 +804,14 @@ impl RenameSource {
                 .is_some_and(|t| t.columns.contains_key(from)),
             Intent::RenameType { from, .. } => declared.types.contains_key(from),
             Intent::RenameRole { from, .. } => declared.roles.contains_key(from),
-            // A drop vacates no name, and its absorption does not ask; nor
-            // does a move.
-            Intent::DropTable { .. }
-            | Intent::DropColumn { .. }
-            | Intent::DropType { .. }
-            | Intent::DropRole { .. }
-            | Intent::MoveRows { .. } => false,
+            Intent::DropTable { table, .. } => declared.tables.contains_key(table),
+            Intent::DropColumn { column, .. } => declared
+                .tables
+                .get(&column.table)
+                .is_some_and(|table| table.columns.contains_key(&column.name)),
+            Intent::DropType { name, .. } => declared.types.contains_key(name),
+            Intent::DropRole { role, .. } => declared.roles.contains_key(role),
+            Intent::MoveRows { .. } => false,
         };
         if redeclared {
             Self::Redeclared
@@ -2294,5 +2352,244 @@ mod tests {
         );
         resolve_with_annotations(&declared, &before, &intents, 2, &ctx())
             .expect("the same retained annotation remains harmless after its table moves");
+    }
+}
+
+#[cfg(test)]
+mod drop_intent2414_tests {
+    use super::*;
+    use pbps_model::{Column, ManagedType, Table};
+
+    fn context() -> Context {
+        Context {
+            operator: "operator".into(),
+            today: "2026-10-26".into(),
+        }
+    }
+
+    fn fixture() -> (Schema, IdsFile, Vec<Intent>) {
+        let mut schema = Schema::default();
+        let mut table = Table::default();
+        for name in ["id", "gone"] {
+            table
+                .columns
+                .insert(name.into(), Column::new("bigint".parse().unwrap()));
+        }
+        schema
+            .tables
+            .insert("app.keep".parse().unwrap(), table.clone());
+        schema.tables.insert("app.gone".parse().unwrap(), table);
+        schema.roles.insert("reader".into(), Default::default());
+        schema.types.insert(
+            "app.mood".parse().unwrap(),
+            ManagedType::Enum {
+                values: vec!["one".into()],
+            },
+        );
+        let ids = resolve(&schema, &IdsFile::default(), &[], &context())
+            .unwrap()
+            .ids;
+        let reason: pbps_model::Reason = "retired".parse().unwrap();
+        let intents = vec![
+            Intent::DropColumn {
+                column: "app.keep.gone".parse().unwrap(),
+                reason: reason.clone(),
+            },
+            Intent::DropTable {
+                table: "app.gone".parse().unwrap(),
+                reason: reason.clone(),
+            },
+            Intent::DropRole {
+                role: "reader".into(),
+                reason: reason.clone(),
+            },
+            Intent::DropType {
+                name: "app.mood".parse().unwrap(),
+                reason,
+            },
+        ];
+        (schema, ids, intents)
+    }
+
+    fn deleted(mut schema: Schema) -> Schema {
+        schema
+            .tables
+            .get_mut(&"app.keep".parse().unwrap())
+            .unwrap()
+            .columns
+            .shift_remove("gone");
+        schema.tables.remove(&"app.gone".parse().unwrap());
+        schema.roles.clear();
+        schema.types.clear();
+        schema
+    }
+
+    #[test]
+    fn baseline_tracked_removals_need_reasons_even_when_local_uids_are_missing() {
+        let (base, before, intents) = fixture();
+        let desired = deleted(base.clone());
+        let approved = resolve(&desired, &before, &intents, &context())
+            .unwrap()
+            .ids;
+        let mut missing = approved.clone();
+        missing.tombstones.clear();
+        let errors = resolve_with_baseline(
+            &desired,
+            &missing,
+            &[],
+            0,
+            crate::Side {
+                schema: &base,
+                ids: &before,
+            },
+            &context(),
+        )
+        .unwrap_err();
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        for expected in resolve(&desired, &before, &[], &context()).unwrap_err() {
+            assert!(errors.contains(&expected), "{expected:?}: {errors:?}");
+        }
+        let resolved = resolve_with_baseline(
+            &desired,
+            &approved,
+            &[],
+            0,
+            crate::Side {
+                schema: &base,
+                ids: &before,
+            },
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(resolved.ids, approved);
+        // An unrelated retirement cannot authorize this baseline UID's drop.
+        let (uid, tombstone) = approved
+            .tombstones
+            .iter()
+            .find(|(uid, _)| {
+                uid.kind() == UidKind::Column
+                    && before.columns[*uid].table.raw().to_string() == "app.keep"
+            })
+            .unwrap();
+        let mut wrong = approved.clone();
+        wrong.tombstones.remove(uid);
+        wrong
+            .tombstones
+            .insert("c_zzzzzz".parse().unwrap(), tombstone.clone());
+        assert_eq!(
+            resolve_with_baseline(
+                &desired,
+                &wrong,
+                &[],
+                0,
+                crate::Side {
+                    schema: &base,
+                    ids: &before
+                },
+                &context()
+            )
+            .unwrap_err(),
+            vec![Blocker::DropColumnNeedsReason {
+                column: "app.keep.gone".parse().unwrap()
+            }]
+        );
+    }
+
+    #[test]
+    fn absent_drop_names_require_real_retirements_and_recorded_repeats_stay_noops() {
+        let (base, before, intents) = fixture();
+        let desired = deleted(base.clone());
+        let approved = resolve(&desired, &before, &intents, &context())
+            .unwrap()
+            .ids;
+        for intent in &intents {
+            let mut missing = approved.clone();
+            missing.tombstones.clear();
+            assert_eq!(
+                resolve(&desired, &missing, std::slice::from_ref(intent), &context()).unwrap_err(),
+                vec![Blocker::UnusedIntent {
+                    intent: intent.clone()
+                }]
+            );
+            assert_eq!(
+                resolve(
+                    &desired,
+                    &approved,
+                    std::slice::from_ref(intent),
+                    &context()
+                )
+                .unwrap()
+                .ids,
+                approved
+            );
+        }
+        // A historical tombstone does not retire a new declaration reusing its name.
+        let mut reused = desired.clone();
+        reused
+            .tables
+            .get_mut(&"app.keep".parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("gone".into(), Column::new("bigint".parse().unwrap()));
+        assert_eq!(
+            resolve(&reused, &approved, &intents[..1], &context()).unwrap_err(),
+            vec![Blocker::UnusedIntent {
+                intent: intents[0].clone()
+            }]
+        );
+        let mut wrong_kind = IdsFile::default();
+        let tombstone = approved
+            .tombstones
+            .iter()
+            .find(|(uid, _)| uid.kind() == UidKind::Type)
+            .unwrap()
+            .1;
+        wrong_kind
+            .tombstones
+            .insert("t_zzzzzz".parse().unwrap(), tombstone.clone());
+        assert!(!intent_is_absorbed(
+            &intents[3],
+            &wrong_kind,
+            RenameSource::Vacated
+        ));
+    }
+
+    #[test]
+    fn baseline_identity_keeps_additions_attribute_edits_and_recorded_renames() {
+        let (base, before, _) = fixture();
+        let mut desired = base.clone();
+        let table = desired
+            .tables
+            .get_mut(&"app.keep".parse().unwrap())
+            .unwrap();
+        table
+            .columns
+            .insert("added".into(), Column::new("int".parse().unwrap()));
+        table.columns.get_mut("id").unwrap().nullable = false;
+        let column = table.columns.shift_remove("gone").unwrap();
+        table.columns.insert("renamed".into(), column);
+        let intent = Intent::RenameColumn {
+            table: "app.keep".parse().unwrap(),
+            from: "gone".into(),
+            to: "renamed".into(),
+        };
+        let result = resolve_with_baseline(
+            &desired,
+            &before,
+            &[intent],
+            0,
+            crate::Side {
+                schema: &base,
+                ids: &before,
+            },
+            &context(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.ids.column_uid(&"app.keep.renamed".parse().unwrap()),
+            before.column_uid(&"app.keep.gone".parse().unwrap())
+        );
+        assert_eq!(result.added_columns.len(), 1);
+        assert!(result.ids.tombstones.is_empty());
     }
 }

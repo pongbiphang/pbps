@@ -351,6 +351,7 @@
         "darwin"
       ],
       "cases": [
+        "drop_intent2414_removals_require_recorded_reasons_on_mssql",
         "dependencies2322::readable_dependencies_compare_exact_shapes_and_name_each_refusal",
         "dependencies2322::unreadable_dependencies_are_reported_without_claiming_comparison",
         "dependencies2322::apply_binds_dependencies_transactionally_without_repeating_the_comparison",
@@ -587,6 +588,8 @@
         "darwin"
       ],
       "cases": [
+        "drop_intent2414_removals_require_recorded_reasons_on_pg16",
+        "drop_intent2414_removals_require_recorded_reasons_on_pg18",
         "a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names",
         "baseline_catalog_evidence_names_only_the_rebound_held_partition",
         "baseline_catalog_evidence_allows_a_hand_dropped_partition_without_reverting_intent",

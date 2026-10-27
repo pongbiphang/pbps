@@ -39,6 +39,21 @@ mod conversions2359;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/drop_intent2414.rs"]
+mod drop_intent2414;
+
+#[test]
+#[ignore = "needs live pg18"]
+fn drop_intent2414_removals_require_recorded_reasons_on_pg18() {
+    drop_intent2414::check(&std::env::var("PBPS_TEST_PG_DB").unwrap(), true);
+}
+
+#[test]
+#[ignore = "needs live pg16"]
+fn drop_intent2414_removals_require_recorded_reasons_on_pg16() {
+    drop_intent2414::check(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
+}
+
 #[path = "support/refusal_next_steps_pg.rs"]
 mod refusal_next_steps;
 
@@ -6843,10 +6858,15 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
 
     // The partitioned table cannot be adopted; its declaration goes. The
     // readable ones are adopted as they stand, and the refusal is gone.
-    // Its uid was only ever minted locally, never recorded, so the identity
-    // file is minted again rather than asked to drop a table no ledger has.
+    // Although never deployed, its UID is in the committed Git baseline.
+    // Record its retirement rather than reminting every tracked identity.
     std::fs::remove_file(d.dir.join("schema/app.p.yml")).unwrap();
-    std::fs::remove_file(d.dir.join("schema.ids.json")).unwrap();
+    succeeds(d.run(&[
+        "drop-table",
+        "app.p",
+        "--reason",
+        "do not adopt the partitioned table",
+    ]));
     succeeds(d.run(&["plan"]));
     d.commit();
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt-existing"]));

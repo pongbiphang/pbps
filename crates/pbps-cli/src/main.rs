@@ -3541,16 +3541,18 @@ fn resolve_with_intent(
     project: &Project,
     loaded: &pbps_load::Loaded,
     ids: &IdsFile,
+    baseline: pbps_diff::Side<'_>,
     may_prompt: bool,
     quiet: bool,
 ) -> anyhow::Result<Result<pbps_diff::Resolution, Vec<pbps_diff::Blocker>>> {
     let mut intents = loaded.intents.clone();
     let annotation_count = loaded.intents.len();
-    let original = match pbps_diff::resolve_with_annotations(
+    let original = match pbps_diff::identity::resolve_with_baseline(
         &loaded.schema,
         ids,
         &intents,
         annotation_count,
+        baseline,
         &context(project.root())?,
     ) {
         Ok(r) => return Ok(Ok(r)),
@@ -3575,11 +3577,12 @@ fn resolve_with_intent(
             // ordinary intents, and running them through the same call is what
             // makes the prompt a wrapper rather than a second implementation of
             // identity resolution.
-            match pbps_diff::resolve_with_annotations(
+            match pbps_diff::identity::resolve_with_baseline(
                 &loaded.schema,
                 ids,
                 &intents,
                 annotation_count,
+                baseline,
                 &context(project.root())?,
             ) {
                 Ok(r) => {
@@ -3882,7 +3885,27 @@ fn cmd_plan(
             ));
         }
 
-        let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
+        // A `--base` that is missing, malformed or of an unsupported version is a
+        // failure of the *input*, not of the plan: the command never got as far as
+        // comparing anything, so it is unanswerable rather than a finding.
+        let base = output::or_unanswerable(
+            "plan",
+            json,
+            "baseline.unreadable",
+            baseline::load(project, source, dialect.as_ref()),
+        )?;
+
+        let res = match resolve_with_intent(
+            project,
+            &loaded,
+            &ids,
+            pbps_diff::Side {
+                schema: &base.schema,
+                ids: &base.ids,
+            },
+            may_prompt,
+            json,
+        )? {
             Ok(r) => r,
             Err(blockers) => {
                 // A finding, not a tool failure: pbps did its job and is asking a
@@ -3954,15 +3977,6 @@ fn cmd_plan(
             }
         }
 
-        // A `--base` that is missing, malformed or of an unsupported version is a
-        // failure of the *input*, not of the plan: the command never got as far as
-        // comparing anything, so it is unanswerable rather than a finding.
-        let base = output::or_unanswerable(
-            "plan",
-            json,
-            "baseline.unreadable",
-            baseline::load(project, source, dialect.as_ref()),
-        )?;
         if base.is_empty_fallback {
             let message = format!(
                 "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
