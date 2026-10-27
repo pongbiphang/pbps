@@ -19,10 +19,10 @@ use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 mod keeper;
 pub(super) mod mssql;
 mod postgres;
-pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use keeper::pause_between_reads;
 pub(super) use keeper::{keep_and_mark, keeper_seen};
+pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
     for_tests::{externals_for_test, reset_for_test, stop_after_cleanup, sweep_cluster_on},

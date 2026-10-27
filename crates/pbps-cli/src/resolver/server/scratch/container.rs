@@ -77,6 +77,9 @@ pub async fn with_started<T>(
 /// the container's own drop guard on any other way out.
 pub struct Held {
     container: Container,
+    /// The run's session in the container's server, closed only once the
+    /// container is gone, as `with_started` keeps it (#2410).
+    keeper: recovery::Keeper,
 }
 
 impl Held {
@@ -88,9 +91,17 @@ impl Held {
         pull: PullPolicy,
     ) -> Result<Self, ProduceError> {
         acquire(image, pull).await?;
-        let container = Container::start(driver, image).await?;
-        match container.ready(driver, READY).await {
-            Ok(()) => Ok(Self { container }),
+        // Named, swept and kept as `with_started`'s, so that a run killed
+        // while it holds the container is recovered by the next one.
+        let token = format!("{:032x}", rand::random::<u128>());
+        recovery::sweep(&token).await;
+        let container = Container::start(driver, image, &token).await?;
+        let kept = match container.ready(driver, READY).await {
+            Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
+            Err(error) => Err(error),
+        };
+        match kept {
+            Ok(keeper) => Ok(Self { container, keeper }),
             Err(error) => match container.remove().await {
                 Ok(()) => Err(error),
                 Err(names) => Err(ProduceError::Cleanup(names)),
@@ -105,7 +116,10 @@ impl Held {
 
     /// Removes the container and confirms it gone.
     pub async fn remove(self) -> Result<(), ProduceError> {
-        self.container.remove().await.map_err(ProduceError::Cleanup)
+        let Self { container, keeper } = self;
+        let removed = container.remove().await;
+        drop(keeper);
+        removed.map_err(ProduceError::Cleanup)
     }
 }
 
