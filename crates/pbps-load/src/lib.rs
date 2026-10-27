@@ -218,9 +218,25 @@ pub fn load_schema_dir(dir: &Path) -> Result<Loaded, Vec<LoadError>> {
     collect_schema_dir(dir, load_file)
 }
 
+/// [`load_schema_dir`] for declarations already in memory: the files of a git
+/// revision, or working files whose bytes were hashed when they were read.
+/// The same cross-file checks run; the paths only name the files in
+/// diagnostics and order them.
+pub fn load_schema_files(files: &[(std::path::PathBuf, String)]) -> Result<Loaded, Vec<LoadError>> {
+    let texts: std::collections::BTreeMap<&Path, &str> = files
+        .iter()
+        .map(|(path, text)| (path.as_path(), text.as_str()))
+        .collect();
+    // Sorted, as the directory form's listing is, so diagnostics keep one order.
+    collect_files(
+        texts.keys().map(|path| (*path).to_owned()).collect(),
+        |path| load_file_str(path, texts[path]),
+    )
+}
+
 fn collect_schema_dir(
     dir: &Path,
-    mut load: impl FnMut(&Path) -> Result<LoadedFile, Vec<LoadError>>,
+    load: impl FnMut(&Path) -> Result<LoadedFile, Vec<LoadError>>,
 ) -> Result<Loaded, Vec<LoadError>> {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files).map_err(|source| {
@@ -232,7 +248,13 @@ fn collect_schema_dir(
     // Directory enumeration order is platform-dependent; sorting is what makes
     // the order of diagnostics stable.
     files.sort();
+    collect_files(files, load)
+}
 
+fn collect_files(
+    files: Vec<std::path::PathBuf>,
+    mut load: impl FnMut(&Path) -> Result<LoadedFile, Vec<LoadError>>,
+) -> Result<Loaded, Vec<LoadError>> {
     let mut loaded = Loaded::default();
     let mut errs = Vec::new();
     let mut seen_tables: std::collections::BTreeMap<TableName, std::path::PathBuf> =

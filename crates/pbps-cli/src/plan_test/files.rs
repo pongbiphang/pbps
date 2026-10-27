@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use pbps_config::test_manifest::{Entries, TestManifest};
 use sha2::{Digest as _, Sha256};
 
-use super::{Change, ConsumedFile, Problem, Refusal, Role};
+use super::{Change, ConsumedFile, Problem, Refusal, Revision, Role};
 
 /// One input as it was read. `source` is the path that was asked for and
 /// `resolved` what it named then; both are kept so that the recheck can tell
@@ -121,6 +121,7 @@ pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen
     })?;
     let manifest_file = ConsumedFile {
         path: manifest_read.project_path.clone(),
+        revision: Revision::Working,
         role: Role::Manifest,
         sha256: manifest_read.sha256.clone(),
     };
@@ -158,6 +159,7 @@ pub(crate) fn freeze(project_root: &Path, manifest_path: &Path) -> Result<Frozen
                 name: name.to_owned(),
                 file: ConsumedFile {
                     path: read.project_path,
+                    revision: Revision::Working,
                     role,
                     sha256: read.sha256,
                 },

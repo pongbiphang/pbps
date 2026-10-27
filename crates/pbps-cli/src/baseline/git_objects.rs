@@ -6,12 +6,22 @@ use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
+/// The tree mode of a submodule entry.
+pub(crate) const SUBMODULE: &str = "160000";
+/// The tree mode of a symbolic link.
+pub(crate) const SYMLINK: &str = "120000";
+
 struct Entry {
+    mode: String,
     oid: String,
     path: String,
 }
 
-fn entries(bytes: &[u8]) -> anyhow::Result<Vec<Entry>> {
+/// The full-tree listing's entries `wanted` accepts, given each one's path and
+/// mode. A wanted entry must be a blob or a submodule commit; whether its mode
+/// is a regular file is the consumer's to say, and a submodule is passed on
+/// rather than dropped so that a consumer which cares can refuse it.
+fn entries(bytes: &[u8], wanted: impl Fn(&str, &str) -> bool) -> anyhow::Result<Vec<Entry>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -37,12 +47,13 @@ fn entries(bytes: &[u8]) -> anyhow::Result<Vec<Entry>> {
                 && !path.is_empty(),
             "Git returned an invalid tree entry for `{path}`"
         );
-        if path.ends_with(".yml") || path.ends_with(".yaml") {
+        if wanted(path, mode) {
             anyhow::ensure!(
-                *kind == "blob",
+                matches!(*kind, "blob" | "commit"),
                 "declaration `{path}` is a Git {kind}, not a blob"
             );
             result.push(Entry {
+                mode: (*mode).to_owned(),
                 oid: (*oid).to_owned(),
                 path: path.to_owned(),
             });
@@ -59,6 +70,35 @@ pub(super) fn read(
     rel: &str,
     mut consume: impl FnMut(&str, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    read_with(
+        root,
+        rev,
+        rel,
+        |path, _mode| path.ends_with(".yml") || path.ends_with(".yaml"),
+        // Retain the existing Git reader's text decoding. Only paths, which
+        // select objects, must not silently change spelling through replacement.
+        |path, mode, bytes| {
+            // Said as the listing said it before submodules were passed on:
+            // which directory at which revision could not be read.
+            anyhow::ensure!(
+                mode != SUBMODULE,
+                "cannot read `{rel}` at `{rev}`: declaration `{path}` is a Git commit, not a blob"
+            );
+            consume(path, &String::from_utf8_lossy(bytes))
+        },
+    )
+}
+
+/// [`read`] for a consumer that needs the raw bytes and the entry's mode: a
+/// hash is of the bytes, not of their lossy decoding, and a symlink or
+/// submodule entry is not a file whose bytes mean anything.
+pub(crate) fn read_with(
+    root: &Path,
+    rev: &str,
+    rel: &str,
+    wanted: impl Fn(&str, &str) -> bool,
+    mut consume: impl FnMut(&str, &str, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let listing = super::git_command(root)
         .args(["ls-tree", "-r", "--full-tree", "-z", rev, "--", rel])
         .output()
@@ -68,8 +108,8 @@ pub(super) fn read(
         "cannot read `{rel}` at `{rev}`: {}",
         String::from_utf8_lossy(&listing.stderr).trim()
     );
-    let listing =
-        entries(&listing.stdout).with_context(|| format!("cannot read `{rel}` at `{rev}`"))?;
+    let listing = entries(&listing.stdout, wanted)
+        .with_context(|| format!("cannot read `{rel}` at `{rev}`"))?;
     if listing.is_empty() {
         return Ok(());
     }
@@ -79,12 +119,16 @@ pub(super) fn read(
     command.args(["cat-file", "--batch"]);
     let mut reader = BlobReader::start(command)?;
     for entry in listing {
+        if entry.mode == SUBMODULE {
+            // A gitlink names a commit in another repository, not an object
+            // this one can give; the consumer decides what that means.
+            consume(&entry.path, &entry.mode, &[])?;
+            continue;
+        }
         let bytes = reader
             .read(&entry.oid)
             .with_context(|| format!("cannot read `{}` at `{rev}`", entry.path))?;
-        // Retain the existing Git reader's text decoding. Only paths, which
-        // select objects, must not silently change spelling through replacement.
-        consume(&entry.path, &String::from_utf8_lossy(&bytes))?;
+        consume(&entry.path, &entry.mode, &bytes)?;
     }
     reader
         .finish()
@@ -289,22 +333,26 @@ mod tests {
         assert!(eof(&mut Cursor::new(b"extra")).is_err());
     }
 
+    fn yaml(path: &str, _mode: &str) -> bool {
+        path.ends_with(".yml") || path.ends_with(".yaml")
+    }
+
     #[test]
     fn tree_entries_preserve_path_bytes_and_refuse_truncation_and_non_blob_declarations() {
         let path = "schema/é space\tline\n'quote.yaml";
-        let rows = entries(format!("100644 blob {OID}\t{path}\0").as_bytes()).unwrap();
+        let rows = entries(format!("100644 blob {OID}\t{path}\0").as_bytes(), yaml).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, path);
         assert_eq!(rows[0].oid, OID);
-        assert!(entries(b"").unwrap().is_empty());
-        assert!(
-            entries(format!("160000 commit {OID}\tschema/submodule\0").as_bytes())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(entries(b"", yaml).unwrap().is_empty());
+        let submodule = format!("160000 commit {OID}\tschema/submodule\0");
+        assert!(entries(submodule.as_bytes(), yaml).unwrap().is_empty());
+        // A consumer that names the mode sees the submodule instead of losing it.
+        let kept = entries(submodule.as_bytes(), |_, mode| mode == SUBMODULE).unwrap();
+        assert_eq!((kept.len(), kept[0].mode.as_str()), (1, SUBMODULE));
         for bad in [
             format!("100644 blob {OID}\tschema/t.yml").into_bytes(),
-            format!("160000 commit {OID}\tschema/t.yml\0").into_bytes(),
+            format!("040000 tree {OID}\tschema/t.yml\0").into_bytes(),
             b"100644 blob bad\tschema/t.yml\0".to_vec(),
             format!("100644 blob {OID}\t\0").into_bytes(),
             b"invalid\0".to_vec(),
@@ -314,7 +362,7 @@ mod tests {
             ]
             .concat(),
         ] {
-            assert!(entries(&bad).is_err(), "{bad:?}");
+            assert!(entries(&bad, yaml).is_err(), "{bad:?}");
         }
     }
 
@@ -364,5 +412,53 @@ mod tests {
         }
         assert!(!alive, "the child must have been killed and reaped");
         assert!(!path.exists());
+    }
+
+    /// The baseline reader still refuses a submodule that looks like a
+    /// declaration and still ignores one that does not: it is the old caller's
+    /// behaviour, kept while plan tests ask for the mode.
+    #[test]
+    fn the_baseline_reader_refuses_a_submodule_named_like_a_declaration() {
+        let dir = std::env::temp_dir().join(format!("pbps-gitobj-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t.t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "one"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let link = |path: &str| {
+            git(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},{path}"),
+            ])
+        };
+        link("schema/vendor");
+        git(&["commit", "-q", "-m", "plain submodule"]);
+        read(&dir, "HEAD", "schema", |_, _| Ok(())).unwrap();
+        link("schema/vendored.yml");
+        git(&["commit", "-q", "-m", "yaml-named submodule"]);
+        let refused = read(&dir, "HEAD", "schema", |_, _| Ok(())).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("cannot read `schema` at `HEAD`: declaration `schema/vendored.yml` is a Git commit, not a blob"),
+            "{refused:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

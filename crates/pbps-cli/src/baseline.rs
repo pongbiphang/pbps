@@ -20,7 +20,7 @@
 //! environment's database as queried (Phase 3).
 
 pub(crate) mod ancestry;
-mod git_objects;
+pub(crate) mod git_objects;
 
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
@@ -200,14 +200,25 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     };
     let config = pbps_config::Config::parse(&text, &project.config_file())
         .map_err(|e| anyhow::anyhow!("`{config_rel}` at `{rev}` does not parse: {e}"))?;
+    paths_from(&config, &config_rel, &relative_to(root)?, rev)
+}
+
+/// The declarations directory and identity file `config` names, as git names
+/// them, for the revision `config` was read at. `prefix` is the project root's
+/// path inside the repository.
+pub(crate) fn paths_from(
+    config: &pbps_config::Config,
+    config_rel: &str,
+    prefix: &str,
+    rev: &str,
+) -> anyhow::Result<(String, String)> {
     // The config's paths are relative to the project root; git's are relative
     // to the repo root. Composed from the *root's* prefix rather than asked of
     // each path, because a path an old revision used may not exist in the
     // working tree at all — `legacy/schema` after a move to `schema` — and
     // `relative_to` answers by running git inside the path's own parent. The
     // project root is the one directory that is always there (DECISIONS 166).
-    let prefix = relative_to(root)?;
-    let schema = under(&prefix, &config.schema_dir)?;
+    let schema = under(prefix, &config.schema_dir)?;
     // A historical config is read from git's tree, where a path resolves only
     // by its spelling, so this is the lexical half of the rule `pbps-config`
     // applies (#739): the declarations directory may not be the project root
@@ -224,7 +235,7 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
              subdirectory of the project, such as `schema/` (the default)"
         );
     }
-    Ok((schema, under(&prefix, &config.ids_file)?))
+    Ok((schema, under(prefix, &config.ids_file)?))
 }
 
 /// A path the config states, relative to the project root, as the path git
@@ -233,7 +244,7 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
 /// `.` is the project root itself, which is the prefix alone. No config path
 /// can be that any more for the declarations (#739), and an ids file is a
 /// file, so no caller here receives the empty pathspec.
-fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
+pub(crate) fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
     use std::path::Component;
 
     let mut parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
@@ -580,7 +591,7 @@ pub fn schema_at(
 ///
 /// `rev-parse --show-prefix` asks git for the same answer in git's own terms, so
 /// only git's notion of the path has to be right.
-fn relative_to(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn relative_to(path: &Path) -> anyhow::Result<String> {
     // A directory can be asked about directly, and has to be: the project root
     // is asked about this way, and its parent is normally outside the worktree,
     // where asking git would fail on a perfectly valid project. Everything else
