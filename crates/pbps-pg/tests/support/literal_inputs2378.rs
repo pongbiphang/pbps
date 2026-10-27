@@ -79,7 +79,6 @@ async fn literal_input_lock_witness(index: usize) {
         for (using, target) in [
             ("'x'::app.unsafe", "app.unsafe"),
             ("CAST('x' AS app.unsafe)", "app.unsafe"),
-            ("'x'::unsafe", "app.unsafe"),
             ("E'x'::app.unsafe", "app.unsafe"),
             ("$tag$x$tag$::app.unsafe", "app.unsafe"),
             ("'x'\n'y'::app.unsafe", "app.unsafe"),
@@ -92,7 +91,6 @@ async fn literal_input_lock_witness(index: usize) {
             ("'[x,x]'::app.unsafe_range", "app.unsafe_range"),
             ("'{[x,x]}'::app.unsafe_multirange", "app.unsafe_multirange"),
             ("app.accepts('x')", "app.unsafe"),
-            ("accepts('x')", "app.unsafe"),
             ("status OPERATOR(app.@@) 'x'", "app.unsafe"),
             ("status = OPERATOR(app.+) 'x'", "app.unsafe"),
             (r#"'x'::app."Unsafe Type""#, "app.Unsafe Type"),
@@ -230,7 +228,7 @@ async fn unrelated_extension_types_and_absent_literals_do_not_add_refusals() {
             ("timestamp with time zone '2000-01-01 UTC'", "42601"),
             ("app.unsafe 'x'", "42601"),
             ("app.unsafe('x')", "42883"),
-            ("status=+'x'", "42725"),
+            ("status=+'x'", "42883"),
             ("'x'", "42P18"),
         ] {
             db.sql("SELECT pg_advisory_lock(2378)").await;
@@ -340,8 +338,8 @@ async fn modifier_lock_witness(index: usize) {
     vet_conversion(&mut db.conn, &column, &ty, "CAST(status AS varchar(3))")
         .await
         .unwrap();
-    for name in ["modtype", "ModType", "length"] {
-        let q = format!("\"{name}\"");
+    for name in ["modtype", "ModType", "length", "numeric", "as", "Mod\"Type"] {
+        let q = format!("\"{}\"", name.replace('"', "\"\""));
         db.sql(&format!("CREATE TYPE app.{q};
             CREATE FUNCTION app.{q}(cstring) RETURNS app.{q} AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
             CREATE FUNCTION app.{q}(app.{q}) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
@@ -349,10 +347,45 @@ async fn modifier_lock_witness(index: usize) {
             CREATE TYPE app.{q}(INPUT=app.{q}, OUTPUT=app.{q}, TYPMOD_IN=app.{q}, INTERNALLENGTH=8, PASSEDBYVALUE, ALIGNMENT=double)")).await;
     }
     db.sql("SET search_path = app, pg_catalog").await;
-    for using in ["length(status)", "pg_catalog.length(status)"] {
+    for using in [
+        "length(status)",
+        "pg_catalog.length(status)",
+        "CAST(status AS numeric(10,2))",
+        "status::int",
+        "status::double precision",
+    ] {
         vet_conversion(&mut db.conn, &column, &ty, using)
             .await
             .unwrap_or_else(|why| panic!("PG{} {using}: {why}", server.label));
+    }
+    let numeric = ColumnType::new(
+        "numeric",
+        vec![pbps_model::TypeArg::Int(10), pbps_model::TypeArg::Int(2)],
+    );
+    for source in [numeric.clone(), numeric.into_array()] {
+        vet_conversion(&mut db.conn, &column, &source, "status::text")
+            .await
+            .unwrap();
+    }
+    // A source type with custom typmodin is refused before either temporary
+    // binding table can parse its declaration, arrays included.
+    let mut custom = ColumnType::reference(TypeRef::new("app", "modtype").unwrap());
+    custom.args.push(pbps_model::TypeArg::Int(1));
+    for source in [custom.clone(), custom.into_array()] {
+        db.sql("SELECT pg_advisory_lock(2378)").await;
+        let result = vet_conversion(&mut db.conn, &column, &source, "status::text").await;
+        assert_eq!(
+            locks(&mut db).await,
+            1,
+            "PG{} source {source:?}: {result:?}",
+            server.label
+        );
+        db.sql("SELECT pg_advisory_unlock_all()").await;
+        assert!(
+            result
+                .unwrap_err()
+                .contains("modifier routine that is not built into PostgreSQL")
+        );
     }
     for (using, name) in [
         ("status::app.MODTYPE(1)", "modtype"),
@@ -360,12 +393,17 @@ async fn modifier_lock_witness(index: usize) {
         ("'x'::app.modtype(1)", "modtype"),
         ("CAST(status AS app.modtype(1))", "modtype"),
         ("status::app.length(1)", "length"),
-        ("CAST(status AS length(1))", "length"),
+        ("CAST(status AS app.length(1))", "length"),
         ("TREAT(status AS app.length(1))", "length"),
         ("XMLSERIALIZE(CONTENT NULL::xml AS app.length(1))", "length"),
-        ("length(1) '1'", "length"),
+        ("app.length(1) '1'", "length"),
         ("app.length((1)) /* gap */ E'1'", "length"),
         ("JSON_ARRAY(RETURNING app.length(1))", "length"),
+        ("status::SETOF app.length(1)", "length"),
+        ("CAST(status AS SETOF app.length(1))", "length"),
+        ("JSON_ARRAY(RETURNING SETOF app.length(1))", "length"),
+        (r#"status::app."as"(1)"#, "as"),
+        (r#"status::app."Mod""Type"(1)"#, "Mod\"Type"),
         ("NULL::app.modtype(1)[]", "modtype"),
         (r#"status::app."modtype" /* gap */ (1)"#, "modtype"),
         (r#"status::app.U&"modt\0079pe"(1)"#, "modtype"),
@@ -401,6 +439,20 @@ async fn modifier_lock_witness(index: usize) {
         .unwrap_err();
     assert!(!why.contains("modifier routine"), "{why}");
     assert!(why.contains("42704"), "{why}");
+    let role = db.role("lookup", "LOGIN").await;
+    db.sql("REVOKE EXECUTE ON FUNCTION pg_catalog.to_regtype(text) FROM PUBLIC")
+        .await;
+    let mut limited = db.as_role(&role).await;
+    let why = vet_conversion(&mut limited, &column, &ty, "length(status)")
+        .await
+        .unwrap_err();
+    assert!(
+        why.contains("modifier-input type names could not be resolved"),
+        "{why}"
+    );
+    drop(limited);
+    db.sql("GRANT EXECUTE ON FUNCTION pg_catalog.to_regtype(text) TO PUBLIC")
+        .await;
     // Quoted spelling is exact: this type does not exist, and binding (rather
     // than the modifier guard) must say so, without calling either routine.
     let why = vet_conversion(&mut db.conn, &column, &ty, r#"status::app."MODTYPE"(1)"#)
@@ -431,4 +483,117 @@ async fn replacement_parameters_keep_neighboring_tokens_separate() {
         }
         db.drop().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn recorded_conversions_bind_probe_and_apply_on_one_empty_path_on_postgres_18() {
+    recorded_conversion_path(0).await;
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+async fn recorded_conversions_bind_probe_and_apply_on_one_empty_path_on_postgres_16() {
+    recorded_conversion_path(1).await;
+}
+
+async fn recorded_conversion_path(index: usize) {
+    use crate::certified_fixture::FixtureEmission as _;
+    use pbps_dialect::Dialect;
+    use pbps_model::{Change, PlannedChange, Uid, UidKind};
+    let server = &servers()[index];
+    let mut db = Scratch::create(server, "resolution2378").await;
+    db.sql("CREATE SCHEMA app; CREATE TABLE app.t(status text); INSERT INTO app.t VALUES ('123');
+          CREATE TYPE app.length;
+          CREATE FUNCTION app.length(cstring) RETURNS app.length AS 'int8in' LANGUAGE internal IMMUTABLE STRICT;
+          CREATE FUNCTION app.length(app.length) RETURNS cstring AS 'int8out' LANGUAGE internal IMMUTABLE STRICT;
+          CREATE TYPE app.length(INPUT=app.length, OUTPUT=app.length, INTERNALLENGTH=8, PASSEDBYVALUE, ALIGNMENT=double);
+          CREATE FUNCTION app.length(text) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 42';
+          SET search_path=app,pg_catalog").await;
+    let column: ColumnRef = "app.t.status".parse().unwrap();
+    let ty = ColumnType::simple("text");
+    // This session would resolve the call to user code. Vetting chooses
+    // the builtin, then rollback restores the caller's path.
+    vet_conversion(&mut db.conn, &column, &ty, "length(status)")
+        .await
+        .unwrap();
+    let path = db.conn.query("SHOW search_path").await.unwrap();
+    assert_eq!(
+        path[0].try_get::<&str>("search_path").unwrap(),
+        Some("app, pg_catalog")
+    );
+    for (using, code) in [("'x'::length", "42704"), ("app_only(status)", "42883")] {
+        if using.starts_with("app_only") {
+            db.sql("CREATE FUNCTION app.app_only(text) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 7'").await;
+        }
+        let why = vet_conversion(&mut db.conn, &column, &ty, using)
+            .await
+            .unwrap_err();
+        // The user function is now absent during binding. An unconstrained
+        // cast to app.length is likewise no longer resolved through app.
+        assert!(why.contains(code), "PG{} {using}: {why}", server.label);
+    }
+    let using = "length('123')::text::integer";
+    vet_conversion(&mut db.conn, &column, &ty, using)
+        .await
+        .unwrap();
+    let change = Change::AlterColumnType {
+        uid: Uid::generate(UidKind::Column),
+        column,
+        from: ty,
+        to: ColumnType::simple("integer"),
+        from_nullable: true,
+        to_nullable: true,
+        through_external_partitions: false,
+        from_collation: None,
+        to_collation: None,
+        using: Some(using.into()),
+    };
+    let pg = pbps_pg::Postgres::new();
+    let changes = pbps_model::ChangeSet {
+        changes: vec![PlannedChange::new(change.clone())],
+    };
+    let ids = crate::plan_fixture::ids(&changes);
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+    let probes = pg.preflight(&names);
+    // run_probes pins these settings before both vetting and probe_query.
+    db.conn
+        .execute(
+            &pg.session_pins(&pbps_model::SessionZone::offline_utc())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(probes.probes.len(), 1);
+    let rows = db.conn.query(&probes.probes[0].sql).await.unwrap();
+    assert_eq!(rows[0].try_get::<i32>("n").unwrap(), Some(0));
+    let expected = db
+        .conn
+        .query("SELECT length('123')::text::integer AS n")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(expected, 3);
+    // The lowered statement is also what rehearsal, plan tests and --sql
+    // consume. It must establish its own path, even in this hostile session.
+    db.sql("SET search_path=app,pg_catalog").await;
+    for statement in pg.fixture_emit(&change, Default::default()).unwrap() {
+        db.conn.execute(&statement.sql).await.unwrap();
+    }
+    let actual = db
+        .conn
+        .query("SELECT status AS n FROM app.t")
+        .await
+        .unwrap()[0]
+        .try_get::<i32>("n")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual, expected,
+        "PG{}: applied the unchecked resolution (123 instead of 3)",
+        server.label
+    );
+    db.drop().await;
 }

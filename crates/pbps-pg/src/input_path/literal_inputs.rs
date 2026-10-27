@@ -1,8 +1,8 @@
 //! Parse-time input paths must be judged before any original expression binds.
-//! PostgreSQL resolves literal parameters; modifier type positions are checked
-//! first because typmodin itself runs during Parse (DEC-2378.1).
-use pbps_db::{Conn, DbError};
-use pbps_model::{TableName, escape::Escaped};
+//! PostgreSQL resolves literal parameters and name-only type OIDs under the
+//! same empty path as execution, before typmodin can run (DEC-2378.1).
+use pbps_db::{Conn, DbError, Param};
+use pbps_model::{ColumnType, TableName, escape::Escaped};
 
 use super::need;
 
@@ -50,11 +50,12 @@ async fn unsafe_types(conn: &mut Conn) -> Result<Vec<(i64, String, String)>, DbE
 pub(super) async fn before_bind(
     conn: &mut Conn,
     expression: &str,
-    source_type: &str,
+    source_type: &ColumnType,
 ) -> Result<Option<LiteralInputs>, String> {
     let modifiers = conn
         .query(
-            "SELECT t.typname::pg_catalog.text AS name, tn.nspname::pg_catalog.text AS schema
+            "SELECT t.oid::pg_catalog.int8 AS oid, t.typname::pg_catalog.text AS name,
+                  tn.nspname::pg_catalog.text AS schema
            FROM pg_catalog.pg_type t
            JOIN pg_catalog.pg_namespace tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
            JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) t.typmodin
@@ -63,21 +64,29 @@ pub(super) async fn before_bind(
         )
         .await
         .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
-    let spans = crate::LEXICON.string_literal_spans(expression);
     if !modifiers.is_empty() {
-        // The source is a type declaration, not an expression. Give it the
-        // same type-position marker as an expression's explicit cast.
-        let source = format!("::{source_type}");
-        let tokens = [
-            modifier_tokens(expression, &spans),
-            modifier_tokens(&source, &crate::LEXICON.string_literal_spans(&source)),
-        ];
+        // Strip modifiers structurally: resolving the full source spelling
+        // would itself call typmodin. Keep its array identity in the OID.
+        let mut source = source_type.clone();
+        source.args.clear();
+        let source = source.raw().to_string();
+        let unreadable = "could not be vetted: modifier-input type names could not be resolved";
+        let source_oid = resolve_type(conn, &source)
+            .await
+            .map_err(|_| unreadable)?
+            .ok_or(unreadable)?;
+        let mut oids = vec![source_oid];
+        for name in type_names(expression) {
+            if let Some(oid) = resolve_type(conn, &name).await.map_err(|_| unreadable)? {
+                oids.push(oid);
+            }
+        }
         for row in &modifiers {
-            let name: &str = need(row, "name")
-                .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
-            let schema: &str = need(row, "schema")
-                .map_err(|_| "could not be vetted: the modifier-input catalog could not be read")?;
-            if tokens.iter().any(|t| names_modifier(t, schema, name)) {
+            let catalog = "could not be vetted: the modifier-input catalog could not be read";
+            let oid: i64 = need(row, "oid").map_err(|_| catalog)?;
+            let name: &str = need(row, "name").map_err(|_| catalog)?;
+            let schema: &str = need(row, "schema").map_err(|_| catalog)?;
+            if oids.contains(&oid) {
                 return Err(format!(
                     "cannot be bound safely: type `{}.{}` has a modifier routine that is not built into PostgreSQL",
                     Escaped(schema),
@@ -86,6 +95,7 @@ pub(super) async fn before_bind(
             }
         }
     }
+    let spans = crate::LEXICON.string_literal_spans(expression);
     let spans: Vec<_> = spans
         .into_iter()
         .filter(|s| !matches!(expression.as_bytes()[s.start], b'b' | b'B' | b'x' | b'X'))
@@ -140,138 +150,110 @@ impl LiteralInputs {
     }
 }
 
-// Only the type positions in gram.y can call typmodin; an ordinary function
-// call with a colliding name belongs to the bound-tree audit (DEC-2378.1).
-enum ModifierToken {
-    Name(String, bool), // The flag preserves quoted spelling, including keywords.
-    Cast,
-    Symbol(char),
-    Literal,
+// Quote every folded name component, including keywords: to_regtype('"as"')
+// is an absent identifier, not a syntax error. Never pass a modifier list.
+async fn resolve_type(conn: &mut Conn, name: &str) -> Result<Option<i64>, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT pg_catalog.to_regtype($1)::pg_catalog.oid::pg_catalog.int8 AS oid",
+            &[Param::Str(name)],
+        )
+        .await?;
+    rows.first()
+        .ok_or_else(|| DbError::Refused("type name lookup returned no row".into()))?
+        .try_get("oid")
 }
 
-fn modifier_tokens(text: &str, spans: &[std::ops::Range<usize>]) -> Vec<ModifierToken> {
+enum NameToken {
+    Name(String),
+    Dot,
+    Other,
+}
+
+fn type_names(text: &str) -> std::collections::BTreeSet<String> {
     let code = crate::LEXICON.header(text);
-    let mut chars = code.char_indices().peekable();
-    let mut literals = spans.iter().peekable();
+    let mut chars = code.chars().peekable();
     let mut tokens = Vec::new();
-    while let Some((at, ch)) = chars.next() {
-        if literals.peek().is_some_and(|s| s.start == at) {
-            let span = literals.next().unwrap();
-            while chars.next_if(|(at, _)| *at < span.end).is_some() {}
-            tokens.push(ModifierToken::Literal);
-        } else if ch.is_ascii_whitespace() {
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_whitespace() {
             continue;
-        } else if ch == '"' || pbps_dialect::continues_ident(ch) {
-            let quoted = ch == '"';
+        }
+        if ch == '"' || (pbps_dialect::continues_ident(ch) && !ch.is_ascii_digit() && ch != '$') {
             let mut name = String::new();
-            if quoted {
-                while let Some((_, c)) = chars.next() {
-                    if c == '"' && chars.next_if(|(_, c)| *c == '"').is_none() {
+            if ch == '"' {
+                while let Some(c) = chars.next() {
+                    if c == '"' && chars.next_if_eq(&'"').is_none() {
                         break;
                     }
                     name.push(c);
                 }
             } else {
                 name.push(ch);
-                while let Some((_, c)) = chars.next_if(|(_, c)| pbps_dialect::continues_ident(*c)) {
+                while let Some(c) = chars.next_if(|c| pbps_dialect::continues_ident(*c)) {
                     name.push(c);
                 }
                 name.make_ascii_lowercase();
             }
-            while name.len() > 63 {
-                name.pop();
-            }
-            tokens.push(ModifierToken::Name(name, quoted));
-        } else if ch == ':' && chars.next_if(|(_, c)| *c == ':').is_some() {
-            tokens.push(ModifierToken::Cast);
+            tokens.push(NameToken::Name(format!(
+                "\"{}\"",
+                name.replace('"', "\"\"")
+            )));
         } else {
-            tokens.push(ModifierToken::Symbol(ch));
+            if ch.is_ascii_digit() || ch == '$' {
+                while chars
+                    .next_if(|c| pbps_dialect::continues_ident(*c))
+                    .is_some()
+                {}
+            }
+            tokens.push(if ch == '.' {
+                NameToken::Dot
+            } else {
+                NameToken::Other
+            });
         }
     }
-    tokens
-}
-
-fn names_modifier(tokens: &[ModifierToken], schema: &str, name: &str) -> bool {
-    for (i, token) in tokens.iter().enumerate() {
-        if !matches!(token, ModifierToken::Name(n, _) if n == name)
-            || !matches!(tokens.get(i + 1), Some(ModifierToken::Symbol('(')))
-        {
-            continue;
-        }
-        let mut start = i;
-        while start >= 2
-            && matches!(tokens[start - 1], ModifierToken::Symbol('.'))
-            && matches!(tokens[start - 2], ModifierToken::Name(..))
-        {
-            start -= 2;
-        }
-        if i > start && !matches!(&tokens[i - 2], ModifierToken::Name(s, _) if s == schema) {
-            continue;
-        }
-        if start > 0
-            && (matches!(tokens[start - 1], ModifierToken::Cast)
-                || matches!(&tokens[start - 1], ModifierToken::Name(s, false) if s == "as" || s == "returning"))
-        {
-            return true;
-        }
-        let mut depth = 0;
-        for (j, token) in tokens.iter().enumerate().skip(i + 1) {
-            match token {
-                ModifierToken::Symbol('(') => depth += 1,
-                ModifierToken::Symbol(')') => depth -= 1,
-                ModifierToken::Name(..)
-                | ModifierToken::Cast
-                | ModifierToken::Symbol(_)
-                | ModifierToken::Literal => {}
+    let mut names = std::collections::BTreeSet::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        if let NameToken::Name(name) = &tokens[at] {
+            let mut name = name.clone();
+            while let (Some(NameToken::Dot), Some(NameToken::Name(part))) =
+                (tokens.get(at + 1), tokens.get(at + 2))
+            {
+                name.push('.');
+                name.push_str(part);
+                at += 2;
             }
-            if depth == 0 {
-                if matches!(tokens.get(j + 1), Some(ModifierToken::Literal)) {
-                    return true;
-                }
-                break;
-            }
+            names.insert(name);
         }
+        at += 1;
     }
-    false
+    names
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{modifier_tokens, names_modifier};
+    use super::type_names;
 
     #[test]
-    fn modifiers_are_type_positions_not_function_names() {
-        let names = |text| {
-            names_modifier(
-                &modifier_tokens(text, &crate::LEXICON.string_literal_spans(text)),
-                "app",
-                "length",
-            )
-        };
-        for text in [
-            "x::app.length(1)",
-            "CAST(x AS length(1))",
-            "TREAT(x AS app.length(1))",
-            "XMLSERIALIZE(CONTENT x AS app.length(1))",
-            "JSON_ARRAY(RETURNING app.length(1))",
-            "app.length((1)) /* gap */ '1'",
-            "length(1) E'1'",
-            "length(1) $tag$1$tag$",
+    fn type_names_preserve_qualification_and_quote_folded_parts() {
+        let names = type_names(
+            r#"CAST(x AS SETOF App."Mod""Type"(1)) + pg_catalog.length(x) + db.app.numeric(1)"#,
+        );
+        for name in [
+            r#""cast""#,
+            r#""as""#,
+            r#""setof""#,
+            r#""app"."Mod""Type""#,
+            r#""pg_catalog"."length""#,
+            r#""db"."app"."numeric""#,
         ] {
-            assert!(names(text), "{text}");
+            assert!(names.contains(name), "{names:?}: {name}");
         }
-        for text in [
-            "length(status)",
-            "pg_catalog.length(status)",
-            "x::other.length(1)",
-            "CAST(x AS pg_catalog.length(1))",
-            "x::\"APP\".length(1)",
-            "length(')') || '1'",
-            "length((1)) + '1'",
-            "length(status) /* 'not a literal' */",
-            "'length(1)'",
-        ] {
-            assert!(!names(text), "{text}");
+        for name in [r#""length""#, r#""numeric""#, r#""1""#] {
+            assert!(!names.contains(name), "{names:?}");
         }
+        assert!(type_names("'app.unsafe' /* app.modtype */ -- app.modtype\n").is_empty());
+        assert!(type_names(r#"app.U&"modt\0079pe""#).contains(r#""app"."modtype""#));
     }
 }

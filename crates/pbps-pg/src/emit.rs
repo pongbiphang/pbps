@@ -2471,9 +2471,9 @@ fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectE
     )))
 }
 
-/// A statement that is pbps's alone, on the session's empty path: every name
-/// in it qualified, and no declared expression to resolve, so it needs no
-/// schema's path and is safer without one (DEC-1564.1).
+/// A statement on the empty path: pbps's own qualified names (DEC-1564.1),
+/// or a recorded conversion explicitly pinned to its vetted resolution
+/// environment (DEC-2378.2). Other declared expressions need their schema path.
 fn unscoped(body: String) -> Sql {
     Ok(vec![Statement::new(body)])
 }
@@ -4364,15 +4364,20 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     }
                 ));
             }
-            let sql = one(
-                pg,
-                &column.table,
-                format!(
-                    "ALTER TABLE {} {};",
-                    qualified(&column.table)?,
-                    parts.join(", ")
-                ),
-            )?;
+            let body = format!(
+                "ALTER TABLE {} {};",
+                qualified(&column.table)?,
+                parts.join(", ")
+            );
+            let sql = if using.is_some() {
+                // The vetter and row pre-flight bind on the empty path. A
+                // schema-scoped ALTER could call code neither judged (DEC-2378.2).
+                // Keep the pin in the emitted statement for rehearsal, plan
+                // tests and standalone SQL replay too.
+                unscoped(format!("SET search_path = '';\n{body}"))?
+            } else {
+                one(pg, &column.table, body)?
+            };
             if !from_nullable && *to_nullable && *through_external_partitions {
                 clear_external_partitions(&column.table, column.name.raw(), sql)
             } else {
