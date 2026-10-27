@@ -3868,38 +3868,56 @@ pins it on 16 and 18. This supersedes the base and collation refusals of DEC-163
 
 <a id="dec-2378-1"></a>
 
-**DEC-2378.1. Refuse a literal's unsafe input path before binding a recorded
-conversion (#2378).** PostgreSQL may call a base type's input routine while
-coercing an unknown literal during parse analysis. Reading the bound tree is
-too late, and rolling back is not containment: measured on 16.15 and 18.6,
-a type whose input aliases the internal `pg_advisory_unlock_all` entry point
-releases a session advisory lock while the temporary CHECK is bound, and the
-lock stays released after rollback.
+**DEC-2378.1. Judge parse-time input paths before binding a recorded conversion
+(#2378).** PostgreSQL may call a base type's input routine while coercing an
+unknown literal during parse analysis. Reading the bound tree is too late,
+and rollback is not containment: measured on 16.15 and 18.6, an input routine
+aliasing `pg_advisory_unlock_all` releases a session advisory lock while the
+CHECK is bound, and rollback leaves it released.
 
-With no string or typed literal, return before querying the catalog so that
-an unreadable catalog cannot abort a literal-free bind's transaction. Otherwise,
-in the vetter's existing transaction, read one catalog closure: base types
-whose input routine is outside `pg_catalog`, then arrays, domains, composites,
-ranges and multiranges containing one of them. An empty closure skips name
-inspection. Otherwise the shared lexer removes comments and literals from code;
-whole identifier tokens preserve quoted names and qualification. Name-only
-target lookups carry no type modifiers and keep built-in aliases distinct
-from same-spelled extension types. No lexer
-features or SQL parser dependency are added.
+Read the unsafe-type catalog closure once when the shared lexer finds a
+string literal: base types whose input routine is outside `pg_catalog`, then
+arrays, domains, composites, ranges and multiranges containing one of them.
+No literal means no closure query; an empty closure means no literal guard.
+B/X bit constants are typed already and are not replaced. The shared string
+reader exposes complete spans, including E/U& prefixes, dollar delimiters,
+continuations and UESCAPE clauses; it adds no second lexer.
 
-Refuse before binding when a literal can reach a type in that closure through
-an explicit cast, typed literal or function-style type cast, a referenced
-column of the table, or an argument of a named routine/operator. All visible
-overloads count, including SQL grammar's implied comparison operators; a
-qualified reference considers only its namespace. Choosing an overload before
-binding would reproduce the engine's resolver. A catalog read failure is
-unreadable evidence and refuses a literal-bearing expression. Refusals name
-the unsafe type, with catalog names escaped as prose. The expression itself
-is unchanged; the single-statement protocol, temporary-table shape check and
-DEC-2181.1 bound-tree audit still run afterwards.
+Create an empty temporary table of the binding column and replace each
+unknown string literal with its own `$n` parameter. Prepare exactly
+`SELECT ((<rewritten>) IS NULL) OR true FROM <temporary table>` through
+Parse/Describe, never executing it or supplying parameter values. PostgreSQL
+itself decides each parameter type. A parameter in the unsafe closure refuses
+before the original expression binds, naming that type with escaped prose.
+The original CHECK statement, shape check and DEC-2181.1 bound-tree audit
+remain authoritative afterwards. There is no local SQL resolver, overload
+scan or grammar-keyword list.
+
+A failed preparation refuses only when that closure is non-empty and a
+string literal is present. The refusal carries its SQLSTATE and the remedy
+`CAST('…' AS type)` or `'…'::type`. Measured, typed-literal syntax such as
+`date '…'` becomes invalid as `date $1` (42601), and an unconstrained literal
+in this wrapper leaves an undeterminable parameter (42P18). A function-style
+type cast can also lose its unknown-constant special case and report 42883.
+These are explicit limitations of this pre-binding check, not guesses about a type name.
+
+Type modifiers need a separate guard: Parse itself calls `typmodin` even
+without literals. Read the small set of types whose modifier-input routine
+is outside `pg_catalog` before any bind or prepare; an empty set skips the
+name check. In the shared lexer's code-only header, refuse an identifier
+matching one of those type names immediately followed by `(`. Unquoted names
+fold as PostgreSQL does, quoted names are exact, and only the last component
+of a qualified name can be followed by `(`. This deliberately coarse match
+also catches a same-named user function such as PostGIS `geometry(...)`:
+DEC-2181.1 already refuses non-built-in types and routines, so the guard moves
+that refusal before Parse can call the modifier routine. It names the type
+and says its modifier routine is not built in. The source type used to make
+the temporary table is checked too. A failed catalog read is unreadable
+evidence, never an empty set. A failed modifier-set read refuses every conversion
+while that read fails, including conversions without literals.
 
 This adds no scratch requirement and changes no saved format or offline
-`convert` recording. Connected plan and apply use the same vetter. A database
-with an unrelated extension type still admits `status = 'active'` on a text
-column. A session-lock witness pins refusal before the input runs on both
-supported majors; removing the guard loses that lock and fails the test.
+`convert` recording. Connected plan and apply share the same vetter. The
+literal and modifier lock witnesses run on both supported majors; removing
+either protection releases the lock. An unrelated unsafe type, sibling column
+or name in literal/comment text adds no refusal to ordinary built-in use.

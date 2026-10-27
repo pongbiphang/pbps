@@ -886,9 +886,14 @@ pub async fn vet_conversion(
         .await
         .map_err(|_| unvetted("could not be vetted: no transaction to bind it in".into()))?;
     let result = async {
-        literal_inputs::check(conn, &column.table, using)
-            .await
-            .map_err(unvetted)?;
+        if let Some(inputs) = literal_inputs::before_bind(conn, using, ty).await.map_err(unvetted)? {
+            // Keep the original CHECK statement and its shape audit unchanged.
+            // This separate empty table only supplies column types to Describe.
+            conn.execute_with(&format!(
+                "CREATE TEMPORARY TABLE pg_temp.pbps_conversion_input ({quoted} {ty}) ON COMMIT DROP"
+            ), &[]).await.map_err(|_| unvetted("could not be vetted: its parameter binding table could not be created".into()))?;
+            inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input")).await.map_err(unvetted)?;
+        }
         vet_in_transaction(conn, quoted, ty, using, shown).await
     }
     .await;

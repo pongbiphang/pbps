@@ -1213,8 +1213,27 @@ impl Lexicon {
     /// (DEC-1364.1). An unterminated literal ends the scan.
     #[must_use]
     pub fn string_literals(&self, text: &str) -> Vec<String> {
-        let bytes = text.as_bytes();
         let mut out = Vec::new();
+        self.scan_string_literals(text, |_, contents| out.push(contents));
+        out
+    }
+
+    /// Complete literal spans, including prefixes, continuations and UESCAPE.
+    /// Uses the same reader as `string_literals`; comments and identifiers do
+    /// not contribute spans. B/X/N prefixes are included, not reclassified.
+    #[must_use]
+    pub fn string_literal_spans(&self, text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        self.scan_string_literals(text, |span, _| out.push(span));
+        out
+    }
+
+    fn scan_string_literals(
+        &self,
+        text: &str,
+        mut emit: impl FnMut(std::ops::Range<usize>, String),
+    ) {
+        let bytes = text.as_bytes();
         let mut i = 0;
         while i < text.len() {
             let rest = &text[i..];
@@ -1274,7 +1293,7 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, i) else {
                     break;
                 };
-                out.push(literal.contents);
+                emit(i..literal.end, literal.contents);
                 i = literal.end;
             } else if let Some(start) = literal_start(rest)
                 && (start == '\'' || !after_name)
@@ -1291,13 +1310,12 @@ impl Lexicon {
                 let Some(literal) = sql_string(text, at) else {
                     break;
                 };
-                out.push(literal.contents);
+                emit(i..literal.end, literal.contents);
                 i = literal.end;
             } else {
                 i += ch.len_utf8();
             }
         }
-        out
     }
 
     /// The routine header's language, decoded independently of its body and
@@ -7594,6 +7612,47 @@ UESCAPE '!' AS s";
             ["x"]
         );
         assert!(lexicon.string_literals("a * 2 -- 'x'").is_empty());
+    }
+
+    #[test]
+    fn literal_spans_cover_whole_tokens_and_skip_comments_and_identifiers() {
+        let tokens = [
+            "'x''y'",
+            r"E'x\'y'",
+            r"U&'x!0061' UESCAPE '!'",
+            "$tag$x$tag$",
+            "'x'\n'y'",
+            "B'101'",
+            "X'ff'",
+            "N'x'",
+            "'same'",
+            "'same'",
+        ];
+        let text = format!(
+            "\"é'\" /* 'ignored' */ {} -- 'ignored'\n",
+            tokens.join(" || ")
+        );
+        let spans = PG.string_literal_spans(&text);
+        assert_eq!(
+            spans.iter().map(|s| &text[s.clone()]).collect::<Vec<_>>(),
+            tokens
+        );
+        assert!(spans.windows(2).all(|s| s[0].end < s[1].start));
+        assert_eq!(
+            PG.string_literals(&text),
+            [
+                "x'y", "x'y", "xa", "x", "xy", "101", "ff", "x", "same", "same"
+            ]
+        );
+        for text in [
+            "status -- 'fake'",
+            "/* 'fake' /* $$fake$$ */ */ status",
+            r#"U&"_0061" UESCAPE '_'"#,
+            "\"'fake'\"",
+            "'unterminated",
+        ] {
+            assert!(PG.string_literal_spans(text).is_empty(), "{text}");
+        }
     }
 
     #[test]

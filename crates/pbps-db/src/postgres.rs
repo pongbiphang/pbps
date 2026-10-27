@@ -44,6 +44,10 @@ pub(crate) struct PreparedQuery {
 }
 
 impl PreparedQuery {
+    pub(crate) fn parameter_type_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.statement.params().iter().map(|t| t.oid())
+    }
+
     pub(crate) fn type_ids(&self) -> impl Iterator<Item = u32> + '_ {
         self.statement.columns().iter().map(|c| c.type_().oid())
     }
