@@ -597,6 +597,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
                         desired: &schema,
                     },
                     &[],
+                    Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
                 )
                 .await
                 .err();
@@ -1217,7 +1218,7 @@ async fn mssql_prepare_renders_missing_external_and_returns_entered_compile_conn
         let mut admin=connection(&scratch_server).await;
         let (provisioning,mut state)=super::engine::scratch(Driver::Mssql,&mut target,&mut admin,&tokens,&identity,&scratch_server,&request,&Standard::Mssql,file,&provenance).await.unwrap();
         let (catalog,authorization)=crate::resolver::scope::read_target(&mut target,Driver::Mssql,&request.schemas,&[],&request.schemas,&[]).await.unwrap();
-        let prepared=state.prepare(provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[]).await;
+        let prepared=state.prepare(provisioning,&mut admin,&mut target,&catalog,&authorization,&request.schemas,&binding,&[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let verification=tokio::spawn(async move { match prepared {
             Ok(super::engine::Prepared::Mssql(mut prepared)) => {
                 assert!(matches!(prepared.map,crate::resolver::scope::Principals::Mssql(_)));
@@ -1284,7 +1285,7 @@ async fn mssql_supplied_type_permissions_release_to_empty_inventory() {
         ).await.unwrap();
         let prepared = state.prepare(
             provisioning, &mut admin, &mut target, &catalog, &authorization,
-            &request.schemas, &binding, &[],
+            &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
         ).await.unwrap();
         let super::engine::Prepared::Mssql(mut prepared) = prepared else { panic!("wrong engine"); };
         let rows = prepared.compile.query("SELECT p.state_desc,USER_NAME(p.grantee_principal_id) AS grantee,USER_NAME(p.grantor_principal_id) AS grantor,USER_NAME(t.principal_id) AS owner FROM sys.database_permissions p JOIN sys.types t ON p.class=6 AND t.user_type_id=p.major_id;").await.unwrap();
@@ -1321,3 +1322,38 @@ mod docker2410;
 
 #[path = "visibility2314_tests.rs"]
 mod visibility2314;
+
+#[cfg(unix)]
+pub(super) fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    capture_key_from(b"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+}
+
+pub(super) fn capture_key_from(text: &[u8]) -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let path = std::env::temp_dir().join(format!(
+        "pbps2375-key-{}-{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path).unwrap();
+    file.write_all(text).unwrap();
+    drop(file);
+    let key = pbps_db::fingerprint::EnvironmentFingerprintKey::from_file(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    key
+}
+
+#[path = "assessment2375_tests.rs"]
+mod assessment2375;
+
+#[cfg(not(unix))]
+pub(super) fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
+    pbps_db::fingerprint::EnvironmentFingerprintKey::from_env("PBPS_TEST_FINGERPRINT_KEY")
+        .expect("the LocalDB runner supplies the environment key")
+}

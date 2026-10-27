@@ -148,7 +148,7 @@ async fn automatic_externals(default: &'static str) {
         let (catalog, authorization) = crate::resolver::scope::read_target(
             &mut target, Driver::Mssql, &request.schemas, &[], &request.schemas, &[],
         ).await.unwrap();
-        let prepared = state.prepare(provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[]).await;
+        let prepared = state.prepare(provisioning, &mut admin, &mut target, &catalog, &authorization, &request.schemas, &binding, &[], Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key())).await;
         let checked = async {
             let super::super::engine::Prepared::Mssql(mut prepared) = prepared? else { panic!("wrong engine"); };
             assert!(prepared.staged.compared().contains(&capture::object("dbo", "external2270")));

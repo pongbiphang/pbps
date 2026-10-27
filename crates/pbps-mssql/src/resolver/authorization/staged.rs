@@ -126,6 +126,7 @@ impl OwnerPartition {
             .into_iter()
             .filter(|(id, _)| {
                 id.class == class::OBJECT
+                    || id.class.starts_with("pbps-unnamed-")
                     || id.name.first().is_some_and(|name| {
                         held_schemas.contains(name.as_str())
                             || SYSTEM_SCHEMAS.contains(&name.as_str())

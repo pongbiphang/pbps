@@ -47,14 +47,14 @@ async fn assembly_case(reached: bool) {
             let result = capture::capture(&mut conn, &capture::CaptureScope {
                 retained: BTreeSet::from([capture::object("dbo", "managed2270")]),
                 candidates: BTreeSet::new(),
-            }).await;
+            }, &crate::capture_key()).await;
             assert!(matches!(&result, Err(capture::CaptureError::Coverage(u)) if u.object.as_ref()==Some(&capture::object("dbo","clr2270")) && u.condition.contains("assembly")), "{:?}", result.as_ref().err());
         } else {
             conn.execute("CREATE TABLE dbo.ordinary2270(i int);").await?;
             capture::capture(&mut conn, &capture::CaptureScope {
                 retained: BTreeSet::from([capture::object("dbo", "ordinary2270")]),
                 candidates: BTreeSet::new(),
-            }).await.expect("an unreached assembly does not block ordinary objects");
+            }, &crate::capture_key()).await.expect("an unreached assembly does not block ordinary objects");
         }
         Ok(())
     }.await;

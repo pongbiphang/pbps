@@ -37,7 +37,7 @@ const NO_BINDING_ADAPTER: &str =
 
 /// Where a SQL Server run stops: reconstruction, the compiled capture and
 /// the target's opening capture exist, and planning from their evidence is
-/// #2143. The first step that needs it, assessment, names it.
+/// #2143. Assessment exists; ordering from that evidence is the next boundary.
 const PLANNING_FROM_EVIDENCE: &str =
     "SQL Server planning from evidence is not implemented yet (#2143)";
 
@@ -200,6 +200,7 @@ impl Scratch<'_> {
         schemas: &[String],
         binding: &BindingRequest<'_>,
         extras: &[String],
+        key: Option<&EnvironmentFingerprintKey>,
     ) -> Result<Prepared, Error> {
         match self {
             Self::Postgres(scratch) => {
@@ -218,6 +219,12 @@ impl Scratch<'_> {
                     authorization,
                     schemas,
                     binding,
+                    key.ok_or_else(|| {
+                        Error::Binding(
+                        "SQL Server capture requires the configured environment fingerprint key"
+                            .into(),
+                    )
+                    })?,
                 )
                 .await
                 .map(Prepared::Mssql),
@@ -497,9 +504,13 @@ impl Binding {
                 CapturedInputs::Postgres(current),
                 Staged::Postgres(staged),
             ) => Ok(binding.assess(closing, current, staged)),
-            // The compiled and opening captures exist; what to conclude from
-            // their difference is #2375's assessment and #2143's planning.
-            (Self::Mssql(_), ..) => Err(Error::Binding(PLANNING_FROM_EVIDENCE.into())),
+            (
+                Self::Mssql(binding),
+                CompiledCapture::Mssql(closing),
+                CapturedInputs::Mssql(current),
+                Staged::Mssql(staged),
+            ) => Ok(binding.assess(closing, current, staged)),
+            (Self::Mssql(_), ..) => Err(unsupported()),
             (Self::Postgres(_), ..) => Err(unsupported()),
         }
     }
@@ -551,7 +562,15 @@ impl CompiledCapture {
     ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
         match self {
             Self::Postgres(closing) => closing.planning_records(),
-            Self::Mssql(_) => unreachable!("SQL Server planning refuses at assessment (#2143)"),
+            Self::Mssql(closing) => Ok(closing
+                .planning_records()?
+                .into_iter()
+                .map(|record| BindingRecord {
+                    object: record.object,
+                    ownership: record.ownership,
+                    bindings: record.bindings,
+                })
+                .collect()),
         }
     }
     pub(super) fn seal_for_plan(
@@ -559,7 +578,7 @@ impl CompiledCapture {
     ) -> Result<InputManifest, pbps_pg::resolver::capture::SealError> {
         match self {
             Self::Postgres(closing) => closing.seal_for_plan(),
-            Self::Mssql(_) => unreachable!("SQL Server planning refuses at assessment (#2143)"),
+            Self::Mssql(closing) => closing.seal_for_plan().map_err(Into::into),
         }
     }
 }

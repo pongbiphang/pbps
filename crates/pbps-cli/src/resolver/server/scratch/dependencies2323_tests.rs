@@ -212,6 +212,7 @@ async fn prepare_probe(
         &request.schemas,
         &binding,
         &[],
+        Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
     ))
     .await;
     let database = case.other_name.clone();
@@ -226,7 +227,7 @@ async fn prepare_probe(
         let scope = capture::CaptureScope {
             retained: [capture::object("dbo", "rehearsed2323")].into(), candidates: Default::default(),
         };
-        capture::capture_declared(&mut prepared.compile, &scope, &declarations).await.unwrap();
+        capture::capture_declared(&mut prepared.compile, &scope, &declarations, &crate::resolver::server::scratch::mssql_live_tests::capture_key()).await.unwrap();
         // Binding succeeds without giving the compiler permission to read data.
         assert!(prepared.compile.query(&format!("SELECT TOP(0) * FROM [{database}].dbo.dep2323;")).await.is_err());
         assert!(prepared.compile.execute("REVERT;").await.is_err());

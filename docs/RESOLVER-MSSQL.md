@@ -763,11 +763,18 @@ at creation and remains outside this static dependency check.
 post-file inventory root and accepts the corresponding target shapes. Its
 `changed_since` check compares those accepted shapes against the final target
 capture, using its exported scope. Retained OBJECTPROPERTYEX facts belong to
-the canonical `mssql-capture-v3` shape and its sealed prerequisites, so later
+the canonical `mssql-capture-v4` shape and its sealed prerequisites, so later
 rechecks do not lose facts the staged comparison used. The CLI prepares and accepts externals, compiles the declarations as the
 reproduced deployer (§5) and reads the compiled scratch and the target, then
 stops at the named boundary: planning from evidence (#2143). No planning or
 binding certificate is fabricated.
+
+System-named keys, CHECKs, DEFAULTs, foreign keys and key-backed indexes use
+canonical declaration identities (DEC-2375.1). Private CHECK definitions stay
+inside capture; their public identities are domain-separated HMAC tokens under
+the environment key fixed before the read. Diagnostics name the table, kind
+and an eight-character token prefix, and suggest naming the constraint. Two
+identical unnamed declarations on one table refuse rather than merge.
 
 **File execution and rendering (DEC-2269.1).** Preparation inventories the
 bounded scratch after generated database authorization setup, executes the

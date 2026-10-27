@@ -31,6 +31,9 @@ impl std::fmt::Debug for Staged {
 }
 
 impl Staged {
+    pub(super) fn holds(&self, id: &ObjectIdentity) -> bool {
+        self.accepted.contains_key(id)
+    }
     pub fn compared(&self) -> &BTreeSet<ObjectIdentity> {
         &self.compared
     }
@@ -68,8 +71,9 @@ pub async fn compare_staged(
     target: &mut impl QueryConnection,
     created: &BTreeSet<ObjectIdentity>,
     managed: &[&Schema],
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<Staged, StageError> {
-    compare_staged_declared(scratch, target, created, managed, &Default::default()).await
+    compare_staged_declared(scratch, target, created, managed, &Default::default(), key).await
 }
 
 pub async fn compare_staged_declared(
@@ -78,6 +82,7 @@ pub async fn compare_staged_declared(
     created: &BTreeSet<ObjectIdentity>,
     managed: &[&Schema],
     declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<Staged, StageError> {
     let managed: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let mut refused = Vec::new();
@@ -118,13 +123,33 @@ pub async fn compare_staged_declared(
     if !refused.is_empty() {
         return Err(StageError::Refused(refused));
     }
-    let mut scope = cascade_scope_for(target, &target_managed)
+    let canonical_created = if created.is_empty() {
+        created.clone()
+    } else {
+        super::capture_declared(
+            scratch,
+            &CaptureScope {
+                retained: created.clone(),
+                candidates: BTreeSet::new(),
+            },
+            declarations,
+            key,
+        )
+        .await
+        .map_err(StageError::Capture)?
+        .scope()
+        .retained
+        .clone()
+    };
+    let created = &canonical_created;
+    let mut scope = cascade_scope_for(target, &target_managed, key)
         .await
         .map_err(StageError::Capture)?;
     scope.retained.extend(created.iter().cloned());
-    let on_target = super::capture_declared(target, &scope, declarations)
+    let on_target = super::capture_declared(target, &scope, declarations, key)
         .await
         .map_err(StageError::Capture)?;
+    scope = on_target.scope().clone();
     let held_managed = Names::read(scratch, &target_managed.objects)
         .await
         .map_err(StageError::Capture)?;
@@ -138,7 +163,7 @@ pub async fn compare_staged_declared(
     if !waiting.is_empty() {
         return Err(StageError::Refused(waiting));
     }
-    let staged = super::capture_declared(scratch, &scope, declarations)
+    let staged = super::capture_declared(scratch, &scope, declarations, key)
         .await
         .map_err(StageError::Capture)?;
     let requested: BTreeSet<_> = created
@@ -152,16 +177,29 @@ pub async fn compare_staged_declared(
                 .cloned(),
         )
         .collect();
-    let target_names = Names::read(target, &requested)
+    let spelled = requested
+        .iter()
+        .filter(|id| !id.class.starts_with("pbps-unnamed-"))
+        .cloned()
+        .collect();
+    let target_names = Names::read(target, &spelled)
         .await
         .map_err(StageError::Capture)?;
-    let scratch_names = Names::read(scratch, &requested)
+    let scratch_names = Names::read(scratch, &spelled)
         .await
         .map_err(StageError::Capture)?;
     let mut roots = BTreeSet::new();
     for root in &requested {
-        let a = target_names.get(root);
-        let b = scratch_names.get(root);
+        let a = if root.class.starts_with("pbps-unnamed-") {
+            on_target.inputs.get_key_value(root).map(|(id, _)| id)
+        } else {
+            target_names.get(root)
+        };
+        let b = if root.class.starts_with("pbps-unnamed-") {
+            staged.inputs.get_key_value(root).map(|(id, _)| id)
+        } else {
+            scratch_names.get(root)
+        };
         for (label, actual, inputs) in [
             ("target", a, &on_target.inputs),
             ("scratch", b, &staged.inputs),
@@ -278,20 +316,22 @@ impl ExternalInputs {
 pub async fn required_externals(
     target: &mut impl QueryConnection,
     managed: &[&Schema],
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<ExternalInputs, CaptureError> {
-    required_externals_declared(target, managed, &Default::default()).await
+    required_externals_declared(target, managed, &Default::default(), key).await
 }
 
 pub async fn required_externals_declared(
     target: &mut impl QueryConnection,
     managed: &[&Schema],
     declarations: &pbps_model::dependency::Dependencies,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<ExternalInputs, CaptureError> {
     let schemas: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let managed = Managed::read(target, &schemas).await?;
-    let mut scope = cascade_scope_for(target, &managed).await?;
+    let mut scope = cascade_scope_for(target, &managed, key).await?;
     scope.retained.extend(managed.objects.iter().cloned());
-    let captured = super::capture_declared(target, &scope, declarations).await?;
+    let captured = super::capture_declared(target, &scope, declarations, key).await?;
     let roots = captured
         .inputs
         .iter()
@@ -300,8 +340,9 @@ pub async fn required_externals_declared(
                 && input.properties.get("engine") != Some(&Value::Bool(true))
                 && ((id.class == class::TYPE
                     && input.properties.get("user_defined") == Some(&Value::Bool(true)))
-                    || (id.class == class::OBJECT
-                        && (reference(input, "parent").is_none() || scope.retained.contains(*id))))
+                    || ((id.class == class::OBJECT || id.class.starts_with("pbps-unnamed-"))
+                        && (reference(input, "parent").is_none()
+                            || captured.scope().retained.contains(*id))))
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -418,15 +459,17 @@ impl Managed {
 pub async fn cascade_scope(
     target: &mut impl QueryConnection,
     managed: &[&Schema],
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<CaptureScope, CaptureError> {
     let managed: Vec<_> = managed.iter().map(|s| (*s).clone()).collect();
     let managed = Managed::read(target, &managed).await?;
-    cascade_scope_for(target, &managed).await
+    cascade_scope_for(target, &managed, key).await
 }
 
 async fn cascade_scope_for(
     target: &mut impl QueryConnection,
     managed: &Managed,
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
 ) -> Result<CaptureScope, CaptureError> {
     let mut scope = CaptureScope::default();
     // Capturing the seeds follows their children and every incoming cascade,
@@ -435,7 +478,7 @@ async fn cascade_scope_for(
         scope.retained.extend([a.clone(), b.clone()]);
     }
     let catalog = super::read::read(target, &super::select::lookups(&scope)).await?;
-    let selected = super::select::select(&catalog, &scope)?;
+    let selected = super::select::select(&catalog, &scope, &super::identity::Producer::new(key))?;
     let relevant = barriers(&selected.inputs, managed);
     scope.retained.extend(relevant);
     for id in scope.retained.clone() {
@@ -763,6 +806,9 @@ fn project_indexes(properties: &mut BTreeMap<String, Value>) {
 }
 
 fn named(id: &ObjectIdentity) -> String {
+    if let Some(name) = id.unnamed_diagnostic() {
+        return name;
+    }
     let parent = id
         .signature
         .first()
@@ -780,7 +826,11 @@ fn spelling(target: &ObjectIdentity, scratch: &ObjectIdentity) -> String {
 }
 
 fn shape_names(shapes: &Shapes) -> BTreeSet<ObjectIdentity> {
-    let mut out: BTreeSet<_> = shapes.keys().cloned().collect();
+    let mut out: BTreeSet<_> = shapes
+        .keys()
+        .filter(|id| !id.class.starts_with("pbps-unnamed-"))
+        .cloned()
+        .collect();
     for (id, properties) in shapes {
         if let Some(indexes) = properties.get("sys.indexes").and_then(Value::as_array) {
             for index in indexes {

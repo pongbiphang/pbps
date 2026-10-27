@@ -290,7 +290,14 @@ impl Unsealed {
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default();
             match &difference.object {
-                Some(object) => format!("{} {} ({change})", object.class, object.name.join(".")),
+                Some(object) => format!(
+                    "{} ({change})",
+                    object.unnamed_diagnostic().unwrap_or_else(|| format!(
+                        "{} {}",
+                        object.class,
+                        object.name.join(".")
+                    ))
+                ),
                 None => format!("the capture's {change}"),
             }
         }));

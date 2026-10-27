@@ -824,6 +824,7 @@ async fn reference_held() {
         &request.schemas,
         &binding,
         &[],
+        Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
     ))
     .await;
     let released = Box::pin(state.release(&mut admin)).await;
@@ -958,6 +959,7 @@ async fn prepared(
         &request.schemas,
         &binding,
         &[],
+        Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
     ))
     .await;
     assert!(prepared.is_ok(), "the run prepares its companion");

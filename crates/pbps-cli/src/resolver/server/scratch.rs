@@ -308,6 +308,7 @@ impl Run<'_> {
                 &scope_schemas,
                 binding,
                 &request.write_path_extras,
+                Some(self.key),
             )
             .await?;
         // The expected visibility is the deployer's after the plan's own

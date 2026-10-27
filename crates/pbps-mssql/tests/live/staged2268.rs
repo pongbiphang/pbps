@@ -46,7 +46,14 @@ impl Fixture {
         self.scratch.execute(sql).await.unwrap();
     }
     async fn compare(&mut self, names: &[&str]) -> Result<capture::Staged, StageError> {
-        capture::compare_staged(&mut self.scratch, &mut self.target, &roots(names), &[]).await
+        capture::compare_staged(
+            &mut self.scratch,
+            &mut self.target,
+            &roots(names),
+            &[],
+            &crate::capture_key(),
+        )
+        .await
     }
 }
 
@@ -108,12 +115,16 @@ async fn five_hundred_rows_do_not_change_external_shape() {
             retained: roots(&["t"]),
             ..Default::default()
         };
-        let before = capture::capture(&mut f.target, &scope).await.unwrap();
+        let before = capture::capture(&mut f.target, &scope, &crate::capture_key())
+            .await
+            .unwrap();
         f.target
             .execute("INSERT dbo.t(b) SELECT TOP(500) 1 FROM sys.all_objects;")
             .await
             .unwrap();
-        let after = capture::capture(&mut f.target, &scope).await.unwrap();
+        let after = capture::capture(&mut f.target, &scope, &crate::capture_key())
+            .await
+            .unwrap();
         assert!(
             before.compare(&after).is_empty(),
             "data must not change the canonical sealed shape"
@@ -256,7 +267,7 @@ async fn staged_external_change_after_acceptance_is_detected() {
     case("change", |mut f| async move {
         f.both("CREATE TABLE dbo.t(a int);").await;
         let staged = f.compare(&["t"]).await.unwrap();
-        let current = capture::capture(&mut f.target, staged.scope())
+        let current = capture::capture(&mut f.target, staged.scope(), &crate::capture_key())
             .await
             .unwrap();
         assert!(staged.changed_since(&current).is_empty());
@@ -264,7 +275,7 @@ async fn staged_external_change_after_acceptance_is_detected() {
             .execute("ALTER TABLE dbo.t ALTER COLUMN a bigint;")
             .await
             .unwrap();
-        let current = capture::capture(&mut f.target, staged.scope())
+        let current = capture::capture(&mut f.target, staged.scope(), &crate::capture_key())
             .await
             .unwrap();
         assert!(!staged.changed_since(&current).is_empty());
@@ -334,10 +345,10 @@ async fn every_created_root_and_managed_overlap_is_accounted_for() {
         f.both("CREATE TABLE dbo.t(a int);").await;
         let mut created = roots(&["t"]);
         created.insert(capture::ObjectIdentity { class: "sys.certificates".into(), name: vec!["unread".into()], signature: vec![] });
-        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[]).await, "unread");
+        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[], &crate::capture_key()).await, "unread");
         let mut managed = pbps_model::Schema::default();
         managed.tables.insert(pbps_model::TableName::new("dbo", "t"), pbps_model::Table::default());
-        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["t"]), &[&managed]).await, "managed");
+        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["t"]), &[&managed], &crate::capture_key()).await, "managed");
         f.both("CREATE USER hidden WITHOUT LOGIN; GRANT SELECT ON sys.sql_expression_dependencies TO hidden;").await;
         f.scratch.execute("EXECUTE AS USER=N'hidden';").await.unwrap();
         assert!(matches!(f.compare(&["t"]).await, Err(StageError::Capture(capture::CaptureError::Coverage(_)))));
@@ -390,14 +401,14 @@ async fn external_cascade_closure_preserves_multiple_path_refusal() {
         f.both("CREATE TABLE dbo.a(a int CONSTRAINT a_pk PRIMARY KEY); CREATE TABLE dbo.b(a int CONSTRAINT b_pk PRIMARY KEY); CREATE TABLE dbo.c(a int CONSTRAINT c_pk PRIMARY KEY); CREATE TABLE dbo.e(a int CONSTRAINT e_pk PRIMARY KEY);").await;
         f.target.execute("ALTER TABLE dbo.b ADD CONSTRAINT ba FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE; ALTER TABLE dbo.c ADD CONSTRAINT cb FOREIGN KEY(a) REFERENCES dbo.b(a) ON DELETE CASCADE; ALTER TABLE dbo.e ADD CONSTRAINT ea FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE;").await.unwrap();
         let managed = cascading(pbps_model::ReferentialAction::Cascade, false, &["a","c"]);
-        let scope = capture::cascade_scope(&mut f.target, &[&managed]).await.unwrap();
+        let scope = capture::cascade_scope(&mut f.target, &[&managed], &crate::capture_key()).await.unwrap();
         assert!(scope.retained.contains(&capture::object("dbo", "ba")));
         assert!(scope.retained.contains(&capture::object("dbo", "cb")));
         assert!(scope.retained.contains(&capture::object("dbo", "ea")));
         // Missing external-to-external paths refuse before a renderer can certify them.
-        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b","c","e"]), &[&managed]).await, "ba");
+        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b","c","e"]), &[&managed], &crate::capture_key()).await, "ba");
         f.scratch.execute("ALTER TABLE dbo.b ADD CONSTRAINT ba FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE; ALTER TABLE dbo.c ADD CONSTRAINT cb FOREIGN KEY(a) REFERENCES dbo.b(a) ON DELETE CASCADE; ALTER TABLE dbo.e ADD CONSTRAINT ea FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE;").await.unwrap();
-        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b","c","e"]), &[&managed]).await.unwrap();
+        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b","c","e"]), &[&managed], &crate::capture_key()).await.unwrap();
         // a -> b -> c and a -> c is a genuine second path, judged by SQL Server.
         let ddl = "CREATE TABLE dbo.managed(a int,CONSTRAINT to_a FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE,CONSTRAINT to_c FOREIGN KEY(a) REFERENCES dbo.c(a) ON DELETE CASCADE);";
         // SQL Server emits causal 1785 followed by 1750; TRY/CATCH and the
@@ -416,9 +427,9 @@ async fn noncascading_or_disjoint_actions_do_not_add_a_barrier() {
         for (event, action) in [("DELETE","NO ACTION"),("DELETE","SET NULL"),("DELETE","SET DEFAULT"),("UPDATE","NO ACTION"),("UPDATE","SET NULL"),("UPDATE","SET DEFAULT"),("UPDATE","CASCADE")] {
             // Noncascading DELETE edges and disjoint UPDATE edges add no barrier.
             f.target.execute(&format!("ALTER TABLE dbo.b ADD CONSTRAINT ba FOREIGN KEY(x) REFERENCES dbo.a(a) ON {event} {action};")).await.unwrap();
-            let scope = capture::cascade_scope(&mut f.target, &[&managed]).await.unwrap();
+            let scope = capture::cascade_scope(&mut f.target, &[&managed], &crate::capture_key()).await.unwrap();
             assert!(!scope.retained.contains(&capture::object("dbo", "ba")));
-            capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b"]), &[&managed]).await.unwrap();
+            capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a","b"]), &[&managed], &crate::capture_key()).await.unwrap();
             let ddl = "CREATE TABLE dbo.managed(a int,CONSTRAINT to_a FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE,CONSTRAINT to_b FOREIGN KEY(a) REFERENCES dbo.b(a) ON DELETE CASCADE);";
             assert_eq!(failure_number(&mut f.target,ddl).await,"accepted");
             assert_eq!(failure_number(&mut f.scratch,ddl).await,"accepted");
@@ -426,7 +437,7 @@ async fn noncascading_or_disjoint_actions_do_not_add_a_barrier() {
             f.target.execute("ALTER TABLE dbo.b DROP CONSTRAINT ba;").await.unwrap();
         }
         f.target.execute("ALTER TABLE dbo.other ADD CONSTRAINT unrelated FOREIGN KEY(a) REFERENCES dbo.disjoint(a) ON DELETE CASCADE;").await.unwrap();
-        let scope = capture::cascade_scope(&mut f.target, &[&managed]).await.unwrap();
+        let scope = capture::cascade_scope(&mut f.target, &[&managed], &crate::capture_key()).await.unwrap();
         assert!(!scope.retained.contains(&capture::object("dbo", "unrelated")));
     }).await;
 }
@@ -438,11 +449,11 @@ async fn referencing_instead_of_trigger_blocks_matching_cascade() {
         f.both("CREATE TABLE dbo.a(a int CONSTRAINT a_pk PRIMARY KEY); CREATE TABLE dbo.managed(a int CONSTRAINT managed_pk PRIMARY KEY);").await;
         f.target.execute("CREATE TRIGGER dbo.barrier ON dbo.managed INSTEAD OF DELETE AS RETURN;").await.unwrap();
         let managed = cascading(pbps_model::ReferentialAction::Cascade, false, &["a"]);
-        let scope = capture::cascade_scope(&mut f.target, &[&managed]).await.unwrap();
+        let scope = capture::cascade_scope(&mut f.target, &[&managed], &crate::capture_key()).await.unwrap();
         assert!(scope.retained.contains(&capture::object("dbo", "barrier")));
-        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed]).await, "barrier");
+        refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed], &crate::capture_key()).await, "barrier");
         f.scratch.execute("CREATE TRIGGER dbo.barrier ON dbo.managed INSTEAD OF DELETE AS RETURN;").await.unwrap();
-        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed]).await.unwrap();
+        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed], &crate::capture_key()).await.unwrap();
         let ddl = "ALTER TABLE dbo.managed ADD CONSTRAINT ma FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE;";
         // The causal 1787 is followed by the reported 1750, as for 1785.
         assert_eq!(failure_number(&mut f.target,ddl).await, "1750");
@@ -458,10 +469,10 @@ async fn parent_or_other_action_trigger_does_not_block() {
         f.target.execute("CREATE TRIGGER dbo.parent_tr ON dbo.a INSTEAD OF DELETE AS RETURN;").await.unwrap();
         f.target.execute("CREATE TRIGGER dbo.other_tr ON dbo.managed INSTEAD OF UPDATE AS RETURN;").await.unwrap();
         let managed = cascading(pbps_model::ReferentialAction::Cascade, false, &["a"]);
-        let scope = capture::cascade_scope(&mut f.target, &[&managed]).await.unwrap();
+        let scope = capture::cascade_scope(&mut f.target, &[&managed], &crate::capture_key()).await.unwrap();
         assert!(!scope.retained.contains(&capture::object("dbo", "parent_tr")));
         assert!(!scope.retained.contains(&capture::object("dbo", "other_tr")));
-        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed]).await.unwrap();
+        capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["a"]), &[&managed], &crate::capture_key()).await.unwrap();
         let ddl = "ALTER TABLE dbo.managed ADD CONSTRAINT ma FOREIGN KEY(a) REFERENCES dbo.a(a) ON DELETE CASCADE;";
         assert_eq!(failure_number(&mut f.target,ddl).await, "accepted");
         assert_eq!(failure_number(&mut f.scratch,ddl).await, "accepted");
@@ -529,15 +540,28 @@ async fn owner_names_can_differ_but_equality_with_managed_schemas_cannot() {
             pbps_model::Table::default(),
         );
         let created = BTreeSet::from([capture::object("ext", "t")]);
-        capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed])
-            .await
-            .unwrap();
+        capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &created,
+            &[&managed],
+            &crate::capture_key(),
+        )
+        .await
+        .unwrap();
         f.scratch
             .execute("ALTER AUTHORIZATION ON SCHEMA::app TO dbo;")
             .await
             .unwrap();
         refused(
-            capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed]).await,
+            capture::compare_staged(
+                &mut f.scratch,
+                &mut f.target,
+                &created,
+                &[&managed],
+                &crate::capture_key(),
+            )
+            .await,
             "owner_group",
         );
     })
@@ -556,15 +580,28 @@ async fn type_defaults_are_skipped_and_type_owner_equality_is_preserved() {
             name: vec!["ext".into(), "amount".into()],
             signature: vec![],
         }]);
-        capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[])
-            .await
-            .unwrap();
+        capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &created,
+            &[],
+            &crate::capture_key(),
+        )
+        .await
+        .unwrap();
         f.target
             .execute("ALTER AUTHORIZATION ON TYPE::ext.amount TO dbo;")
             .await
             .unwrap();
         refused(
-            capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[]).await,
+            capture::compare_staged(
+                &mut f.scratch,
+                &mut f.target,
+                &created,
+                &[],
+                &crate::capture_key(),
+            )
+            .await,
             "owner_group",
         );
         f.target
@@ -580,9 +617,15 @@ async fn type_defaults_are_skipped_and_type_owner_equality_is_preserved() {
             name: vec!["ext".into(), "rows_type".into()],
             signature: vec![],
         }]);
-        capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[])
-            .await
-            .unwrap();
+        capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &created,
+            &[],
+            &crate::capture_key(),
+        )
+        .await
+        .unwrap();
     })
     .await;
 }
@@ -672,6 +715,7 @@ async fn resolved_object_type_and_schema_spellings_refuse_by_both_names() {
                     &mut f.target,
                     &BTreeSet::from([root(b)]),
                     &[],
+                    &crate::capture_key(),
                 )
                 .await,
                 a,
@@ -683,6 +727,7 @@ async fn resolved_object_type_and_schema_spellings_refuse_by_both_names() {
                 &mut f.target,
                 &BTreeSet::from([root(a)]),
                 &[],
+                &crate::capture_key(),
             )
             .await
             .unwrap();
@@ -697,6 +742,7 @@ async fn resolved_object_type_and_schema_spellings_refuse_by_both_names() {
                         &mut f.target,
                         &BTreeSet::from([root(a)]),
                         &[],
+                        &crate::capture_key(),
                     )
                     .await,
                     "a",
@@ -795,7 +841,14 @@ async fn column_index_and_constraint_spellings_are_compared() {
                 signature: vec![],
             }]);
             spelling_refused(
-                capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[]).await,
+                capture::compare_staged(
+                    &mut f.scratch,
+                    &mut f.target,
+                    &created,
+                    &[],
+                    &crate::capture_key(),
+                )
+                .await,
                 a,
                 b,
             );
@@ -825,6 +878,7 @@ async fn managed_aliases_are_rejected_as_overlap() {
             &mut f.target,
             &BTreeSet::from([actual]),
             &[&managed],
+            &crate::capture_key(),
         )
         .await
         else {
@@ -848,6 +902,7 @@ async fn managed_aliases_are_rejected_as_overlap() {
             &mut f.target,
             &BTreeSet::from([capture::object("Ext", "v")]),
             &[&managed],
+            &crate::capture_key(),
         )
         .await
         else {
@@ -872,6 +927,7 @@ async fn managed_aliases_are_rejected_as_overlap() {
             &mut f.target,
             &BTreeSet::from([capture::object("Ext", "t_pk")]),
             &[&managed],
+            &crate::capture_key(),
         )
         .await
         else {
@@ -899,18 +955,18 @@ async fn cascade_seeds_resolve_to_catalog_spelling() {
             let mut canonical = cascading(pbps_model::ReferentialAction::Cascade, update, &["A"]);
             let table = canonical.tables.remove(&pbps_model::TableName::new("dbo", "managed")).unwrap();
             canonical.tables.insert(pbps_model::TableName::new("dbo", "Managed"), table);
-            let a = capture::cascade_scope(&mut f.target, &[&alias]).await.unwrap();
-            let b = capture::cascade_scope(&mut f.target, &[&canonical]).await.unwrap();
+            let a = capture::cascade_scope(&mut f.target, &[&alias], &crate::capture_key()).await.unwrap();
+            let b = capture::cascade_scope(&mut f.target, &[&canonical], &crate::capture_key()).await.unwrap();
             assert_eq!(a, b, "YAML aliases must retain the same canonical closure");
             assert!(a.retained.contains(&capture::object("dbo", "ba")));
             assert!(a.retained.contains(&capture::object("dbo", "barrier")));
             assert!(a.retained.contains(&capture::object("dbo", "A")));
             assert!(!a.retained.contains(&capture::object("dbo", "a")));
-            refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias]).await, "ba");
+            refused(capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias], &crate::capture_key()).await, "ba");
             f.scratch.execute(&format!("ALTER TABLE dbo.B ADD CONSTRAINT ba FOREIGN KEY(a) REFERENCES dbo.A(a) ON {event} CASCADE;")).await.unwrap();
             f.scratch.execute(&format!("CREATE TRIGGER dbo.barrier ON dbo.Managed INSTEAD OF {event} AS RETURN;")).await.unwrap();
-            let accepted = capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias]).await.unwrap();
-            let current = capture::capture(&mut f.target, accepted.scope()).await.unwrap();
+            let accepted = capture::compare_staged(&mut f.scratch, &mut f.target, &roots(&["A","B"]), &[&alias], &crate::capture_key()).await.unwrap();
+            let current = capture::capture(&mut f.target, accepted.scope(), &crate::capture_key()).await.unwrap();
             assert!(accepted.changed_since(&current).is_empty());
             // A managed FK is excluded even when its declaration uses an alias.
             f.both("DROP TRIGGER dbo.barrier;").await;
@@ -919,7 +975,7 @@ async fn cascade_seeds_resolve_to_catalog_spelling() {
             let table = named_alias.tables.get_mut(&pbps_model::TableName::new("dbo", "managed")).unwrap();
             let fk = table.foreign_keys.remove("to_a").unwrap();
             table.foreign_keys.insert("TO_A".into(), fk);
-            let scope = capture::cascade_scope(&mut f.target, &[&named_alias]).await.unwrap();
+            let scope = capture::cascade_scope(&mut f.target, &[&named_alias], &crate::capture_key()).await.unwrap();
             assert!(!scope.retained.contains(&capture::object("dbo", "to_a")));
             assert!(scope.retained.contains(&capture::object("dbo", "ba")));
         }).await;
@@ -943,15 +999,28 @@ async fn managed_schema_aliases_preserve_owner_anchors() {
             pbps_model::Table::default(),
         );
         let created = BTreeSet::from([capture::object("ext", "t")]);
-        capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed])
-            .await
-            .unwrap();
+        capture::compare_staged(
+            &mut f.scratch,
+            &mut f.target,
+            &created,
+            &[&managed],
+            &crate::capture_key(),
+        )
+        .await
+        .unwrap();
         f.scratch
             .execute("ALTER AUTHORIZATION ON SCHEMA::app TO other_owner;")
             .await
             .unwrap();
         refused(
-            capture::compare_staged(&mut f.scratch, &mut f.target, &created, &[&managed]).await,
+            capture::compare_staged(
+                &mut f.scratch,
+                &mut f.target,
+                &created,
+                &[&managed],
+                &crate::capture_key(),
+            )
+            .await,
             "owner_group",
         );
     })
@@ -967,7 +1036,7 @@ async fn accepted_handoff_keeps_exact_target_spelling() {
         f.both("CREATE TABLE dbo.T(a int);").await;
         let accepted = f.compare(&["T"]).await.unwrap();
         assert!(accepted.compared().contains(&capture::object("dbo", "T")));
-        let current = capture::capture(&mut f.target, accepted.scope())
+        let current = capture::capture(&mut f.target, accepted.scope(), &crate::capture_key())
             .await
             .unwrap();
         assert!(accepted.changed_since(&current).is_empty());
@@ -975,7 +1044,7 @@ async fn accepted_handoff_keeps_exact_target_spelling() {
             .execute("EXEC sys.sp_rename N'dbo.T', N't';")
             .await
             .unwrap();
-        let current = capture::capture(&mut f.target, accepted.scope())
+        let current = capture::capture(&mut f.target, accepted.scope(), &crate::capture_key())
             .await
             .unwrap();
         assert!(!accepted.changed_since(&current).is_empty());

@@ -70,9 +70,14 @@ pub struct Uncovered {
 /// Name components are listed, never joined with dots, for the reason
 /// [`ObjectIdentity`] keeps them apart.
 fn named(object: &Option<ObjectIdentity>) -> String {
-    object
-        .as_ref()
-        .map_or_else(String::new, |object| format!(" {:?}", object.name))
+    object.as_ref().map_or_else(String::new, |object| {
+        format!(
+            " {}",
+            object
+                .unnamed_diagnostic()
+                .unwrap_or_else(|| format!("{:?}", object.name))
+        )
+    })
 }
 
 impl Uncovered {

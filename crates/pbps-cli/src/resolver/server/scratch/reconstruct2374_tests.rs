@@ -17,7 +17,7 @@ type Case = for<'a> fn(&'a str, &'a str) -> Pin<Box<dyn Future<Output = ()> + Se
 /// A target database to seed for each scratch it is run against: the second
 /// instance, and a container the run starts itself. Whatever a case does, the
 /// database and every login it made are removed.
-async fn both(case: Case) {
+pub(super) async fn both(case: Case) {
     let primary = server("PBPS_TEST_DB");
     let supplied = server("PBPS_TEST_MSSQL_SCRATCH_DB");
     let image = server("PBPS_TEST_RESOLVER_MSSQL_IMAGE");
@@ -260,6 +260,7 @@ async fn on_scratch(target: &str, scratch: &str) -> String {
             &schemas,
             &binding,
             &[],
+            Some(&crate::resolver::server::scratch::mssql_live_tests::capture_key()),
         )
         .await;
     let landed = async {
