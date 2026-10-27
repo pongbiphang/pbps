@@ -52,7 +52,7 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
                 column: column.clone(),
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array: false,
-                removed: vec![],
+                values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
             },
             vec![&table],
         ),
@@ -60,6 +60,8 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
             EnumRebuildStep::Swap {
                 definition: definition.clone(),
                 comment: None,
+                depth: 0,
+                over: None,
             },
             vec![],
         ),

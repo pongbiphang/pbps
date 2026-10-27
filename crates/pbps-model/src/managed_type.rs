@@ -199,7 +199,8 @@ pub enum EnumPlacement {
     After(String),
 }
 
-/// One step of rebuilding an enum while keeping its uid (DEC-1635.7).
+/// One step of rebuilding an enum or a domain while keeping its uid
+/// (DEC-1635.7, DEC-1635.9).
 ///
 /// The replacement exists under a pbps-chosen name until `Swap`; the columns
 /// move to it one at a time, so every intermediate state is a state the
@@ -207,39 +208,63 @@ pub enum EnumPlacement {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnumRebuildStep {
-    /// `CREATE TYPE <tmp> AS ENUM (<final labels>)`. `removed` lists, as the
+    /// `CREATE TYPE <tmp> AS ENUM (<final labels>)`, or `CREATE DOMAIN <tmp>
+    /// AS ..` from the final declaration of a domain. `removed` lists, as the
     /// database spells them today, the labels the final type lacks; a row
     /// holding one is refused at plan time.
     Create {
         definition: Box<ManagedType>,
         removed: Vec<String>,
-        /// After the label renames of the same uid, which map by name.
+        /// After the label renames of the same uid, which map by name. A
+        /// domain over a rebuilt type is created after it.
         ordinal: usize,
+        /// A domain whose base is itself rebuilt is created over that base's
+        /// replacement, since the old base is dropped with the swap; this
+        /// names it. The declaration's own base is the final one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        over: Option<crate::TypeRef>,
+        /// Why a domain is rebuilt, in a sentence for the plan's reader: its
+        /// base or collation changed, the type it is built on is rebuilt, or
+        /// an array of it blocks an in-place check. Never read back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
     },
-    /// `ALTER COLUMN .. TYPE <tmp> USING .. ::text::<tmp>`: a full rewrite of
-    /// the table under ACCESS EXCLUSIVE, even for a pure reorder. A
-    /// partitioned table is retyped at its root only.
+    /// `ALTER COLUMN .. TYPE <tmp>`, with `USING .. ::text::<tmp>` unless the
+    /// conversion is the engine's own assignment cast: a full rewrite of the
+    /// table under ACCESS EXCLUSIVE, even for a pure reorder. A partitioned
+    /// table is retyped at its root only.
     Retype {
         column_uid: crate::Uid,
         column: crate::ColumnRef,
         /// The type the column has once the swap has named the replacement
-        /// back: the enum, or an array of it, as the declaration spells it.
-        /// The closing read holds the column to it (SPEC §7.6), since a
-        /// concurrent retype between this step and the last would otherwise
-        /// leave the column as that session made it.
+        /// back: the enum or domain, or an array of it, as the declaration
+        /// spells it. The closing read holds the column to it (SPEC §7.6),
+        /// since a concurrent retype between this step and the last would
+        /// otherwise leave the column as that session made it.
         to: crate::ColumnType,
         array: bool,
-        /// The labels the rebuild removes, as stored now: the cast refuses a
-        /// row holding one, and the plan-time probe counts them.
-        removed: Vec<String>,
+        /// The single judgement input shared with a direct column retype.
+        values: Box<crate::ValueChange>,
     },
-    /// `DROP TYPE <name>; ALTER TYPE <tmp> RENAME TO <name>`, then the
-    /// carried `COMMENT ON TYPE`. The uid never changes.
+    /// `DROP TYPE <name>; ALTER TYPE <tmp> RENAME TO <name>` (`DOMAIN` for a
+    /// domain), then the carried `COMMENT ON`. The uid never changes.
     Swap {
         definition: Box<ManagedType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         comment: Option<String>,
+        /// How many rebuilt types this one is built on: a domain over a
+        /// rebuilt enum is swapped before it, so the old base can be dropped.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        depth: usize,
+        /// The replacement a domain's replacement is built over, as in
+        /// `Create`: until the base is swapped too, the domain stands over it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        over: Option<crate::TypeRef>,
     },
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]
@@ -447,6 +472,8 @@ mod rebuild_tests {
                 definition: definition.clone(),
                 removed: vec!["gone".into()],
                 ordinal: 0,
+                over: None,
+                why: None,
             }),
             step(EnumRebuildStep::Retype {
                 column_uid: crate::Uid::derived(crate::UidKind::Column, "m", 0),
@@ -456,11 +483,15 @@ mod rebuild_tests {
                 },
                 to: crate::ColumnType::reference("app.e".parse().unwrap()),
                 array: true,
-                removed: vec!["gone".into()],
+                values: Box::new(crate::ValueChange::Relabel {
+                    removed: vec!["gone".into()],
+                }),
             }),
             step(EnumRebuildStep::Swap {
                 definition,
                 comment: Some("moods".into()),
+                depth: 0,
+                over: None,
             }),
         ]
     }
@@ -496,6 +527,66 @@ mod rebuild_tests {
             vec![(retype.columns()[0].clone(), crate::ColumnField::Type)]
         );
         assert_eq!(retype.subject(), "app.e");
+    }
+
+    /// Plan format 56 carries one required value change, with no legacy fields.
+    #[test]
+    fn rebuild_value_changes_round_trip_and_reject_legacy_fields() {
+        let [_, retype, swap] = steps();
+        let text = serde_json::to_string(&retype).unwrap();
+        assert!(text.contains("\"values\":{\"relabel\""), "{text}");
+        for field in ["conversion", "base_change", "value_arrays"] {
+            assert!(!text.contains(field), "{text}");
+        }
+        let mut domain = retype.clone();
+        if let Change::EnumRebuild {
+            step: EnumRebuildStep::Retype { values, .. },
+            ..
+        } = &mut domain
+        {
+            **values = crate::ValueChange::Cast {
+                from: "varchar(20)".parse().unwrap(),
+                to: "varchar(10)".parse().unwrap(),
+                arrays: 2,
+                using: None,
+            };
+        }
+        let text = serde_json::to_string(&domain).unwrap();
+        assert!(
+            text.contains("\"cast\"") && text.contains("\"arrays\":2"),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Change>(&text).unwrap(), domain);
+        // This is the unreleased v56 shape: missing judgement and legacy
+        // independent fields must not silently default to different semantics.
+        let mut missing = serde_json::to_value(&domain).unwrap();
+        missing["step"].as_object_mut().unwrap().remove("values");
+        assert!(serde_json::from_value::<Change>(missing).is_err());
+        for field in ["conversion", "base_change", "value_arrays", "removed"] {
+            let mut legacy = serde_json::to_value(&domain).unwrap();
+            legacy["step"]
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), serde_json::Value::Null);
+            assert!(serde_json::from_value::<Change>(legacy).is_err(), "{field}");
+        }
+
+        let mut over = swap.clone();
+        if let Change::EnumRebuild {
+            step: EnumRebuildStep::Swap { over, depth, .. },
+            ..
+        } = &mut over
+        {
+            *over = Some("app.pbps_rebuild_y_000009".parse().unwrap());
+            *depth = 2;
+        }
+        let text = serde_json::to_string(&over).unwrap();
+        assert!(
+            text.contains("\"over\"") && text.contains("\"depth\":2"),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Change>(&text).unwrap(), over);
+        assert!(!serde_json::to_string(&swap).unwrap().contains("over"));
     }
 
     #[test]

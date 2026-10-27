@@ -917,8 +917,19 @@ not-null`. A tightening is refused by name, before any SQL, while an array or a
 composite of the domain is a column, because PostgreSQL refuses it there over
 any table. A standing `NOT VALID` domain check equals its declaration and is
 reported as `plan.domain-check-not-valid`, with `ALTER DOMAIN … VALIDATE
-CONSTRAINT` as the remedy for a person to run. Base and collation changes
-refuse by name and wait for the domain rebuild (slice 4b).
+CONSTRAINT` as the remedy for a person to run. A domain's base type or
+collation, a check or NOT NULL added while an array of the domain is a column,
+and the enum or domain it is built on being rebuilt are the keep-uid rebuild
+(slice 4b, DEC-1635.9): a replacement is created from the final declaration,
+every column moves to it with a plain `ALTER COLUMN … TYPE` (the engine's own
+assignment cast, no `USING`; over a rebuilt enum or domain the labels go through
+`text`), and the old domain is dropped and the replacement renamed back, under
+`--allow type-rebuild`. A base the engine cannot convert is refused by name,
+pointing at the conversion the author states (#2331); a narrower base is
+`--allow narrowing` and the rows that do not fit are counted before apply. The
+comment is carried; a non-default owner or privilege list, a composite attribute,
+a partition key, a function signature and every other dependent the plan cannot
+restore refuse by name before any SQL.
 
 Applied domain default and named CHECK texts are retained in the declaration
 record, as table expressions are (decisions 207/208, DEC-1635.4). After the

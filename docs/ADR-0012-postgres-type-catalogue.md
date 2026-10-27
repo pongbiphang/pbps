@@ -610,6 +610,26 @@ change alone: no other change, type pair or declaration can obtain a `USING`,
 and a conversion that decides where data goes still needs the declared
 transformation §5 asks for.
 
+## Amendment 6 — a domain's base change writes no `USING` (#1635 slice 4b)
+
+A same-uid domain rebuild (DEC-1635.9) moves each column to the replacement
+with a plain `ALTER COLUMN c TYPE <replacement>`. For a base or collation
+change that is the engine's own assignment cast, so pbps writes no expression
+and §5 is untouched: it is used exactly when the shared `ValueChange` verdict
+admits the root's leaf pair and array shape without a stated conversion
+(#2461). An incompatible pair, a conversion that gains or loses the session
+time zone, and a non-safe array element change are refused by name with a
+pointer to the conversion the author states (#2331). The one `USING` of
+Amendment 5, `c::text::<replacement>` (arrays `c::text[]::<replacement>[]`),
+extends through domains built on a rebuilt enum (`ValueChange::Relabel`),
+for the same reason: the declarations fix a pure mapping and no value changes.
+A domain built on a rebuilt built-in base inherits `ValueChange::Cast` and
+uses assignment through every derived link. A narrower
+base carries the `Narrowing` class beside `type-rebuild`, and the rows that
+do not fit are counted by the same built-in and bounded-string assignment
+probe material as a column retype; the new domain's checks
+are not probed at plan time, as for any non-built-in code (DEC-1635.4).
+
 ## Placement
 
 The catalogue landed in Phase 5 step 2 (#77); the estimate landed in step 9

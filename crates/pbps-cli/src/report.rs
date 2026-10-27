@@ -1460,16 +1460,24 @@ pub fn describe(c: &Change) -> String {
             pbps_model::EnumRebuildStep::Create {
                 definition,
                 removed,
+                why,
                 ..
             } => {
                 let labels = match definition.as_ref() {
-                    pbps_model::ManagedType::Enum { values } => values
-                        .iter()
-                        .map(|v| Escaped(v).to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    pbps_model::ManagedType::Enum { values } => format!(
+                        " with labels {}",
+                        values
+                            .iter()
+                            .map(|v| Escaped(v).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     pbps_model::ManagedType::Domain { .. } => String::new(),
                 };
+                let why = why
+                    .as_ref()
+                    .map(|why| format!(" ({})", Escaped(why)))
+                    .unwrap_or_default();
                 let removed = if removed.is_empty() {
                     String::new()
                 } else {
@@ -1483,7 +1491,8 @@ pub fn describe(c: &Change) -> String {
                     )
                 };
                 format!(
-                    "~ rebuild enum {} as {} with labels {labels}{removed}",
+                    "~ rebuild {} {} as {}{labels}{removed}{why}",
+                    definition.kind(),
                     name.shown(),
                     tmp.shown()
                 )
@@ -2302,6 +2311,8 @@ mod tests {
             definition: definition.clone(),
             removed: vec!["sad\nline".into()],
             ordinal: 0,
+            over: None,
+            why: None,
         }));
         assert!(
             create.contains("rebuild enum app.e as app.tmp")
@@ -2314,6 +2325,8 @@ mod tests {
                 definition: definition.clone(),
                 removed: vec![],
                 ordinal: 0,
+                over: None,
+                why: None,
             }))
             .contains("removes")
         );
@@ -2325,7 +2338,7 @@ mod tests {
             },
             to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
             array: false,
-            removed: vec![],
+            values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
         }));
         assert!(
             retype.contains("app.t.m")
@@ -2338,10 +2351,47 @@ mod tests {
             super::describe(&step(EnumRebuildStep::Swap {
                 definition: definition.clone(),
                 comment: comment.map(str::to_owned),
+                depth: 0,
+                over: None,
             }))
         };
         assert!(swap(Some("c")).contains("keeping its comment"));
         assert!(!swap(None).contains("comment"));
+    }
+
+    /// A domain's rebuild names the kind and the reason it is rebuilt; an
+    /// enum's, which has none, reads as before (DEC-1635.9).
+    #[test]
+    fn domain_rebuild_lines_say_why_the_domain_is_rebuilt() {
+        use pbps_model::{Change, EnumRebuildStep, ManagedType};
+        let create = |why: Option<&str>| {
+            super::describe(&Change::EnumRebuild {
+                uid: "y_000002".parse().unwrap(),
+                name: "app.d".parse().unwrap(),
+                tmp: "app.tmp".parse().unwrap(),
+                step: EnumRebuildStep::Create {
+                    definition: Box::new(ManagedType::Domain {
+                        base: "text".parse().unwrap(),
+                        not_null: false,
+                        default: None,
+                        checks: Default::default(),
+                        collation: None,
+                    }),
+                    removed: vec![],
+                    ordinal: 0,
+                    over: None,
+                    why: why.map(str::to_owned),
+                },
+            })
+        };
+        let line = create(Some("its base type changed"));
+        assert!(
+            line.contains("rebuild domain app.d as app.tmp")
+                && line.contains("its base type changed"),
+            "{line}"
+        );
+        assert!(!create(None).contains("its base type"));
+        assert!(!create(None).contains("enum"));
     }
 
     /// A numbering change's line shows the options each side sets, so an

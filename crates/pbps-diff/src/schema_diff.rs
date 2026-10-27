@@ -803,7 +803,14 @@ pub(crate) fn diff_partial_rebuilding(
 
     let (label_changes, label_errors) = crate::enum_labels::changes(base, declared, hints);
     errs.extend(label_errors);
+    // The domains rebuilt under their uid: for a changed base or collation, as
+    // the replacement of the type they are built on follows, or for an array
+    // that blocks an in-place check (DEC-1635.9). They get no alteration.
+    let rebuilt_domains =
+        crate::domain_rebuild::plan(base, declared, hints, &label_changes, dialect);
+    errs.extend(rebuilt_domains.errors);
     changes.extend(label_changes);
+    changes.extend(rebuilt_domains.changes);
 
     // Definitions match by recorded identity. A rename is never inferred
     // from equal definitions or a pair of disappearing/appearing names.
@@ -868,11 +875,17 @@ pub(crate) fn diff_partial_rebuilding(
                     ..Default::default()
                 };
                 let mut refused = Vec::new();
+                // An enum's labels and a domain's every attribute have their
+                // own changes; only a change of kind is refused here
+                // (DEC-1635.6, DEC-1635.8, DEC-1635.9).
                 if !matches!(
                     (&old_schema.types[name], new),
                     (
                         pbps_model::ManagedType::Enum { .. },
                         pbps_model::ManagedType::Enum { .. }
+                    ) | (
+                        pbps_model::ManagedType::Domain { .. },
+                        pbps_model::ManagedType::Domain { .. }
                     )
                 ) {
                     refused = type_differences(&old_schema, &new_schema, dialect, true);
@@ -883,6 +896,7 @@ pub(crate) fn diff_partial_rebuilding(
                 // above and plans nothing (DEC-1635.8).
                 let comparable = &old_schema.types[name];
                 let alters = refused.is_empty()
+                    && !rebuilt_domains.uids.contains_key(uid)
                     && matches!(
                         (comparable, new),
                         (
@@ -2136,7 +2150,10 @@ pub(crate) fn diff_partial_rebuilding(
             if let Change::AlterColumnType {
                 column, from, to, ..
             } = &p.change
-                && dialect.type_change_risk(from, to) != pbps_dialect::TypeChangeRisk::Safe
+                && p.change.value_change().map_or_else(
+                    || dialect.type_change_risk(from, to),
+                    |values| dialect.value_change(&values, "").risk,
+                ) != pbps_dialect::TypeChangeRisk::Safe
             {
                 Some(column)
             } else {
@@ -2580,7 +2597,7 @@ pub(crate) fn diff_partial_rebuilding(
                     &drop_type_rank,
                 )
             },
-            p.change.subject(),
+            rebuild_subject(&p.change),
             // Columns added to one table in the order they are declared:
             // the engine appends each, so this is the table's column order,
             // which a pull writes and a positional `INSERT` binds to. Left
@@ -2881,7 +2898,10 @@ fn diff_columns(
                         column: declared_ref.clone(),
                     });
                 }
-            } else if dialect.type_change_needs_using(&from_ty, &to_ty) {
+            } else if pbps_model::ValueChange::cast(&from_ty, &to_ty, None).map_or_else(
+                || dialect.type_change_needs_using(&from_ty, &to_ty),
+                |values| dialect.value_change(&values, "").needs_using.is_some(),
+            ) {
                 errs.push(DiffError::ConversionFromMismatch {
                     column: declared_ref.clone(),
                     recorded: record.from.clone(),
@@ -3721,10 +3741,21 @@ fn recreate_retyped_dependents(
             to_nullable,
             ..
         } => Some((column.clone(), dialect.nullability_dependents(*to_nullable))),
+        // A conversion by name leaves constants of the old type in checks,
+        // keys and partial indexes that the replacement cannot be compared
+        // with. The engine's own assignment cast of a domain's base change
+        // keeps them (measured on 16 and 18, DEC-1635.9), so nothing comes
+        // down for it.
         Change::EnumRebuild {
-            step: pbps_model::EnumRebuildStep::Retype { column, .. },
+            step: pbps_model::EnumRebuildStep::Retype { column, values, .. },
             ..
-        } => Some((column.clone(), dialect.enum_rebuild_dependents())),
+        } => Some((
+            column.clone(),
+            match values.as_ref() {
+                pbps_model::ValueChange::Relabel { .. } => dialect.enum_rebuild_dependents(),
+                pbps_model::ValueChange::Cast { .. } => Default::default(),
+            },
+        )),
         Change::CreateTable { .. }
         | Change::DropTable { .. }
         | Change::DetachPartition { .. }
@@ -7822,6 +7853,24 @@ fn domain_sets_default(from: &pbps_model::ManagedType, to: &pbps_model::ManagedT
     pbps_model::DomainDelta::of(from, to).is_some_and(|d| matches!(d.default, Some(Some(_))))
 }
 
+/// The subject a change is sorted by within its class and rank. A rebuilt
+/// type's steps lead with their phase, so that every retype of every rebuilt
+/// type comes before the first swap, and a swap before the swap of the type
+/// it is built on: the old base cannot be dropped while a domain over it
+/// stands (DEC-1635.9). Every other change sorts by its own subject.
+fn rebuild_subject(change: &Change) -> String {
+    use pbps_model::EnumRebuildStep as Step;
+    let Change::EnumRebuild { step, .. } = change else {
+        return change.subject();
+    };
+    match step {
+        Step::Retype { .. } => format!("0 {}", change.subject()),
+        // Fixed width, reversed: a deeper swap sorts first at any depth.
+        Step::Swap { depth, .. } => format!("1 {:020} {}", usize::MAX - *depth, change.subject()),
+        Step::Create { .. } => change.subject(),
+    }
+}
+
 fn order_key(c: &Change) -> u8 {
     match c {
         Change::RebuildPartitionedTable(_)
@@ -8498,27 +8547,42 @@ mod tests {
         );
     }
 
-    /// Negative: a base type or collation change is the rebuild's, and plans
-    /// nothing, with a pointer to it; so is a domain whose identity is not
-    /// recorded.
+    /// A collation change is the rebuild's and plans no alteration; an
+    /// unconvertible base is refused with a pointer to #2331; so is a domain
+    /// whose identity is not recorded.
     #[test]
-    fn a_domains_base_or_collation_change_plans_no_alteration_and_points_at_the_rebuild() {
+    fn a_domains_base_or_collation_change_plans_no_alteration_and_is_left_to_the_rebuild() {
         let base = domain_world(code(false, None, &[], "text"), false, false);
         let mut collated = code(false, None, &[], "text");
         if let pbps_model::ManagedType::Domain { collation, .. } = &mut collated {
             *collation = Some("pg_catalog.\"C\"".parse().unwrap());
         }
-        for wanted in [code(false, None, &[], "varchar(20)"), collated] {
-            let errors = alter_domain(&base, &domain_world(wanted, false, false), &[])
-                .expect_err("a base or collation change is refused");
-            assert!(
-                errors.iter().any(|e| {
-                    let said = e.to_string();
-                    said.contains("app.code") && said.contains("rebuilding it (#1635 slice 4b)")
-                }),
-                "{errors:?}"
-            );
-        }
+        // A collation change is the rebuild's, with no in-place alteration.
+        let plan = alter_domain(&base, &domain_world(collated, false, false), &[])
+            .expect("a collation change plans the rebuild");
+        assert!(
+            !plan.changes.is_empty()
+                && plan
+                    .changes
+                    .iter()
+                    .all(|p| matches!(p.change, Change::EnumRebuild { .. })),
+            "{plan:?}"
+        );
+        // A base the dialect does not convert by itself is refused by name,
+        // pointing at the conversion the author states.
+        let errors = alter_domain(
+            &base,
+            &domain_world(code(false, None, &[], "varchar(20)"), false, false),
+            &[],
+        )
+        .expect_err("an unconvertible base is refused");
+        assert!(
+            errors.iter().any(|e| {
+                let said = e.to_string();
+                said.contains("app.code") && said.contains("#2331")
+            }),
+            "{errors:?}"
+        );
         // Beside a base change, a changed check plans no half either.
         let both = domain_world(
             code(false, None, &[("c", "VALUE <> ''")], "varchar(20)"),

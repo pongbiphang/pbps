@@ -6600,6 +6600,7 @@ pub fn cmd_bootstrap(
             &pbps_model::Hints {
                 enum_value_renames: loaded.hints.enum_value_renames.clone(),
                 enum_comments: Default::default(),
+                domain_array_holders: Default::default(),
                 enum_dependents: Default::default(),
                 strategies: Default::default(),
                 module_deps: loaded.hints.module_deps.clone(),
@@ -7044,7 +7045,7 @@ pub(crate) fn type_replacement_warnings(
             return None;
         }
         let message = format!(
-            "Type `{}` is replaced: old uid `{old}` and new uid `{new}` are different types to pbps, so the old uid's history does not carry over to the new one. To change the type while keeping its uid, keep the original declaration file and its uid and edit the definition there; rename with `renamed_from`. Enum labels (#1635 slice 3) and a domain's NOT NULL, default and checks (slice 4a) change in place under the same uid; a domain's base type or collation is refused until the domain rebuild (slice 4b). This is a suggestion only; pbps never infers identity from the name.",
+            "Type `{}` is replaced: old uid `{old}` and new uid `{new}` are different types to pbps, so the old uid's history does not carry over to the new one. To change the type while keeping its uid, keep the original declaration file and its uid and edit the definition there; rename with `renamed_from`. Enum labels (#1635 slice 3) and a domain's NOT NULL, default and checks (slice 4a) change in place under the same uid; a domain's base type or collation is rebuilt under its uid (slice 4b). This is a suggestion only; pbps never infers identity from the name.",
             name.shown(),
         );
         if !json { eprintln!("warning: {message}"); }
@@ -7542,17 +7543,22 @@ pub fn cmd_plan_db(
         // module is ordered by the annotation it was written under, not by
         // this revision's (see `rehearsal::connected::Plan::base_hints`).
         let recorded_module_deps = entry.snapshot.module_deps.clone();
-        // A rebuilt enum keeps its comment, which `CREATE TYPE` does not
-        // copy: it is a fact about the target, read before the differ writes
-        // the swap that carries it (DEC-1635.7).
+        // A rebuilt enum or domain keeps its comment, which `CREATE TYPE` does
+        // not copy: it is a fact about the target, read before the differ
+        // writes the swap that carries it (DEC-1635.7, DEC-1635.9). So is
+        // which domains an array holds, which PostgreSQL refuses a new check
+        // on in place and a rebuild takes instead.
         if conn.driver() == pbps_db::Driver::Postgres {
-            let enums: Vec<_> = base
+            let types: Vec<_> = base.types.keys().cloned().collect();
+            hints.enum_comments = pbps_pg::type_rebuild::comments(&mut conn, &types).await?;
+            let domains: Vec<_> = base
                 .types
                 .iter()
-                .filter(|(_, ty)| matches!(ty, pbps_model::ManagedType::Enum { .. }))
-                .map(|(name, _)| name.clone())
+                .filter(|(_, ty)| matches!(ty, pbps_model::ManagedType::Domain { .. }))
+                .filter_map(|(name, _)| Some((recorded_ids.type_uid(name)?.clone(), name.clone())))
                 .collect();
-            hints.enum_comments = pbps_pg::type_rebuild::comments(&mut conn, &enums).await?;
+            hints.domain_array_holders =
+                pbps_pg::domain_alter::array_holders(&mut conn, &domains).await?;
         }
         // SQL Server's computed columns that stand throughout are judged by
         // the catalog's edges below (`order_computed_by_edges`), under the
@@ -7993,14 +7999,18 @@ pub fn cmd_plan_db(
         let (mut cs, rename_evidence, dependents, rebuilds, drop_blockers, logical_slots, fills) =
             checks?;
         rollback?;
-        // Rows that hold a label an enum rebuild removes are counted now, by
-        // the same probes the apply runs, so the plan is refused by name and
-        // with a count before anything is written (DEC-1635.7).
+        // Rows that hold a label an enum rebuild removes, or that a domain's
+        // narrower base cannot hold, are counted now, by the same probes the
+        // apply runs, so the plan is refused by name and with a count before
+        // anything is written (DEC-1635.7, DEC-1635.9).
         if conn.driver() == pbps_db::Driver::Postgres
             && cs.changes().changes.iter().any(|p| {
                 matches!(&p.change, pbps_model::Change::EnumRebuild {
-                    step: pbps_model::EnumRebuildStep::Retype { removed, .. }, ..
-                } if !removed.is_empty())
+                    step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
+                } if match values.as_ref() {
+                    pbps_model::ValueChange::Cast { from, to, .. } => from != to,
+                    pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
+                })
             })
         {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
@@ -11232,7 +11242,9 @@ mod tests {
                 column: renamed.column("m"),
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
-                removed: vec!["sad".to_owned()],
+                values: Box::new(pbps_model::ValueChange::Relabel {
+                    removed: vec!["sad".to_owned()],
+                }),
             },
         };
         let check = pbps_model::Change::AddCheck {
@@ -16219,6 +16231,8 @@ mod tests {
                         definition: definition.clone(),
                         removed: vec![],
                         ordinal: 0,
+                        over: None,
+                        why: None,
                     },
                 ),
                 step(
@@ -16231,7 +16245,7 @@ mod tests {
                             .column("m"),
                         to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                         array: false,
-                        removed: vec![],
+                        values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
                     },
                 ),
                 step(
@@ -16239,6 +16253,8 @@ mod tests {
                     EnumRebuildStep::Swap {
                         definition: definition.clone(),
                         comment: None,
+                        depth: 0,
+                        over: None,
                     },
                 ),
             ]

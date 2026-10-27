@@ -60,6 +60,7 @@ pub mod strategy;
 pub mod text;
 pub mod types;
 pub mod uid;
+pub mod value_change;
 pub mod zone;
 
 pub use change::{
@@ -114,4 +115,5 @@ pub use strategy::{Strategies, Strategy};
 pub use text::Text;
 pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
+pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};

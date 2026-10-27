@@ -1,0 +1,1635 @@
+//! Declared domains rebuilt under their uid (DEC-1635.9, slice 4b).
+//!
+//! PostgreSQL cannot change a domain's base type or collation in place, and a
+//! domain cannot be repointed at another type, so the keep-uid rebuild of
+//! DEC-1635.7 is used: the replacement is created from the final declaration,
+//! every column of the domain moves to it, the old type is dropped and the
+//! replacement takes its name. This module decides *which* domains are
+//! rebuilt and builds each one's steps with [`crate::enum_labels::rebuild_type`];
+//! nothing about the mechanism is new.
+//!
+//! A domain is rebuilt when
+//!
+//! - its base type or collation changed (a conversion the engine can make from
+//!   its own assignment cast; anything else is refused by name, #2331),
+//! - the enum or domain it is built on is rebuilt, which can only be done by
+//!   building a replacement over the base's replacement, transitively, or
+//! - a check or NOT NULL is added while an array of it is a column, which the
+//!   engine refuses in place (the connected planner names such domains).
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use pbps_dialect::Dialect;
+use pbps_model::{
+    Change, ColumnType, EnumRebuildStep, Hints, ManagedType, TypeRef, Uid, ValueChange,
+};
+
+use crate::{
+    DiffError, Side,
+    enum_labels::{Replacement, rebuild_type},
+    identity::type_refs::{Leaf, TypeIdentity, TypeResolver, TypeSide},
+};
+
+/// Why a domain is rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Why {
+    /// Its base type changed.
+    Base,
+    /// Its collation changed.
+    Collation,
+    /// The enum or domain it is built on is rebuilt.
+    Derived(TypeRef),
+    /// A check or NOT NULL is added while an array of it is a column.
+    Array,
+}
+
+impl Why {
+    /// The sentence the plan gives for a rebuild no declaration of the domain
+    /// itself asks for.
+    pub fn shown(&self) -> String {
+        match self {
+            Why::Base => "its base type changed".into(),
+            Why::Collation => "its collation changed".into(),
+            Why::Derived(on) => format!("it is built on {}, which is rebuilt", on.shown()),
+            Why::Array => "a check or NOT NULL is added while an array of it is a column".into(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Rebuilt {
+    pub changes: Vec<Change>,
+    /// The domains rebuilt, with why: they get no in-place alteration.
+    pub uids: BTreeMap<Uid, Why>,
+    pub errors: Vec<DiffError>,
+}
+
+fn refusal(name: &TypeRef, reason: impl Into<String>) -> DiffError {
+    DiffError::TypeLifecycleUnsupported {
+        name: name.clone(),
+        reason: reason.into(),
+    }
+}
+
+/// The domains this plan rebuilds and the steps for each, given the steps the
+/// enums' label changes already made.
+pub(crate) fn plan(
+    base: Side<'_>,
+    desired: Side<'_>,
+    hints: &Hints,
+    enum_steps: &[Change],
+    dialect: &(impl Dialect + ?Sized),
+) -> Rebuilt {
+    let mut out = Rebuilt::default();
+    let resolver = TypeResolver::new(base.ids, desired.ids);
+    // The enums rebuilt: replacement, labels removed, and where it is created.
+    let mut rebuilt: BTreeMap<Uid, Replaced> = BTreeMap::new();
+    for change in enum_steps {
+        if let Change::EnumRebuild {
+            uid,
+            tmp,
+            step: EnumRebuildStep::Create {
+                removed, ordinal, ..
+            },
+            ..
+        } = change
+        {
+            rebuilt.insert(
+                uid.clone(),
+                Replaced {
+                    tmp: tmp.clone(),
+                    removed: removed.clone(),
+                    ordinal: *ordinal,
+                    depth: 0,
+                    // No cast leads from an enum to its replacement: the
+                    // labels go through text.
+                    values: ValueChange::Relabel {
+                        removed: removed.clone(),
+                    },
+                },
+            );
+        }
+    }
+
+    // The label statements of each enum in the plan, as the count of its
+    // operations: a replacement domain is created after them, as 3b's enum
+    // `Create` is (it takes its place by the same operation ordinal), because
+    // its default or a check may name a label they rename or add.
+    let mut label_operations: BTreeMap<Uid, usize> = BTreeMap::new();
+    for change in enum_steps {
+        if let Change::AddEnumValue { uid, ordinal, .. }
+        | Change::RenameEnumValue { uid, ordinal, .. } = change
+        {
+            let seen = label_operations.entry(uid.clone()).or_default();
+            *seen = (*seen).max(ordinal + 1);
+        }
+    }
+
+    // Retained domains: their names on both sides, definitions, and seeds.
+    struct Domain<'a> {
+        uid: &'a Uid,
+        name: &'a TypeRef,
+        old: ManagedType,
+        new: &'a ManagedType,
+    }
+    let mut domains: BTreeMap<&Uid, Domain<'_>> = BTreeMap::new();
+    for (uid, name) in &desired.ids.types {
+        let Some(new @ ManagedType::Domain { .. }) = desired.schema.types.get(name) else {
+            continue;
+        };
+        let Some(was) = resolver.name(TypeSide::Base, uid) else {
+            continue;
+        };
+        let Some(old @ ManagedType::Domain { .. }) = base.schema.types.get(was) else {
+            continue;
+        };
+        // The old base spelled by the names the plan leaves.
+        let mut comparable = old.clone();
+        if let ManagedType::Domain { base: ty, .. } = &mut comparable {
+            resolver.remap(ty, TypeSide::Base, TypeSide::Desired);
+        }
+        domains.insert(
+            uid,
+            Domain {
+                uid,
+                name,
+                old: comparable,
+                new,
+            },
+        );
+    }
+
+    // How many label operations precede a domain's creation: those of the enum
+    // it is built on, directly or through the domains between, whether or not
+    // those are rebuilt (one that is takes its own place after them).
+    let labels_before = |start: &ManagedType| -> usize {
+        let mut at = start;
+        for _ in 0..=desired.ids.types.len() {
+            let ManagedType::Domain { base: ty, .. } = at else {
+                return 0;
+            };
+            let Some(reference) = ty.type_ref() else {
+                return 0;
+            };
+            let TypeIdentity::Declared(uid) = resolver.resolve(TypeSide::Desired, reference) else {
+                return 0;
+            };
+            if let Some(operations) = label_operations.get(uid) {
+                return *operations;
+            }
+            let Some(next) = desired
+                .ids
+                .types
+                .get(uid)
+                .and_then(|name| desired.schema.types.get(name))
+            else {
+                return 0;
+            };
+            at = next;
+        }
+        0
+    };
+    let normalized = |ty: &ColumnType| dialect.normalize_type(ty).unwrap_or_else(|_| ty.clone());
+    let mut why: BTreeMap<Uid, Why> = BTreeMap::new();
+    for d in domains.values() {
+        let (
+            ManagedType::Domain {
+                base: old_base,
+                collation: old_collation,
+                ..
+            },
+            ManagedType::Domain {
+                base: new_base,
+                collation: new_collation,
+                ..
+            },
+        ) = (&d.old, d.new)
+        else {
+            continue;
+        };
+        let (old_base, new_base) = (normalized(old_base), normalized(new_base));
+        if old_base != new_base {
+            // The engine's own assignment cast converts compatible bases; the
+            // rest needs a conversion the author states, which is #2331.
+            let compatible = old_base.type_ref().is_none()
+                && new_base.type_ref().is_none()
+                && ValueChange::cast(&old_base, &new_base, None).is_some_and(|values| {
+                    let verdict = dialect.value_change(&values, "");
+                    verdict.needs_using.is_none()
+                        && verdict.risk != pbps_dialect::TypeChangeRisk::Incompatible
+                });
+            if compatible {
+                why.insert(d.uid.clone(), Why::Base);
+            } else {
+                out.errors.push(refusal(
+                    d.name,
+                    format!(
+                        "its base type changes from {} to {}, which the engine does not convert by itself; a conversion the author states waits for #2331",
+                        old_base.shown(),
+                        new_base.shown()
+                    ),
+                ));
+            }
+        } else if old_collation != new_collation {
+            why.insert(d.uid.clone(), Why::Collation);
+        }
+        if !why.contains_key(d.uid)
+            && hints.domain_array_holders.contains(d.uid)
+            && pbps_model::DomainDelta::of(&d.old, d.new).is_some_and(|delta| delta.tightens())
+        {
+            why.insert(d.uid.clone(), Why::Array);
+        }
+    }
+
+    // Derived: built on a rebuilt enum or domain, transitively.
+    loop {
+        let mut grew = false;
+        for d in domains.values() {
+            // The type it is built on being rebuilt is the reason that holds
+            // for every attribute, so it is the one given, over an array's.
+            if matches!(
+                why.get(d.uid),
+                Some(Why::Base | Why::Collation | Why::Derived(_))
+            ) {
+                continue;
+            }
+            let ManagedType::Domain { base: ty, .. } = d.new else {
+                continue;
+            };
+            let Some(reference) = ty.type_ref() else {
+                continue;
+            };
+            let TypeIdentity::Declared(on) = resolver.resolve(TypeSide::Desired, reference) else {
+                continue;
+            };
+            if rebuilt.contains_key(on) || why.contains_key(on) {
+                why.insert(d.uid.clone(), Why::Derived(reference.clone()));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // A domain created in this plan over a type it rebuilds would hold the old
+    // type, which the swap drops.
+    for (uid, name) in &desired.ids.types {
+        if domains.contains_key(uid) {
+            continue;
+        }
+        let Some(ManagedType::Domain { base: ty, .. }) = desired.schema.types.get(name) else {
+            continue;
+        };
+        if let Some(reference) = ty.type_ref()
+            && let TypeIdentity::Declared(on) = resolver.resolve(TypeSide::Desired, reference)
+            && (rebuilt.contains_key(on) || why.contains_key(on))
+        {
+            out.errors.push(refusal(
+                name,
+                format!(
+                    "it is created in a plan that rebuilds {}; create it in a plan of its own",
+                    reference.shown()
+                ),
+            ));
+        }
+    }
+
+    // Rebuild each in base-depth order.
+    // Each pass plans the domains whose base is planned: a chain of any depth
+    // takes one pass per level, so the bound is the number of domains.
+    let mut pending: Vec<&Uid> = why.keys().collect();
+    let mut failed: BTreeSet<&Uid> = BTreeSet::new();
+    for _ in 0..=why.len() {
+        if pending.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for uid in pending {
+            let d = &domains[uid];
+            let ManagedType::Domain { base: ty, .. } = d.new else {
+                continue;
+            };
+            let on = ty.type_ref().and_then(|reference| {
+                match resolver.resolve(TypeSide::Desired, reference) {
+                    TypeIdentity::Declared(on) => Some(on),
+                    TypeIdentity::ExternalOrUnrecorded(_) => None,
+                }
+            });
+            let under = match on {
+                Some(on) if rebuilt.contains_key(on) => Some(&rebuilt[on]),
+                // Built on a domain this plan refuses: its own refusal says
+                // all there is to say.
+                Some(on) if failed.contains(on) => {
+                    failed.insert(uid);
+                    continue;
+                }
+                Some(on) if why.contains_key(on) => {
+                    // Built on a domain not planned yet: wait for it.
+                    next.push(uid);
+                    continue;
+                }
+                _ => None,
+            };
+            let (over, removed, ordinal, depth) = match under {
+                Some(r) => (
+                    Some(r.tmp.clone()),
+                    r.removed.clone(),
+                    r.ordinal + 1,
+                    r.depth + 1,
+                ),
+                None => (None, Vec::new(), labels_before(d.new), 1),
+            };
+            let reason = &why[uid];
+            // What the columns of this type undergo, as one walk down the
+            // chain under it, not a test on why this type is rebuilt: how a
+            // value reaches the replacement and which change of base type it
+            // meets on the way. The root says both and every domain built on
+            // it inherits them, through any collation, array or derived link:
+            // an enum root has no cast to its replacement, so the labels go
+            // through text; a built-in root's change is carried by the
+            // engine's assignment cast, which a column of a domain built on it
+            // takes by the leaf types (measured on 16 and 18, DEC-1635.9). The
+            // pair is of the element types; whether a column's values are
+            // arrays is its shape's to say (`TypeResolver::values_shape`).
+            let values = match under {
+                Some(r) => r.values.clone(),
+                None => {
+                    let (
+                        ManagedType::Domain { base: from, .. },
+                        ManagedType::Domain { base: to, .. },
+                    ) = (&d.old, d.new)
+                    else {
+                        continue;
+                    };
+                    let old = resolver.values_shape(TypeSide::Desired, from, desired.schema);
+                    let new = resolver.values_shape(TypeSide::Desired, to, desired.schema);
+                    ValueChange::Cast {
+                        from: match old.leaf {
+                            Leaf::Builtin(ty) => normalized(&ty),
+                            Leaf::Enum(uid) => ColumnType::reference(
+                                resolver
+                                    .name(TypeSide::Desired, &uid)
+                                    .expect("a resolved enum has a declared name")
+                                    .clone(),
+                            ),
+                            Leaf::Other => normalized(from).element(),
+                        },
+                        to: match new.leaf {
+                            Leaf::Builtin(ty) => normalized(&ty),
+                            Leaf::Enum(uid) => ColumnType::reference(
+                                resolver
+                                    .name(TypeSide::Desired, &uid)
+                                    .expect("a resolved enum has a declared name")
+                                    .clone(),
+                            ),
+                            Leaf::Other => normalized(to).element(),
+                        },
+                        arrays: new.arrays,
+                        using: None,
+                    }
+                }
+            };
+            match rebuild_type(
+                base,
+                desired,
+                hints,
+                (d.uid, d.name),
+                Replacement {
+                    definition: d.new.clone(),
+                    removed: removed.clone(),
+                    over,
+                    why: Some(reason.shown()),
+                    values: values.clone(),
+                    ordinal,
+                    depth,
+                },
+            ) {
+                Ok(steps) => {
+                    if let Some(Change::EnumRebuild { tmp, .. }) = steps.first() {
+                        rebuilt.insert(
+                            d.uid.clone(),
+                            Replaced {
+                                tmp: tmp.clone(),
+                                removed,
+                                ordinal,
+                                depth,
+                                values,
+                            },
+                        );
+                    }
+                    out.changes.extend(steps);
+                }
+                // Includes a domain renamed in the plan that rebuilds it: the
+                // steps would run under the old name beside the rename.
+                Err(reason) => {
+                    failed.insert(uid);
+                    out.errors.push(refusal(d.name, reason));
+                }
+            }
+        }
+        pending = next;
+    }
+    for uid in pending {
+        out.errors.push(refusal(
+            domains[uid].name,
+            "its base could not be ordered before it",
+        ));
+    }
+    out.uids = why;
+    out
+}
+
+struct Replaced {
+    tmp: TypeRef,
+    removed: Vec<String>,
+    ordinal: usize,
+    depth: usize,
+    /// What the columns of this type undergo: a domain built on this one
+    /// inherits it.
+    values: ValueChange,
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)] // Fixtures name only the rebuild's changes.
+mod tests {
+    use super::*;
+    use pbps_dialect::{MinimalDialect, TypeChangeRisk};
+    use pbps_model::{Column, ColumnRef, IdsFile, Schema, Table, TableName, UidKind};
+
+    /// A dialect that converts every pair of built-in bases but one with an
+    /// integer, as the engine's assignment casts do for text and character
+    /// types.
+    struct Casts;
+    impl Dialect for Casts {
+        fn name(&self) -> &'static str {
+            "casts"
+        }
+        fn quote_ident(&self, i: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(i)
+        }
+        fn intermediate_tables(
+            &self,
+            c: &Change,
+            s: pbps_model::Strategy,
+        ) -> Result<Vec<TableName>, pbps_dialect::DialectError> {
+            MinimalDialect.intermediate_tables(c, s)
+        }
+        fn normalize_type(&self, t: &ColumnType) -> Result<ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(t)
+        }
+        fn type_change_needs_using(&self, from: &ColumnType, to: &ColumnType) -> bool {
+            self.type_change_risk(from, to) == TypeChangeRisk::Incompatible
+        }
+        fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
+            if from.base == "integer" || to.base == "integer" {
+                TypeChangeRisk::Incompatible
+            } else {
+                TypeChangeRisk::Safe
+            }
+        }
+        fn fold_ident<'a>(&self, i: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(i)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(&self, n: &TableName, t: &Table) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(n, t)
+        }
+        fn transaction_framing(
+            &self,
+            z: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(z)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
+    }
+
+    fn domain(base: &str, collation: Option<&str>, checks: &[(&str, &str)]) -> ManagedType {
+        ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null: false,
+            default: None,
+            checks: checks
+                .iter()
+                .map(|(n, e)| ((*n).into(), (*e).into()))
+                .collect(),
+            collation: collation.map(|c| c.parse().unwrap()),
+        }
+    }
+
+    fn uid(n: u32) -> Uid {
+        format!("y_{n:06}").parse().unwrap()
+    }
+
+    /// `app.t(id, v app.d, w app.d2)` beside the declared types, by uid:
+    /// `app.e` (1), `app.d` (2) and `app.d2` (3).
+    fn world(types: &[(&str, ManagedType)]) -> (Schema, IdsFile) {
+        let t: TableName = "app.t".parse().unwrap();
+        let mut table = Table::default();
+        for (name, ty) in [
+            ("id", "integer"),
+            ("v", "app.d"),
+            ("w", "app.d2"),
+            ("x", "app.d3"),
+        ] {
+            table
+                .columns
+                .insert(name.into(), Column::new(ty.parse().unwrap()));
+        }
+        let mut ids = IdsFile {
+            tables: [(Uid::derived(UidKind::Table, "t", 0), t.clone())].into(),
+            ..Default::default()
+        };
+        for (n, (name, _)) in types.iter().enumerate() {
+            ids.types
+                .insert(uid(n as u32 + 1), (*name).parse().unwrap());
+        }
+        for column in ["id", "v", "w", "x"] {
+            ids.columns.insert(
+                Uid::derived(UidKind::Column, column, 0),
+                ColumnRef {
+                    table: t.clone(),
+                    name: column.into(),
+                },
+            );
+        }
+        (
+            Schema {
+                types: types
+                    .iter()
+                    .map(|(n, d)| ((*n).parse().unwrap(), d.clone()))
+                    .collect(),
+                tables: [(t, table)].into(),
+                ..Default::default()
+            },
+            ids,
+        )
+    }
+
+    fn enumeration(values: &[&str]) -> ManagedType {
+        ManagedType::Enum {
+            values: values.iter().map(|v| (*v).into()).collect(),
+        }
+    }
+
+    fn run(old: &[(&str, ManagedType)], new: &[(&str, ManagedType)], hints: &Hints) -> Rebuilt {
+        let (b, d) = (world(old), world(new));
+        let (base, desired) = (
+            Side {
+                schema: &b.0,
+                ids: &b.1,
+            },
+            Side {
+                schema: &d.0,
+                ids: &d.1,
+            },
+        );
+        let (enum_steps, errors) = crate::enum_labels::changes(base, desired, hints);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut out = plan(base, desired, hints, &enum_steps, &Casts);
+        let mut all = enum_steps;
+        all.append(&mut out.changes);
+        out.changes = all;
+        out
+    }
+
+    fn steps(rebuilt: &Rebuilt, of: &Uid) -> Vec<EnumRebuildStep> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild { uid, step, .. } if uid == of => Some(step.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tables() -> Vec<(&'static str, ManagedType)> {
+        vec![("app.e", enumeration(&["a", "b"]))]
+    }
+
+    #[test]
+    fn a_base_change_is_a_rebuild_whose_retypes_ride_the_assignment_cast() {
+        let mut old = tables();
+        old.push(("app.d", domain("varchar(20)", None, &[])));
+        let mut new = tables();
+        new.push(("app.d", domain("text", None, &[])));
+        let out = run(&old, &new, &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.uids.get(&uid(2)), Some(&Why::Base));
+        let [create, retype, swap] = &steps(&out, &uid(2))[..] else {
+            panic!("{:?}", out.changes);
+        };
+        assert!(matches!(
+            create,
+            EnumRebuildStep::Create { why: Some(w), over: None, .. } if w == "its base type changed"
+        ));
+        let EnumRebuildStep::Retype {
+            column,
+            array,
+            values,
+            ..
+        } = retype
+        else {
+            panic!("{retype:?}");
+        };
+        assert_eq!((column.name.raw(), *array), ("v", false));
+        let ValueChange::Cast { from, to, .. } = values.as_ref() else {
+            panic!("{values:?}");
+        };
+        assert_eq!(
+            (from.shown().to_string(), to.shown().to_string()),
+            ("varchar(20)".into(), "text".into())
+        );
+        assert!(matches!(
+            swap,
+            EnumRebuildStep::Swap {
+                depth: 1,
+                over: None,
+                ..
+            }
+        ));
+        // Negatives: the same base, and a base the engine cannot convert, are
+        // not this rebuild.
+        old[1].1 = domain("text", None, &[]);
+        assert!(run(&old, &new, &Hints::default()).uids.is_empty());
+        new[1].1 = domain("integer", None, &[]);
+        let out = run(&old, &new, &Hints::default());
+        assert!(out.changes.is_empty() && out.uids.is_empty());
+        let said = out.errors[0].to_string();
+        assert!(said.contains("app.d") && said.contains("#2331"), "{said}");
+    }
+
+    #[test]
+    fn a_collation_change_alone_rebuilds_without_a_narrowing_pair() {
+        let mut old = tables();
+        old.push(("app.d", domain("text", None, &[])));
+        let mut new = tables();
+        new.push(("app.d", domain("text", Some("pg_catalog.\"C\""), &[])));
+        let out = run(&old, &new, &Hints::default());
+        assert_eq!(out.uids.get(&uid(2)), Some(&Why::Collation));
+        assert!(steps(&out, &uid(2)).iter().any(|s| matches!(
+            s,
+            EnumRebuildStep::Retype {
+                values,
+                ..
+            } if matches!(values.as_ref(), ValueChange::Cast { from, to, .. } if from == to)
+        )));
+    }
+
+    #[test]
+    fn a_rebuilt_enum_takes_the_domains_over_it_in_depth_order_and_unrelated_ones_stay() {
+        let enum_old = ("app.e", enumeration(&["a", "b"]));
+        let enum_new = ("app.e", enumeration(&["b"]));
+        let on = |base: &str| domain(base, None, &[]);
+        let old = vec![
+            enum_old,
+            ("app.d", on("app.e")),
+            ("app.d2", on("app.d")),
+            ("app.u", on("text")),
+        ];
+        let mut new = old.clone();
+        new[0] = enum_new;
+        let out = run(&old, &new, &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.uids.len(), 2, "{:?}", out.uids);
+        assert!(
+            matches!(out.uids.get(&uid(2)), Some(Why::Derived(r)) if r.shown().to_string() == "app.e")
+        );
+        assert!(
+            matches!(out.uids.get(&uid(3)), Some(Why::Derived(r)) if r.shown().to_string() == "app.d")
+        );
+        // The unrelated domain is not rebuilt.
+        assert!(!out.uids.contains_key(&uid(4)));
+        let first = steps(&out, &uid(2));
+        let second = steps(&out, &uid(3));
+        assert!(matches!(
+            &first[0],
+            EnumRebuildStep::Create { over: Some(_), removed, .. } if removed == &["a".to_owned()]
+        ));
+        assert!(matches!(
+            &second[0],
+            EnumRebuildStep::Create {
+                over: Some(_),
+                ordinal: 2,
+                ..
+            }
+        ));
+        // Labels are mapped through text, and the deeper swap comes first.
+        assert!(matches!(
+            &first[1],
+            EnumRebuildStep::Retype {
+                values,
+                ..
+            } if matches!(values.as_ref(), ValueChange::Relabel { .. })
+        ));
+        assert!(matches!(&first[2], EnumRebuildStep::Swap { depth: 1, .. }));
+        assert!(matches!(&second[2], EnumRebuildStep::Swap { depth: 2, .. }));
+    }
+
+    #[test]
+    fn a_tightening_beside_an_array_of_the_domain_is_the_rebuild_and_a_loosening_is_not() {
+        let old = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("text", None, &[("c", "VALUE <> ''")])),
+        ];
+        let tighter = vec![
+            ("app.e", enumeration(&["a"])),
+            (
+                "app.d",
+                domain("text", None, &[("c", "VALUE <> ''"), ("d", "VALUE <> 'x'")]),
+            ),
+        ];
+        let mut hints = Hints::default();
+        // No array of it stands: the in-place alteration is the plan.
+        assert!(run(&old, &tighter, &hints).uids.is_empty());
+        hints.domain_array_holders.insert(uid(2));
+        let out = run(&old, &tighter, &hints);
+        assert_eq!(out.uids.get(&uid(2)), Some(&Why::Array));
+        // A loosening is not the engine's concern, array or not.
+        let looser = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("text", None, &[])),
+        ];
+        assert!(run(&old, &looser, &hints).uids.is_empty());
+    }
+
+    /// `n` domains, each over the one before and the first over `app.e`. The
+    /// deepest is named last and listed (so given its uid) first: a swap order
+    /// that fell back to names would drop each base under the domain over it,
+    /// and a planner that took one pass per 64 levels, in uid order, would
+    /// need a pass for each level.
+    fn chain(n: usize, labels: &[&str]) -> Vec<(String, ManagedType)> {
+        let mut types = vec![("app.e".to_owned(), enumeration(labels))];
+        for depth in (1..=n).rev() {
+            let on = if depth == 1 {
+                "app.e".to_owned()
+            } else {
+                format!("app.d{:03}", depth - 1)
+            };
+            types.push((format!("app.d{depth:03}"), domain(&on, None, &[])));
+        }
+        types
+    }
+
+    fn world_owned(types: &[(String, ManagedType)]) -> (Schema, IdsFile) {
+        let (mut schema, mut ids) = world(&[]);
+        for (n, (name, definition)) in types.iter().enumerate() {
+            ids.types.insert(uid(n as u32 + 1), name.parse().unwrap());
+            schema
+                .types
+                .insert(name.parse().unwrap(), definition.clone());
+        }
+        (schema, ids)
+    }
+
+    /// The swaps of a whole plan, by the depth each carries, in plan order.
+    fn swap_depths(
+        types_old: &[(String, ManagedType)],
+        types_new: &[(String, ManagedType)],
+    ) -> Vec<usize> {
+        let (b, d) = (world_owned(types_old), world_owned(types_new));
+        let plan = crate::schema_diff::diff(
+            Side {
+                schema: &b.0,
+                ids: &b.1,
+            },
+            Side {
+                schema: &d.0,
+                ids: &d.1,
+            },
+            &Casts,
+            &Hints::default(),
+        )
+        .expect("a valid rebuild plans");
+        plan.changes()
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::EnumRebuild {
+                    step: EnumRebuildStep::Swap { depth, .. },
+                    ..
+                } => Some(*depth),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn swaps_run_deepest_first_at_any_depth_and_a_shallow_chain_keeps_its_order() {
+        // Past ten levels, where a one-digit rank gave two depths one value
+        // and the names decided: the old base was dropped under its domain.
+        for n in [3, 11, 12, 70] {
+            let depths = swap_depths(&chain(n, &["a", "b"]), &chain(n, &["b"]));
+            let want: Vec<usize> = (0..=n).rev().filter(|d| *d > 0).chain([0]).collect();
+            assert_eq!(depths.len(), n + 1, "{n}: {depths:?}");
+            // Every domain's swap before the enum's (depth 0), each deeper
+            // one before the one it is built on.
+            assert_eq!(depths, want, "{n}");
+        }
+    }
+
+    #[test]
+    fn a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_with_no_steps() {
+        let old = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("varchar(20)", None, &[])),
+        ];
+        // Rename and base change: refused.
+        let renamed = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d_new", domain("text", None, &[])),
+        ];
+        let out = run(&old, &renamed, &Hints::default());
+        assert!(out.changes.is_empty(), "{:?}", out.changes);
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            said.contains("app.d_new") && said.contains("renamed or moved in this plan"),
+            "{said}"
+        );
+        // Rename alone and rebuild alone are not.
+        let only_renamed = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d_new", domain("varchar(20)", None, &[])),
+        ];
+        let out = run(&old, &only_renamed, &Hints::default());
+        assert!(out.errors.is_empty() && out.uids.is_empty() && out.changes.is_empty());
+        let only_rebuilt = vec![
+            ("app.e", enumeration(&["a"])),
+            ("app.d", domain("text", None, &[])),
+        ];
+        let out = run(&old, &only_rebuilt, &Hints::default());
+        assert!(out.errors.is_empty() && out.uids.len() == 1);
+        // A domain over a rebuilt enum is rebuilt for that alone, and renamed
+        // beside it is refused like any other; the one beside it is not.
+        let over = |name: &'static str| {
+            vec![
+                ("app.e", enumeration(&["a", "b"])),
+                (name, domain("app.e", None, &[])),
+            ]
+        };
+        let mut shrunk = over("app.d_new");
+        shrunk[0].1 = enumeration(&["b"]);
+        let out = run(&over("app.d"), &shrunk, &Hints::default());
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(said.contains("renamed or moved in this plan"), "{said}");
+        assert!(out.changes.iter().all(|c| match c {
+            Change::EnumRebuild { uid: u, .. } => *u != uid(2),
+            _ => true,
+        }));
+        let mut kept = over("app.d");
+        kept[0].1 = enumeration(&["b"]);
+        assert!(
+            run(&over("app.d"), &kept, &Hints::default())
+                .errors
+                .is_empty()
+        );
+    }
+
+    /// The `base_change` of every `Retype` of a plan, by the column it moves.
+    fn base_changes(rebuilt: &Rebuilt) -> BTreeMap<String, Option<(String, String)>> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step: EnumRebuildStep::Retype { column, values, .. },
+                    ..
+                } => Some((
+                    column.name.raw().to_owned(),
+                    match values.as_ref() {
+                        ValueChange::Cast { from, to, .. } if from != to => {
+                            Some((from.shown().to_string(), to.shown().to_string()))
+                        }
+                        _ => None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The levels of array in the stored values of each column a plan moves.
+    fn value_arrays(rebuilt: &Rebuilt) -> BTreeMap<String, usize> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step:
+                        EnumRebuildStep::Retype {
+                            column, values, to, ..
+                        },
+                    ..
+                } => {
+                    let arrays = match values.as_ref() {
+                        ValueChange::Cast { arrays, .. } => *arrays,
+                        ValueChange::Relabel { .. } => {
+                            let mut ty = to;
+                            let mut arrays = 0;
+                            for _ in 0..=rebuilt.changes.len() {
+                                arrays += usize::from(ty.is_array());
+                                let next = rebuilt.changes.iter().find_map(|c| match c {
+                                    Change::EnumRebuild {
+                                        name,
+                                        step: EnumRebuildStep::Create { definition, .. },
+                                        ..
+                                    } if Some(name) == ty.type_ref() => match &**definition {
+                                        ManagedType::Domain { base, .. } => Some(base),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                });
+                                let Some(next) = next else {
+                                    break;
+                                };
+                                ty = next;
+                            }
+                            arrays
+                        }
+                    };
+                    Some((column.name.raw().to_owned(), arrays))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_domain_built_on_a_rebuilt_one_undergoes_its_roots_base_change() {
+        let on = |base: &str| domain(base, None, &[]);
+        // `v` is of `app.d` and `w` of `app.d2`, built on it: only `w` is
+        // held by the derived domain, and it is narrowed all the same.
+        let old = |base: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&old("varchar(20)"), &old("varchar(10)"), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            out.uids.get(&uid(3)),
+            Some(&Why::Derived("app.d".parse().unwrap()))
+        );
+        let pair = Some(("varchar(20)".to_owned(), "varchar(10)".to_owned()));
+        let changes = base_changes(&out);
+        assert_eq!(changes["v"], pair);
+        assert_eq!(
+            changes["w"], pair,
+            "the derived domain's column: {changes:?}"
+        );
+        // A built-in root: the derived column rides the assignment cast too.
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { column, values, .. },
+                ..
+            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
+        )));
+        // Through a third level, the same pair.
+        let deeper = |base: &str| {
+            let mut types = old(base);
+            types.push(("app.d3", on("app.d2")));
+            types
+        };
+        let out = run(
+            &deeper("varchar(20)"),
+            &deeper("varchar(10)"),
+            &Hints::default(),
+        );
+        let derived: Vec<_> = out
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    uid: u,
+                    step: EnumRebuildStep::Create { .. },
+                    ..
+                } => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derived.len(), 3, "{derived:?}");
+        assert_eq!(
+            base_changes(&out)["x"],
+            pair,
+            "three levels down: {:?}",
+            base_changes(&out)
+        );
+        // A widened base is carried as well: whether it narrows is the
+        // dialect's to say, and the gate and probe ask it per column.
+        let out = run(&old("varchar(20)"), &old("text"), &Hints::default());
+        assert_eq!(
+            base_changes(&out)["w"],
+            Some(("varchar(20)".to_owned(), "text".to_owned()))
+        );
+        // Negatives: a domain built on a rebuilt enum undergoes a change of
+        // labels and no change of base; nor does one beside an unchanged base.
+        let labels = |values: &[&str]| {
+            vec![
+                ("app.e", enumeration(values)),
+                ("app.d", on("app.e")),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&labels(&["a", "b"]), &labels(&["b"]), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(base_changes(&out)["v"], None);
+        assert_eq!(base_changes(&out)["w"], None);
+        let out = run(&old("varchar(20)"), &old("varchar(20)"), &Hints::default());
+        assert!(out.uids.is_empty() && base_changes(&out).is_empty());
+    }
+
+    #[test]
+    fn a_derived_domain_over_an_unconvertible_base_is_refused_like_a_direct_one() {
+        let on = |base: &str| domain(base, None, &[]);
+        let types = |base: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&types("varchar(20)"), &types("integer"), &Hints::default());
+        assert!(
+            out.changes.is_empty() && out.uids.is_empty(),
+            "{:?}",
+            out.changes
+        );
+        let said = out
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(said.contains("app.d") && said.contains("#2331"), "{said}");
+        // A collation change alone carries no base pair, derived or not.
+        let collated = |collation: Option<&str>| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", domain("text", collation, &[])),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(
+            &collated(None),
+            &collated(Some("pg_catalog.\"C\"")),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.uids.len(), 2);
+        assert_eq!(base_changes(&out)["v"], None);
+        assert_eq!(base_changes(&out)["w"], None);
+    }
+
+    #[test]
+    fn the_base_change_of_a_column_follows_the_chain_under_its_type_whatever_the_reason() {
+        let on = |base: &str| domain(base, None, &[]);
+        let collated = |base: &str| domain(base, Some("pg_catalog.\"C\""), &[]);
+        let pair = |from: &str, to: &str| Some((from.to_owned(), to.to_owned()));
+        let world_of = |root: &str, d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(root)),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        // The same shapes before and after, but for the root's base and the
+        // collation the second domain gains.
+        let run_pair = |old_root: &str,
+                        new_root: &str,
+                        old_d2: ManagedType,
+                        d2: ManagedType,
+                        d3: ManagedType| {
+            let out = run(
+                &world_of(old_root, old_d2, d3.clone()),
+                &world_of(new_root, d2, d3),
+                &Hints::default(),
+            );
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            out
+        };
+        // A collation change together with an inherited narrowing: the
+        // collating domain and the one under it both carry the pair.
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d"),
+            collated("app.d"),
+            on("app.d2"),
+        );
+        assert_eq!(out.uids.get(&uid(3)), Some(&Why::Collation));
+        let changes = base_changes(&out);
+        let p = pair("varchar(20)", "varchar(10)");
+        assert_eq!(
+            (
+                changes["v"].clone(),
+                changes["w"].clone(),
+                changes["x"].clone()
+            ),
+            (p.clone(), p.clone(), p.clone()),
+            "{changes:?}"
+        );
+        // The values of the derived column ride the assignment cast, as the
+        // root's do.
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { column, values, .. },
+                ..
+            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
+        )));
+        // An array link: the pair stays of the element types and the
+        // columns' values are arrays of them, which the shape says
+        // (`TypeResolver::values_shape`): no scalar probe, the direct array
+        // case's note.
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2"),
+        );
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        assert_eq!(
+            (changes["v"].clone(), changes["w"].clone()),
+            (p.clone(), p.clone())
+        );
+        assert_eq!((arrays["v"], arrays["w"]), (0, 1), "{arrays:?}");
+        // Through a second link the levels add up, and a scalar link under an
+        // array link adds none.
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2[]"),
+        );
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        assert_eq!(changes["x"], p, "{changes:?}");
+        assert_eq!((arrays["w"], arrays["x"]), (1, 2), "{arrays:?}");
+        let out = run_pair(
+            "varchar(20)",
+            "varchar(10)",
+            on("app.d"),
+            on("app.d"),
+            on("app.d2[]"),
+        );
+        let arrays = value_arrays(&out);
+        assert_eq!(base_changes(&out)["w"], p);
+        assert_eq!((arrays["w"], arrays["x"]), (0, 1), "{arrays:?}");
+        // A widening is carried as well, with the same shape (the dialect says
+        // it is no narrowing).
+        let out = run_pair(
+            "varchar(20)",
+            "text",
+            on("app.d[]"),
+            on("app.d[]"),
+            on("app.d2"),
+        );
+        assert_eq!(
+            base_changes(&out)["w"],
+            pair("varchar(20)", "text"),
+            "{:?}",
+            base_changes(&out)
+        );
+        assert_eq!(value_arrays(&out)["w"], 1);
+        // Below an enum there is no base change, array link or collation or
+        // not.
+        let over_enum = |d: ManagedType, d2: ManagedType, labels: &[&str]| {
+            vec![("app.e", enumeration(labels)), ("app.d", d), ("app.d2", d2)]
+        };
+        let out = run(
+            &over_enum(on("app.e"), on("app.d[]"), &["a", "b"]),
+            &over_enum(collated("app.e"), on("app.d[]"), &["b"]),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let changes = base_changes(&out);
+        assert!(
+            !changes.is_empty() && changes.values().all(Option::is_none),
+            "{changes:?}"
+        );
+    }
+
+    /// A domain with a default, as the label renames leave the enum.
+    fn with_default(base: &str, default: &str, checks: &[(&str, &str)]) -> ManagedType {
+        let ManagedType::Domain {
+            base,
+            not_null,
+            checks,
+            collation,
+            ..
+        } = domain(base, None, checks)
+        else {
+            unreachable!()
+        };
+        ManagedType::Domain {
+            base,
+            not_null,
+            default: Some(default.into()),
+            checks,
+            collation,
+        }
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> Hints {
+        Hints {
+            enum_value_renames: [(
+                "app.e".parse().unwrap(),
+                pairs
+                    .iter()
+                    .map(|(from, to)| ((*to).to_owned(), (*from).to_owned()))
+                    .collect(),
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// The plan's changes, by the order they will run in, as a kind and the
+    /// type each belongs to.
+    fn order_of(
+        old: &[(&str, ManagedType)],
+        new: &[(&str, ManagedType)],
+        hints: &Hints,
+    ) -> Result<Vec<String>, Vec<DiffError>> {
+        let (b, d) = (world(old), world(new));
+        crate::schema_diff::diff(
+            Side {
+                schema: &b.0,
+                ids: &b.1,
+            },
+            Side {
+                schema: &d.0,
+                ids: &d.1,
+            },
+            &Casts,
+            hints,
+        )
+        .map(|plan| {
+            plan.changes()
+                .changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::RenameEnumValue { uid, .. } => format!("rename {uid}"),
+                    Change::AddEnumValue { uid, .. } => format!("add {uid}"),
+                    Change::EnumRebuild {
+                        uid,
+                        step: EnumRebuildStep::Create { .. },
+                        ..
+                    } => format!("create {uid}"),
+                    _ => "other".to_owned(),
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_replacement_domain_is_created_after_the_label_changes_of_the_enum_it_uses() {
+        // An array holds `app.d`, which gains a check in the plan that renames
+        // the enum's labels, and its default becomes a renamed label: the
+        // replacement is created after every rename, one or two, directly or
+        // through a domain the plan leaves alone.
+        let mut hints = Hints::default();
+        hints.domain_array_holders.insert(uid(2));
+        let checked = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", with_default("app.e", default, checks)),
+            ]
+        };
+        let position = |order: &[String], what: &str| {
+            order
+                .iter()
+                .position(|o| o.starts_with(what))
+                .unwrap_or_else(|| panic!("{what}: {order:?}"))
+        };
+        for (old_labels, new_labels, moves, default) in [
+            (vec!["a", "c"], vec!["b", "c"], vec![("a", "b")], "'b'"),
+            (
+                vec!["a1", "a2", "c"],
+                vec!["b1", "b2", "c"],
+                vec![("a1", "b1"), ("a2", "b2")],
+                "'b2'",
+            ),
+        ] {
+            hints.enum_value_renames = renames(&moves).enum_value_renames;
+            let old = checked(&old_labels, "'c'", false);
+            let new = checked(&new_labels, default, true);
+            let order = order_of(&old, &new, &hints).expect("a valid plan");
+            assert_eq!(
+                order.iter().filter(|o| o.starts_with("rename")).count(),
+                moves.len(),
+                "{order:?}"
+            );
+            let last_rename = order.iter().rposition(|o| o.starts_with("rename")).unwrap();
+            assert!(
+                position(&order, "create") > last_rename,
+                "{moves:?}: {order:?}"
+            );
+        }
+        // Through a domain the plan does not rebuild: `app.d2` is built on
+        // `app.d`, which is built on the enum.
+        let chained = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", domain("app.e", None, &[])),
+                ("app.d2", with_default("app.d", default, checks)),
+            ]
+        };
+        let mut hints = renames(&[("a", "b")]);
+        hints.domain_array_holders.insert(uid(3));
+        let order = order_of(
+            &chained(&["a", "c"], "'c'", false),
+            &chained(&["b", "c"], "'b'", true),
+            &hints,
+        )
+        .expect("a valid plan");
+        assert!(
+            position(&order, "create") > position(&order, "rename"),
+            "{order:?}"
+        );
+        // Negative: with no label change the creation keeps its place, and
+        // the ordinal stays zero.
+        let plain = Hints {
+            domain_array_holders: [uid(2)].into(),
+            ..Default::default()
+        };
+        let out = run(
+            &checked(&["a", "c"], "'c'", false),
+            &checked(&["a", "c"], "'c'", true),
+            &plain,
+        );
+        assert_eq!(out.uids.get(&uid(2)), Some(&Why::Array));
+        assert!(out.changes.iter().any(|c| matches!(
+            c,
+            Change::EnumRebuild {
+                step: EnumRebuildStep::Create { ordinal: 0, .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_replacement_domain_waits_for_the_label_it_adds_and_the_plan_refuses_its_use() {
+        // The ordinal says after: one operation precedes it.
+        let mut hints = Hints::default();
+        hints.domain_array_holders.insert(uid(2));
+        let with = |labels: &[&str], default: &str, check: bool| {
+            let checks: &[(&str, &str)] = if check { &[("c", "VALUE <> ''")] } else { &[] };
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", with_default("app.e", default, checks)),
+            ]
+        };
+        let out = run(
+            &with(&["a"], "'a'", false),
+            &with(&["a", "b"], "'a'", true),
+            &hints,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(
+            out.changes.iter().any(|c| matches!(
+                c,
+                Change::EnumRebuild {
+                    uid: u,
+                    step: EnumRebuildStep::Create { ordinal: 1, .. },
+                    ..
+                } if *u == uid(2)
+            )),
+            "{:?}",
+            out.changes
+        );
+        // A default that names the added label cannot run in the transaction
+        // that adds it (DEC-1635.6): refused, as for a new domain.
+        let errors = order_of(
+            &with(&["a"], "'a'", false),
+            &with(&["a", "b"], "'b'", true),
+            &hints,
+        )
+        .expect_err("the new label is used where it is added");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, DiffError::EnumValueUse { .. })),
+            "{errors:?}"
+        );
+        // And one that does not name it is fine.
+        assert!(
+            order_of(
+                &with(&["a"], "'a'", false),
+                &with(&["a", "b"], "'a'", true),
+                &hints
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_columns_of_a_domain_over_an_array_of_a_rebuilt_enum_are_read_by_their_elements() {
+        let on = |base: &str| domain(base, None, &[]);
+        let world_of = |labels: &[&str]| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e[]")),
+                ("app.d2", on("app.d")),
+                ("app.d3", on("app.d2[]")),
+            ]
+        };
+        let out = run(&world_of(&["a", "b"]), &world_of(&["a"]), &Hints::default());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // `v` is of `app.d` (an array of the enum), `w` of `app.d2` over it,
+        // `x` of `app.d3`, an array of that: each reads its elements, and the
+        // target type is spelled with `[]` only where the column is.
+        let arrays = value_arrays(&out);
+        assert_eq!(
+            (arrays["v"], arrays["w"], arrays["x"]),
+            (1, 1, 2),
+            "{arrays:?}"
+        );
+        for change in &out.changes {
+            if let Change::EnumRebuild {
+                step: EnumRebuildStep::Retype { array, values, .. },
+                ..
+            } = change
+            {
+                assert!(!array, "none of these columns is itself `[]`");
+                assert!(
+                    matches!(values.as_ref(), ValueChange::Relabel { removed } if removed == &["b".to_owned()])
+                );
+            }
+        }
+        // Negative: a scalar domain over the enum reads the value.
+        let scalar = |labels: &[&str]| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e")),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(&scalar(&["a", "b"]), &scalar(&["a"]), &Hints::default());
+        assert_eq!(value_arrays(&out)["v"], 0);
+        assert_eq!(value_arrays(&out)["w"], 0);
+    }
+
+    #[test]
+    fn a_root_domain_over_an_array_narrows_its_elements_and_its_columns_are_arrays() {
+        let on = |base: &str| domain(base, None, &[]);
+        let world_of = |root: &str| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(root)),
+                ("app.d2", on("app.d")),
+            ]
+        };
+        let out = run(
+            &world_of("varchar(20)[]"),
+            &world_of("varchar(10)[]"),
+            &Hints::default(),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let pair = Some(("varchar(20)".to_owned(), "varchar(10)".to_owned()));
+        let (changes, arrays) = (base_changes(&out), value_arrays(&out));
+        // The pair is of the element types; the root's own array base is a
+        // level of the values of its columns and of the ones built on it.
+        assert_eq!(
+            (changes["v"].clone(), changes["w"].clone()),
+            (pair.clone(), pair)
+        );
+        assert_eq!((arrays["v"], arrays["w"]), (1, 1), "{arrays:?}");
+        // Negative: a scalar root has no level.
+        let out = run(
+            &world_of("varchar(20)"),
+            &world_of("varchar(10)"),
+            &Hints::default(),
+        );
+        assert_eq!(value_arrays(&out)["v"], 0);
+    }
+
+    /// How each column's value reaches its replacement, by column.
+    fn conversions(rebuilt: &Rebuilt) -> BTreeMap<String, bool> {
+        rebuilt
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::EnumRebuild {
+                    step: EnumRebuildStep::Retype { column, values, .. },
+                    ..
+                } => Some((
+                    column.name.raw().to_owned(),
+                    matches!(values.as_ref(), ValueChange::Cast { .. }),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_conversion_of_a_derived_domain_is_its_roots_through_every_link() {
+        const ASSIGN: bool = true;
+        const TEXT: bool = false;
+        let on = |base: &str| domain(base, None, &[]);
+        let collated = |base: &str| domain(base, Some("pg_catalog.\"C\""), &[]);
+        let check = |out: &Rebuilt, want: [(&str, bool); 3]| {
+            assert!(out.errors.is_empty(), "{:?}", out.errors);
+            let got = conversions(out);
+            for (column, conversion) in want {
+                assert_eq!(got[column], conversion, "{column}: {got:?}");
+            }
+        };
+        // An enum root has no cast to its replacement: every domain built on
+        // it goes through text, through array and collation links as well.
+        let over_enum = |labels: &[&str], d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(labels)),
+                ("app.d", on("app.e")),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2")),
+            &over_enum(&["a"], on("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2[]")),
+            &over_enum(&["a"], on("app.d"), on("app.d2[]")),
+            &Hints::default(),
+        );
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
+        // Negative: an enum root under a collation link is still text.
+        let out = run(
+            &over_enum(&["a", "b"], on("app.d"), on("app.d2")),
+            &over_enum(&["a"], collated("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        assert_eq!(out.uids.get(&uid(3)), Some(&Why::Collation));
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
+        // A built-in root's change rides the assignment cast for the root's
+        // columns and for every domain built on it, through a collation link
+        // and through array links.
+        let over_builtin = |base: &str, d2: ManagedType, d3: ManagedType| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", on(base)),
+                ("app.d2", d2),
+                ("app.d3", d3),
+            ]
+        };
+        for (d2, d3) in [
+            (on("app.d"), on("app.d2")),
+            (collated("app.d"), on("app.d2")),
+            (on("app.d[]"), on("app.d2")),
+            (on("app.d"), on("app.d2[]")),
+            (collated("app.d[]"), on("app.d2[]")),
+        ] {
+            let out = run(
+                &over_builtin("numeric(10, 2)", d2.clone(), d3.clone()),
+                &over_builtin("numeric(5, 0)", d2, d3),
+                &Hints::default(),
+            );
+            check(&out, [("v", ASSIGN), ("w", ASSIGN), ("x", ASSIGN)]);
+        }
+        // A built-in collation change alone: the same.
+        let builtin_collation = |collation: Option<&str>| {
+            vec![
+                ("app.e", enumeration(&["a"])),
+                ("app.d", domain("text", collation, &[])),
+                ("app.d2", on("app.d")),
+                ("app.d3", on("app.d2")),
+            ]
+        };
+        let out = run(
+            &builtin_collation(None),
+            &builtin_collation(Some("pg_catalog.\"C\"")),
+            &Hints::default(),
+        );
+        check(&out, [("v", ASSIGN), ("w", ASSIGN), ("x", ASSIGN)]);
+        // A scalar root alone is unchanged.
+        let out = run(
+            &over_builtin("varchar(20)", on("app.d"), on("app.d2")),
+            &over_builtin("text", on("app.d"), on("app.d2")),
+            &Hints::default(),
+        );
+        assert_eq!(conversions(&out)["v"], ASSIGN);
+    }
+}

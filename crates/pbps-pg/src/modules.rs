@@ -2074,7 +2074,9 @@ fn dependents_query(edge: &str) -> String {
                 COALESCE(pn.nspname, n2.nspname), COALESCE(pt.relname, c2.relname), con.conname,
                 0::int8,
                 CASE WHEN con.conrelid = 0
-                     THEN 'a constraint on a domain rather than on a table, which this model does not hold'
+                     THEN pg_catalog.format('a constraint on domain %s.%s rather than on a table, which this model does not hold',
+                                            (SELECT nspname FROM pg_catalog.pg_namespace WHERE oid = (SELECT typnamespace FROM pg_catalog.pg_type WHERE oid = con.contypid)),
+                                            (SELECT typname FROM pg_catalog.pg_type WHERE oid = con.contypid))
                      WHEN con.contype <> 'c'
                      THEN 'a constraint of a kind that is not a check'
                      ELSE '' END

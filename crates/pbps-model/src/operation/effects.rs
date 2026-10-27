@@ -400,6 +400,25 @@ impl Cx<'_> {
                     self.type_input(base);
                 }
             }
+            // A domain's replacement is created from its final declaration, so
+            // the type it is built on stands in its final incarnation first:
+            // after the label renames and additions that make the labels its
+            // default and checks name. One built on a type the plan rebuilds
+            // is created over that type's replacement (`over`), after its
+            // creation, and needs no more (DEC-1635.9).
+            Change::EnumRebuild {
+                step:
+                    crate::EnumRebuildStep::Create {
+                        definition,
+                        over: None,
+                        ..
+                    },
+                ..
+            } => {
+                if let crate::ManagedType::Domain { base, .. } = definition.as_ref() {
+                    self.type_input(base);
+                }
+            }
             Change::CreateTable { table, .. } => {
                 for column in table.columns.values() {
                     self.type_input(&column.ty);

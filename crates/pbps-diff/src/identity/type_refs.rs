@@ -22,6 +22,24 @@ pub enum TypeDependent<'a> {
     New(TypeIdentity<'a>),
 }
 
+/// What a column's values are at the bottom of its domain chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leaf {
+    /// A declared enum.
+    Enum(Uid),
+    /// A built-in type, its own `[]` stripped.
+    Builtin(ColumnType),
+    /// A type this plan has no declaration of.
+    Other,
+}
+
+/// The leaf of a column's type and the levels of array above it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValuesShape {
+    pub leaf: Leaf,
+    pub arrays: usize,
+}
+
 pub struct TypeResolver<'a> {
     base: &'a IdsFile,
     desired: &'a IdsFile,
@@ -43,6 +61,42 @@ impl<'a> TypeResolver<'a> {
         match self.ids(side).type_uid(reference) {
             Some(uid) => TypeIdentity::Declared(uid),
             None => TypeIdentity::ExternalOrUnrecorded(reference),
+        }
+    }
+
+    /// What a column's stored values are, looking through every domain from
+    /// its type down to the leaf: the leaf type and the levels of array on the
+    /// way, the column's own `[]` and each domain built on an array included.
+    /// The one answer to "is this column an array of X" for a value check;
+    /// reading only the column's own type misses a domain over `e[]`
+    /// (DEC-1635.9). `schema` is the side's, and an unrecorded or external
+    /// type is a leaf of its own.
+    pub fn values_shape(&self, side: TypeSide, ty: &ColumnType, schema: &Schema) -> ValuesShape {
+        let mut arrays = 0;
+        let mut ty = ty.clone();
+        for _ in 0..=schema.types.len() {
+            if ty.is_array() {
+                arrays += 1;
+            }
+            let Some(reference) = ty.type_ref() else {
+                return ValuesShape {
+                    leaf: Leaf::Builtin(ty.element()),
+                    arrays,
+                };
+            };
+            let leaf = |leaf| ValuesShape { leaf, arrays };
+            let TypeIdentity::Declared(uid) = self.resolve(side, reference) else {
+                return leaf(Leaf::Other);
+            };
+            match schema.types.get(reference) {
+                Some(ManagedType::Enum { .. }) => return leaf(Leaf::Enum(uid.clone())),
+                Some(ManagedType::Domain { base, .. }) => ty = base.clone(),
+                None => return leaf(Leaf::Other),
+            }
+        }
+        ValuesShape {
+            leaf: Leaf::Other,
+            arrays,
         }
     }
 
@@ -296,5 +350,86 @@ mod tests {
         let mut unrecorded: ColumnType = "app.b[]".parse().unwrap();
         external.remap(&mut unrecorded, TypeSide::Base, TypeSide::Desired);
         assert_eq!(unrecorded, "app.b[]".parse::<ColumnType>().unwrap());
+    }
+
+    /// The shape of a column's values, through every domain (DEC-1635.9): the
+    /// leaf and the levels of array, the column's own `[]` included.
+    #[test]
+    fn a_columns_values_are_read_through_every_domain_to_their_leaf() {
+        let uid = |n: u32| -> Uid { format!("y_{n:06}").parse().unwrap() };
+        let enumeration = ManagedType::Enum {
+            values: vec!["a".into(), "b".into()],
+        };
+        let over = |base: &str| ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null: false,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        let schema = Schema {
+            types: [
+                ("app.e".parse().unwrap(), enumeration),
+                ("app.scalar".parse().unwrap(), over("app.e")),
+                ("app.arr".parse().unwrap(), over("app.e[]")),
+                ("app.arr2".parse().unwrap(), over("app.arr")),
+                ("app.arr_of_arr".parse().unwrap(), over("app.arr[]")),
+                ("app.text".parse().unwrap(), over("text")),
+                ("app.texts".parse().unwrap(), over("varchar(20)[]")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            types: ["e", "scalar", "arr", "arr2", "arr_of_arr", "text", "texts"]
+                .iter()
+                .enumerate()
+                .map(|(n, name)| (uid(n as u32 + 1), format!("app.{name}").parse().unwrap()))
+                .collect(),
+            ..Default::default()
+        };
+        let resolver = TypeResolver::new(&ids, &ids);
+        let shape = |ty: &str| {
+            let s = resolver.values_shape(TypeSide::Desired, &ty.parse().unwrap(), &schema);
+            (s.leaf, s.arrays)
+        };
+        let e = Leaf::Enum(uid(1));
+        // The enum itself and its own array.
+        assert_eq!(shape("app.e"), (e.clone(), 0));
+        assert_eq!(shape("app.e[]"), (e.clone(), 1));
+        // A scalar domain adds none; a domain over `e[]` adds one, and the
+        // column's own `[]` another (the engine keeps an array of such a
+        // domain as an array of its arrays).
+        assert_eq!(shape("app.scalar"), (e.clone(), 0));
+        assert_eq!(shape("app.scalar[]"), (e.clone(), 1));
+        assert_eq!(shape("app.arr"), (e.clone(), 1));
+        assert_eq!(shape("app.arr[]"), (e.clone(), 2));
+        // A domain over a domain over `e[]` is still one level, and over an
+        // array of it two.
+        assert_eq!(shape("app.arr2"), (e.clone(), 1));
+        assert_eq!(shape("app.arr_of_arr"), (e.clone(), 2));
+        // A built-in leaf is not an enum, scalar or array, through a domain.
+        assert_eq!(
+            shape("app.text"),
+            (Leaf::Builtin("text".parse().unwrap()), 0)
+        );
+        assert_eq!(
+            shape("app.texts"),
+            (Leaf::Builtin("varchar(20)".parse().unwrap()), 1)
+        );
+        assert_eq!(
+            shape("integer[]"),
+            (Leaf::Builtin("integer".parse().unwrap()), 1)
+        );
+        // A type the plan does not declare is a leaf of its own, as is one
+        // the schema lacks.
+        assert_eq!(shape("other.t[]"), (Leaf::Other, 1));
+        let nothing = IdsFile::default();
+        let bare = TypeResolver::new(&nothing, &nothing);
+        assert_eq!(
+            bare.values_shape(TypeSide::Desired, &"app.arr".parse().unwrap(), &schema)
+                .leaf,
+            Leaf::Other
+        );
     }
 }

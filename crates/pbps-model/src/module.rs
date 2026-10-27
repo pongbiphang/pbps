@@ -1074,6 +1074,12 @@ pub struct Hints {
     /// target, not intent: it is absent offline.
     pub enum_comments: BTreeMap<crate::TypeRef, String>,
 
+    /// The domains (by uid) that a connected plan found an array of as a column
+    /// of a standing table. PostgreSQL refuses a new check or NOT NULL on such
+    /// a domain in place, so the plan rebuilds it instead (DEC-1635.9). A fact
+    /// about the target, absent offline.
+    pub domain_array_holders: std::collections::BTreeSet<crate::Uid>,
+
     /// Declared modules a connected plan found standing on the columns of an
     /// enum it rebuilds: they come down before the retypes and go back after
     /// the swap, as a trigger whose table changes hands does (DEC-1635.7).

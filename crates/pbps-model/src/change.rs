@@ -3582,7 +3582,7 @@ mod tests {
                 column: column.clone(),
                 to: ty(to),
                 array: false,
-                removed: vec![],
+                values: Box::new(crate::ValueChange::Relabel { removed: vec![] }),
             },
         }
     }
@@ -4130,10 +4130,14 @@ mod tests {
                 definition: definition.clone(),
                 removed: vec![],
                 ordinal: 0,
+                over: None,
+                why: None,
             },
             crate::EnumRebuildStep::Swap {
                 definition,
                 comment: None,
+                depth: 0,
+                over: None,
             },
         ] {
             let change = Change::EnumRebuild {

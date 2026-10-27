@@ -3120,6 +3120,7 @@ fn build<'v, 'p: 'v>(
     change: &Change,
     names: &impl Deref<Target = AsStored<'v, 'p>>,
     unchecked: &mut Vec<Unchecked>,
+    label_arrays: usize,
 ) -> Result<Vec<Probe>, DialectError> {
     if reads_recomputed(names, change) {
         return Ok(skip(
@@ -3249,20 +3250,39 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             step:
                 pbps_model::EnumRebuildStep::Retype {
                     column,
-                    array,
-                    removed,
+                    values,
                     ..
                 },
             ..
         } => {
-            if removed.is_empty() {
-                return Ok(Vec::new());
-            }
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
             let table = qualified(&stored.table)?;
             let quoted = quote(stored.name.raw())?;
+            let verdict = crate::Postgres::new().value_change(values, &quoted);
+            let mut probes = Vec::new();
+            let removed = match values.as_ref() {
+                pbps_model::ValueChange::Cast { arrays, .. } => {
+                    // Existing derived-array rebuilds retain their unchecked
+                    // report; root array narrowing is refused by the differ.
+                    if *arrays > 0 && verdict.risk != pbps_dialect::TypeChangeRisk::Safe {
+                        unchecked.push(Unchecked::for_change(change,
+                            "the elements of an array are not checked against a narrower base"));
+                    } else if let pbps_dialect::ValueProbe::Predicate { target, fails } = verdict.probe {
+                        probes.push(Probe::new(
+                            format!("values in {column} that cannot become {to}", column = column.shown(), to = target.shown()),
+                            format!("SELECT {} AS n FROM {table}\n WHERE {quoted} IS NOT NULL AND ({fails});", saturated_count("count(*)")),
+                        ));
+                    } else if let pbps_dialect::ValueProbe::Unchecked(reason) = verdict.probe {
+                        unchecked.push(Unchecked::for_change(change, reason));
+                    }
+                    return Ok(probes);
+                }
+                pbps_model::ValueChange::Relabel { removed } => removed,
+            };
+            if removed.is_empty() { return Ok(probes); }
+            let levels = label_arrays;
             let labels = format!(
                 "ARRAY[{}]::pg_catalog.text[]",
                 removed
@@ -3271,13 +3291,23 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            let (what, sql) = if *array {
+            // One unnest per level of array in the stored values, so a
+            // domain over `e[]` is read by its elements and not by the
+            // array's text.
+            let (what, sql) = if levels > 0 {
+                let mut joins = String::new();
+                let mut source = format!("t.{quoted}");
+                for level in 1..=levels {
+                    joins.push_str(&format!(
+                        " CROSS JOIN LATERAL pg_catalog.unnest({source}) AS x{level}(v{level})"
+                    ));
+                    source = format!("x{level}.v{level}");
+                }
                 (
                     "elements",
                     format!(
-                        "SELECT {} AS n FROM {table} AS t CROSS JOIN LATERAL \
-                         pg_catalog.unnest(t.{quoted}::pg_catalog.text[]) AS x(label) \
-                         WHERE x.label OPERATOR(pg_catalog.=) ANY ({labels});",
+                        "SELECT {} AS n FROM {table} AS t{joins} \
+                         WHERE {source}::pg_catalog.text OPERATOR(pg_catalog.=) ANY ({labels});",
                         saturated_count("count(*)")
                     ),
                 )
@@ -3291,7 +3321,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     ),
                 )
             };
-            Ok(vec![Probe::new(
+            probes.push(Probe::new(
                 format!(
                     "{what} of {column} holding a label this plan removes ({})",
                     removed
@@ -3302,7 +3332,8 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     column = column.shown(),
                 ),
                 sql,
-            )])
+            ));
+            Ok(probes)
         }
         Change::AlterColumnType {
             column,
@@ -3338,11 +3369,21 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             // refuses (see `types::cannot_become`). That target gets the
             // count of rows the assignment would refuse, beside the cast.
             if let Some(expression) = using {
-                let Ok(target) = crate::types::normalize(to) else {
-                    unchecked.push(Unchecked::for_change(
-                        change,
-                        "the conversion's target type cannot be normalized",
-                    ));
+                let material = match change.value_change() {
+                    Some(values) => crate::Postgres::new().value_change(&values, &quoted).probe,
+                    // A scalar/array crossing has no common leaf shape.
+                    None => match crate::types::normalize(to) {
+                        Ok(target) => pbps_dialect::ValueProbe::Using {
+                            assignment_refuses: crate::types::assignment_refuses(&target, &format!("({expression})")),
+                            target, expression: expression.clone(),
+                        },
+                        Err(_) => pbps_dialect::ValueProbe::Unchecked("the conversion's target type cannot be normalized"),
+                    },
+                };
+                let pbps_dialect::ValueProbe::Using { target, assignment_refuses, .. } = material else {
+                    if let pbps_dialect::ValueProbe::Unchecked(reason) = material {
+                        unchecked.push(Unchecked::for_change(change, reason));
+                    }
                     return Ok(out);
                 };
                 let value = format!("({expression})");
@@ -3360,7 +3401,7 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
                     )
                     .refusing_when_it_fails(),
                 );
-                if let Some(refused) = crate::types::assignment_refuses(&target, &value) {
+                if let Some(refused) = assignment_refuses {
                     out.push(Probe::new(
                         format!(
                             "values the conversion `USING {}` of {column} makes that {to} would refuse",
@@ -3400,12 +3441,19 @@ Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::
             if *from_nullable && !*to_nullable {
                 out.push(null_probe(column, &table, &quoted));
             }
-            let (Ok(from), Ok(to)) = (crate::types::normalize(from), crate::types::normalize(to))
-            else {
-                unchecked.push(Unchecked::for_change(change, "the conversion types cannot be normalized"));
-                return Ok(out);
+            let material = match change.value_change() {
+                Some(values) => crate::Postgres::new().value_change(&values, &quoted).probe,
+                // The full types retain the scalar/array distinction here.
+                None => match (crate::types::normalize(from), crate::types::normalize(to)) {
+                    (Ok(from), Ok(to)) => crate::types::cannot_become(&from, &to, &quoted)
+                        .map_or(pbps_dialect::ValueProbe::None, |fails| pbps_dialect::ValueProbe::Predicate { target: to, fails }),
+                    _ => pbps_dialect::ValueProbe::Unchecked("the conversion types cannot be normalized"),
+                },
             };
-            if let Some(fails) = crate::types::cannot_become(&from, &to, &quoted) {
+            if let pbps_dialect::ValueProbe::Unchecked(reason) = &material {
+                unchecked.push(Unchecked::for_change(change, *reason));
+            }
+            if let pbps_dialect::ValueProbe::Predicate { target: to, fails } = material {
                 out.push(Probe::new(
                     format!(
                         "values in {column} that cannot become {to}",
@@ -4095,6 +4143,44 @@ fn without_filtered_rows(
     ))
 }
 
+/// Rebuilt domains carry their declarations in `Create`. Following those
+/// definitions preserves nested arrays without a second persisted shape on a
+/// `Relabel` (#2461). Every domain over a rebuilt enum is rebuilt with it.
+#[allow(clippy::wildcard_enum_match_arm)] // Only rebuild declarations contribute label shape.
+fn relabel_arrays(change: &Change, plan: &PlanNames<'_>) -> usize {
+    let Change::EnumRebuild {
+        step: pbps_model::EnumRebuildStep::Retype { to, .. },
+        ..
+    } = change
+    else {
+        return 0;
+    };
+    let mut ty = to;
+    let mut arrays = 0;
+    for _ in 0..=plan.changes().len() {
+        arrays += usize::from(ty.is_array());
+        let Some(reference) = ty.type_ref() else {
+            break;
+        };
+        let base = plan.changes().iter().find_map(|p| match &p.change {
+            Change::EnumRebuild {
+                name,
+                step: pbps_model::EnumRebuildStep::Create { definition, .. },
+                ..
+            } if name == reference => match &**definition {
+                pbps_model::ManagedType::Domain { base, .. } => Some(base),
+                pbps_model::ManagedType::Enum { .. } => None,
+            },
+            _ => None,
+        });
+        let Some(base) = base else {
+            break;
+        };
+        ty = base;
+    }
+    arrays
+}
+
 /// Every probe this dialect asks before a plan runs.
 ///
 /// Per `DeleteRow`, the count of what still references the row and the
@@ -4135,7 +4221,12 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
             names
         });
-        match build(&p.change, &names, &mut unchecked) {
+        match build(
+            &p.change,
+            &names,
+            &mut unchecked,
+            relabel_arrays(&p.change, plan_names),
+        ) {
             // A probe of a DEFAULT partition's own rows, after a move out of
             // it, counts rows that are gone by then: a check the moved rows
             // break, or a duplicate between a moved row and a kept one,
@@ -5787,6 +5878,90 @@ mod tests {
         PlannedChange::new(change)
     }
 
+    /// A domain's base narrowed under its rebuild: the rows the replacement's
+    /// base cannot hold are counted by the built-in expression alone, and a
+    /// domain that only widens, or whose column is an array, counts none
+    /// (DEC-1635.9).
+    #[test]
+    fn a_domains_narrowing_rebuild_counts_the_rows_that_do_not_fit() {
+        let table: TableName = "app.t".parse().unwrap();
+        let ty = |text: &str| crate::types::normalize(&text.parse().unwrap()).unwrap();
+        let retype_with = |array: bool, from: &str, to: &str| Change::EnumRebuild {
+            uid: "y_000001".parse().unwrap(),
+            name: "app.name".parse().unwrap(),
+            tmp: "app.tmp".parse().unwrap(),
+            step: pbps_model::EnumRebuildStep::Retype {
+                column_uid: "c_aaaaaa".parse().unwrap(),
+                column: table.column("v"),
+                to: pbps_model::ColumnType::reference("app.name".parse().unwrap()),
+                array,
+                values: Box::new(pbps_model::ValueChange::Cast {
+                    from: ty(from),
+                    to: ty(to),
+                    arrays: usize::from(array),
+                    using: None,
+                }),
+            },
+        };
+        let retype = |array, from: &str, to: &str| retype_with(array, from, to);
+        let report = preflight(&set(vec![retype(false, "varchar(20)", "varchar(10)")]));
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe
+                .description
+                .contains("values in app.t.v that cannot become")
+                && probe.sql.contains("IS NOT NULL"),
+            "{probe:#?}"
+        );
+        // Negatives: a widening has nothing to count, and an array's elements
+        // are reported unchecked and not counted.
+        assert!(
+            preflight(&set(vec![retype(false, "varchar(20)", "text")]))
+                .probes
+                .is_empty()
+        );
+        let array = preflight(&set(vec![retype(true, "varchar(20)", "varchar(10)")]));
+        assert!(
+            array.probes.is_empty() && !array.unchecked.is_empty(),
+            "{array:#?}"
+        );
+        // A domain built on the rebuilt one inherits its cast and is counted
+        // all the same; its widening is not.
+        let derived = |from: &str, to: &str| retype_with(false, from, to);
+        let report = preflight(&set(vec![derived("varchar(20)", "varchar(10)")]));
+        assert!(
+            matches!(report.probes.as_slice(), [p] if p.description.contains("cannot become")),
+            "{report:#?}"
+        );
+        assert!(
+            preflight(&set(vec![derived("varchar(20)", "text")]))
+                .probes
+                .is_empty()
+        );
+        // Through an array link the values are arrays of the base: no scalar
+        // probe, and the elements are reported unchecked as for a direct
+        // array column. The pair stays of the element types; the shape is the
+        // step's `ValueChange::Cast.arrays`.
+        let mut through_array = retype_with(false, "varchar(20)", "varchar(10)");
+        if let Change::EnumRebuild {
+            step: pbps_model::EnumRebuildStep::Retype { values, .. },
+            ..
+        } = &mut through_array
+        {
+            let pbps_model::ValueChange::Cast { arrays, .. } = values.as_mut() else {
+                panic!("{values:?}");
+            };
+            *arrays = 1;
+        }
+        let report = preflight(&set(vec![through_array]));
+        assert!(
+            report.probes.is_empty() && !report.unchecked.is_empty(),
+            "{report:#?}"
+        );
+    }
+
     /// The cast to the replacement refuses a row holding a removed label, so
     /// the plan counts them first: rows of a scalar column, elements of an
     /// array, by the spelling the database stores (DEC-1635.7).
@@ -5800,9 +5975,15 @@ mod tests {
             step: pbps_model::EnumRebuildStep::Retype {
                 column_uid: "c_aaaaaa".parse().unwrap(),
                 column: table.column("m"),
-                to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
+                to: if array {
+                    pbps_model::ColumnType::reference("app.e".parse().unwrap()).into_array()
+                } else {
+                    pbps_model::ColumnType::reference("app.e".parse().unwrap())
+                },
                 array,
-                removed: removed.iter().map(|l| (*l).to_owned()).collect(),
+                values: Box::new(pbps_model::ValueChange::Relabel {
+                    removed: removed.iter().map(|l| (*l).to_owned()).collect(),
+                }),
             },
         };
         let report = preflight(&set(vec![retype(false, &["sad", "it's"])]));
@@ -5837,11 +6018,69 @@ mod tests {
             probe.description
         );
         assert!(
-            probe
-                .sql
-                .contains("pg_catalog.unnest(t.\"m\"::pg_catalog.text[])"),
+            probe.sql.contains("pg_catalog.unnest(t.\"m\") AS x1(v1)")
+                && probe
+                    .sql
+                    .contains("x1.v1::pg_catalog.text OPERATOR(pg_catalog.=)"),
             "{}",
             probe.sql
+        );
+        // A column of a domain built on `e[]` is not itself an array, and its
+        // values are read by their elements all the same; one more level of
+        // array unnests once more; a scalar domain reads the value.
+        let through = |levels: usize, removed: &[&str]| {
+            let mut changes = vec![retype(false, removed)];
+            for level in 0..levels {
+                changes.push(Change::EnumRebuild {
+                    uid: "y_000001".parse().unwrap(),
+                    name: if level == 0 {
+                        "app.e".parse().unwrap()
+                    } else {
+                        format!("app.d{level}").parse().unwrap()
+                    },
+                    tmp: format!("app.tmp{level}").parse().unwrap(),
+                    step: pbps_model::EnumRebuildStep::Create {
+                        definition: Box::new(pbps_model::ManagedType::Domain {
+                            base: format!("app.d{}[]", level + 1).parse().unwrap(),
+                            collation: None,
+                            default: None,
+                            not_null: false,
+                            checks: Default::default(),
+                        }),
+                        removed: vec![],
+                        ordinal: 0,
+                        over: None,
+                        why: None,
+                    },
+                });
+            }
+            preflight(&set(changes))
+        };
+        let report = through(1, &["sad"]);
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe.description.starts_with("elements of app.t.m")
+                && probe.sql.contains("pg_catalog.unnest(t.\"m\") AS x1(v1)")
+                && !probe.sql.contains("\"m\"::pg_catalog.text"),
+            "{}",
+            probe.sql
+        );
+        let report = through(2, &["sad"]);
+        let [probe] = report.probes.as_slice() else {
+            panic!("{report:#?}");
+        };
+        assert!(
+            probe.sql.contains("unnest(x1.v1) AS x2(v2)")
+                && probe.sql.contains("x2.v2::pg_catalog.text"),
+            "{}",
+            probe.sql
+        );
+        let report = through(0, &["sad"]);
+        assert!(
+            matches!(report.probes.as_slice(), [p] if p.description.starts_with("rows of")),
+            "{report:#?}"
         );
         // Nothing removed, nothing to count: a pure reorder asks no question.
         let report = preflight(&set(vec![retype(false, &[])]));
@@ -5857,6 +6096,8 @@ mod tests {
             step: pbps_model::EnumRebuildStep::Swap {
                 definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
                 comment: None,
+                depth: 0,
+                over: None,
             },
         };
         let report = preflight(&set(vec![create]));
@@ -7082,7 +7323,9 @@ mod tests {
                 column: t.column(column),
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
-                removed: vec!["sad".to_owned()],
+                values: Box::new(pbps_model::ValueChange::Relabel {
+                    removed: vec!["sad".to_owned()],
+                }),
             },
         };
 
@@ -7154,7 +7397,9 @@ mod tests {
                 column: t.column("m"),
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
-                removed: vec!["sad".to_owned()],
+                values: Box::new(pbps_model::ValueChange::Relabel {
+                    removed: vec!["sad".to_owned()],
+                }),
             },
         };
         let probed =

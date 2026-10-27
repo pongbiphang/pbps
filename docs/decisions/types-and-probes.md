@@ -3497,7 +3497,7 @@ domain's rename, the label's rename and the default in one plan),
 `a_tightening_over_a_violating_row_rolls_the_apply_back_and_keeps_the_old_check`,
 `a_check_calling_a_project_function_is_vetted_before_it_runs_and_leaves_nothing`
 (the pinned negative: emitted as a plain `ADD CONSTRAINT`, it fails because the
-function ran), `a_tightening_is_refused_by_name_while_an_array_or_composite_of_the_domain_is_a_column`,
+function ran), `a_tightening_is_rebuilt_for_an_array_of_the_domain_and_refused_for_a_composite`,
 `a_staged_domain_tightening_is_one_step_and_a_resume_accepts_it` and
 `a_loosening_comes_before_the_columns_the_plan_adds_and_a_tightening_after` pin
 it on 16 and 18, with unit tests for the delta, the emitter, the sort, the
@@ -3666,3 +3666,201 @@ and 18, `a_lookup_table_over_enums_converges_updates_and_deletes_its_rows`,
 `a_rebuilt_enum_keeps_the_rows_over_it_and_a_removed_label_a_row_holds_is_refused`,
 with `every_other_reference_keeps_the_data_refusal_beside_a_declared_enum`
 for the refusals.
+
+<a id="dec-1635-9"></a>
+
+**DEC-1635.9. Slice 4b rebuilds a declared domain under its uid, with the enum rebuild's mechanism.**
+PostgreSQL has no `ALTER DOMAIN … SET DATA TYPE` or `COLLATE`, cannot repoint a
+domain at another type, and refuses a new check or NOT NULL in place while an
+array of the domain is a column. The keep-uid rebuild of DEC-1635.7 is
+generalised, not repeated: `Change::EnumRebuild` carries a domain's definition
+as it carries an enum's, with the same three steps (`Create`, a `Retype` per
+dependent column, `Swap`), the same temporary-name chooser, the same
+`type-rebuild` class, the same dependent drop and restore and the same module
+rebuild. A domain is rebuilt when one of four things holds, and the plan says
+which in the `Create` line (`Create.why`):
+
+- **Its base type changed.** Each column moves with a plain `ALTER COLUMN … TYPE
+  <replacement>`, no `USING`, on the engine's own assignment cast, exactly when
+  `change_risk(old base, new base)` is not `Incompatible` and both bases are
+  built-in. Any other base change is refused by name, pointing at #2331
+  (ADR-0012 Amendment 6). A base change that narrows carries `Narrowing`
+  beside `type-rebuild`, and the plan counts the rows that do not fit with the
+  existing `cannot_become` probe, per column (an array's elements are reported
+  unchecked). The new domain's checks are not probed at plan time (DEC-1635.4);
+  a row appearing between plan and apply, or failing the checks, rolls the whole
+  apply back with the old domain standing. Plan format 56.
+- **Its collation changed.** The same, with no narrowing pair.
+- **The enum or domain it is built on is rebuilt**, transitively, in base-depth
+  order (`Why::Derived`). The replacement is created over the base's
+  replacement (`Create.over`, `Swap.over`) and each column moves with 3b's
+  `::text::<replacement>` (arrays `::text[]::<replacement>[]`); rows holding a
+  label the base drops are counted by 3b's probe through the domain's columns.
+  The swaps run deepest first, so the old base is dropped last. A domain created
+  in the same plan over a type the plan rebuilds is refused (it would hold the
+  type the swap drops); 3b's refusal of a declared domain over a rebuilt enum is
+  removed.
+- **A check or NOT NULL is added while an array of the domain is a column**
+  (`Hints.domain_array_holders`, read from the catalog at plan time), which
+  slice 4a refused. The replacement is created from the final declaration, so
+  moving the columns validates the arrays. A composite attribute of the domain
+  stays refused.
+
+Issue #2461 replaces the rebuild's independent value judgement with
+`ValueChange`: `Cast` carries the old and new leaf types, every array level
+through the domain chain and column, and any stated conversion; `Relabel`
+carries the removed labels of a replaced enum. `Retype.values` replaces
+`conversion`, `base_change`, `value_arrays` and `removed` in unreleased plan
+format 56. The dialect's shared verdict supplies admission, risk and probe
+material to both column retypes and rebuilds, composing the existing rules.
+A root base change that needs a stated conversion now refuses with #2331,
+including gaining or losing the session time zone and narrowing an array's
+elements. Derived domains inherit the root's value change; `Cast` uses
+assignment and `Relabel` goes through text. Bounded-string probes use the
+assignment refusal predicate too, so an explicit cast's truncation cannot
+hide a row the assignment refuses. Label probes derive their array levels
+from the rebuild's carried type definitions. Existing derived array links
+retain their unchecked element report; the new refusal is at the root's
+admission. Scalar/array crossings retain the column's full-type path because
+a leaf pair with one common array count cannot describe different shapes.
+The measured rewrite estimate stays separate: it also needs the column's
+nullability, table layout and indexes, while a rebuild always rewrites its
+holders under ACCESS EXCLUSIVE (ADR-0012).
+
+**The conversion rule, measured on PG 16.15 and 18.6, identical on both.** A
+castable retype to a text-based domain leaves the indexes (btree, expression,
+unique), the primary key, extended statistics, the table `CHECK` (re-deparsed as
+`((v)::text <> 'zz'::text)`), a castable column `DEFAULT`, a foreign key
+between two columns converted in the same plan, an array column and a
+partitioned table's non-key column working with no manual step. A retype to a
+domain over integer has no assignment cast (`column "v" cannot be cast
+automatically to type d_int`) and is refused before it is tried. A `varchar(20)`
+value of 16 characters into `varchar(10)` fails with `value too long`. A
+generated column, a view, an `UPDATE OF` trigger, a partition key, a function
+signature, a domain over the domain and a composite attribute each block, with
+the messages in the design. The replacement carries no ACL and no comment.
+
+**Dependents.** For an `Assign` retype nothing is dropped and restored; the
+`Text` retype of a derived rebuild drops and restores checks, filtered indexes
+and foreign keys by the dialect's rebuild policy, as 3b does. Views and bodies
+come down and go back through the module rebuild. The retained set is read from
+the catalog at plan time (`type_rebuild::census`) and again before the first
+statement: a dependent the plan cannot restore is refused by name, never
+`CASCADE`d. The census skips the domains the plan itself rebuilds, and a check
+that stands on one of them, which go with it.
+
+**Decision 4, for domains and enums alike.** The comment is read before the
+rebuild and set on the replacement. A non-default owner or privilege list on
+the old type is refused by name. Nothing needed to change for the enum rebuild:
+3b's census already refused both.
+
+**Limits recorded.** A domain check with an explicit cast to a rebuilt enum
+binds the old enum and blocks `DROP TYPE` at apply, which rolls back loudly. A
+domain renamed in the same plan as its rebuild is refused. Every table that
+holds the domain is rewritten under `ACCESS EXCLUSIVE`, even for `varchar(20)`
+to `text`; the plan names the tables.
+
+Tests: `a_domains_base_or_collation_change_is_rebuilt_under_its_uid_with_its_columns_converted`
+(table, array, partitioned table, index, table check; `text`, `varchar(30)` and
+`"C"`), `a_narrowed_domain_base_reports_the_rows_that_do_not_fit_and_rolls_back_a_late_one`,
+`a_base_the_engine_cannot_convert_is_refused_by_name_and_points_at_the_author_stated_conversion`,
+`an_enum_rebuild_rebuilds_the_domains_over_it_in_depth_order_and_says_why`,
+`a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql`,
+`a_domain_rebuild_carries_the_comment_to_the_replacement`,
+`a_tightening_is_rebuilt_for_an_array_of_the_domain_and_refused_for_a_composite`
+`a_domain_beside_an_enum_partition_key_is_tightened_or_rebuilt_like_any_other_holder`,
+`a_chain_of_eleven_domains_over_a_rebuilt_enum_is_swapped_deepest_first` and
+`a_domain_renamed_in_the_plan_that_rebuilds_it_is_refused_by_name_before_any_sql`
+on 16 and 18, with unit tests in the model, differ, emitter, preflight, census
+and report.
+
+Round 1 of the PR. The swaps sort by `Swap.depth` reversed at a fixed width
+(`usize::MAX - depth`, twenty digits), not by a one-digit complement that gave
+every depth past nine the same value and left the order to the names; the
+create order (`Create.ordinal`) and the drop order (`DropType` rank) are plain
+integers and never had a cap. The planning passes over a chain are bounded by
+the number of domains, not by 64, and a domain whose base could not be ordered
+is reported instead of dropped. A domain renamed in the plan that rebuilds it is
+refused by name (the rename guard compares the desired name, as the enum's
+does), also when it is rebuilt only because its base is: rename it in one plan,
+then change it in the next.
+
+Round 2 of the PR. A domain rebuilt because the one it is built on is rebuilt
+(`Why::Derived`) undergoes the change of its root's base, through every level
+between, so its columns carry the same old and new base type
+(`Replaced.effective` is inherited down the chain). The narrowing risk and the
+`cannot_become` probe then see a column that only holds the derived domain,
+exactly as for the root's own columns; the conversion stays `::text::<tmp>`.
+A derived domain over a base the engine cannot convert is refused with the root
+(#2331): the root is never planned, so nothing under it is. A collation change
+carries no base pair on either path, as before.
+`a_column_of_a_domain_built_on_a_narrowed_one_is_counted_and_needs_the_narrowing_allow`
+pins it on 16 and 18.
+
+Round 3 of the PR: one rule for both gaps. The base change a column undergoes
+is derived from the chain under its type, not from why the type is rebuilt: a
+domain takes its own base's pair if its base changed, else the pair it
+inherits from the type it is built on, whatever its reason (a collation change
+and an array fallback as much as the plain derivation). A link that is an
+array of the type below it makes the pair one of arrays
+(`varchar(20)[]` to `varchar(10)[]`), through any number of links; the dialect
+keeps the element's risk, and preflight reports such a column's elements
+unchecked, by the mechanism a direct array column already has, instead of
+length-checking the array's text as a scalar. How the values reach the replacement
+is the root's, see round 6. An enum below carries no pair.
+`a_domain_over_an_array_of_a_narrowed_one_is_not_length_checked_as_a_scalar` and
+`a_derived_collation_change_over_a_narrowed_root_still_counts_the_rows_that_do_not_fit`
+pin it on 16 and 18.
+
+Round 4 of the PR. A replacement domain over a type the plan does not rebuild
+was created at operation ordinal 0, tied with the enum's first label statement
+and ordered by name, so a default naming a renamed label could run before the
+rename. It now takes the ordinal 3b's enum `Create` takes, the count of the
+label operations of the enum it uses, directly or through the domains between
+(rebuilt or not), so it follows every rename and addition; one over a rebuilt
+type keeps its place after that type's creation. The effects say the same: a
+domain's `Create` requires the type it is built on in its final incarnation,
+unless it is created over a replacement. The same-plan new-label check now
+reads a rebuilt domain's `Create` as it reads a new domain's, since a default
+or check naming a label added in the same transaction is refused by the
+engine. The domain's `Retype`, `Swap` and the restored defaults and checks are
+classes 9 and 13, after the label statements of class 7.
+`an_array_held_domain_rebuilt_beside_a_label_rename_is_created_after_it` pins it
+on 16 and 18.
+
+Round 5 of the PR. Whether a column's stored values are arrays is asked in one
+place: `TypeResolver::values_shape` reads a column's type down every domain to
+its leaf and returns the leaf (enum, built-in, or another type) and the levels
+of array on the way, the column's own `[]` and each domain built on an array
+included. The rebuild's `Retype` carries it as `value_arrays` (plan format 56,
+omitted when zero), separate from `array`, which stays whether the target type
+is spelled with `[]`. The label probe unnests once per level, so a column of a
+domain over `e[]` is counted by its elements and not by the array's text; the
+narrowing probe reports such a column's elements unchecked by the same field.
+The base-change pair is of the element types always, replacing round 3's
+array-typed pair. Other readers: the new-label use check asks only whether a
+type reaches an enum, which is shape-free; the census reads the catalog for
+the type and its array; the data-row checks and the label-rename forwarding
+act on columns of the enum itself, and a column of a domain is refused rows
+(the enum rows of #2346). A column of an array of a domain over `e[]` is an array of arrays
+in the engine (two levels) and is counted level by level.
+`a_column_of_a_domain_over_an_array_of_a_rebuilt_enum_is_counted_by_its_elements`
+pins it on 16 and 18.
+
+Round 6 of the PR. How a value reaches the replacement is a fact about the
+chain under the column's type, found by the same walk that gives the base pair
+(`Replaced.carried`: the conversion and the change, inherited from the root
+through every collation, array or derived link), not a test on why the type is
+rebuilt. An enum root has no cast to its replacement, so every domain built on
+it moves its values through text. A built-in root, a changed base or only a
+collation, is carried by the engine's assignment cast, which the columns of a
+domain built on it take as well. Measured on 16 and 18, identical: over
+`d2 AS d AS numeric(10,2)` a column with `1.00`, `ALTER COLUMN … TYPE <d2 over
+integer>` with no `USING` gives `1` (`1.50` gives `2`, as the root's own column
+does), `USING v::<d2>` also works, and `USING v::text::<d2>` fails with `invalid
+input syntax for type integer: "1.00"`; the same through `d3 AS d[]`
+(`{1.00,2.00}` becomes `{1,2}`). Round 3's rule, text for every domain with a
+rebuilt type under it, failed that valid plan at apply; the probe could not see
+it, since it checks only the rounded range.
+`a_domain_built_on_a_narrowed_numeric_converts_by_the_assignment_cast_not_through_text`
+pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.
