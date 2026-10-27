@@ -89,6 +89,19 @@ fn run(n: char) -> String {
     n.to_string().repeat(32)
 }
 
+/// Whether the run's lock can be taken, allowing for a `docker` or `git` child
+/// that another test's thread forked while the lock was held: a lock belongs to
+/// the open file, so it is held until that child execs (a few milliseconds).
+fn released(dir: &StateDir, run_id: &str) -> bool {
+    (0..500).any(|_| {
+        let free = dir.try_lock_existing(run_id).unwrap().is_some();
+        if !free {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        free
+    })
+}
+
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(60)
 }
@@ -377,7 +390,7 @@ mod records {
         assert!(d.dir.lock(&run('a')).is_err(), "a run id is never reused");
         assert!(d.dir.try_lock_existing(&run('a')).unwrap().is_none());
         drop(held);
-        assert!(d.dir.try_lock_existing(&run('a')).unwrap().is_some());
+        assert!(released(&d.dir, &run('a')));
     }
 
     /// A recovery that finds the lock by name never finds one it can take while
@@ -409,7 +422,7 @@ mod records {
                 assert_eq!(spy.join().unwrap(), 0, "a recovery took a live run's lock");
                 drop(held.expect("the lock is made"));
             });
-            assert!(d.dir.try_lock_existing(&id).unwrap().is_some());
+            assert!(released(&d.dir, &id));
         }
     }
 
@@ -868,6 +881,7 @@ mod recovery {
     async fn a_lock_with_no_record_is_nothing_to_confirm() {
         let d = Dir::new();
         drop(d.dir.lock(&run('a')).unwrap());
+        assert!(released(&d.dir, &run('a')));
         let done = reconciled(&d, &Fake::default()).await;
         assert_eq!(done.removed, vec![run('a')]);
         assert!(d.dir.runs().unwrap().is_empty());
