@@ -2608,10 +2608,7 @@ fn a_rebuilds_moved_column_is_held_to_its_final_type_at_the_closing_read() {
             column: name.column("m"),
             to: "app.mood".parse().unwrap(),
             array: false,
-            removed: vec![],
-            base_change: None,
-            conversion: Default::default(),
-            value_arrays: 0,
+            values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
         },
     }]);
     let mut ids = pbps_model::IdsFile::default();

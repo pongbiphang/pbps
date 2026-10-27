@@ -1554,6 +1554,87 @@ impl Dialect for Postgres {
             || types::depends_on_the_session_time_zone(&from, &to)
     }
 
+    fn value_change(
+        &self,
+        values: &pbps_model::ValueChange,
+        value: &str,
+    ) -> pbps_dialect::ValueChangeVerdict {
+        use pbps_dialect::{ConversionRequired, ValueChangeVerdict, ValueProbe};
+        let pbps_model::ValueChange::Cast {
+            from,
+            to,
+            arrays,
+            using,
+        } = values
+        else {
+            return ValueChangeVerdict {
+                needs_using: None,
+                risk: TypeChangeRisk::Safe,
+                probe: ValueProbe::None,
+            };
+        };
+        let shape = |ty: &ColumnType| {
+            if *arrays > 0 {
+                ty.clone().into_array()
+            } else {
+                ty.clone()
+            }
+        };
+        let (from, to) = (shape(from), shape(to));
+        let risk = self.type_change_risk(&from, &to);
+        // Preserve the column emitter's precedence as well as its rules. The
+        // existing needs-using hook remains the admission predicate; these
+        // reasons only select the existing diagnostic.
+        let needs_using =
+            (using.is_none() && self.type_change_needs_using(&from, &to)).then(|| {
+                if *arrays > 0 && risk != TypeChangeRisk::Safe {
+                    ConversionRequired::ArrayElements
+                } else if risk == TypeChangeRisk::Incompatible {
+                    ConversionRequired::Incompatible
+                } else {
+                    ConversionRequired::SessionTimeZone
+                }
+            });
+        let probe = if let Some(expression) = using {
+            match types::normalize(&to) {
+                Ok(target) => ValueProbe::Using {
+                    assignment_refuses: types::assignment_refuses(
+                        &target,
+                        &format!("({expression})"),
+                    ),
+                    target,
+                    expression: expression.clone(),
+                },
+                Err(_) => {
+                    ValueProbe::Unchecked("the conversion's target type cannot be normalized")
+                }
+            }
+        } else {
+            match (types::normalize(&from), types::normalize(&to)) {
+                (Ok(from), Ok(to)) => {
+                    // The assignment predicate is also needed for rebuilds:
+                    // an explicit bounded-string cast can silently truncate.
+                    let fails = if risk == TypeChangeRisk::Narrowing {
+                        types::assignment_refuses(&to, value)
+                            .or_else(|| types::cannot_become(&from, &to, value))
+                    } else {
+                        types::cannot_become(&from, &to, value)
+                    };
+                    match fails {
+                        Some(fails) => ValueProbe::Predicate { target: to, fails },
+                        None => ValueProbe::None,
+                    }
+                }
+                _ => ValueProbe::Unchecked("the conversion types cannot be normalized"),
+            }
+        };
+        ValueChangeVerdict {
+            needs_using,
+            risk,
+            probe,
+        }
+    }
+
     fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         // Normalized again here, as the SQL Server dialect does and for the
         // same reason: the trait says the caller normalizes first, but a
@@ -8531,10 +8612,10 @@ mod enum_rebuild_dependents_tests {
     /// carry only the rebuild's (DEC-1635.9).
     #[test]
     fn a_domain_rebuilds_retype_carries_the_narrowing_risk_of_its_base_change() {
-        use pbps_model::{Change, EnumRebuildStep, RetypeConversion, RiskClass};
+        use pbps_model::{Change, EnumRebuildStep, RiskClass};
         let pg = Postgres::new();
         let ty = |text: &str| pg.normalize_type(&text.parse().unwrap()).unwrap();
-        let retype_with = |base_change, conversion| Change::EnumRebuild {
+        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| Change::EnumRebuild {
             uid: "y_000002".parse().unwrap(),
             name: "app.d".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -8543,13 +8624,17 @@ mod enum_rebuild_dependents_tests {
                 column: pbps_model::TableName::new("app", "t").column("v"),
                 to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
                 array: false,
-                removed: vec![],
-                base_change,
-                conversion,
-                value_arrays: 0,
+                values: Box::new(match base_change {
+                    Some(pair) => pbps_model::ValueChange::Cast {
+                        from: pair.0,
+                        to: pair.1,
+                        arrays: 0,
+                        using: None,
+                    },
+                    None => pbps_model::ValueChange::Relabel { removed: vec![] },
+                }),
             },
         };
-        let retype = |base_change| retype_with(base_change, RetypeConversion::Assign);
         let risks = |change| pg.change_risks(&change);
         assert_eq!(
             risks(retype(Some(Box::new((
@@ -8563,9 +8648,9 @@ mod enum_rebuild_dependents_tests {
             [RiskClass::TypeRebuild].into()
         );
         assert_eq!(risks(retype(None)), [RiskClass::TypeRebuild].into());
-        // A domain built on a rebuilt one moves its columns through text and
+        // A domain built on a rebuilt one inherits the same cast and
         // undergoes its root's change all the same (DEC-1635.9).
-        let derived = |pair| retype_with(pair, RetypeConversion::Text);
+        let derived = retype;
         assert_eq!(
             risks(derived(Some(Box::new((
                 ty("varchar(20)"),
@@ -8596,3 +8681,6 @@ mod enum_rebuild_dependents_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod value_change_tests;

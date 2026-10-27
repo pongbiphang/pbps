@@ -3706,6 +3706,27 @@ which in the `Create` line (`Create.why`):
   moving the columns validates the arrays. A composite attribute of the domain
   stays refused.
 
+Issue #2461 replaces the rebuild's independent value judgement with
+`ValueChange`: `Cast` carries the old and new leaf types, every array level
+through the domain chain and column, and any stated conversion; `Relabel`
+carries the removed labels of a replaced enum. `Retype.values` replaces
+`conversion`, `base_change`, `value_arrays` and `removed` in unreleased plan
+format 56. The dialect's shared verdict supplies admission, risk and probe
+material to both column retypes and rebuilds, composing the existing rules.
+A root base change that needs a stated conversion now refuses with #2331,
+including gaining or losing the session time zone and narrowing an array's
+elements. Derived domains inherit the root's value change; `Cast` uses
+assignment and `Relabel` goes through text. Bounded-string probes use the
+assignment refusal predicate too, so an explicit cast's truncation cannot
+hide a row the assignment refuses. Label probes derive their array levels
+from the rebuild's carried type definitions. Existing derived array links
+retain their unchecked element report; the new refusal is at the root's
+admission. Scalar/array crossings retain the column's full-type path because
+a leaf pair with one common array count cannot describe different shapes.
+The measured rewrite estimate stays separate: it also needs the column's
+nullability, table layout and indexes, while a rebuild always rewrites its
+holders under ACCESS EXCLUSIVE (ADR-0012).
+
 **The conversion rule, measured on PG 16.15 and 18.6, identical on both.** A
 castable retype to a text-based domain leaves the indexes (btree, expression,
 unique), the primary key, extended statistics, the table `CHECK` (re-deparsed as

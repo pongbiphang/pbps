@@ -2150,7 +2150,10 @@ pub(crate) fn diff_partial_rebuilding(
             if let Change::AlterColumnType {
                 column, from, to, ..
             } = &p.change
-                && dialect.type_change_risk(from, to) != pbps_dialect::TypeChangeRisk::Safe
+                && p.change.value_change().map_or_else(
+                    || dialect.type_change_risk(from, to),
+                    |values| dialect.value_change(&values, "").risk,
+                ) != pbps_dialect::TypeChangeRisk::Safe
             {
                 Some(column)
             } else {
@@ -2895,7 +2898,10 @@ fn diff_columns(
                         column: declared_ref.clone(),
                     });
                 }
-            } else if dialect.type_change_needs_using(&from_ty, &to_ty) {
+            } else if pbps_model::ValueChange::cast(&from_ty, &to_ty, None).map_or_else(
+                || dialect.type_change_needs_using(&from_ty, &to_ty),
+                |values| dialect.value_change(&values, "").needs_using.is_some(),
+            ) {
                 errs.push(DiffError::ConversionFromMismatch {
                     column: declared_ref.clone(),
                     recorded: record.from.clone(),
@@ -3714,16 +3720,13 @@ fn recreate_retyped_dependents(
         // keeps them (measured on 16 and 18, DEC-1635.9), so nothing comes
         // down for it.
         Change::EnumRebuild {
-            step:
-                pbps_model::EnumRebuildStep::Retype {
-                    column, conversion, ..
-                },
+            step: pbps_model::EnumRebuildStep::Retype { column, values, .. },
             ..
         } => Some((
             column.clone(),
-            match conversion {
-                pbps_model::RetypeConversion::Text => dialect.enum_rebuild_dependents(),
-                pbps_model::RetypeConversion::Assign => Default::default(),
+            match values.as_ref() {
+                pbps_model::ValueChange::Relabel { .. } => dialect.enum_rebuild_dependents(),
+                pbps_model::ValueChange::Cast { .. } => Default::default(),
             },
         )),
         Change::CreateTable { .. }

@@ -8270,3 +8270,162 @@ fn a_domain_built_on_a_narrowed_numeric_converts_by_the_assignment_cast_not_thro
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_time_zone_change_and_its_derived_domains_need_a_stated_conversion() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        for (from, to) in [("timestamp", "timestamptz"), ("timestamptz", "timestamp")] {
+            for derived in [false, true] {
+                let sql = format!(
+                    "CREATE SCHEMA app; CREATE DOMAIN app.d AS {from}; \
+                    CREATE DOMAIN app.d2 AS app.d; CREATE TABLE app.t (v {}); \
+                    INSERT INTO app.t VALUES ('2026-01-02 12:00:00');",
+                    if derived { "app.d2" } else { "app.d" }
+                );
+                let (own, d) = adopted(&server, "domain_zone2461", &sql);
+                std::fs::write(
+                    d.dir.join("schema/app.d.type.yml"),
+                    format!("domain: app.d\ntype: {to}\n"),
+                )
+                .unwrap();
+                let path = d.dir.join("zone.plan.json");
+                let out = d.run(&[
+                    "plan",
+                    "--db",
+                    own.connection(),
+                    "--out",
+                    path.to_str().unwrap(),
+                ]);
+                assert_ne!(code(&out), 0, "{from} -> {to}, derived={derived}");
+                let said = format!("{}{}", stdout(&out), stderr(&out));
+                assert!(said.contains("app.d") && said.contains("#2331"), "{said}");
+                assert!(!path.exists());
+                assert_eq!(
+                    scalar(
+                        own.connection(),
+                        "SELECT count(*) FROM pg_type WHERE typname LIKE 'pbps_rebuild%'"
+                    ),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_with_an_array_base_refuses_narrowing_like_a_direct_array_column() {
+    use pbps_dialect::Dialect;
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS varchar(20)[]; \
+            CREATE DOMAIN app.d2 AS app.d; CREATE TABLE app.t (v app.d2); \
+            INSERT INTO app.t VALUES (ARRAY['fits']);";
+        let (own, d) = adopted(&server, "domain_array2461", sql);
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(10)[]\n",
+        )
+        .unwrap();
+        let path = d.dir.join("array.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+        ]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(said.contains("app.d") && said.contains("#2331"), "{said}");
+        assert!(!path.exists());
+        let pg = pbps_pg::Postgres::new();
+        let direct = pbps_model::ValueChange::cast(
+            &"varchar(20)[]".parse().unwrap(),
+            &"varchar(10)[]".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(pg.value_change(&direct, "v").needs_using.is_some());
+        // A widening of the same domain remains a valid rebuild.
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(30)[]\n",
+        )
+        .unwrap();
+        label_plan(&d, own.connection(), &path);
+        succeeds(apply_allowing(
+            &d,
+            own.connection(),
+            &path,
+            &["type-rebuild"],
+        ));
+        assert_eq!(
+            text_of(own.connection(), "SELECT v::text FROM app.t"),
+            "{fits}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_bounded_string_change_counts_assignment_refusals_before_rebuilding() {
+    for server in [
+        server(),
+        std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    ] {
+        let sql = "CREATE SCHEMA app; CREATE DOMAIN app.d AS xml; CREATE DOMAIN app.d2 AS app.d; \
+            CREATE TABLE app.t (id integer PRIMARY KEY, v app.d2); \
+            INSERT INTO app.t VALUES (1, '<a>long value</a>'), (2, '<a/>'), (3, NULL);";
+        let (own, d) = adopted(&server, "domain_string2461", sql);
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.d.type.yml"),
+            "domain: app.d\ntype: varchar(10)\n",
+        )
+        .unwrap();
+        let path = d.dir.join("string.plan.json");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            said.contains("app.t.v") && said.contains("cannot become character varying(10)"),
+            "{said}"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*) FROM app.t WHERE v IS NOT NULL AND length(rtrim(v::text, ' ')) > 10"
+            ),
+            1
+        );
+        on_server(db, "UPDATE app.t SET v = '<b/>' WHERE id = 1");
+        let plan = label_plan(&d, db, &path);
+        assert!(
+            plan.changes
+                .changes
+                .iter()
+                .any(|p| p.risks.contains(&pbps_model::RiskClass::Narrowing))
+        );
+        succeeds(apply_allowing(
+            &d,
+            db,
+            &path,
+            &["type-rebuild", "narrowing"],
+        ));
+        assert_eq!(
+            text_of(db, "SELECT v::text FROM app.t WHERE id = 1"),
+            "<b/>"
+        );
+        assert_eq!(scalar(db, "SELECT count(*) FROM app.t WHERE v IS NULL"), 1);
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+}

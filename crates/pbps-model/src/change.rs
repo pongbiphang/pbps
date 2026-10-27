@@ -3582,10 +3582,7 @@ mod tests {
                 column: column.clone(),
                 to: ty(to),
                 array: false,
-                removed: vec![],
-                base_change: None,
-                conversion: Default::default(),
-                value_arrays: 0,
+                values: Box::new(crate::ValueChange::Relabel { removed: vec![] }),
             },
         }
     }

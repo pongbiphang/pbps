@@ -373,10 +373,7 @@ fn an_enum_rebuilds_retype_step_is_an_event_of_its_column_and_no_other_step_is()
             column: table("a").column("m"),
             to: ColumnType::reference("app.e".parse().unwrap()),
             array: false,
-            removed: vec![],
-            base_change: None,
-            conversion: Default::default(),
-            value_arrays: 0,
+            values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
         }),
         step(pbps_model::EnumRebuildStep::Swap {
             definition,

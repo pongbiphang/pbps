@@ -615,14 +615,19 @@ transformation §5 asks for.
 A same-uid domain rebuild (DEC-1635.9) moves each column to the replacement
 with a plain `ALTER COLUMN c TYPE <replacement>`. For a base or collation
 change that is the engine's own assignment cast, so pbps writes no expression
-and §5 is untouched: it is used exactly when `change_risk(old base, new base)`
-is not `Incompatible`, and an `Incompatible` pair is refused by name with a
+and §5 is untouched: it is used exactly when the shared `ValueChange` verdict
+admits the root's leaf pair and array shape without a stated conversion
+(#2461). An incompatible pair, a conversion that gains or loses the session
+time zone, and a non-safe array element change are refused by name with a
 pointer to the conversion the author states (#2331). The one `USING` of
 Amendment 5, `c::text::<replacement>` (arrays `c::text[]::<replacement>[]`),
-extends to a domain whose base is a rebuilt enum or domain, for the same
-reason: the declarations fix a pure mapping and no value changes. A narrower
+extends through domains built on a rebuilt enum (`ValueChange::Relabel`),
+for the same reason: the declarations fix a pure mapping and no value changes.
+A domain built on a rebuilt built-in base inherits `ValueChange::Cast` and
+uses assignment through every derived link. A narrower
 base carries the `Narrowing` class beside `type-rebuild`, and the rows that
-do not fit are counted by the existing built-in probe; the new domain's checks
+do not fit are counted by the same built-in and bounded-string assignment
+probe material as a column retype; the new domain's checks
 are not probed at plan time, as for any non-built-in code (DEC-1635.4).
 
 ## Placement

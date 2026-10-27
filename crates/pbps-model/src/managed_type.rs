@@ -243,25 +243,8 @@ pub enum EnumRebuildStep {
         /// otherwise leave the column as that session made it.
         to: crate::ColumnType,
         array: bool,
-        /// The labels the rebuild removes, as stored now: the cast refuses a
-        /// row holding one, and the plan-time probe counts them.
-        removed: Vec<String>,
-        /// How the stored value reaches the replacement. `Text` is a pure
-        /// mapping by name; `Assign` rides the engine's assignment cast, which
-        /// a domain's base change uses when the types are compatible.
-        #[serde(default, skip_serializing_if = "RetypeConversion::is_text")]
-        conversion: RetypeConversion,
-        /// A domain's base type before and after, when the conversion can
-        /// narrow it: the plan-time probe reports the rows that do not fit.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base_change: Option<Box<(crate::ColumnType, crate::ColumnType)>>,
-        /// How many levels of array the stored values have, through every
-        /// domain between the column's type and its leaf type and the
-        /// column's own `[]` (DEC-1635.9): what a value check must unnest. It
-        /// is not `array`, which is only whether the target type is spelled
-        /// with `[]`. Zero for a scalar.
-        #[serde(default, skip_serializing_if = "is_zero")]
-        value_arrays: usize,
+        /// The single judgement input shared with a direct column retype.
+        values: Box<crate::ValueChange>,
     },
     /// `DROP TYPE <name>; ALTER TYPE <tmp> RENAME TO <name>` (`DOMAIN` for a
     /// domain), then the carried `COMMENT ON`. The uid never changes.
@@ -282,24 +265,6 @@ pub enum EnumRebuildStep {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
-}
-
-/// How a rebuild converts a column's stored values to the replacement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetypeConversion {
-    /// `USING col::text::<tmp>`: each label or value maps by name.
-    #[default]
-    Text,
-    /// No `USING`: the engine's assignment cast, exactly when the old and new
-    /// base types are compatible (ADR-0012 §5).
-    Assign,
-}
-
-impl RetypeConversion {
-    fn is_text(&self) -> bool {
-        matches!(self, RetypeConversion::Text)
-    }
 }
 
 #[cfg(test)]
@@ -518,10 +483,9 @@ mod rebuild_tests {
                 },
                 to: crate::ColumnType::reference("app.e".parse().unwrap()),
                 array: true,
-                removed: vec!["gone".into()],
-                base_change: None,
-                conversion: Default::default(),
-                value_arrays: 0,
+                values: Box::new(crate::ValueChange::Relabel {
+                    removed: vec!["gone".into()],
+                }),
             }),
             step(EnumRebuildStep::Swap {
                 definition,
@@ -565,46 +529,48 @@ mod rebuild_tests {
         assert_eq!(retype.subject(), "app.e");
     }
 
-    /// A domain's rebuild adds a conversion, the base pair for the narrowing
-    /// probe and the base's replacement; each is omitted when it is the
-    /// default, so an enum's step reads as it always did (DEC-1635.9).
+    /// Plan format 56 carries one required value change, with no legacy fields.
     #[test]
-    fn a_domains_rebuild_fields_round_trip_and_are_omitted_when_default() {
+    fn rebuild_value_changes_round_trip_and_reject_legacy_fields() {
         let [_, retype, swap] = steps();
         let text = serde_json::to_string(&retype).unwrap();
-        assert!(
-            !text.contains("conversion")
-                && !text.contains("base_change")
-                && !text.contains("value_arrays"),
-            "{text}"
-        );
+        assert!(text.contains("\"values\":{\"relabel\""), "{text}");
+        for field in ["conversion", "base_change", "value_arrays"] {
+            assert!(!text.contains(field), "{text}");
+        }
         let mut domain = retype.clone();
         if let Change::EnumRebuild {
-            step:
-                EnumRebuildStep::Retype {
-                    conversion,
-                    base_change,
-                    value_arrays,
-                    ..
-                },
+            step: EnumRebuildStep::Retype { values, .. },
             ..
         } = &mut domain
         {
-            *value_arrays = 2;
-            *conversion = crate::RetypeConversion::Assign;
-            *base_change = Some(Box::new((
-                "varchar(20)".parse().unwrap(),
-                "varchar(10)".parse().unwrap(),
-            )));
+            **values = crate::ValueChange::Cast {
+                from: "varchar(20)".parse().unwrap(),
+                to: "varchar(10)".parse().unwrap(),
+                arrays: 2,
+                using: None,
+            };
         }
         let text = serde_json::to_string(&domain).unwrap();
         assert!(
-            text.contains("\"conversion\":\"assign\"")
-                && text.contains("base_change")
-                && text.contains("\"value_arrays\":2"),
+            text.contains("\"cast\"") && text.contains("\"arrays\":2"),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<Change>(&text).unwrap(), domain);
+        // This is the unreleased v56 shape: missing judgement and legacy
+        // independent fields must not silently default to different semantics.
+        let mut missing = serde_json::to_value(&domain).unwrap();
+        missing["step"].as_object_mut().unwrap().remove("values");
+        assert!(serde_json::from_value::<Change>(missing).is_err());
+        for field in ["conversion", "base_change", "value_arrays", "removed"] {
+            let mut legacy = serde_json::to_value(&domain).unwrap();
+            legacy["step"]
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), serde_json::Value::Null);
+            assert!(serde_json::from_value::<Change>(legacy).is_err(), "{field}");
+        }
+
         let mut over = swap.clone();
         if let Change::EnumRebuild {
             step: EnumRebuildStep::Swap { over, depth, .. },

@@ -168,11 +168,12 @@ pub(crate) fn changes(
                     definition: ManagedType::Enum {
                         values: wanted.clone(),
                     },
+                    values: pbps_model::ValueChange::Relabel {
+                        removed: removed.clone(),
+                    },
                     removed,
                     over: None,
                     why: None,
-                    conversion: pbps_model::RetypeConversion::Text,
-                    base_change: None,
                     ordinal,
                     depth: 0,
                 },
@@ -268,9 +269,7 @@ pub(crate) struct Replacement {
     pub over: Option<TypeRef>,
     /// Why it is rebuilt, for the plan's reader.
     pub why: Option<String>,
-    pub conversion: pbps_model::RetypeConversion,
-    /// A domain's base before and after, for the plan-time narrowing probe.
-    pub base_change: Option<(ColumnType, ColumnType)>,
+    pub values: pbps_model::ValueChange,
     /// After the label renames of the same uid, and after the replacement of
     /// the type this one is built on.
     pub ordinal: usize,
@@ -407,8 +406,7 @@ pub(crate) fn rebuild_type(
         removed,
         over,
         why,
-        conversion,
-        base_change,
+        values,
         ordinal,
         depth,
     } = replacement;
@@ -438,10 +436,17 @@ pub(crate) fn rebuild_type(
                 column,
                 array: to.is_array(),
                 to,
-                removed: removed.clone(),
-                conversion,
-                base_change: base_change.clone().map(Box::new),
-                value_arrays,
+                values: Box::new(match &values {
+                    pbps_model::ValueChange::Cast {
+                        from, to, using, ..
+                    } => pbps_model::ValueChange::Cast {
+                        from: from.clone(),
+                        to: to.clone(),
+                        arrays: value_arrays,
+                        using: using.clone(),
+                    },
+                    pbps_model::ValueChange::Relabel { .. } => values.clone(),
+                }),
             },
         }
     }));
@@ -3089,9 +3094,14 @@ mod rebuild_tests {
                 EnumRebuildStep::Retype {
                     column,
                     array,
-                    removed,
+                    values,
                     ..
-                } => (column.name.raw().to_owned(), *array, removed.clone()),
+                } => {
+                    let pbps_model::ValueChange::Relabel { removed } = values.as_ref() else {
+                        panic!("{values:?}");
+                    };
+                    (column.name.raw().to_owned(), *array, removed.clone())
+                }
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -3588,10 +3598,7 @@ mod rebuild_tests {
                 column: column.clone(),
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array: false,
-                removed: vec![],
-                base_change: None,
-                conversion: Default::default(),
-                value_arrays: 0,
+                values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
             },
         };
         let (mut base, mut desired) = (world(&["a"]), world(&["a"]));

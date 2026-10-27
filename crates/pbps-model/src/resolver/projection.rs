@@ -1077,10 +1077,9 @@ mod tests {
             column: TableName::new("app", "t").column("m"),
             to: crate::ColumnType::reference(mood()),
             array: false,
-            removed: Vec::new(),
-            base_change: None,
-            conversion: Default::default(),
-            value_arrays: 0,
+            values: Box::new(crate::ValueChange::Relabel {
+                removed: Vec::new(),
+            }),
         });
         assert!(!touches(&retype, &surface));
     }
@@ -1135,10 +1134,9 @@ mod tests {
             column: TableName::new("app", "t").column("m"),
             to: crate::ColumnType::reference(mood()),
             array: false,
-            removed: Vec::new(),
-            base_change: None,
-            conversion: Default::default(),
-            value_arrays: 0,
+            values: Box::new(crate::ValueChange::Relabel {
+                removed: Vec::new(),
+            }),
         });
         assert!(matches!(
             owner(&retype).0.as_slice(),

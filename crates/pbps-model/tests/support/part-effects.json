@@ -1439,9 +1439,13 @@
         "column": "app.t.n",
         "to": "app.e",
         "array": false,
-        "removed": [
-          "old"
-        ]
+        "values": {
+          "relabel": {
+            "removed": [
+              "old"
+            ]
+          }
+        }
       }
     }
   },

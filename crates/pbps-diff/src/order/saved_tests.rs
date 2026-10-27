@@ -238,10 +238,7 @@ fn an_edited_rebuild_cannot_point_its_swap_at_another_type() {
         column: "app.t.m".parse().unwrap(),
         to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
         array: false,
-        removed: vec![],
-        base_change: None,
-        conversion: Default::default(),
-        value_arrays: 0,
+        values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
     };
     let (ids, change) = rebuild_step("y_000001", "app.pbps_rebuild_y_000001", retype("c_aaaaaa"));
     assert!(super::saved::rebuild_is_well_formed(&ids, &change));

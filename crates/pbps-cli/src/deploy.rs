@@ -8006,8 +8006,11 @@ pub fn cmd_plan_db(
         if conn.driver() == pbps_db::Driver::Postgres
             && cs.changes().changes.iter().any(|p| {
                 matches!(&p.change, pbps_model::Change::EnumRebuild {
-                    step: pbps_model::EnumRebuildStep::Retype { removed, base_change, .. }, ..
-                } if !removed.is_empty() || base_change.is_some())
+                    step: pbps_model::EnumRebuildStep::Retype { values, .. }, ..
+                } if match values.as_ref() {
+                    pbps_model::ValueChange::Cast { from, to, .. } => from != to,
+                    pbps_model::ValueChange::Relabel { removed } => !removed.is_empty(),
+                })
             })
         {
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes().changes, &resolved.ids)?;
@@ -11239,10 +11242,9 @@ mod tests {
                 column: renamed.column("m"),
                 to: pbps_model::ColumnType::reference("app.mood".parse().unwrap()),
                 array: false,
-                removed: vec!["sad".to_owned()],
-                base_change: None,
-                conversion: Default::default(),
-                value_arrays: 0,
+                values: Box::new(pbps_model::ValueChange::Relabel {
+                    removed: vec!["sad".to_owned()],
+                }),
             },
         };
         let check = pbps_model::Change::AddCheck {
@@ -16243,10 +16245,7 @@ mod tests {
                             .column("m"),
                         to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                         array: false,
-                        removed: vec![],
-                        base_change: None,
-                        conversion: Default::default(),
-                        value_arrays: 0,
+                        values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
                     },
                 ),
                 step(

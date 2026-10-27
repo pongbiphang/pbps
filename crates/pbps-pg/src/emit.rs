@@ -393,10 +393,7 @@ mod declared_type_emission_tests {
                 column: table.column("m"),
                 to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
                 array,
-                removed: vec![],
-                base_change: None,
-                conversion: Default::default(),
-                value_arrays: 0,
+                values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
             }));
             assert_eq!(
                 moved[0].sql,
@@ -493,29 +490,44 @@ mod declared_type_emission_tests {
         let certified = create[0].declared_type.as_ref().expect("the vet");
         assert!(certified.altered && certified.name == tmp);
         let table = pbps_model::TableName::new("app", "t");
-        let retype = |array, conversion| {
+        let retype = |array, values| {
             sql(&step(Step::Retype {
                 column_uid: "c_aaaaaa".parse().unwrap(),
                 column: table.column("v"),
                 to: pbps_model::ColumnType::reference("app.d".parse().unwrap()),
                 array,
-                removed: vec![],
-                base_change: None,
-                conversion,
-                value_arrays: 0,
+                values: Box::new(values),
             }))
         };
         assert_eq!(
-            retype(false, pbps_model::RetypeConversion::Assign)[0].sql,
+            retype(
+                false,
+                pbps_model::ValueChange::cast(
+                    &"text".parse().unwrap(),
+                    &"text".parse().unwrap(),
+                    None
+                )
+                .unwrap()
+            )[0]
+            .sql,
             "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"v\" TYPE \"app\".\"pbps_rebuild_y_000002\";"
         );
         assert_eq!(
-            retype(true, pbps_model::RetypeConversion::Assign)[0].sql,
+            retype(
+                true,
+                pbps_model::ValueChange::cast(
+                    &"text".parse().unwrap(),
+                    &"text".parse().unwrap(),
+                    None
+                )
+                .unwrap()
+            )[0]
+            .sql,
             "ALTER TABLE \"app\".\"t\" ALTER COLUMN \"v\" TYPE \"app\".\"pbps_rebuild_y_000002\"[];"
         );
         // Over a rebuilt enum or domain the labels go through text.
         assert!(
-            retype(false, pbps_model::RetypeConversion::Text)[0]
+            retype(false, pbps_model::ValueChange::Relabel { removed: vec![] })[0]
                 .sql
                 .ends_with("USING \"v\"::text::\"app\".\"pbps_rebuild_y_000002\";")
         );
@@ -4254,11 +4266,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // is safe, and nowhere else yet (#1167, DEC-1167.1): narrowing one
             // needs element-wise probes over NULL arrays, NULL elements,
             // bounds and shape, which nothing counts today.
-            if using.is_none()
-                && (was.is_array() || normalized.is_array())
-                && was.is_array() == normalized.is_array()
-                && types::change_risk(&was, &normalized) != pbps_dialect::TypeChangeRisk::Safe
-            {
+            let verdict = change
+                .value_change()
+                .map(|values| pbps_dialect::Dialect::value_change(pg, &values, ""));
+            if verdict.as_ref().is_some_and(|v| {
+                v.needs_using == Some(pbps_dialect::ConversionRequired::ArrayElements)
+            }) {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{was}` to `{normalized}`: an array's \
                      element type is changed only where every element keeps its value, and \
@@ -4269,10 +4282,14 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     normalized = normalized.shown(),
                 )));
             }
-            if using.is_none()
-                && types::change_risk(&was, &normalized)
-                    == pbps_dialect::TypeChangeRisk::Incompatible
-            {
+            if verdict.as_ref().map_or_else(
+                || {
+                    using.is_none()
+                        && types::change_risk(&was, &normalized)
+                            == pbps_dialect::TypeChangeRisk::Incompatible
+                },
+                |v| v.needs_using == Some(pbps_dialect::ConversionRequired::Incompatible),
+            ) {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{}` to `{normalized}`: this engine \
                      refuses the conversion outright -- `column \"{}\" cannot be cast \
@@ -4304,7 +4321,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // stored value in that zone is exactly the undeclared
             // transformation ADR-0012 §5 refuses. Whether the recorded zone
             // changes that answer is #1919.
-            if using.is_none() && types::depends_on_the_session_time_zone(&was, &normalized) {
+            if verdict.as_ref().is_some_and(|v| {
+                v.needs_using == Some(pbps_dialect::ConversionRequired::SessionTimeZone)
+            }) {
                 return Err(invalid(format!(
                     "column `{}` cannot be changed from `{was}` to `{normalized}`: the \
                      conversion gains or loses the time zone, and what each stored value \
@@ -5237,16 +5256,16 @@ fn emit_enum_rebuild(
         Step::Retype {
             column,
             array,
-            conversion,
+            values,
             ..
         } => {
             let brackets = if *array { "[]" } else { "" };
             let c = quote(column.name.raw())?;
-            let using = match conversion {
-                pbps_model::RetypeConversion::Text => {
+            let using = match values.as_ref() {
+                pbps_model::ValueChange::Relabel { .. } => {
                     format!(" USING {c}::text::{}{brackets}", ty(tmp)?)
                 }
-                pbps_model::RetypeConversion::Assign => String::new(),
+                pbps_model::ValueChange::Cast { .. } => String::new(),
             };
             unscoped(format!(
                 "ALTER TABLE {} ALTER COLUMN {c} TYPE {}{brackets}{using};",

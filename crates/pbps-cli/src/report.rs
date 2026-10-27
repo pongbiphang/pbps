@@ -2338,10 +2338,7 @@ mod tests {
             },
             to: pbps_model::ColumnType::reference("app.e".parse().unwrap()),
             array: false,
-            removed: vec![],
-            base_change: None,
-            conversion: Default::default(),
-            value_arrays: 0,
+            values: Box::new(pbps_model::ValueChange::Relabel { removed: vec![] }),
         }));
         assert!(
             retype.contains("app.t.m")

@@ -191,6 +191,39 @@ impl TypeChangeRisk {
     }
 }
 
+/// Why a value change needs a conversion supplied by its author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionRequired {
+    ArrayElements,
+    Incompatible,
+    SessionTimeZone,
+}
+
+/// Engine-owned probe material; statement and report construction stay with
+/// their callers. A relabel never produces a cast probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueProbe {
+    None,
+    Predicate {
+        target: ColumnType,
+        fails: String,
+    },
+    Using {
+        target: ColumnType,
+        expression: String,
+        assignment_refuses: Option<String>,
+    },
+    Unchecked(&'static str),
+}
+
+/// One answer for admission, risk and probe semantics (#2461).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueChangeVerdict {
+    pub needs_using: Option<ConversionRequired>,
+    pub risk: TypeChangeRisk,
+    pub probe: ValueProbe,
+}
+
 /// A relation an engine creates with a table under a name it generates itself
 /// (#465), with how to move a declared name out of its way (#990).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2502,6 +2535,39 @@ pub trait Dialect {
         false
     }
 
+    /// Judge stored values independently of the SQL that moves them. `value`
+    /// is the engine-quoted stored expression used to build probe material.
+    fn value_change(&self, values: &pbps_model::ValueChange, _value: &str) -> ValueChangeVerdict {
+        let (risk, needs_using) = match values {
+            pbps_model::ValueChange::Cast {
+                from,
+                to,
+                arrays,
+                using,
+            } => {
+                let shape = |ty: &ColumnType| {
+                    if *arrays > 0 {
+                        ty.clone().into_array()
+                    } else {
+                        ty.clone()
+                    }
+                };
+                let (from, to) = (shape(from), shape(to));
+                (
+                    self.type_change_risk(&from, &to),
+                    (using.is_none() && self.type_change_needs_using(&from, &to))
+                        .then_some(ConversionRequired::Incompatible),
+                )
+            }
+            pbps_model::ValueChange::Relabel { .. } => (TypeChangeRisk::Safe, None),
+        };
+        ValueChangeVerdict {
+            needs_using,
+            risk,
+            probe: ValueProbe::None,
+        }
+    }
+
     /// Derives the complete risk set for planning and saved-plan verification.
     /// Defaults use this engine's identifier boundary; persisted risks are
     /// checked against this same answer so artifact validation cannot disagree.
@@ -2522,23 +2588,14 @@ pub trait Dialect {
                 }
             }
         }
-        if let Change::AlterColumnType { from, to, .. } = change
+        if let Some(values) = change.value_change() {
+            if let Some(risk) = self.value_change(&values, "").risk.risk_class() {
+                risks.insert(risk);
+            }
+        } else if let Change::AlterColumnType { from, to, .. } = change
             && let Some(risk) = self.type_change_risk(from, to).risk_class()
         {
-            risks.insert(risk);
-        }
-        // A domain's base narrowed under its rebuild: the column moves to a
-        // replacement over the narrower type (DEC-1635.9).
-        if let Change::EnumRebuild {
-            step:
-                pbps_model::EnumRebuildStep::Retype {
-                    base_change: Some(pair),
-                    ..
-                },
-            ..
-        } = change
-            && let Some(risk) = self.type_change_risk(&pair.0, &pair.1).risk_class()
-        {
+            // Scalar/array crossings have no shared leaf shape.
             risks.insert(risk);
         }
         if let Change::AlterColumnType {
@@ -4825,7 +4882,7 @@ mod tests {
     /// the rebuild's, and only when the base changes (DEC-1635.9).
     #[test]
     fn a_rebuild_retype_takes_the_risk_of_its_base_change_and_none_without_one() {
-        let retype = |base_change| Change::EnumRebuild {
+        let retype = |base_change: Option<Box<(ColumnType, ColumnType)>>| Change::EnumRebuild {
             uid: "y_000002".parse().unwrap(),
             name: "app.d".parse().unwrap(),
             tmp: "app.tmp".parse().unwrap(),
@@ -4834,10 +4891,20 @@ mod tests {
                 column: pbps_model::TableName::new("app", "t").column("v"),
                 to: ColumnType::reference("app.d".parse().unwrap()),
                 array: false,
-                removed: vec![],
-                base_change,
-                conversion: pbps_model::RetypeConversion::Assign,
-                value_arrays: 0,
+                values: Box::new(match base_change {
+                    Some(pair) => pbps_model::ValueChange::Cast {
+                        from: pair.0,
+                        to: pair.1,
+                        arrays: 0,
+                        using: None,
+                    },
+                    None => pbps_model::ValueChange::cast(
+                        &ColumnType::simple("text"),
+                        &ColumnType::simple("text"),
+                        None,
+                    )
+                    .unwrap(),
+                }),
             },
         };
         let (text, integer): (ColumnType, ColumnType) =

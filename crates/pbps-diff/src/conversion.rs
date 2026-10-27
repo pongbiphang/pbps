@@ -216,12 +216,18 @@ pub fn needed(changes: &[PlannedChange], dialect: &(impl Dialect + ?Sized)) -> V
             else {
                 return None;
             };
-            dialect.type_change_needs_using(from, to).then(|| Needed {
-                uid: uid.clone(),
-                column: column.clone(),
-                from: from.raw().to_string(),
-                to: to.raw().to_string(),
-            })
+            p.change
+                .value_change()
+                .map_or_else(
+                    || dialect.type_change_needs_using(from, to),
+                    |values| dialect.value_change(&values, "").needs_using.is_some(),
+                )
+                .then(|| Needed {
+                    uid: uid.clone(),
+                    column: column.clone(),
+                    from: from.raw().to_string(),
+                    to: to.raw().to_string(),
+                })
         })
         .collect()
 }

@@ -19,15 +19,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{Dialect, TypeChangeRisk};
+use pbps_dialect::Dialect;
 use pbps_model::{
-    Change, ColumnType, EnumRebuildStep, Hints, ManagedType, RetypeConversion, TypeRef, Uid,
+    Change, ColumnType, EnumRebuildStep, Hints, ManagedType, TypeRef, Uid, ValueChange,
 };
 
 use crate::{
     DiffError, Side,
     enum_labels::{Replacement, rebuild_type},
-    identity::type_refs::{TypeIdentity, TypeResolver, TypeSide},
+    identity::type_refs::{Leaf, TypeIdentity, TypeResolver, TypeSide},
 };
 
 /// Why a domain is rebuilt.
@@ -103,9 +103,8 @@ pub(crate) fn plan(
                     depth: 0,
                     // No cast leads from an enum to its replacement: the
                     // labels go through text.
-                    carried: Carried {
-                        conversion: RetypeConversion::Text,
-                        change: None,
+                    values: ValueChange::Relabel {
+                        removed: removed.clone(),
                     },
                 },
             );
@@ -214,7 +213,11 @@ pub(crate) fn plan(
             // rest needs a conversion the author states, which is #2331.
             let compatible = old_base.type_ref().is_none()
                 && new_base.type_ref().is_none()
-                && dialect.type_change_risk(&old_base, &new_base) != TypeChangeRisk::Incompatible;
+                && ValueChange::cast(&old_base, &new_base, None).is_some_and(|values| {
+                    let verdict = dialect.value_change(&values, "");
+                    verdict.needs_using.is_none()
+                        && verdict.risk != pbps_dialect::TypeChangeRisk::Incompatible
+                });
             if compatible {
                 why.insert(d.uid.clone(), Why::Base);
             } else {
@@ -349,9 +352,9 @@ pub(crate) fn plan(
             // takes by the leaf types (measured on 16 and 18, DEC-1635.9). The
             // pair is of the element types; whether a column's values are
             // arrays is its shape's to say (`TypeResolver::values_shape`).
-            let carried = match (under, reason) {
-                (Some(r), _) => r.carried.clone(),
-                (None, Why::Base) => {
+            let values = match under {
+                Some(r) => r.values.clone(),
+                None => {
                     let (
                         ManagedType::Domain { base: from, .. },
                         ManagedType::Domain { base: to, .. },
@@ -359,20 +362,34 @@ pub(crate) fn plan(
                     else {
                         continue;
                     };
-                    Carried {
-                        conversion: RetypeConversion::Assign,
-                        change: Some((normalized(from).element(), normalized(to).element())),
+                    let old = resolver.values_shape(TypeSide::Desired, from, desired.schema);
+                    let new = resolver.values_shape(TypeSide::Desired, to, desired.schema);
+                    ValueChange::Cast {
+                        from: match old.leaf {
+                            Leaf::Builtin(ty) => normalized(&ty),
+                            Leaf::Enum(uid) => ColumnType::reference(
+                                resolver
+                                    .name(TypeSide::Desired, &uid)
+                                    .expect("a resolved enum has a declared name")
+                                    .clone(),
+                            ),
+                            Leaf::Other => normalized(from).element(),
+                        },
+                        to: match new.leaf {
+                            Leaf::Builtin(ty) => normalized(&ty),
+                            Leaf::Enum(uid) => ColumnType::reference(
+                                resolver
+                                    .name(TypeSide::Desired, &uid)
+                                    .expect("a resolved enum has a declared name")
+                                    .clone(),
+                            ),
+                            Leaf::Other => normalized(to).element(),
+                        },
+                        arrays: new.arrays,
+                        using: None,
                     }
                 }
-                (None, Why::Derived(_) | Why::Collation | Why::Array) => Carried {
-                    conversion: RetypeConversion::Assign,
-                    change: None,
-                },
             };
-            let Carried {
-                conversion,
-                change: base_change,
-            } = carried.clone();
             match rebuild_type(
                 base,
                 desired,
@@ -383,8 +400,7 @@ pub(crate) fn plan(
                     removed: removed.clone(),
                     over,
                     why: Some(reason.shown()),
-                    conversion,
-                    base_change,
+                    values: values.clone(),
                     ordinal,
                     depth,
                 },
@@ -398,7 +414,7 @@ pub(crate) fn plan(
                                 removed,
                                 ordinal,
                                 depth,
-                                carried,
+                                values,
                             },
                         );
                     }
@@ -431,23 +447,14 @@ struct Replaced {
     depth: usize,
     /// What the columns of this type undergo: a domain built on this one
     /// inherits it.
-    carried: Carried,
-}
-
-/// How a value reaches the replacement and the change of base type it meets,
-/// as the root of the chain says them.
-#[derive(Debug, Clone)]
-struct Carried {
-    conversion: RetypeConversion,
-    /// The old and new element base type, when a built-in base changed.
-    change: Option<(ColumnType, ColumnType)>,
+    values: ValueChange,
 }
 
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)] // Fixtures name only the rebuild's changes.
 mod tests {
     use super::*;
-    use pbps_dialect::MinimalDialect;
+    use pbps_dialect::{MinimalDialect, TypeChangeRisk};
     use pbps_model::{Column, ColumnRef, IdsFile, Schema, Table, TableName, UidKind};
 
     /// A dialect that converts every pair of built-in bases but one with an
@@ -470,6 +477,9 @@ mod tests {
         }
         fn normalize_type(&self, t: &ColumnType) -> Result<ColumnType, pbps_dialect::DialectError> {
             MinimalDialect.normalize_type(t)
+        }
+        fn type_change_needs_using(&self, from: &ColumnType, to: &ColumnType) -> bool {
+            self.type_change_risk(from, to) == TypeChangeRisk::Incompatible
         }
         fn type_change_risk(&self, from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             if from.base == "integer" || to.base == "integer" {
@@ -621,16 +631,16 @@ mod tests {
         let EnumRebuildStep::Retype {
             column,
             array,
-            conversion,
-            base_change,
+            values,
             ..
         } = retype
         else {
             panic!("{retype:?}");
         };
         assert_eq!((column.name.raw(), *array), ("v", false));
-        assert_eq!(*conversion, RetypeConversion::Assign);
-        let (from, to) = &**base_change.as_ref().expect("the narrowing probe's pair");
+        let ValueChange::Cast { from, to, .. } = values.as_ref() else {
+            panic!("{values:?}");
+        };
         assert_eq!(
             (from.shown().to_string(), to.shown().to_string()),
             ("varchar(20)".into(), "text".into())
@@ -665,10 +675,9 @@ mod tests {
         assert!(steps(&out, &uid(2)).iter().any(|s| matches!(
             s,
             EnumRebuildStep::Retype {
-                base_change: None,
-                conversion: RetypeConversion::Assign,
+                values,
                 ..
-            }
+            } if matches!(values.as_ref(), ValueChange::Cast { from, to, .. } if from == to)
         )));
     }
 
@@ -714,10 +723,9 @@ mod tests {
         assert!(matches!(
             &first[1],
             EnumRebuildStep::Retype {
-                conversion: RetypeConversion::Text,
-                base_change: None,
+                values,
                 ..
-            }
+            } if matches!(values.as_ref(), ValueChange::Relabel { .. })
         ));
         assert!(matches!(&first[2], EnumRebuildStep::Swap { depth: 1, .. }));
         assert!(matches!(&second[2], EnumRebuildStep::Swap { depth: 2, .. }));
@@ -897,18 +905,16 @@ mod tests {
             .iter()
             .filter_map(|c| match c {
                 Change::EnumRebuild {
-                    step:
-                        EnumRebuildStep::Retype {
-                            column,
-                            base_change,
-                            ..
-                        },
+                    step: EnumRebuildStep::Retype { column, values, .. },
                     ..
                 } => Some((
                     column.name.raw().to_owned(),
-                    base_change
-                        .as_ref()
-                        .map(|pair| (pair.0.shown().to_string(), pair.1.shown().to_string())),
+                    match values.as_ref() {
+                        ValueChange::Cast { from, to, .. } if from != to => {
+                            Some((from.shown().to_string(), to.shown().to_string()))
+                        }
+                        _ => None,
+                    },
                 )),
                 _ => None,
             })
@@ -924,12 +930,38 @@ mod tests {
                 Change::EnumRebuild {
                     step:
                         EnumRebuildStep::Retype {
-                            column,
-                            value_arrays,
-                            ..
+                            column, values, to, ..
                         },
                     ..
-                } => Some((column.name.raw().to_owned(), *value_arrays)),
+                } => {
+                    let arrays = match values.as_ref() {
+                        ValueChange::Cast { arrays, .. } => *arrays,
+                        ValueChange::Relabel { .. } => {
+                            let mut ty = to;
+                            let mut arrays = 0;
+                            for _ in 0..=rebuilt.changes.len() {
+                                arrays += usize::from(ty.is_array());
+                                let next = rebuilt.changes.iter().find_map(|c| match c {
+                                    Change::EnumRebuild {
+                                        name,
+                                        step: EnumRebuildStep::Create { definition, .. },
+                                        ..
+                                    } if Some(name) == ty.type_ref() => match &**definition {
+                                        ManagedType::Domain { base, .. } => Some(base),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                });
+                                let Some(next) = next else {
+                                    break;
+                                };
+                                ty = next;
+                            }
+                            arrays
+                        }
+                    };
+                    Some((column.name.raw().to_owned(), arrays))
+                }
                 _ => None,
             })
             .collect()
@@ -964,9 +996,9 @@ mod tests {
         assert!(out.changes.iter().any(|c| matches!(
             c,
             Change::EnumRebuild {
-                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Assign, .. },
+                step: EnumRebuildStep::Retype { column, values, .. },
                 ..
-            } if column.name.raw() == "w"
+            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
         )));
         // Through a third level, the same pair.
         let deeper = |base: &str| {
@@ -1117,9 +1149,9 @@ mod tests {
         assert!(out.changes.iter().any(|c| matches!(
             c,
             Change::EnumRebuild {
-                step: EnumRebuildStep::Retype { column, conversion: RetypeConversion::Assign, .. },
+                step: EnumRebuildStep::Retype { column, values, .. },
                 ..
-            } if column.name.raw() == "w"
+            } if column.name.raw() == "w" && matches!(values.as_ref(), ValueChange::Cast { .. })
         )));
         // An array link: the pair stays of the element types and the
         // columns' values are arrays of them, which the shape says
@@ -1434,12 +1466,14 @@ mod tests {
         );
         for change in &out.changes {
             if let Change::EnumRebuild {
-                step: EnumRebuildStep::Retype { array, removed, .. },
+                step: EnumRebuildStep::Retype { array, values, .. },
                 ..
             } = change
             {
                 assert!(!array, "none of these columns is itself `[]`");
-                assert_eq!(removed, &["b".to_owned()]);
+                assert!(
+                    matches!(values.as_ref(), ValueChange::Relabel { removed } if removed == &["b".to_owned()])
+                );
             }
         }
         // Negative: a scalar domain over the enum reads the value.
@@ -1490,18 +1524,18 @@ mod tests {
     }
 
     /// How each column's value reaches its replacement, by column.
-    fn conversions(rebuilt: &Rebuilt) -> BTreeMap<String, RetypeConversion> {
+    fn conversions(rebuilt: &Rebuilt) -> BTreeMap<String, bool> {
         rebuilt
             .changes
             .iter()
             .filter_map(|c| match c {
                 Change::EnumRebuild {
-                    step:
-                        EnumRebuildStep::Retype {
-                            column, conversion, ..
-                        },
+                    step: EnumRebuildStep::Retype { column, values, .. },
                     ..
-                } => Some((column.name.raw().to_owned(), *conversion)),
+                } => Some((
+                    column.name.raw().to_owned(),
+                    matches!(values.as_ref(), ValueChange::Cast { .. }),
+                )),
                 _ => None,
             })
             .collect()
@@ -1509,10 +1543,11 @@ mod tests {
 
     #[test]
     fn the_conversion_of_a_derived_domain_is_its_roots_through_every_link() {
-        use RetypeConversion::{Assign, Text};
+        const ASSIGN: bool = true;
+        const TEXT: bool = false;
         let on = |base: &str| domain(base, None, &[]);
         let collated = |base: &str| domain(base, Some("pg_catalog.\"C\""), &[]);
-        let check = |out: &Rebuilt, want: [(&str, RetypeConversion); 3]| {
+        let check = |out: &Rebuilt, want: [(&str, bool); 3]| {
             assert!(out.errors.is_empty(), "{:?}", out.errors);
             let got = conversions(out);
             for (column, conversion) in want {
@@ -1534,13 +1569,13 @@ mod tests {
             &over_enum(&["a"], on("app.d"), on("app.d2")),
             &Hints::default(),
         );
-        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
         let out = run(
             &over_enum(&["a", "b"], on("app.d"), on("app.d2[]")),
             &over_enum(&["a"], on("app.d"), on("app.d2[]")),
             &Hints::default(),
         );
-        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
         // Negative: an enum root under a collation link is still text.
         let out = run(
             &over_enum(&["a", "b"], on("app.d"), on("app.d2")),
@@ -1548,7 +1583,7 @@ mod tests {
             &Hints::default(),
         );
         assert_eq!(out.uids.get(&uid(3)), Some(&Why::Collation));
-        check(&out, [("v", Text), ("w", Text), ("x", Text)]);
+        check(&out, [("v", TEXT), ("w", TEXT), ("x", TEXT)]);
         // A built-in root's change rides the assignment cast for the root's
         // columns and for every domain built on it, through a collation link
         // and through array links.
@@ -1572,7 +1607,7 @@ mod tests {
                 &over_builtin("numeric(5, 0)", d2, d3),
                 &Hints::default(),
             );
-            check(&out, [("v", Assign), ("w", Assign), ("x", Assign)]);
+            check(&out, [("v", ASSIGN), ("w", ASSIGN), ("x", ASSIGN)]);
         }
         // A built-in collation change alone: the same.
         let builtin_collation = |collation: Option<&str>| {
@@ -1588,13 +1623,13 @@ mod tests {
             &builtin_collation(Some("pg_catalog.\"C\"")),
             &Hints::default(),
         );
-        check(&out, [("v", Assign), ("w", Assign), ("x", Assign)]);
+        check(&out, [("v", ASSIGN), ("w", ASSIGN), ("x", ASSIGN)]);
         // A scalar root alone is unchanged.
         let out = run(
             &over_builtin("varchar(20)", on("app.d"), on("app.d2")),
             &over_builtin("text", on("app.d"), on("app.d2")),
             &Hints::default(),
         );
-        assert_eq!(conversions(&out)["v"], Assign);
+        assert_eq!(conversions(&out)["v"], ASSIGN);
     }
 }

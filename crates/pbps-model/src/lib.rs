@@ -60,6 +60,7 @@ pub mod strategy;
 pub mod text;
 pub mod types;
 pub mod uid;
+pub mod value_change;
 pub mod zone;
 
 pub use change::{
@@ -78,9 +79,7 @@ pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
 pub use ids::{Conversion, IdsFile, IdsIndex, Move, Tombstone, ValidIds};
 pub use intent::Intent;
-pub use managed_type::{
-    DomainDelta, DomainHalf, EnumPlacement, EnumRebuildStep, ManagedType, RetypeConversion,
-};
+pub use managed_type::{DomainDelta, DomainHalf, EnumPlacement, EnumRebuildStep, ManagedType};
 pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ModuleOptions, ObjectName,
     PublicExecute, RoutineArg, RoutineArgError, RoutineId,
@@ -116,4 +115,5 @@ pub use strategy::{Strategies, Strategy};
 pub use text::Text;
 pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
+pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};
