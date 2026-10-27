@@ -333,7 +333,7 @@ jobs:
       # A block scalar: a plain one cannot end in `::`, which YAML reads as a
       # mapping and the whole workflow file then fails to load.
       - run: |
-          cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 --skip connected_plan_json_reports_unsupported_online_edition_as_a_finding --skip dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes --skip recovery2410::
+          cargo test -p pbps-cli --test flow -- --ignored --test-threads=1 --skip connected_plan_json_reports_unsupported_online_edition_as_a_finding --skip dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes --skip recovery2410:: --skip recovery2410_docker::
         if: matrix.suite == 'flow'
       # A session killed mid-run (error 596, #669) leaves nothing in the job
       # log about why: the test sees only "the session is in the kill state".
@@ -762,10 +762,11 @@ jobs:
           # docs/PITFALLS.md calls "tests that pass for the wrong reason".
           out=$(cargo test -p pbps-cli --test flow -- \
                   --ignored --test-threads=1 a_dev_container_outlives \
-                  dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes 2>&1)
+                  dev587::docker_signals_remove_the_rehearsal_container_and_its_volumes \
+                  recovery2410_docker:: 2>&1)
           echo "$out"
-          echo "$out" | grep -qE '^test result: ok\. 2 passed' || {
-            echo "expected both rehearsal tests to run and pass" >&2
+          echo "$out" | grep -qE '^test result: ok\. 3 passed' || {
+            echo "expected the three Docker SQL Server tests to run and pass" >&2
             exit 1
           }
 

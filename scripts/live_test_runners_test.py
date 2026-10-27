@@ -1333,6 +1333,23 @@ elif command[0] != 'sleep':
             ["cargo", "test", "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", "--test-threads=1"],
         ])
 
+    def test_every_cli_run_that_starts_a_docker_scratch_gets_the_scratch_images(self):
+        # `flow_pg` starts real runs whose Docker scratch needs the image, as
+        # the resolver's own tests do; the sharded driver runs this script.
+        script = (ROOT / "scripts" / "live-tests-pg.sh").read_text()
+        images = [re.search(rf"^{name}=(\S+)", script, re.MULTILINE)[1]
+                  for name in ("IMAGE", "OLD_IMAGE")]
+        result, _ = self.local_pg_script("initializing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [(command, scratch, old) for command, scratch, old in self.cargo_images
+                if "pbps-cli" in command and "--bin" not in command]
+        self.assertEqual(
+            [("flow_pg" if "flow_pg" in command else "lib") for command, _, _ in runs],
+            ["lib", "flow_pg"])
+        for command, scratch, old in runs:
+            with self.subTest(command=command):
+                self.assertEqual([scratch, old], images)
+
     def test_wrong_fixture_identity_stops_before_test_writes(self):
         result, calls = self.local_pg_script("wrong-identity")
         self.assertNotEqual(result.returncode, 0)
@@ -1352,6 +1369,10 @@ root = Path(os.environ["PBPS_ADMISSION_CONTROL"])
 command = [Path(sys.argv[0]).name, *sys.argv[1:]]
 with (root / "calls").open("a") as log:
     log.write(json.dumps(command) + "\n")
+if command[0] == "cargo":
+    with (root / "images").open("a") as log:
+        log.write(json.dumps([command, os.environ.get("PBPS_TEST_PG_SCRATCH_IMAGE"),
+                              os.environ.get("PBPS_TEST_PG_OLD_SCRATCH_IMAGE")]) + "\n")
 if command[:2] == ["docker", "ps"]:
     print("pbps-test-pg\npbps-test-pg16\npbps-test-pg-scratch")
 elif command[:2] == ["docker", "exec"]:
@@ -1380,6 +1401,9 @@ elif command[0] not in ("cargo", "python3", "sleep"):
             result = subprocess.run(["bash", "scripts/live-tests-pg.sh"], cwd=ROOT,
                                     env=env, text=True, capture_output=True, timeout=30)
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            images = root / "images"
+            self.cargo_images = [json.loads(line) for line in images.read_text().splitlines()] \
+                if images.exists() else []
             return result, calls
 
 if __name__ == "__main__":

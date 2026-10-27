@@ -16,8 +16,12 @@ use pbps_db::{Conn, DbError, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
+mod keeper;
 pub(super) mod mssql;
 mod postgres;
+#[cfg(test)]
+pub(super) use keeper::pause_between_reads;
+pub(super) use keeper::{keep_and_mark, keeper_seen};
 pub(super) use postgres::Naming;
 #[cfg(test)]
 pub(super) use postgres::{
@@ -691,7 +695,7 @@ pub(super) use postgres::{generation_version, reconstruction, release_supplied};
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.
 pub(super) struct Docker {
-    driver: Driver,
+    pub driver: Driver,
     pub environment: Vec<String>,
     pub port: u16,
     pub readiness_query: &'static str,

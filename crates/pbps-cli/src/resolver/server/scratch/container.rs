@@ -11,6 +11,9 @@
 
 use super::super::{Error, ProduceError, engine};
 
+mod recovery;
+#[cfg(test)]
+pub(super) use recovery::{Keeper, seen, swept, swept_alone};
 mod startup;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};
@@ -19,7 +22,7 @@ use tokio::process::Command;
 
 /// How long a started server may take to accept a connection. The image's
 /// first start runs initdb, then restarts the server.
-const READY: Duration = Duration::from_secs(180);
+pub(super) const READY: Duration = Duration::from_secs(180);
 
 /// How long one `docker` command may take before the run gives up on it.
 const COMMAND: Duration = Duration::from_secs(120);
@@ -48,12 +51,20 @@ pub async fn with_started<T>(
     run: impl AsyncFnOnce(&str) -> Result<T, ProduceError>,
 ) -> Result<T, ProduceError> {
     acquire(image, pull).await?;
-    let container = Container::start(driver, image).await?;
-    let outcome = match container.ready(driver, READY).await {
-        Ok(()) => run(&container.connection).await,
-        Err(error) => Err(error),
+    // The run's token names its container and its session in the server, so a
+    // later run can tell from them that the owner is gone (#2410).
+    let token = format!("{:032x}", rand::random::<u128>());
+    recovery::sweep(&token).await;
+    let container = Container::start(driver, image, &token).await?;
+    let (outcome, keeper) = match container.ready(driver, READY).await {
+        Ok(()) => match recovery::Keeper::open(driver, &container.connection, &token).await {
+            Ok(keeper) => (run(&container.connection).await, Some(keeper)),
+            Err(error) => (Err(error), None),
+        },
+        Err(error) => (Err(error), None),
     };
     let removed = container.remove().await;
+    drop(keeper);
     match (outcome, removed) {
         (_, Err(names)) => Err(ProduceError::Cleanup(names)),
         (outcome, Ok(())) => outcome,
@@ -66,6 +77,9 @@ pub async fn with_started<T>(
 /// the container's own drop guard on any other way out.
 pub struct Held {
     container: Container,
+    /// The run's session in the container's server, closed only once the
+    /// container is gone, as `with_started` keeps it (#2410).
+    keeper: recovery::Keeper,
 }
 
 impl Held {
@@ -77,9 +91,17 @@ impl Held {
         pull: PullPolicy,
     ) -> Result<Self, ProduceError> {
         acquire(image, pull).await?;
-        let container = Container::start(driver, image).await?;
-        match container.ready(driver, READY).await {
-            Ok(()) => Ok(Self { container }),
+        // Named, swept and kept as `with_started`'s, so that a run killed
+        // while it holds the container is recovered by the next one.
+        let token = format!("{:032x}", rand::random::<u128>());
+        recovery::sweep(&token).await;
+        let container = Container::start(driver, image, &token).await?;
+        let kept = match container.ready(driver, READY).await {
+            Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
+            Err(error) => Err(error),
+        };
+        match kept {
+            Ok(keeper) => Ok(Self { container, keeper }),
             Err(error) => match container.remove().await {
                 Ok(()) => Err(error),
                 Err(names) => Err(ProduceError::Cleanup(names)),
@@ -94,7 +116,10 @@ impl Held {
 
     /// Removes the container and confirms it gone.
     pub async fn remove(self) -> Result<(), ProduceError> {
-        self.container.remove().await.map_err(ProduceError::Cleanup)
+        let Self { container, keeper } = self;
+        let removed = container.remove().await;
+        drop(keeper);
+        removed.map_err(ProduceError::Cleanup)
     }
 }
 
@@ -165,14 +190,14 @@ struct Container {
 }
 
 impl Container {
-    async fn start(driver: Driver, image: &str) -> Result<Self, ProduceError> {
+    async fn start(driver: Driver, image: &str, token: &str) -> Result<Self, ProduceError> {
         let password = format!("{:032x}", rand::random::<u128>());
         let engine = engine::docker(driver, &password)?;
         // Named by the run before it is asked for, so a `docker run` that
         // created the container and then failed, timed out or was cancelled
         // leaves one this run can still name and remove.
         let mut container = Self {
-            id: format!("pbps-scratch-{:016x}", rand::random::<u64>()),
+            id: format!("pbps-scratch-{token}"),
             connection: String::new(),
             engine,
             removed: false,
@@ -181,7 +206,7 @@ impl Container {
                 Driver::Postgres => password.clone(),
             },
         };
-        let args = run_args(&container.id, &container.engine, image);
+        let args = run_args(&container.id, token, &container.engine, image);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let started = match run_to_end(&args).await {
             Ok(started) => {
@@ -266,54 +291,86 @@ impl Container {
     /// volume it failed to delete, so a container gone proves nothing of
     /// them (#1843 review).
     async fn remove(mut self) -> Result<(), Vec<String>> {
-        let volumes = docker(&[
-            "container",
-            "inspect",
-            "--format",
-            "{{range .Mounts}}{{.Name}} {{end}}",
-            &self.id,
-        ])
-        .await
-        .map(|names| {
-            names
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        });
-        let _ = docker(&["kill", &self.id]).await;
-        let _ = docker(&["rm", "--force", "--volumes", &self.id]).await;
-        let mut left = Vec::new();
-        // Only the runtime saying there is no such container is absence. An
-        // unreachable daemon or a timeout says nothing, and the container
-        // may still run.
-        match docker(&["container", "inspect", "--format", "{{.Id}}", &self.id]).await {
-            Err(why) if no_such_container(&why) => {}
-            _ => left.push(format!("the docker container {} and its volumes", self.id)),
+        let removed = remove_named(&self.id).await;
+        if removed.is_ok() {
+            self.removed = true;
         }
-        match volumes {
-            Ok(volumes) => {
-                for volume in volumes {
+        removed
+    }
+}
+
+/// Whether the runtime says the container is being removed, by this run or
+/// by another's sweep.
+async fn removing(id: &str) -> bool {
+    docker(&["container", "inspect", "--format", "{{.State.Status}}", id])
+        .await
+        .is_ok_and(|status| status.trim() == "removing")
+}
+
+/// [`Container::remove`] for a container named, not owned: a leftover of a run
+/// that was killed (`recovery`).
+async fn remove_named(id: &str) -> Result<(), Vec<String>> {
+    let volumes = docker(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{.Name}} {{end}}",
+        id,
+    ])
+    .await
+    .map(|names| {
+        names
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    });
+    let _ = docker(&["kill", id]).await;
+    let _ = docker(&["rm", "--force", "--volumes", id]).await;
+    let mut left = Vec::new();
+    // Only the runtime saying there is no such container is absence. An
+    // unreachable daemon or a timeout says nothing, and the container
+    // may still run. A container another run's sweep is removing is waited
+    // for, with its volumes: two sweeps may find the same dead one.
+    let mut waits = 0;
+    let gone = loop {
+        match docker(&["container", "inspect", "--format", "{{.Id}}", id]).await {
+            Err(why) if no_such_container(&why) => break true,
+            Ok(_) if waits < 50 && removing(id).await => {
+                waits += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => break false,
+        }
+    };
+    if !gone {
+        left.push(format!("the docker container {id} and its volumes"));
+    }
+    match volumes {
+        Ok(volumes) => {
+            for volume in volumes {
+                let mut tries = 0;
+                loop {
                     match docker(&["volume", "inspect", "--format", "{{.Name}}", &volume]).await {
                         Err(why) if no_such_volume(&why) => {}
+                        Ok(_) if gone && tries < 30 => {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
                         _ => left.push(format!("the docker volume {volume}")),
                     }
+                    break;
                 }
             }
-            // Never created, or created and never named: nothing to read.
-            Err(why) if no_such_container(&why) => {}
-            Err(_) if left.is_empty() => left.push(format!(
-                "the volumes of the docker container {}, which could not be read",
-                self.id
-            )),
-            Err(_) => {}
         }
-        if left.is_empty() {
-            self.removed = true;
-            Ok(())
-        } else {
-            Err(left)
-        }
+        // Never created, or created and never named: nothing to read.
+        Err(why) if no_such_container(&why) => {}
+        Err(_) if left.is_empty() => left.push(format!(
+            "the volumes of the docker container {id}, which could not be read"
+        )),
+        Err(_) => {}
     }
+    if left.is_empty() { Ok(()) } else { Err(left) }
 }
 
 /// A run that ends some other way (a panic, a cancelled future) still asks
@@ -336,7 +393,7 @@ impl Drop for Container {
 /// Docker and Podman both report a missing container this way (measured on
 /// #1674: Podman's CLI `Error: no such container <name>`, its compatible
 /// socket `... found: no such container`, Docker's `No such container:`).
-fn no_such_container(error: &str) -> bool {
+pub(super) fn no_such_container(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such container")
 }
 
@@ -363,7 +420,7 @@ pub(super) fn process_label() -> String {
 }
 
 /// The `docker run` that starts the scratch server.
-fn run_args(name: &str, engine: &engine::Docker, image: &str) -> Vec<String> {
+fn run_args(name: &str, token: &str, engine: &engine::Docker, image: &str) -> Vec<String> {
     let mut args: Vec<String> = [
         "run",
         "--detach",
@@ -380,6 +437,19 @@ fn run_args(name: &str, engine: &engine::Docker, image: &str) -> Vec<String> {
         // owner, and what lets the live tests count only their own (#2095).
         "--label",
         &process_label(),
+        // The run's token and its engine: what a later run reads to tell
+        // whether the owner is gone (`recovery`, #2410).
+        "--label",
+        &format!("{}={token}", recovery::TOKEN),
+        "--label",
+        &format!(
+            "{}={}",
+            recovery::ENGINE,
+            match engine.driver {
+                Driver::Postgres => "postgres",
+                Driver::Mssql => "mssql",
+            }
+        ),
     ]
     .into_iter()
     .map(str::to_owned)
@@ -413,7 +483,7 @@ fn unfinished_start(name: &str, why: &str, removal: Result<(), Vec<String>>) -> 
 
 /// Runs `docker` with `args`, and returns its standard output, or why it
 /// failed.
-async fn docker(args: &[&str]) -> Result<String, String> {
+pub(super) async fn docker(args: &[&str]) -> Result<String, String> {
     run_to_end(args).await.and_then(|finished| finished)
 }
 
@@ -450,7 +520,7 @@ async fn run_to_end(args: &[&str]) -> Result<Result<String, String>, String> {
 
 /// Exactly the one loopback mapping asked for. Accepting any line, or any
 /// suffix, would hide a second, public bind.
-fn published_port(text: &str, container_port: u16) -> Result<u16, String> {
+pub(super) fn published_port(text: &str, container_port: u16) -> Result<u16, String> {
     text.trim()
         .strip_prefix("127.0.0.1:")
         .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
@@ -521,7 +591,8 @@ mod tests {
     #[test]
     fn the_launch_never_pulls_and_publishes_on_loopback_only() {
         let engine = super::engine::docker(Driver::Postgres, "secret").unwrap();
-        let args = run_args("pbps-scratch-0", &engine, "postgres:18");
+        let token = "0123456789abcdef0123456789abcdef";
+        let args = run_args("pbps-scratch-0", token, &engine, "postgres:18");
         let after = |flag: &str| {
             let at = args
                 .iter()
@@ -556,7 +627,7 @@ mod tests {
                  Id=sa;Password={password};TrustServerCertificate=true"
             )
         );
-        let mssql_args = run_args("pbps-scratch-1", &mssql, "sql-server-image");
+        let mssql_args = run_args("pbps-scratch-1", token, &mssql, "sql-server-image");
         assert!(
             mssql_args
                 .windows(2)
@@ -576,7 +647,15 @@ mod tests {
             .map(|(i, _)| args[i + 1].as_str())
             .collect();
         let label = super::process_label();
-        assert_eq!(labels, ["pbps.resolver=scratch", label.as_str()]);
+        assert_eq!(
+            labels,
+            [
+                "pbps.resolver=scratch",
+                label.as_str(),
+                "pbps.resolver.token=0123456789abcdef0123456789abcdef",
+                "pbps.resolver.engine=postgres"
+            ]
+        );
         // One value for the process's lifetime, which the live tests filter
         // on, and more than the pid, which another PID namespace can share.
         assert_eq!(label, super::process_label());

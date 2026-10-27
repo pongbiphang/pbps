@@ -132,16 +132,54 @@ pub async fn mark(conn: &mut impl ExecuteConnection, nonce: &str) -> Result<Sess
 }
 
 pub async fn marked(conn: &mut impl QueryConnection, mark: &SessionMark) -> Result<bool, DbError> {
+    present(conn, &mark.name).await
+}
+
+async fn present(conn: &mut impl QueryConnection, name: &str) -> Result<bool, DbError> {
     let row = one(
         conn.query(&format!(
             "SELECT CONVERT(nvarchar(1), CASE WHEN OBJECT_ID({}) IS NULL THEN 0 ELSE 1 END) \
              AS seen;",
-            literal(&format!("tempdb..{}", mark.name))
+            literal(&format!("tempdb..{name}"))
         ))
         .await?,
         "the scratch marker",
     )?;
     Ok(text(&row, "seen")? == "1")
+}
+
+/// The name of a server-wide property a keeper leaves once it has connected
+/// (DEC-2410.3); it outlives the session.
+const KEPT: &str = "pbps-keeper";
+
+/// Leaves the mark of the keeper of `token`, whose session mark is already made.
+pub async fn mark_kept(conn: &mut impl ExecuteConnection, token: &str) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "EXEC master.sys.sp_addextendedproperty @name = {}, @value = {};",
+        literal(KEPT),
+        literal(token)
+    ))
+    .await
+}
+
+/// Whether the session that made the marker for `nonce` (see [`mark`]) is still
+/// there.
+pub async fn marker_present(conn: &mut impl QueryConnection, nonce: &str) -> Result<bool, DbError> {
+    present(conn, &format!("##pbps_{nonce}")).await
+}
+
+/// Whether a keeper has ever connected to this server. A reader reads this
+/// before it reads the session: the mark is written only once the session
+/// exists, so a mark read first can only be older than the session read after.
+pub async fn kept(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
+    Ok(!conn
+        .query(&format!(
+            "SELECT 1 AS there FROM master.sys.extended_properties WHERE class = 0 \
+             AND name = {};",
+            literal(KEPT)
+        ))
+        .await?
+        .is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

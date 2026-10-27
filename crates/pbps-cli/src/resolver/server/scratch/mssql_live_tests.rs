@@ -1315,3 +1315,6 @@ mod reconstruct2374;
 
 #[path = "recovery2410_mssql_tests.rs"]
 mod recovery2410;
+
+#[path = "docker2410_mssql_tests.rs"]
+mod docker2410;

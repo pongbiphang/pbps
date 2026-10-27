@@ -87,6 +87,22 @@ mod recovery2410 {
         recovery2410_mssql::supplied_held_by_a_live_run();
     }
 }
+
+#[path = "support/recovery2410_docker_mssql.rs"]
+mod recovery2410_docker_mssql;
+
+/// This kills a real `pbps plan` whose scratch is a Docker SQL Server, which
+/// needs `PBPS_TEST_DEV_IMAGE`. Only the `dev-rehearsal` job sets it, so that
+/// job selects the module by its path and the `live` job skips it.
+mod recovery2410_docker {
+    use super::recovery2410_docker_mssql;
+
+    #[test]
+    #[ignore = "needs docker and PBPS_TEST_DEV_IMAGE"]
+    fn a_docker_sql_server_run_killed_inside_its_externals_file_is_removed_by_the_next_run() {
+        recovery2410_docker_mssql::killed_inside_the_externals_file();
+    }
+}
 #[path = "support/refusal_next_steps.rs"]
 mod refusal_next_steps;
 

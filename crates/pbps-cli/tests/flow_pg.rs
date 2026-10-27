@@ -1138,6 +1138,33 @@ fn a_supplied_database_a_live_run_holds_is_refused_and_left_alone() {
     recovery2410::supplied_held_by_a_live_run(&server());
 }
 
+#[path = "support/recovery2410_docker.rs"]
+mod recovery2410_docker;
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_docker_run_killed_before_its_first_connection_keeps_its_container_inside_the_grace() {
+    recovery2410_docker::before_the_first_connection(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_docker_run_killed_after_its_keeper_connected_is_removed_by_the_next_run() {
+    recovery2410_docker::after_the_connection(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_docker_run_killed_inside_its_externals_file_is_removed_by_the_next_run() {
+    recovery2410_docker::during_use(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
+fn a_live_docker_run_and_foreign_containers_are_left_alone_by_another_runs_sweep() {
+    recovery2410_docker::a_live_run_and_foreign_containers_are_left_alone(&server());
+}
+
 #[path = "support/resolver_publication.rs"]
 mod resolver_publication;
 

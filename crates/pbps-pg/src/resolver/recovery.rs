@@ -120,6 +120,32 @@ pub async fn alive(
     Ok(own_seen.then_some(sessions))
 }
 
+/// The mark a keeper leaves once it has connected (DEC-2410.3): the comment on
+/// the `postgres` database of the server the run started, which outlives the
+/// session.
+const KEPT: &str = "pbps-keeper";
+
+/// Leaves the mark of a keeper that has connected.
+pub async fn mark_kept(conn: &mut impl ExecuteConnection) -> Result<(), DbError> {
+    conn.execute(&format!("COMMENT ON DATABASE postgres IS '{KEPT}'"))
+        .await
+}
+
+/// Whether a keeper has ever connected to this server. A reader reads this
+/// before it reads the session: the mark is written only once the session
+/// exists, so a mark read first can only be older than the session read after.
+pub async fn kept(conn: &mut impl QueryConnection) -> Result<bool, DbError> {
+    let marks = conn
+        .query(
+            "SELECT pg_catalog.shobj_description(oid, 'pg_database') AS comment \
+               FROM pg_catalog.pg_database WHERE datname = 'postgres'",
+        )
+        .await?;
+    Ok(marks
+        .first()
+        .is_some_and(|row| row.try_get::<&str>("comment").ok().flatten() == Some(KEPT)))
+}
+
 /// The advisory lock that serialises runs in one supplied database: `"pbps"`
 /// and the issue. It is private to its database, the scope wanted here.
 pub const LOCK: (i32, i32) = (0x7062_7073, 2410);
