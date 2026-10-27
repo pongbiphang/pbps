@@ -98,14 +98,19 @@ pub(crate) async fn recover(
     dir: &StateDir,
     deadline: std::time::Instant,
 ) -> Result<Reconciliation, Error> {
-    // Discovery is bounded by the same deadline as the cleanup it serves.
-    let discovery =
-        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), runtime::current());
-    let daemon = discovery
+    let daemon = discovered(deadline, runtime::current()).await?;
+    reconcile::reconcile(dir, &Docker, &daemon, deadline).await
+}
+
+/// The runtime's identity, bounded by the same deadline as the cleanup it serves.
+async fn discovered(
+    deadline: std::time::Instant,
+    discovery: impl std::future::Future<Output = Result<record::Daemon, runtime::Fail>>,
+) -> Result<record::Daemon, Error> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), discovery)
         .await
         .map_err(|_| Error::Runtime("the runtime did not answer before the deadline".into()))?
-        .map_err(|f| Error::Runtime(f.to_string()))?;
-    reconcile::reconcile(dir, &Docker, &daemon, deadline).await
+        .map_err(|f| Error::Runtime(f.to_string()))
 }
 
 /// What a failed start owes before its record may go. The start's own removal

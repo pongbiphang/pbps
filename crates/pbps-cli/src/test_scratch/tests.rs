@@ -555,12 +555,13 @@ mod recovery {
 
     #[tokio::test]
     async fn daemon_discovery_is_bounded_by_the_recovery_deadline() {
-        let d = Dir::new();
-        // An expired deadline ends the discovery, whatever the daemon is doing.
-        let error = super::super::recover(&d.dir, Instant::now())
-            .await
-            .err()
-            .unwrap();
+        // A daemon that never answers does not hold the recovery past its deadline.
+        let error = super::super::discovered(
+            Instant::now() + Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("deadline"), "{error}");
     }
 
