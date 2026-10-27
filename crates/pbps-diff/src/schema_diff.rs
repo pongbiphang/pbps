@@ -30,7 +30,7 @@ use pbps_model::change::DeleteCause;
 use pbps_model::data::cell;
 use pbps_model::{
     Cell, Change, ChangeSet, ColumnRef, ColumnType, DataMode, DetachedKind, DetachedName,
-    GrantTarget, Hints, IdsFile, Index, IndexMethod, IndexPart, ModuleId, Permission,
+    GrantTarget, Hints, IdsFile, Index, IndexMethod, IndexPart, Module, ModuleId, Permission,
     PlannedChange, PrimaryKey, PublicAccess, Renames, ReplicaIdentity, RoutineOrigin, Schema,
     Table, TableName, Uid, UniqueConstraint, Value, ValueSource,
 };
@@ -2930,7 +2930,7 @@ fn diff_columns(
         // unchanged and the old one was cast across without a word. So a
         // conversion takes the default down and puts it back, as a changed
         // one does (#2331).
-        if old_default != new_default || (converting && old_default.is_some()) {
+        if defaults_differ(old_default, new_default) || (converting && old_default.is_some()) {
             // A default that is *replaced* on a column this same plan retypes
             // is two changes, because the type change has to run between them.
             // Measured on SQL Server, an `ALTER COLUMN` that changes the type
@@ -5623,7 +5623,9 @@ fn diff_partition_columns(
             } else {
                 was_default != now_default
             };
-        if from.default != to.default || (default_moved && to.default.is_some()) {
+        if defaults_differ(from.default.as_ref(), to.default.as_ref())
+            || (default_moved && to.default.is_some())
+        {
             changes.push(Change::SetPartitionDefault {
                 uid: uid.clone(),
                 table: name.clone(),
@@ -7561,6 +7563,168 @@ fn names_changing_hands(base: Side<'_>, declared: Side<'_>) -> BTreeSet<TableNam
         .collect()
 }
 
+/// The logical module change, shared with plan-time consumers (SPEC §8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleDelta {
+    Unchanged,
+    Alter,
+    Rebuild,
+}
+
+/// Descriptions are declaration metadata. Kind changes cannot use ALTER;
+/// options and dialect-normalized definitions determine whether to restate it.
+pub fn module_delta(
+    before: &Module,
+    after: &Module,
+    dialect: &(impl Dialect + ?Sized),
+) -> ModuleDelta {
+    // A trigger moved to another table needs no case of its own any
+    // more: its table is part of its identity, so the move is a key
+    // that is gone and a key that is new, and the two loops here
+    // already spell that as a drop and a create (ADR-0009 §1). What is
+    // left is the kind, which the key does not hold: `CREATE OR ALTER`
+    // cannot turn a view into a procedure.
+    if before.kind != after.kind {
+        ModuleDelta::Rebuild
+    } else if dialect.normalize_definition(&before.definition)
+        // The definition is compared after the dialect's lightweight
+        // normalization, never by understanding it (SPEC §8.2). What
+        // survives that is re-stated in full, which is idempotent and
+        // keeps the permissions granted on the object.
+        != dialect.normalize_definition(&after.definition)
+        // The option is part of what the module is: the engine
+        // keeps it, refuses changes to what it reads while it
+        // holds, and `CREATE OR ALTER` sets it either way.
+        || before.options != after.options
+    {
+        ModuleDelta::Alter
+    } else {
+        ModuleDelta::Unchanged
+    }
+}
+
+// Physical teardown for a conversion or a dependency is separate from whether
+// the declaration changes its default. SQL expressions stay opaque (SPEC §8.2).
+fn defaults_differ(before: Option<&String>, after: Option<&String>) -> bool {
+    before != after
+}
+
+fn ordinary_default<'a>(side: Side<'a>, uid: &Uid) -> Option<Option<&'a String>> {
+    let at = side.ids.columns.get(uid)?;
+    let column = side.schema.tables.get(&at.table)?.columns.get(&at.name)?;
+    Some(match &column.value_source {
+        ValueSource::Default(text) => Some(text),
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => None,
+    })
+}
+
+/// Compare logical restorations through the differ's own decisions (SPEC §8.2).
+/// Parameter-only index edits do not replace a part; physical dependent rebuilds
+/// must not turn them into new interface restrictions. Prepare once per plan.
+pub fn restoration_comparison<'a>(
+    base: Side<'a>,
+    declared: Side<'a>,
+    dialect: &'a (impl Dialect + ?Sized),
+) -> impl Fn(&Change, Option<&Uid>) -> bool + 'a {
+    let renames = renames_of(base, declared);
+    let mut changed = BTreeSet::new();
+    let mut partition_defaults = BTreeSet::new();
+    for (uid, old) in &base.ids.tables {
+        let Some(new) = declared.ids.tables.get(uid) else {
+            continue;
+        };
+        let (Some(before), Some(after)) =
+            (base.schema.tables.get(old), declared.schema.tables.get(new))
+        else {
+            continue;
+        };
+        let mut edits = Vec::new();
+        let renamed = renames.apply(before, old);
+        diff_constraints(new, &renamed, after, &mut edits);
+        if let (Some(was), Some(now)) = (&renamed.partition_of, &after.partition_of) {
+            for column in declared
+                .schema
+                .tables
+                .get(&now.parent)
+                .into_iter()
+                .flat_map(|t| t.columns.keys())
+            {
+                let existed = declared
+                    .ids
+                    .column_uid(&now.parent.column(column.clone()))
+                    .is_some_and(|id| base.ids.columns.contains_key(id));
+                if existed
+                    && !defaults_differ(
+                        was.columns.get(column).and_then(|c| c.default.as_ref()),
+                        now.columns.get(column).and_then(|c| c.default.as_ref()),
+                    )
+                {
+                    partition_defaults.insert((uid.clone(), column.clone()));
+                }
+            }
+        }
+        diff_computed(new, before, after, &mut edits);
+        for edit in edits {
+            if let Some(part) = edit.constraints() {
+                changed.insert((uid.clone(), part.part(), part.name.map(str::to_owned)));
+            }
+        }
+    }
+    move |change: &Change, uid: Option<&Uid>| {
+        if let Change::AlterColumnDefault { uid, .. } = change {
+            return ordinary_default(base, uid)
+                .zip(ordinary_default(declared, uid))
+                .is_some_and(|(b, d)| !defaults_differ(b, d));
+        }
+        if let Change::SetPartitionDefault { column, .. } = change {
+            return uid.is_some_and(|u| partition_defaults.contains(&(u.clone(), column.clone())));
+        }
+        if let Some(id) = change.module_id() {
+            return base
+                .schema
+                .modules
+                .get(id)
+                .zip(declared.schema.modules.get(id))
+                .is_some_and(|(b, d)| module_delta(b, d, dialect) == ModuleDelta::Unchanged);
+        }
+        let Some(part) = change.constraints() else {
+            return false;
+        };
+        let Some(uid) = uid else { return false };
+        let (Some(before), Some(after)) = (
+            base.ids
+                .tables
+                .get(uid)
+                .and_then(|n| base.schema.tables.get(n)),
+            declared
+                .ids
+                .tables
+                .get(uid)
+                .and_then(|n| declared.schema.tables.get(n)),
+        ) else {
+            return false;
+        };
+        let present = |t: &Table| match part.part() {
+            pbps_model::Part::PrimaryKey => t.primary_key.is_some(),
+            pbps_model::Part::Computed => part.name.is_some_and(|n| t.computed.contains_key(n)),
+            pbps_model::Part::Unique => part.name.is_some_and(|n| t.unique.contains_key(n)),
+            pbps_model::Part::Check => part.name.is_some_and(|n| t.checks.contains_key(n)),
+            pbps_model::Part::ForeignKey => {
+                part.name.is_some_and(|n| t.foreign_keys.contains_key(n))
+            }
+            pbps_model::Part::Index => part.name.is_some_and(|n| t.indexes.contains_key(n)),
+            // RLS policy changes have no consumer restoration exemption.
+            pbps_model::Part::Policy => false,
+        };
+        present(before)
+            && present(after)
+            && !changed.contains(&(uid.clone(), part.part(), part.name.map(str::to_owned)))
+    }
+}
+
 fn diff_modules(
     base: &Schema,
     declared: &Schema,
@@ -7592,40 +7756,23 @@ fn diff_modules(
                     module: Box::new(module.clone()),
                 });
             }
-            // A trigger moved to another table needs no case of its own any
-            // more: its table is part of its identity, so the move is a key
-            // that is gone and a key that is new, and the two loops here
-            // already spell that as a drop and a create (ADR-0009 §1). What is
-            // left is the kind, which the key does not hold: `CREATE OR ALTER`
-            // cannot turn a view into a procedure.
-            Some(before) if before.kind != module.kind => {
-                changes.push(Change::DropModule {
-                    id: id.clone(),
-                    kind: before.kind,
-                });
-                changes.push(Change::CreateModule {
+            Some(before) => match module_delta(before, module, dialect) {
+                ModuleDelta::Unchanged => {}
+                ModuleDelta::Alter => changes.push(Change::AlterModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
-                });
-            }
-            Some(before) => {
-                // The definition is compared after the dialect's lightweight
-                // normalization, never by understanding it (SPEC §8.2). What
-                // survives that is re-stated in full, which is idempotent and
-                // keeps the permissions granted on the object.
-                if dialect.normalize_definition(&before.definition)
-                    != dialect.normalize_definition(&module.definition)
-                    // The option is part of what the module is: the engine
-                    // keeps it, refuses changes to what it reads while it
-                    // holds, and `CREATE OR ALTER` sets it either way.
-                    || before.options != module.options
-                {
-                    changes.push(Change::AlterModule {
+                }),
+                ModuleDelta::Rebuild => {
+                    changes.push(Change::DropModule {
+                        id: id.clone(),
+                        kind: before.kind,
+                    });
+                    changes.push(Change::CreateModule {
                         id: id.clone(),
                         module: Box::new(module.clone()),
                     });
                 }
-            }
+            },
         }
     }
 
@@ -25731,6 +25878,509 @@ mod tests {
             .clone();
         assert_eq!(flat, legacy);
         assert_eq!(format!("{:?}", flat.changes), before);
+    }
+
+    #[test]
+    fn restoration_comparison_uses_each_parts_differ_equivalence() {
+        use pbps_model::{
+            CheckConstraint, Column, ColumnType, ComputedColumn, ForeignKey, Index, IndexColumn,
+            IndexKey, Part, PrimaryKey, ReferentialAction, Table, TableName, Uid, UniqueConstraint,
+        };
+        let table: TableName = "app.t".parse().unwrap();
+        let parent: TableName = "app.parent".parse().unwrap();
+        let renamed: TableName = "app.renamed".parse().unwrap();
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let reference: Uid = "t_bbbbbb".parse().unwrap();
+        let key = || IndexColumn {
+            key: IndexKey::Column("old".into()),
+            descending: false,
+            opclass: None,
+        };
+        for kind in [
+            Part::Computed,
+            Part::PrimaryKey,
+            Part::Unique,
+            Part::Check,
+            Part::ForeignKey,
+            Part::Index,
+        ] {
+            let mut shape = Table::default();
+            for column in ["old", "other"] {
+                let mut spec = Column::new(ColumnType::simple("integer"));
+                spec.nullable = false;
+                shape.columns.insert(column.into(), spec);
+            }
+            match kind {
+                Part::Computed => {
+                    shape.computed.insert(
+                        "derived".into(),
+                        ComputedColumn {
+                            expression: "old + 1".into(),
+                            persisted: true,
+                            not_null: true,
+                        },
+                    );
+                }
+                Part::PrimaryKey => {
+                    shape.primary_key = Some(PrimaryKey {
+                        name: Some("PK__generated".into()),
+                        columns: vec!["old".into()],
+                        storage_parameters: Default::default(),
+                    })
+                }
+                Part::Unique => {
+                    shape.unique.insert(
+                        "uq".into(),
+                        UniqueConstraint {
+                            columns: vec!["old".into()],
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }
+                Part::Check => {
+                    shape.checks.insert(
+                        "ck".into(),
+                        CheckConstraint {
+                            expression: "old > 0".into(),
+                        },
+                    );
+                }
+                Part::ForeignKey => {
+                    shape.foreign_keys.insert(
+                        "fk".into(),
+                        ForeignKey {
+                            columns: vec!["old".into()],
+                            references_table: parent.clone(),
+                            references_columns: vec!["old".into()],
+                            on_delete: Default::default(),
+                            on_update: Default::default(),
+                        },
+                    );
+                }
+                Part::Index => {
+                    shape.indexes.insert(
+                        "ix".into(),
+                        Index {
+                            columns: vec![key()],
+                            include: vec![],
+                            unique: true,
+                            filter: None,
+                            method: Default::default(),
+                            storage_parameters: Default::default(),
+                        },
+                    );
+                }
+                Part::Policy => unreachable!(),
+            }
+            let mut referenced = Table {
+                columns: shape.columns.clone(),
+                ..Default::default()
+            };
+            referenced.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["old".into()],
+                storage_parameters: Default::default(),
+            });
+            let before = Schema {
+                tables: [(table.clone(), shape.clone()), (parent.clone(), referenced)].into(),
+                ..Default::default()
+            };
+            let old = IdsFile {
+                tables: [
+                    (owner.clone(), table.clone()),
+                    (reference.clone(), parent.clone()),
+                ]
+                .into(),
+                columns: [
+                    ("c_aaaaaa".parse().unwrap(), table.column("old")),
+                    ("c_bbbbbb".parse().unwrap(), table.column("other")),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            let mut canonical = before.clone();
+            let mut new = old.clone();
+            let after = canonical.tables.get_mut(&table).unwrap();
+            match kind {
+                // The catalog infers NOT NULL; its absence in YAML is not a change.
+                Part::Computed => after.computed.get_mut("derived").unwrap().not_null = false,
+                // The declaration leaves a generated constraint name to the engine.
+                Part::PrimaryKey => after.primary_key.as_mut().unwrap().name = None,
+                // Parameter-only edits keep the same unique restriction.
+                Part::Unique => {
+                    after
+                        .unique
+                        .get_mut("uq")
+                        .unwrap()
+                        .storage_parameters
+                        .insert("fillfactor".into(), "80".into());
+                }
+                Part::Index => {
+                    after
+                        .indexes
+                        .get_mut("ix")
+                        .unwrap()
+                        .storage_parameters
+                        .insert("fillfactor".into(), "80".into());
+                }
+                // Rename remapping belongs to the differ, including referenced UIDs.
+                Part::ForeignKey => {
+                    after.foreign_keys.get_mut("fk").unwrap().references_table = renamed.clone();
+                    let shape = canonical.tables.remove(&parent).unwrap();
+                    canonical.tables.insert(renamed.clone(), shape);
+                    new.tables.insert(reference.clone(), renamed.clone());
+                }
+                Part::Check => {}
+                Part::Policy => unreachable!(),
+            }
+            for changed in [false, true] {
+                let mut desired = canonical.clone();
+                let after = desired.tables.get_mut(&table).unwrap();
+                if changed {
+                    match kind {
+                        Part::Computed => {
+                            after.computed.get_mut("derived").unwrap().expression =
+                                "other + 1".into()
+                        }
+                        Part::PrimaryKey => {
+                            after.primary_key.as_mut().unwrap().columns = vec!["other".into()]
+                        }
+                        Part::Unique => {
+                            after.unique.get_mut("uq").unwrap().columns = vec!["other".into()]
+                        }
+                        Part::Check => {
+                            after.checks.get_mut("ck").unwrap().expression = "old > 10".into()
+                        }
+                        Part::ForeignKey => {
+                            after.foreign_keys.get_mut("fk").unwrap().on_delete =
+                                ReferentialAction::Cascade
+                        }
+                        Part::Index => {
+                            after.indexes.get_mut("ix").unwrap().columns[0].key =
+                                IndexKey::Column("other".into())
+                        }
+                        Part::Policy => unreachable!(),
+                    }
+                }
+                let restoration = match kind {
+                    Part::Computed => Change::DropComputedColumn {
+                        table: table.clone(),
+                        name: "derived".into(),
+                        computed: shape.computed["derived"].clone(),
+                    },
+                    Part::PrimaryKey => Change::SetPrimaryKey {
+                        table: table.clone(),
+                        from: None,
+                        to: after.primary_key.clone(),
+                        nonclustered: !after.primary_key_is_clustered(),
+                    },
+                    Part::Unique => Change::AddUnique {
+                        table: table.clone(),
+                        name: "uq".into(),
+                        constraint: after.unique["uq"].clone(),
+                        clustered: after.unique_is_clustered("uq"),
+                    },
+                    // The physical rebuild can carry the engine's expression spelling.
+                    Part::Check => Change::AddCheck {
+                        table: table.clone(),
+                        name: "ck".into(),
+                        constraint: CheckConstraint {
+                            expression: if changed { "old > 10" } else { "((old)>(0))" }.into(),
+                        },
+                    },
+                    Part::ForeignKey => Change::AddForeignKey {
+                        table: table.clone(),
+                        name: "fk".into(),
+                        constraint: Box::new(after.foreign_keys["fk"].clone()),
+                    },
+                    Part::Index => Change::AddIndex {
+                        table: table.clone(),
+                        name: "ix".into(),
+                        index: Box::new(after.indexes["ix"].clone()),
+                        clustered: after.index_is_clustered("ix"),
+                    },
+                    Part::Policy => unreachable!(),
+                };
+                let compare = restoration_comparison(
+                    Side {
+                        schema: &before,
+                        ids: &old,
+                    },
+                    Side {
+                        schema: &desired,
+                        ids: &new,
+                    },
+                    &MinimalDialect,
+                );
+                assert_eq!(
+                    compare(&restoration, Some(&owner)),
+                    !changed,
+                    "{kind:?}, changed={changed}"
+                );
+                assert!(!compare(&restoration, None), "a part needs its owner");
+                let absent = IdsFile::default();
+                let unavailable = restoration_comparison(
+                    Side {
+                        schema: &before,
+                        ids: &absent,
+                    },
+                    Side {
+                        schema: &desired,
+                        ids: &new,
+                    },
+                    &MinimalDialect,
+                );
+                assert!(!unavailable(&restoration, Some(&owner)));
+            }
+        }
+    }
+
+    #[test]
+    fn module_decisions_preserve_the_differs_normalization_and_rebuild_boundary() {
+        let before = Module {
+            kind: pbps_model::ModuleKind::View,
+            definition: "CREATE VIEW app.v AS SELECT 1".into(),
+            description: None,
+            options: Default::default(),
+        };
+        let id: ModuleId = "app.v".parse().unwrap();
+        for case in ["description", "formatting", "body", "options", "kind"] {
+            let mut after = before.clone();
+            let expected = match case {
+                "description" => {
+                    after.description = Some("report".into());
+                    ModuleDelta::Unchanged
+                }
+                "formatting" => {
+                    after.definition = "CREATE VIEW app.v AS\r\n SELECT 1\n".into();
+                    ModuleDelta::Unchanged
+                }
+                "body" => {
+                    after.definition = "CREATE VIEW app.v AS SELECT 2".into();
+                    ModuleDelta::Alter
+                }
+                "options" => {
+                    after.options.schemabinding = true;
+                    ModuleDelta::Alter
+                }
+                "kind" => {
+                    after.kind = pbps_model::ModuleKind::Procedure;
+                    ModuleDelta::Rebuild
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                module_delta(&before, &after, &MinimalDialect),
+                expected,
+                "{case}"
+            );
+            let base = Schema {
+                modules: [(id.clone(), before.clone())].into(),
+                ..Default::default()
+            };
+            let declared = Schema {
+                modules: [(id.clone(), after.clone())].into(),
+                ..Default::default()
+            };
+            let mut changes = Vec::new();
+            diff_modules(
+                &base,
+                &declared,
+                &BTreeSet::new(),
+                &MinimalDialect,
+                &mut changes,
+            );
+            assert_eq!(
+                changes.len(),
+                match expected {
+                    ModuleDelta::Unchanged => 0,
+                    ModuleDelta::Alter => 1,
+                    ModuleDelta::Rebuild => 2,
+                },
+                "{case}"
+            );
+            let ids = IdsFile::default();
+            let compare = restoration_comparison(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+            );
+            let drop = Change::DropModule {
+                id: id.clone(),
+                kind: before.kind,
+            };
+            let create = Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(after),
+            };
+            for change in [&drop, &create] {
+                assert_eq!(
+                    compare(change, None),
+                    expected == ModuleDelta::Unchanged,
+                    "{case}"
+                );
+            }
+            let missing = Schema::default();
+            let unavailable = restoration_comparison(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                Side {
+                    schema: &missing,
+                    ids: &ids,
+                },
+                &MinimalDialect,
+            );
+            assert!(!unavailable(&drop, None));
+        }
+    }
+
+    #[test]
+    fn default_decisions_compare_the_declared_opaque_expression_and_its_absence() {
+        for (before, after, different) in [
+            (None, None, false),
+            (Some("app.f()"), Some("app.f()"), false),
+            (None, Some("app.f()"), true),
+            (Some("app.f()"), None, true),
+            (Some("app.f()"), Some("app.f() + 1"), true),
+        ] {
+            let before = before.map(str::to_owned);
+            let after = after.map(str::to_owned);
+            assert_eq!(defaults_differ(before.as_ref(), after.as_ref()), different);
+        }
+    }
+
+    #[test]
+    fn restoration_comparison_distinguishes_unchanged_defaults_from_edits_and_missing_identity() {
+        use pbps_model::{PartitionBound, PartitionColumn, PartitionOf};
+        let parent: TableName = "app.parent".parse().unwrap();
+        let name: TableName = "app.t".parse().unwrap();
+        let owner: Uid = "t_aaaaaa".parse().unwrap();
+        let column: Uid = "c_aaaaaa".parse().unwrap();
+        for partition in [false, true] {
+            let mut spec = Column::new(ty("int"));
+            spec.value_source = ValueSource::Default("app.f()".into());
+            let shape = table(&[("old", spec)]);
+            let mut before = schema_of("app.t", shape.clone());
+            if partition {
+                before.tables.insert(parent.clone(), shape);
+                before.tables.insert(
+                    name.clone(),
+                    Table {
+                        partition_of: Some(PartitionOf {
+                            parent: parent.clone(),
+                            bound: PartitionBound::Default,
+                            columns: [(
+                                "old".into(),
+                                PartitionColumn {
+                                    default: Some("app.f()".into()),
+                                    not_null: false,
+                                },
+                            )]
+                            .into(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+            let ids = IdsFile {
+                tables: [
+                    (owner.clone(), name.clone()),
+                    ("t_bbbbbb".parse().unwrap(), parent.clone()),
+                ]
+                .into(),
+                columns: [(
+                    column.clone(),
+                    if partition {
+                        parent.column("old")
+                    } else {
+                        name.column("old")
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            for changed in [false, true] {
+                let mut after = before.clone();
+                let desired = if changed { "app.f() + 1" } else { "app.f()" };
+                let shape = after.tables.get_mut(&name).unwrap();
+                if partition {
+                    shape
+                        .partition_of
+                        .as_mut()
+                        .unwrap()
+                        .columns
+                        .get_mut("old")
+                        .unwrap()
+                        .default = Some(desired.into());
+                } else {
+                    shape.columns.get_mut("old").unwrap().value_source =
+                        ValueSource::Default(desired.into());
+                }
+                let compare = restoration_comparison(
+                    Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    Side {
+                        schema: &after,
+                        ids: &ids,
+                    },
+                    &MinimalDialect,
+                );
+                for (from, to) in [(Some("app.f()".into()), None), (None, Some(desired.into()))] {
+                    let change = if partition {
+                        Change::SetPartitionDefault {
+                            uid: owner.clone(),
+                            table: name.clone(),
+                            parent: parent.clone(),
+                            column: "old".into(),
+                            from,
+                            to,
+                            fallback: Some("app.f()".into()),
+                        }
+                    } else {
+                        Change::AlterColumnDefault {
+                            uid: column.clone(),
+                            column: name.column("old"),
+                            from,
+                            to,
+                        }
+                    };
+                    assert_eq!(
+                        compare(&change, Some(&owner)),
+                        !changed,
+                        "partition={partition}, changed={changed}"
+                    );
+                    let absent = IdsFile::default();
+                    let unavailable = restoration_comparison(
+                        Side {
+                            schema: &before,
+                            ids: &absent,
+                        },
+                        Side {
+                            schema: &after,
+                            ids: &ids,
+                        },
+                        &MinimalDialect,
+                    );
+                    assert!(!unavailable(&change, Some(&owner)));
+                }
+                let unrelated = Change::SetColumnDeprecated {
+                    uid: column.clone(),
+                    column: name.column("old"),
+                    reason: None,
+                };
+                assert!(!compare(&unrelated, Some(&owner)));
+            }
+        }
     }
 }
 
