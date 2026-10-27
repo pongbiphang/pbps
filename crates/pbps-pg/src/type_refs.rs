@@ -506,17 +506,8 @@ pub async fn input_routines(
     trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
 ) -> Result<BTreeSet<i64>, DbError> {
-    use crate::input_path::{Added, InputPath, Reason, Why};
-    let types = read(conn, within, references).await?;
-    let added: Vec<_> = types
-        .iter()
-        .flat_map(|ty| [Added::new(ty, true), Added::new(ty, false)])
-        .collect();
-    let roles: Vec<_> = trusted.iter().cloned().collect();
-    let answers = crate::input_path::read(conn, within, &roles, &added).await;
-    if answers.len() != added.len() {
-        return Err(failed("the input-path read returned an incomplete answer"));
-    }
+    use crate::input_path::{InputPath, Reason, Why};
+    let answers = input_answers(conn, within, references, trusted).await?;
     let mut roots = BTreeSet::new();
     for (index, mut answer) in answers.into_iter().enumerate() {
         if let InputPath::Refused(reasons) = &mut answer {
@@ -539,6 +530,76 @@ pub async fn input_routines(
         }
     }
     Ok(roots)
+}
+
+/// A bound tree can prove ineligible code, or fail to supply a verdict.
+#[derive(Debug, thiserror::Error)]
+pub enum CodeVetError {
+    #[error("{0}")]
+    Refused(String),
+    #[error("{0}")]
+    Unreadable(String),
+}
+
+/// Advisory scratch vet: target owner trust is checked only inside apply.
+/// Uses no trusted roles and never pins user routines (DEC-2309.1).
+pub async fn vet_code(
+    conn: &mut Conn,
+    within: Within,
+    references: &[TypeRef],
+) -> Result<(), CodeVetError> {
+    let answers = input_answers(conn, within, references, &BTreeSet::new())
+        .await
+        .map_err(|error| CodeVetError::Unreadable(error.to_string()))?;
+    for (index, answer) in answers.into_iter().enumerate() {
+        code_answer(answer, &references[index / 2])?;
+    }
+    Ok(())
+}
+
+fn code_only(mut answer: crate::input_path::InputPath) -> crate::input_path::InputPath {
+    if let crate::input_path::InputPath::Refused(reasons) = &mut answer {
+        reasons.retain(|reason| matches!(reason, crate::input_path::Reason::Routine(_)));
+    }
+    answer
+}
+
+fn code_answer(
+    answer: crate::input_path::InputPath,
+    reference: &TypeRef,
+) -> Result<(), CodeVetError> {
+    use crate::input_path::InputPath;
+    let answer = code_only(answer);
+    if matches!(&answer, InputPath::Refused(reasons) if reasons.is_empty()) {
+        return Ok(());
+    }
+    match answer.refusal(reference) {
+        None => Ok(()),
+        Some(why) if matches!(answer, InputPath::Unreadable(_)) => {
+            Err(CodeVetError::Unreadable(why))
+        }
+        Some(why) => Err(CodeVetError::Refused(why)),
+    }
+}
+
+async fn input_answers(
+    conn: &mut Conn,
+    within: Within,
+    references: &[TypeRef],
+    trusted: &BTreeSet<pbps_model::RoleName>,
+) -> Result<Vec<crate::input_path::InputPath>, DbError> {
+    use crate::input_path::Added;
+    let types = read(conn, within, references).await?;
+    let added: Vec<_> = types
+        .iter()
+        .flat_map(|ty| [Added::new(ty, true), Added::new(ty, false)])
+        .collect();
+    let roles: Vec<_> = trusted.iter().cloned().collect();
+    let answers = crate::input_path::read(conn, within, &roles, &added).await;
+    if answers.len() != added.len() {
+        return Err(failed("the input-path read returned an incomplete answer"));
+    }
+    Ok(answers)
 }
 
 /// Offline reconstruction asserts prerequisites before it creates any object.
@@ -1102,5 +1163,70 @@ mod tests {
         let from_pin = TypeRef::new(&pins[0].schema, &pins[0].name).unwrap();
         assert_eq!(from_pin, raw);
         assert!(references(&[&schema], &ChangeSet::default()).contains(&from_pin));
+    }
+}
+
+#[cfg(test)]
+mod code_only_tests {
+    use super::*;
+    use crate::input_path::{
+        InputPath, OwnerReason, Part, Reason, RoutineKind, RoutineOwnerReason, RoutineReason,
+        Unreadable, Use, Why,
+    };
+
+    #[test]
+    fn scratch_code_vetting_ignores_owners_keeps_routines_and_refuses_unreadable_trees() {
+        let owner = Reason::Owner(OwnerReason {
+            ty: "app.d".into(),
+            owner: "deployer".into(),
+            actor: "deployer".into(),
+        });
+        let routine_owner = Reason::RoutineOwner(RoutineOwnerReason {
+            kind: RoutineKind::Function,
+            identity: "app.f(text)".into(),
+            owner: "deployer".into(),
+            actor: "deployer".into(),
+        });
+        assert_eq!(
+            code_only(InputPath::Refused(vec![
+                owner.clone(),
+                routine_owner.clone()
+            ])),
+            InputPath::Refused(vec![])
+        );
+        for why in [Why::NotBuiltin, Why::RunsSql] {
+            let routine = Reason::Routine(RoutineReason {
+                kind: RoutineKind::Function,
+                identity: "app.f(text)".into(),
+                runs: None,
+                owner: "deployer".into(),
+                why,
+                oid: 16384,
+                used_by: Use {
+                    ty: "app.d".into(),
+                    part: Part::Default,
+                },
+            });
+            assert_eq!(
+                code_only(InputPath::Refused(vec![
+                    owner.clone(),
+                    routine.clone(),
+                    routine_owner.clone()
+                ])),
+                InputPath::Refused(vec![routine])
+            );
+        }
+        let unreadable = InputPath::Unreadable(Unreadable::Failed("unknown tree".into()));
+        assert!(matches!(
+            code_answer(unreadable.clone(), &"app.d".parse().unwrap()),
+            Err(CodeVetError::Unreadable(_))
+        ));
+        assert_eq!(code_only(unreadable.clone()), unreadable);
+        assert!(
+            code_only(unreadable)
+                .refusal(&"app.d".parse().unwrap())
+                .unwrap()
+                .contains("unknown tree")
+        );
     }
 }

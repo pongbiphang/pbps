@@ -35,6 +35,7 @@ use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, Scratc
 
 pub use super::engine::{Standard, declared_standard};
 
+pub mod domain;
 pub mod preview;
 pub mod recovery;
 pub mod rehearse;

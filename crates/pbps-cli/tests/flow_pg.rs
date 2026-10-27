@@ -19,6 +19,9 @@ use crate::certified_fixture::FixtureEmission as _;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/domain_vet2309.rs"]
+mod domain_vet2309;
+
 #[path = "support/managed_types.rs"]
 mod managed_types;
 

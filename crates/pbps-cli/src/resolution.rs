@@ -11,6 +11,8 @@
 //!    ordinary connected checks and a fresh recheck of the target
 //!    (DEC-1516.1).
 
+pub mod domain;
+
 use pbps_cli::resolver::server::ProduceError;
 use pbps_config::resolver::ResolverSelection;
 use pbps_diff::resolver::{Answer, Assessment};

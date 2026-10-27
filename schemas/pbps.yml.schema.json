@@ -524,6 +524,27 @@
           "description": "Rule id to its setting.\n\nA map in Rust, a closed list of keys in the editor schema: see\n[`rules_schema`]. `BTreeMap<String, _>` derives to \"any key\", which\nblessed `naming.tabel` in the editor and left the typo to be found by\n`pbps validate` — the opposite of what a generated schema is for\n(DECISIONS 172).",
           "type": "object",
           "properties": {
+            "plan.domain-vet-unavailable": {
+              "description": "Checks the selected scratch can vet declared domain CHECK and DEFAULT code before apply.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
             "naming.table": {
               "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
               "anyOf": [
@@ -785,6 +806,7 @@
         "rule": {
           "type": "string",
           "enum": [
+            "plan.domain-vet-unavailable",
             "naming.table",
             "naming.column",
             "naming.index",
@@ -823,6 +845,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 64,
+  "x-pbps-schema-version": 67,
   "x-pbps-tool-version": "0.0.0"
 }

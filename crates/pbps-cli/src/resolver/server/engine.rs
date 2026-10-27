@@ -189,6 +189,32 @@ pub(super) async fn scratch<'a>(
 }
 
 impl Scratch<'_> {
+    /// A code vet stages only the operator's externals file. Automatic fill
+    /// could install an extension whose absence must be named by CREATE.
+    pub(super) async fn prepare_code(
+        &mut self,
+        provisioning: Provisioning,
+        admin: &mut Conn,
+        target: &CatalogFacts,
+        authorization: &scope::Authorization,
+        schemas: &[String],
+    ) -> Result<Prepared, Error> {
+        match self {
+            Self::Postgres(scratch) => scratch
+                .prepare(
+                    provisioning,
+                    admin,
+                    target,
+                    authorization,
+                    schemas,
+                    &Default::default(),
+                )
+                .await
+                .map(Prepared::Postgres),
+            Self::Mssql(_) => Err(unsupported()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare(
         &mut self,
