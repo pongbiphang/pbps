@@ -592,8 +592,8 @@ mod drop_requirement_tests {
                 conn.execute("CREATE SCHEMA app; CREATE TABLE app.t (amount integer); INSERT INTO app.t VALUES (0)").await.unwrap();
                 let mut statement = Statement::new("ALTER TABLE app.t DROP COLUMN amount");
                 statement.drop_guard = Some(pbps_model::DropGuard {
-                    table: "app.t".parse().unwrap(), detach_from: None,
-                    requirements: [("c_000001".parse().unwrap(), pbps_model::DropRequirement { predicate: "amount = 1".into(), required_at: "2026-10-28".into(), operator: "reviewer".into() })].into(),
+                    table_uid: "t_000001".parse().unwrap(), table: "app.t".parse().unwrap(), detach_from: None,
+                    requirements: [("c_000001".parse().unwrap(), pbps_model::DropRequirement { table_uid: "t_000001".parse().unwrap(), predicate: "amount = 1".into(), required_at: "2026-10-28".into(), operator: "reviewer".into() })].into(),
                 });
                 let statements = [statement];
                 let failed = |_: usize, _: &str, error: &pbps_db::DbError| anyhow::anyhow!(error.to_string());

@@ -5,11 +5,13 @@ use pbps_pg::{Postgres, drop_requirements::check, input_path::vet_requirement};
 
 fn guard(predicate: &str) -> DropGuard {
     DropGuard {
+        table_uid: "t_000001".parse().unwrap(),
         table: "app.t".parse().unwrap(),
         detach_from: None,
         requirements: [(
             "c_000001".parse().unwrap(),
             DropRequirement {
+                table_uid: "t_000001".parse().unwrap(),
                 predicate: predicate.into(),
                 required_at: "2026-10-28".into(),
                 operator: "reviewer".into(),

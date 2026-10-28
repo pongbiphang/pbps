@@ -2642,8 +2642,9 @@ pub(crate) fn diff_partial_rebuilding(
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
     let mut changes = ChangeSet { changes: planned };
-    crate::drop_requirements::assign(&mut changes, base.ids, declared.ids);
-    if let Err(reason) = crate::drop_requirements::validate(&changes, base.ids, declared.ids) {
+    if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)
+        .and_then(|()| crate::drop_requirements::validate(&changes, base.ids, declared.ids))
+    {
         errs.push(DiffError::DropRequirement { reason });
     }
     if !dialect.records_conversions() && changes.changes.iter().any(|p| p.drop_guard.is_some()) {

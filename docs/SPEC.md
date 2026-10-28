@@ -1463,7 +1463,7 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
 `pbps drop <column> --reason <reason> --require <predicate>|- --db <connection>`
 (or `--env <name>`) records a boolean row requirement on the column's UID
 tombstone. `drop-table` accepts the same options. The record contains
-`predicate`, `required_at` and `operator`, and is sealed with the saved plan.
+the owning `table_uid`, `predicate`, `required_at` and `operator`, and is sealed with the saved plan.
 Recording requires the actual target and vets before writing the identity file;
 unlike offline `convert`, it must refuse unsafe code when recorded. Repeating
 `--require` replaces the requirement; omitting it preserves the requirement.

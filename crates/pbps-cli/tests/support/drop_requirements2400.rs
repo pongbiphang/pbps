@@ -494,3 +494,191 @@ fn renamed_table(server: &str) {
         2
     );
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn recording_after_a_table_rename_follows_its_target_uid_on_postgres_18() {
+    record_after_rename(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn recording_after_a_table_rename_follows_its_target_uid_on_postgres_16() {
+    record_after_rename(&old_server());
+}
+
+fn record_after_rename(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_record_rename");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_record_rename", BEFORE);
+    let table_uid = ids(&d).tables.keys().next().unwrap().clone();
+    d.table(&BEFORE.replace("app.t", "app.renamed"));
+    succeeds(d.run(&["rename-table", "app.t", "app.renamed"]));
+    d.table(&AFTER.replace("app.t", "app.renamed"));
+    // A previous holder of this spelling is audit history, not this intent.
+    let mut history = ids(&d);
+    history.tombstones.insert(
+        "c_999999".parse().unwrap(),
+        pbps_model::Tombstone {
+            was: "app.renamed.amount".into(),
+            dropped_at: "2026-10-28".into(),
+            reason: "older holder".into(),
+            operator: "reviewer".into(),
+            require: None,
+        },
+    );
+    std::fs::write(
+        d.dir.join("schema.ids.json"),
+        serde_json::to_vec_pretty(&history).unwrap(),
+    )
+    .unwrap();
+    succeeds(d.run(&[
+        "drop",
+        "app.renamed.amount",
+        "--reason",
+        "copied",
+        "--require",
+        PREDICATE,
+        "--db",
+        connection,
+    ]));
+    let recorded = ids(&d);
+    assert_eq!(
+        recorded
+            .tombstones
+            .values()
+            .find_map(|t| t.require.as_ref())
+            .unwrap()
+            .table_uid,
+        table_uid
+    );
+    let plan = connected_artifact(&d, connection, false);
+    let saved: SavedPlan = serde_json::from_slice(&std::fs::read(plan).unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .find_map(|s| s.drop_guard.as_ref())
+            .unwrap()
+            .table_uid,
+        table_uid
+    );
+    // Negative: the dependency follows this UID through the rename too.
+    d.table(
+        &AFTER
+            .replace("app.t", "app.renamed")
+            .replace("  cents:", "  amount_cents:"),
+    );
+    succeeds(d.run(&["rename", "app.renamed.cents", "amount_cents"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("names a column changed by this plan; split the plan"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn a_reused_table_name_does_not_match_the_dropped_holder_on_postgres_18() {
+    reused_name(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn a_reused_table_name_does_not_match_the_dropped_holder_on_postgres_16() {
+    reused_name(&old_server());
+}
+
+fn reused_name(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_reuse");
+    let connection = own.connection();
+    let d = bootstrapped_demo(
+        connection,
+        "require2400_reuse",
+        &BEFORE.replace("app.t", "app.old"),
+    );
+    let old_uid = ids(&d).tables.keys().next().unwrap().clone();
+    on_server(connection, "INSERT INTO app.old VALUES (1,0,100)");
+    let other = BEFORE
+        .replace("app.t", "app.other")
+        .replace("pk_t", "pk_other");
+    std::fs::write(d.dir.join("schema/app.other.yml"), &other).unwrap();
+    let setup = connected_artifact(&d, connection, false);
+    succeeds(approved_apply(&d, connection, &setup, &[]));
+    on_server(connection, "INSERT INTO app.other VALUES (2,2,200)");
+    std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+    succeeds(d.run(&[
+        "drop-table",
+        "app.old",
+        "--reason",
+        "archived",
+        "--require",
+        "amount > 0",
+        "--db",
+        connection,
+    ]));
+    std::fs::write(
+        d.dir.join("schema/app.other.yml"),
+        other
+            .replace("app.other", "app.old")
+            .replace("amount: {type: integer}", "amount: {type: bigint}"),
+    )
+    .unwrap();
+    succeeds(d.run(&["rename-table", "app.other", "app.old"]));
+    let plan = connected_artifact(&d, connection, false);
+    let saved: SavedPlan = serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let guard = saved
+        .changes
+        .changes
+        .iter()
+        .find_map(|s| s.drop_guard.as_ref())
+        .unwrap();
+    assert_eq!(guard.table_uid, old_uid);
+    assert_ne!(saved.ids.tables.keys().next().unwrap(), &old_uid);
+    // Negative: the replacement has only good rows. It must not answer the
+    // requirement belonging to the old holder, whose bad row still refuses.
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "rename,destructive"]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("1 row(s) of app.old violate"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM app.old WHERE amount=0"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM app.other WHERE amount=2"
+        ),
+        1
+    );
+    on_server(connection, "UPDATE app.old SET amount=1");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename,destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM app.old WHERE id=2 AND amount=2"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='old' AND column_name='amount' AND data_type='bigint'"
+        ),
+        1
+    );
+}

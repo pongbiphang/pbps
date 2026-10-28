@@ -4484,7 +4484,7 @@ fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
 fn cmd_intent_with(
     project: &Project,
     batch: IntentBatch,
-    update: impl FnOnce(&mut IdsFile) -> anyhow::Result<()>,
+    update: impl FnOnce(&mut pbps_diff::Resolution) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
@@ -4502,7 +4502,7 @@ fn cmd_intent_with(
     ) {
         Ok(mut res) => {
             pbps_diff::conversion::prune(&mut res.ids, &loaded.schema, dialect(project)?.as_ref());
-            update(&mut res.ids)?;
+            update(&mut res)?;
             if res.ids == ids {
                 println!(
                     "The identity file is unchanged; these intents may have taken effect already."

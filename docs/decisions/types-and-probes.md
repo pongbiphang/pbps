@@ -4066,7 +4066,7 @@ boundaries, built-in casts, source UID separation and nonliteral refusal.
 
 **DEC-2400.1. A recorded drop's row requirement is vetted against the target
 and checked under the lock held through its removal.** `Tombstone.require`
-holds the verbatim predicate, recording operator and date; absence preserves
+holds the owning table UID, verbatim predicate, recording operator and date; absence preserves
 old ids/plan/state bytes. Connected recording refuses before the ids write,
 unlike offline conversion recording (ADR-0020). Re-recording replaces the
 requirement, omission preserves it and `--clear-require` removes it explicitly.
@@ -4074,6 +4074,12 @@ The UID selects intent; a table drop also selects its removed column UIDs.
 Typed guard metadata travels with the certified drop and is rechecked against
 the retained baseline before apply. It is never reconstructed from emitted SQL
 or a tombstone's rendered address.
+Recording resolves the selected retired UID through the target baseline, never
+through the declaration's table address. The guard carries that table UID;
+`PlanNames` resolves its holder and changed-column owners at each operation.
+Referenced column UIDs are bound at Start, so table/column renames follow the
+identity and an address reused by another holder cannot match. Missing identity
+evidence refuses without an address fallback.
 
 PostgreSQL extends the existing CHECK binding and DEC-2181.1 decoder, retaining
 DEC-2378.1's Parse/Describe and modifier guards and DEC-2378.2's empty path.

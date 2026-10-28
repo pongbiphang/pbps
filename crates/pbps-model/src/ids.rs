@@ -64,7 +64,7 @@ pub enum IdsError {
     InvalidConversion { uid: Uid },
 
     #[error(
-        "the row requirement recorded for {uid} is blank or is not on a table or column tombstone"
+        "the row requirement recorded for {uid} is blank, has an invalid table identity or is not on a table or column tombstone"
     )]
     InvalidDropRequirement { uid: Uid },
 
@@ -217,6 +217,8 @@ pub struct Tombstone {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DropRequirement {
+    /// The owning identity, not the address at which the intent was recorded.
+    pub table_uid: Uid,
     pub predicate: String,
     pub required_at: String,
     pub operator: String,
@@ -226,6 +228,7 @@ pub struct DropRequirement {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DropGuard {
+    pub table_uid: Uid,
     pub table: TableName,
     pub detach_from: Option<TableName>,
     pub requirements: BTreeMap<Uid, DropRequirement>,
@@ -475,7 +478,9 @@ impl IdsFile {
         for (uid, tombstone) in &self.tombstones {
             if let Some(requirement) = &tombstone.require
                 && (requirement.predicate.trim().is_empty()
-                    || !matches!(uid.kind(), UidKind::Table | UidKind::Column))
+                    || requirement.table_uid.kind() != UidKind::Table
+                    || !matches!(uid.kind(), UidKind::Table | UidKind::Column)
+                    || (uid.kind() == UidKind::Table && uid != &requirement.table_uid))
             {
                 return Err(IdsError::InvalidDropRequirement { uid: uid.clone() });
             }

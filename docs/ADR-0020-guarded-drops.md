@@ -17,7 +17,7 @@ the tombstone by uid, with the recording operator and time, and is covered by
 the saved plan's checksum. Plan and apply cannot supply a replacement predicate.
 The requirements of columns removed by a table drop are honored too.
 
-`require` contains `predicate`, `required_at` and `operator`. Repeating
+`require` contains the owning `table_uid`, `predicate`, `required_at` and `operator`. Repeating
 `--require` adds or replaces it; omission preserves it. `--clear-require`
 removes it explicitly. Changing a historical tombstone requires an unambiguous
 UID; it does not replace the original drop's reason, operator or date.
@@ -27,6 +27,11 @@ UID; it does not replace the original drop's reason, operator or date.
 Recording a guarded drop needs a target connection and vets the predicate
 before writing the identity file. The desired declarations can already omit
 the column or table, so the actual target supplies its column scope and types.
+The selected retired UID resolves through the target baseline to its table UID.
+Requirements and derived guards retain that UID; `PlanNames` resolves holders
+at each operation, and dependency checks compare referenced column UIDs. A
+rename follows the identity; reuse of its old address cannot match another
+holder. Missing baseline identity evidence refuses without a name fallback.
 The offline `convert` command records a conversion against its Git source
 declaration and defers connected vetting; a drop requirement must instead be
 refused when recorded, before any durable write, as acceptance test 3 requires.

@@ -99,20 +99,17 @@ pub async fn vet_drop_requirements(
         let Some(guard) = &step.drop_guard else {
             continue;
         };
-        // Resolve the drop's holder before translating it to its stored name;
-        // an earlier rename may have vacated or reassigned this address.
+        // The UID survives renames and address reuse. Never fall back to an
+        // address when the target has no stored evidence for this identity.
         let table = names
-            .stored(&guard.table, pbps_model::plan_names::At::Before(index))
-            .unwrap_or_else(|| guard.table.clone());
+            .table_at(&guard.table_uid, pbps_model::plan_names::At::Start)
+            .ok_or_else(|| {
+                anyhow::anyhow!("the requirement's table identity has no stored target")
+            })?;
         for requirement in guard.requirements.values() {
-            let columns = vet_drop_requirement(conn, &table, &requirement.predicate).await?;
-            pbps_diff::drop_requirements::check_columns(
-                guard,
-                &step.change,
-                names.changes(),
-                &columns,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let columns = vet_drop_requirement(conn, table, &requirement.predicate).await?;
+            pbps_diff::drop_requirements::check_columns(guard, index, names, &columns)
+                .map_err(anyhow::Error::msg)?;
         }
     }
     Ok(())

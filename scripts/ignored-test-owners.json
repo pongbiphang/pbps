@@ -2792,7 +2792,11 @@
         "drop_requirements2400::a_table_drop_honors_its_removed_columns_requirements_on_postgres_18",
         "drop_requirements2400::a_table_drop_honors_its_removed_columns_requirements_on_postgres_16",
         "drop_requirements2400::guarded_column_drops_follow_their_table_through_a_rename_on_postgres_18",
-        "drop_requirements2400::guarded_column_drops_follow_their_table_through_a_rename_on_postgres_16"
+        "drop_requirements2400::guarded_column_drops_follow_their_table_through_a_rename_on_postgres_16",
+        "drop_requirements2400::recording_after_a_table_rename_follows_its_target_uid_on_postgres_18",
+        "drop_requirements2400::recording_after_a_table_rename_follows_its_target_uid_on_postgres_16",
+        "drop_requirements2400::a_reused_table_name_does_not_match_the_dropped_holder_on_postgres_18",
+        "drop_requirements2400::a_reused_table_name_does_not_match_the_dropped_holder_on_postgres_16"
       ]
     },
     {
