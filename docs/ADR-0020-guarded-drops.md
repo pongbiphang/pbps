@@ -83,7 +83,7 @@ introduce a built-in contract-verification language.
 
 ## Formats and delivery
 
-Identity-file version 1 and state version 34 remain unchanged. Compatibility
+Identity-file version 1 and the current state version 35 remain unchanged by this feature. Compatibility
 tests retain their bytes when there is no requirement. Schema set 69 publishes
 the new shape and merges after #2451's set 68. PostgreSQL ships in PR 1; the
 issue stays open for the SQL Server integration.

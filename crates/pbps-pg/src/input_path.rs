@@ -970,7 +970,10 @@ pub async fn vet_requirement(
         .await
         .map_err(|_| refused("could not be vetted: no transaction to bind it in"))?;
     let result = async {
-        conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set").await.map_err(|_| refused("could not be vetted: its resolution path could not be pinned"))?;
+        // Recording and early planning start fresh sessions. Bind under the
+        // same parser settings as apply, including the target's captured zone.
+        let zone = conn.session_zone().cloned().unwrap_or_else(pbps_model::SessionZone::utc);
+        conn.execute(&crate::session_pins(&zone)).await.map_err(|_| refused("could not be vetted: its session settings could not be pinned"))?;
         let rows = conn.query_with("SELECT count(*)::pg_catalog.int4 AS columns FROM pg_catalog.pg_attribute WHERE attrelid OPERATOR(pg_catalog.=) $1::pg_catalog.text::pg_catalog.regclass AND attnum OPERATOR(pg_catalog.>) 0 AND NOT attisdropped", &[pbps_db::Param::Str(&qualified)]).await.map_err(|_| refused("could not be vetted: its table columns could not be read"))?;
         let columns: i32 = rows.first().and_then(|r| r.try_get("columns").ok().flatten()).ok_or_else(|| refused("could not be vetted: its table columns are unreadable"))?;
         if let Some(inputs) = literal_inputs::before_bind(conn, predicate, None).await? {
@@ -1948,7 +1951,16 @@ pub(crate) async fn vet_copy_conversion(
 ) -> Result<(), String> {
     let name = crate::quote(column.raw()).map_err(|e| e.to_string())?;
     let ty = crate::types::normalize(from).map_err(|e| e.to_string())?;
-    vet_in_transaction(conn, &name, &ty.raw().to_string(), using, column.raw()).await?;
+    vet_in_transaction(
+        conn,
+        &name,
+        &ty.raw().to_string(),
+        using,
+        column.raw(),
+        1,
+        false,
+    )
+    .await?;
     conn.execute("DROP TABLE pg_temp.pbps_conversion")
         .await
         .map_err(|_| "rebuild conversion binding could not be removed".to_owned())?;

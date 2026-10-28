@@ -200,6 +200,82 @@ fn outcome(server: &str) {
 
 #[test]
 #[ignore = "needs live PostgreSQL 18"]
+fn requirements_parse_identically_at_record_plan_and_apply_under_dmy_defaults_on_postgres_18() {
+    parser_settings(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn requirements_parse_identically_at_record_plan_and_apply_under_dmy_defaults_on_postgres_16() {
+    parser_settings(&old_server());
+}
+
+fn parser_settings(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_parser");
+    let connection = own.connection();
+    on_server(
+        server,
+        &format!("ALTER DATABASE \"{}\" SET DateStyle = 'ISO, DMY'", own.name),
+    );
+    let before = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  d: {type: date}\n  amount: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\n";
+    let d = bootstrapped_demo(connection, "require2400_parser", before);
+    on_server(
+        connection,
+        "INSERT INTO app.t VALUES (1,DATE '2026-01-01',7),(2,DATE '2026-01-15',8)",
+    );
+    d.table(&before.replace("  amount: {type: integer}\n", ""));
+    // The first date cannot parse under DMY; the second means a different
+    // threshold there. Recording, planning and counting must all use MDY.
+    let predicate = "d < DATE '12/31/2026' AND d < DATE '01/02/2026'";
+    record(&d, connection, predicate);
+    let plan = connected_artifact(&d, connection, false);
+    let expected = scalar(
+        connection,
+        "SELECT count(*) FROM app.t WHERE (d < DATE '2026-12-31' AND d < DATE '2026-01-02') IS NOT TRUE",
+    );
+    assert_eq!(expected, 1);
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM app.t WHERE (d < DATE '2026-12-31' AND d < DATE '2026-02-01') IS NOT TRUE"
+        ),
+        0,
+        "the DMY interpretation would count a different number of violations"
+    );
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "destructive"]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains(&format!(
+            "{expected} row(s) of app.t violate the row requirement `{predicate}`"
+        )),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='amount'"
+        ),
+        1
+    );
+    on_server(connection, "DELETE FROM app.t WHERE id=2");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='amount'"
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
 fn a_violating_row_after_plan_refuses_and_rolls_back_the_drop_on_postgres_18() {
     late_row(&server());
 }

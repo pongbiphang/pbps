@@ -4083,6 +4083,9 @@ evidence refuses without an address fallback.
 
 PostgreSQL extends the existing CHECK binding and DEC-2181.1 decoder, retaining
 DEC-2378.1's Parse/Describe and modifier guards and DEC-2378.2's empty path.
+The shared requirement vetter establishes apply's existing session pins before
+binding, retaining the target's captured time zone, so recording, planning and
+apply parse the predicate identically even under different session defaults.
 `LIKE ... EXCLUDING ALL` copies the actual table's column type identities
 without calling their modifier inputs; this was measured with an advisory-lock
 witness on 16.15 and 18.6. The boolean CHECK retains the tree and its `conkey`

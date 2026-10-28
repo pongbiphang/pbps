@@ -2785,6 +2785,8 @@
       "cases": [
         "drop_requirements2400::guarded_drops_record_replace_clear_pin_and_apply_on_postgres_18",
         "drop_requirements2400::guarded_drops_record_replace_clear_pin_and_apply_on_postgres_16",
+        "drop_requirements2400::requirements_parse_identically_at_record_plan_and_apply_under_dmy_defaults_on_postgres_18",
+        "drop_requirements2400::requirements_parse_identically_at_record_plan_and_apply_under_dmy_defaults_on_postgres_16",
         "drop_requirements2400::a_violating_row_after_plan_refuses_and_rolls_back_the_drop_on_postgres_18",
         "drop_requirements2400::a_violating_row_after_plan_refuses_and_rolls_back_the_drop_on_postgres_16",
         "drop_requirements2400::unsafe_recording_writes_nothing_and_referenced_renames_split_the_plan_on_postgres_18",
