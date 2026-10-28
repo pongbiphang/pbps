@@ -449,7 +449,6 @@ How each kind is handled today:
 |---|---|
 | Publications, subscriptions, standalone sequences, user-defined operators, operator classes and casts, extended statistics, event triggers, tablespaces, collation objects, unused range, multirange and base types, transforms, large objects, comments on extensions | #2444 |
 | Column `STORAGE` and `COMPRESSION`, a table in a non-default tablespace, a view column `DEFAULT` | #2445 |
-| Column-level grants and `WITH GRANT OPTION` on a managed table (named by pull, not by `plan --db`) | #2446 |
 
 ### Named, no support planned yet
 
@@ -493,6 +492,11 @@ How each kind is handled today:
   - user-defined aggregates and window functions;
   - triggers that are disabled or set to `ENABLE REPLICA` / `ENABLE ALWAYS`.
 - **Privileges**
+  - column-level grants and `WITH GRANT OPTION`: pull names them; connected
+    plan refuses them for managed grantees on managed targets, and reports
+    `plan.unmanaged-grant` warnings for unmanaged grantees on those targets
+    (DEC-2446.1). The advisory is outside recorded state. Schema grants keep
+    their declarable-schema scope; targetless findings get no advisory;
   - default privileges (`ALTER DEFAULT PRIVILEGES`).
 - **Domains**
   - a domain's base type and collation changes (#1635 slice 4b);

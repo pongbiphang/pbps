@@ -43,6 +43,21 @@ mod conversions2331;
 #[path = "support/conversions2359.rs"]
 mod conversions2359;
 
+#[path = "support/grant_advisories2446.rs"]
+mod grant_advisories2446;
+
+#[test]
+#[ignore = "needs live PostgreSQL 18; set PBPS_TEST_PG_DB"]
+fn unsupported_unmanaged_grants_are_report_only_on_pg18() {
+    grant_advisories2446::check(&server());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16; set PBPS_TEST_PG_OLD_DB"]
+fn unsupported_unmanaged_grants_are_report_only_on_pg16() {
+    grant_advisories2446::check(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap());
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 #[path = "support/drop_intent2414.rs"]

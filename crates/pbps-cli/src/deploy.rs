@@ -54,6 +54,9 @@ pub struct Managed {
     /// never ignorable warnings, and no recorder accepts a schema that has any
     /// (see [`managed_limitations`]).
     pub limitations: Vec<String>,
+    /// Unsupported grants to unmanaged roles on managed targets. These are
+    /// report-only context, never scoped state or saved-plan findings (DEC-2446.1).
+    pub permission_advisories: Vec<String>,
     /// The grants this read could see and this connection could not take
     /// away (#251): an entry a third role granted, where no `REVOKE` this
     /// connection runs would carry that grantor.
@@ -2690,6 +2693,10 @@ async fn managed_state_full(
     let pulled = pull(conn, read).await?;
     let unreadable = unreadable_objects(&pulled);
     let limitations = managed_limitations(&pulled, ids, modules, external);
+    let permission_advisories = permission_advisories(&pulled.unexpressible, ids, modules)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let unmanaged_relations = pulled
         .limitations
         .iter()
@@ -2715,6 +2722,7 @@ async fn managed_state_full(
         database_collation: pulled.database_collation.clone(),
         scoped,
         limitations,
+        permission_advisories,
         unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
@@ -4044,27 +4052,80 @@ pub(crate) fn permissions_the_managed_set_keeps<'a>(
     found
         .iter()
         .filter(|u| ids.roles.values().any(|managed| managed == &u.role))
-        .filter(|u| match &u.target {
-            // In the relation namespace, the same question `pbps_diff::scope`
-            // asks of the plain grant beside it: an id carrying a signature is
-            // a routine on an engine that overloads, and there a table of that
-            // name is a different object. Counted, a limitation on somebody
-            // else's table was kept — and refused every plan — because a
-            // managed routine happened to share its name (DECISIONS 176, 384).
-            Some(pbps_model::GrantTarget::Object(o)) => {
-                managed_tables.contains(o)
-                    || modules.iter().any(|id| {
-                        !matches!(id, ModuleId::Routine(_))
-                            && id.referenced_name().as_ref() == Some(o)
-                    })
-            }
-            Some(pbps_model::GrantTarget::Routine(r)) => modules
-                .iter()
-                .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
-            Some(pbps_model::GrantTarget::Sequence(c)) => managed_tables.contains(&c.table),
-            Some(pbps_model::GrantTarget::Schema(_)) | None => true,
+        .filter(|u| {
+            u.target
+                .as_ref()
+                .is_none_or(|target| permission_target_is_managed(target, &managed_tables, modules))
         })
         .map(|u| u.what.as_str())
+        .collect()
+}
+
+/// One target cut for fatal permissions and report-only advisories. A routine
+/// signature must not capture a relation of the same name (DECISIONS 176, 384).
+fn permission_target_is_managed(
+    target: &pbps_model::GrantTarget,
+    tables: &BTreeSet<&TableName>,
+    modules: &BTreeSet<ModuleId>,
+) -> bool {
+    match target {
+        pbps_model::GrantTarget::Object(o) => {
+            tables.contains(o)
+                || modules.iter().any(|id| {
+                    !matches!(id, ModuleId::Routine(_)) && id.referenced_name().as_ref() == Some(o)
+                })
+        }
+        pbps_model::GrantTarget::Routine(r) => modules
+            .iter()
+            .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
+        pbps_model::GrantTarget::Sequence(c) => tables.contains(&c.table),
+        // Schema grants are declarable independently of object identities;
+        // preserve the fatal filter's existing schema scope (DEC-2446.1).
+        pbps_model::GrantTarget::Schema(_) => true,
+    }
+}
+
+fn permission_advisories<'a>(
+    found: &'a [pbps_db::catalog::Unexpressible],
+    ids: &IdsFile,
+    modules: &BTreeSet<ModuleId>,
+) -> Vec<&'a str> {
+    let tables = ids.tables.values().collect();
+    found
+        .iter()
+        .filter(|u| !ids.roles.values().any(|managed| managed == &u.role))
+        // A targetless finding cannot establish managed-object membership.
+        .filter(|u| {
+            u.target
+                .as_ref()
+                .is_some_and(|target| permission_target_is_managed(target, &tables, modules))
+        })
+        .map(|u| u.what.as_str())
+        .collect()
+}
+
+fn permission_advisory_findings(
+    advisories: &[String],
+    project: &Project,
+) -> Vec<crate::output::Finding> {
+    let id = pbps_policy::rules::UNMANAGED_GRANT;
+    let policies = project.config.policies();
+    let today = pbps_policy::civil::at(crate::unix_seconds(), 0).date();
+    policies
+        .effective(id)
+        .severity
+        .filter(|_| !policies.suppressed(id, None, &today))
+        .into_iter()
+        .flat_map(|severity| {
+            advisories.iter().map(move |what| {
+                crate::policy_finding(&pbps_model::Finding::new(
+                    id,
+                    severity,
+                    format!("{what}; the grantee is unmanaged, so this permission is outside drift comparison"),
+                    None,
+                ))
+            })
+        })
         .collect()
 }
 
@@ -7381,6 +7442,26 @@ pub fn cmd_plan_db(
         )
         .await?;
         refuse_unexpressible(&managed.scoped, &target.label, "plan again")?;
+        let advisories = permission_advisory_findings(&managed.permission_advisories, project);
+        if !json {
+            eprint!("{}", crate::output::human(&advisories));
+        }
+        let refused_by_policy = advisories
+            .iter()
+            .any(|f| f.severity == crate::output::Severity::Error);
+        findings.extend(advisories);
+        if json {
+            carried.clone_from(&findings);
+        }
+        if refused_by_policy {
+            if json {
+                crate::output::Report::plain("plan", findings).emit_json()?;
+            }
+            bail!(
+                "a policy set to `error` refuses this plan; fix the declarations, or suppress \
+                 the rule in pbps.yml with a reason"
+            );
+        }
         // A connected plan becomes an applyable artifact. If introspection
         // omitted a fact on a recorded table, its scoped checksum can still
         // match while the real database does not; planning from that partial
@@ -16844,6 +16925,69 @@ mod tests {
             ],
             "{kept:?}"
         );
+    }
+
+    #[test]
+    fn permission_advisories_share_the_fatal_target_cut_but_require_an_unmanaged_grantee() {
+        use pbps_db::catalog::Unexpressible;
+        use pbps_model::{ColumnRef, GrantTarget};
+
+        let table: TableName = "app.t".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), table.clone());
+        ids.roles
+            .insert("r_aaaaaa".parse().unwrap(), "managed".into());
+        let modules = ["app.v", "app.f(integer)", "app.only_routine(integer)"]
+            .map(|name| name.parse().unwrap())
+            .into_iter()
+            .collect();
+        let object = |name: &str| Some(GrantTarget::Object(name.parse().unwrap()));
+        let cases = [
+            (object("app.t"), true),
+            (object("app.v"), true),
+            (object("other.t"), false),
+            (object("app.only_routine"), false),
+            (Some("app.f(integer)".parse().unwrap()), true),
+            (Some("app.f(text)".parse().unwrap()), false),
+            (Some("app.t(integer)".parse().unwrap()), false),
+            (
+                Some(GrantTarget::Sequence(ColumnRef::new(table, "id"))),
+                true,
+            ),
+            (
+                Some(GrantTarget::Sequence(ColumnRef::new(
+                    "other.t".parse().unwrap(),
+                    "id",
+                ))),
+                false,
+            ),
+            (Some(GrantTarget::Schema("outside".into())), true),
+            (None, false),
+        ];
+        for (target, advisory_target) in cases {
+            for role in ["managed", "unmanaged"] {
+                let found = [Unexpressible {
+                    role: role.into(),
+                    target: target.clone(),
+                    what: "named catalog finding".into(),
+                }];
+                let fatal = permissions_the_managed_set_keeps(&found, &ids, &modules);
+                let advisory = permission_advisories(&found, &ids, &modules);
+                assert_eq!(
+                    !fatal.is_empty(),
+                    role == "managed" && (advisory_target || target.is_none()),
+                    "fatal: {role} {target:?}"
+                );
+                assert_eq!(
+                    !advisory.is_empty(),
+                    role == "unmanaged" && advisory_target,
+                    "advisory: {role} {target:?}"
+                );
+                assert!(fatal.is_empty() || advisory.is_empty());
+            }
+        }
+        assert!(permission_advisories(&[], &ids, &modules).is_empty());
     }
 
     use super::*;

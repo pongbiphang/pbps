@@ -1833,6 +1833,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 68,
+  "x-pbps-schema-version": 70,
   "x-pbps-tool-version": "0.0.0"
 }
