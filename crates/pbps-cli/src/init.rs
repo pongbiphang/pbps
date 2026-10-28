@@ -213,7 +213,11 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                 (
                     pulled.schema,
                     ids,
-                    pulled.warnings,
+                    pulled
+                        .warnings
+                        .into_iter()
+                        .chain(pulled.catalog_notices)
+                        .collect(),
                     pulled.unmanaged_modules,
                     pulled.onboarding_notices,
                     pulled.public_execute,

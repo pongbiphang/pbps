@@ -24,6 +24,8 @@
 //! pin the empty path — the one value that does not move with the project's
 //! shape — and put back whatever the session had.
 
+mod census;
+
 use pbps_model::ValueSource;
 use std::collections::BTreeMap;
 
@@ -1341,6 +1343,7 @@ fn batch_query(identity: &str) -> String {
         ("session", SESSION.to_owned(), "role"),
         ("baseline_identity", identity.to_owned(), "database_oid"),
         ("owners", owners_query(), "schema_name, object_name, routine_oid, kind"),
+        ("census", census::QUERY.to_owned(), "kind, identity"),
     ]
     .into_iter()
     .map(|(part, query, order)| format!(
@@ -1501,7 +1504,10 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         });
     }
 
-    let mut raw = RawCatalog::default();
+    let mut raw = RawCatalog {
+        catalog_notices: census::notices(batch.get("census").ok_or_else(|| missing("census"))?)?,
+        ..RawCatalog::default()
+    };
     for row in batch.get("types").ok_or_else(|| missing("types"))? {
         // Without these query columns there is no identity to attribute a
         // limitation to. Their failure still means the query and reader differ.
@@ -5215,6 +5221,7 @@ mod tests {
             "default_acls",
             "unheld_modules",
             "owners",
+            "census",
         ] {
             batch.insert(part.to_owned(), Vec::new());
         }

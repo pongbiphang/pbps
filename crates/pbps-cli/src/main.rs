@@ -1831,7 +1831,7 @@ fn cmd_pull(
     for notice in &pulled.onboarding_notices {
         eprintln!("warning: {}", notice);
     }
-    for warning in &pulled.warnings {
+    for warning in pulled.warnings.iter().chain(&pulled.catalog_notices) {
         eprintln!("warning: {warning}");
     }
     // A role's permission the model cannot hold: for `pull` a warning like
@@ -2026,7 +2026,8 @@ fn cmd_pull(
         pulled.schema.types.len(),
         dir.display()
     );
-    let left_out = pulled.warnings.len() + pulled.unexpressible.len();
+    let left_out =
+        pulled.warnings.len() + pulled.catalog_notices.len() + pulled.unexpressible.len();
     if left_out > 0 {
         println!(
             "{left_out} thing(s) could not be expressed and were left out; see the warnings above."

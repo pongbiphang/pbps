@@ -61,6 +61,8 @@ pub struct Managed {
     /// Unsupported grants to unmanaged roles on managed targets. These are
     /// report-only context, never scoped state or saved-plan findings (DEC-2446.1).
     pub permission_advisories: Vec<String>,
+    /// Report-only catalog objects; never attached to plan changes or state.
+    pub catalog_notices: Vec<String>,
     /// The grants this read could see and this connection could not take
     /// away (#251): an entry a third role granted, where no `REVOKE` this
     /// connection runs would carry that grantor.
@@ -2727,6 +2729,7 @@ async fn managed_state_full(
         scoped,
         limitations,
         permission_advisories,
+        catalog_notices: pulled.catalog_notices.clone(),
         unrevocable: pulled.unrevocable.clone(),
         unreadable,
         rows,
@@ -7439,7 +7442,18 @@ fn plan_db(
         )
         .await?;
         refuse_unexpressible(&managed.scoped, &target.label, "plan again")?;
-        let advisories = permission_advisory_findings(&managed.permission_advisories, project);
+        let mut advisories = permission_advisory_findings(&managed.permission_advisories, project);
+        // Both report-only inventories must reach the same policy gate.
+        let policies = project.config.policies();
+        let rule = pbps_policy::rules::UNHELD_OBJECT;
+        let today = pbps_policy::civil::at(crate::unix_seconds(), 0).date();
+        if let Some(severity) = policies.effective(rule).severity
+            && !policies.suppressed(rule, None, &today)
+        {
+            advisories.extend(managed.catalog_notices.iter().map(|message| {
+                crate::policy_finding(&pbps_model::Finding::new(rule, severity, message.clone(), None))
+            }));
+        }
         if !json {
             eprint!("{}", crate::output::human(&advisories));
         }
@@ -16666,6 +16680,7 @@ mod tests {
             baseline_evidence: None,
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
+            catalog_notices: Vec::new(),
             warnings: Vec::new(),
             limitations: Vec::new(),
             unmanaged_modules: Vec::new(),
@@ -22744,6 +22759,7 @@ mod tests {
             baseline_evidence: None,
             schema: Schema::default(),
             onboarding_notices: Vec::new(),
+            catalog_notices: Vec::new(),
             warnings: Vec::new(),
             unexpressible: Vec::new(),
             limitations: vec![
