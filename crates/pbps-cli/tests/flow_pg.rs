@@ -45,6 +45,9 @@ const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 #[path = "support/drop_intent2414.rs"]
 mod drop_intent2414;
 
+#[path = "support/partition_identity.rs"]
+mod partition_identity;
+
 #[test]
 #[ignore = "needs live pg18"]
 fn drop_intent2414_removals_require_recorded_reasons_on_pg18() {

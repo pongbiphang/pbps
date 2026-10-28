@@ -1010,3 +1010,24 @@ and `missing_or_malformed_baseline_identity_is_never_absent_evidence` (unit);
 (live, PostgreSQL 16 and 18, revoked EXECUTE and absent ledger evidence).
 The existing DEC-1852.1 live fixture retains a snapshot
 without evidence to pin the historical fallback and checks apply recording.
+
+<a id="dec-1681-1"></a>
+
+**DEC-1681.1. Read a partition's identity from its parent's same-named column,
+and refuse a partition's own identity sequence (#1681).** Measured on the
+pinned PostgreSQL 16.15 and 18.6 engines: `PARTITION OF` and attaching a plain
+table copy `attidentity` only on 18; neither gives the partition an identity
+sequence dependency. Both use the parent's sequence for inserts through the
+parent. The catalog therefore reads identity kind and sequence facts from
+the parent, matching columns by name because a dropped column can leave
+their attribute numbers different. The tree's column comparison omits the
+local identity marker, but still refuses a different nonempty marker or an
+identity sequence owned by the partition. PostgreSQL 16 allows an attached
+table to retain that sequence, which the declared tree cannot express.
+
+An identity owner without readable sequence facts remains a broken catalog
+read; no missing value receives a default. The issue's declaration must
+bootstrap, verify and plan no changes on both versions. A pull of a BY DEFAULT
+identity with a DEFAULT partition must produce a tree that bootstraps and
+pulls back identically. BY DEFAULT retains its existing warning and projection
+to the declaration's ALWAYS identity.

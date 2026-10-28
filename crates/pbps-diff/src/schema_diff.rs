@@ -4399,7 +4399,9 @@ fn attached(
                     nullable: true,
                     value_source: match &c.value_source {
                         ValueSource::Default(_) | ValueSource::None => ValueSource::None,
-                        ValueSource::Identity(identity) => ValueSource::Identity(*identity),
+                        // A partition takes its parent's identity. Its own is
+                        // refused separately below (DEC-1681.2).
+                        ValueSource::Identity(_) => ValueSource::None,
                         // The parent's serial is a default the partition
                         // copies, not a sequence the attached table owns.
                         // An ordinary table's own sequence still differs.
@@ -4493,7 +4495,7 @@ fn attached(
         for ((name, a), (_, b)) in mine.iter().zip(&theirs) {
             if a != b {
                 what.push(format!(
-                    "its column `{name}` is not its parent's in type, collation, identity or \
+                    "its column `{name}` is not its parent's in type, collation or \
                      generation",
                     name = name.shown(),
                 ));
@@ -4522,6 +4524,13 @@ fn attached(
     let mut own_columns = BTreeMap::new();
     let mut defaultless = Vec::new();
     for (name, c) in &table.columns {
+        if matches!(c.value_source, ValueSource::Identity(_)) {
+            what.push(format!(
+                "its column `{name}` has its own identity; drop the identity in an earlier plan \
+                 before attaching it",
+                name = name.shown(),
+            ));
+        }
         let Some(p) = parent.columns.get(name) else {
             continue;
         };
@@ -13082,6 +13091,49 @@ mod tests {
         };
 
         let base = ordinary(&|_| {});
+        // A plain table takes the parent's identity, but even an identical
+        // identity of its own cannot attach portably (DEC-1681.2).
+        let with_identity = |schema: &Schema, tables: &[&str]| {
+            let mut schema = schema.clone();
+            for name in tables {
+                schema
+                    .tables
+                    .get_mut(&name.parse::<TableName>().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = ValueSource::Identity(pbps_model::Identity {
+                    seed: 1,
+                    increment: 1,
+                    options: Default::default(),
+                });
+            }
+            schema
+        };
+        let identity_base = with_identity(&base, &["app.ev"]);
+        let identity_declared = with_identity(&declared, &["app.ev"]);
+        let plain = outcome(&identity_base, &identity_declared, &[])
+            .2
+            .expect("a plain table attaches under an identity parent");
+        assert_eq!(
+            kinds(&plain),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"]
+        );
+        for (base, declared) in [
+            (with_identity(&base, &["app.t"]), &declared),
+            (
+                with_identity(&base, &["app.ev", "app.t"]),
+                &identity_declared,
+            ),
+        ] {
+            let errors = refused(&base, declared, &[]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|m| m.contains("app.t")
+                        && m.contains("its column `id` has its own identity")),
+                "{errors:?}"
+            );
+        }
         let (base_ids, declared_ids, planned) = outcome(&base, &declared, &[]);
         let planned = planned.expect("an attach is planned");
         assert_eq!(
@@ -14412,11 +14464,9 @@ mod tests {
                 strategy: Default::default(),
             });
             let mut base = schema_of("app.p", parent);
-            let mut ordinary = plain.clone();
-            if let ValueSource::Identity(identity) = &source {
-                ordinary.columns["id"].value_source = ValueSource::Identity(*identity);
-            }
-            base.tables.insert("app.t".parse().unwrap(), ordinary);
+            // The partition takes the parent's identity; the ordinary table
+            // must have none of its own (DEC-1681.2).
+            base.tables.insert("app.t".parse().unwrap(), plain.clone());
             let mut declared = base.clone();
             let partition = Table {
                 partition_of: Some(PartitionOf {
