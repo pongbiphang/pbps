@@ -203,6 +203,30 @@
   },
   "groups": [
     {
+      "target": ["pbps-cli", "bin", "pbps"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["deploy::services::tests::connected_planning_and_apply_use_in_memory_inputs_without_a_plan_file"]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "darwin"],
+      "cases": [
+        "deployment_services1165_command_contracts_on_pg16",
+        "deployment_services1165_command_contracts_on_pg18"
+      ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "darwin"],
+      "cases": ["deployment_services1165_command_contracts_on_mssql"]
+    },
+    {
       "target": ["pbps-cli", "test", "flow"],
       "owner": "mssql",
       "validate_on": "linux",
