@@ -95,12 +95,14 @@ pub async fn vet_drop_requirements(
     conn: &mut Conn,
     names: &pbps_model::plan_names::PlanNames<'_>,
 ) -> anyhow::Result<()> {
-    for step in names.changes() {
+    for (index, step) in names.changes().iter().enumerate() {
         let Some(guard) = &step.drop_guard else {
             continue;
         };
+        // Resolve the drop's holder before translating it to its stored name;
+        // an earlier rename may have vacated or reassigned this address.
         let table = names
-            .stored(&guard.table, pbps_model::plan_names::At::Start)
+            .stored(&guard.table, pbps_model::plan_names::At::Before(index))
             .unwrap_or_else(|| guard.table.clone());
         for requirement in guard.requirements.values() {
             let columns = vet_drop_requirement(conn, &table, &requirement.predicate).await?;

@@ -2790,7 +2790,9 @@
         "drop_requirements2400::unsafe_recording_writes_nothing_and_referenced_renames_split_the_plan_on_postgres_18",
         "drop_requirements2400::unsafe_recording_writes_nothing_and_referenced_renames_split_the_plan_on_postgres_16",
         "drop_requirements2400::a_table_drop_honors_its_removed_columns_requirements_on_postgres_18",
-        "drop_requirements2400::a_table_drop_honors_its_removed_columns_requirements_on_postgres_16"
+        "drop_requirements2400::a_table_drop_honors_its_removed_columns_requirements_on_postgres_16",
+        "drop_requirements2400::guarded_column_drops_follow_their_table_through_a_rename_on_postgres_18",
+        "drop_requirements2400::guarded_column_drops_follow_their_table_through_a_rename_on_postgres_16"
       ]
     },
     {

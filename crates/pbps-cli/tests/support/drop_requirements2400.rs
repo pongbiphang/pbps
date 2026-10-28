@@ -426,3 +426,71 @@ fn table_drop(server: &str) {
             .all(|(_, t)| t.require.is_none())
     );
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn guarded_column_drops_follow_their_table_through_a_rename_on_postgres_18() {
+    renamed_table(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn guarded_column_drops_follow_their_table_through_a_rename_on_postgres_16() {
+    renamed_table(&old_server());
+}
+
+fn renamed_table(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_rename");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_rename", BEFORE);
+    on_server(connection, "INSERT INTO app.t VALUES (1,2,200)");
+    d.table(AFTER);
+    record(&d, connection, PREDICATE);
+    d.table(&AFTER.replace("table: app.t", "table: app.renamed"));
+    succeeds(d.run(&["rename-table", "app.t", "app.renamed"]));
+    let plan = connected_artifact(&d, connection, false);
+    // Negative: execution checks the renamed holder, and a refusal rolls its
+    // preceding rename back together with the drop.
+    on_server(connection, "INSERT INTO app.t VALUES (2,2,0)");
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "rename,destructive"]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("1 row(s) of app.renamed violate"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='amount'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='app' AND table_name='renamed'"
+        ),
+        0
+    );
+    on_server(connection, "UPDATE app.t SET cents=amount*100");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename,destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='renamed' AND column_name='amount'"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM app.renamed WHERE cents=200"
+        ),
+        2
+    );
+}
