@@ -9042,3 +9042,38 @@ An attached table's own identity is refused even when its parameters match
 the parent's: 18 refuses the attach, while 16 keeps an independent sequence
 that the partition declaration cannot hold. Drop that identity in an earlier
 plan before attaching the table. The other column shape requirements remain.
+
+<a id="dec-1896-1"></a>
+
+**DEC-1896.1. A retype runs in a held default's release gap only when the plan
+contains separate release and restoration operations for it.** PostgreSQL's
+`USING` converts stored rows, not a held default. The PostgreSQL 16/18
+measurement `a_retyped_defaults_binding_and_assignment_are_measured_before_rebuild_rules`
+compares `pg_attrdef` identities, routine dependencies and inserted values for
+plain tables and partitioned parents with a different own partition default:
+
+| Retype | Held default, with or without USING | Released/rebuilt/restored |
+| --- | --- | --- |
+| integer to bigint | Accepted; new pg_attrdef OID, same old routine binding | Accepted with or without USING; restored default binds the new routine |
+| text to integer | 42804; USING does not convert the default | USING converts rows; an explicit integer cast restores the rebuilt default |
+| boolean to integer | 42804 | USING converts rows; restoring the boolean default still fails with 42804 |
+
+A parent retype reaches its partitions' own defaults too. Therefore the rule
+is about a default's lifecycle, not a whitelist of widening casts: user casts
+and domains make such a list incomplete. `Requirement::ReleaseGap(Default)`
+states this conditional fact per operation. Graph construction activates it
+only for separate removal and creation operations of the same key; the
+independent verifier indexes the same effect lifetimes and checks absence
+at the retype. A single in-place replacement has no released state. Without
+a pair, there is no obligation and no edge, so a retype with a standing
+default keeps the ordinary plan change for change. An unconditional `Absent`
+would invent an unmet obligation on that valid plan. Existing unconditional
+absence for a changed default remains intact.
+
+No rank, source provenance, edge record, guess policy, wire field or checksum
+changes. The exhaustive operation match remains the classification; adding a
+Change without an arm fails compilation. The matrix keeps the historical
+#1880 cases and their negative; plain/tree retype tests name the paths in
+settle and the sealed proof, and replay independently. The live combined
+rename/attach acceptance is PR 2 after #2296 PR 7 (maintainer decision,
+2026-10-28); PR 1 neither includes those blocked tests nor lifts a guard.

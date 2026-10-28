@@ -4693,6 +4693,111 @@ fn a_new_default_follows_the_retype_of_its_column() {
     ));
 }
 
+fn rebuilt_default_gap() -> Plan {
+    let mut before = table_with(&["c"]);
+    before.columns.get_mut("c").unwrap().value_source =
+        pbps_model::ValueSource::Default("7".into());
+    let mut after = before.clone();
+    after.columns.get_mut("c").unwrap().ty = "bigint".parse().unwrap();
+    let default = |from, to| {
+        p(Change::AlterColumnDefault {
+            uid: uid(UidKind::Column, "t.c"),
+            column: t("t").column("c"),
+            from,
+            to,
+        })
+    };
+    on_one_table(
+        vec![
+            default(Some("7".into()), None),
+            retype_c(),
+            default(None, Some("7".into())),
+        ],
+        before,
+        after,
+        &["c"],
+    )
+}
+
+#[test]
+fn a_release_gap_has_effect_edges_and_independent_absence_replay() {
+    let (ops, fx, baseline) = rebuilt_default_gap().analysed(ModuleEdits::InPlace);
+    let declared = ModuleDeps::new();
+    for checks in [
+        Checks::ALL,
+        Checks {
+            incarnations: false,
+            ..Checks::ALL
+        },
+    ] {
+        let g = graph(ops.as_slice(), &fx, &baseline, &declared, checks);
+        assert!(g.edges.iter().any(|e| e.before == 0
+            && e.after == 1
+            && matches!(e.because, Because::Frees(ObjectKey::Default(_)))));
+        assert!(g.edges.iter().any(|e| e.before == 1
+            && e.after == 2
+            && matches!(e.because, Because::Precedes(ObjectKey::Default(_)))));
+        if checks.incarnations {
+            assert!(run(&ops, &fx, &baseline, &[0, 1, 2], &declared, checks).is_empty());
+        }
+        for order in [[1, 0, 2], [0, 2, 1]] {
+            let bad = run(&ops, &fx, &baseline, &order, &declared, checks);
+            assert!(
+                bad.iter().any(|v| matches!(v,
+                Violation::StillPresent { operation, key: ObjectKey::Default(_) }
+                    if *operation == ops.as_slice()[1].id())),
+                "{order:?}: {bad:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_release_gap_requires_separate_halves_and_otherwise_keeps_the_order() {
+    let mut plan = rebuilt_default_gap();
+    let release = plan.logical[0].clone();
+    let retype = plan.logical[1].clone();
+    let restore = plan.logical[2].clone();
+    let combined = p(Change::AlterColumnDefault {
+        uid: uid(UidKind::Column, "t.c"),
+        column: t("t").column("c"),
+        from: Some("7".into()),
+        to: Some("7".into()),
+    });
+    for logical in [
+        vec![retype.clone()],
+        vec![combined.clone(), retype.clone()],
+        vec![retype.clone(), combined],
+        vec![release, retype.clone()],
+        vec![retype, restore],
+    ] {
+        plan.logical = logical;
+        let (ops, mut fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+        // Isolate the conditional requirement: default creates/removes have
+        // their own ordinary rules; neither half alone activates this one.
+        let with = graph(
+            ops.as_slice(),
+            &fx,
+            &baseline,
+            &ModuleDeps::new(),
+            Checks::ALL,
+        );
+        for e in &mut fx {
+            e.requires
+                .retain(|r| !matches!(r, Requirement::ReleaseGap(_)));
+        }
+        let without = graph(
+            ops.as_slice(),
+            &fx,
+            &baseline,
+            &ModuleDeps::new(),
+            Checks::ALL,
+        );
+        assert_eq!(with.edges, without.edges);
+        assert_eq!(with.unmet.len(), without.unmet.len());
+    }
+}
+
 /// AddUnique: `Reads` of the table's rows.
 #[test]
 fn a_unique_key_follows_the_rows_it_validates() {

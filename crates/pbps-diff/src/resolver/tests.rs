@@ -1235,6 +1235,8 @@ fn new_table_indexes_are_offline_while_existing_table_indexes_keep_the_requested
 
 mod generated_surface_coverage {
     use super::*;
+
+    include!("default_rebuild_matrix.rs");
     use pbps_model::resolver::{Binding, BoundSurface, ObjectIdentity};
     use pbps_model::{Column, Generated, Hints, IdsFile, Schema, Table};
 

@@ -67,6 +67,9 @@ mod user_types_tests;
 #[path = "support/input_path.rs"]
 mod input_path_tests;
 
+#[path = "support/default_rebuild.rs"]
+mod default_rebuild;
+
 #[path = "support/literal_inputs2378.rs"]
 mod literal_inputs2378;
 

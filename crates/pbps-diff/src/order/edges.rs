@@ -293,6 +293,7 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
                 other @ (Requirement::Exists(_)
                 | Requirement::Bound(..)
                 | Requirement::Absent(_)
+                | Requirement::ReleaseGap(_)
                 | Requirement::NotBoundTo { .. }
                 | Requirement::Reads(_)
                 | Requirement::BeforeRewrite(_)
@@ -566,6 +567,17 @@ pub fn graph(
                             operation: b,
                             requirement: requirement.clone(),
                         });
+                    }
+                }
+                Requirement::ReleaseGap(_) => {
+                    for &a in removers {
+                        for &c in creators {
+                            // A single in-place edit has no released state.
+                            if a != c && a != b && c != b {
+                                edge(a, b, Source::Effect, Because::Frees(key.clone()));
+                                edge(b, c, Source::Effect, Because::Precedes(key.clone()));
+                            }
+                        }
                     }
                 }
                 Requirement::Absent(_) => {
