@@ -1493,3 +1493,154 @@ fn derived_domain_overrides_keep_effective_column_attributes() {
         }
     }
 }
+
+fn domain_chain_schema(default: Option<&str>) -> Schema {
+    let mut s = schema();
+    s.types
+        .insert("app.domain".parse().unwrap(), domain(false, default, None));
+    for (name, base) in [("app.derived", "app.domain"), ("app.array", "app.domain[]")] {
+        let mut spec = domain(false, None, None);
+        let pbps_model::ManagedType::Domain { base: ty, .. } = &mut spec else {
+            unreachable!()
+        };
+        *ty = base.parse().unwrap();
+        s.types.insert(name.parse().unwrap(), spec);
+    }
+    s
+}
+
+#[test]
+fn new_not_null_columns_use_scalar_domain_defaults_without_crossing_arrays() {
+    for (ty, default, column_default, compatible) in [
+        ("app.domain", Some("1"), None, true),
+        ("app.derived", Some("1"), None, true),
+        ("app.domain[]", Some("1"), None, false),
+        ("app.derived[]", Some("1"), None, false),
+        ("app.array", Some("1"), None, false),
+        ("app.domain", None, None, false),
+        ("app.derived", None, None, false),
+        ("app.domain[]", Some("1"), Some("ARRAY[3]"), true),
+    ] {
+        let before = domain_chain_schema(default);
+        let mut after = before.clone();
+        let mut new = ids();
+        let mut spec = Column::new(ty.parse().unwrap()).not_null();
+        spec.value_source =
+            column_default.map_or(ValueSource::None, |v| ValueSource::Default(v.into()));
+        new.columns.insert(uid("c_bbbbbb"), name().column("added"));
+        after
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .insert("added".into(), spec.clone());
+        let f = findings(
+            &before,
+            &after,
+            &ids(),
+            &new,
+            &consumers("app.t", true),
+            vec![Change::AddColumn {
+                uid: uid("c_bbbbbb"),
+                table: name(),
+                name: "added".into(),
+                column: Box::new(spec),
+            }],
+        );
+        assert_eq!(
+            f.is_empty(),
+            compatible,
+            "{ty}/{default:?}/{column_default:?}: {f:?}"
+        );
+        assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));
+    }
+    // A domain over an array may supply its own whole-array default.
+    let mut s = domain_chain_schema(Some("1"));
+    let pbps_model::ManagedType::Domain { default, .. } =
+        s.types.get_mut(&"app.array".parse().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    *default = Some("ARRAY[1]".into());
+    let mut new = ids();
+    new.columns.insert(uid("c_bbbbbb"), name().column("added"));
+    let spec = Column::new("app.array".parse().unwrap()).not_null();
+    let mut after = s.clone();
+    after
+        .tables
+        .get_mut(&name())
+        .unwrap()
+        .columns
+        .insert("added".into(), spec.clone());
+    assert!(
+        findings(
+            &s,
+            &after,
+            &ids(),
+            &new,
+            &consumers("app.t", true),
+            vec![Change::AddColumn {
+                uid: uid("c_bbbbbb"),
+                table: name(),
+                name: "added".into(),
+                column: Box::new(spec),
+            }]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn element_domain_defaults_leave_array_contracts_unchanged_but_checks_still_apply() {
+    for (ty, default_compatible, check_compatible) in [
+        ("app.domain", false, false),
+        ("app.derived", false, false),
+        ("app.domain[]", true, false),
+        ("app.derived[]", true, false),
+        ("app.array", true, false),
+        ("integer", true, true),
+    ] {
+        let mut before = domain_chain_schema(Some("1"));
+        before
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("old")
+            .unwrap()
+            .ty = ty.parse().unwrap();
+        for (to, half, compatible) in [
+            (
+                domain(false, Some("2"), None),
+                pbps_model::DomainHalf::Loosen,
+                default_compatible,
+            ),
+            (
+                domain(false, Some("1"), Some("VALUE > 0")),
+                pbps_model::DomainHalf::Tighten,
+                check_compatible,
+            ),
+        ] {
+            let mut after = before.clone();
+            after
+                .types
+                .insert("app.domain".parse().unwrap(), to.clone());
+            let f = findings(
+                &before,
+                &after,
+                &ids(),
+                &ids(),
+                &consumers("app.t.old", true),
+                vec![Change::AlterDomain {
+                    uid: uid("y_aaaaaa"),
+                    name: "app.domain".parse().unwrap(),
+                    from: Box::new(domain(false, Some("1"), None)),
+                    to: Box::new(to),
+                    half,
+                }],
+            );
+            assert_eq!(f.is_empty(), compatible, "{ty}/{half:?}: {f:?}");
+            assert!(f.iter().all(|(_, f)| f.id == "consumer.unproven"));
+        }
+    }
+}

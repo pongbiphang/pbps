@@ -4,8 +4,8 @@ use super::{
     binding::{Entry, Target},
 };
 use pbps_model::{
-    Change, ChangeSet, ColumnRef, DomainDelta, DomainHalf, PlannedChange, RiskClass, Uid,
-    ValueSource,
+    Change, ChangeSet, Column, ColumnName, ColumnRef, ColumnType, DomainDelta, DomainHalf,
+    ManagedType, PlannedChange, RiskClass, Schema, TypeRef, Uid, ValueSource,
 };
 use std::collections::BTreeSet;
 
@@ -40,49 +40,75 @@ fn supplied_new(at: &ColumnRef, cs: &ChangeSet, sides: &[Side<'_>]) -> bool {
             .changes
             .iter()
             .any(|p| matches!(&p.change, Change::AddColumn { uid: added, .. } if added == uid))
-        && !matches!(column.value_source, ValueSource::None)
+        && (!matches!(column.value_source, ValueSource::None)
+            || domain_chain(&column.ty, side.schema).any(|(_, definition, scalar)| {
+                scalar
+                    && matches!(
+                        definition,
+                        Some(ManagedType::Domain {
+                            default: Some(_),
+                            ..
+                        })
+                    )
+            }))
 }
 
-// A derived domain carries the base domain's restrictions, unless its own
-// attributes (or the column's) already supply the stronger/local definition.
-fn domain_column(
-    mut column: pbps_model::Column,
-    name: &pbps_model::TypeRef,
-    schema: &pbps_model::Schema,
-) -> Option<pbps_model::Column> {
-    let mut ty = column.ty.clone();
-    for _ in 0..=schema.types.len() {
+// Column DEFAULT and nullable metadata stop at an array boundary. Element
+// constraints still need the full chain, so carry the boundary instead of
+// stopping there. External names remain visible; validated chains are finite.
+fn domain_chain<'a>(
+    ty: &'a ColumnType,
+    schema: &'a Schema,
+) -> impl Iterator<Item = (&'a TypeRef, Option<&'a ManagedType>, bool)> {
+    let (mut next, mut scalar) = (Some(ty), true);
+    std::iter::from_fn(move || {
+        let ty = next.take()?;
         let reference = ty.type_ref()?;
+        scalar &= !ty.is_array();
+        let definition = schema.types.get(reference);
+        next = match definition {
+            Some(ManagedType::Domain { base, .. }) => Some(base),
+            Some(ManagedType::Enum { .. }) | None => None,
+        };
+        Some((reference, definition, scalar))
+    })
+    .take(schema.types.len() + 1)
+}
+
+// Fold only the domains above the changed one: local overrides keep their
+// meaning, while the caller translates that domain's own delta.
+fn domain_column(mut column: Column, name: &TypeRef, schema: &Schema) -> Option<(Column, bool)> {
+    let ty = column.ty.clone();
+    for (reference, definition, scalar) in domain_chain(&ty, schema) {
         if reference == name {
-            return Some(column);
+            return Some((column, scalar));
         }
-        let pbps_model::ManagedType::Domain {
-            base,
+        if let Some(ManagedType::Domain {
             not_null,
             default,
             collation,
             ..
-        } = schema.types.get(reference)?
-        else {
-            return None;
-        };
-        column.nullable &= !not_null;
-        if matches!(column.value_source, ValueSource::None) {
-            column.value_source = default
-                .clone()
-                .map_or(ValueSource::None, ValueSource::Default);
+        }) = definition
+        {
+            if scalar {
+                column.nullable &= !not_null;
+                if matches!(column.value_source, ValueSource::None) {
+                    column.value_source = default
+                        .clone()
+                        .map_or(ValueSource::None, ValueSource::Default);
+                }
+            }
+            column.collation = column.collation.or_else(|| {
+                collation
+                    .as_ref()
+                    .map(|c| pbps_model::Collation::new(c.raw().to_string()))
+            });
         }
-        column.collation = column.collation.or_else(|| {
-            collation
-                .as_ref()
-                .map(|c| pbps_model::Collation::new(c.raw().to_string()))
-        });
-        ty = base.clone();
     }
     None
 }
 
-fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> bool {
+fn uses_type(entry: &Entry, name: &TypeRef, sides: &[Side<'_>]) -> bool {
     if entry.table().is_none() {
         return false;
     }
@@ -90,7 +116,7 @@ fn uses_type(entry: &Entry, name: &pbps_model::TypeRef, sides: &[Side<'_>]) -> b
         side.schema.tables.keys().any(|owner| {
             side.ids.table_uid(owner) == entry.table()
                 && side.columns(owner).any(|(at, _, spec)| {
-                    domain_column(spec, name, side.schema).is_some()
+                    domain_chain(&spec.ty, side.schema).any(|(reference, _, _)| reference == name)
                         && (matches!(entry.target, Target::Table(_))
                             || entry.named_column(&at.name, sides)
                             || side
@@ -139,7 +165,7 @@ pub(super) fn classify(
             .and_then(|s| s.ids.columns.get(uid))
             .is_some_and(|c| supplied_new(c, cs, sides))
     };
-    let named = |name: &pbps_model::ColumnName| hit && entry.named_column(name, sides);
+    let named = |name: &ColumnName| hit && entry.named_column(name, sides);
     let nullability = |column_hit: bool, nullable: bool| {
         if entry.writes {
             write_hit && !nullable
@@ -181,11 +207,11 @@ pub(super) fn classify(
                 side.schema.tables.keys().find_map(|owner| {
                     let table = side.ids.table_uid(owner);
                     side.columns(owner).find_map(|(at, source, spec)| {
-                        let spec = domain_column(spec, name, side.schema)?;
+                        let (spec, scalar) = domain_column(spec, name, side.schema)?;
                         let uid = side.ids.column_uid(&source)?;
                         let (
-                            pbps_model::ManagedType::Domain { collation: was, .. },
-                            pbps_model::ManagedType::Domain { collation: now, .. },
+                            ManagedType::Domain { collation: was, .. },
+                            ManagedType::Domain { collation: now, .. },
                         ) = (from.as_ref(), to.as_ref())
                         else {
                             return None;
@@ -224,11 +250,11 @@ pub(super) fn classify(
                             });
                         }
                         if *half == DomainHalf::Loosen
+                            && scalar
                             && delta.default.is_some()
                             && matches!(spec.value_source, ValueSource::None)
                         {
-                            let pbps_model::ManagedType::Domain { default, .. } = from.as_ref()
-                            else {
+                            let ManagedType::Domain { default, .. } = from.as_ref() else {
                                 return None;
                             };
                             effects.push(Change::AlterColumnDefault {
@@ -439,5 +465,47 @@ pub(super) fn classify(
         | Change::Grant { .. }
         | Change::Revoke { .. }
         | Change::PublicExecution { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn element_not_null_leaves_the_array_nullable_but_scalar_overrides_still_hold() {
+        let domain = |base: &str, not_null| ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null,
+            default: None,
+            checks: Default::default(),
+            collation: None,
+        };
+        let schema = Schema {
+            types: [
+                ("app.base".parse().unwrap(), domain("integer", false)),
+                ("app.d".parse().unwrap(), domain("app.base", true)),
+                ("app.outer_array".parse().unwrap(), domain("app.d[]", true)),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        // Measured on PG 16/18: NOT NULL on the element rejects NULL elements,
+        // while a column's or outer domain's own NOT NULL rejects NULL arrays.
+        for (ty, nullable, expected) in [
+            ("app.d[]", true, true),
+            ("app.d", true, false),
+            ("app.outer_array", true, false),
+            ("app.d[]", false, false),
+        ] {
+            let mut column = Column::new(ty.parse().unwrap());
+            column.nullable = nullable;
+            let (effective, _) =
+                domain_column(column, &"app.base".parse().unwrap(), &schema).unwrap();
+            assert_eq!(
+                effective.nullable, expected,
+                "{ty}, column nullable={nullable}"
+            );
+        }
     }
 }

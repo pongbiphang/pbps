@@ -36100,3 +36100,92 @@ fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
         consumer_contracts::live(&std::env::var(variable).unwrap(), true);
     }
 }
+
+fn consumer_domain_project(slug: &str, ty: &str, default: bool) -> Demo {
+    let d = Demo::new(slug);
+    std::fs::write(
+        d.dir.join("schema/app.d.yml"),
+        format!(
+            "domain: app.d\ntype: integer\n{}",
+            if default { "default: '1'\n" } else { "" }
+        ),
+    )
+    .unwrap();
+    for (name, base) in [("derived", "app.d"), ("array", "app.d[]")] {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!("domain: app.{name}\ntype: '{base}'\n"),
+        )
+        .unwrap();
+    }
+    d.table(&format!("table: app.t\ncolumns:\n  v: {{type: '{ty}'}}\n"));
+    let out = d.run(&["plan"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    d.commit();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nconsumers:\n  writer: {writes: [app.t]}\n",
+    )
+    .unwrap();
+    d
+}
+
+#[test]
+fn consumer_contracts_accept_supplied_scalar_domain_columns_but_refuse_unsupplied_arrays() {
+    for (ty, default, expected) in [
+        ("app.d", true, 0),
+        ("app.derived", true, 0),
+        ("app.d[]", true, 2),
+        ("app.derived[]", true, 2),
+        ("app.array", true, 2),
+        ("app.d", false, 2),
+    ] {
+        let d = consumer_domain_project("consumer-domain-supply", "integer", default);
+        d.table(&format!("table: app.t\ncolumns:\n  v: {{type: integer}}\n  n: {{type: '{ty}', nullable: false}}\n"));
+        let out = d.run(&["plan", "--format", "json"]);
+        assert_eq!(
+            code(&out),
+            expected,
+            "{ty}/{default}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        if expected == 2 {
+            assert!(stdout(&out).contains("consumer.unproven"));
+        }
+    }
+}
+
+#[test]
+fn consumer_contracts_ignore_element_defaults_but_keep_scalar_and_element_check_protection() {
+    for (ty, default_exit, check_exit) in [
+        ("app.d", 2, 2),
+        ("app.derived", 2, 2),
+        ("app.d[]", 0, 2),
+        ("app.derived[]", 0, 2),
+        ("app.array", 0, 2),
+        ("integer", 0, 0),
+    ] {
+        let d = consumer_domain_project("consumer-domain-elements", ty, true);
+        for (definition, expected) in [
+            ("domain: app.d\ntype: integer\ndefault: '2'\n", default_exit),
+            (
+                "domain: app.d\ntype: integer\ndefault: '1'\nchecks:\n  positive: VALUE > 0\n",
+                check_exit,
+            ),
+        ] {
+            std::fs::write(d.dir.join("schema/app.d.yml"), definition).unwrap();
+            let out = d.run(&["plan", "--format", "json"]);
+            assert_eq!(
+                code(&out),
+                expected,
+                "{ty}: {}{}",
+                stdout(&out),
+                stderr(&out)
+            );
+            if expected == 2 {
+                assert!(stdout(&out).contains("consumer.unproven"));
+            }
+        }
+    }
+}
