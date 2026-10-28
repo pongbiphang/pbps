@@ -87,6 +87,9 @@ preview statement counts are engine metadata observations, never lowered SQL.
 Certified inputs bind their mode; lowering reads it and sealing checks it.
 CLI keeps concrete engine variants through immutable lowering and all apply
 modes, so a caller-defined emitter cannot substitute an executable collection.
+Lowering prepares an engine's plan-local position function once per emission,
+then keeps its operation IDs, origins and indivisible groups. Statement-count
+loops reuse the same preparation; context never becomes saved-plan data.
 The normal `pbps-mssql -> pbps-diff` edge remains the only added workspace
 crate dependency; no transport/engine dependency enters diff or dialect.
 

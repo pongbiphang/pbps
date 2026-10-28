@@ -2420,6 +2420,20 @@ pub trait PlanDialect: Dialect {
         Ok(None)
     }
 
+    /// Prepare plan-local context once, while retaining the certified input
+    /// and the selected emission mode. Single-position callers may use emit;
+    /// loops must keep this function instead of preparing it per change.
+    fn prepare_emission<'a>(
+        &'a self,
+        plan: &'a Self::Plan,
+        mode: pbps_model::PlanMode,
+    ) -> lower::Emission<'a> {
+        Box::new(move |position| match mode {
+            pbps_model::PlanMode::Transactional => self.emit(plan, position),
+            pbps_model::PlanMode::Staged => self.emit_staged(plan, position),
+        })
+    }
+
     /// Emits one position of the engine's certified input. The associated type
     /// avoids a dialect -> diff dependency; concrete engines cannot substitute
     /// an unsealed user-defined view (DEC-1959.5).

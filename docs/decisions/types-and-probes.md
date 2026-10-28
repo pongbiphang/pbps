@@ -4046,6 +4046,11 @@ Admitted lifecycle UIDs reconstruct the base and executed-prefix type maps;
 through `TypeRenames::expression`. A new after-expression is not interpreted
 as a base binding when a name is reused. Built-in conversions stay intact,
 including mixed cast chains; quoted names and schema moves use the same adapter.
+The emission prepares this context once for its certified input. Lifecycle
+boundaries index the effective rename maps; first default-write positions
+preserve the before/after distinction without scanning row-filled prefixes.
+Transactional/staged lowering and staged statement-count loops reuse that
+prepared position function. No plan cache is serialized or kept on the engine.
 The literal-only gate remains: functions and other nonliteral defaults are
 never evaluated as guard expectations. Enum label renames retain DEC-2346.2's
 separate limit. The fields and loader shape are unchanged, so no format version

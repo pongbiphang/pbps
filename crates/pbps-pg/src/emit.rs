@@ -63,7 +63,7 @@ use crate::{Postgres, quote, types};
 type Sql = Result<Vec<Statement>, DialectError>;
 pub(crate) mod rebuild;
 mod row_defaults;
-pub(crate) use row_defaults::RowDefaults;
+pub(crate) use row_defaults::{RowDefaultIndex, RowDefaults};
 
 #[cfg(test)]
 mod declared_type_emission_tests {
@@ -3712,7 +3712,7 @@ pub(crate) fn emit_staged_in(
     pg: &Postgres,
     change: &Change,
     strategy: Strategy,
-    defaults: &RowDefaults,
+    defaults: &RowDefaults<'_>,
 ) -> Sql {
     if let Some((operation, table)) = change.pending_rebuild() {
         return Err(DialectError::RebuildUnavailable {
@@ -3818,7 +3818,7 @@ pub(crate) fn emit_in(
     pg: &Postgres,
     change: &Change,
     strategy: Strategy,
-    row_defaults: &RowDefaults,
+    row_defaults: &RowDefaults<'_>,
 ) -> Sql {
     match change {
         Change::BuildPartitionedIndex(recipe) => rebuild::build_partitioned_index(pg, recipe),
@@ -6643,7 +6643,7 @@ fn insert_row(
     row: &Row,
     defaults: &BTreeMap<ColumnName, String>,
     types: &BTreeMap<ColumnName, ColumnType>,
-    defaults_context: &RowDefaults,
+    defaults_context: &RowDefaults<'_>,
 ) -> Result<String, DialectError> {
     if identity_key {
         return Err(invalid(format!(
@@ -6746,7 +6746,7 @@ fn update_row(
     types: &BTreeMap<ColumnName, ColumnType>,
     after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
-    defaults_context: &RowDefaults,
+    defaults_context: &RowDefaults<'_>,
 ) -> Result<String, DialectError> {
     let before_ty = |column: &ColumnName| Held::of(types.get(column), after_types.get(column));
     let after_ty = |column: &ColumnName| {
@@ -6770,7 +6770,7 @@ fn update_row(
             column.raw(),
             from,
             before_ty(column),
-            Some(&defaults_context.base),
+            Some(defaults_context.base),
         )?);
     }
     for (column, held) in unchanged {
@@ -6778,7 +6778,7 @@ fn update_row(
             column.raw(),
             held,
             before_ty(column),
-            Some(&defaults_context.base),
+            Some(defaults_context.base),
         )?);
     }
     // An empty `SET` is not valid SQL, and the differ never produces one — it
@@ -6820,7 +6820,7 @@ fn update_row(
             column.raw(),
             held,
             after_ty(column),
-            Some(&defaults_context.base),
+            Some(defaults_context.base),
         )?);
     }
     sql.push('\n');
@@ -6845,7 +6845,7 @@ fn delete_row(
     types: &BTreeMap<ColumnName, ColumnType>,
     after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
-    defaults_context: &RowDefaults,
+    defaults_context: &RowDefaults<'_>,
 ) -> Result<String, DialectError> {
     let mut predicates = vec![key_equals(key_column, key, key_type)?];
     for (column, cell) in row {
@@ -6853,7 +6853,7 @@ fn delete_row(
             column.raw(),
             cell,
             Held::of(types.get(column), after_types.get(column)),
-            Some(&defaults_context.base),
+            Some(defaults_context.base),
         )?);
     }
     let sql = format!(

@@ -3144,8 +3144,9 @@ fn role_name_expectations<D: crate::emission::Engine>(
     let mut wanted = Vec::new();
     let mut vacated = Vec::new();
     let mut at = 0usize;
+    let emit = crate::emitter(dialect, plan, mode);
     for (position, p) in cs.changes.iter().enumerate() {
-        let n = crate::emitted(dialect, plan, position, mode)?.len();
+        let n = emit(position)?.len();
         // A change is pending while any of its statements is: a half-done
         // role drop has removed members and still holds the name.
         if completed < at + n {
@@ -10573,8 +10574,9 @@ fn role_drop_expectations<D: crate::emission::Engine>(
     let cs = pbps_dialect::PlanPayload::changes(plan);
     let mut out = Vec::new();
     let mut at = 0usize;
+    let emit = crate::emitter(dialect, plan, mode);
     for (position, p) in cs.changes.iter().enumerate() {
-        let n = crate::emitted(dialect, plan, position, mode)?.len();
+        let n = emit(position)?.len();
         if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
             let done = completed.saturating_sub(at).min(n);
             if done <= members.len() {
