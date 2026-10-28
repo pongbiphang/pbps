@@ -64,6 +64,8 @@ SQL_BUILDERS = {
     # Private rebuild lowering and its independent native SQL projections.
     "crates/pbps-pg/src/emit/rebuild.rs",
     "crates/pbps-pg/src/emit/rebuild/native.rs",
+    # The connected rebuild probe's typed copy projection and bound predicates.
+    "crates/pbps-pg/src/rebuild.rs",
     "crates/pbps-mssql/src/resolver/externals.rs",
     "crates/pbps-mssql/src/resolver/externals/render.rs",
     "crates/pbps-mssql/src/resolver/dependencies.rs",
@@ -144,6 +146,10 @@ ALLOWED = {
     "crates/pbps-pg/src/emit/rebuild/native.rs": (
         None,
         "builds independent native cast projections from typed raw names",
+    ),
+    "crates/pbps-pg/src/rebuild.rs": (
+        None,
+        "builds the connected rebuild probe's projection and bound SQL from raw names",
     ),
     "crates/pbps-pg/src/preflight.rs": (
         None,
