@@ -30,7 +30,8 @@
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
-use pbps_diff::order::scratch::Part;
+use pbps_diff::order::scratch::{Part, Progress, TrialProgram};
+mod trial;
 use pbps_model::ValueSource;
 use pbps_model::{Change, ModuleId, ModuleKind};
 use std::collections::{BTreeMap, BTreeSet};
@@ -111,6 +112,7 @@ pub type Named = (Nameable, String, String);
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Metadata {
     table_part: Option<pbps_model::TableName>,
+    foreign_key: bool,
     /// What an error names: the declaration, never the statement text.
     declaration: String,
     /// What this step makes resolvable, for the order check: its kind,
@@ -152,6 +154,13 @@ impl std::ops::DerefMut for Step {
 #[derive(Debug, Clone)]
 pub struct Reconstruction {
     steps: Vec<Step>,
+    trial: TrialProgram<crate::Postgres>,
+    progress: Progress<crate::Postgres>,
+    committed: Vec<usize>,
+    failed: bool,
+    waiting_fill: Option<usize>,
+    #[cfg(test)]
+    fault: Option<(trial_tests::Point, usize)>,
     lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
     /// Declared routines the plan drops, which are never compiled, and the
     /// catalog identity each declared signature names in the target
@@ -162,7 +171,23 @@ pub struct Reconstruction {
     between: Vec<(usize, Vec<Named>)>,
 }
 
+/// Completion proof for assessment; partial or failed execution grants none.
+pub struct Observations<'a>(&'a Reconstruction);
+impl Observations<'_> {
+    pub fn len(&self) -> usize {
+        self.0.committed.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.committed.is_empty()
+    }
+}
+
 impl Reconstruction {
+    pub fn observations(&self) -> Option<Observations<'_>> {
+        (!self.failed && self.waiting_fill.is_none() && self.committed.len() == self.steps.len())
+            .then_some(Observations(self))
+    }
+
     /// `bootstrap` is the plan from an empty schema to the desired one, as
     /// the differ produces it; its order among modules is kept.
     ///
@@ -188,6 +213,14 @@ impl Reconstruction {
     ) -> Result<Self, ReconstructError> {
         let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
+        Self::from_prepared(dialect, prepared)
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn from_prepared(
+        dialect: &crate::Postgres,
+        prepared: pbps_diff::order::scratch::Prepared,
+    ) -> Result<Self, ReconstructError> {
         let expanded = prepared.changes();
         let mut steps = Vec::new();
         for (operation, planned) in expanded.changes.iter().enumerate() {
@@ -436,7 +469,18 @@ impl Reconstruction {
             })
             .collect::<Vec<_>>();
 
+        let trial = ordered
+            .trial()
+            .expect("PG scratch issues trial authority")
+            .clone();
         Ok(Self {
+            progress: trial.begin(),
+            trial,
+            committed: Vec::with_capacity(steps.len()),
+            failed: false,
+            waiting_fill: None,
+            #[cfg(test)]
+            fault: None,
             steps,
             lowered,
             dropped: BTreeMap::new(),
@@ -456,6 +500,7 @@ impl Reconstruction {
         &self,
         owner: &ObjectIdentity,
     ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
+        self.observations()?;
         let at = self
             .steps
             .iter()
@@ -472,13 +517,18 @@ impl Reconstruction {
     /// The names made resolvable after the step at `at`: by every later
     /// step, and between steps after it.
     fn names_after(&self, at: usize) -> std::collections::BTreeSet<(Nameable, &str, &str)> {
-        self.steps[at + 1..]
+        let rank = self
+            .committed
             .iter()
-            .map(|step| &step.names)
+            .position(|&id| id == at)
+            .expect("completed step");
+        self.committed[rank + 1..]
+            .iter()
+            .map(|&id| &self.steps[id].names)
             .chain(
                 self.between
                     .iter()
-                    .filter(|(before, _)| at < *before)
+                    .filter(|(before, _)| rank < *before)
                     .map(|(_, names)| names),
             )
             .flat_map(|names| {
@@ -501,6 +551,7 @@ impl Reconstruction {
         table: &str,
         column: &str,
     ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
+        self.observations()?;
         let at = self.steps.iter().position(|step| {
             step.module.is_none()
                 && step
@@ -523,13 +574,35 @@ impl Reconstruction {
     /// created between two parts of the compile (#1778, DEC-1778.2). A module
     /// compiled earlier may have bound one of these names to another object,
     /// and [`Self::later_names`] then says so.
+    /// Register the existing chained-fill cut before compiling its prefix.
+    /// Completion cannot be inferred from SQL alone when a fill is pending.
+    pub fn expect_fill_at(&mut self, position: usize) {
+        if position > self.steps.len() || !self.committed.is_empty() || self.waiting_fill.is_some()
+        {
+            self.failed = true;
+        } else {
+            self.waiting_fill = Some(position);
+        }
+    }
+
     pub fn created_before(&mut self, position: usize, names: Vec<Named>) {
-        self.between.push((position, names));
+        if self.failed
+            || self.committed.len() != position
+            || self
+                .waiting_fill
+                .is_some_and(|expected| expected != position)
+        {
+            self.failed = true;
+            return;
+        }
+        self.waiting_fill = None;
+        self.between.push((self.committed.len(), names));
     }
 
     /// The catalog identity of the routine compiled for `id`, once the
     /// reconstruction has compiled; `None` for a module it does not compile.
     pub fn created(&self, id: &ModuleId) -> Option<&ObjectIdentity> {
+        self.observations()?;
         self.steps
             .iter()
             .find(|step| step.module.as_ref() == Some(id))
@@ -628,98 +701,120 @@ impl Reconstruction {
         conn: &mut impl pbps_db::transport::ExecuteConnection,
         range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
+        if self.failed {
+            return Err(ReconstructError::Transaction("reuse a failed run of"));
+        }
+        let cursor = self
+            .trial
+            .start(range, &self.progress)
+            .map_err(ReconstructError::Cycle)?;
         let framing = dialect.transaction_framing(zone);
-        conn.execute(&framing.begin).await.map_err(|e| {
-            // `invalid_parameter_value`, measured on 18.6 for an unknown
-            // `TimeZone`. The zone is the one setting in the pins that is not
-            // a constant, so it is the one this can be about.
-            if let pbps_db::DbError::Driver {
-                code: Some(code), ..
-            } = &e
-                && code == "22023"
-            {
+        if let Err(e) = conn.execute(&framing.begin).await {
+            self.failed = true;
+            return Err(if e.server_error_code().as_deref() == Some("22023") {
                 ReconstructError::Zone {
                     zone: zone.to_string(),
                     reason: e.to_string(),
                 }
             } else {
                 ReconstructError::Transaction("begin")
-            }
-        })?;
-        let outcome = self.compile_steps(conn, range).await;
-        if outcome.is_err() {
-            let _ = conn.execute(&framing.rollback).await;
-            return outcome;
+            });
         }
-        conn.execute(&framing.commit)
-            .await
-            .map_err(|_| ReconstructError::Transaction("commit"))
+        let outcome = self.trial_range(conn, cursor).await;
+        let result = match outcome {
+            Ok((delta, progress)) => {
+                let receipt = conn.execute(&framing.commit).await;
+                #[cfg(test)]
+                let receipt = if self.fault == Some((trial_tests::Point::CommitAck, 0)) {
+                    Err(pbps_db::DbError::BadRow(
+                        "injected lost commit acknowledgement".into(),
+                    ))
+                } else {
+                    receipt
+                };
+                match receipt {
+                    Ok(_) => {
+                        // Capacity is reserved at construction. No read, validation
+                        // or allocation occurs between this receipt and publication.
+                        for (at, step) in delta {
+                            self.steps[at] = step;
+                            self.committed.push(at);
+                        }
+                        self.progress = progress;
+                        Ok(())
+                    }
+                    Err(_) => Err(ReconstructError::Transaction("commit")),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            self.failed = true;
+            let _ = conn.execute(&framing.rollback).await;
+        }
+        result
     }
 
-    async fn compile_steps(
-        &mut self,
+    async fn attempt_step(
+        &self,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
-        range: std::ops::Range<usize>,
-    ) -> Result<(), ReconstructError> {
-        for (step, group) in self.steps[range.clone()]
-            .iter_mut()
-            .zip(&self.lowered.groups()[range])
-        {
-            let declaration = step.declaration.clone();
-            let failed = |reason: String| ReconstructError::Compile {
-                declaration: declaration.clone(),
-                reason,
-            };
-            let unread = |reason: String| ReconstructError::Read {
-                declaration: declaration.clone(),
-                reason,
-            };
-            let interrupted = |reason: String| ReconstructError::Interrupted {
-                declaration: declaration.clone(),
-                reason,
-            };
-            let routine = match &step.module {
-                Some(id @ ModuleId::Routine(_)) => {
-                    Some((id.schema().to_owned(), id.name().to_owned()))
-                }
-                Some(ModuleId::Named(_) | ModuleId::Trigger { .. }) | None => None,
-            };
-            let before = match &routine {
-                Some((schema, name)) => routines(conn, schema, name).await.map_err(unread)?,
-                None => Vec::new(),
-            };
-            for statement in group.statements() {
-                conn.execute(&statement.sql).await.map_err(|error| {
-                    if judged_the_statement(&error) {
-                        failed(with_remedy(&error))
-                    } else {
-                        interrupted(error.to_string())
-                    }
-                })?;
-            }
-            let relation = step
-                .names
-                .iter()
-                .find(|(kind, _, _)| *kind == Nameable::Relation)
-                .map(|(_, schema, name)| (schema.clone(), name.clone()));
-            if let Some((schema, name)) = relation
-                && let Some((array_schema, array)) =
-                    array_type(conn, &schema, &name).await.map_err(unread)?
-            {
-                step.names.push((Nameable::Type, array_schema, array));
-            }
-            if let Some((schema, name)) = &routine {
-                let mut after = routines(conn, schema, name).await.map_err(unread)?;
-                after.retain(|created| !before.contains(created));
-                let [created] = after.as_slice() else {
-                    return Err(failed(
-                        "the routine it created could not be told from its overloads".into(),
-                    ));
-                };
-                step.created = Some(created.clone());
-            }
+        at: usize,
+    ) -> Result<Step, trial::Failure> {
+        let mut step = self.steps[at].clone();
+        let group = &self.lowered.groups()[at];
+        let declaration = step.declaration.clone();
+        let failed = |reason: String| ReconstructError::Compile {
+            declaration: declaration.clone(),
+            reason,
+        };
+        let unread = |reason: String| ReconstructError::Read {
+            declaration: declaration.clone(),
+            reason,
+        };
+        let routine = match &step.module {
+            Some(id @ ModuleId::Routine(_)) => Some((id.schema().to_owned(), id.name().to_owned())),
+            Some(ModuleId::Named(_) | ModuleId::Trigger { .. }) | None => None,
+        };
+        let before = match &routine {
+            Some((schema, name)) => routines(conn, schema, name)
+                .await
+                .map_err(|e| trial::Failure::Terminal(unread(e)))?,
+            None => Vec::new(),
+        };
+        for statement in group.statements() {
+            conn.execute(&statement.sql)
+                .await
+                .map_err(trial::Failure::Statement)?;
         }
-        Ok(())
+        #[cfg(test)]
+        self.inject(conn, trial_tests::Point::Readback, at)
+            .await
+            .map_err(trial::Failure::Terminal)?;
+        let relation = step
+            .names
+            .iter()
+            .find(|(kind, _, _)| *kind == Nameable::Relation)
+            .map(|(_, schema, name)| (schema.clone(), name.clone()));
+        if let Some((schema, name)) = relation
+            && let Some((array_schema, array)) = array_type(conn, &schema, &name)
+                .await
+                .map_err(|e| trial::Failure::Terminal(unread(e)))?
+        {
+            step.names.push((Nameable::Type, array_schema, array));
+        }
+        if let Some((schema, name)) = &routine {
+            let mut after = routines(conn, schema, name)
+                .await
+                .map_err(|e| trial::Failure::Terminal(unread(e)))?;
+            after.retain(|created| !before.contains(created));
+            let [created] = after.as_slice() else {
+                return Err(trial::Failure::Terminal(failed(
+                    "the routine it created could not be told from its overloads".into(),
+                )));
+            };
+            step.created = Some(created.clone());
+        }
+        Ok(step)
     }
 }
 
@@ -920,6 +1015,7 @@ fn part(
         change: planned.clone(),
         metadata: Metadata {
             table_part: None,
+            foreign_key: matches!(planned.change, Change::AddForeignKey { .. }),
             declaration: declaration.to_owned(),
             names,
             generated: Vec::new(),
@@ -1008,6 +1104,9 @@ pub struct ScratchBlueprint(pbps_diff::order::scratch::Input<Metadata>);
 impl pbps_diff::order::scratch::Engine for crate::Postgres {
     type Input = ScratchBlueprint;
     type Metadata = Metadata;
+    fn trial_order(&self) -> bool {
+        true
+    }
     fn blueprint(&self, input: Self::Input) -> pbps_diff::order::scratch::Input<Metadata> {
         input.0
     }
@@ -1035,4 +1134,14 @@ pub(crate) fn fixture_plan(changes: &[Change]) -> pbps_diff::order::PlanningPlan
             .map(pbps_model::PlannedChange::new)
             .collect(),
     })
+}
+
+#[cfg(test)]
+pub(crate) mod trial_tests;
+#[cfg(test)]
+impl Reconstruction {
+    // Explicit synthetic observations for metadata-only units, never compilation.
+    pub(crate) fn observe_blueprint_fixture(&mut self) {
+        self.committed = (0..self.steps.len()).collect();
+    }
 }

@@ -2,9 +2,11 @@
 //! into the parts the engine creates one at a time, and one `Schedule`
 //! settles the constraints `prepare` states over them (DEC-2389.1).
 use super::{Constraint, Schedule};
+mod trial;
 use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations};
 use pbps_model::{Change, ChangeSet, PlannedChange};
+pub use trial::{Attempt, Progress, TrialProgram, Trials};
 
 /// One operation of the prepared plan as the engine compiles it. An
 /// operation is at most one part, and one the engine does not compile is none.
@@ -20,6 +22,9 @@ pub trait Engine: Dialect + Sized {
     type Input;
     type Metadata: Clone + std::fmt::Debug;
     fn blueprint(&self, input: Self::Input) -> Input<Self::Metadata>;
+    fn trial_order(&self) -> bool {
+        false
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -32,6 +37,11 @@ impl Prepared {
     }
     pub fn edges(&self) -> &[Constraint] {
         &self.edges
+    }
+    #[cfg(feature = "test-fixtures")]
+    pub fn without_guesses(mut self) -> Self {
+        self.edges.retain(|e| e.source != super::Source::Guess);
+        self
     }
 }
 /// The generated expansion of reconstruction, with every new table split as
@@ -68,7 +78,29 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
         super::PlanningPlan::new(payload, input.origins.clone(), input.logical, proof);
     changes.boundaries = input.boundaries.clone();
     super::generated::expand_in(&mut changes, ids, dependencies, dialect, true)?;
-    let edges = super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
+    let mut edges =
+        super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
+    if dialect.scratch_text_edges_are_guesses() {
+        // Explicit identities must not pass through the inferred same-leaf
+        // exclusion (DEC-2465.1); no general Source/Requirement rule changes.
+        let module_at = |id: &pbps_model::ModuleId| {
+            changes.changes.iter().position(
+                |p| matches!(&p.change, Change::CreateModule { id: found, .. } if found == id),
+            )
+        };
+        for (owner, providers) in dependencies {
+            for provider in providers {
+                if let (Some(before), Some(after)) = (module_at(provider), module_at(owner)) {
+                    edges.push(Constraint {
+                        before,
+                        after,
+                        source: super::Source::Lexical,
+                        reason: pbps_model::resolver::OrderReason::Structural,
+                    });
+                }
+            }
+        }
+    }
     Ok(Prepared { changes, edges })
 }
 /// Logical blueprint facts supplied by the engine's opaque input. There is no
@@ -97,10 +129,14 @@ pub struct ScratchPlan<E: Engine> {
     parts: Vec<Part<E::Metadata>>,
     operations: Operations,
     changes: ChangeSet,
+    trial: Option<TrialProgram<E>>,
 }
 impl<E: Engine> ScratchPlan<E> {
     pub fn parts(&self) -> &[Part<E::Metadata>] {
         &self.parts
+    }
+    pub fn trial(&self) -> Option<&TrialProgram<E>> {
+        self.trial.as_ref()
     }
 }
 impl<E: Engine> pbps_dialect::PlanPayload for ScratchPlan<E> {
@@ -139,7 +175,7 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         ModuleEdits::InPlace,
     );
     let mut schedule = Schedule::new(source.changes.len());
-    for edge in prepared.edges {
+    for edge in &prepared.edges {
         schedule.edge(edge.before, edge.after, edge.source, edge.reason);
     }
     let names = ChangeSet {
@@ -157,6 +193,12 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         .iter()
         .filter_map(|&operation| at[operation])
         .collect();
+    let trial = if engine.trial_order() {
+        let sources: Vec<_> = sequence.iter().map(|&part| parts[part].operation).collect();
+        Some(TrialProgram::project(&prepared.edges, &sources, &names)?)
+    } else {
+        None
+    };
     let operations = super::reordered_operations(&operations, &sequence);
     let parts = permute(parts, &sequence);
     let changes = ChangeSet {
@@ -166,6 +208,7 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         parts,
         operations,
         changes,
+        trial,
     })
 }
 fn permute<T>(items: Vec<T>, sequence: &[usize]) -> Vec<T> {
@@ -336,3 +379,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod trial_tests;

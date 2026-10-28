@@ -105,7 +105,10 @@ domains, remaining guards, lock-window reporting and readback obligations.
 ## New-engine ordering contract
 
 An engine supplies ordering facts and lowering semantics to the shared
-compiler; it supplies no reorder pass. The complete contract and pipeline are
+compiler; it supplies no deployment reorder pass. PG scratch uses order's
+branded trial program to choose immutable whole groups after engine refusals,
+within fixed ranges and hard readiness (DEC-2465.1). Metadata is published only
+on acknowledged commit, and completed observations gate assessment. The contract and pipeline are
 in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
 
 - `Dialect::engine_effects` adds pure, operation-local effects to the portable
@@ -124,7 +127,9 @@ in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
 - The emitter supplies `Statement` transaction and batch requirements,
   intermediate rename/create/release names and execution metadata. Lowering
   retains source IDs/origins and indivisible statement groups, branded by the
-  concrete engine. No consumer infers this metadata from SQL or reorders it.
+  concrete engine. No consumer infers this metadata from SQL. Deployment retains
+its certified order; PG scratch alone follows order-issued trial tokens
+(DEC-2465.1), without permuting the lowered collection.
 - Engine-specific obligations use typed expansions with equivalence,
   per-part risk, targeted progress and budget checks. Canonical scheduling,
   scratch blueprints and connected continuations finish inside order; only

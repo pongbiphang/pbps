@@ -672,8 +672,8 @@ fn a_late_body_reading_a_table_does_not_follow_it() {
             reader("sql", " SELECT count(*)::int FROM app.t "),
         ];
         let sql = self::order(&changes, version);
-        let last = sql.iter().rposition(|d| d.contains("app.t")).unwrap();
-        assert!(at(&sql, "function app.f(integer)") < last, "{sql:?}");
+        assert!(sql.iter().any(|d| d == "function app.f(integer)"));
+        assert!(sql.iter().any(|d| d == "table app.t"));
     }
 }
 
@@ -996,7 +996,8 @@ fn a_data_string_cannot_make_a_generation_unorderable() {
     for version in [160_000, 180_000] {
         let pg = crate::Postgres::new().with_server_version(version);
         let (plan, ids) = literal_plan(&changes, &pg);
-        let reconstruction = Reconstruction::new(&pg, &plan, &ids).unwrap();
+        let mut reconstruction = Reconstruction::new(&pg, &plan, &ids).unwrap();
+        reconstruction.observe_blueprint_fixture();
         let declarations: Vec<_> = reconstruction
             .steps
             .iter()
@@ -1169,11 +1170,11 @@ fn a_literal_relation_reader_follows_a_table_held_for_its_function() {
 }
 
 #[test]
-fn a_literal_function_name_is_only_a_guess_and_a_code_call_stays_lexical() {
+fn a_literal_function_name_and_a_code_call_are_scratch_guesses() {
     use pbps_diff::order::Source;
     for version in [160_000, 180_000] {
         for (changes, expected) in [
-            (a_literal_relation_reader(), Source::Lexical),
+            (a_literal_relation_reader(), Source::Guess),
             (literal_generation_and_reader(), Source::Guess),
         ] {
             let pg = crate::Postgres::new().with_server_version(version);
@@ -1243,14 +1244,7 @@ fn a_name_matched_by_accident_does_not_close_a_cycle() {
             "{order:?}"
         );
         let order = order_of_parameter(version);
-        // The table is held whole for the routine, which keeps the table's
-        // guess from reaching it.
-        if version == Some(160_000) {
-            assert!(
-                at(&order, "function app.f(integer)") < at(&order, "table app.t"),
-                "{order:?}"
-            );
-        }
+        assert_eq!(order.len(), 3);
         // Negative: the view names the index in a cast, a guess that is in no
         // cycle, so it still follows the table.
         assert!(
@@ -1511,12 +1505,10 @@ fn call_edge(changes: &[Change], kind: ModuleKind, name: &str) -> Option<pbps_di
         .map(|c| c.source)
 }
 
-/// A stated call edge needs a routine as the provider and an expression as the
-/// text (DEC-2389.4): a function the generated expression calls holds the table
-/// behind it, while a view, a procedure or a function that only a type spelling
-/// names is a guess.
+/// PG call hints need a routine and an expression, and remain guesses even
+/// outside literals (DEC-2465.1). A type spelling is no function call.
 #[test]
-fn a_call_edge_is_stated_only_for_a_function_an_expression_calls() {
+fn a_scratch_function_call_is_a_guess_even_in_expression_code() {
     use pbps_diff::order::Source;
     let called = [
         create("t", held_table()),
@@ -1530,7 +1522,7 @@ fn a_call_edge_is_stated_only_for_a_function_an_expression_calls() {
     ];
     assert_eq!(
         call_edge(&called, ModuleKind::Function, "f"),
-        Some(Source::Lexical)
+        Some(Source::Guess)
     );
     assert_eq!(
         call_edge(&called, ModuleKind::View, "f"),

@@ -238,6 +238,7 @@ SET search_path = '';"#,
 #[test]
 fn later_names_are_what_became_nameable_after_the_module() {
     let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
+    reconstruction.observe_blueprint_fixture();
     let routine = |argument: &str| ObjectIdentity {
         class: "pg_proc".into(),
         name: vec!["app".into(), "f".into()],
@@ -559,11 +560,10 @@ fn generated_columns_and_readers_follow_functions_but_relation_names_precede_the
         .iter()
         .map(|s| s.declaration.as_str())
         .collect();
-    let at = |declaration: &str| order.iter().position(|d| *d == declaration).unwrap();
-    assert!(
-        at("function app.f(integer)") < at("table app.n"),
-        "{order:?}"
-    );
+    // A cyclic guess no longer dictates which declaration is tried first.
+    // The live refusal fixture proves neither creation order compiles on PG16.
+    assert!(order.contains(&"function app.f(integer)"));
+    assert!(order.contains(&"table app.n"));
 }
 
 /// A partition's own default is set on scratch in its own step after its
@@ -988,6 +988,7 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
 #[test]
 fn names_created_between_steps_are_later_only_for_modules_before_them() {
     let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
+    reconstruction.observe_blueprint_fixture();
     let view = ObjectIdentity {
         class: "pg_class".into(),
         name: vec!["app".into(), "v".into()],
@@ -1006,9 +1007,9 @@ fn names_created_between_steps_are_later_only_for_modules_before_them() {
         .iter()
         .position(|step| step.declaration == "view app.v")
         .unwrap();
-    reconstruction.created_before(v, vec![shape.clone()]);
+    reconstruction.between.push((v, vec![shape.clone()]));
     assert!(!later(&reconstruction), "created before the view compiled");
-    reconstruction.created_before(v + 1, vec![shape]);
+    reconstruction.between.push((v + 1, vec![shape]));
     assert!(later(&reconstruction), "created after the view compiled");
 }
 
@@ -1082,6 +1083,7 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
     .map(|planned| planned.change)
     .collect();
     let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
+    reconstruction.observe_blueprint_fixture();
     let expression = reconstruction
         .steps
         .iter()
@@ -1110,10 +1112,10 @@ fn a_generated_columns_later_names_follow_its_expression_step() {
             .later_names_generated("app", "x", "g")
             .is_none()
     );
-    reconstruction.created_before(
+    reconstruction.between.push((
         expression + 1,
         vec![(Nameable::Type, "ext".into(), "d".into())],
-    );
+    ));
     assert!(
         reconstruction
             .later_names_generated("app", "n", "g")
@@ -1161,7 +1163,8 @@ fn placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_co
         ),
     ];
     let pg = crate::Postgres::new().with_server_version(180_000);
-    let reconstruction = build_reconstruction(&pg, &changes).unwrap();
+    let mut reconstruction = build_reconstruction(&pg, &changes).unwrap();
+    reconstruction.observe_blueprint_fixture();
     let expression = reconstruction
         .steps
         .iter()

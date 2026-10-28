@@ -354,7 +354,7 @@ impl Run<'_> {
             .state
             .reconstruction(target, binding, desired.ids, &hints.module_deps)
             .await?;
-        let split = prepared.split(&reconstruction);
+        let split = prepared.split(&mut reconstruction);
         let chains = reconstruction.chains(&prepared);
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
             self.state
