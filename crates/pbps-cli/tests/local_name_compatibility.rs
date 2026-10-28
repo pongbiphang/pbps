@@ -335,13 +335,21 @@ where
     declaration_schema["description"] = serde_json::json!(
         "One pbps declaration file: a table, one view, procedure, function or\ntrigger, or a database role. The leading key is both the kind and the name."
     );
+    // These fixtures pin the legacy projection, before optional drop guards.
+    assert!(
+        plan.changes
+            .changes
+            .iter()
+            .all(|step| step.drop_guard.is_none())
+    );
+    let changes_debug = format!("{:?}", plan.changes).replace(", drop_guard: None", "");
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         (
             "declaration-schema.json",
             serde_json::to_string(&declaration_schema).unwrap(),
         ),
-        ("changes-debug.txt", format!("{:?}", plan.changes)),
+        ("changes-debug.txt", changes_debug),
         ("ids.json", serde_json::to_string(&state.ids).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
         ("state.json", serde_json::to_string(&state).unwrap()),
