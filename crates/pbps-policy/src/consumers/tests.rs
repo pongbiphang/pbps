@@ -1494,6 +1494,165 @@ fn derived_domain_overrides_keep_effective_column_attributes() {
     }
 }
 
+#[test]
+fn domain_changes_compare_effective_attributes_over_the_whole_chain() {
+    use pbps_model::DomainHalf::{Loosen, Tighten};
+    type Attributes = (bool, Option<&'static str>, Option<&'static str>);
+    let plain = (false, None, None);
+    let required = (true, None, None);
+    let default = (false, Some("'same'"), None);
+    let collated = (false, None, Some("pg_catalog.\"C\""));
+    let definition =
+        |base: &str, (not_null, default, collation): Attributes| pbps_model::ManagedType::Domain {
+            base: base.parse().unwrap(),
+            not_null,
+            default: default.map(str::to_owned),
+            checks: Default::default(),
+            collation: collation.map(|s| s.parse().unwrap()),
+        };
+    // Literal (reader, writer) cells: redundant edits preserve the effective
+    // interface; removing the last restriction or changing the value does not.
+    for (label, base, inner, from, to, half, expected) in [
+        (
+            "inner NOT NULL survives",
+            "app.inner_d",
+            required,
+            required,
+            plain,
+            Loosen,
+            [0, 0],
+        ),
+        (
+            "last NOT NULL removed",
+            "app.inner_d",
+            plain,
+            required,
+            plain,
+            Loosen,
+            [1, 0],
+        ),
+        (
+            "inner NOT NULL already holds",
+            "app.inner_d",
+            required,
+            plain,
+            required,
+            Tighten,
+            [0, 0],
+        ),
+        (
+            "first NOT NULL added",
+            "app.inner_d",
+            plain,
+            plain,
+            required,
+            Tighten,
+            [0, 1],
+        ),
+        (
+            "element NOT NULL cannot protect array",
+            "app.inner_d[]",
+            required,
+            required,
+            plain,
+            Loosen,
+            [1, 0],
+        ),
+        (
+            "same DEFAULT exposed",
+            "app.inner_d",
+            default,
+            default,
+            plain,
+            Loosen,
+            [0, 0],
+        ),
+        (
+            "same DEFAULT restated",
+            "app.inner_d",
+            default,
+            plain,
+            default,
+            Loosen,
+            [0, 0],
+        ),
+        (
+            "different DEFAULT exposed",
+            "app.inner_d",
+            default,
+            (false, Some("'different'"), None),
+            plain,
+            Loosen,
+            [0, 1],
+        ),
+        (
+            "last DEFAULT removed",
+            "app.inner_d",
+            plain,
+            default,
+            plain,
+            Loosen,
+            [0, 1],
+        ),
+        (
+            "same collation exposed",
+            "app.inner_d",
+            collated,
+            collated,
+            plain,
+            Tighten,
+            [0, 0],
+        ),
+        (
+            "different collation exposed",
+            "app.inner_d",
+            collated,
+            (false, None, Some("pg_catalog.\"POSIX\"")),
+            plain,
+            Tighten,
+            [1, 1],
+        ),
+    ] {
+        let changed: pbps_model::TypeRef = "app.outer_d".parse().unwrap();
+        let mut before = schema();
+        before
+            .tables
+            .get_mut(&name())
+            .unwrap()
+            .columns
+            .get_mut("old")
+            .unwrap()
+            .ty = ColumnType::reference(changed.clone());
+        before
+            .types
+            .insert("app.inner_d".parse().unwrap(), definition("text", inner));
+        let from = definition(base, from);
+        let to = definition(base, to);
+        before.types.insert(changed.clone(), from.clone());
+        let mut after = before.clone();
+        after.types.insert(changed.clone(), to.clone());
+        let change = Change::AlterDomain {
+            uid: uid("y_aaaaaa"),
+            name: changed,
+            from: Box::new(from),
+            to: Box::new(to),
+            half,
+        };
+        for (writes, count) in [false, true].into_iter().zip(expected) {
+            let found = findings(
+                &before,
+                &after,
+                &ids(),
+                &ids(),
+                &consumers("app.t.old", writes),
+                vec![change.clone()],
+            );
+            assert_eq!(found.len(), count, "{label}, writes={writes}: {found:?}");
+            assert!(found.iter().all(|(_, f)| f.id == "consumer.unproven"));
+        }
+    }
+}
+
 fn domain_chain_schema(default: Option<&str>) -> Schema {
     let mut s = schema();
     s.types

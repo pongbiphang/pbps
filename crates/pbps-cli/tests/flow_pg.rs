@@ -36189,3 +36189,84 @@ fn consumer_contracts_ignore_element_defaults_but_keep_scalar_and_element_check_
         }
     }
 }
+
+#[test]
+fn consumer_contracts_classify_effective_domain_attributes_instead_of_redundant_edits() {
+    // Real differ plans exercise both ordinary domain edits and the rebuild
+    // needed for a collation edit; expected exits are literal contract cells.
+    for (inner, from, to, writes, expected) in [
+        ("not_null: true\n", "not_null: true\n", "", false, 0),
+        ("", "not_null: true\n", "", false, 2),
+        ("not_null: true\n", "", "not_null: true\n", true, 0),
+        ("", "", "not_null: true\n", true, 2),
+        (
+            "default: \"'same'\"\n",
+            "default: \"'same'\"\n",
+            "",
+            true,
+            0,
+        ),
+        (
+            "default: \"'same'\"\n",
+            "default: \"'different'\"\n",
+            "",
+            true,
+            2,
+        ),
+        (
+            "collation: pg_catalog.\"C\"\n",
+            "collation: pg_catalog.\"C\"\n",
+            "",
+            false,
+            0,
+        ),
+        (
+            "collation: pg_catalog.\"C\"\n",
+            "collation: pg_catalog.\"POSIX\"\n",
+            "",
+            false,
+            2,
+        ),
+    ] {
+        let d = Demo::new("consumer-effective-domain");
+        std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.inner_d.yml"),
+            format!("domain: app.inner_d\ntype: text\n{inner}"),
+        )
+        .unwrap();
+        let outer = d.dir.join("schema/app.outer_d.yml");
+        std::fs::write(
+            &outer,
+            format!("domain: app.outer_d\ntype: app.inner_d\n{from}"),
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  v: {type: app.outer_d}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!(
+                "dialect: postgres\nconsumers:\n  client: {{{}: [app.t.v]}}\n",
+                if writes { "writes" } else { "uses" }
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &outer,
+            format!("domain: app.outer_d\ntype: app.inner_d\n{to}"),
+        )
+        .unwrap();
+        let out = d.run(&["plan", "--format", "json"]);
+        assert_eq!(
+            code(&out),
+            expected,
+            "{inner}/{from}/{to}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        if expected == 2 {
+            assert!(stdout(&out).contains("consumer.unproven"));
+        }
+    }
+}

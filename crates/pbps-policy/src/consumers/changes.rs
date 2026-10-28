@@ -40,17 +40,10 @@ fn supplied_new(at: &ColumnRef, cs: &ChangeSet, sides: &[Side<'_>]) -> bool {
             .changes
             .iter()
             .any(|p| matches!(&p.change, Change::AddColumn { uid: added, .. } if added == uid))
-        && (!matches!(column.value_source, ValueSource::None)
-            || domain_chain(&column.ty, side.schema).any(|(_, definition, scalar)| {
-                scalar
-                    && matches!(
-                        definition,
-                        Some(ManagedType::Domain {
-                            default: Some(_),
-                            ..
-                        })
-                    )
-            }))
+        && !matches!(
+            domain_column(column, side.schema).value_source,
+            ValueSource::None
+        )
 }
 
 // Column DEFAULT and nullable metadata stop at an array boundary. Element
@@ -75,14 +68,12 @@ fn domain_chain<'a>(
     .take(schema.types.len() + 1)
 }
 
-// Fold only the domains above the changed one: local overrides keep their
-// meaning, while the caller translates that domain's own delta.
-fn domain_column(mut column: Column, name: &TypeRef, schema: &Schema) -> Option<(Column, bool)> {
+// A domain edit changes the interface only when the whole chain's effective
+// attributes change. Inner restrictions survive outer removals; local DEFAULT
+// and collation overrides keep precedence over inherited values.
+fn domain_column(mut column: Column, schema: &Schema) -> Column {
     let ty = column.ty.clone();
-    for (reference, definition, scalar) in domain_chain(&ty, schema) {
-        if reference == name {
-            return Some((column, scalar));
-        }
+    for (_, definition, scalar) in domain_chain(&ty, schema) {
         if let Some(ManagedType::Domain {
             not_null,
             default,
@@ -105,7 +96,7 @@ fn domain_column(mut column: Column, name: &TypeRef, schema: &Schema) -> Option<
             });
         }
     }
-    None
+    column
 }
 
 fn uses_type(entry: &Entry, name: &TypeRef, sides: &[Side<'_>]) -> bool {
@@ -207,18 +198,28 @@ pub(super) fn classify(
                 side.schema.tables.keys().find_map(|owner| {
                     let table = side.ids.table_uid(owner);
                     side.columns(owner).find_map(|(at, source, spec)| {
-                        let (spec, scalar) = domain_column(spec, name, side.schema)?;
-                        let uid = side.ids.column_uid(&source)?;
-                        let (
-                            ManagedType::Domain { collation: was, .. },
-                            ManagedType::Domain { collation: now, .. },
-                        ) = (from.as_ref(), to.as_ref())
-                        else {
+                        if !domain_chain(&spec.ty, side.schema)
+                            .any(|(reference, _, _)| reference == name)
+                        {
                             return None;
+                        }
+                        let uid = side.ids.column_uid(&source)?;
+                        let effective = |s: &Side<'_>| {
+                            let column = table
+                                .and_then(|t| s.ids.tables.get(t))
+                                .zip(s.ids.columns.get(uid))
+                                .and_then(|(owner, source)| {
+                                    s.column(&owner.column(source.name.clone()))
+                                })
+                                // A new/removed column exists on only one side.
+                                // Its own add/drop path handles that transition.
+                                .map_or_else(|| spec.clone(), |(_, spec)| spec);
+                            domain_column(column, s.schema)
                         };
+                        let (before, after) = (effective(sides.first()?), effective(sides.last()?));
                         if *half == DomainHalf::Tighten
                             && let Some(class) =
-                                retype(uid, false, spec.collation.is_none() && was != now)
+                                retype(uid, false, before.collation != after.collation)
                         {
                             return Some(class);
                         }
@@ -234,34 +235,35 @@ pub(super) fn classify(
                                 });
                             }
                         }
-                        if spec.nullable
+                        if before.nullable != after.nullable
                             && match half {
-                                DomainHalf::Loosen => delta.drop_not_null,
-                                DomainHalf::Tighten => delta.set_not_null,
+                                DomainHalf::Loosen => after.nullable,
+                                DomainHalf::Tighten => !after.nullable,
                             }
                         {
                             effects.push(Change::AlterColumnNullability {
                                 uid: uid.clone(),
                                 column: at.clone(),
                                 ty: spec.ty.clone(),
-                                to_nullable: *half == DomainHalf::Loosen,
-                                collation: spec.collation.clone(),
+                                to_nullable: after.nullable,
+                                collation: after.collation.clone(),
                                 through_external_partitions: false,
                             });
                         }
-                        if *half == DomainHalf::Loosen
-                            && scalar
-                            && delta.default.is_some()
-                            && matches!(spec.value_source, ValueSource::None)
-                        {
-                            let ManagedType::Domain { default, .. } = from.as_ref() else {
-                                return None;
-                            };
+                        let default = |spec: Column| match spec.value_source {
+                            ValueSource::Default(text) => Some(text),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
+                            | ValueSource::Generated(_) => None,
+                        };
+                        let (was, now) = (default(before), default(after));
+                        if *half == DomainHalf::Loosen && was != now {
                             effects.push(Change::AlterColumnDefault {
                                 uid: uid.clone(),
                                 column: at,
-                                from: default.clone(),
-                                to: delta.default.flatten().map(str::to_owned),
+                                from: was,
+                                to: now,
                             });
                         }
                         // Reuse the ordinary paths, but ask the differ about
@@ -500,8 +502,7 @@ mod tests {
         ] {
             let mut column = Column::new(ty.parse().unwrap());
             column.nullable = nullable;
-            let (effective, _) =
-                domain_column(column, &"app.base".parse().unwrap(), &schema).unwrap();
+            let effective = domain_column(column, &schema);
             assert_eq!(
                 effective.nullable, expected,
                 "{ty}, column nullable={nullable}"
