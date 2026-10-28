@@ -36,6 +36,7 @@ pub(super) enum Value {
     List(Vec<Value>),
     Node(Node),
     Datum,
+    DatumBytes { length: usize, bytes: Vec<u8> },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -58,6 +59,7 @@ struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
     items: usize,
+    values: bool,
 }
 
 impl Reader<'_> {
@@ -149,7 +151,8 @@ impl Reader<'_> {
                         let Value::Atom(length) = &value else {
                             return Err(Uncovered::Malformed);
                         };
-                        length.parse::<usize>().map_err(|_| Uncovered::Malformed)?;
+                        let length = length.parse::<usize>().map_err(|_| Uncovered::Malformed)?;
+                        let mut bytes = Vec::new();
                         self.position += 1;
                         while self.peek() != Some(b']') {
                             let byte = self
@@ -159,9 +162,19 @@ impl Reader<'_> {
                             if !(-128..=255).contains(&byte) {
                                 return Err(Uncovered::Malformed);
                             }
+                            if self.values {
+                                if bytes.len() >= 1_000_000 {
+                                    return Err(Uncovered::Limit);
+                                }
+                                bytes.push(byte as u8);
+                            }
                         }
                         self.take(b']')?;
-                        value = Value::Datum;
+                        value = if self.values {
+                            Value::DatumBytes { length, bytes }
+                        } else {
+                            Value::Datum
+                        };
                     }
                     if fields.insert(key, value).is_some() {
                         return Err(Uncovered::Malformed);
@@ -194,6 +207,13 @@ impl Reader<'_> {
 }
 
 pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
+    decode_values(text, major, false)
+}
+
+fn decode_values(text: &str, major: u32, values: bool) -> Result<Value, Uncovered> {
+    if values && text.len() > 1_048_576 {
+        return Err(Uncovered::Limit);
+    }
     if !matches!(major, 16 | 18) {
         return Err(Uncovered::Version);
     }
@@ -204,6 +224,7 @@ pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
         bytes: text.as_bytes(),
         position: 0,
         items: 0,
+        values,
     };
     let value = reader.value(0)?;
     if reader.peek().is_some() || matches!(value, Value::Null | Value::Atom(_) | Value::Datum) {
@@ -212,11 +233,61 @@ pub(super) fn decode(text: &str, major: u32) -> Result<Value, Uncovered> {
     Ok(value)
 }
 
+/// Equality is a separate observation from binding coverage: every Datum is
+/// retained, and only a covered source-location field is discarded.
+pub(super) fn equal(left: &str, right: &str, major: u32) -> Result<bool, Uncovered> {
+    fn prepare(text: &str, major: u32) -> Result<Value, Uncovered> {
+        let mut value = decode_values(text, major, true)?;
+        references(&value, major)?;
+        fn locations(value: &mut Value) -> Result<(), Uncovered> {
+            match value {
+                Value::Node(node) => {
+                    if node.tag == "CONST" {
+                        let valid = match (&node.fields["constisnull"], &node.fields["constvalue"])
+                        {
+                            (Value::Atom(null), Value::Null) => null == "true",
+                            (Value::Atom(null), Value::DatumBytes { length, bytes }) => {
+                                let byval = matches!(&node.fields["constbyval"], Value::Atom(v) if v == "true");
+                                let byref = matches!(&node.fields["constbyval"], Value::Atom(v) if v == "false");
+                                null == "false"
+                                    && ((byval
+                                        && matches!(*length, 1 | 2 | 4 | 8)
+                                        && bytes.len() == 8)
+                                        || (byref && *length == bytes.len()))
+                            }
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(Uncovered::Malformed);
+                        }
+                    }
+                    node.fields.remove("location");
+                    for child in node.fields.values_mut() {
+                        locations(child)?;
+                    }
+                }
+                Value::List(values) => {
+                    for child in values {
+                        locations(child)?;
+                    }
+                }
+                Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
+            }
+            Ok(())
+        }
+        locations(&mut value)?;
+        Ok(value)
+    }
+    Ok(prepare(left, major)? == prepare(right, major)?)
+}
+
 impl Value {
     pub(super) fn number(&self) -> Result<u32, Uncovered> {
         match self {
             Self::Atom(value) => value.parse().map_err(|_| Uncovered::Reference),
-            Self::Null | Self::List(_) | Self::Node(_) | Self::Datum => Err(Uncovered::Reference),
+            Self::Null | Self::List(_) | Self::Node(_) | Self::Datum | Self::DatumBytes { .. } => {
+                Err(Uncovered::Reference)
+            }
         }
     }
 }
@@ -283,7 +354,10 @@ fn walk(
                                     path.pop();
                                 }
                             }
-                            Value::Atom(_) | Value::Node(_) | Value::Datum => {
+                            Value::Atom(_)
+                            | Value::Node(_)
+                            | Value::Datum
+                            | Value::DatumBytes { .. } => {
                                 return Err(Uncovered::Reference);
                             }
                         }
@@ -303,7 +377,7 @@ fn walk(
                 path.pop();
             }
         }
-        Value::Null | Value::Atom(_) | Value::Datum => {}
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
     }
     Ok(())
 }
@@ -477,7 +551,7 @@ mod tests {
                     nodes_with_tag(value, tag, found);
                 }
             }
-            Value::Null | Value::Atom(_) | Value::Datum => {}
+            Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
         }
     }
 
@@ -838,5 +912,34 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn retained2354_values_locations_and_unknown_coverage_are_distinct() {
+        let left = "{CONST :consttype 25 :consttypmod -1 :constcollid 100 :constlen -1 :constbyval false :constisnull false :location 5 :constvalue 7 [ 28 0 0 0 115 97 100 ]}";
+        let changed = left.replace("115 97 100", "109 97 100");
+        for major in [16, 18] {
+            assert!(
+                decode(left, major).unwrap() == decode(&changed, major).unwrap(),
+                "binding-only decoding intentionally ignores constant values"
+            );
+            assert_eq!(equal(left, &changed, major), Ok(false));
+            assert_eq!(
+                equal(left, &left.replace(":location 5", ":location 99"), major),
+                Ok(true)
+            );
+            assert!(
+                equal(
+                    left,
+                    &left.replace(":consttype", ":future 1 :consttype"),
+                    major
+                )
+                .is_err()
+            );
+            assert!(equal(left, &left.replace("7 [", "6 ["), major).is_err());
+        }
+        assert!(equal(left, left, 17).is_err());
+        assert!(equal("{FUTURE :value 1}", left, 18).is_err());
+        let collation = left.replace(":constcollid 100", ":constcollid 950");
+        assert_eq!(equal(left, &collation, 18), Ok(false));
     }
 }

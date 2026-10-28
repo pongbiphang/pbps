@@ -4113,3 +4113,34 @@ parser core and later integration remain separate PRs of #2400.
 Pinned on PostgreSQL 16 and 18 by the guarded-drop recording/apply regressions,
 the late-row rollback witness, the own-column/built-in audit tests, RLS and
 privilege refusals, and the partition lock/writer-wait regression.
+
+
+<a id="dec-2354-1"></a>
+
+**DEC-2354.1. Retained enum-label CHECKs advance their authored record only after target-bound equality.**
+With a selected resolver, a separate unsealed scratch goal creates the before
+type graph and empty carriers, binds the live CHECKs, emits the approved type
+and label renames, and binds the declared expressions on those same carriers.
+The complete covered node trees compare with constant values preserved and
+only source locations ignored. Binding-only capture still discards Datum
+bytes; its AST equality is never expression equality. Unsupported trees,
+unavailable scratch or TEMP, changed bindings and absent routines retain the
+ordinary rebuild. No SQL literal is forwarded through a label rename.
+
+The differ consumes neutral answers before constructing its immutable plan.
+A retained expression carries its logical target, exact before/after authored
+text and rename anchors on RenameEnumValue. Plan 58 and schema set 72 carry
+this contract; 57 and 68–71 were already claimed. Admission validates the
+target and anchors. Apply holds ACCESS SHARE on each retained table before
+DDL, independently binds the saved new expression on an empty target TEMP
+carrier after the rename, and compares it with the same validated local
+CHECK's identity and tree. Only that verified expression loses closing byte
+comparison; routine pins and every other field stay enforced. A failed
+comparison rolls back without advancing the record. Staged checkpoints keep
+the old declaration; closure rechecks in a transaction holding the relation
+lock through recording, including a closing-only resume.
+
+This first part retains CHECKs only. Defaults keep AlterColumnDefault and its
+ordinary table lock. Offline and unproved plans keep DropCheck/AddCheck.
+The ledger stores the actual read-back and advances only the approved
+expression payload, so applying a saved plan needs no checkout or resolver.

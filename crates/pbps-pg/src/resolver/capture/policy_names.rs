@@ -82,7 +82,7 @@ fn mentions(value: &Value, depth: u32, rename: &Rename) -> Result<bool, Uncovere
                 }
             }
         }
-        Value::Null | Value::Atom(_) | Value::Datum => {}
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
     }
     Ok(false)
 }

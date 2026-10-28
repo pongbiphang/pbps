@@ -1069,6 +1069,8 @@ pub struct Hints {
     /// names. Row guards use these after semantic diffing; authored expression
     /// comparisons and the declaration record remain untouched (DEC-2456.1).
     pub row_guard_defaults: BTreeMap<crate::ColumnRef, String>,
+    /// Connected paired-binding answers, absent offline (DEC-2354.1).
+    pub retained_expressions: Vec<crate::RetainedExpression>,
 
     /// One-shot label intent, keyed by declared type and new label. It never
     /// participates in Schema equality; live definitions establish absorption.

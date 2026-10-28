@@ -6544,6 +6544,7 @@ mod tests {
                 from: from.into(),
                 to: to.into(),
                 ordinal,
+                retained: Vec::new(),
                 definition: Box::new(pbps_model::ManagedType::Enum { values: vec![] }),
             })
         };

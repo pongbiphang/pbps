@@ -498,6 +498,7 @@ async fn enum_label_definitions_are_vetted_at_each_add_and_rename_and_resumed_pr
                     from: "sad".into(),
                     to: "blue".into(),
                     ordinal: 0,
+                    retained: Vec::new(),
                     definition: Box::new(enumeration(&["blue", "ok"])),
                 }),
                 PlannedChange::new(Change::AddEnumValue {

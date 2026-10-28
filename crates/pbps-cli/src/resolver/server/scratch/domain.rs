@@ -26,6 +26,31 @@ pub async fn vet(
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<(), Refused> {
+    run(
+        scratch,
+        target_connection,
+        identity,
+        desired,
+        standard,
+        externals,
+        provenance,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run(
+    scratch: &str,
+    target_connection: &str,
+    identity: &str,
+    desired: pbps_diff::Side<'_>,
+    standard: impl Into<Standard>,
+    externals: Option<&str>,
+    provenance: &Provenance,
+    comparison: Option<&super::retained::Comparison<'_>>,
+) -> Result<Vec<pbps_model::RetainedExpression>, Refused> {
     let types = Schema {
         types: desired.schema.types.clone(),
         ..Default::default()
@@ -71,8 +96,17 @@ pub async fn vet(
         &dialect,
     )
     .map_err(|error| unavailable(error.to_string()))?;
-    let request = request(Driver::Postgres, base, desired_types, &hints, &[])
-        .map_err(|error| Refused::Unavailable(ProduceError::Run(error)))?;
+    let request = match comparison {
+        Some(comparison) => request(
+            Driver::Postgres,
+            comparison.before,
+            comparison.after,
+            comparison.hints,
+            &[],
+        ),
+        None => request(Driver::Postgres, base, desired_types, &hints, &[]),
+    }
+    .map_err(|error| Refused::Unavailable(ProduceError::Run(error)))?;
     let standard = standard.into();
     let mut target = Conn::connect(Driver::Postgres, target_connection)
         .await
@@ -162,7 +196,10 @@ pub async fn vet(
             }
         }
         match report.verdict() {
-            Verdict::Verified => Ok(()),
+            Verdict::Verified => match comparison {
+                Some(comparison) => comparison.run(session).await.map_err(|why| run(Error::Binding(why))),
+                None => Ok(Vec::new()),
+            },
             Verdict::Mismatch(facts) => Err(run(Error::Incompatible(facts))),
             Verdict::Unknown(facts) => Err(run(Error::Scope(facts.join("; ")))),
         }

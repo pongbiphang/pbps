@@ -8831,3 +8831,5 @@ mod enum_rebuild_dependents_tests {
 
 #[cfg(test)]
 mod value_change_tests;
+
+pub mod retained;

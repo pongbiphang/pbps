@@ -120,3 +120,6 @@ pub use types::{CollationName, ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
 pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};
+
+pub mod retained;
+pub use retained::{ExpressionTarget, RenameAnchor, RetainedExpression};

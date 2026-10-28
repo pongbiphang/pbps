@@ -302,6 +302,7 @@ mod label_tests {
             from: "sad".into(),
             to: "blue".into(),
             ordinal: 0,
+            retained: Vec::new(),
             definition,
         };
         assert!(addition.intrinsic_risks().is_empty());

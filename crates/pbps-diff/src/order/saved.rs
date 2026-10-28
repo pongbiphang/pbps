@@ -421,6 +421,7 @@ pub fn validate_saved_plan(
     if plan.version != pbps_model::plan::CURRENT_VERSION {
         refuse!("unsupported saved-plan version {}", plan.version);
     }
+    pbps_model::retained::validate(plan).map_err(AdmissionError::message)?;
     // A lineage record stays in the identity file after its rewrite, so one is
     // not a reason to refuse. A broken one fails the identity validation below
     // (DEC-2298.12); a rewrite still to run is refused change by change.

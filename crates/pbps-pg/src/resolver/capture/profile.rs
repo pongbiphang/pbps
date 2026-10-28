@@ -38,7 +38,7 @@ pub(super) fn expression(catalog: &Catalog, text: &str, major: u32) -> Result<()
                     walk(catalog, child)?;
                 }
             }
-            Value::Null | Value::Atom(_) | Value::Datum => {}
+            Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
         }
         Ok(())
     }

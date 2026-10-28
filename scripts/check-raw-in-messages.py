@@ -66,6 +66,8 @@ SQL_BUILDERS = {
     "crates/pbps-pg/src/emit/rebuild/native.rs",
     # The connected rebuild probe's typed copy projection and bound predicates.
     "crates/pbps-pg/src/rebuild.rs",
+    # Retained CHECK catalog queries and empty-carrier SQL.
+    "crates/pbps-pg/src/retained.rs",
     "crates/pbps-mssql/src/resolver/externals.rs",
     "crates/pbps-mssql/src/resolver/externals/render.rs",
     "crates/pbps-mssql/src/resolver/dependencies.rs",
@@ -154,6 +156,10 @@ ALLOWED = {
     "crates/pbps-pg/src/rebuild.rs": (
         None,
         "builds the connected rebuild probe's projection and bound SQL from raw names",
+    ),
+    "crates/pbps-pg/src/retained.rs": (
+        None,
+        "builds retained-CHECK catalog/carrier SQL; diagnostic sinks remain checked",
     ),
     "crates/pbps-pg/src/preflight.rs": (
         None,
