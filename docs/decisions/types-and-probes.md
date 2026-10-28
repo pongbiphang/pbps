@@ -4002,3 +4002,26 @@ ALTER pin stores 123; reverting the vetter pin resolves a user function and
 refuses valid builtin use. `modifiers_are_refused_before_parse_can_release_a_session_lock`
 covers type-name OIDs, builtin collisions, quoted names, SETOF/RETURNING,
 source arrays and unreadable name resolution on both supported majors.
+<a id="dec-2392-1"></a>
+
+**DEC-2392.1. A declared routine bound to a rebuilt type is rebuilt through the ordinary module path.**
+A function or procedure whose input, output, array or argument default names
+an enum or domain holds the old type's OID and blocks `DROP TYPE`. Measured on
+PostgreSQL 16.15 and 18.6: dropping the routine before the replacement and
+creating it after the swap preserves its signature spelling and makes it bind
+the replacement. The type-rebuild census therefore classifies these `pg_proc`
+edges as `Holds::Module`, using the shared dependent reader's `format_type`
+identity arguments; it does not refuse them before classification. The same
+rule covers domain rebuilds without another path, superseding the signature
+refusals in DEC-1635.7 and DEC-1635.9.
+
+The existing module rebuild drops the routine in class 0 and creates it in
+class 14. Its dependency weave releases and restores views, defaults, checks
+and triggers that call it. No ordering class, saved-plan field, SQL rewrite or
+`CASCADE` is added. A routine the project does not declare still refuses by
+name, as does a routine appearing after planning that the saved plan does not
+drop. `before_a_rebuild` retains its owner, ACL and other carried-state checks;
+this census admits no shortcut around them. A module rebuild still requires a
+transaction and refuses staged planning. The declaration supplies the restored
+body and parameter defaults, so their values must remain valid under the
+replacement type.

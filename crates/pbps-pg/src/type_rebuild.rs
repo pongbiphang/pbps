@@ -297,27 +297,11 @@ pub async fn census(
             )));
         }
 
-        // 2. Routines that name the type in a signature block DROP TYPE.
-        let routines = conn
-            .query_with(
-                "SELECT pg_catalog.pg_describe_object('pg_catalog.pg_proc'::regclass, p.oid, 0) AS described
-                   FROM pg_catalog.pg_proc p
-                  WHERE p.prorettype IN (($1::int8)::oid, ($2::int8)::oid)
-                     OR p.proargtypes::pg_catalog.oid[] && ARRAY[($1::int8)::oid, ($2::int8)::oid]
-                     OR p.proallargtypes && ARRAY[($1::int8)::oid, ($2::int8)::oid]
-                  ORDER BY 1",
-                &[Param::I64(ty), Param::I64(array)],
-            )
-            .await?;
-        if let Some(row) = routines.first() {
-            return Err(refused(format!(
-                "{} names {noun} {shown} in its signature, which blocks DROP TYPE; the rebuild of {shown} is refused until the routine is changed in a plan of its own",
-                row.try_get::<&str>("described")?.unwrap_or_default()
-            )));
-        }
-
-        // 3. Everything else with an edge on the type: constants in checks,
-        // defaults, partial indexes and bodies; domains, ranges and casts.
+        // Signature and argument-default edges are pg_proc dependents too:
+        // the shared reader identifies their overload with format_type and
+        // module_verdict sends them through the ordinary drop/recreate path
+        // (DEC-2392.1), including its owner and ACL checks.
+        // Everything else on the type is classified by the same census.
         let mut seen: Vec<(Level, Dependent)> = Vec::new();
         for dependent in crate::modules::type_dependents(conn, ty, array).await? {
             // A column that holds the type was judged above, whether the
@@ -329,7 +313,7 @@ pub async fn census(
                 seen.push((Level::Type, dependent));
             }
         }
-        // 4. Everything on a column the plan moves that the engine does not
+        // Everything on a column the plan moves that the engine does not
         // rebuild: views, bodies, triggers, policies, generated columns.
         for (schema, table, column) in moved.union(&follow) {
             let rows = conn
@@ -716,6 +700,58 @@ mod tests {
             None
         );
         assert_eq!(constraint_owner(&part(Part::Check("c".into()))), None);
+    }
+
+    #[test]
+    fn routine_signature_dependents_use_the_module_rebuild_verdict() {
+        // The catalog reader supplies identity arguments only: return/OUT
+        // types and defaults create edges without adding identity arguments.
+        for name in [
+            "app.f(app.mood)",
+            "app.f(app.mood[])",
+            "app.arr()",
+            "app.outarg()",
+            "app.default_only(text)",
+            "app.p(app.mood)",
+        ] {
+            let id: ModuleId = name.parse().unwrap();
+            let held = dependent(Holds::Module(id.clone()));
+            let mut schema = declaring(&id);
+            let kind = if name.starts_with("app.p(") {
+                ModuleKind::Procedure
+            } else {
+                ModuleKind::Function
+            };
+            schema.modules.get_mut(&id).unwrap().kind = kind;
+            assert!(matches!(
+                verdict(Level::Type, &held, &plan(vec![]), Some(&schema), &Default::default()),
+                Verdict::Rebuild(found) if found == id
+            ));
+            // An overload or another schema's routine is not a declaration
+            // of this identity, and apply cannot discover new rebuild intent.
+            assert!(matches!(
+                verdict(
+                    Level::Type,
+                    &held,
+                    &plan(vec![]),
+                    Some(&declaring(&view("f"))),
+                    &Default::default()
+                ),
+                Verdict::Refuse(_)
+            ));
+            assert!(matches!(
+                verdict(Level::Type, &held, &plan(vec![]), None, &Default::default()),
+                Verdict::Refuse(_)
+            ));
+            let dropped = plan(vec![Change::DropModule {
+                id: id.clone(),
+                kind,
+            }]);
+            assert!(matches!(
+                verdict(Level::Type, &held, &dropped, None, &Default::default()),
+                Verdict::Fine
+            ));
+        }
     }
 
     #[test]

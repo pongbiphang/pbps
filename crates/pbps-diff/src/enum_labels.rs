@@ -315,20 +315,9 @@ pub(crate) fn rebuild_type(
             if is_domain { "definition" } else { "labels" }
         ));
     }
-    let spelled = name.raw().to_string();
-    for id in desired.schema.modules.keys() {
-        if let pbps_model::ModuleId::Routine(routine) = id
-            && routine.args.iter().any(|arg| {
-                let arg = arg.raw().replace('"', "");
-                arg.trim().trim_end_matches("[]").trim() == spelled.replace('"', "")
-            })
-        {
-            return Err(format!(
-                "routine {} takes this {kind} as an argument, which blocks DROP TYPE; declare it without the type first",
-                id.shown()
-            ));
-        }
-    }
+    // The connected census rebuilds signature-bound routines through the
+    // ordinary module path, which also checks their carried state and callers
+    // (DEC-2392.1). A signature alone is not a reason to refuse this rebuild.
     let mut columns = Vec::new();
     for (table_name, table) in &desired.schema.tables {
         for (column_name, column) in &table.columns {
@@ -3188,6 +3177,38 @@ mod rebuild_tests {
     }
 
     #[test]
+    fn routine_signatures_are_left_for_the_connected_module_rebuild() {
+        for (id, definition) in [
+            (
+                "app.f(app.e)",
+                "(x app.e) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f(app.e[])",
+                "(x app.e[]) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                "app.f()",
+                "() RETURNS app.e[] LANGUAGE sql AS $$ SELECT ARRAY['ok'::app.e] $$",
+            ),
+        ] {
+            let mut base = world(&["sad", "ok"]);
+            let mut desired = world(&["ok"]);
+            let module = pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: definition.into(),
+                options: Default::default(),
+            };
+            base.0.modules.insert(id.parse().unwrap(), module.clone());
+            desired.0.modules.insert(id.parse().unwrap(), module);
+            let (out, errors) = changes(side(&base), side(&desired), &Hints::default());
+            assert!(errors.is_empty(), "{id}: {errors:?}");
+            assert!(!steps(&out).is_empty(), "{id}: {out:?}");
+        }
+    }
+
+    #[test]
     fn what_a_rebuild_cannot_do_is_refused_by_name_with_no_step() {
         let refuses = |edit: &dyn Fn(&mut World, &mut World), expect: &str| {
             let mut base = world(&["sad", "ok"]);
@@ -3206,22 +3227,6 @@ mod rebuild_tests {
             assert!(steps(&out).is_empty(), "{expect}: {out:?}");
         };
         let t: TableName = "app.t".parse().unwrap();
-        // A routine that takes the type blocks DROP TYPE.
-        refuses(
-            &|_, d| {
-                d.0.modules.insert(
-                    "app.f(app.e)".parse().unwrap(),
-                    pbps_model::Module {
-                        kind: pbps_model::ModuleKind::Function,
-                        description: None,
-                        definition: "(x app.e) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
-                            .into(),
-                        options: Default::default(),
-                    },
-                );
-            },
-            "as an argument",
-        );
         // A column the plan adds, or retypes to the enum, is not rebuilt around.
         refuses(
             &|b, _| {

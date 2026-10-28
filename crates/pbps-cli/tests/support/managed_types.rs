@@ -3784,11 +3784,6 @@ fn enum_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_sql(
             INSERT INTO app.t VALUES (1,'ok');";
         for (slug, extra, expected) in [
             (
-                "signature",
-                "CREATE FUNCTION app.f(x app.mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
-                "as an argument",
-            ),
-            (
                 "policy",
                 "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;
                  CREATE POLICY p ON app.t USING (m <> 'sad');",
@@ -7637,11 +7632,6 @@ fn a_domain_rebuild_refuses_each_dependent_it_cannot_restore_by_name_before_any_
             INSERT INTO app.t VALUES (1,'ok');";
         for (slug, extra, expected) in [
             (
-                "signature",
-                "CREATE FUNCTION app.f(x app.name) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;",
-                "as an argument",
-            ),
-            (
                 "policy",
                 "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY;
                  CREATE POLICY p ON app.t USING (v <> 'sad');",
@@ -8427,5 +8417,245 @@ fn a_domain_bounded_string_change_counts_assignment_refusals_before_rebuilding()
         assert_eq!(scalar(db, "SELECT count(*) FROM app.t WHERE v IS NULL"), 1);
         assert!(label_plan(&d, db, &path).changes.is_empty());
         succeeds(d.run(&["verify", "--db", db]));
+    }
+}
+
+// The same pg_proc edges hold enums and domains, including a default whose
+// argument itself is built-in. Keep overloads distinct by identity arguments.
+fn signature_rebuild_dependents(ty: &str) -> String {
+    format!(
+        "CREATE FUNCTION app.accepts(x {ty}) RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN x::text <> '';
+         CREATE FUNCTION app.arr() RETURNS {ty}[] LANGUAGE SQL AS $$ SELECT ARRAY['ok'::{ty}] $$;
+         CREATE FUNCTION app.overload(x {ty}) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;
+         CREATE FUNCTION app.overload(x {ty}[]) RETURNS int LANGUAGE SQL AS $$ SELECT 2 $$;
+         CREATE FUNCTION app.outarg(OUT x {ty}) LANGUAGE SQL AS $$ SELECT 'ok'::{ty} $$;
+         CREATE FUNCTION app.default_only(x text DEFAULT 'ok'::{ty}::text) RETURNS text LANGUAGE SQL AS $$ SELECT x $$;
+         CREATE PROCEDURE app.p(x {ty} DEFAULT 'ok') LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+         CREATE TABLE app.t (id int PRIMARY KEY, v {ty}, tags {ty}[] DEFAULT app.arr(),
+             CONSTRAINT accepted CHECK (app.accepts(v)));
+         CREATE VIEW app.v AS SELECT app.accepts(v) AS accepted FROM app.t;
+         CREATE FUNCTION app.trig() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+         CREATE TRIGGER accepted BEFORE INSERT OR UPDATE ON app.t FOR EACH ROW
+             WHEN (app.accepts(NEW.v)) EXECUTE FUNCTION app.trig();
+         INSERT INTO app.t(id,v) VALUES (1,'ok');"
+    )
+}
+
+fn signature_rebuild_is_ordered(plan: &pbps_model::SavedPlan, ty: &str) {
+    use pbps_model::{Change, EnumRebuildStep, ModuleId};
+    let changes = &plan.changes.changes;
+    let first_type = changes
+        .iter()
+        .position(|p| matches!(p.change, Change::EnumRebuild { .. }))
+        .unwrap();
+    let last_swap = changes
+        .iter()
+        .rposition(|p| {
+            matches!(
+                p.change,
+                Change::EnumRebuild {
+                    step: EnumRebuildStep::Swap { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    for name in [
+        format!("app.accepts({ty})"),
+        "app.arr()".into(),
+        format!("app.overload({ty})"),
+        format!("app.overload({ty}[])"),
+        "app.outarg()".into(),
+        "app.default_only(text)".into(),
+        format!("app.p({ty})"),
+    ] {
+        let wanted: ModuleId = name.parse().unwrap();
+        let drop = changes
+            .iter()
+            .position(|p| matches!(&p.change, Change::DropModule { id, .. } if id == &wanted))
+            .unwrap_or_else(|| panic!("missing drop of {name}: {changes:#?}"));
+        let create = changes
+            .iter()
+            .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id == &wanted))
+            .unwrap_or_else(|| panic!("missing create of {name}: {changes:#?}"));
+        assert!(drop < first_type, "{name}: {changes:#?}");
+        assert!(create > last_swap, "{name}: {changes:#?}");
+    }
+}
+
+fn rebuilt_signatures_work(db: &str, ty: &str) {
+    assert_eq!(
+        scalar(db, &format!("SELECT app.overload('ok'::{ty})::bigint")),
+        1
+    );
+    assert_eq!(
+        scalar(
+            db,
+            &format!("SELECT app.overload(ARRAY['ok'::{ty}])::bigint")
+        ),
+        2
+    );
+    assert_eq!(text_of(db, "SELECT app.arr()::text"), "{ok}");
+    assert_eq!(text_of(db, "SELECT app.outarg()::text"), "ok");
+    assert_eq!(text_of(db, "SELECT app.default_only()"), "ok");
+    on_server(db, "CALL app.p(); INSERT INTO app.t(id,v) VALUES (2,'ok')");
+    assert_eq!(
+        scalar(db, "SELECT count(*)::bigint FROM app.v WHERE accepted"),
+        2
+    );
+    assert_eq!(
+        text_of(db, "SELECT tags::text FROM app.t WHERE id=2"),
+        "{ok}"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_rebuild_restores_signature_routines_and_their_dependents() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for (slug, values, labels) in [
+            ("remove", "[ok, happy]", vec!["ok", "happy"]),
+            ("reorder", "[happy, ok, sad]", vec!["happy", "ok", "sad"]),
+        ] {
+            let sql = format!(
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad','ok','happy'); {}",
+                signature_rebuild_dependents("app.mood")
+            );
+            let (own, d) = adopted(&server, &format!("signature_{slug}2392"), &sql);
+            let db = own.connection();
+            let ids = type_ids(&d);
+            declare_mood(&d, values);
+            let path = d.dir.join("signature.plan.json");
+            let plan = label_plan(&d, db, &path);
+            signature_rebuild_is_ordered(&plan, "app.mood");
+            succeeds(apply_rebuild(&d, db, &path, &[]));
+            assert!(mood_is(db, &labels));
+            assert_eq!(type_ids(&d), ids);
+            assert!(no_replacement_left(db));
+            rebuilt_signatures_work(db, "app.mood");
+            succeeds(d.run(&["verify", "--db", db]));
+            assert!(label_plan(&d, db, &path).changes.is_empty());
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domain_rebuild_restores_signature_routines_and_their_dependents() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let sql = format!(
+            "CREATE SCHEMA app; CREATE DOMAIN app.name AS varchar(20); {}",
+            signature_rebuild_dependents("app.name")
+        );
+        let (own, d) = adopted(&server, "domain_signature2392", &sql);
+        let db = own.connection();
+        std::fs::write(
+            d.dir.join("schema/app.name.type.yml"),
+            "domain: app.name\ntype: text\n",
+        )
+        .unwrap();
+        d.commit();
+        let path = d.dir.join("signature.plan.json");
+        let plan = label_plan(&d, db, &path);
+        signature_rebuild_is_ordered(&plan, "app.name");
+        succeeds(apply_rebuild(&d, db, &path, &[]));
+        assert_eq!(
+            text_of(
+                db,
+                "SELECT format_type(typbasetype,typtypmod) FROM pg_type WHERE oid='app.name'::regtype"
+            ),
+            "text"
+        );
+        rebuilt_signatures_work(db, "app.name");
+        succeeds(d.run(&["verify", "--db", db]));
+        assert!(label_plan(&d, db, &path).changes.is_empty());
+        assert!(no_replacement_left(db));
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn signature_rebuild_keeps_unmanaged_granted_and_owner_refusals() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        for (slug, extra, expected) in [
+            (
+                "unmanaged",
+                "CREATE SCHEMA outside; CREATE FUNCTION outside.f(x app.mood) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$",
+                "outside.f",
+            ),
+            (
+                "granted",
+                "GRANT EXECUTE ON FUNCTION app.f(app.mood) TO pg_monitor",
+                "pg_monitor",
+            ),
+            (
+                "owner",
+                "ALTER FUNCTION app.f(app.mood) OWNER TO pg_monitor",
+                "owner",
+            ),
+        ] {
+            let (own, d) = adopted(
+                &server,
+                &format!("signature_{slug}2392"),
+                "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+                 CREATE FUNCTION app.f(x app.mood) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;",
+            );
+            let db = own.connection();
+            on_server(db, extra);
+            // Adopt the independent edit so the test reaches the rebuild's
+            // carried-state/census refusal rather than ordinary drift.
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                db,
+                "--reason",
+                "independent routine state",
+            ]));
+            declare_mood(&d, "[ok, happy]");
+            let path = d.dir.join("refused.plan.json");
+            let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            assert_ne!(code(&out), 0, "{slug}");
+            let message = format!("{}{}", stdout(&out), stderr(&out));
+            assert!(message.contains(expected), "{slug}: {message}");
+            assert!(
+                message.contains("app.f") || message.contains("outside.f"),
+                "{message}"
+            );
+            assert!(!path.exists(), "{slug}");
+            assert!(mood_is(db, &["sad", "ok", "happy"]));
+            assert!(no_replacement_left(db));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn signature_module_rebuild_refuses_staged_planning() {
+    for server in [server(), std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()] {
+        let (own, d) = adopted(
+            &server,
+            "signature_staged2392",
+            "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('sad','ok','happy');
+             CREATE FUNCTION app.f(x app.mood) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$;",
+        );
+        declare_mood(&d, "[ok, happy]");
+        let path = d.dir.join("staged.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--out",
+            path.to_str().unwrap(),
+            "--staged",
+        ]);
+        assert_ne!(code(&out), 0);
+        let message = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            message.contains("module rebuilds require a transaction"),
+            "{message}"
+        );
+        assert!(!path.exists());
+        assert!(mood_is(own.connection(), &["sad", "ok", "happy"]));
+        assert!(no_replacement_left(own.connection()));
     }
 }

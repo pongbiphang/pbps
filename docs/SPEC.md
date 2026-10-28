@@ -875,8 +875,14 @@ of the type is rewritten under an ACCESS EXCLUSIVE lock, even for a pure
 reorder; rows holding a removed label are refused at plan time, with a count
 per column. Defaults, checks, foreign keys and filtered or expression indexes
 that name a moved column, and the views, SQL bodies and triggers over it, come
-down and go back from the declaration. A policy, generated column, materialized
-view, publication, composite attribute, domain, routine signature, range or
+down and go back from the declaration. Declared functions and procedures whose
+arguments, results or argument defaults name a rebuilt enum or domain, scalar
+or array, are dropped before it and recreated after its swap through the module
+rebuild (DEC-2392.1). Their own views, defaults, checks and triggers follow the
+ordinary dependency weave. Undeclared routines and routine state the rebuild
+cannot restore, including owner and ACL state, still refuse by name; module
+rebuilds require a transaction and refuse staged planning. A policy, generated
+column, materialized view, publication, composite attribute, domain, range or
 undeclared table that uses the type refuses by name, before any SQL. Label
 rename chains execute in free-target order; swaps refuse by name.
 Adding a label has no intrinsic risk class, like type creation; renaming one
@@ -928,8 +934,8 @@ assignment cast, no `USING`; over a rebuilt enum or domain the labels go through
 pointing at the conversion the author states (#2331); a narrower base is
 `--allow narrowing` and the rows that do not fit are counted before apply. The
 comment is carried; a non-default owner or privilege list, a composite attribute,
-a partition key, a function signature and every other dependent the plan cannot
-restore refuse by name before any SQL.
+a partition key and every other dependent the plan cannot restore refuse by
+name before any SQL. Declared routine signatures use DEC-2392.1's module rebuild.
 
 Applied domain default and named CHECK texts are retained in the declaration
 record, as table expressions are (decisions 207/208, DEC-1635.4). After the
