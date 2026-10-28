@@ -600,6 +600,10 @@
         "darwin"
       ],
       "cases": [
+        "trace::pg18_server_keeps_definition_sources_out_of_every_sink",
+        "trace::pg16_server_keeps_definition_sources_out_of_every_sink",
+        "trace::pg18_docker_keeps_definition_sources_out_of_every_sink",
+        "trace::pg16_docker_keeps_definition_sources_out_of_every_sink",
         "drop_intent2414_removals_require_recorded_reasons_on_pg16",
         "drop_intent2414_removals_require_recorded_reasons_on_pg18",
         "a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names",
