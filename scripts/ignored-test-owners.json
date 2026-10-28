@@ -213,7 +213,7 @@
       "target": ["pbps-cli", "test", "flow_pg"],
       "owner": "pg",
       "validate_on": "linux",
-      "ignored_on": ["linux", "darwin"],
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "deployment_services1165_command_contracts_on_pg16",
         "deployment_services1165_command_contracts_on_pg18"
@@ -223,7 +223,7 @@
       "target": ["pbps-cli", "test", "flow"],
       "owner": "mssql",
       "validate_on": "linux",
-      "ignored_on": ["linux", "darwin"],
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["deployment_services1165_command_contracts_on_mssql"]
     },
     {
