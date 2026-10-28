@@ -261,7 +261,14 @@
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
         "rehearsal::connected::tests::a_role_the_target_lost_since_planning_is_refused_in_the_planners_words",
         "engine::tests::the_role_questions_refuse_on_postgres_rather_than_answer_none",
-        "resolution::tests::every_resolver_kind_demands_the_cluster_identity_grant"
+        "resolution::tests::every_resolver_kind_demands_the_cluster_identity_grant",
+        "test_scratch::tests::live::a_run_is_recorded_before_and_with_its_verified_id_and_finish_confirms_it_gone",
+        "test_scratch::tests::live::a_killed_run_is_removed_by_the_next_and_a_live_one_is_not",
+        "test_scratch::tests::live::a_failed_removal_fails_the_finish_whatever_the_assertions_did_and_keeps_the_record",
+        "test_scratch::tests::live::a_pending_record_finds_its_container_by_label_and_a_stranger_by_name_is_kept",
+        "test_scratch::tests::live::a_start_cancelled_before_its_id_is_recorded_leaves_the_container_for_recovery",
+        "test_scratch::tests::live::a_start_whose_record_fails_leaves_the_container_to_the_journaled_removal",
+        "test_scratch::tests::live::a_start_failing_after_its_id_is_recorded_removes_that_container_not_the_one_now_holding_its_name"
       ]
     },
     {

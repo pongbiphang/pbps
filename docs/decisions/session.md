@@ -756,3 +756,61 @@ decides each hop there. The resolution's operator and date only stamp tombstones
 that would make the file differ and refuse anyway, so neither is read from the
 machine. The project's declaration policies bind the candidate alone: an older
 pin may predate a rule and must still replay.
+
+<a id="dec-1165-7"></a>
+
+**DEC-1165.7. A test run owns its scratch by a private record, not by a clock or a name.**
+`pbps test` adds to the resolver's Docker recovery (DEC-2410.3) only what
+ADR-0019 section 3 asks beyond it, and builds no second sweep. The container is
+still the resolver's (`Held::start_owned`: its labels, its keeper, its removal),
+so a resolver run's sweep sees a live test run as alive. What is new is on the
+client: a run id of 128 random bits, a record written atomically **before**
+`docker run` and advanced to the container's id once the runtime returns it, and
+an exclusive lock held for the run. The state directory is
+`$XDG_STATE_HOME/pbps/test-runs` (a relative value is ignored), owned by the user
+and mode 0700, and a link in place of it or of a record is refused, because a
+record that can be redirected is not evidence. The record holds ownership only:
+no SQL and no credential.
+
+A later run calls the owner dead only if its lock is free **and** the recorded
+pid is gone, or has another start time, or the boot differs. A free lock with
+the same live process proves nothing (a filesystem that ignores locks looks the
+same) and is reported, never acted on. A record with no id is resolved by
+listing the exact run label on the recorded runtime, never by name; an id is
+inspected and removed by that immutable id, and only when its labels, name and
+mounts match the record and no other container uses its volumes. A different
+container now holding the recorded name is not the original and is left alone.
+The runtime recorded must be the runtime asked: its endpoint and an identity
+read with the first `info` template that works (Podman 5.7 rejects `{{.ID}}`).
+
+One function, `removal::remove_run`, does every removal and every record
+deletion (normal teardown, recovery, a failed start), and states the rule once:
+evidence (container id and volumes) is persisted before any removal, and a
+record is deleted only after confirmed absence of the container and of every
+recorded volume. A finding that a path forgets or misjudges evidence is fixed
+in that function, never beside it.
+A removal that reports names it cannot identify (the start's own, before the
+container's id is known) leaves them on the record as `leftovers`, and such a
+record is never forgotten automatically: only a person resolves it. A start
+whose record already holds the id and volumes is an ordinary retry instead, and
+until the id is recorded the container's drop fallback stands down
+(`Owner::recoverable`), and until then the start does not remove the container
+either on failure: the owner's journaled removal does, after recording the
+evidence. So a cancelled or failed start leaves the container for the label
+listing and never one half-removed with its volume unnamed.
+
+Absence, an unreadable inspection and a timeout are three results. Only the
+runtime saying "no such container" and "no such volume" is absence; the record
+is deleted after that and not before. Anything else is a `CleanupFailure` naming
+the run, the resources and the manual removal, and it fails the command whatever
+the assertions did, which the resolver's sweep deliberately never does.
+`TestScratch::finish` is the only normal teardown and returns it; both types are
+`#[must_use]`.
+
+**Residual window.** A run killed after the client sent `docker run` and before
+the daemon created the container, found by a label listing that returns nothing,
+is read as never created, and the record goes. The daemon can in principle still
+complete that create. ADR-0019 accepts this; the resolver's own sweep still
+covers such a container by its keeper and grace. Linux only: the process
+identity is `/proc` and the boot id, and every other platform refuses with one
+typed error rather than record a weaker proof.

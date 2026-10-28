@@ -504,9 +504,10 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
         );
         let name = std::fs::read_to_string(&id).unwrap();
         assert!(name.starts_with("pbps-scratch-"));
+        // Removed by the id `docker run` printed, not by the reusable name.
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            format!("publish 127.0.0.1::1433\nkill {name}\nrm --force --volumes {name}\n")
+            "publish 127.0.0.1::1433\nkill runtime-id\nrm --force --volumes runtime-id\n"
         );
         if !mapping_case {
             assert!(

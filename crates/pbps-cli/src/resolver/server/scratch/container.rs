@@ -55,7 +55,7 @@ pub async fn with_started<T>(
     // later run can tell from them that the owner is gone (#2410).
     let token = format!("{:032x}", rand::random::<u128>());
     recovery::sweep(&token).await;
-    let container = Container::start(driver, image, &token).await?;
+    let container = Container::start(driver, image, &token, &mut Anonymous(token.clone())).await?;
     let (outcome, keeper) = match container.ready(driver, READY).await {
         Ok(()) => match recovery::Keeper::open(driver, &container.connection, &token).await {
             Ok(keeper) => (run(&container.connection).await, Some(keeper)),
@@ -90,12 +90,25 @@ impl Held {
         image: &str,
         pull: PullPolicy,
     ) -> Result<Self, ProduceError> {
+        Self::start_owned(driver, image, pull, &mut Anonymous::new()).await
+    }
+
+    /// [`Held::start`] for a caller that must know of the container before it
+    /// exists and as soon as it does: `owner` names the run, adds its labels,
+    /// is told before the create and given the container's id before anything
+    /// connects to it (`pbps test`, ADR-0019 section 3).
+    pub async fn start_owned(
+        driver: Driver,
+        image: &str,
+        pull: PullPolicy,
+        owner: &mut impl Owner,
+    ) -> Result<Self, ProduceError> {
         acquire(image, pull).await?;
         // Named, swept and kept as `with_started`'s, so that a run killed
         // while it holds the container is recovered by the next one.
-        let token = format!("{:032x}", rand::random::<u128>());
+        let token = owner.token();
         recovery::sweep(&token).await;
-        let container = Container::start(driver, image, &token).await?;
+        let container = Container::start(driver, image, &token, owner).await?;
         let kept = match container.ready(driver, READY).await {
             Ok(()) => recovery::Keeper::open(driver, &container.connection, &token).await,
             Err(error) => Err(error),
@@ -114,12 +127,69 @@ impl Held {
         &self.container.connection
     }
 
+    /// Stands the drop guard down for a container whose removal by name is no
+    /// longer safe (a name now held by a container that is not ours).
+    pub fn disown(mut self) {
+        self.container.removed = true;
+    }
+
     /// Removes the container and confirms it gone.
     pub async fn remove(self) -> Result<(), ProduceError> {
         let Self { container, keeper } = self;
         let removed = container.remove().await;
         drop(keeper);
         removed.map_err(ProduceError::Cleanup)
+    }
+}
+
+/// What a caller that owns the run it starts a container for supplies
+/// ([`Held::start_owned`]). The calls happen in this order: `before_create`,
+/// the `docker run`, `created`, and only then any connection to the server.
+#[allow(
+    async_fn_in_trait,
+    reason = "the one caller uses it by value in one function; no Send bound is needed"
+)]
+pub trait Owner {
+    /// The run's token: 32 lowercase hex digits, naming the container
+    /// `pbps-scratch-<token>` and its keeper session.
+    fn token(&self) -> String;
+    /// Further `key=value` labels for the container.
+    fn labels(&self) -> Vec<String>;
+    /// Whether a later run can find the container by its labels from what
+    /// `before_create` recorded. Then the drop fallback stands down until
+    /// `created` has recorded its id and volumes: a fallback that removed the
+    /// container first could leave a volume nothing names.
+    fn recoverable(&self) -> bool {
+        false
+    }
+    /// Called before `docker run`; an error stops the start.
+    async fn before_create(&mut self) -> Result<(), String>;
+    /// Called with the id `docker run` returned, before anything connects; an
+    /// error removes the container and stops the start.
+    async fn created(&mut self, id: &str) -> Result<(), String>;
+}
+
+/// The resolver's own run: a fresh token and nothing else to tell anyone.
+pub struct Anonymous(String);
+
+impl Anonymous {
+    fn new() -> Self {
+        Self(format!("{:032x}", rand::random::<u128>()))
+    }
+}
+
+impl Owner for Anonymous {
+    fn token(&self) -> String {
+        self.0.clone()
+    }
+    fn labels(&self) -> Vec<String> {
+        Vec::new()
+    }
+    async fn before_create(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn created(&mut self, _: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -182,6 +252,8 @@ async fn acquire(image: &str, pull: PullPolicy) -> Result<(), ProduceError> {
 /// A started container, and the superuser connection to its server.
 struct Container {
     id: String,
+    /// The runtime's id, known once `docker run` returned it; empty before.
+    immutable: String,
     connection: String,
     engine: engine::Docker,
     /// Set once `remove` confirmed it gone, so the drop guard stands down.
@@ -190,7 +262,12 @@ struct Container {
 }
 
 impl Container {
-    async fn start(driver: Driver, image: &str, token: &str) -> Result<Self, ProduceError> {
+    async fn start(
+        driver: Driver,
+        image: &str,
+        token: &str,
+        owner: &mut impl Owner,
+    ) -> Result<Self, ProduceError> {
         let password = format!("{:032x}", rand::random::<u128>());
         let engine = engine::docker(driver, &password)?;
         // Named by the run before it is asked for, so a `docker run` that
@@ -198,6 +275,7 @@ impl Container {
         // leaves one this run can still name and remove.
         let mut container = Self {
             id: format!("pbps-scratch-{token}"),
+            immutable: String::new(),
             connection: String::new(),
             engine,
             removed: false,
@@ -206,17 +284,54 @@ impl Container {
                 Driver::Postgres => password.clone(),
             },
         };
-        let args = run_args(&container.id, token, &container.engine, image);
+        owner
+            .before_create()
+            .await
+            .map_err(|why| ProduceError::Acquire(format!("before starting {image}: {why}")))?;
+        container.removed = owner.recoverable();
+        let args = run_args(
+            &container.id,
+            token,
+            &container.engine,
+            image,
+            &owner.labels(),
+        );
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let started = match run_to_end(&args).await {
             Ok(started) => {
                 started.map_err(|why| ProduceError::Acquire(format!("starting {image}: {why}")))
+            }
+            // A run that cannot be found by its labels removes at once; one that
+            // can leaves it to its owner's journaled removal, which records the
+            // evidence first.
+            Err(why) if owner.recoverable() => {
+                return Err(ProduceError::Acquire(format!("starting {image}: {why}")));
             }
             Err(why) => {
                 let name = container.id.clone();
                 return Err(unfinished_start(&name, &why, container.remove().await));
             }
         };
+        // The id is the container's identity from here on; a name can be
+        // reused, and the owner records the id before anything connects.
+        let started = match started {
+            Ok(printed) => {
+                container.immutable = printed.trim().to_owned();
+                owner
+                    .created(&container.immutable)
+                    .await
+                    .map_err(|why| {
+                        ProduceError::Acquire(format!("recording {image}'s container: {why}"))
+                    })
+                    .map(|()| printed)
+            }
+            Err(error) => Err(error),
+        };
+        // Its id and volumes are recorded now: the drop fallback may remove it.
+        let unrecorded = started.is_err();
+        if !unrecorded {
+            container.removed = false;
+        }
         let port = match started {
             Ok(_) => docker(&[
                 "port",
@@ -232,6 +347,7 @@ impl Container {
         };
         let port = match port {
             Ok(port) => port,
+            Err(error) if unrecorded && owner.recoverable() => return Err(error),
             Err(error) => {
                 return match container.remove().await {
                     Ok(()) => Err(error),
@@ -291,7 +407,9 @@ impl Container {
     /// volume it failed to delete, so a container gone proves nothing of
     /// them (#1843 review).
     async fn remove(mut self) -> Result<(), Vec<String>> {
-        let removed = remove_named(&self.id).await;
+        // By the id once the runtime returned it: the name can be taken by
+        // another container by now.
+        let removed = remove_named(self.removal_target()).await;
         if removed.is_ok() {
             self.removed = true;
         }
@@ -309,7 +427,7 @@ async fn removing(id: &str) -> bool {
 
 /// [`Container::remove`] for a container named, not owned: a leftover of a run
 /// that was killed (`recovery`).
-async fn remove_named(id: &str) -> Result<(), Vec<String>> {
+pub async fn remove_named(id: &str) -> Result<(), Vec<String>> {
     let volumes = docker(&[
         "container",
         "inspect",
@@ -376,13 +494,26 @@ async fn remove_named(id: &str) -> Result<(), Vec<String>> {
 /// A run that ends some other way (a panic, a cancelled future) still asks
 /// for its container's removal, best effort. The command is started and not
 /// waited for: an unresponsive runtime must not hold the executor.
+impl Container {
+    /// What the best-effort removal names: the runtime's id once `docker run`
+    /// returned it, because a name can come to belong to another container
+    /// (a cancelled teardown must not delete the one that took it).
+    fn removal_target(&self) -> &str {
+        if self.immutable.is_empty() {
+            &self.id
+        } else {
+            &self.immutable
+        }
+    }
+}
+
 impl Drop for Container {
     fn drop(&mut self) {
         if self.removed {
             return;
         }
         let _ = std::process::Command::new("docker")
-            .args(["rm", "--force", "--volumes", &self.id])
+            .args(["rm", "--force", "--volumes", self.removal_target()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -393,12 +524,12 @@ impl Drop for Container {
 /// Docker and Podman both report a missing container this way (measured on
 /// #1674: Podman's CLI `Error: no such container <name>`, its compatible
 /// socket `... found: no such container`, Docker's `No such container:`).
-pub(super) fn no_such_container(error: &str) -> bool {
+pub fn no_such_container(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such container")
 }
 
 /// And a missing volume (measured on #1674: `no such volume` on both).
-fn no_such_volume(error: &str) -> bool {
+pub fn no_such_volume(error: &str) -> bool {
     error.to_ascii_lowercase().contains("no such volume")
 }
 
@@ -420,7 +551,13 @@ pub(super) fn process_label() -> String {
 }
 
 /// The `docker run` that starts the scratch server.
-fn run_args(name: &str, token: &str, engine: &engine::Docker, image: &str) -> Vec<String> {
+fn run_args(
+    name: &str,
+    token: &str,
+    engine: &engine::Docker,
+    image: &str,
+    extra: &[String],
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "run",
         "--detach",
@@ -454,6 +591,10 @@ fn run_args(name: &str, token: &str, engine: &engine::Docker, image: &str) -> Ve
     .into_iter()
     .map(str::to_owned)
     .collect();
+    for label in extra {
+        args.push("--label".into());
+        args.push(label.clone());
+    }
     for variable in &engine.environment {
         args.push("--env".into());
         args.push(variable.clone());
@@ -483,7 +624,7 @@ fn unfinished_start(name: &str, why: &str, removal: Result<(), Vec<String>>) -> 
 
 /// Runs `docker` with `args`, and returns its standard output, or why it
 /// failed.
-pub(super) async fn docker(args: &[&str]) -> Result<String, String> {
+pub async fn docker(args: &[&str]) -> Result<String, String> {
     run_to_end(args).await.and_then(|finished| finished)
 }
 
@@ -568,6 +709,21 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_removal_names_the_id_once_it_is_known() {
+        let mut container = Container {
+            id: "pbps-scratch-t".into(),
+            immutable: String::new(),
+            connection: String::new(),
+            engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
+            removed: true,
+            password: String::new(),
+        };
+        assert_eq!(container.removal_target(), "pbps-scratch-t");
+        container.immutable = "f".repeat(64);
+        assert_eq!(container.removal_target(), "f".repeat(64));
+    }
+
+    #[test]
     fn only_the_runtime_saying_so_confirms_a_volume_gone() {
         for absent in [
             "docker volume failed (exit status: 1): Error response from daemon: no such volume",
@@ -592,7 +748,7 @@ mod tests {
     fn the_launch_never_pulls_and_publishes_on_loopback_only() {
         let engine = super::engine::docker(Driver::Postgres, "secret").unwrap();
         let token = "0123456789abcdef0123456789abcdef";
-        let args = run_args("pbps-scratch-0", token, &engine, "postgres:18");
+        let args = run_args("pbps-scratch-0", token, &engine, "postgres:18", &[]);
         let after = |flag: &str| {
             let at = args
                 .iter()
@@ -627,7 +783,7 @@ mod tests {
                  Id=sa;Password={password};TrustServerCertificate=true"
             )
         );
-        let mssql_args = run_args("pbps-scratch-1", token, &mssql, "sql-server-image");
+        let mssql_args = run_args("pbps-scratch-1", token, &mssql, "sql-server-image", &[]);
         assert!(
             mssql_args
                 .windows(2)
@@ -707,6 +863,7 @@ mod tests {
         });
         let container = Container {
             id: "pbps-scratch-test".into(),
+            immutable: String::new(),
             connection: format!(
                 "host=127.0.0.1 port={port} user=postgres password=x dbname=postgres sslmode=disable"
             ),
