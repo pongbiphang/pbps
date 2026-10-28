@@ -79,6 +79,8 @@ pub struct Explanation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_path: Option<String>,
     pub probes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop_requirements: Vec<String>,
     /// Checks the plan implies but that cannot be asked before it runs — a
     /// predicate over rows the plan itself writes, say. Kept apart from
     /// [`Explanation::probes`]: those are counted against the data before the
@@ -457,6 +459,13 @@ fn explain(
             .into_iter()
             .map(|p| p.description)
             .collect(),
+        drop_requirements: plan
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| p.drop_guard.as_ref())
+            .flat_map(crate::report::required_rows)
+            .collect(),
         unchecked: preflight
             .unchecked
             .into_iter()
@@ -713,12 +722,26 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         }
     }
 
+    if !e.drop_requirements.is_empty() {
+        out.push_str("\nRow requirements checked under the drop lock\n");
+        for requirement in &e.drop_requirements {
+            out.push_str(&format!("  - {requirement}\n"));
+        }
+    }
     out.push_str("\nChecks that run before the first statement\n");
     if e.probes.is_empty() && e.unchecked.is_empty() {
         // Not "everything is fine": a plan with nothing to probe is the ordinary
         // case, and phrasing it as reassurance would make the reviewer read a
         // silence as a clearance.
-        out.push_str("  None: no change in this plan has a hazard that today's data can answer.\n");
+        if e.drop_requirements.is_empty() {
+            out.push_str(
+                "  None: no change in this plan has a hazard that today's data can answer.\n",
+            );
+        } else {
+            out.push_str(
+                "  No separate pre-flight probes; row requirements run under the drop lock.\n",
+            );
+        }
     } else if e.probes.is_empty() {
         out.push_str("  None can run: each check this plan implies is listed below.\n");
     } else {

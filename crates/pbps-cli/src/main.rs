@@ -15,6 +15,7 @@ mod deploy;
 mod dev;
 mod doctor;
 use pbps_cli::emission;
+mod drop_requirement;
 mod engine;
 mod explain;
 mod externals_draft;
@@ -347,6 +348,14 @@ enum Command {
         /// Why it is being dropped; required for audit
         #[arg(long)]
         reason: pbps_model::Reason,
+        /// Require every row to satisfy this predicate before removal (`-` reads stdin)
+        #[arg(long, conflicts_with = "clear_require")]
+        require: Option<String>,
+        /// Remove the recorded row requirement
+        #[arg(long)]
+        clear_require: bool,
+        #[command(flatten)]
+        target: TargetArgs,
     },
 
     /// Record a table drop
@@ -354,6 +363,14 @@ enum Command {
         table: String,
         #[arg(long)]
         reason: pbps_model::Reason,
+        /// Require every row to satisfy this predicate before removal (`-` reads stdin)
+        #[arg(long, conflicts_with = "clear_require")]
+        require: Option<String>,
+        /// Remove the recorded row requirement
+        #[arg(long)]
+        clear_require: bool,
+        #[command(flatten)]
+        target: TargetArgs,
     },
 
     /// Record a database role rename (ADR-0005)
@@ -875,6 +892,26 @@ fn run() -> anyhow::Result<()> {
         }
         error.exit()
     });
+    if let Command::Drop {
+        reason, require, ..
+    }
+    | Command::DropTable {
+        reason, require, ..
+    } = &mut cli.command
+        && let Some(expression) = require
+    {
+        let resolved = if expression == "-" && reason.as_ref() == "-" {
+            Err("--reason and --require cannot both read standard input".into())
+        } else {
+            using_expression(expression, &mut std::io::stdin().lock())
+                .map_err(|e| e.replace("conversion expression", "row requirement"))
+        };
+        *expression = resolved.unwrap_or_else(|message: String| {
+            Cli::command()
+                .error(clap::error::ErrorKind::ValueValidation, message)
+                .exit()
+        });
+    }
     if let Command::Drop { reason, .. }
     | Command::DropTable { reason, .. }
     | Command::DropRole { reason, .. }
@@ -1384,21 +1421,37 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
-        Command::Drop { column, reason } => cmd_intent(
+        Command::Drop {
+            column,
+            reason,
+            require,
+            clear_require,
+            target,
+        } => drop_requirement::record(
             &project,
             Intent::DropColumn {
                 column: column.parse()?,
                 reason,
-            }
-            .into(),
+            },
+            &target,
+            require.as_deref(),
+            clear_require,
         ),
-        Command::DropTable { table, reason } => cmd_intent(
+        Command::DropTable {
+            table,
+            reason,
+            require,
+            clear_require,
+            target,
+        } => drop_requirement::record(
             &project,
             Intent::DropTable {
                 table: table.parse::<TableName>()?,
                 reason,
-            }
-            .into(),
+            },
+            &target,
+            require.as_deref(),
+            clear_require,
         ),
         Command::RenameRole { from, to } => cmd_intent(
             &project,
@@ -4425,6 +4478,14 @@ fn cmd_convert(
 
 /// Resolves every supplied decision together; only a complete answer is written.
 fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
+    cmd_intent_with(project, batch, |_| Ok(()))
+}
+
+fn cmd_intent_with(
+    project: &Project,
+    batch: IntentBatch,
+    update: impl FnOnce(&mut IdsFile) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let loaded = load(project, dialect(project)?.as_ref())?;
     let ids = read_ids(project)?;
     let annotation_count = loaded.intents.len();
@@ -4441,6 +4502,7 @@ fn cmd_intent(project: &Project, batch: IntentBatch) -> anyhow::Result<()> {
     ) {
         Ok(mut res) => {
             pbps_diff::conversion::prune(&mut res.ids, &loaded.schema, dialect(project)?.as_ref());
+            update(&mut res.ids)?;
             if res.ids == ids {
                 println!(
                     "The identity file is unchanged; these intents may have taken effect already."
@@ -5408,11 +5470,11 @@ fn render_sql<D: emission::Engine>(
     let statements = statements(cs, dialect)?;
     // No target to ask: UTC, as before, until #1918 gives a preview the
     // declared zone or a refusal (DEC-1916.1).
-    Ok(sql_script(
+    sql_script(
         &statements,
         baseline,
         &pbps_model::SessionZone::offline_utc(),
-    ))
+    )
 }
 
 /// [`render_sql`]'s text for statements already emitted, pinned to `zone`.
@@ -5424,11 +5486,11 @@ pub(crate) fn sql_script(
     statements: &impl emission::Script,
     baseline: &str,
     zone: &pbps_model::SessionZone,
-) -> String {
-    format!(
+) -> anyhow::Result<String> {
+    Ok(format!(
         "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
-        statements.render(zone)
-    )
+        statements.render(zone)?
+    ))
 }
 
 /// Emits every change of a plan, in plan order.

@@ -65,6 +65,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     unicode_identifiers: true,
 };
 pub mod domain_alter;
+pub mod drop_requirements;
 pub mod estimate;
 pub mod generated;
 pub mod impact;
@@ -1211,14 +1212,31 @@ impl pbps_dialect::PlanDialect for Postgres {
         Box::new(move |position| {
             let planned = &changes.changes[position];
             let context = defaults.at(position);
-            match mode {
+            let mut statements = match mode {
                 pbps_model::PlanMode::Transactional => {
-                    emit::emit_in(self, &planned.change, planned.strategy, &context)
+                    emit::emit_in(self, &planned.change, planned.strategy, &context)?
                 }
                 pbps_model::PlanMode::Staged => {
-                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)
+                    if planned.drop_guard.is_some() {
+                        return Err(DialectError::Invalid {
+                            dialect: "postgres",
+                            message: "guarded drops require a transactional plan; --staged is unsupported"
+                                .into(),
+                        });
+                    }
+                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)?
                 }
+            };
+            if let Some(guard) = &planned.drop_guard {
+                let first = statements
+                    .first_mut()
+                    .ok_or_else(|| DialectError::Invalid {
+                        dialect: "postgres",
+                        message: "a guarded drop emitted no statement".into(),
+                    })?;
+                first.drop_guard = Some(guard.clone());
             }
+            Ok(statements)
         })
     }
 
@@ -8032,7 +8050,8 @@ mod certified_emission_tests {
                     (0, 0)
                 );
                 assert_eq!(
-                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
+                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc())
+                        .unwrap(),
                     script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,

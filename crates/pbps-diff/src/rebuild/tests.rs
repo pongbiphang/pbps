@@ -847,6 +847,7 @@ fn qualification_follows_what_the_baseline_holds() {
     swapped.tombstones.insert(
         old_leaf,
         pbps_model::Tombstone {
+            require: None,
             was: "app.p1".into(),
             dropped_at: "2026-10-24".into(),
             reason: "re-created".into(),
@@ -1387,6 +1388,7 @@ fn withdrawing_restores_exactly_the_file_before_the_approval() {
     dropped.tombstones.insert(
         child,
         pbps_model::Tombstone {
+            require: None,
             was: "app.p1".into(),
             dropped_at: "d".into(),
             reason: "r".into(),

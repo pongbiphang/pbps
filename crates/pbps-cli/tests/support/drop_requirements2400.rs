@@ -1,0 +1,428 @@
+use super::{
+    BIN, Demo, OwnDatabase, approved_apply, bootstrapped_demo, code, connected_artifact,
+    old_server, on_server, plan_checksum, scalar, server, stderr, stdout, succeeds,
+};
+use pbps_model::{IdsFile, SavedPlan};
+use std::io::Write as _;
+use std::process::{Command, Output, Stdio};
+
+fn with_stdin(d: &Demo, args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(BIN)
+        .arg("--project")
+        .arg(&d.dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn blank_non_utf8_and_competing_stdin_requirements_are_usage_errors_before_recording() {
+    let d = Demo::new("require2400_stdin");
+    for input in [b" \r\n".as_slice(), b"\xff"] {
+        let out = with_stdin(
+            &d,
+            &[
+                "drop",
+                "app.t.amount",
+                "--reason",
+                "copied",
+                "--require",
+                "-",
+            ],
+            input,
+        );
+        assert_eq!(code(&out), 2, "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains(if input == b"\xff" {
+                "not UTF-8"
+            } else {
+                "row requirement is blank"
+            }),
+            "{}",
+            stderr(&out)
+        );
+    }
+    let out = with_stdin(
+        &d,
+        &["drop", "app.t.amount", "--reason", "-", "--require", "-"],
+        b"",
+    );
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("--reason and --require cannot both read standard input"));
+    assert!(!d.dir.join("schema.ids.json").exists());
+}
+
+const BEFORE: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  amount: {type: integer}\n  cents: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\n";
+const AFTER: &str = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  cents: {type: integer}\n  marker: {type: integer}\nprimary_key: {name: pk_t, columns: [id]}\n";
+const PREDICATE: &str = "cents = amount * 100";
+
+fn bytes(d: &Demo) -> Vec<u8> {
+    std::fs::read(d.dir.join("schema.ids.json")).unwrap()
+}
+fn ids(d: &Demo) -> IdsFile {
+    serde_json::from_slice(&bytes(d)).unwrap()
+}
+fn record(d: &Demo, connection: &str, predicate: &str) {
+    succeeds(d.run(&[
+        "drop",
+        "app.t.amount",
+        "--reason",
+        "copied",
+        "--require",
+        predicate,
+        "--db",
+        connection,
+    ]));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn guarded_drops_record_replace_clear_pin_and_apply_on_postgres_18() {
+    outcome(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn guarded_drops_record_replace_clear_pin_and_apply_on_postgres_16() {
+    outcome(&old_server());
+}
+
+fn outcome(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_success");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_success", BEFORE);
+    on_server(connection, "INSERT INTO app.t VALUES (1,2,200)");
+    d.table(AFTER);
+    succeeds(with_stdin(
+        &d,
+        &[
+            "drop",
+            "app.t.amount",
+            "--reason",
+            "copied",
+            "--require",
+            "-",
+            "--db",
+            connection,
+        ],
+        format!("{PREDICATE}\r\n").as_bytes(),
+    ));
+    let first = bytes(&d);
+    record(&d, connection, PREDICATE);
+    assert_eq!(bytes(&d), first, "the same requirement is idempotent");
+    let plan = connected_artifact(&d, connection, false);
+    let old_checksum = plan_checksum(&plan);
+    let old: SavedPlan = serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let guard = old
+        .changes
+        .changes
+        .iter()
+        .find_map(|p| p.drop_guard.as_ref())
+        .unwrap();
+    assert_eq!(guard.requirements.len(), 1);
+    assert_eq!(
+        guard.requirements.values().next().unwrap().predicate,
+        PREDICATE
+    );
+    let explained = succeeds(d.run(&["explain", "--plan", plan.to_str().unwrap()]));
+    assert!(stdout(&explained).contains(PREDICATE));
+    assert!(stdout(&explained).contains("readers and writers wait"));
+    let sql = d.dir.join("guarded.sql");
+    let out = d.run(&["plan", "--db", connection, "--sql", sql.to_str().unwrap()]);
+    assert_ne!(code(&out), 0);
+    assert!(
+        stderr(&out).contains("standalone SQL export"),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(!sql.exists());
+    let staged = d.run(&["plan", "--db", connection, "--staged"]);
+    assert_ne!(code(&staged), 0);
+    succeeds(d.run(&[
+        "drop",
+        "app.t.amount",
+        "--reason",
+        "copied",
+        "--clear-require",
+        "--db",
+        connection,
+    ]));
+    assert!(ids(&d).tombstones.values().all(|t| t.require.is_none()));
+    record(&d, connection, "cents = amount * 100 AND amount >= 0");
+    let plan = connected_artifact(&d, connection, false);
+    assert_ne!(plan_checksum(&plan), old_checksum);
+    let stale = d.run(&[
+        "apply",
+        "--db",
+        connection,
+        "--plan",
+        plan.to_str().unwrap(),
+        "--checksum",
+        &old_checksum,
+        "--allow",
+        "destructive",
+    ]);
+    assert_ne!(code(&stale), 0);
+    assert!(
+        stderr(&stale).contains("no longer matches"),
+        "{}",
+        stderr(&stale)
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='amount'"
+        ),
+        0
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*)::bigint FROM public.__pbps_state WHERE plan_checksum='{}'",
+                plan_checksum(&plan)
+            )
+        ),
+        1
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn a_violating_row_after_plan_refuses_and_rolls_back_the_drop_on_postgres_18() {
+    late_row(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn a_violating_row_after_plan_refuses_and_rolls_back_the_drop_on_postgres_16() {
+    late_row(&old_server());
+}
+
+fn late_row(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_late");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_late", BEFORE);
+    on_server(connection, "INSERT INTO app.t VALUES (1,2,200)");
+    d.table(AFTER);
+    record(&d, connection, PREDICATE);
+    let plan = connected_artifact(&d, connection, false);
+    on_server(connection, "INSERT INTO app.t VALUES (2,2,0)");
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "destructive"]);
+    assert_ne!(
+        code(&refused),
+        0,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused)
+            .contains("1 row(s) of app.t violate the row requirement `cents = amount * 100`"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='amount'"
+        ),
+        1
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.columns WHERE table_schema='app' AND table_name='t' AND column_name='marker'"
+        ),
+        0,
+        "the earlier ADD COLUMN rolls back too"
+    );
+    assert_eq!(scalar(connection, "SELECT count(*)::bigint FROM app.t"), 2);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn unsafe_recording_writes_nothing_and_referenced_renames_split_the_plan_on_postgres_18() {
+    recording(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn unsafe_recording_writes_nothing_and_referenced_renames_split_the_plan_on_postgres_16() {
+    recording(&old_server());
+}
+
+fn recording(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_record");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_record", BEFORE);
+    d.table(AFTER);
+    on_server(
+        connection,
+        "CREATE TABLE app.other (amount integer); CREATE FUNCTION app.user_check(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'",
+    );
+    let before = bytes(&d);
+    for predicate in [
+        "app.user_check(amount)",
+        "app.other.amount = amount",
+        "random() > 0",
+        "EXISTS(SELECT 1 FROM app.other)",
+        "false) AND (false",
+    ] {
+        let refused = d.run(&[
+            "drop",
+            "app.t.amount",
+            "--reason",
+            "copied",
+            "--require",
+            predicate,
+            "--db",
+            connection,
+        ]);
+        assert_ne!(
+            code(&refused),
+            0,
+            "{predicate}: {}{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(!stderr(&refused).is_empty());
+        assert_eq!(
+            bytes(&d),
+            before,
+            "{predicate} must be refused before the ids write"
+        );
+    }
+    on_server(
+        connection,
+        "DROP FUNCTION app.user_check(integer); DROP TABLE app.other",
+    );
+    record(&d, connection, PREDICATE);
+    let guarded = bytes(&d);
+    let mut malformed = ids(&d);
+    for tombstone in malformed.tombstones.values_mut() {
+        if let Some(requirement) = &mut tombstone.require {
+            requirement.predicate = "false) AND (false".into();
+        }
+    }
+    std::fs::write(
+        d.dir.join("schema.ids.json"),
+        serde_json::to_vec_pretty(&malformed).unwrap(),
+    )
+    .unwrap();
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("has unbalanced parentheses"),
+        "{}",
+        stderr(&refused)
+    );
+    std::fs::write(d.dir.join("schema.ids.json"), guarded).unwrap();
+    d.commit();
+    d.table(&AFTER.replace(
+        "  cents: {type: integer}",
+        "  amount_cents: {type: integer}",
+    ));
+    succeeds(d.run(&["rename", "app.t.cents", "amount_cents"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("split the plan"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn a_table_drop_honors_its_removed_columns_requirements_on_postgres_18() {
+    table_drop(&server());
+}
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn a_table_drop_honors_its_removed_columns_requirements_on_postgres_16() {
+    table_drop(&old_server());
+}
+
+fn table_drop(server: &str) {
+    let own = OwnDatabase::new(server, "require2400_table");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "require2400_table", BEFORE);
+    on_server(connection, "INSERT INTO app.t VALUES (1,2,0)");
+    d.table(AFTER);
+    record(&d, connection, PREDICATE);
+    std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+    succeeds(d.run(&[
+        "drop-table",
+        "app.t",
+        "--reason",
+        "archived",
+        "--require",
+        "id > 0",
+        "--db",
+        connection,
+    ]));
+    let plan = connected_artifact(&d, connection, false);
+    let saved: SavedPlan = serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved
+            .changes
+            .changes
+            .iter()
+            .find_map(|p| p.drop_guard.as_ref())
+            .unwrap()
+            .requirements
+            .len(),
+        2
+    );
+    let refused = approved_apply(&d, connection, &plan, &["--allow", "destructive"]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("violate the row requirement"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(scalar(connection, "SELECT count(*)::bigint FROM app.t"), 1);
+    on_server(connection, "UPDATE app.t SET cents=200");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM information_schema.tables WHERE table_schema='app' AND table_name='t'"
+        ),
+        0
+    );
+    succeeds(d.run(&[
+        "drop-table",
+        "app.t",
+        "--reason",
+        "archived",
+        "--clear-require",
+        "--db",
+        connection,
+    ]));
+    assert!(
+        ids(&d)
+            .tombstones
+            .iter()
+            .filter(|(u, _)| u.kind() == pbps_model::UidKind::Table)
+            .all(|(_, t)| t.require.is_none())
+    );
+}

@@ -78,7 +78,9 @@ pub use data_work::{DataWorkError, DataWorkIdentity, DataWorkOutcome, DataWorkRe
 pub use declared::{Binding, Bindings, Declared, DeclaredExpressions, DeclaredPolicyExpressions};
 pub use drift::{DriftBaseline, DriftReport};
 pub use finding::{Finding, Severity};
-pub use ids::{Conversion, IdsFile, IdsIndex, Move, Tombstone, ValidIds};
+pub use ids::{
+    Conversion, DropGuard, DropRequirement, IdsFile, IdsIndex, Move, Tombstone, ValidIds,
+};
 pub use intent::Intent;
 pub use managed_type::{DomainDelta, DomainHalf, EnumPlacement, EnumRebuildStep, ManagedType};
 pub use module::{

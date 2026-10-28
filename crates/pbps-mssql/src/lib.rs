@@ -1130,7 +1130,8 @@ mod certified_emission_tests {
                     (0, 0)
                 );
                 assert_eq!(
-                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
+                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc())
+                        .unwrap(),
                     script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,

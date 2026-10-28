@@ -26,6 +26,7 @@ fn policy(roles: &[&str]) -> RowPolicy {
 
 fn planned(change: Change) -> PlannedChange {
     PlannedChange {
+        drop_guard: None,
         change,
         risks: Default::default(),
         strategy: Default::default(),

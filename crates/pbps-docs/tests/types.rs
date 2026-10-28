@@ -47,6 +47,7 @@ fn without_types() -> (Schema, IdsFile) {
     ids.tombstones.insert(
         "c_k7x2mq".parse().unwrap(),
         Tombstone {
+            require: None,
             was: "app.customer.legacy".into(),
             dropped_at: "2026-01-05".into(),
             reason: "No longer collected.".into(),

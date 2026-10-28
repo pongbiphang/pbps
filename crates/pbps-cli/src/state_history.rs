@@ -786,6 +786,7 @@ mod tests {
         current.tombstones.insert(
             source.clone(),
             pbps_model::Tombstone {
+                require: None,
                 was: "dbo.product".into(),
                 dropped_at: "2026-10-24".into(),
                 reason: "maintenance".into(),
@@ -1222,6 +1223,7 @@ mod tests {
         retired.tombstones.insert(
             "c_aaaaaa".parse().unwrap(),
             pbps_model::Tombstone {
+                require: None,
                 was: "dbo.product.code".into(),
                 dropped_at: "2026-10-23".into(),
                 reason: "retired".into(),
@@ -1329,6 +1331,7 @@ mod tests {
                 (
                     "c_cccccc".parse().unwrap(),
                     pbps_model::Tombstone {
+                        require: None,
                         was: "dbo.product.retired".into(),
                         dropped_at: "2026-10-22".into(),
                         reason: "selected snapshot retirement".into(),
@@ -1339,6 +1342,7 @@ mod tests {
                 (
                     "t_dddddd".parse().unwrap(),
                     pbps_model::Tombstone {
+                        require: None,
                         was: table.raw().to_string(),
                         dropped_at: "2026-10-24".into(),
                         reason: "selected snapshot rebuild".into(),
@@ -1348,6 +1352,7 @@ mod tests {
                 (
                     "c_dddddd".parse().unwrap(),
                     pbps_model::Tombstone {
+                        require: None,
                         was: table.column("code").raw().to_string(),
                         dropped_at: "2026-10-24".into(),
                         reason: "selected snapshot rebuild".into(),
@@ -1469,6 +1474,7 @@ mod tests {
             0,
         );
         let stone = |was: String| pbps_model::Tombstone {
+            require: None,
             was,
             dropped_at: "2026-10-24".into(),
             reason: "retired by the rebuild".into(),

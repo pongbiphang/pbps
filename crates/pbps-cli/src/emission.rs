@@ -172,7 +172,7 @@ impl LoweredPlan {
             EnginePlan::Mssql { plan, .. } => plan.groups(),
         }
     }
-    pub fn render(&self, zone: &SessionZone) -> String {
+    pub fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
         match &self.inner {
             EnginePlan::Postgres { dialect, plan } => {
                 pbps_dialect::render_script(plan, dialect, zone)
@@ -221,10 +221,10 @@ pub fn statement_count(
 /// }
 /// ```
 pub trait Script: sealed::Script {
-    fn render(&self, zone: &SessionZone) -> String;
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError>;
 }
 impl Script for LoweredPlan {
-    fn render(&self, zone: &SessionZone) -> String {
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
         LoweredPlan::render(self, zone)
     }
 }
@@ -240,7 +240,7 @@ pub enum BootstrapScript {
     },
 }
 impl Script for BootstrapScript {
-    fn render(&self, zone: &SessionZone) -> String {
+    fn render(&self, zone: &SessionZone) -> Result<String, pbps_dialect::DialectError> {
         match self {
             Self::Postgres { dialect, script } => script.render(dialect, zone),
             Self::Mssql { dialect, script } => script.render(dialect, zone),

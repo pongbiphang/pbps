@@ -63,6 +63,11 @@ pub enum IdsError {
     )]
     InvalidConversion { uid: Uid },
 
+    #[error(
+        "the row requirement recorded for {uid} is blank or is not on a table or column tombstone"
+    )]
+    InvalidDropRequirement { uid: Uid },
+
     #[error("{uid} points at `{}`, but the snapshot schema does not hold it", crate::escape::Escaped(.name))]
     NotHeld { uid: Uid, name: String },
 }
@@ -204,6 +209,26 @@ pub struct Tombstone {
     pub dropped_at: String,
     pub reason: String,
     pub operator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<DropRequirement>,
+}
+
+/// Human intent, kept outside schema equality and sealed with the tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DropRequirement {
+    pub predicate: String,
+    pub required_at: String,
+    pub operator: String,
+}
+
+/// Derived before certification; consumers must execute this check or refuse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DropGuard {
+    pub table: TableName,
+    pub detach_from: Option<TableName>,
+    pub requirements: BTreeMap<Uid, DropRequirement>,
 }
 
 impl IdsFile {
@@ -447,7 +472,13 @@ impl IdsFile {
             }
         }
 
-        for uid in self.tombstones.keys() {
+        for (uid, tombstone) in &self.tombstones {
+            if let Some(requirement) = &tombstone.require
+                && (requirement.predicate.trim().is_empty()
+                    || !matches!(uid.kind(), UidKind::Table | UidKind::Column))
+            {
+                return Err(IdsError::InvalidDropRequirement { uid: uid.clone() });
+            }
             if self.tables.contains_key(uid)
                 || self.columns.contains_key(uid)
                 || self.roles.contains_key(uid)
@@ -736,6 +767,7 @@ mod tests {
         ids.tombstones.insert(
             uid("c_zzzzzz"),
             Tombstone {
+                require: None,
                 was: "dbo.retired.old".into(),
                 dropped_at: "2026-10-12".into(),
                 reason: "retired".into(),
@@ -807,6 +839,7 @@ mod tests {
         f.tombstones.insert(
             uid("c_z9z9z9"),
             Tombstone {
+                require: None,
                 was: "dbo.order.legacy".into(),
                 dropped_at: "2026-10-07".into(),
                 reason: "gone".into(),
@@ -1046,6 +1079,7 @@ mod tests {
         f.tombstones.insert(
             uid("c_p3n8vd"),
             Tombstone {
+                require: None,
                 was: "dbo.customer.full_name".into(),
                 dropped_at: "2026-08-30".into(),
                 reason: "test".into(),
@@ -1392,6 +1426,7 @@ mod managed_type_tests {
         ids.tombstones.insert(
             uid,
             Tombstone {
+                require: None,
                 was: name.raw().to_string(),
                 dropped_at: "2026-10-23".into(),
                 reason: "fixture".into(),

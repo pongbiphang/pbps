@@ -7322,6 +7322,7 @@ fn apply_refuses_a_plan_that_relabels_a_rebuilt_routine_as_a_fresh_one() {
     let plan_path = d.dir.join("relabelled.json");
     let id: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
     let planned = |change| pbps_model::PlannedChange {
+        drop_guard: None,
         change,
         risks: Default::default(),
         strategy: Default::default(),
@@ -7409,6 +7410,7 @@ fn apply_refuses_a_plan_that_builds_a_routine_and_settles_nothing_about_public()
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
+                drop_guard: None,
                 change: pbps_model::Change::CreateModule {
                     id: "app.f(integer)".parse().unwrap(),
                     module: Box::new(pbps_model::Module {
@@ -7469,6 +7471,7 @@ fn apply_refuses_a_plan_whose_risks_were_removed() {
         },
         pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange {
+                drop_guard: None,
                 change: pbps_model::Change::DropTable {
                     uid: "t_aaaaaa".parse().unwrap(),
                     name: "dbo.t".parse().unwrap(),

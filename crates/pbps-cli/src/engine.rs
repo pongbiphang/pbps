@@ -91,6 +91,66 @@ pub async fn vet_conversions(
     Ok(())
 }
 
+pub async fn vet_drop_requirements(
+    conn: &mut Conn,
+    names: &pbps_model::plan_names::PlanNames<'_>,
+) -> anyhow::Result<()> {
+    for step in names.changes() {
+        let Some(guard) = &step.drop_guard else {
+            continue;
+        };
+        let table = names
+            .stored(&guard.table, pbps_model::plan_names::At::Start)
+            .unwrap_or_else(|| guard.table.clone());
+        for requirement in guard.requirements.values() {
+            let columns = vet_drop_requirement(conn, &table, &requirement.predicate).await?;
+            pbps_diff::drop_requirements::check_columns(
+                guard,
+                &step.change,
+                names.changes(),
+                &columns,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn vet_drop_requirement(
+    conn: &mut Conn,
+    table: &TableName,
+    predicate: &str,
+) -> anyhow::Result<BTreeSet<pbps_model::ColumnName>> {
+    match conn.driver() {
+        Driver::Postgres => pbps_pg::input_path::vet_requirement(
+            conn,
+            pbps_pg::pins::Within::OwnTransaction,
+            table,
+            predicate,
+        )
+        .await
+        .map_err(anyhow::Error::msg),
+        Driver::Mssql => anyhow::bail!("guarded drops are not supported on this engine yet"),
+    }
+}
+
+pub async fn check_drop_requirement(
+    conn: &mut Conn,
+    statement: &pbps_dialect::Statement,
+) -> Result<(), DbError> {
+    let Some(guard) = &statement.drop_guard else {
+        return Ok(());
+    };
+    match conn.driver() {
+        Driver::Postgres => pbps_pg::drop_requirements::check(conn, guard)
+            .await
+            .map_err(DbError::Refused),
+        Driver::Mssql => Err(DbError::Refused(
+            "guarded drops are not supported on this engine yet".into(),
+        )),
+    }
+}
+
 /// Recover validation after a staged step's caller has rolled its transaction back.
 pub async fn recover_failed_staged_validation(
     conn: &mut Conn,

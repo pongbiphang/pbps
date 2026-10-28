@@ -523,6 +523,7 @@ mod tests {
             ids.tombstones.insert(
                 uid.parse::<Uid>().unwrap(),
                 Tombstone {
+                    require: None,
                     was: was.into(),
                     dropped_at: at.into(),
                     reason: "no longer collected".into(),

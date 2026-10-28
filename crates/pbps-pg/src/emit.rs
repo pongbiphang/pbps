@@ -220,7 +220,7 @@ mod declared_type_emission_tests {
                 &pg,
             )
             .unwrap();
-            pbps_dialect::render_script(&lowered, &pg, &pbps_model::SessionZone::utc())
+            pbps_dialect::render_script(&lowered, &pg, &pbps_model::SessionZone::utc()).unwrap()
         };
         let plain = domain_for_alteration(false, None, &[("old", "VALUE <> ''")]);
         let checked = domain_for_alteration(

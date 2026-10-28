@@ -1458,6 +1458,42 @@ pbps convert app.orders.amount --using "amount::integer" --from "varchar(20)"
 
 ---
 
+### 6.7 Row requirements for recorded drops
+
+`pbps drop <column> --reason <reason> --require <predicate>|- --db <connection>`
+(or `--env <name>`) records a boolean row requirement on the column's UID
+tombstone. `drop-table` accepts the same options. The record contains
+`predicate`, `required_at` and `operator`, and is sealed with the saved plan.
+Recording requires the actual target and vets before writing the identity file;
+unlike offline `convert`, it must refuse unsafe code when recorded. Repeating
+`--require` replaces the requirement; omitting it preserves the requirement.
+`--clear-require` explicitly removes it. Historical name reuse must identify
+one tombstone unambiguously. Neither plan nor apply supplies replacement SQL.
+
+PostgreSQL uses the recorded-conversion binding and built-in decoder: only
+columns of that table, no subqueries, no non-built-in code and no volatile
+routines. The literal and modifier-input protections run before binding,
+under the same empty search path as execution. A predicate referencing a
+column this plan renames, retypes or replaces is refused with the split-plan
+remedy. A column-drop predicate cannot depend on another column the plan
+also drops. Rebuild-source requirements are unsupported in v1. A table drop
+honors requirements of the column UIDs it removes too.
+
+Immediately before a guarded drop, apply takes ACCESS EXCLUSIVE directly on
+the table, including its partitions and inheritance children, and counts
+`WHERE (<predicate>) IS NOT TRUE`. FALSE and NULL fail. The lock is held
+through the drop and transaction commit: **readers and writers wait for the
+scan's duration**. Existing lock-wait and timeout behavior applies. A positive
+count refuses with the full count; query errors, unreadable counts, active RLS
+and missing privilege refuse too. No unchecked fallback can permit the drop.
+
+The guard is derived from recorded intent under section 7.5, not a user hook.
+Transactional rehearsal executes it; unframed and staged consumers refuse.
+Standalone SQL export refuses guarded drops. SQL Server integration follows
+PostgreSQL in #2400's separate PR; until then it refuses guarded drops.
+
+---
+
 ## 7. Change classification and the risk gate
 
 ### 7.1 Decided automatically vs needing intent

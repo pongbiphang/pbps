@@ -13868,6 +13868,7 @@ async fn recorded_last_table_keeps_its_schema_in_the_readiness_check() {
     ids.tombstones.insert(
         "t_aaaaaa".parse().unwrap(),
         pbps_model::Tombstone {
+            require: None,
             was: "legacy.t".to_owned(),
             dropped_at: "2026-01-01".to_owned(),
             reason: "retired".to_owned(),

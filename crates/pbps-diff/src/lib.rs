@@ -9,6 +9,7 @@
 
 pub mod conversion;
 pub mod domain_rebuild;
+pub mod drop_requirements;
 pub mod enum_labels;
 pub mod foreign_keys;
 pub mod identity;
