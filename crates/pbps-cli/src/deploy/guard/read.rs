@@ -14,6 +14,7 @@ enum Mode {
 pub(in crate::deploy) struct Read<'a> {
     plan: Plan<'a>,
     mode: Mode,
+    retained: Option<&'a pbps_pg::retained::Verified>,
 }
 
 impl<'a> Read<'a> {
@@ -21,6 +22,7 @@ impl<'a> Read<'a> {
         Self {
             plan,
             mode: Mode::Transactional,
+            retained: None,
         }
     }
 
@@ -30,7 +32,22 @@ impl<'a> Read<'a> {
             StagedRead::Checkpoint { .. } => Mode::StagedWhole,
             StagedRead::Closing { .. } => Mode::StagedClosing,
         };
-        Self { plan, mode }
+        Self {
+            plan,
+            mode,
+            retained: None,
+        }
+    }
+
+    pub(in crate::deploy) fn with_retained(
+        mut self,
+        retained: Option<&'a pbps_pg::retained::Verified>,
+    ) -> Self {
+        self.retained = retained;
+        self
+    }
+    pub(in crate::deploy) fn retained(&self) -> Option<&'a pbps_pg::retained::Verified> {
+        self.retained
     }
 
     pub(in crate::deploy) fn parts(self) -> (Plan<'a>, Settled) {

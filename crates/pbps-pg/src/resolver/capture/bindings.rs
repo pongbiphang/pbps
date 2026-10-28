@@ -48,7 +48,7 @@ pub(super) fn extract(
         match value {
             Value::Node(_) => true,
             Value::List(values) => !values.is_empty() && values.iter().all(has_node),
-            Value::Null | Value::Atom(_) | Value::Datum => false,
+            Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => false,
         }
     }
     if !has_node(&tree) {
@@ -177,7 +177,7 @@ fn subobjects<'a>(
                 path.pop();
             }
         }
-        Value::Null | Value::Atom(_) | Value::Datum => {}
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
     }
     Ok(())
 }
@@ -470,7 +470,7 @@ mod tests {
             Value::Node(node) if node.tag == tag => Some(node),
             Value::Node(node) => node.fields.values().find_map(|v| find_node(v, tag)),
             Value::List(values) => values.iter().find_map(|v| find_node(v, tag)),
-            Value::Null | Value::Atom(_) | Value::Datum => None,
+            Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => None,
         }
     }
 
@@ -575,7 +575,8 @@ mod tests {
                     | Value::Atom(_)
                     | Value::List(_)
                     | Value::Node(_)
-                    | Value::Datum => None,
+                    | Value::Datum
+                    | Value::DatumBytes { .. } => None,
                 })
                 .unwrap();
             let original = derived_row_fields(range).unwrap();
