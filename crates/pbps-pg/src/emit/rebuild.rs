@@ -1,7 +1,8 @@
-//! Physical lowering remains behind the canonical/admission rebuild refusal.
+//! Physical lowering of the certified, transactional rebuild parts.
 use super::*;
 use pbps_model::{
-    AnalyzeTableTree, BuildPartitionedIndex, CopyTableRows, PartitionIndexDefinition as Definition,
+    AnalyzeTableTree, BuildPartitionedIndex, CopyColumn, CopyTableRows,
+    PartitionIndexDefinition as Definition,
 };
 
 pub(super) fn build_partitioned_index(pg: &Postgres, recipe: &BuildPartitionedIndex) -> Sql {
@@ -101,15 +102,7 @@ pub(super) fn copy_table_rows(pg: &Postgres, copy: &CopyTableRows) -> Sql {
             return Err(invalid("copy column belongs to another relation".into()));
         }
         names.push(quote(column.target.name.raw())?);
-        let source = match &column.source {
-            Some(source) => format!("src.{}", quote(source.column.name.raw())?),
-            None => "NULL".into(),
-        };
-        let mut value = format!("CAST({source} AS {})", sql_type(&column.cast)?);
-        if let Some(collation) = &column.collation {
-            value.push_str(&format!(" COLLATE {}", quote(collation.as_str())?));
-        }
-        values.push(value);
+        values.push(copy_value(column)?);
     }
     if names.is_empty() {
         return Err(invalid("rebuild copy has no destination columns".into()));
@@ -152,3 +145,32 @@ mod tests;
 #[cfg(test)]
 #[path = "../../../pbps-model/tests/support/rebuild.rs"]
 pub(super) mod fixture;
+
+/// Apply every stage to the preceding value. The one-column vet ensures an
+/// expression cannot accidentally bind a sibling or the outer source row.
+pub(crate) fn copy_value(column: &CopyColumn) -> Result<String, DialectError> {
+    let mut value = column.source.as_ref().map_or(Ok("NULL".into()), |s| {
+        quote(s.column.name.raw()).map(|name| format!("src.{name}"))
+    })?;
+    if column.stages.is_empty() {
+        value = format!("CAST({value} AS {})", sql_type(&column.cast)?);
+        if let Some(collation) = &column.collation {
+            value.push_str(&format!(" COLLATE {}", quote(collation.as_str())?));
+        }
+    } else {
+        for stage in &column.stages {
+            if let Some(using) = &stage.using {
+                value = format!(
+                    "(SELECT ({}) FROM (SELECT {value} AS {}) AS conversion)",
+                    verbatim(using),
+                    quote(stage.input.raw())?
+                );
+            }
+            value = format!("CAST({value} AS {})", sql_type(&stage.cast)?);
+            if let Some(collation) = &stage.collation {
+                value.push_str(&format!(" COLLATE {}", quote(collation.as_str())?));
+            }
+        }
+    }
+    Ok(value)
+}

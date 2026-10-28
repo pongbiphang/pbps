@@ -169,7 +169,7 @@ mod tests {
                 Some("operator-branch".into()),
             )
             .unwrap();
-        assert_eq!(new.version, 34);
+        assert_eq!(new.version, 35);
         assert_eq!(new.schema, old.schema);
         assert_eq!(new.ids, old.ids);
         assert_eq!(new.module_deps, old.module_deps);

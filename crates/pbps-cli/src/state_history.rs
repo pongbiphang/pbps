@@ -808,6 +808,7 @@ mod tests {
                 reason: "maintenance".parse().unwrap(),
                 operator: "o".into(),
                 types: Default::default(),
+                conversions: Default::default(),
             },
         );
         current.validate().unwrap();
@@ -1380,6 +1381,7 @@ mod tests {
                     reason: "selected snapshot rebuild".parse().unwrap(),
                     operator: "selected".into(),
                     types: Default::default(),
+                    conversions: Default::default(),
                 },
             )]
             .into(),
@@ -1510,6 +1512,7 @@ mod tests {
                     reason: "reserve past identities".parse().unwrap(),
                     operator: "selected".into(),
                     types: Default::default(),
+                    conversions: Default::default(),
                 },
             )]
             .into(),

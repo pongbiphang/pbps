@@ -332,10 +332,17 @@ fn reapprove(
         ));
     }
     let mut out = ids.clone();
+    let conversions: BTreeMap<_, _> = replacement
+        .columns
+        .keys()
+        .filter(|uid| old.continues.contains_key(*uid))
+        .filter_map(|uid| ids.conversions.get(uid).map(|c| (uid.clone(), c.clone())))
+        .collect();
     let approval = out.rebuilds.get_mut(key).unwrap();
     if approval.target_checksum == checksum
         && approval.replacement == replacement
         && approval.types == shapes(schema, &replacement)
+        && approval.conversions == conversions
         && approval.max_rows == max_rows
         && &approval.reason == reason
     {
@@ -343,6 +350,7 @@ fn reapprove(
     }
     approval.target_checksum = checksum.to_owned();
     approval.types = shapes(schema, &replacement);
+    approval.conversions = conversions;
     // What a member continues does not change with its name; only a member
     // the file no longer holds leaves the pairing.
     approval.continues.retain(|to, _| {
@@ -429,23 +437,6 @@ pub fn record(
             ),
         ));
     }
-    // A conversion is keyed by a uid approval retires (DEC-2298.12).
-    if let Some((column, c)) = source
-        .columns
-        .iter()
-        .find_map(|(u, column)| ids.conversions.get(u).map(|c| (column, c)))
-    {
-        return Err(refused(
-            table,
-            format!(
-                "{} has a recorded conversion from `{}` to `{}`; apply it first, or delete its \
-                 `conversions` entry, then approve",
-                column.shown(),
-                c.from,
-                c.to
-            ),
-        ));
-    }
     let mut reserved = BTreeSet::new();
     let mut fresh = |kind| loop {
         let uid = Uid::generate(kind);
@@ -497,6 +488,14 @@ pub fn record(
             },
         );
     }
+    let conversions = continues
+        .iter()
+        .filter_map(|(to, from)| {
+            let conversion = out.conversions.remove(from)?;
+            out.conversions.insert(to.clone(), conversion.clone());
+            Some((to.clone(), conversion))
+        })
+        .collect();
     out.tables.extend(replacement.tables.clone());
     out.columns.extend(replacement.columns.clone());
     out.rebuilds.insert(
@@ -504,6 +503,7 @@ pub fn record(
         Rebuild {
             source,
             types: shapes(desired, &replacement),
+            conversions,
             replacement,
             replacement_root,
             continues,
@@ -542,9 +542,40 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
         out.tombstones.remove(uid);
         out.tables.insert(uid.clone(), name.clone());
     }
+    for (to, conversion) in &record.conversions {
+        if let Some(from) = record.continues.get(to) {
+            out.conversions.insert(from.clone(), conversion.clone());
+        }
+    }
     for (uid, column) in &record.source.columns {
         out.tombstones.remove(uid);
         out.columns.insert(uid.clone(), column.clone());
+    }
+    out
+}
+
+fn restored_chain<'a>(ids: &IdsFile, links: impl Iterator<Item = &'a Rebuild>) -> IdsFile {
+    let links: Vec<_> = links.collect();
+    let source = &links[0].source;
+    let mut out = ids.clone();
+    for record in links.iter().rev() {
+        out = restored(&out, record.source_root().unwrap(), record);
+    }
+    // A member born between approvals never existed at the oldest source.
+    // Restoring each link separately would leave that intermediate UID live.
+    for record in links {
+        for uid in record
+            .source
+            .tables
+            .keys()
+            .chain(record.source.columns.keys())
+            .filter(|uid| !source.tables.contains_key(*uid) && !source.columns.contains_key(*uid))
+        {
+            out.tables.remove(uid);
+            out.columns.remove(uid);
+            out.moves.remove(uid);
+            out.conversions.remove(uid);
+        }
     }
     out
 }
@@ -554,11 +585,7 @@ fn restored(ids: &IdsFile, key: &Uid, record: &Rebuild) -> IdsFile {
 /// own, so naming its plan over the switched file would start the tree under
 /// UIDs the environment does not hold (DEC-2298.12).
 pub fn logical_view(desired: &IdsFile, root: &RebuildPartitionedTable) -> IdsFile {
-    let key = root
-        .intent
-        .source_root()
-        .expect("a qualified root pairs its replacement parent with a source parent");
-    restored(desired, key, &root.intent)
+    restored_chain(desired, root.links())
 }
 
 /// The inverse of an approval, as an offline edit of the identity file
@@ -726,6 +753,23 @@ pub fn qualify(
         });
     }
     shape(base.schema, desired.schema, table, used.len() == 1)?;
+    if intent.conversions
+        != intent
+            .replacement
+            .columns
+            .keys()
+            .filter(|uid| intent.continues.contains_key(*uid))
+            .filter_map(|uid| {
+                desired
+                    .ids
+                    .conversions
+                    .get(uid)
+                    .map(|c| (uid.clone(), c.clone()))
+            })
+            .collect()
+    {
+        return Err(stale());
+    }
     if intent.target_checksum != after.fingerprint() {
         return Err(stale());
     }
@@ -892,18 +936,10 @@ pub(crate) fn lineage_errors(
                  it cannot be read as rebuilt or as not yet rebuilt"
                     .to_owned(),
             )),
-            Stand::Source(start) => {
-                let composed = links.len() - start;
-                let why = match qualify(base, declared, &table, dialect) {
-                    Ok(_) if composed > 1 => format!(
-                        "recorded intent is valid, as one rebuild composed over {composed} approved links; \
-                         table rebuild execution is not available yet"
-                    ),
-                    Ok(_) => "recorded intent is valid; table rebuild execution is not available yet"
-                        .to_owned(),
-                    Err(error) => error.why,
-                };
-                errors.push(error(table, why));
+            Stand::Source(_) => {
+                if let Err(refused) = qualify(base, declared, &table, dialect) {
+                    errors.push(error(table, refused.why));
+                }
             }
         }
     }
@@ -936,3 +972,139 @@ mod tests;
 #[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub mod member_cases;
+
+/// Install the identities the last recorded environment actually holds. Names
+/// cannot identify a lineage link: a chain can return to its original shape.
+pub fn installation(
+    ids: &IdsFile,
+    previous: Option<&pbps_model::StateSnapshot>,
+) -> Result<IdsFile, RebuildError> {
+    let mut installed = ids.clone();
+    for (key, record) in &ids.rebuilds {
+        let Some(table) = ids.tables.get(&record.replacement_root) else {
+            continue;
+        };
+        let previous = previous.ok_or_else(|| refused(table, "the rebuild lineage has no recorded environment identity; bootstrap a new environment, or restore its ledger before baselining"))?;
+        let links = chain(ids, key, record);
+        match stand(&previous.ids, &links) {
+            Stand::Done => {}
+            Stand::Source(start) => {
+                installed =
+                    restored_chain(&installed, links[start..].iter().map(|(_, record)| *record));
+            }
+            Stand::Fresh | Stand::Partial => {
+                return Err(refused(
+                    table,
+                    "the recorded environment does not identify one complete rebuild lineage link",
+                ));
+            }
+        }
+    }
+    installed
+        .validate()
+        .map_err(|e| refused(&TableName::new("?", "?"), e.to_string()))?;
+    Ok(installed)
+}
+
+/// Pin the complete copy projection, including each intermediate transformation.
+/// A USING expression is vetted against its one input column by the engine.
+pub fn copy_columns(
+    root: &RebuildPartitionedTable,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> Result<Vec<pbps_model::CopyColumn>, RebuildError> {
+    let lineages = root.composed_columns();
+    root.after[&root.table]
+        .columns
+        .iter()
+        .map(|(name, declared)| {
+            let target = root.table.column(name);
+            let lineage = lineages
+                .get(&target)
+                .ok_or_else(|| refused(&root.table, "copy column has no lineage"))?;
+            let source = if lineage.from_environment {
+                let column = &lineage.stages[0].column;
+                let spec = root.before[&column.table]
+                    .columns
+                    .get(&column.name)
+                    .ok_or_else(|| refused(&root.table, "copy source column is absent"))?;
+                Some(pbps_model::CopySource {
+                    column: column.clone(),
+                    ty: spec.ty.clone(),
+                    collation: spec.collation.clone(),
+                })
+            } else {
+                None
+            };
+            let mut previous = source
+                .as_ref()
+                .map(|s| s.ty.clone());
+            let mut stages = Vec::new();
+            for stage in lineage
+                .stages
+                .iter()
+                .skip(usize::from(lineage.from_environment))
+            {
+                let shape = stage.shape.as_ref().ok_or_else(|| {
+                    refused(
+                        &root.table,
+                        "an intermediate copy type is missing; re-approve the lineage",
+                    )
+                })?;
+                let link = root.links().find(|link| link.replacement.columns.contains_key(&stage.uid)).unwrap();
+                let input = link.continues.get(&stage.uid).and_then(|uid| link.source.columns.get(uid)).map_or_else(|| stage.column.name.clone(), |c| c.name.clone());
+                let conversion = link.conversions.get(&stage.uid).filter(|c| {
+                    c.to == shape.ty.raw().to_string() && previous.as_ref().is_some_and(|p| c.from == p.raw().to_string() || *p != shape.ty)
+                });
+                if let (Some(c), Some(ty)) = (conversion, &previous)
+                    && c.from != ty.raw().to_string() {
+                    let from = c.from.parse::<pbps_model::ColumnType>().map_err(|e| refused(&root.table, e.to_string()))?;
+                    if dialect.type_change_needs_using(ty, &from) { return Err(refused(&root.table, "an ordinary edit between rebuild approvals needs an unrecorded conversion")); }
+                    stages.push(pbps_model::CopyStage { input: input.clone(), cast: from, collation: None, using: None });
+                }
+                let using = conversion.map(|c| c.using.clone());
+                if let Some(from) = &previous
+                    && using.is_none()
+                    && dialect.type_change_needs_using(from, &shape.ty)
+                {
+                    return Err(refused(
+                        &root.table,
+                        format!(
+                            "{} needs a recorded conversion from `{}` to `{}`",
+                            stage.column.shown(),
+                            from.shown(),
+                            shape.ty.shown()
+                        ),
+                    ));
+                }
+                stages.push(pbps_model::CopyStage {
+                    input,
+                    cast: shape.ty.clone(),
+                    collation: shape.collation.clone(),
+                    using,
+                });
+                previous = Some(shape.ty.clone());
+            }
+            if stages.len() == 1 && stages[0].using.is_none() {
+                stages.clear();
+            }
+            Ok(pbps_model::CopyColumn {
+                source,
+                target,
+                cast: declared.ty.clone(),
+                collation: declared.collation.clone(),
+                stages,
+            })
+        })
+        .collect()
+}
+
+/// Recheck exactly the locked tree with the approval's canonical type rules.
+pub fn same_tree(
+    before: &Schema,
+    observed: &Schema,
+    root: &TableName,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
+) -> bool {
+    tree(&canonical_schema(before, dialect).0, root)
+        == tree(&canonical_schema(observed, dialect).0, root)
+}

@@ -4924,6 +4924,7 @@ fn refuse_pinned_movement(
     let carried: BTreeSet<&TableName> = before
         .tables
         .keys()
+        .filter(|name| !tables.retired(name))
         .map(|name| tables.final_name(name))
         .collect();
     let no_rows = pbps_model::TableData {
@@ -4948,6 +4949,7 @@ fn refuse_pinned_movement(
     let touched_tables = before
         .tables
         .iter()
+        .filter(|(name, _)| !tables.retired(name))
         .map(|(name, was)| {
             (
                 name,
@@ -4966,12 +4968,6 @@ fn refuse_pinned_movement(
     for (name, was_rows) in touched_tables {
         if !named(name) {
             // Already compared whole, rows included.
-            continue;
-        }
-        // A table this plan drops, read while a table it renames into that
-        // name was still under its own: the later read's occupant is the
-        // renamed one, which its own entry compares (DEC-536.1).
-        if tables.retired(name) {
             continue;
         }
         let now_name = tables.final_name(name);
@@ -5031,7 +5027,9 @@ fn refuse_pinned_movement(
         {
             continue;
         }
-        if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name)) {
+        if let (Some(was), Some(now)) = (before.tables.get(name), after.tables.get(now_name))
+            && carried.contains(now_name)
+        {
             // A rename carries the constraints that name the column or the
             // table with it — a primary key, a unique, an index's key and
             // `INCLUDE` columns, a child's `references_table` — so no change
@@ -5980,6 +5978,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         let mut conn = db::connect(target).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
+            let ids = crate::engine::installation_ids(&mut conn, &ids).await?;
             let scoped = managed_state(
                 &mut conn,
                 &ids,
@@ -6215,6 +6214,7 @@ pub fn cmd_baseline(
         let mut conn = db::connect(target).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
+            let ids = crate::engine::installation_ids(&mut conn, &ids).await?;
             // A staged attach's temporary CHECK is taken out in the same
             // transaction as the read and the record. Dropped on its own, a
             // baseline that then refused left the database without it while
@@ -7175,6 +7175,19 @@ pub fn cmd_plan_db(
             carried.clone_from(&checkout_findings);
         }
 
+        if let Ok((_, entry)) = &checked_target {
+            let reversed = pbps_diff::rebuild::rebuilt_since(&ids, &entry.snapshot.ids);
+            anyhow::ensure!(
+                reversed.is_empty(),
+                "this environment already applied an approved rewrite of {}; restore the approval before planning; neither a drop and create nor a reverse rebuild is planned",
+                reversed
+                    .iter()
+                    .map(|t| t.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         // Identity and the eventual diff use the same recorded snapshot: a
         // missing checkout UID supplies no drop reason (DEC-2414.1).
         let context = crate::context(project.root())?;
@@ -7876,7 +7889,16 @@ pub fn cmd_plan_db(
             } else {
                 cs
             };
-            let (mut cs, dependents) = crate::engine::account_for_module_dependents(
+            let mut rebuild_verification = None;
+            let (mut cs, dependents) = if cs.changes.iter().any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))) {
+                let (changes, check, verification) = crate::engine::expand_table_rebuild(&mut conn, cs,
+                    pbps_diff::Side { schema: &base, ids: &recorded_ids },
+                    pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+                    &hints, dialect.as_ref()).await?;
+                rebuild_verification = Some(verification);
+                (changes, check)
+            } else {
+                crate::engine::account_for_module_dependents(
                 &mut conn,
                 cs,
                 &loaded.schema,
@@ -7892,7 +7914,8 @@ pub fn cmd_plan_db(
                 dialect.as_ref(),
                 &rediff,
             )
-            .await?;
+            .await?
+            };
             // A retype or drop of a column a generated column reads goes
             // after the plan's change to that expression which stops reading
             // it (DEC-1316.1): after the module passes, which may move that
@@ -7944,8 +7967,11 @@ pub fn cmd_plan_db(
             // Debug assertions alone, not `cfg(test)`: `pbps-diff` is compiled
             // without its own `cfg(test)` here, so a release test build has no
             // observer to call.
+            if let Some(verification) = &rebuild_verification {
+                verification.verify(pbps_diff::Side { schema: &base, ids: &recorded_ids }, pbps_diff::Side { schema: &declared, ids: &resolved.ids }, &hints, &cs, dialect.as_ref()).map_err(|why| anyhow::anyhow!("{why}"))?;
+            }
             #[cfg(debug_assertions)]
-            pbps_diff::order::shadow::observe_scheduled(
+            if rebuild_verification.is_none() { pbps_diff::order::shadow::observe_scheduled(
                 pbps_diff::Side {
                     schema: &recorded_snapshot.schema,
                     ids: &recorded_ids,
@@ -7964,7 +7990,7 @@ pub fn cmd_plan_db(
                         .or_else(|| name_facts.as_ref().map(crate::engine::NameFacts::slots))
                         .unwrap_or_default(),
                 ),
-            );
+            ); }
             // The observer's own gate: a release test build has `cfg(test)`
             // but no observer, so the facts are spent here too (#2089).
             #[cfg(not(debug_assertions))]
@@ -9187,6 +9213,15 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
+        crate::engine::rebuild_window(
+            conn,
+            pbps_diff::Side {
+                schema: &entry.snapshot.schema,
+                ids: &recorded_ids,
+            },
+            &plan.changes,
+        )
+        .await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_dependents(
             conn,

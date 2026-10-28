@@ -96,7 +96,7 @@ pub use reason::{Reason, ReasonError};
 pub use rebuild::{ColumnShape, Rebuild, RebuildIdentities};
 pub use rebuild_ops::{
     AnalyzeTableTree, BuildPartitionedIndex, ColumnLineage, ColumnStage, CopyColumn, CopySource,
-    CopyTableRows, IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition,
+    CopyStage, CopyTableRows, IntermediateAddress, PartitionIndexClone, PartitionIndexDefinition,
     RebuildPartitionedTable, RebuildRelation,
 };
 pub use rehearsal::{AuthorizationRehearsal, Rehearsal};

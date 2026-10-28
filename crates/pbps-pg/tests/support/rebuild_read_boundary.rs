@@ -103,6 +103,7 @@ fn one_split_origin_orders_source_temp_and_backup_reads_through_shared_slots() {
             .columns
             .iter()
             .map(|(name, c)| CopyColumn {
+                stages: Vec::new(),
                 source: Some(CopySource {
                     column: parent.column(name),
                     ty: schema.tables[&parent].columns[name].ty.clone(),

@@ -143,7 +143,8 @@ use crate::schema::Schema;
 /// Version 34 adds self-reported data work; earlier snapshots truthfully have none
 /// (DEC-2402.1). Older clients must refuse the new kind rather than treat its
 /// reporting checkout as deployed schema evidence.
-pub const CURRENT_VERSION: u32 = 34;
+/// Version 35 keeps per-link rebuild conversion history (DEC-2298.13).
+pub const CURRENT_VERSION: u32 = 35;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -721,7 +722,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 34);
+        assert_eq!(CURRENT_VERSION, 35);
     }
 
     fn schema_with(ty: &str) -> Schema {

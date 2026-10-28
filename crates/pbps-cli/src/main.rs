@@ -389,7 +389,6 @@ enum Command {
     },
 
     /// Approve a blocking partitioned-table rewrite, or withdraw an approval
-    /// (execution is not available yet)
     ///
     /// Approving switches the table's identities in the identity file at once;
     /// commit it with the declarations. `--withdraw` is the offline inverse.
@@ -3389,7 +3388,7 @@ fn cmd_rebuild_table(
         println!("updated {}", project.ids_file().display());
     }
     println!(
-        "Approved a blocking rewrite and switched its identities; table rebuild execution is not available yet."
+        "Approved a blocking rewrite and switched its identities; commit the declarations and identities, then plan against the database."
     );
     Ok(())
 }

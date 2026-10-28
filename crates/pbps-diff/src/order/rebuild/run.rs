@@ -384,7 +384,7 @@ impl Expansion for Rule<'_> {
     }
 }
 /// Consume the validated inventory into a settled draft, with independent replay.
-/// It still cannot be lowered, sealed or admitted as an executable rebuild.
+/// Only the checked connected continuation can grant its route state.
 pub fn expand(
     input: &Input<'_>,
     prepared: Prepared,
@@ -433,3 +433,29 @@ pub fn expand(
 
 #[cfg(test)]
 mod tests;
+
+/// Verify the final sequence using the expansion facts, without another settlement.
+pub fn verify_plan(
+    input: &Input<'_>,
+    prepared: &Prepared,
+    plan: &ChangeSet,
+    dialect: &dyn Dialect,
+) -> Result<(), String> {
+    let rule = Rule {
+        canonical: prepared.operations(),
+        prepared: prepared.clone(),
+        input,
+        dialect,
+    };
+    let (_, indices) = rule.select(&plan.changes)?;
+    if indices.len() != prepared.parts.len() {
+        return Err("the final rebuild lost an approved part".into());
+    }
+    rule.replay(&plan.changes)?;
+    for edge in rule.order(&plan.changes)? {
+        if !matches!((edge.before, edge.after), (Step::Plan(a), Step::Plan(b)) if a < b) {
+            return Err("the final rebuild violates its expansion obligations".into());
+        }
+    }
+    Ok(())
+}

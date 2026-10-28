@@ -2581,7 +2581,7 @@ impl Change {
                 standing(match &r.definition {
                     crate::PartitionIndexDefinition::Index(i) => PartDefinition::Index(i, false),
                     crate::PartitionIndexDefinition::PrimaryKey(k) => {
-                        PartDefinition::PrimaryKey(k, false)
+                        PartDefinition::PrimaryKey(k, true)
                     }
                     crate::PartitionIndexDefinition::Unique(k) => PartDefinition::Unique(k, false),
                 }),

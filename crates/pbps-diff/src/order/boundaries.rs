@@ -22,6 +22,7 @@ pub(super) struct Obligations {
     // not alter replay, but respelling, rewriting or reordering a Change does.
     checked: Option<Receipt>,
     modules: Option<ModuleEdits>,
+    rebuild: bool,
 }
 #[derive(Debug, Clone)]
 struct Receipt {
@@ -29,6 +30,13 @@ struct Receipt {
     events: Vec<(OperationId, Origin)>,
 }
 impl Obligations {
+    pub(super) fn rebuilt(&self) -> bool {
+        self.rebuild
+    }
+    pub(super) fn enable_rebuild(&mut self) {
+        self.rebuild = true;
+    }
+
     pub(super) fn require(
         &mut self,
         pending: impl IntoIterator<Item = Boundary>,

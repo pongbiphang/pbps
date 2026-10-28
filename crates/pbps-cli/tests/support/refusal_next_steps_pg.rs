@@ -82,12 +82,8 @@ fn partition_rebuild_refusals_name_the_open_tracking_issue_and_keep_their_exit_c
         stdout(&refused),
         stderr(&refused)
     );
-    assert!(stderr(&refused).contains("cannot plan the blocking rewrite"));
-    assert!(
-        stderr(&refused)
-            .contains("recorded intent is valid; table rebuild execution is not available yet")
-    );
-    assert!(stderr(&refused).contains("issue #2298"));
+    assert!(stderr(&refused).contains("requires connected expansion"));
+    assert!(stderr(&refused).contains("pbps plan --db"));
 }
 
 #[test]

@@ -3771,6 +3771,14 @@ pub fn require_transactional_rebuilds(
     changes: &ChangeSet,
     staged: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !staged
+            || !changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::RebuildPartitionedTable(_))),
+        "table rebuild requires transactional mode; --staged is unsupported"
+    );
     if driver == Driver::Postgres && staged && !rebuilt_modules(changes).is_empty() {
         anyhow::bail!(
             "PostgreSQL module rebuilds require a transaction to preserve their catalog state \
@@ -6476,3 +6484,71 @@ mod removal_note_tests {
         }
     }
 }
+
+/// Snapshot and baseline retain a source UID until its approved copy commits.
+pub async fn installation_ids(conn: &mut Conn, ids: &IdsFile) -> anyhow::Result<IdsFile> {
+    if ids.rebuilds.is_empty() {
+        return Ok(ids.clone());
+    }
+    let previous = latest(conn).await?;
+    Ok(pbps_diff::rebuild::installation(
+        ids,
+        previous.as_ref().map(|e| &e.snapshot),
+    )?)
+}
+
+/// The qualified table root expands at the existing connected continuation.
+pub async fn expand_table_rebuild<
+    S: pbps_diff::order::RouteState<D>,
+    D: crate::emission::Engine,
+>(
+    conn: &mut Conn,
+    changes: PlanningPlan<S>,
+    before: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &pbps_model::Hints,
+    dialect: &D,
+) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck, RebuildVerification)> {
+    anyhow::ensure!(
+        conn.driver() == Driver::Postgres,
+        "this engine does not support table rebuilds"
+    );
+    let (links, cap) = changes
+        .changes
+        .first()
+        .and_then(|p| {
+            if let pbps_model::Change::RebuildPartitionedTable(r) = &p.change {
+                Some((r.earlier.len() + 1, r.cap()))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing qualified rebuild root"))?;
+    let (changes, rows, bytes, verification) =
+        pbps_pg::rebuild::plan(conn, changes, before, desired, hints, dialect).await?;
+    Ok((
+        changes,
+        ConnectedCheck {
+            name: "blocking_rewrite",
+            engine: "PostgreSQL",
+            status: "checked",
+            message: format!(
+                "blocking rewrite composed over {links} approved links: {rows} observed rows, max_rows {cap}, {bytes} total bytes; about twice the disk space while both trees exist; the full copy is written to WAL and can delay replicas",
+            ),
+        },
+        verification,
+    ))
+}
+
+pub async fn rebuild_window(
+    conn: &mut Conn,
+    before: pbps_diff::Side<'_>,
+    changes: &ChangeSet,
+) -> anyhow::Result<()> {
+    if conn.driver() == Driver::Postgres {
+        pbps_pg::rebuild::window(conn, before, changes).await?;
+    }
+    Ok(())
+}
+
+pub type RebuildVerification = pbps_pg::rebuild::Verification;

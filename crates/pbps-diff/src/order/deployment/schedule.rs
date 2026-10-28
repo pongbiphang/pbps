@@ -240,7 +240,8 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     facts: &Facts<'_>,
     dialect: &dyn Dialect,
 ) -> Result<Scheduled<S, D>, Refusal> {
-    crate::order::plan::reject_pending_rebuild(cs.changes()).map_err(Refusal)?;
+    crate::order::plan::reject_pending_rebuild(cs.changes(), cs.boundaries.rebuilt())
+        .map_err(Refusal)?;
     let mut cs: PlanningPlan = crate::order::plan::state(cs);
     let (mut added, mut split, mut moved) = (0, 0, 0);
     let mut skipped = Vec::new();

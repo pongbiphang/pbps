@@ -1798,6 +1798,23 @@ async fn untrusted_actors(
     Ok(out)
 }
 
+/// Bind a copy stage in the caller's probe savepoint; its rollback removes the
+/// temporary binding even when decoding or vetting refuses the expression.
+pub(crate) async fn vet_copy_conversion(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnName,
+    from: &pbps_model::ColumnType,
+    using: &str,
+) -> Result<(), String> {
+    let name = crate::quote(column.raw()).map_err(|e| e.to_string())?;
+    let ty = crate::types::normalize(from).map_err(|e| e.to_string())?;
+    vet_in_transaction(conn, &name, &ty.raw().to_string(), using, column.raw()).await?;
+    conn.execute("DROP TABLE pg_temp.pbps_conversion")
+        .await
+        .map_err(|_| "rebuild conversion binding could not be removed".to_owned())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

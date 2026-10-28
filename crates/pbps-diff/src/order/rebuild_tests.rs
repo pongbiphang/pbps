@@ -195,7 +195,7 @@ fn rebuild_roots_and_partial_parts_are_refused_by_the_shared_route() {
         .unwrap_err()
         .to_string();
         assert!(
-            error.contains("cannot be certified") && error.contains(&name),
+            error.contains("requires") && error.contains(&name),
             "{error}"
         );
     }

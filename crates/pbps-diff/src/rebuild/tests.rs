@@ -993,8 +993,11 @@ fn a_plan_follows_what_its_environment_holds_of_the_lineage() {
 
     // Holding the source: the record supplies the rebuild, which is still refused.
     let pending = diff(side(&base, &ids), target);
-    assert!(first_rebuild_error(&pending).contains("not available yet"));
-    assert!(pending.changes.changes.is_empty());
+    assert!(pending.errors.is_empty());
+    assert!(matches!(
+        &pending.changes.changes[0].change,
+        pbps_model::Change::RebuildPartitionedTable(_)
+    ));
 
     // The declarations moved since the approval: refused by name with the command.
     let mut moved = desired.clone();
@@ -1122,12 +1125,8 @@ fn an_environment_behind_on_a_chain_is_qualified_for_one_composed_rebuild() {
 
     // Holding the first source: one rebuild to the last link, shown as composed.
     let behind = diff(side(&chain.base.0, &chain.base.1), head);
-    let why = first_rebuild_error(&behind);
-    assert!(
-        why.contains("composed over 2 approved links") && why.contains("not available yet"),
-        "{why}"
-    );
-    assert!(behind.changes.changes.is_empty());
+    assert!(behind.errors.is_empty());
+    assert_eq!(behind.changes.changes.len(), 1);
     let root = qualify(side(&chain.base.0, &chain.base.1), head, &table()).unwrap();
     assert_eq!(root.earlier.len(), 1);
     assert_eq!(
@@ -1145,8 +1144,9 @@ fn an_environment_behind_on_a_chain_is_qualified_for_one_composed_rebuild() {
     assert!(middle.earlier.is_empty());
     assert_eq!(middle.source(), &middle.intent.source);
     assert!(
-        first_rebuild_error(&diff(side(&chain.middle.0, &chain.middle.1), head))
-            .ends_with("not available yet")
+        diff(side(&chain.middle.0, &chain.middle.1), head)
+            .errors
+            .is_empty()
     );
 
     // Holding the last replacement, or nothing: no rebuild to plan.
@@ -2021,11 +2021,8 @@ fn a_chain_that_ends_where_it_began_is_qualified_as_one_composed_rebuild() {
             "{widen}: a column carried through both links reads the environment's"
         );
         let behind = diff(side(&start, &ids), side(&start, &back));
-        let why = first_rebuild_error(&behind);
-        assert!(
-            why.contains("composed over 2 approved links"),
-            "{widen}: {why}"
-        );
+        assert!(behind.errors.is_empty());
+        assert_eq!(behind.changes.changes.len(), 1);
         // Holding the middle link is one ordinary rebuild, which does change.
         qualify(side(&away, &first), side(&start, &back), &table()).unwrap();
         // The environment that has everything has nothing to rebuild.
@@ -2133,38 +2130,52 @@ fn an_approval_keeps_the_conversion_of_a_column_it_does_not_replace() {
 }
 
 #[test]
-fn an_approval_over_a_recorded_conversion_of_a_source_column_is_refused() {
-    let (base, mut ids, desired) = fixture();
-    let bucket = ids.column_uid(&table().column("bucket")).unwrap().clone();
-    ids.conversions.insert(bucket.clone(), conversion());
-    // The approval retires the column the conversion belongs to; it must not
-    // write a file that validation refuses, nor drop the intent unnamed.
-    let refused = record(
-        side(&base, &ids),
-        &desired,
-        &ids,
-        &table(),
-        20,
-        &reason(),
-        &ctx(),
+fn approval_carries_a_conversion_and_withdrawal_restores_its_source() {
+    let (base, mut ids, mut desired) = fixture();
+    desired
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .get_mut("bucket")
+        .unwrap()
+        .ty = "bigint".parse().unwrap();
+    let source = ids.column_uid(&table().column("bucket")).unwrap().clone();
+    let mut c = conversion();
+    c.from = "integer".into();
+    c.to = "bigint".into();
+    c.using = "bucket::bigint + 1".into();
+    ids.conversions.insert(source.clone(), c.clone());
+    let approval = recorded(&base, &ids, &desired);
+    let target = approval.column_uid(&table().column("bucket")).unwrap();
+    assert_eq!(approval.conversions.get(target), Some(&c));
+    assert!(!approval.conversions.contains_key(&source));
+    let link = approval.rebuilds.values().next().unwrap();
+    assert_eq!(link.conversions.get(target), Some(&c));
+    assert_eq!(withdraw(&approval, &table()).unwrap(), ids);
+    let root = qualify(side(&base, &ids), side(&desired, &approval), &table()).unwrap();
+    let columns = copy_columns(&root, &pbps_dialect::MinimalDialect).unwrap();
+    assert_eq!(
+        columns
+            .iter()
+            .find(|c| c.target.name.raw() == "bucket")
+            .unwrap()
+            .stages[0]
+            .using
+            .as_deref(),
+        Some("bucket::bigint + 1")
     );
-    let why = refused.unwrap_err().why;
-    for named in ["app.p.bucket", "from `text` to `integer`", "apply it first"] {
-        assert!(why.contains(named), "{named}: {why}");
-    }
-    // The same file without the conversion is approved.
-    ids.conversions.remove(&bucket);
+    let mut broken = approval.clone();
+    broken
+        .rebuilds
+        .values_mut()
+        .next()
+        .unwrap()
+        .conversions
+        .insert(source, c);
     assert!(
-        record(
-            side(&base, &ids),
-            &desired,
-            &ids,
-            &table(),
-            20,
-            &reason(),
-            &ctx()
-        )
-        .is_ok()
+        broken.validate().is_err(),
+        "history must be paired with a replacement UID"
     );
 }
 
@@ -2201,38 +2212,70 @@ fn a_withdrawal_takes_the_conversion_of_a_replacement_column_with_it() {
 }
 
 #[test]
-fn a_chain_link_meets_the_conversion_rules_of_the_link_before_it() {
-    let (start, _, away, first, back) = there_and_back(false);
-    let middle = first.column_uid(&table().column("bucket")).unwrap().clone();
-    // The second approval retires the first link's replacement columns, so a
-    // conversion recorded for one is refused as for any source column.
-    let mut converted = first.clone();
-    converted.conversions.insert(middle.clone(), conversion());
-    let next = |ids: &IdsFile| {
-        record(
-            side(&away, ids),
-            &start,
-            ids,
-            &table(),
-            30,
-            &reason(),
-            &ctx(),
-        )
+fn composed_columns_keep_each_links_conversion_and_strictest_cap() {
+    let (start, mut ids, mut middle) = fixture();
+    middle
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .get_mut("bucket")
+        .unwrap()
+        .ty = "bigint".parse().unwrap();
+    let column = table().column("bucket");
+    let source = ids.column_uid(&column).unwrap().clone();
+    let c = pbps_model::Conversion {
+        from: "integer".into(),
+        to: "bigint".into(),
+        using: "bucket::bigint + 1".into(),
+        ..conversion()
     };
-    let why = next(&converted).unwrap_err().why;
-    assert!(
-        why.contains("app.p.bucket") && why.contains("apply it first"),
-        "{why}"
+    ids.conversions.insert(source.clone(), c.clone());
+    let mut first = recorded(&start, &ids, &middle);
+    let mid_uid = first.column_uid(&column).unwrap().clone();
+    let next = pbps_model::Conversion {
+        from: "bigint".into(),
+        to: "integer".into(),
+        using: "bucket::integer * 2".into(),
+        ..conversion()
+    };
+    first.conversions.insert(mid_uid.clone(), next.clone());
+    let mut last = middle.clone();
+    last.tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .get_mut("bucket")
+        .unwrap()
+        .ty = "integer".parse().unwrap();
+    let final_ids = record(
+        side(&middle, &first),
+        &last,
+        &first,
+        &table(),
+        7,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    let final_uid = final_ids.column_uid(&column).unwrap();
+    assert_eq!(final_ids.conversions.get(final_uid), Some(&next));
+    assert_eq!(withdraw(&final_ids, &table()).unwrap(), first);
+    let root = qualify(side(&start, &ids), side(&last, &final_ids), &table()).unwrap();
+    assert_eq!(root.cap(), 7);
+    let columns = copy_columns(&root, &pbps_dialect::MinimalDialect).unwrap();
+    let stages = &columns.iter().find(|c| c.target == column).unwrap().stages;
+    assert_eq!(
+        stages
+            .iter()
+            .map(|s| s.using.as_deref())
+            .collect::<Vec<_>>(),
+        [Some(c.using.as_str()), Some(next.using.as_str())]
     );
-    assert!(next(&first).is_ok(), "the same link without the conversion");
-    // Withdrawing the second link brings the middle columns back, and a
-    // conversion recorded for the last link's columns goes with them.
-    let last = back.column_uid(&table().column("bucket")).unwrap().clone();
-    let mut later = back.clone();
-    later.conversions.insert(last.clone(), conversion());
-    let restored = withdraw(&later, &table()).unwrap();
-    assert_eq!(restored, first);
-    assert!(restored.conversions.is_empty());
+    assert_eq!(logical_view(&final_ids, &root).columns, ids.columns);
+    let mut incomplete = root.clone();
+    incomplete.earlier[0].types.clear();
+    assert!(copy_columns(&incomplete, &pbps_dialect::MinimalDialect).is_err());
 }
 
 #[test]
@@ -2248,5 +2291,98 @@ fn a_conversion_left_on_a_retired_column_makes_the_lineage_unreadable_by_name() 
     assert!(why.contains("conversion"), "{why}");
     // The same file without the conversion is not unreadable.
     let clean = diff(side(&base, &ids), side(&desired, &approval));
-    assert!(first_rebuild_error(&clean).contains("recorded intent is valid"));
+    assert!(clean.errors.is_empty());
+}
+
+#[test]
+fn ledger_installation_retains_the_complete_recorded_link_and_refuses_unknown_lineage() {
+    let chain = chained(7);
+    let snapshot = |schema, ids| {
+        pbps_model::StateSnapshot::new(pbps_model::StateKind::Baseline, schema, ids, "operator")
+    };
+    let first = snapshot(chain.base.0.clone(), chain.base.1.clone());
+    let middle = snapshot(chain.middle.0.clone(), chain.middle.1.clone());
+    let last = snapshot(chain.last.0.clone(), chain.last.1.clone());
+    let installed = installation(&chain.last.1, Some(&first)).unwrap();
+    assert_eq!(installed.tables, chain.base.1.tables);
+    assert_eq!(installed.columns, chain.base.1.columns);
+    assert!(installed.rebuilds.is_empty());
+    let installed = installation(&chain.last.1, Some(&middle)).unwrap();
+    assert_eq!(installed.tables, chain.middle.1.tables);
+    assert_eq!(installed.rebuilds, chain.middle.1.rebuilds);
+    assert_eq!(
+        installation(&chain.last.1, Some(&last)).unwrap(),
+        chain.last.1
+    );
+    assert!(installation(&chain.last.1, None).is_err());
+    let mut partial = first.clone();
+    partial.ids.columns.pop_first();
+    assert!(installation(&chain.last.1, Some(&partial)).is_err());
+    let unknown = snapshot(Schema::default(), IdsFile::default());
+    assert!(installation(&chain.last.1, Some(&unknown)).is_err());
+}
+
+#[test]
+fn copy_stages_bind_a_renamed_input_by_lineage_and_pin_changed_conversions() {
+    let chain = chained(7);
+    let mut middle = chain.middle.1.clone();
+    let column = table().column("old_k");
+    let uid = middle.column_uid(&column).unwrap().clone();
+    let conversion = pbps_model::Conversion {
+        from: "integer".into(),
+        to: "bigint".into(),
+        using: "old_k::bigint + 1".into(),
+        ..conversion()
+    };
+    middle.conversions.insert(uid, conversion.clone());
+    let mut desired = chain.last.0.clone();
+    desired
+        .tables
+        .get_mut(&table())
+        .unwrap()
+        .columns
+        .get_mut("old_k")
+        .unwrap()
+        .ty = "bigint".parse().unwrap();
+    let last = record(
+        side(&chain.middle.0, &middle),
+        &desired,
+        &middle,
+        &table(),
+        7,
+        &reason(),
+        &ctx(),
+    )
+    .unwrap();
+    let root = qualify(
+        side(&chain.base.0, &chain.base.1),
+        side(&desired, &last),
+        &table(),
+    )
+    .unwrap();
+    let columns = copy_columns(&root, &pbps_dialect::MinimalDialect).unwrap();
+    let stages = &columns.iter().find(|c| c.target == column).unwrap().stages;
+    assert_eq!(stages.last().unwrap().input.raw(), "old_k");
+    assert_eq!(
+        stages.last().unwrap().using.as_deref(),
+        Some(conversion.using.as_str())
+    );
+    let mut edited = last.clone();
+    let uid = edited.column_uid(&column).unwrap().clone();
+    edited
+        .conversions
+        .get_mut(&uid)
+        .unwrap()
+        .using
+        .push_str(" + 1");
+    assert!(
+        qualify(
+            side(&chain.base.0, &chain.base.1),
+            side(&desired, &edited),
+            &table()
+        )
+        .unwrap_err()
+        .why
+        .contains("re-approve")
+    );
 }

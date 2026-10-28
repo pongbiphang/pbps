@@ -306,9 +306,27 @@ async fn exercise(
         }
     }
     let pg = Postgres::new();
-    let ids = pbps_diff::resolve(&before, &IdsFile::default(), &[], &context())
+    let mut ids = pbps_diff::resolve(&before, &IdsFile::default(), &[], &context())
         .unwrap()
         .ids;
+    // Explicit casts in these native copy oracles need the same recorded
+    // conversion intent that the connected route now requires.
+    for (name, column) in &before.tables[&table].columns {
+        if let Some(target) = desired.tables[&table].columns.get(name)
+            && pbps_dialect::Dialect::type_change_needs_using(&pg, &column.ty, &target.ty)
+        {
+            ids.conversions.insert(
+                ids.column_uid(&table.column(name)).unwrap().clone(),
+                Conversion {
+                    from: column.ty.raw().to_string(),
+                    to: target.ty.raw().to_string(),
+                    using: format!("{}::{}", quote(name.raw()).unwrap(), target.ty.raw()),
+                    allowed_at: context().today,
+                    operator: context().operator,
+                },
+            );
+        }
+    }
     let recorded = pbps_diff::rebuild::record(
         side(&before, &ids),
         &desired,

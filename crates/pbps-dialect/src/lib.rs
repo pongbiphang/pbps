@@ -2576,14 +2576,24 @@ pub trait Dialect {
         if let Change::CopyTableRows(copy) = change {
             for column in &copy.columns {
                 if let Some(source) = &column.source {
-                    if let Some(risk) = self.type_change_risk(&source.ty, &column.cast).risk_class()
+                    let mut previous = (&source.ty, &source.collation);
+                    for (ty, collation) in
+                        column.stages.iter().map(|s| (&s.cast, &s.collation)).chain(
+                            column
+                                .stages
+                                .is_empty()
+                                .then_some((&column.cast, &column.collation)),
+                        )
                     {
-                        risks.insert(risk);
-                    }
-                    if source.collation != column.collation
-                        && let Some(risk) = self.collation_change_risk(&column.cast)
-                    {
-                        risks.insert(risk);
+                        if let Some(risk) = self.type_change_risk(previous.0, ty).risk_class() {
+                            risks.insert(risk);
+                        }
+                        if previous.1 != collation
+                            && let Some(risk) = self.collation_change_risk(ty)
+                        {
+                            risks.insert(risk);
+                        }
+                        previous = (ty, collation);
                     }
                 }
             }

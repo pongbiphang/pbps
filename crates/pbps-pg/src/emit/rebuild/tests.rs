@@ -10,6 +10,7 @@ fn physical_parts_keep_explicit_copy_analysis_and_owned_index_sql() {
         panic!()
     };
     payload.columns.push(pbps_model::CopyColumn {
+        stages: Vec::new(),
         source: None,
         target: payload.target.name.column("new\"column"),
         cast: "text".parse().unwrap(),
