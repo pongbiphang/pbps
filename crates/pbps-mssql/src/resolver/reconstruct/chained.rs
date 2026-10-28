@@ -97,10 +97,6 @@ pub(super) fn blueprint(
             })
             .map(|step| Node::Operation(step.operation))
             .collect();
-        // An earlier managed consumer needs the renderer before the suffix.
-        if deferred && before.is_empty() {
-            after.push(Node::Auxiliary(0));
-        }
         auxiliary.push(Auxiliary {
             name: format!("external {id:?}"),
             after,
@@ -112,7 +108,36 @@ pub(super) fn blueprint(
             },
         });
     }
+    if deferred {
+        defer_unconsumed(&mut auxiliary);
+    }
     Ok(auxiliary)
+}
+
+fn defer_unconsumed(auxiliary: &mut [Auxiliary<Metadata>]) {
+    // A renderer with only an external consumer still has to precede the
+    // suffix when that consumer eventually supplies a managed step. Follow
+    // the already-derived prerequisite facts before adding suffix edges.
+    let mut pending: Vec<_> = auxiliary
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !node.before.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    let mut consumed = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if consumed.insert(index) {
+            pending.extend(auxiliary[index].after.iter().filter_map(|node| match node {
+                Node::Auxiliary(index) => Some(*index),
+                Node::Operation(_) => None,
+            }));
+        }
+    }
+    for (index, node) in auxiliary.iter_mut().enumerate().skip(1) {
+        if !consumed.contains(&index) {
+            node.after.push(Node::Auxiliary(0));
+        }
+    }
 }
 
 // Unhandled creates already refuse in Reconstruction before key facts are derived.

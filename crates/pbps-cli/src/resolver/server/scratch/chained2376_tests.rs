@@ -245,6 +245,44 @@ async fn mssql_native_chain_is_compared_and_merged_for_renderer_and_deferred_fil
                     "{roots:?}"
                 );
             }
+            connection(target)
+                .await
+                .execute(
+                    "CREATE VIEW ext2376.relay_view2376 AS SELECT i FROM ext2376.chain_view2376;",
+                )
+                .await
+                .unwrap();
+            connection(target)
+                .await
+                .execute("ALTER VIEW dbo.consumer2376 AS SELECT i FROM ext2376.relay_view2376;")
+                .await
+                .unwrap();
+            consumed
+                .desired
+                .modules
+                .get_mut(&"dbo.consumer2376".parse().unwrap())
+                .unwrap()
+                .definition = "SELECT i FROM ext2376.relay_view2376".into();
+            consumed.base = consumed.desired.clone();
+            // Both renderer ancestors must precede the indirect managed
+            // consumer even though the first has no direct managed reader.
+            for file in [None, Some(format!("{EARLY}\n-- pbps:deferred\nSELECT 1;"))] {
+                let (roots, _) = observe(
+                    target,
+                    scratch,
+                    &consumed,
+                    file.as_deref(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+                for view in ["chain_view2376", "relay_view2376"] {
+                    assert!(
+                        roots.contains(&capture::object("ext2376", view)),
+                        "{roots:?}"
+                    );
+                }
+            }
         })
     }
     reconstruct2374::both(case).await;
