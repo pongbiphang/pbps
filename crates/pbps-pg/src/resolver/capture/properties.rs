@@ -16,6 +16,7 @@
 
 use super::logical::{self, Catalog, Row};
 use pbps_db::resolver::capture::ObjectIdentity;
+use pbps_db::resolver::capture::rules::{Coverage, unclassified};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -145,15 +146,41 @@ pub(super) fn qualify_layout(catalog: &Catalog, major: u32) -> Result<()> {
             .ok_or(Uncovered::Class)?;
         let expected = fields(class, major)?;
         if actual.len() != expected.len()
-            || actual
-                .iter()
-                .zip(expected)
-                .any(|((_, name, kind, ns), (n, k))| name != n || kind != k || *ns != namespace)
+            || unclassified(
+                actual.iter().zip(expected),
+                |((_, name, kind, ns), (n, k))| {
+                    (name == n && kind == k && *ns == namespace)
+                        .then(|| field_coverage(class, name, kind))
+                        .flatten()
+                },
+            )
+            .next()
+            .is_some()
         {
             return Err(Uncovered::Field);
         }
     }
     Ok(())
+}
+
+// Coverage does not reinterpret values: normalization and the frozen layout
+// remain engine-owned, including the strict default for unknown OID fields.
+fn field_coverage(class: &str, name: &str, kind: &str) -> Option<Coverage> {
+    field(class, name, kind).ok().map(|field| match field {
+        Field::Authorization => Coverage::WithReason(
+            "authorization metadata does not determine creation bindings (DEC-1274.1)",
+        ),
+        Field::Physical => {
+            Coverage::WithReason("physical bookkeeping is not a resolution prerequisite (ADR-0016)")
+        }
+        Field::Scalar
+        | Field::Reference(_)
+        | Field::References(_)
+        | Field::Columns(_)
+        | Field::Column(_)
+        | Field::Definition
+        | Field::Address => Coverage::Classified,
+    })
 }
 
 /// Field names come from a qualified layout, never a target-supplied SQL
@@ -581,13 +608,18 @@ mod tests {
     #[test]
     fn every_qualified_reference_column_has_an_explicit_disposition() {
         for major in [16, 18] {
+            let unknown_classes: Vec<_> = unclassified(CLASSES, |class| {
+                fields(class, major).ok().map(|_| Coverage::Classified)
+            })
+            .collect();
+            assert!(unknown_classes.is_empty(), "PG{major} {unknown_classes:?}");
             for class in CLASSES {
-                for &(name, kind) in fields(class, major).unwrap() {
-                    assert!(
-                        field(class, name, kind).is_ok(),
-                        "PG{major} {class}.{name} ({kind})"
-                    );
-                }
+                let unknown: Vec<_> =
+                    unclassified(fields(class, major).unwrap(), |(name, kind)| {
+                        field_coverage(class, name, kind)
+                    })
+                    .collect();
+                assert!(unknown.is_empty(), "PG{major} {class}: {unknown:?}");
             }
         }
         assert_eq!(field("pg_proc", "future_ref", "oid"), Err(Uncovered::Field));

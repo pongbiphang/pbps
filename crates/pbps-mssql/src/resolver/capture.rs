@@ -134,7 +134,38 @@ pub const WHOLE_VIEWS: &[&str] = columns::VIEWS;
 /// column no rule names is the one it does not, and a capture that meets one
 /// refuses; the coverage test asks this of every column a build reports.
 pub fn classifies(view: &str, column: &str) -> bool {
-    columns::rule(view, column).is_some() || columns::comparable_raw(column)
+    pbps_db::resolver::capture::rules::unclassified([(view, column)], |(view, column)| {
+        column_coverage(view, column)
+    })
+    .next()
+    .is_none()
+}
+
+/// The coverage disposition, including reasons attached to explicit exceptions.
+/// Unnamed non-id scalars remain compared; unnamed ids remain uncovered.
+pub fn column_coverage(
+    view: &str,
+    column: &str,
+) -> Option<pbps_db::resolver::capture::rules::Coverage> {
+    use columns::Rule;
+    use pbps_db::resolver::capture::rules::Coverage;
+    match columns::rule(view, column) {
+        Some(Rule::Skip(reason) | Rule::AsReported(reason)) => Some(Coverage::WithReason(reason)),
+        Some(
+            Rule::Principal
+            | Rule::Schema
+            | Rule::Object
+            | Rule::Type
+            | Rule::Column(_)
+            | Rule::Index(_)
+            | Rule::DataSpace
+            | Rule::XmlCollection
+            | Rule::EncryptionKey
+            | Rule::FullText(_)
+            | Rule::ExecuteAs,
+        ) => Some(Coverage::Classified),
+        None => columns::comparable_raw(column).then_some(Coverage::Classified),
+    }
 }
 
 /// The identity of the object `schema.name` in `sys.objects`.
