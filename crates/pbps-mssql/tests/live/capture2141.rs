@@ -3,6 +3,7 @@
 //! what it binds, what it leaves to the candidates, and what it refuses.
 
 use super::*;
+use pbps_db::resolver::capture::rules::{Coverage, unclassified};
 use pbps_db::resolver::capture::{CaptureError, InputChange};
 use pbps_mssql::resolver::capture::{
     self, CandidateClass, CandidateSet, CaptureScope, ObjectIdentity, class,
@@ -1198,12 +1199,15 @@ async fn mssql_every_catalog_column_has_a_rule_or_is_compared() {
             .await
             .expect("list the view's columns");
         assert!(!rows.is_empty(), "sys.{view} reports no columns");
-        for row in rows {
-            let column = row.try_get::<&str>("name").unwrap().unwrap().to_owned();
-            if !capture::classifies(view, &column) {
-                unclassified.push(format!("sys.{view}.{column}"));
-            }
-        }
+        let columns = rows
+            .iter()
+            .map(|row| row.try_get::<&str>("name").unwrap().unwrap());
+        unclassified.extend(
+            pbps_db::resolver::capture::rules::unclassified(columns, |column| {
+                capture::column_coverage(view, column)
+            })
+            .map(|column| format!("sys.{view}.{column}")),
+        );
     }
     assert_eq!(unclassified, Vec::<String>::new());
     db.drop().await;
@@ -1693,10 +1697,17 @@ async fn mssql_every_catalog_view_is_read_or_set_aside_with_a_reason() {
         .iter()
         .map(|row| row.try_get::<&str>("name").unwrap().unwrap().to_owned())
         .collect();
-    let unclassed: Vec<_> = reported
-        .iter()
-        .filter(|view| capture::disposition(view).is_none())
-        .collect();
+    let unclassed: Vec<_> = unclassified(&reported, |view| {
+        capture::disposition(view).map(|disposition| match disposition {
+            capture::Disposition::Refused(reason) | capture::Disposition::Skipped(reason) => {
+                Coverage::WithReason(reason)
+            }
+            capture::Disposition::Read
+            | capture::Disposition::Named
+            | capture::Disposition::Typed => Coverage::Classified,
+        })
+    })
+    .collect();
     assert_eq!(unclassed, Vec::<&String>::new(), "views no rule classes");
     let read: BTreeSet<&str> = capture::CATALOG
         .iter()

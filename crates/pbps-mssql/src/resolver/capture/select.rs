@@ -1227,3 +1227,7 @@ pub(super) fn runtime_candidates(
     }
     candidates
 }
+
+#[cfg(test)]
+#[path = "translation2162_tests.rs"]
+mod translation2162;

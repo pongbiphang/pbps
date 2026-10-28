@@ -15,7 +15,7 @@ const OTHER_USER: i64 = 7;
 const PRICE: i64 = 100;
 const VIEW: i64 = 200;
 
-fn catalog() -> Catalog {
+pub(super) fn catalog() -> Catalog {
     Catalog {
         declarations: Default::default(),
         major: 17,
@@ -847,7 +847,7 @@ fn capture_key() -> pbps_db::fingerprint::EnvironmentFingerprintKey {
     key
 }
 
-fn producer() -> super::identity::Producer {
+pub(super) fn producer() -> super::identity::Producer {
     #[cfg(unix)]
     {
         super::identity::Producer::new(&capture_key())
