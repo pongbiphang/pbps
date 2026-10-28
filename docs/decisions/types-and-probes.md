@@ -3041,8 +3041,9 @@ the YAML it would have to be deleted by hand once every environment moved.
   reference only the column and the result cannot depend on another column's
   retype. The tree then goes through DEC-2181.1's decoder: no function, operator
   or cast that a role wrote, none on `RUNS_SQL`, no user-defined or domain type.
-  No text scanner (DEC-1635.4). A refusal names the code and the SQLSTATE and
-  never the server's text.
+  DEC-2378.1 adds a pre-binding literal-input check; the bound-tree audit
+  stays authoritative for execution (DEC-1635.4). A refusal names the code and
+  the SQLSTATE and never the server's text.
 - **Applied.** The change is classified `destructive` in addition to whatever
   its pair of types says, through the ordinary `--allow`. The whole expression
   is in the plan, `--sql` and `explain`. The pre-flight evaluates it over every
@@ -3893,3 +3894,111 @@ The project may raise that finding to error through policies. This deliberately
 differs from DEC-1515.1: a binding question has no fallback because its answer
 is needed for correctness; this code vet is advisory because apply still runs
 unchanged in-transaction declared::vet and its owner and closing checks.
+
+<a id="dec-2378-1"></a>
+
+**DEC-2378.1. Judge parse-time input paths before binding a recorded conversion
+(#2378).** PostgreSQL may call a base type's input routine while coercing an
+unknown literal during parse analysis. Reading the bound tree is too late,
+and rollback is not containment: measured on 16.15 and 18.6, an input routine
+aliasing `pg_advisory_unlock_all` releases a session advisory lock while the
+CHECK is bound, and rollback leaves it released.
+
+Read the unsafe-type catalog closure once when the shared lexer finds a
+string literal: base types whose input routine is outside `pg_catalog`, then
+arrays, domains, composites, ranges and multiranges containing one of them.
+No literal means no closure query; an empty closure means no literal guard.
+B/X bit constants are typed already and are not replaced. The shared string
+reader exposes complete spans, including E/U& prefixes, dollar delimiters,
+continuations and UESCAPE clauses; it adds no second lexer.
+
+Create an empty temporary table of the binding column and replace each
+unknown string literal with its own `$n` parameter. Prepare exactly
+`SELECT ((<rewritten>) IS NULL) OR true FROM <temporary table>` through
+Parse/Describe, never executing it or supplying parameter values. PostgreSQL
+itself decides each parameter type. A parameter in the unsafe closure refuses
+before the original expression binds, naming that type with escaped prose.
+The original CHECK statement, shape check and DEC-2181.1 bound-tree audit
+remain authoritative afterwards. Literal types are not inferred by a local
+SQL resolver, overload scan or grammar-keyword list.
+
+A failed preparation refuses only when that closure is non-empty and a
+string literal is present. The refusal carries its SQLSTATE and the remedy
+`CAST('...' AS type)` or `'...'::type`. Measured, typed-literal syntax such as
+`date '...'` becomes invalid as `date $1` (42601), and an unconstrained literal
+in this wrapper leaves an undeterminable parameter (42P18). A function-style
+type cast can also lose its unknown-constant special case and report 42883.
+These are explicit limitations of this pre-binding check, not guesses about a type name.
+
+Type modifiers need a separate guard: Parse itself calls `typmodin` even
+without literals. Read the small set of type OIDs whose modifier-input routine
+is outside `pg_catalog` before any bind or prepare. An empty set skips name
+collection. Otherwise collect every identifier or qualified identifier chain
+from the shared lexer's code-only header, independently of its grammar
+position. Fold unquoted parts, preserve quoted parts, then quote every part
+for a bound name-only `to_regtype` lookup: `"as"` is a name, not a keyword,
+and `"app"."length"` cannot be confused with a builtin. No modifiers enter the
+lookup, so it cannot call `typmodin`. Compare catalog OIDs, including the
+normalized source type with its arguments removed structurally and its array
+identity retained, before creating either temporary table.
+
+Every lookup runs under the same empty search path as execution
+(DEC-2378.2). A bare name can resolve in `pg_catalog` or `pg_temp`, but an
+unrelated `app.length` or `app.numeric` cannot shadow builtin use. Only an
+explicit reference resolving to a modifier-set type refuses, naming that
+type and its non-built-in modifier routine. DEC-2181.1's bound-tree audit
+already refuses such types: this changes when they are refused, not which
+conversion it admits. SETOF, RETURNING and future type positions need no
+special rule. Literal and comment contents contribute no names. Grammar
+aliases such as `int` may yield no catalog name when quoted; builtins are
+never in this unsafe set. An absent candidate is harmless; an absent source,
+unreadable lookup or unreadable modifier catalog refuses. A failed modifier-set
+read refuses every conversion, including those without literals.
+
+Measured on 16.15 and 18.6, XMLSERIALIZE, SETOF and JSON_ARRAY RETURNING can
+resolve the fixture's modifier before a later refusal: without the guard the
+session lock has already been released. Name-only resolution retains that
+lock. Builtin `length`, numeric modifiers and numeric source OIDs remain
+admitted beside same-named app types.
+
+This adds no scratch requirement and changes no saved format or offline
+`convert` recording. Connected plan and apply share the same vetter. The
+literal and modifier lock witnesses run on both supported majors; removing
+either protection releases the lock. An unrelated unsafe type, sibling column
+or name in literal/comment text adds no refusal to ordinary built-in use.
+
+
+<a id="dec-2378-2"></a>
+
+**DEC-2378.2. A recorded conversion has one empty resolution path from vetting
+through execution (#2378).** The vetter pins `search_path` locally to empty
+before either pre-binding guard or the original CHECK binds. Its rollback
+restores the caller's path. Row pre-flight already pins the session to empty
+before vetting and probe execution. The emitted recorded-conversion ALTER now
+explicitly sets that same empty path; ordinary ALTERs keep their schema path.
+A session SET before the ALTER also pins standalone `--sql` replay: unscoped
+statements already assume the empty path, and scoped statements set their own.
+The lowered statement is shared by apply, staged execution, connected/dev
+rehearsal and `--sql` output, so none can reintroduce a schema-scoped resolution
+of the approved expression. The plan-test preparation in this tree assembles
+revisions and fixtures without binding or evaluating conversions; it has no
+independent execution path to pin. Any replay of the lowered SQL retains the
+statement-local pin.
+
+Measured on PostgreSQL 16.15 and 18.6, with a custom `app.length` type using
+`int8in`/`int8out`, `length('123')::text::integer` is admitted by the vetter
+under an empty path and evaluates to 3. The old schema-scoped ALTER instead
+resolves it as a cast to that type and stores 123, reaching an input routine
+the vetter never judged. The empty-path ALTER stores 3. Unqualified user types
+and functions that only bind on the session's app path now fail binding; their
+non-built-in targets were already forbidden by the final audit. Qualified
+references retain their ordinary guard/audit refusals. This does not pin
+arbitrary declared expressions to empty or change formats or scratch policy.
+
+Tests: `recorded_conversions_bind_probe_and_apply_on_one_empty_path` runs both
+majors, checks caller-path restoration, session-only name refusals and row
+pre-flight, then executes the real lowered SQL and requires 3. Reverting the
+ALTER pin stores 123; reverting the vetter pin resolves a user function and
+refuses valid builtin use. `modifiers_are_refused_before_parse_can_release_a_session_lock`
+covers type-name OIDs, builtin collisions, quoted names, SETOF/RETURNING,
+source arrays and unreadable name resolution on both supported majors.
