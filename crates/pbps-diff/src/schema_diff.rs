@@ -7670,6 +7670,10 @@ fn defaults_differ(before: Option<&String>, after: Option<&String>) -> bool {
     before != after
 }
 
+fn table_by_uid<'a>(side: Side<'a>, uid: &Uid) -> Option<&'a Table> {
+    side.schema.tables.get(side.ids.tables.get(uid)?)
+}
+
 fn ordinary_default<'a>(side: Side<'a>, uid: &Uid) -> Option<Option<&'a String>> {
     let at = side.ids.columns.get(uid)?;
     let column = side.schema.tables.get(&at.table)?.columns.get(&at.name)?;
@@ -7701,8 +7705,7 @@ pub fn restoration_comparison<'a>(
         let Some(new) = declared.ids.tables.get(uid) else {
             continue;
         };
-        let (Some(before), Some(after)) =
-            (base.schema.tables.get(old), declared.schema.tables.get(new))
+        let (Some(before), Some(after)) = (table_by_uid(base, uid), table_by_uid(declared, uid))
         else {
             continue;
         };
@@ -7761,17 +7764,8 @@ pub fn restoration_comparison<'a>(
             return false;
         };
         let Some(uid) = uid else { return false };
-        let (Some(before), Some(after)) = (
-            base.ids
-                .tables
-                .get(uid)
-                .and_then(|n| base.schema.tables.get(n)),
-            declared
-                .ids
-                .tables
-                .get(uid)
-                .and_then(|n| declared.schema.tables.get(n)),
-        ) else {
+        let (Some(before), Some(after)) = (table_by_uid(base, uid), table_by_uid(declared, uid))
+        else {
             return false;
         };
         let present = |t: &Table| match part.part() {

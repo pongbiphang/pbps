@@ -179,6 +179,56 @@ that are data (a pattern, a number, a change window) and never code
 `validate`; rules over the plan run in `plan`, attach to the changes they are
 about, and an `error` refuses to produce the plan. `apply` is never touched.
 
+A project may declare external consumers in the same file:
+
+```yaml
+consumers:
+  billing-v41:
+    owner: billing-team
+    note: rolling deployment until 2026-11-30
+    uses: [dbo.customer.email, dbo.v_invoice_totals]
+    writes: [dbo.invoice]
+```
+
+Entries are plain strings: parentheses identify a routine (including its
+normalized signature), three dotted parts a column, two parts a relation
+resolved against declarations. SQL Server routines use their declared two-part
+names because their model identity has no signature. Declared candidates are
+checked before guessing from punctuation in an identifier. Missing or ambiguous objects are errors naming
+the entry and candidates. `writes` accepts only a table or writable column.
+A table contract covers its column interface; every write entry identifies
+its written table and that table's whole partition tree by UID. New constraints
+there affect the consumer even when they name another column. Duplicate consumer names and duplicate canonical entries
+are refused. Owner/note are optional review metadata, not access control.
+
+`consumer.breaking` refuses loss/rename of contracted names. Narrowing,
+changed module interfaces and added NOT NULL/CHECK/FK/UNIQUE constraints on
+written tables use `consumer.unproven`: they **cannot be proven compatible**,
+not a claim that a particular writer will fail. Both default to `error` and
+use the existing severity and suppression settings. A new NOT NULL column
+with a DEFAULT in the same plan is compatible and produces no finding; an
+existing column tightened to NOT NULL is still unproven. Widening and ordinary
+additions are compatible. No SQL predicate or module-body analysis is implied.
+
+Use expand/contract: keep the old interface alongside the new one, migrate
+consumers, then retire the entry (or consumer) in a reviewed commit before
+contracting. A temporary exception uses `policies.suppress` with a reason and
+`until`; expiry restores the configured severity. A refusal names the consumer,
+change, object and the original `consumers.<name>.uses|writes: <entry>` text.
+Tables/columns bind by UID across a plan's renames; computed/inherited columns
+use their table identity and named column. Modules keep their identity-free
+ModuleId: removing an old routine signature is a name loss, while altering an
+opaque definition is unproven. Identical dependency restoration is compatible.
+
+**Limits.** Contracts describe only declared consumers, not dynamic SQL or
+runtime usage. They name objects, not the consumer's login: a grant, revoke or
+role change that breaks a consumer is not caught. They do not promise row
+contents, replication behavior, RLS authorization or staged availability.
+View columns are not modeled individually, so any changed contracted view
+is unproven. Configuration integrity is checked wholly by `validate --since`;
+compatibility rules run only in `plan`. A saved plan still applies after a
+contract is added: contracts are never reevaluated by `apply` (ADR-0008 §3).
+
 ### 4.2 Table definitions
 
 One table per file. File names carry no meaning; the table name comes from
@@ -1563,9 +1613,9 @@ Server stores definition text and `sp_rename` **does not**. That is exactly why
 connected rename-impact queries belong in the engine crates, routed through
 `pbps-cli::engine` (see [ARCHITECTURE.md](ARCHITECTURE.md)).
 
-Impact outside the database — applications, reports, downstream ELT — is invisible
-to the tool; a checklist is printed and attached to the MR for a human to sign
-off.
+Declared external consumer contracts (§4.1) are checked at plan time. Other
+impact outside the database — applications, reports, downstream ELT — remains
+invisible; a checklist is printed for a human to sign off.
 
 ### 7.5 The execution model of `apply`
 

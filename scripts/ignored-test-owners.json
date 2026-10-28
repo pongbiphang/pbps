@@ -2657,6 +2657,20 @@
         "predicate2400::current_engine_and_compatibility_facts_gate_new_function_shapes",
         "predicate2400::datefirst_and_dateformat_remain_session_dependent"
       ]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
     }
   ]
 }

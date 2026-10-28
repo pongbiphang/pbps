@@ -36081,3 +36081,184 @@ fn data_work_does_not_replace_deployed_commit_evidence() {
 fn data_work_preserves_cli_audit_and_json_boundaries() {
     data_work::cli_boundaries(true);
 }
+
+#[path = "support/consumer_contracts.rs"]
+mod consumer_contracts;
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18"]
+fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        consumer_contracts::live(&std::env::var(variable).unwrap(), true);
+    }
+}
+
+fn consumer_domain_project(slug: &str, ty: &str, default: bool) -> Demo {
+    let d = Demo::new(slug);
+    std::fs::write(
+        d.dir.join("schema/app.d.yml"),
+        format!(
+            "domain: app.d\ntype: integer\n{}",
+            if default { "default: '1'\n" } else { "" }
+        ),
+    )
+    .unwrap();
+    for (name, base) in [("derived", "app.d"), ("array", "app.d[]")] {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!("domain: app.{name}\ntype: '{base}'\n"),
+        )
+        .unwrap();
+    }
+    d.table(&format!("table: app.t\ncolumns:\n  v: {{type: '{ty}'}}\n"));
+    let out = d.run(&["plan"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    d.commit();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nconsumers:\n  writer: {writes: [app.t]}\n",
+    )
+    .unwrap();
+    d
+}
+
+#[test]
+fn consumer_contracts_accept_supplied_scalar_domain_columns_but_refuse_unsupplied_arrays() {
+    for (ty, default, expected) in [
+        ("app.d", true, 0),
+        ("app.derived", true, 0),
+        ("app.d[]", true, 2),
+        ("app.derived[]", true, 2),
+        ("app.array", true, 2),
+        ("app.d", false, 2),
+    ] {
+        let d = consumer_domain_project("consumer-domain-supply", "integer", default);
+        d.table(&format!("table: app.t\ncolumns:\n  v: {{type: integer}}\n  n: {{type: '{ty}', nullable: false}}\n"));
+        let out = d.run(&["plan", "--format", "json"]);
+        assert_eq!(
+            code(&out),
+            expected,
+            "{ty}/{default}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        if expected == 2 {
+            assert!(stdout(&out).contains("consumer.unproven"));
+        }
+    }
+}
+
+#[test]
+fn consumer_contracts_ignore_element_defaults_but_keep_scalar_and_element_check_protection() {
+    for (ty, default_exit, check_exit) in [
+        ("app.d", 2, 2),
+        ("app.derived", 2, 2),
+        ("app.d[]", 0, 2),
+        ("app.derived[]", 0, 2),
+        ("app.array", 0, 2),
+        ("integer", 0, 0),
+    ] {
+        let d = consumer_domain_project("consumer-domain-elements", ty, true);
+        for (definition, expected) in [
+            ("domain: app.d\ntype: integer\ndefault: '2'\n", default_exit),
+            (
+                "domain: app.d\ntype: integer\ndefault: '1'\nchecks:\n  positive: VALUE > 0\n",
+                check_exit,
+            ),
+        ] {
+            std::fs::write(d.dir.join("schema/app.d.yml"), definition).unwrap();
+            let out = d.run(&["plan", "--format", "json"]);
+            assert_eq!(
+                code(&out),
+                expected,
+                "{ty}: {}{}",
+                stdout(&out),
+                stderr(&out)
+            );
+            if expected == 2 {
+                assert!(stdout(&out).contains("consumer.unproven"));
+            }
+        }
+    }
+}
+
+#[test]
+fn consumer_contracts_classify_effective_domain_attributes_instead_of_redundant_edits() {
+    // Real differ plans exercise both ordinary domain edits and the rebuild
+    // needed for a collation edit; expected exits are literal contract cells.
+    for (inner, from, to, writes, expected) in [
+        ("not_null: true\n", "not_null: true\n", "", false, 0),
+        ("", "not_null: true\n", "", false, 2),
+        ("not_null: true\n", "", "not_null: true\n", true, 0),
+        ("", "", "not_null: true\n", true, 2),
+        (
+            "default: \"'same'\"\n",
+            "default: \"'same'\"\n",
+            "",
+            true,
+            0,
+        ),
+        (
+            "default: \"'same'\"\n",
+            "default: \"'different'\"\n",
+            "",
+            true,
+            2,
+        ),
+        (
+            "collation: pg_catalog.\"C\"\n",
+            "collation: pg_catalog.\"C\"\n",
+            "",
+            false,
+            0,
+        ),
+        (
+            "collation: pg_catalog.\"C\"\n",
+            "collation: pg_catalog.\"POSIX\"\n",
+            "",
+            false,
+            2,
+        ),
+    ] {
+        let d = Demo::new("consumer-effective-domain");
+        std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.inner_d.yml"),
+            format!("domain: app.inner_d\ntype: text\n{inner}"),
+        )
+        .unwrap();
+        let outer = d.dir.join("schema/app.outer_d.yml");
+        std::fs::write(
+            &outer,
+            format!("domain: app.outer_d\ntype: app.inner_d\n{from}"),
+        )
+        .unwrap();
+        d.table("table: app.t\ncolumns:\n  v: {type: app.outer_d}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!(
+                "dialect: postgres\nconsumers:\n  client: {{{}: [app.t.v]}}\n",
+                if writes { "writes" } else { "uses" }
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &outer,
+            format!("domain: app.outer_d\ntype: app.inner_d\n{to}"),
+        )
+        .unwrap();
+        let out = d.run(&["plan", "--format", "json"]);
+        assert_eq!(
+            code(&out),
+            expected,
+            "{inner}/{from}/{to}: {}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        if expected == 2 {
+            assert!(stdout(&out).contains("consumer.unproven"));
+        }
+    }
+}

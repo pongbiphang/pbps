@@ -28,6 +28,7 @@
 
 pub mod civil;
 pub mod config;
+pub mod consumers;
 pub mod evaluate;
 pub mod rules;
 

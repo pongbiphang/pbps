@@ -253,3 +253,19 @@ names the destination. The rule walks the plan in order, and a rename hands its
 source's identity to its destination. A computed rebuild across a rename is
 then still a rebuild, and a table that takes the source name afterwards is
 another table.
+
+<a id="dec-2398-1"></a>
+
+**DEC-2398.1. Consumer contracts are declaration data for built-in plan rules
+(#2398; amends ADR-0008's catalogue).** `consumers` in `pbps.yml` lists plain
+object names under `uses` and `writes`. Planning binds tables/columns by UID,
+including either name of a rename, and identity-free modules by canonical
+ModuleId. Validation checks all references, even under `--since`; planning
+also admits baseline objects so a removed declaration produces its consumer
+finding. Certain name losses use `consumer.breaking`; conservative uncertainty
+uses `consumer.unproven`, both default error with ordinary suppressions. A new
+NOT NULL column supplied by a DEFAULT produces neither. Module definitions
+stay opaque, so a changed view/routine interface is unproven; unchanged
+restoration uses the differ's own part/module decisions through one CLI callback. Contracts add no apply gate or execution language.
+Schema set 68 publishes the configuration and rule catalogue; other formats
+stay unchanged. Retirement explanations follow in PR 2.

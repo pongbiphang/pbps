@@ -390,6 +390,10 @@ pub struct Config {
     /// means every built-in rule at its default severity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policies: Option<pbps_policy::Policies>,
+
+    /// External consumers whose declared uses and writes the plan must protect.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consumers: pbps_policy::consumers::Consumers,
 }
 
 /// The horizon of `partition_runway:`: a count of partitions, or a width.

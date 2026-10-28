@@ -104,6 +104,8 @@ Plan rules, evaluated by `plan`:
 | `change.expand-contract` | — | on, `warning` — one revision both adds and drops or narrows in the same table (§13.3) |
 | `change.narrowing-on-data` | — | on, `note` — a narrowing the preflight probe will measure at apply time |
 | `grant.widen` | — | on, `note` — restates the `grant-widen` label as a finding a project can raise |
+| `consumer.breaking` | declared `consumers` | on, `error` — a consumer loses an object name it still uses or writes |
+| `consumer.unproven` | declared `consumers` | on, `error` — changed interfaces or writes cannot be proven compatible |
 | `change.window` | time zone, allowed windows | off; **evaluated by `plan --db` only**, because it needs a clock and a target |
 
 The change-window rule is the one that does not fit an offline `validate`, and
@@ -170,7 +172,9 @@ Decisions taken during implementation:
 ## Ruled out
 
 - **Custom rules in v1**, in any language. The parameters above cover the
-  rules the P1 rows name; anything past them gets its own ADR.
+  rules the P1 rows name; anything past them gets its own ADR. The built-in
+  consumer-contract extension is declared data, admitted by this catalogue
+  amendment and DEC-2398.1, not a custom executable rule.
 - **A policy that gates `apply`.** Decision 3.
 - **Rules over emitted SQL.** Constraint 3; the analyzer catalogue is depth on
   the `ChangeSet`, not string inspection.
