@@ -2262,6 +2262,7 @@ mod tests {
                 from: "old".into(),
                 to: "new\nline".into(),
                 ordinal: 0,
+                retained: Vec::new(),
                 definition
             }),
             "~ rename enum value old -> new\\nline in app.e"

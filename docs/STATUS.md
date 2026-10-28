@@ -98,7 +98,10 @@ Existing enums, domains and standalone composites are referenced as
 `.type.yml` files and `types` identities
 (#1635 slice one). Declared enums and domains can be created, dropped and
 renamed (#1635 slice two, DEC-1635.3); enum labels are added and renamed in
-place (slice 3a, DEC-1635.6) and removed or reordered by rebuilding the enum
+place (slice 3a, DEC-1635.6). Resolver-selected label renames may retain
+validated local CHECKs through paired binding and a fresh target recheck
+(DEC-2354.1); defaults keep their ordinary alteration. Labels are removed or reordered by
+rebuilding the enum
 under its uid (slice 3b, DEC-1635.7); a domain's checks, default and NOT NULL
 change in place (slice 4a, DEC-1635.8); its base type and collation, and the
 domains over a rebuilt enum, by rebuilding it under its uid (slice 4b,

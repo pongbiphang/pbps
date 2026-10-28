@@ -12,6 +12,7 @@
 //!    (DEC-1516.1).
 
 pub mod domain;
+pub mod retained;
 
 use pbps_cli::resolver::server::ProduceError;
 use pbps_config::resolver::ResolverSelection;

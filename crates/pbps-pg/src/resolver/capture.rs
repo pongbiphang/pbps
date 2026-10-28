@@ -8,6 +8,11 @@ mod bindings;
 mod body;
 mod logical;
 mod nodes;
+
+/// Complete expression equality; unknown coverage is never equality.
+pub(crate) fn expressions_equal(left: &str, right: &str, major: u32) -> Result<bool, String> {
+    nodes::equal(left, right, major).map_err(|_| "the bound expression is not covered".into())
+}
 pub(crate) mod policy_names;
 mod properties;
 mod queries;
@@ -237,7 +242,7 @@ fn input_coercions(
                 input_coercions(child, inputs, reads_session, body)?;
             }
         }
-        Value::Null | Value::Atom(_) | Value::Datum => {}
+        Value::Null | Value::Atom(_) | Value::Datum | Value::DatumBytes { .. } => {}
     }
     Ok(())
 }

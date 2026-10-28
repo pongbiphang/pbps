@@ -967,11 +967,17 @@ or CHECK, or in a created/altered view or SQL routine body. Apply the label
 first, then the rest. Only a PL/pgSQL routine's body is exempt because it binds
 at invocation. Function and procedure parameter defaults, in DEFAULT or =
 spelling, bind at creation and are checked even for PL/pgSQL. An updated
-CHECK/default is rebuilt or altered by the ordinary diff, and
-those changes appear in the plan. No SQL text is rewritten through label
-renames. DropCheck precedes the rename; defaults and AddCheck follow it in the
-same transaction. AddCheck scans its table under ACCESS EXCLUSIVE until
-commit; #2354 tracks an engine-typed, scan-free approach. Plan-time expression
+CHECK/default ordinarily rebuilds or alters through the diff. With a selected
+resolver, a retained validated local CHECK may instead use paired bound-tree
+comparison on an empty scratch carrier (DEC-2354.1). Complete values, casts,
+collations and routine identities stay significant; only source locations are
+ignored. RenameEnumValue carries the exact authored record update and anchors.
+Apply independently binds that expression on an empty target TEMP carrier
+under a relation lock before recording; mismatch rolls back. No SQL literal is
+rewritten through a label rename. Unproved, offline and unavailable cases keep
+DropCheck before the rename and AddCheck after it, including its validating
+scan under ACCESS EXCLUSIVE. Defaults retain their ordinary alteration and
+table lock in this CHECK-only part. Plan-time expression
 probes defer by the resolved enum type when its label is renamed, including
 arrays and domains. The engine enforces the declaration at apply, with the
 existing vet and readback checks.

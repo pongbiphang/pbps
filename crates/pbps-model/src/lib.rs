@@ -123,3 +123,5 @@ pub use value_change::ValueChange;
 pub use zone::{SessionZone, ZoneError};
 
 pub use project::{DatabaseMap, DatabaseName, InDatabase, ProjectSchemas, UidReservations};
+pub mod retained;
+pub use retained::{ExpressionTarget, RenameAnchor, RetainedExpression};

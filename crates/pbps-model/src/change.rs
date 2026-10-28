@@ -256,6 +256,8 @@ pub enum Change {
         from: String,
         to: String,
         ordinal: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retained: Vec<crate::RetainedExpression>,
         definition: Box<crate::ManagedType>,
     },
     /// One half of an in-place domain alteration (DEC-1635.8). The statements

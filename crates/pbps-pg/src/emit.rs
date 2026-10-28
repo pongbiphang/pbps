@@ -349,6 +349,7 @@ mod declared_type_emission_tests {
             from: "can't".into(),
             to: "blue".into(),
             ordinal: 1,
+            retained: Vec::new(),
             definition: Box::new(pbps_model::ManagedType::Enum {
                 values: vec!["blue".into(), "ok".into()],
             }),
@@ -1788,7 +1789,7 @@ fn numbering(
     block(&body, &variables)
 }
 
-fn sql_type(ty: &ColumnType) -> Result<String, DialectError> {
+pub(crate) fn sql_type(ty: &ColumnType) -> Result<String, DialectError> {
     let normalized = types::normalize(ty)?;
     match normalized.type_ref() {
         Some(reference) => Ok(format!(
@@ -2466,7 +2467,7 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
 /// the scope holds runs on the schema's path, and pbps's own SQL there must
 /// not reach an operator a user of that schema could add: [`unscoped`] for a
 /// statement that is pbps's alone, [`on_catalog_path`] inside one that is not.
-fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectError> {
+pub(crate) fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectError> {
     scoped_items(pg, schema, vec![body.to_owned()])
 }
 
