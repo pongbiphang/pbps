@@ -124,6 +124,13 @@ fn at(statements: &[String], needle: &str) -> usize {
 const FUNCTION: &str = "(@x int) RETURNS int AS BEGIN RETURN @x + 1; END";
 
 #[test]
+fn setup_connection_auxiliaries_do_not_opt_into_managed_creation_trials() {
+    // Chained steps execute once on the setup connection. Enabling trials
+    // here would need an executor that also honours auxiliary boundaries.
+    assert!(!pbps_diff::order::scratch::Engine::trial_order(&Mssql));
+}
+
+#[test]
 fn a_computed_column_calling_a_declared_function_follows_it_and_leaves_the_table_bare() {
     // The ordinary plan order writes the column inline in CREATE TABLE, which
     // fails 4121 when the function does not exist yet (measured on 17.0).

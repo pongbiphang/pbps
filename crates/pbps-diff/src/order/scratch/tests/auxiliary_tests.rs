@@ -22,6 +22,7 @@ fn auxiliary_is_a_hard_boundary_inside_the_compile_range() {
         ),
     )
     .unwrap();
+    assert!(plan.trial().is_none());
     // A compile range includes this node as well as the managed groups. A
     // managed trial may reorder neither side across it, or retry the setup
     // connection's work. No auxiliary borrows an operation ID or origin.
