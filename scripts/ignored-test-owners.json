@@ -710,6 +710,7 @@
         "managed_types::rows_of_a_renamed_enum_type_are_inserted_updated_and_deleted_under_its_new_name",
         "managed_types::rows_that_omit_an_enum_cell_with_a_default_are_guarded_under_the_renamed_type",
         "mixed_cast_defaults2456::mixed2456_rename_update_delete_use_catalog_defaults_and_converge",
+        "mixed_cast_defaults2456::mixed2456_state_diff_matches_the_applied_plan_without_rewriting_authored_defaults",
         "mixed_cast_defaults2456::mixed2456_historical_authored_names_survive_later_update_delete_and_insert",
         "mixed_cast_defaults2456::mixed2456_outside_edits_to_updated_deleted_and_null_cells_refuse_and_rollback",
         "mixed_cast_defaults2456::mixed2456_rename_chains_reused_names_and_new_defaults_keep_their_source_uid",

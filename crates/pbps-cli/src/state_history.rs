@@ -318,6 +318,9 @@ pub fn cmd_diff(
         module_deps: to.snapshot.module_deps.clone(),
         ..Default::default()
     };
+    // Reproduce the plan's guard payloads from the saved catalog, while the
+    // overlay above keeps authored SQL for semantic comparison (DEC-2456.1).
+    hints.record_row_defaults(&from.snapshot.schema);
     for (id, deps) in &from.snapshot.module_deps {
         if !after.modules.contains_key(id) {
             hints.module_deps.insert(id.clone(), deps.clone());

@@ -371,3 +371,87 @@ fn mixed2456_rename_chains_reused_names_and_new_defaults_keep_their_source_uid()
         assert!(plan(&d, db, &path).changes.is_empty());
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn mixed2456_state_diff_matches_the_applied_plan_without_rewriting_authored_defaults() {
+    for var in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let server = std::env::var(var).unwrap();
+        let old_default = "'sad'::text::app.mood";
+        let new_default = "'ok'::varchar::app.mood";
+        let (own, d, path) = initial(&server, "app.mood", old_default, false);
+        let db = own.connection();
+        let from = scalar(db, "SELECT max(id) FROM public.__pbps_state");
+        let before = snapshot(db);
+        let saved_catalog = catalog(&before, "next");
+        assert_ne!(
+            saved_catalog, old_default,
+            "catalog must respell this fixture"
+        );
+        assert_eq!(authored(&before, "next"), old_default);
+
+        declare(
+            &d,
+            "app.mood",
+            new_default,
+            old_default,
+            "    ok: {note: c}\n",
+            None,
+        );
+        d.commit();
+        let forward = plan(&d, db, &path);
+        let update = forward
+            .changes
+            .changes
+            .iter()
+            .find_map(|step| {
+                if let pbps_model::Change::UpdateRow {
+                    columns, unchanged, ..
+                } = &step.change
+                {
+                    Some((columns, unchanged))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            update.0["next"].0,
+            pbps_model::Cell::Default(saved_catalog.clone())
+        );
+        assert_eq!(
+            update.0["next"].1,
+            pbps_model::Cell::Default(new_default.into())
+        );
+        assert_eq!(
+            update.1["kept"],
+            pbps_model::Cell::Default(catalog(&before, "kept"))
+        );
+        succeeds(apply(&d, db, &path));
+        let to = scalar(db, "SELECT max(id) FROM public.__pbps_state");
+        assert!(to > from);
+        let after = snapshot(db);
+        let expected = serde_json::to_value(&forward.changes).unwrap();
+        let from = from.to_string();
+        let to = to.to_string();
+        for destination in [Some(to.as_str()), None] {
+            let mut args = vec!["state", "diff", from.as_str()];
+            args.extend(destination);
+            args.extend(["--db", db, "--format", "json"]);
+            let out = succeeds(d.run(&args));
+            let compared: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(compared["data"]["changes"], expected);
+        }
+        // Guard enrichment never becomes authored text in either ledger entry.
+        let original = pbps_model::StateSnapshot::read_json(&text_of(
+            db,
+            &format!("SELECT state_json::text FROM public.__pbps_state WHERE id={from}"),
+        ))
+        .unwrap();
+        assert_eq!(original, before);
+        assert_eq!(snapshot(db), after);
+        assert_eq!(authored(&after, "next"), new_default);
+        assert_eq!(authored(&after, "kept"), old_default);
+        assert!(plan(&d, db, &path).changes.is_empty());
+    }
+}

@@ -952,6 +952,7 @@ fn surviving_keys(
     // A read knows the sequence names it leaves out (#1631).
     pbps_dialect::name_read_sequences(&mut base, crate::dialect_for(declared.dialect).as_ref());
     let mut hints = loaded.hints.clone();
+    hints.record_row_defaults(&snapshot.schema);
     for (name, dependencies) in &snapshot.module_deps {
         if !loaded.schema.modules.contains_key(name) {
             hints.module_deps.insert(name.clone(), dependencies.clone());
