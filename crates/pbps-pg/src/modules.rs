@@ -2581,6 +2581,7 @@ mod tests {
             let error = the_engine_broke_a_tie(
                 &id("app.v"),
                 DbError::Driver {
+                    diagnostic: None,
                     message: "original server sentence".into(),
                     code: code.map(str::to_owned),
                 },

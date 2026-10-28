@@ -15384,6 +15384,7 @@ fn deadlocked(e: &DbError) -> bool {
 fn a_wrapped_deadlock_is_retriable_but_other_failures_are_not() {
     for code in [Some("40P01"), Some("42501"), None] {
         let error = DbError::Driver {
+            diagnostic: None,
             message: "driver diagnosis".into(),
             code: code.map(str::to_owned),
         };

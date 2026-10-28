@@ -26,6 +26,8 @@ sha2.workspace = true
 # `rows::RowsError`, which travels beside a `DbError` and a `DialectError` and
 # has to carry both (Phase 5 step 7).
 thiserror.workspace = true
+# Carets follow terminal width after inert escaping, not UTF-8 bytes.
+unicode-width = "0.2.2"
 
 # The opaque native transfer opens only beneath a caller-held root. It does
 # not discover processes, acquire a runtime, or own lifecycle qualification.

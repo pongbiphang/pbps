@@ -1633,6 +1633,7 @@
         "resolver::reconstruct::function_tests::held_tables_and_readers_compile_with_their_keys_on_both_servers",
         "resolver::reconstruct::rule_tests::scratch_rules_compile_on_both_servers",
         "resolver::reconstruct::rule_tests::scratch_refusals_name_what_is_missing",
+        "resolver::reconstruct::refusal_tests::true_refusals_render_every_pending_declaration_on_both_majors",
         "generated::tests::the_bodies_that_resolve_a_name_are_refused_by_the_engine_without_it",
         "catalog::tests::a_failed_canonical_permission_query_restores_both_transaction_scopes",
         "catalog::tests::partition_membership_is_scoped_and_shared_by_the_catalog_parts",

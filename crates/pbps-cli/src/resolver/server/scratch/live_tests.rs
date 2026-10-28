@@ -2036,6 +2036,9 @@ async fn produce_staged_then(
 fn externals_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
     match result {
         Err(ProduceError::Run(Error::Externals(findings))) => findings.join("; "),
+        Err(ProduceError::Run(Error::Creation(failure))) if failure.externals => {
+            failure.to_string()
+        }
         Err(other) => format!("not an externals file refusal: {other}"),
         Ok(_) => "not an externals file refusal: a plan".into(),
     }
@@ -3211,6 +3214,9 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
     .await;
     target.drop().await;
     let reason = match result {
+        Err(ProduceError::Run(Error::Creation(failure))) if !failure.externals => {
+            failure.to_string()
+        }
         Err(ProduceError::Run(Error::Binding(reason))) => reason,
         other => panic!(
             "not a binding refusal: {:?}",

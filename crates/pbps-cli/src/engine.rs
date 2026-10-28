@@ -494,6 +494,31 @@ pub fn ledger_safe_reason(error: &anyhow::Error) -> String {
         .into_iter()
         .rev()
         .map(|frame| {
+            // Creation reports include several server verdicts; their operator
+            // rendering must never become a durable ledger frame (DEC-2465.2).
+            use pbps_pg::resolver::reconstruct::{ReconstructError, refusal::Refusal};
+            if frame.is::<pbps_cli::resolver::server::CreationFailure>()
+                || frame.is::<std::sync::Arc<pbps_cli::resolver::server::CreationFailure>>()
+                || frame.is::<Refusal>()
+                || frame.is::<std::sync::Arc<Refusal>>()
+                || matches!(
+                    frame.downcast_ref::<ReconstructError>(),
+                    Some(ReconstructError::Refused(_))
+                )
+                || matches!(
+                    frame.downcast_ref::<pbps_cli::resolver::server::ProduceError>(),
+                    Some(pbps_cli::resolver::server::ProduceError::Run(
+                        pbps_cli::resolver::server::Error::Creation(_)
+                    ))
+                )
+                || matches!(
+                    frame.downcast_ref::<pbps_cli::resolver::server::Error>(),
+                    Some(pbps_cli::resolver::server::Error::Creation(_))
+                )
+            {
+                return "scratch creation was refused; transient diagnostics are not recorded here"
+                    .into();
+            }
             // `RowsError::Read` boxes its `#[source]` (`Box<DbError>`, kept
             // small beside every `Ok` it travels next to) — and a boxed
             // `#[source]` is not merely a `DbError` behind one more layer of
@@ -5291,6 +5316,7 @@ mod tests {
     #[test]
     fn a_driver_frame_is_redacted_to_its_code_and_nothing_else() {
         let db = anyhow::Error::new(DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
             code: Some("22P02".to_owned()),
         });
@@ -5310,6 +5336,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scratch_reports_keep_driver_text_and_internal_queries_out_of_the_ledger() {
+        use pbps_pg::resolver::reconstruct::{
+            ReconstructError,
+            refusal::{Diagnosis, Pending, Refusal},
+        };
+        use std::sync::Arc;
+        let report = Arc::new(Refusal {
+            version: 180006,
+            committed: vec![],
+            stalled: true,
+            overtakes: vec![],
+            pending: vec![Pending {
+                declaration: "view app.v".into(),
+                subject: pbps_model::Change::CreateModule {
+                    id: "app.v".parse().unwrap(),
+                    module: Box::new(pbps_model::Module {
+                        kind: pbps_model::ModuleKind::View,
+                        description: None,
+                        definition: "SELECT 1 AS n".into(),
+                        options: Default::default(),
+                    }),
+                },
+                owner: None,
+                dependency: None,
+                blocked: vec![],
+                why: vec![],
+                recovery: None,
+                last: Some(Diagnosis {
+                    error: Arc::new(DbError::Driver {
+                        message: "private-row-value".into(),
+                        code: Some("42P01".into()),
+                        diagnostic: Some(Box::new(pbps_db::DriverDiagnostic {
+                            primary: "private-row-value".into(),
+                            schema: None,
+                            table: None,
+                            column: None,
+                            datatype: None,
+                            constraint: None,
+                            position: Some(pbps_db::ErrorPosition::Internal {
+                                position: 1,
+                                query: "private-query-text".into(),
+                            }),
+                        })),
+                    }),
+                    statement: 0,
+                    generation: 0,
+                    excerpt: None,
+                    reference: None,
+                    candidates: vec![],
+                    declared: vec![],
+                    created: vec![],
+                    overtaken: vec![],
+                }),
+            }],
+        });
+        for error in [
+            anyhow::Error::new(ReconstructError::Refused(report.clone())),
+            anyhow::Error::new(pbps_cli::resolver::server::Error::Creation(Arc::new(
+                pbps_cli::resolver::server::CreationFailure::new(report.clone()),
+            ))),
+            anyhow::Error::new(pbps_cli::resolver::server::ProduceError::Run(
+                pbps_cli::resolver::server::Error::Creation(Arc::new(
+                    pbps_cli::resolver::server::CreationFailure::new(report),
+                )),
+            )),
+        ] {
+            assert!(error.to_string().contains("private-row-value"));
+            let reason = ledger_safe_reason(&error);
+            assert!(reason.contains("42P01"), "{reason}");
+            assert!(!reason.contains("private-row-value"), "{reason}");
+            assert!(!reason.contains("private-query-text"), "{reason}");
+        }
+    }
     /// #1605 review: the absence proof's refusal keeps a driver failure as
     /// its source, so a failed bootstrap's ledger row is redacted still, and
     /// the operator reads both the refusal and its cause.
@@ -5318,6 +5418,7 @@ mod tests {
         let refused = absence_unproven(
             &["other.t".parse().unwrap()],
             DbError::Driver {
+                diagnostic: None,
                 message: "server says super-secret-abc".to_owned(),
                 code: Some("229".to_owned()),
             },
@@ -5340,6 +5441,7 @@ mod tests {
     #[test]
     fn a_driver_frame_with_no_code_is_redacted_without_inventing_one() {
         let db = anyhow::Error::new(DbError::Driver {
+            diagnostic: None,
             message: "super-secret-protocol-detail".to_owned(),
             code: None,
         });
@@ -5363,6 +5465,7 @@ mod tests {
     #[test]
     fn a_mssql_driver_frame_is_redacted_without_being_called_a_sqlstate() {
         let db = anyhow::Error::new(DbError::Driver {
+            diagnostic: None,
             message: "Conversion failed when converting the varchar value \
                       'super-secret-abc' to data type int."
                 .to_owned(),
@@ -5427,6 +5530,7 @@ mod tests {
     #[test]
     fn a_context_wrapped_driver_frame_keeps_the_context_and_redacts_the_source() {
         let db = DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
             code: Some("22P02".to_owned()),
         };
@@ -5465,6 +5569,7 @@ mod tests {
         );
         let long_statement = "x".repeat(pbps_pg::state::REASON_CHARS * 2);
         let db = DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-abc\"".to_owned(),
             code: Some("22P02".to_owned()),
         };
@@ -5501,6 +5606,7 @@ mod tests {
     #[test]
     fn a_wrapper_that_names_its_source_does_not_repeat_the_drivers_text() {
         let db = DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-xyz\"".to_owned(),
             code: Some("22P02".to_owned()),
         };
@@ -5540,6 +5646,7 @@ mod tests {
     #[test]
     fn a_transparent_wrapper_does_not_repeat_the_drivers_text() {
         let db = DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-def\"".to_owned(),
             code: Some("22P02".to_owned()),
         };
@@ -5557,6 +5664,7 @@ mod tests {
         );
 
         let db2 = DbError::Driver {
+            diagnostic: None,
             message: "invalid input syntax for type integer: \"super-secret-ghi\"".to_owned(),
             code: Some("22P03".to_owned()),
         };
@@ -5571,6 +5679,7 @@ mod tests {
         for code in [Some("42501"), Some("1088"), None] {
             for wrapper in 0..4 {
                 let db = DbError::Driver {
+                    diagnostic: None,
                     message: "undeclared-secret-488".into(),
                     code: code.map(str::to_owned),
                 }

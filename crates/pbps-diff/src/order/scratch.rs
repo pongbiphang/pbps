@@ -3,6 +3,25 @@
 //! settles the constraints `prepare` states over them (DEC-2389.1).
 use super::{Constraint, Schedule};
 mod trial;
+/// Scratch-only provenance; operation IDs stay in the prepared coordinate space.
+#[derive(Debug, Clone)]
+pub struct DroppedGuess {
+    pub edge: Constraint,
+    pub members: Vec<usize>,
+    pub backward_only: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRule {
+    Inferred,
+    Annotation,
+    Structural,
+}
+#[derive(Debug, Clone)]
+pub struct EdgeWhy {
+    pub edge: Constraint,
+    pub rule: EdgeRule,
+}
+
 use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations};
 use pbps_model::{Change, ChangeSet, PlannedChange};
@@ -30,6 +49,7 @@ pub trait Engine: Dialect + Sized {
 pub struct Prepared {
     changes: super::PlanningPlan,
     edges: Vec<Constraint>,
+    why: Vec<EdgeWhy>,
 }
 impl Prepared {
     pub fn changes(&self) -> &super::PlanningPlan {
@@ -41,6 +61,7 @@ impl Prepared {
     #[cfg(feature = "test-fixtures")]
     pub fn without_guesses(mut self) -> Self {
         self.edges.retain(|e| e.source != super::Source::Guess);
+        self.why.retain(|w| w.edge.source != super::Source::Guess);
         self
     }
 }
@@ -80,6 +101,17 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
     super::generated::expand_in(&mut changes, ids, dependencies, dialect, true)?;
     let mut edges =
         super::generated::constraints_in(&changes, &declared, dependencies, dialect, true);
+    let mut why: Vec<_> = edges
+        .iter()
+        .map(|edge| EdgeWhy {
+            edge: edge.clone(),
+            rule: if edge.source == super::Source::Guess {
+                EdgeRule::Inferred
+            } else {
+                EdgeRule::Structural
+            },
+        })
+        .collect();
     if dialect.scratch_text_edges_are_guesses() {
         // Explicit identities must not pass through the inferred same-leaf
         // exclusion (DEC-2465.1); no general Source/Requirement rule changes.
@@ -91,17 +123,26 @@ pub fn prepare<S: super::RouteState<D>, D: Dialect + ?Sized>(
         for (owner, providers) in dependencies {
             for provider in providers {
                 if let (Some(before), Some(after)) = (module_at(provider), module_at(owner)) {
-                    edges.push(Constraint {
+                    let edge = Constraint {
                         before,
                         after,
                         source: super::Source::Lexical,
                         reason: pbps_model::resolver::OrderReason::Structural,
+                    };
+                    why.push(EdgeWhy {
+                        edge: edge.clone(),
+                        rule: EdgeRule::Annotation,
                     });
+                    edges.push(edge);
                 }
             }
         }
     }
-    Ok(Prepared { changes, edges })
+    Ok(Prepared {
+        changes,
+        edges,
+        why,
+    })
 }
 /// Logical blueprint facts supplied by the engine's opaque input. There is no
 /// caller-supplied settlement or certificate conversion.
@@ -185,8 +226,9 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
             .map(|p| PlannedChange::new(p.change.clone()))
             .collect(),
     };
+    let mut dropped = Vec::new();
     let settled = schedule
-        .settle_raw(names.clone())
+        .settle_scratch(names.clone(), &mut dropped)
         .map_err(|e| e.describe(&names))?;
     let sequence: Vec<usize> = settled
         .sequence
@@ -195,7 +237,9 @@ pub fn settle<E: Engine>(engine: &E, input: E::Input) -> Result<ScratchPlan<E>, 
         .collect();
     let trial = if engine.trial_order() {
         let sources: Vec<_> = sequence.iter().map(|&part| parts[part].operation).collect();
-        Some(TrialProgram::project(&prepared.edges, &sources, &names)?)
+        let mut program = TrialProgram::project(&prepared.edges, &sources, &names)?;
+        program.set_trace(prepared.why, dropped, sources, &names);
+        Some(program)
     } else {
         None
     };

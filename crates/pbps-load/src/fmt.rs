@@ -639,7 +639,7 @@ const BOOLISH: &[&str] = &["y", "n", "yes", "no", "true", "false", "on", "off"];
 const NULLISH: &[&str] = &["null", "~"];
 
 /// Renders a scalar, quoting it when necessary.
-pub(crate) fn scalar(s: &str) -> String {
+pub fn scalar(s: &str) -> String {
     if needs_quotes(s) {
         quoted(s)
     } else {

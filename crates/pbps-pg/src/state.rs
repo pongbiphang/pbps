@@ -2060,6 +2060,7 @@ mod tests {
     #[test]
     fn a_concurrent_creator_is_recognised_by_each_code_it_can_surface_as() {
         let with = |code: Option<&str>| DbError::Driver {
+            diagnostic: None,
             message: "raced".into(),
             code: code.map(str::to_owned),
         };
@@ -2078,6 +2079,7 @@ mod tests {
                 let original = "original driver failure";
                 let error = migration_error(
                     DbError::Driver {
+                        diagnostic: None,
                         message: original.into(),
                         code: code.map(str::to_owned),
                     },

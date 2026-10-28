@@ -469,7 +469,7 @@ pub enum ProduceError {
     Acquire(String),
     /// The run refused; nothing it owned is left behind.
     #[error("{0}")]
-    Run(Error),
+    Run(#[source] Error),
     /// Cleanup was not confirmed: these exact names may remain.
     #[error("the resolver run's cleanup was not confirmed; remove exactly: {}", .0.join(", "))]
     Cleanup(Vec<String>),

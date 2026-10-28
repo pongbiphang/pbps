@@ -4706,6 +4706,7 @@ mod tests {
     fn catalog_guidance_preserves_a_separate_source_only_for_recognized_codes() {
         for code in [Some("XX000"), Some("40P01"), Some("57014"), None] {
             let error = schema_changed_underneath(DbError::Driver {
+                diagnostic: None,
                 message: "original server sentence".into(),
                 code: code.map(str::to_owned),
             });

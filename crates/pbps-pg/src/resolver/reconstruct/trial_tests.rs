@@ -453,7 +453,7 @@ async fn rejected_ranges_publish_no_metadata_and_cannot_be_reused() {
         let mut r = build(&pg, &[table("a+1")], &Default::default(), false);
         let before = r.steps.clone();
         let error = compile(&mut r, &pg, &mut conn).await.unwrap_err();
-        assert_eq!(error, ReconstructError::Transaction("commit"));
+        assert!(matches!(error, ReconstructError::Transaction("commit")));
         assert_eq!(r.steps, before);
         assert!(r.committed.is_empty());
         assert!(r.observations().is_none());

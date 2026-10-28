@@ -799,6 +799,7 @@ mod tests {
     #[test]
     fn read_back_status_still_names_the_drivers_sentence() {
         let db = pbps_db::DbError::Driver {
+            diagnostic: None,
             message: "permission denied for table t".to_owned(),
             code: Some("42501".to_owned()),
         };
@@ -824,6 +825,7 @@ mod tests {
     #[test]
     fn an_unreachable_catalog_keeps_the_servers_sentence_under_its_context() {
         let driver = || pbps_db::DbError::Driver {
+            diagnostic: None,
             message: "deadlock detected: process 4711 waits for ShareLock".to_owned(),
             code: Some("40P01".to_owned()),
         };

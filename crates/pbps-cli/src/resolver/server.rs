@@ -18,6 +18,8 @@ mod transitions;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Creation(#[source] std::sync::Arc<CreationFailure>),
     #[error("the run-owned scratch resources could not be created on the scratch server")]
     Scratch,
     #[error("the analysis scope could not be qualified or changed under the run: {0}")]
@@ -47,6 +49,52 @@ pub enum Error {
     /// object, each named (#1516). Nothing is published.
     #[error("the target changed after the resolver read it: {}", .0.join("; "))]
     Changed(Vec<String>),
+}
+
+/// CLI-owned rendering context; the engine's report owns no filesystem paths.
+#[derive(Debug, Clone)]
+pub struct CreationFailure {
+    pub report: std::sync::Arc<pbps_pg::resolver::reconstruct::refusal::Refusal>,
+    pub sources: pbps_load::DeclarationSourceIndex,
+    pub context: Vec<String>,
+    pub externals: bool,
+}
+impl CreationFailure {
+    pub fn new(report: std::sync::Arc<pbps_pg::resolver::reconstruct::refusal::Refusal>) -> Self {
+        Self {
+            report,
+            sources: Default::default(),
+            context: Vec::new(),
+            externals: false,
+        }
+    }
+}
+impl std::error::Error for CreationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.report.as_ref())
+    }
+}
+impl std::fmt::Display for CreationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = |owner: &pbps_model::diagnostic::Declaration| {
+            self.sources
+                .get(owner)
+                .map(|path| pbps_model::escape::Escaped(&path.to_string_lossy()).to_string())
+        };
+        write!(f, "{}", self.report.render(path))?;
+        for pending in &self.report.pending {
+            if let (Some(owner), Some(provider)) = (&pending.owner, &pending.dependency)
+                && let Some(file) = path(owner)
+            {
+                let yaml = pbps_load::render_scalar(&provider.raw().to_string());
+                write!(f, "\n  fix: add to {file}\n         depends_on: [{yaml}]")?;
+            }
+        }
+        for context in &self.context {
+            write!(f, "\n{context}")?;
+        }
+        Ok(())
+    }
 }
 
 /// What a run is asked to qualify: the schemas its plan writes to, the extras

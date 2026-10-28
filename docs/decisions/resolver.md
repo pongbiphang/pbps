@@ -5021,3 +5021,30 @@ belong to master's existing separation contract, not this database repair set.
 <a id="dec-2162-1"></a>
 
 **DEC-2162.1. Catalog capture shares its coverage check; translation and catalog-reading policies remain engine-owned.** The approved #2162 translator extraction was prototyped against pre-extraction golden maps. It preserved bytes but increased the mechanism's size once its native adapter was included, triggering the maintainer's coverage-only stop rule. `pbps_db::resolver::capture::rules::unclassified` checks engine-supplied dispositions for reported columns or catalog classes. Missing dispositions and exceptions with empty reasons are uncovered. SQL Server's live coverage tests and PostgreSQL's frozen-layout test and runtime qualification use that same check. SQL Server still compares unnamed non-id scalars and refuses unnamed ids; PostgreSQL still requires its exact qualified layout, including order, type and type namespace, and refuses unknown reference fields. The native rule tables, translators, lossless value conversions, catalog SQL and read consistency remain in their engine crates. A new column rule remains a change to one engine's table. Existing fingerprint rules and canonical property bytes are unchanged; a future translator extraction must justify its total cost including adapters.
+
+<a id="dec-2465-2"></a>
+
+**DEC-2465.2. Scratch refusal diagnostics retain transient typed facts at their source.**
+The driver preserves the primary message, supplied object fields and P or internal
+p/q without adding DETAIL, HINT or CONTEXT. Display stays unchanged; internal query
+text is redacted from Debug. Reports retain the Driver as a source, and ledger
+rendering redacts report frames as well as the driver. P counts characters in the
+exact submitted statement; p counts characters in q, which is shown only when it
+maps to this run's own declaration text. Carets follow inert escaping and terminal
+width. No identity is extracted from message prose. Unqualified, unsupported or
+ambiguous tokens leave labelled candidates, never a guessed identity.
+
+Checked loading captures a typed declaration-to-file index beside the model.
+The CLI joins routine identities using the dialect's normalization and owns path
+and YAML rendering; absent indexes say "source file unavailable". Scratch keeps
+edge provenance and the exact dropped guesses, their SCCs and removal stages.
+Each actual diagnosis snapshots its statement ordinal, success generation, unmet
+soft preferences and local successes. Failed-range successes are labelled rolled
+back, separately from a committed earlier range. Hard-blocked declarations carry
+no invented engine verdict. True creation cycles require a declaration change;
+they receive no hard-cycle annotation or two-plan suggestion. A module remedy is
+available only for a sole positioned named-module provider outside the refused set,
+when adding its hard edge is acyclic and no fill is pending. A positioned routine
+family alone is not an overload identity. A possible creation-time return path
+through other declarations also suppresses advice. Other typed targets and owners remain
+#2469. None of these facts enters Schema equality, saved artifacts or evidence.

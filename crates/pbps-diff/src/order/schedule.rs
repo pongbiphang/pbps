@@ -343,13 +343,21 @@ impl Schedule {
     }
 
     pub(super) fn settle_raw(&self, changes: ChangeSet) -> Result<DraftSettled, Refusal> {
+        self.settle_scratch(changes, &mut Vec::new())
+    }
+
+    pub(super) fn settle_scratch(
+        &self,
+        changes: ChangeSet,
+        dropped: &mut Vec<super::scratch::DroppedGuess>,
+    ) -> Result<DraftSettled, Refusal> {
         if changes.changes.len() != self.steps {
             return Err(Refusal::Mismatch {
                 steps: self.steps,
                 changes: changes.changes.len(),
             });
         }
-        let (sequence, kept) = self.settled()?;
+        let (sequence, kept) = self.settled_trace(dropped)?;
         let mut position = vec![0usize; self.steps];
         for (at, &from) in sequence.iter().enumerate() {
             position[from] = at;
@@ -385,6 +393,12 @@ impl Schedule {
     /// component made only of `depends_on:` annotations, whose members keep
     /// the order given (DEC-1956.3, #2083).
     fn settled(&self) -> Result<(Vec<usize>, Vec<&Constraint>), Refusal> {
+        self.settled_trace(&mut Vec::new())
+    }
+    fn settled_trace(
+        &self,
+        dropped: &mut Vec<super::scratch::DroppedGuess>,
+    ) -> Result<(Vec<usize>, Vec<&Constraint>), Refusal> {
         let n = self.steps;
         if let Some(c) = self
             .constraints
@@ -412,7 +426,7 @@ impl Schedule {
         // Steps wait on one another: give up the guesses that run against the
         // order given first, and the others only if that is not enough.
         for backward_only in [true, false] {
-            if emitted.len() < n && drop_guesses(n, &mut kept, backward_only) {
+            if emitted.len() < n && drop_guesses(n, &mut kept, backward_only, dropped) {
                 emitted = kahn(n, &kept, self.tie);
             }
         }
@@ -536,21 +550,35 @@ impl Schedule {
 /// run with it. Each cycle lies inside one component, so after the second
 /// step what is left of them holds no guess (DEC-2389.4). A guess between
 /// components, and one in no cycle, is kept.
-fn drop_guesses(n: usize, kept: &mut Vec<&Constraint>, backward_only: bool) -> bool {
+fn drop_guesses(
+    n: usize,
+    kept: &mut Vec<&Constraint>,
+    backward_only: bool,
+    dropped: &mut Vec<super::scratch::DroppedGuess>,
+) -> bool {
     let mut component = vec![usize::MAX; n];
-    for (id, members) in components(n, kept).into_iter().enumerate() {
+    let groups = components(n, kept);
+    for (id, members) in groups.iter().enumerate() {
         if members.len() > 1 {
             for member in members {
-                component[member] = id;
+                component[*member] = id;
             }
         }
     }
     let before = kept.len();
     kept.retain(|c| {
-        c.source != Source::Guess
+        let keep = c.source != Source::Guess
             || component[c.before] == usize::MAX
             || component[c.before] != component[c.after]
-            || (backward_only && c.after > c.before)
+            || (backward_only && c.after > c.before);
+        if !keep {
+            dropped.push(super::scratch::DroppedGuess {
+                edge: (*c).clone(),
+                members: groups[component[c.before]].clone(),
+                backward_only,
+            });
+        }
+        keep
     });
     kept.len() != before
 }
