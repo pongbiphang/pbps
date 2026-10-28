@@ -257,8 +257,11 @@ fn a_missing_sink_and_an_unreadable_artifact_cannot_pass_as_empty() {
     let d = Demo::new("trace2488-missing");
     let absent = d.dir.join("absent");
     assert!(std::panic::catch_unwind(|| Trace::new().files(&absent)).is_err());
+    // A directory cannot be read as artifact bytes, even with DAC override.
+    assert!(std::panic::catch_unwind(|| Trace::new().artifact(Sink::Artifact, &d.dir)).is_err());
     #[cfg(unix)]
-    {
+    if !rustix::process::geteuid().is_root() {
+        // Root bypasses mode bits; the I/O failure above covers every uid.
         use std::os::unix::fs::PermissionsExt as _;
         let denied = d.dir.join("unreadable");
         std::fs::write(&denied, b"public bytes").unwrap();
