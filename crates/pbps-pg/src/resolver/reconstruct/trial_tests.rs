@@ -685,3 +685,94 @@ async fn retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects() {
         assert!(r.observations().is_none());
     }
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL 16 and 18"]
+async fn recovery_interruptions_are_not_creation_refusals() {
+    for server in servers() {
+        let mut check = Conn::connect(Driver::Postgres, &server).await.unwrap();
+        if crate::roles::server_version_num(&mut check).await.unwrap() / 10_000 != 16 {
+            continue;
+        }
+        for killed in [true, false] {
+            let (mut admin, mut conn, name, pg) = database(&server).await;
+            // Sequence increments survive the first failed savepoint, so the
+            // trigger can distinguish the recovery attempt without external I/O.
+            let action = if killed {
+                "PERFORM pg_terminate_backend(pg_backend_pid())"
+            } else {
+                "RAISE EXCEPTION 'recovery refused by the scratch trigger'"
+            };
+            conn.execute(&format!(
+                "CREATE SEQUENCE public.recovery_attempt; \
+                 CREATE FUNCTION public.recovery_stop() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN IF nextval('public.recovery_attempt') = 1 THEN \
+                 RAISE EXCEPTION 'parked syntax verdict' USING ERRCODE = '42601'; END IF; \
+                 {action}; END $$; CREATE EVENT TRIGGER recovery_stop ON ddl_command_start \
+                 WHEN TAG IN ('CREATE VIEW') EXECUTE FUNCTION public.recovery_stop();"
+            )).await.unwrap();
+            let changes = [
+                module("app.v", ModuleKind::View, "SELECT 1 AS n"),
+                table("1"),
+            ];
+            let mut r = build(&pg, &changes, &Default::default(), false);
+            assert_eq!(r.steps[0].module.as_ref(), Some(&"app.v".parse().unwrap()));
+            let compiled = compile(&mut r, &pg, &mut conn).await;
+            drop(conn);
+            let mut probe = Conn::connect(Driver::Postgres, &format!("{server} dbname={name}"))
+                .await
+                .unwrap();
+            let attempts = probe
+                .query("SELECT last_value FROM public.recovery_attempt")
+                .await
+                .unwrap()[0]
+                .try_get_at::<i64>(0)
+                .unwrap();
+            let absent = probe
+                .query("SELECT to_regclass('app.t') IS NULL AS absent")
+                .await
+                .unwrap()[0]
+                .try_get::<bool>("absent")
+                .unwrap();
+            drop(probe);
+            remove(&mut admin, &name).await;
+            assert_eq!(
+                attempts,
+                Some(2),
+                "the backend reached the recovery attempt"
+            );
+            assert_eq!(absent, Some(true), "the failed range was rolled back");
+            assert!(r.committed.is_empty() && r.observations().is_none());
+            if killed {
+                assert!(
+                    matches!(compiled, Err(ReconstructError::Interrupted { .. })),
+                    "{compiled:?}"
+                );
+            } else {
+                let Err(ReconstructError::Refused(report)) = compiled else {
+                    panic!("{compiled:?}")
+                };
+                assert_eq!(
+                    report.pending[0]
+                        .last
+                        .as_ref()
+                        .unwrap()
+                        .error
+                        .server_error_code()
+                        .as_deref(),
+                    Some("42601")
+                );
+                assert_eq!(
+                    report.pending[0]
+                        .recovery
+                        .as_ref()
+                        .unwrap()
+                        .error
+                        .server_error_code()
+                        .as_deref(),
+                    Some("P0001")
+                );
+            }
+        }
+    }
+}

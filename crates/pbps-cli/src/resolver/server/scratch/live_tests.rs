@@ -5896,10 +5896,14 @@ async fn scratch_generated_table_parts_compile_literal_and_collision_names_befor
                     .map_err(anyhow::Error::msg)?;
                 let compiled = reconstruction.compile(&pg, &pbps_model::SessionZone::utc(), &mut conn).await;
                 if case == "missing" {
-                    let Err(pbps_pg::resolver::reconstruct::ReconstructError::Compile { reason, .. }) = compiled else {
+                    let Err(pbps_pg::resolver::reconstruct::ReconstructError::Refused(report)) = compiled else {
                         anyhow::bail!("a missing function must remain an engine compile refusal");
                     };
-                    anyhow::ensure!(reason.contains("app.missing") && reason.contains("does not exist"), "{reason}");
+                    anyhow::ensure!(report.pending.iter().filter_map(|pending| pending.last.as_ref()).any(|last|
+                        last.error.server_error_code().as_deref() == Some("42883")
+                            && last.error.to_string().contains("app.missing")
+                            && last.error.to_string().contains("does not exist")), "{report}");
+                    anyhow::ensure!(reconstruction.observations().is_none(), "a failed compile grants no binding observations");
                     let rows = conn.query("SELECT to_regclass('app.a') IS NULL AS absent").await?;
                     anyhow::ensure!(rows[0].try_get::<bool>("absent")? == Some(true),
                         "failed compilation must leave no table");

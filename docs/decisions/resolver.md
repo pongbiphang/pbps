@@ -5048,3 +5048,17 @@ when adding its hard edge is acyclic and no fill is pending. A positioned routin
 family alone is not an overload identity. A possible creation-time return path
 through other declarations also suppresses advice. Other typed targets and owners remain
 #2469. None of these facts enters Schema equality, saved artifacts or evidence.
+
+
+<a id="dec-2465-3"></a>
+
+**DEC-2465.3. A recovery interruption is never a creation verdict.** Test the
+statement's SQLSTATE classification before the PG16 syntax-recovery branch
+preserves its initial refusal. A terminated backend, connection loss, timeout
+or resource failure answers nothing about the declaration (SPEC §9.8), including
+when an earlier attempt returned 42601. A real PG16 event-trigger probe first
+raises 42601, permits a later table to compile, then terminates its backend on
+recovery: the former branch reported a Refused result containing recovery
+57P01. It must return Interrupted and publish no metadata. A P0001 raised by the
+trigger remains an engine refusal; during recovery it retains the original
+42601 and the later P0001 as context. Neither failure is retried again.

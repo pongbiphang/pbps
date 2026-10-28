@@ -1726,6 +1726,7 @@
         "resolver::reconstruct::trial_tests::rejected_ranges_publish_no_metadata_and_cannot_be_reused",
         "resolver::reconstruct::trial_tests::suffix_failure_keeps_prefix_private_and_fill_at_the_committed_boundary",
         "resolver::reconstruct::trial_tests::terminal_statement_errors_do_not_retry_or_attempt_a_later_provider",
+        "resolver::reconstruct::trial_tests::recovery_interruptions_are_not_creation_refusals",
         "resolver::reconstruct::trial_tests::genuine_syntax_is_refused_with_its_original_diagnosis",
         "resolver::reconstruct::trial_tests::retries_roll_back_whole_groups_but_can_repeat_sequence_side_effects",
         "resolver::reconstruct::trial_tests::the_three_call_counterexamples_compile_deterministically",

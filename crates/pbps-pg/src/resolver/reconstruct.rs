@@ -50,7 +50,7 @@ pub enum ReconstructError {
     #[error("scratch compilation of {declaration} failed: {reason}")]
     Compile { declaration: String, reason: String },
     /// A catalog read around a step failed: nothing was learned about the
-    /// declaration, so it is not a [`ReconstructError::Compile`] verdict
+    /// declaration, so it is not a [`ReconstructError::Refused`] verdict
     /// (SPEC 9.8, #1575).
     #[error("reading back what compiling {declaration} made failed: {reason}")]
     Read { declaration: String, reason: String },

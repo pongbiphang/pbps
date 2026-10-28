@@ -54,7 +54,14 @@ impl Reconstruction {
                 }
                 Err(Failure::Statement { error, statement }) => {
                     let code = error.server_error_code();
-                    let judged = judged_the_statement(&error);
+                    // Recovery preserves the first creation verdict only when
+                    // this attempt also reached an engine verdict (DEC-2465.3).
+                    if !judged_the_statement(&error) {
+                        return Err(ReconstructError::Interrupted {
+                            declaration: self.steps[at].declaration.clone(),
+                            reason: error.to_string(),
+                        });
+                    }
                     let diagnosis = self.diagnosis(at, statement, error, &delta, overtaken);
                     if recovery {
                         recoveries[at] = Some(diagnosis);
@@ -80,24 +87,17 @@ impl Reconstruction {
                             attempt.park_syntax();
                         }
                     } else {
-                        return Err(if judged {
-                            let pending = super::refusal::Pending {
-                                declaration: self.steps[at].declaration.clone(),
-                                subject: self.steps[at].subject.clone(),
-                                owner: self.steps[at].owner.clone(),
-                                dependency: None,
-                                last: Some(diagnosis),
-                                recovery: None,
-                                blocked: Vec::new(),
-                                why: self.trial.explanation(at),
-                            };
-                            self.refusal(version, vec![pending], false, overtakes)
-                        } else {
-                            ReconstructError::Interrupted {
-                                declaration: self.steps[at].declaration.clone(),
-                                reason: diagnosis.error.to_string(),
-                            }
-                        });
+                        let pending = super::refusal::Pending {
+                            declaration: self.steps[at].declaration.clone(),
+                            subject: self.steps[at].subject.clone(),
+                            owner: self.steps[at].owner.clone(),
+                            dependency: None,
+                            last: Some(diagnosis),
+                            recovery: None,
+                            blocked: Vec::new(),
+                            why: self.trial.explanation(at),
+                        };
+                        return Err(self.refusal(version, vec![pending], false, overtakes));
                     }
                 }
                 Err(Failure::Terminal(error)) => return Err(error),
