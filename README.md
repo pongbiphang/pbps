@@ -255,3 +255,9 @@ that evidence on the target before its first statement and after its last;
 it needs no resolver, scratch or Docker (#616). See
 [SPEC §9.3.2](docs/SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 for configuration and [the delivery steps](docs/RESOLVER-DELIVERY.md).
+
+[Resolver acceptance](docs/RESOLVER-ACCEPTANCE.md) records planning, offline
+explanation and resolved apply separately for each engine/build, scratch kind
+and platform. A compiled resolver, another engine's pass or a compact core
+compatibility cell does not qualify a live resolver path. Final SQL Server
+planning/apply qualification remains #2143/#2144 and #621.

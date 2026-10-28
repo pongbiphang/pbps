@@ -205,7 +205,7 @@ through the runner's `docker` command; the operator vouches for its isolation
 (DEC-1528.1, DEC-1636.1). Separation is decided by the engines' own identity
 before any scratch write, not by names. pbps enforces no containment and
 observes no process, so the resolver reaches its scratch with SQL alone and
-runs on every platform pbps supports.
+its [acceptance matrix](RESOLVER-ACCEPTANCE.md) separates live qualification for planning, offline explanation and resolved apply from build portability.
 `apply` checks saved prerequisites without invoking the resolver or adding
 changes after approval.
 

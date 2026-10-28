@@ -473,6 +473,8 @@ def python_tokens(source):
 
 
 def rust_tokens(source):
+    # Match at an offset: copying the remaining tail for each token made
+    # large source fixtures quadratic without changing any token rule.
     """Lex witnesses, not Rust items/cfgs; Cargo supplies compiled case names."""
     result, i = [], 0
     while i < len(source):
@@ -491,9 +493,9 @@ def rust_tokens(source):
                 else: i += 1
             require(depth == 0, "unterminated Rust comment")
             continue
-        raw = re.match(r'(?:b|c)?r(#+)?"', source[i:])
+        raw = re.compile(r'(?:b|c)?r(#+)?"').match(source, i)
         if raw:
-            start = i + raw.end()
+            start = raw.end()
             end = source.find('"' + (raw[1] or ""), start)
             require(end >= 0, "unterminated Rust raw string")
             result.append(("string", source[start:end]))
@@ -512,10 +514,10 @@ def rust_tokens(source):
             result.append(("string", value))
             i = end + 1
             continue
-        char = re.match(r"'(?:\\.|[^'\\\n])'", source[i:])
+        char = re.compile(r"'(?:\\.|[^'\\\n])'").match(source, i)
         if char:
             result.append(("char", char[0])); i += len(char[0]); continue
-        word = re.match(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+", source[i:])
+        word = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+").match(source, i)
         if word:
             result.append(word[0]); i += len(word[0]); continue
         result.append(source[i]); i += 1

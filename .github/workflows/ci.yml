@@ -139,6 +139,9 @@ jobs:
       # person reads (#2084); the compiler cannot see that last step.
       - run: python3 scripts/check_raw_in_messages_test.py
       - run: python3 scripts/check-raw-in-messages.py
+      # Existence and ownership do not infer ADR coverage or test execution.
+      - run: python3 scripts/check_resolver_acceptance_test.py
+      - run: python3 scripts/check_resolver_acceptance.py
       # The checker `ci-gate` runs on its own `needs` (#637).
       - run: python3 scripts/check_gate_needs_test.py
       - run: python3 scripts/ci_gate_verdict_test.py
