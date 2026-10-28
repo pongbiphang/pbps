@@ -43,6 +43,7 @@ pub mod engine_effects;
 pub mod estimate;
 pub mod lower;
 pub mod plan_rows;
+pub mod predicate;
 pub mod slots;
 
 #[cfg(test)]
@@ -1740,6 +1741,32 @@ struct SqlString {
     breaks: String,
 }
 
+// One quoted piece, without PostgreSQL's continuation or escape decoding.
+// The strict predicate cursor shares termination/doubling with the existing
+// string reader, but must not inherit PostgreSQL's newline continuation.
+fn quoted_piece(text: &str, mut at: usize, close: char, escape: bool) -> Option<(String, usize)> {
+    let mut piece = String::new();
+    loop {
+        let ch = text.get(at..)?.chars().next()?;
+        at += ch.len_utf8();
+        if ch == close {
+            if text[at..].starts_with(close) {
+                piece.push(close);
+                at += close.len_utf8();
+            } else {
+                return Some((piece, at));
+            }
+        } else {
+            piece.push(ch);
+            if escape && ch == '\\' {
+                let escaped = text[at..].chars().next()?;
+                piece.push(escaped);
+                at += escaped.len_utf8();
+            }
+        }
+    }
+}
+
 /// PostgreSQL's Sconst forms, shared by routine bodies and language names.
 /// B/X/N prefixes are not accepted in those grammar positions.
 fn sql_string(definition: &str, at: usize) -> Option<SqlString> {
@@ -1772,27 +1799,8 @@ fn sql_string(definition: &str, at: usize) -> Option<SqlString> {
     let mut breaks = String::new();
     let mut cursor = at + prefix + 1;
     loop {
-        let mut piece = String::new();
-        loop {
-            let ch = definition[cursor..].chars().next()?;
-            cursor += ch.len_utf8();
-            if ch == '\'' {
-                if definition[cursor..].starts_with('\'') {
-                    piece.push('\'');
-                    cursor += 1;
-                } else {
-                    break;
-                }
-            } else {
-                piece.push(ch);
-                if escape && ch == '\\' {
-                    // An escaped quote is data, not this piece's terminator.
-                    let escaped = definition[cursor..].chars().next()?;
-                    piece.push(escaped);
-                    cursor += escaped.len_utf8();
-                }
-            }
-        }
+        let (piece, end) = quoted_piece(definition, cursor, '\'', escape)?;
+        cursor = end;
         if escape {
             // E escapes are read within each piece: E'\x' ⏎ '63' is x63,
             // not c. The prefix still applies to every continued piece.

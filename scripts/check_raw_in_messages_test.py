@@ -475,6 +475,7 @@ class TheAllowlist(unittest.TestCase):
             'crates/pbps-cli/src/status.rs',
             'crates/pbps-cli/tests/flow.rs',
             'crates/pbps-cli/tests/flow_pg.rs',
+            'crates/pbps-dialect/src/predicate/render.rs',
             'crates/pbps-dialect/tests/support/positional_preflight.rs',
             'crates/pbps-diff/src/identity.rs',
             'crates/pbps-diff/src/schema_diff.rs',

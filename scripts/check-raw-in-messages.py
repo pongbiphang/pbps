@@ -79,6 +79,10 @@ SQL_BUILDERS = {
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
+    "crates/pbps-dialect/src/predicate/render.rs": (
+        1,
+        "renders validated raw type arguments as SQL, not diagnostic prose (#2400)",
+    ),
     "crates/pbps-mssql/src/resolver/dependencies.rs": (
         None,
         "builds companion declaration SQL; diagnostic sinks remain checked",
