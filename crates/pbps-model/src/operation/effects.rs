@@ -27,6 +27,8 @@
 //! - [`Requirement::Absent`]: nothing of the object stands, because it would
 //!   block the step. A dependent in the way, such as a foreign key into a table
 //!   about to be dropped.
+//! - [`Requirement::ReleaseGap`]: when separate operations release and restore
+//!   the object, this step runs in their gap; otherwise nothing is required.
 //! - [`Requirement::NotBoundTo`]: a surface is absent or its live FK binds a
 //!   known different table UID. Unknown bindings still block retirement.
 //! - [`Requirement::Reads`]: the values under a key, after every write of
@@ -95,6 +97,10 @@ pub enum Requirement {
     Is(ObjectKey, Incarnation),
     Bound(ObjectKey, BoundInput),
     Absent(ObjectKey),
+    /// Runs between separate release and restoration operations on this key.
+    /// Without both halves, imposes no presence or ordering requirement
+    /// (DEC-1896.1). A single in-place replacement has no release gap.
+    ReleaseGap(ObjectKey),
     /// No live incarnation of this surface may bind the retiring table.
     /// Missing binding evidence is conservative, not proof of a new target.
     NotBoundTo {
@@ -122,6 +128,7 @@ impl Requirement {
             | Requirement::Is(key, _)
             | Requirement::Bound(key, _)
             | Requirement::Absent(key)
+            | Requirement::ReleaseGap(key)
             | Requirement::Reads(key)
             | Requirement::BeforeRewrite(key) => key,
         }
@@ -161,6 +168,7 @@ impl Effects {
             | Requirement::Holds(_)
             | Requirement::Exists(_)
             | Requirement::Absent(_)
+            | Requirement::ReleaseGap(_)
             | Requirement::NotBoundTo { .. }
             | Requirement::Reads(_)
             | Requirement::BeforeRewrite(_) => None,
@@ -787,6 +795,8 @@ impl Cx<'_> {
                 self.nullability_moves(&key, *from_nullable, *to_nullable);
                 // A default written for the old type blocks the retype, and
                 // one written for the new type follows it (DEC-1168.1).
+                self.requires(Requirement::ReleaseGap(ObjectKey::Default(key.clone())));
+                self.partition_default_gaps(&owner, &key);
                 if self.default_goes(&owner, &key) {
                     self.requires(Requirement::Absent(ObjectKey::Default(key)));
                 }
@@ -1914,6 +1924,35 @@ impl Cx<'_> {
             }
         }
         renames
+    }
+
+    /// TYPE recurses into the standing partitions too. Membership-changing
+    /// parent-column plans remain guarded by #2296; the baseline identifies
+    /// the own defaults this operation can retype (DEC-1896.1).
+    fn partition_default_gaps(&mut self, owner: &Recorded, column: &ColumnKey) {
+        let Some((parent, _)) = self.base_of(owner) else {
+            return;
+        };
+        let Some((name, _)) = self.names_of(column) else {
+            return;
+        };
+        let mut defaults = Vec::new();
+        for (table, definition) in &self.before.schema.tables {
+            if definition
+                .partition_of
+                .as_ref()
+                .is_some_and(|of| of.parent == *parent)
+                && let Some(child) = self.base_table(table)
+            {
+                defaults.push(ObjectKey::Default(ColumnKey::Partition {
+                    table: child,
+                    column: name.clone(),
+                }));
+            }
+        }
+        for key in defaults {
+            self.requires(Requirement::ReleaseGap(key));
+        }
     }
 
     /// Whether the plan takes the column's default away: the baseline has one

@@ -1096,6 +1096,7 @@ mod effects_of_each_kind {
                 Requirement::Is(..) => "Is",
                 Requirement::Bound(..) => "Bound",
                 Requirement::Absent(_) => "Absent",
+                Requirement::ReleaseGap(_) => "ReleaseGap",
                 Requirement::NotBoundTo { .. } => "NotBoundTo",
                 Requirement::Reads(_) => "Reads",
                 Requirement::BeforeRewrite(_) => "BeforeRewrite",

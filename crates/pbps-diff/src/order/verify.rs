@@ -91,6 +91,21 @@ pub(crate) fn verify_with(
             Resource::Column(_) => None,
         })
         .collect();
+    // Index lifetimes once: retypes may ask about many different defaults.
+    let mut releases: BTreeMap<&ObjectKey, Vec<usize>> = BTreeMap::new();
+    let mut restorations: BTreeMap<&ObjectKey, Vec<usize>> = BTreeMap::new();
+    for (i, fx) in effects.iter().enumerate() {
+        for resource in &fx.removes {
+            if let Resource::Object(key, _) = resource {
+                releases.entry(key).or_default().push(i);
+            }
+        }
+        for resource in &fx.creates {
+            if let Resource::Object(key, _) = resource {
+                restorations.entry(key).or_default().push(i);
+            }
+        }
+    }
     let held = |key: &ObjectKey| -> Option<bool> {
         if checks.baseline {
             baseline.holds(key)
@@ -111,7 +126,7 @@ pub(crate) fn verify_with(
         }
     };
     let mut values: BTreeMap<ObjectKey, (bool, bool)> = BTreeMap::new();
-    for (operation, fx) in operations.iter().zip(effects) {
+    for (operation_index, (operation, fx)) in operations.iter().zip(effects).enumerate() {
         for requirement in &fx.requires {
             let key = requirement.key();
             let now = replay
@@ -170,6 +185,25 @@ pub(crate) fn verify_with(
                         || (now.base && now.base_target.as_ref().is_none_or(|t| t == target))
                         || (now.plan && now.plan_target.as_ref().is_none_or(|t| t == target));
                     if still_bound {
+                        out.push(Violation::StillPresent {
+                            operation: operation.id(),
+                            key: key.clone(),
+                        });
+                    }
+                    true
+                }
+                Requirement::ReleaseGap(_) => {
+                    // Derive activation from the operations' effects, independently
+                    // of the graph: a combined replacement has no gap to check.
+                    let gap = releases.get(key).is_some_and(|from| {
+                        restorations.get(key).is_some_and(|to| {
+                            from.iter().any(|&a| {
+                                a != operation_index
+                                    && to.iter().any(|&c| c != a && c != operation_index)
+                            })
+                        })
+                    });
+                    if gap && present(&now) {
                         out.push(Violation::StillPresent {
                             operation: operation.id(),
                             key: key.clone(),
