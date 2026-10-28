@@ -9029,3 +9029,16 @@ target execution receive no retry. This extends DEC-1959.5's scratch clause
 and the lowering wording without changing deployment execution. #2376 was not
 merged at this PR's base: its later join must project Auxiliary steps from
 `steps()` as hard interleaved boundaries, with no implicit retry or crossing.
+
+<a id="dec-1681-2"></a>
+
+**DEC-1681.2. Ignore the parent's identity in an attach's column comparison,
+and refuse every identity of the attached table's own by name (#1681).** This
+amends DEC-1545.1's identity equality rule. Measured on PostgreSQL 16.15 and
+18.6, a plain table attaches under an identity parent on both versions. On 18
+the partition then holds the parent's identity marker without owning its
+sequence; on 16 it holds no marker. DEC-1681.1 reads both as the declared tree.
+An attached table's own identity is refused even when its parameters match
+the parent's: 18 refuses the attach, while 16 keeps an independent sequence
+that the partition declaration cannot hold. Drop that identity in an earlier
+plan before attaching the table. The other column shape requirements remain.

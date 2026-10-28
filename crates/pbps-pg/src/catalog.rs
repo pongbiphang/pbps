@@ -233,7 +233,8 @@ fn tables_query() -> String {
 /// parameters, which are its own (#1580), with no grant on a column, which no
 /// table declares (a grant on the partition itself is its own, read as any
 /// table's, #1579), whose columns are inherited and its parent's in
-/// the parent's order with the parent's identities and generations. Its
+/// the parent's order with the parent's generations. Its identity is read
+/// from the parent, and it must own no identity sequence (DEC-1681.1). Its
 /// defaults and NOT NULLs are the parent's or its own (#1578): a default of
 /// its own where the parent's column has one or none, a NOT NULL of its own
 /// where the parent's is nullable, but never a default dropped where the
@@ -258,7 +259,7 @@ fn partition_tree(root: &str) -> String {
     let columns = |rel: &str| {
         format!(
             "(SELECT pg_catalog.array_agg(ROW(a.attname, a.atttypid, a.atttypmod, a.attcollation,
-                                               a.attidentity, a.attgenerated,
+                                               a.attgenerated,
                                                CASE WHEN a.attgenerated <> ''
                                                     THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid)
                                                END)::text
@@ -343,7 +344,17 @@ fn partition_tree(root: &str) -> String {
                                         ON pd.adrelid = pa.attrelid AND pd.adnum = pa.attnum
                                      WHERE ca.attrelid = ch.oid AND ca.attnum > 0
                                        AND NOT ca.attisdropped
-                                       AND ((pa.attnotnull AND NOT ca.attnotnull)
+                                       AND ((ca.attidentity <> ''
+                                             AND ca.attidentity <> pa.attidentity)
+                                            OR EXISTS (
+                                                SELECT 1 FROM pg_catalog.pg_depend idep
+                                                JOIN pg_catalog.pg_class seq
+                                                  ON seq.oid = idep.objid AND seq.relkind = 'S'
+                                                 WHERE idep.classid = 'pg_class'::regclass
+                                                   AND idep.refobjid = ca.attrelid
+                                                   AND idep.refobjsubid = ca.attnum
+                                                   AND idep.deptype = 'i')
+                                            OR (pa.attnotnull AND NOT ca.attnotnull)
                                             OR (pd.oid IS NOT NULL AND cd.oid IS NULL)))
                                   AND NOT EXISTS (
                                     SELECT 1 FROM pg_catalog.pg_constraint k
@@ -748,6 +759,9 @@ fn partitioned_query() -> String {
 /// last. Two joins give one row per column and take each fact from the
 /// dependency that means it.
 fn columns_query() -> String {
+    // A partition's identity belongs to its parent: 18 copies attidentity but
+    // no sequence dependency, while 16 copies neither (DEC-1681.1). Match by
+    // name, since dropped columns can leave the two attnums different.
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty,
@@ -757,7 +771,7 @@ fn columns_query() -> String {
             (el.oid IS NOT NULL) AS type_array,
             NOT a.attnotnull AS nullable,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr,
-            a.attidentity::text AS identity_kind,
+            ia.attidentity::text AS identity_kind,
             a.attgenerated::text AS generated,
             s.seqstart::int8 AS seq_start,
             s.seqincrement::int8 AS seq_increment,
@@ -789,6 +803,10 @@ fn columns_query() -> String {
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+       LEFT JOIN pg_catalog.pg_inherits ih ON c.relispartition AND ih.inhrelid = c.oid
+       LEFT JOIN pg_catalog.pg_attribute ia
+         ON ia.attrelid = COALESCE(ih.inhparent, a.attrelid) AND ia.attname = a.attname
+        AND ia.attnum > 0 AND NOT ia.attisdropped
        LEFT JOIN pg_catalog.pg_type el ON el.oid = ty.typelem AND el.typarray = ty.oid
        LEFT JOIN pg_catalog.pg_type ut ON ut.oid = COALESCE(el.oid, ty.oid) AND ut.oid >= 16384
        LEFT JOIN pg_catalog.pg_namespace un ON un.oid = ut.typnamespace
@@ -803,7 +821,7 @@ fn columns_query() -> String {
                   JOIN pg_catalog.pg_sequence s ON s.seqrelid = idep.objid
                   JOIN pg_catalog.pg_class iseq
                     ON iseq.oid = idep.objid AND iseq.relkind = 'S')
-              ON idep.refobjid = a.attrelid AND idep.refobjsubid = a.attnum
+              ON idep.refobjid = ia.attrelid AND idep.refobjsubid = ia.attnum
              AND idep.classid = 'pg_class'::regclass AND idep.deptype = 'i'
        -- The `serial` shape (#1631): the sequences this column owns that its
        -- default uses. An aggregate, so a column owning two keeps one row, and
@@ -1576,8 +1594,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         let identity = match first_char(&text(row, "identity_kind")?) {
             Some(kind @ ('a' | 'd')) => Some(RawIdentity {
                 always: kind == 'a',
-                // A column the catalog calls an identity always has a sequence
-                // behind it. Defaulting rather than failing here would invent
+                // The identity owner (the parent for a partition) must have
+                // a sequence. Defaulting rather than failing here would invent
                 // `GENERATED ... (START WITH 0)`, which is not a thing this
                 // engine will accept back (see `types::identity_seed_range`).
                 seed: number(row, "seq_start")?,
@@ -4718,6 +4736,93 @@ mod tests {
         assert!(!flag(&row, "flag").unwrap());
         assert!(flag(&row, "none").is_err());
         assert!(decode_batch(&CatalogBatch::new()).is_err());
+    }
+
+    #[test]
+    fn an_identity_without_readable_sequence_facts_is_a_broken_read() {
+        let row = serde_json::json!({
+            "table_oid": 1, "attnum": 1, "name": "id", "ty": "integer",
+            "user_type_oid": null, "nullable": false, "default_expr": null,
+            "identity_kind": "a", "generated": "", "sequence_name": null,
+            "seq_start": 7, "seq_increment": 3, "seq_min": 1,
+            "seq_max": 2147483647, "seq_cycle": false, "seq_cache": 1,
+            "seq_same_type": true, "ser_count": 0,
+            "default_sequences": null, "collation": null
+        });
+        let mut batch = empty_catalog_batch();
+        batch.insert("columns".into(), vec![row.clone()]);
+        let raw = decode_batch(&batch).unwrap().0;
+        let identity = raw.columns[0].identity.as_ref().unwrap();
+        assert_eq!((identity.seed, identity.increment), (7, 3));
+        for field in ["seq_start", "seq_increment"] {
+            for value in [
+                None,
+                Some(serde_json::Value::Null),
+                Some(serde_json::json!("")),
+            ] {
+                let mut bad = row.clone();
+                match value {
+                    None => {
+                        bad.as_object_mut().unwrap().remove(field);
+                    }
+                    Some(value) => bad[field] = value,
+                }
+                batch.insert("columns".into(), vec![bad]);
+                let error = decode_batch(&batch).unwrap_err().to_string();
+                assert!(error.contains(field), "{error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions"]
+    async fn a_partitions_identity_facts_come_from_its_parent_by_column_name() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let database = format!("pbps_identity1681_{}", probe_token().replace('-', "_"));
+            let mut admin = Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {database}"))
+                .await
+                .unwrap();
+            let mut conn = Conn::connect(
+                pbps_db::Driver::Postgres,
+                &format!("{base} dbname={database}"),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "CREATE SCHEMA app;
+                CREATE TABLE app.ev(id bigint GENERATED ALWAYS AS IDENTITY
+                    (START WITH 7 INCREMENT BY 3 MINVALUE 2 MAXVALUE 999 CYCLE CACHE 4),
+                    at date NOT NULL) PARTITION BY RANGE(at);
+                CREATE TABLE app.ev_2025 PARTITION OF app.ev
+                    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+                CREATE TABLE app.shifted(gone text, id bigint NOT NULL, at date NOT NULL);
+                ALTER TABLE app.shifted DROP COLUMN gone;
+                ALTER TABLE app.ev ATTACH PARTITION app.shifted DEFAULT",
+            )
+            .await
+            .unwrap();
+            let result = read_all(&mut conn).await;
+            drop(conn);
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            let raw = result.unwrap().0;
+            let columns: Vec<_> = raw.columns.iter().filter(|c| c.name == "id").collect();
+            assert_eq!(columns.len(), 3);
+            for column in columns {
+                let identity = column.identity.as_ref().expect("the parent's identity");
+                assert!(identity.always);
+                assert_eq!((identity.seed, identity.increment), (7, 3));
+                assert_eq!((identity.min, identity.max, identity.cache), (2, 999, 4));
+                assert!(identity.cycles && identity.same_type);
+            }
+        }
     }
 
     #[tokio::test]
