@@ -949,7 +949,8 @@ edges order that handover; there is no extra reordering pass.
 
 A declared type's checksum-pinned evidence is its uid and desired definition,
 plus its actual before-definition when it already exists (DEC-1635.4). Planning
-reports that a domain's checks/default are vetted at apply. Right after its
+reports that a domain's checks/default are vetted at apply; a selected resolver
+also runs the advisory code vet described in §9.3.2. Right after its
 CREATE/ALTER, inside the same transaction and before dependents, apply re-reads
 its definition and vets its bound stored trees with the existing built-in-only
 input-path decoder. Enum labels/order and domain base/collation/NOT NULL/CHECK
@@ -1740,6 +1741,14 @@ A finding that falls inside the last list is a recorded limitation of this
 section, not a defect; it is answered by pointing here.
 
 See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
+
+**Declared-domain code (§9.3.2, DEC-2309.1):** target-aware planning with a
+selected resolver vets code-bearing created or altered domains on scratch.
+This early check reads bound CHECK and DEFAULT trees, including operators and
+base domains; it checks code eligibility only, because target owner trust is
+apply's responsibility. It is unsealed, needs no project key, and does not
+replace apply's immediate in-transaction `declared::vet` or its closing checks.
+An unavailable scratch leaves a warning; apply still refuses ineligible code.
 
 **Binding-evidence guard (§9.3.2, #616, DEC-616.1):** a resolver-backed
 transactional plan is checked against the target its evidence was sealed
@@ -2597,6 +2606,32 @@ DEC-1674.1).**
   `--dev` remains preview-only and incompatible with a target; it is not an alias
   for this new option. `--resolve-with` requires a target-aware plan and cannot
   turn `--check` or a snapshot preview into a connected operation.
+
+A separate **advisory domain-code goal** (DEC-2309.1) runs when a selected
+resolver meets a target-aware plan creating or altering a declared domain with
+a CHECK or DEFAULT. It creates declared types only, enums included, in the
+emitter's dependency order and with its own CREATE statements and annotations,
+then reads each domain's bound input path without executing its expressions.
+It shares scratch separation, layout, authorization, externals and release;
+it seals nothing, reads no project key and makes no target publication recheck.
+It leaves `--staged` available. A refusal names the type, CHECK or DEFAULT and
+routine, and writes no plan. A missing managed function is identified as such;
+a missing extension type is refused with the engine error. Other compile
+failures, an unreachable scratch or incompatible facts leave the warning
+`plan.domain-vet-unavailable`, and the plan is produced. Projects can raise it:
+
+```yaml
+policies:
+  rules:
+    plan.domain-vet-unavailable: error
+```
+
+This differs deliberately from mandatory binding resolution: apply still vets
+every declared type in its own transaction. The advisory goal never starts for
+an enum-only plan, code-free domains, offline planning, `plan --check`, `--dev`
+or `explain`. Binding resolution and connected rehearsal remain independent
+uses of the selected entry; an unavailable advisory scratch is not retried for
+rehearsal. Turning rehearsal off does not turn off the domain vet.
 
 Selection (#606), lazy acquisition (#1515) and publication (#1516) are
 implemented. A plan that needs the selected resolver runs it, and publishes

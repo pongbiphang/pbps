@@ -66,3 +66,4 @@ DECISIONS 465).
 - `62/` adds a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).
 - `63/` adds an environment's `rehearse:` and `explain`'s and a plan's `rehearsal` output field (issue #2379).
 - `64/` adds the `state record-data-work` envelope and its typed self-reported work payload (#2402), ordered after #2432's version 63.
+- `67/` adds the configurable advisory domain-vet availability policy (#2309).

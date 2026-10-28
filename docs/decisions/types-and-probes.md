@@ -3864,3 +3864,32 @@ rebuilt type under it, failed that valid plan at apply; the probe could not see
 it, since it checks only the rounded range.
 `a_domain_built_on_a_narrowed_numeric_converts_by_the_assignment_cast_not_through_text`
 pins it on 16 and 18. This supersedes the base and collation refusals of DEC-1635.8.
+
+<a id="dec-2309-1"></a>
+
+**DEC-2309.1. Advisory declared-domain code vetting uses an unsealed scratch goal.**
+
+With a selected resolver, a target-aware plan creating or altering a declared
+domain with a CHECK or DEFAULT runs a vet-only goal of the existing scratch
+lifecycle. It creates declared types, including enum and domain dependencies,
+in emitter order with the ordinary CREATE statements and `declared_type`
+annotations. The shared input-path reader drops Owner and RoutineOwner reasons,
+retains Routine reasons (NotBuiltin and RunsSql), refuses unreadable trees,
+uses no trusted roles and never admits source-review pins. Target owner trust
+remains apply-only. A refusal names its type, expression part and routine before
+any plan file is written. Missing managed functions are explained in one
+sentence; missing extension types retain the engine error.
+
+The goal is unsealed: no project key, target publication recheck or saved-plan
+format change. It leaves staged planning available and releases scratch on
+every result. Enum-only and code-free plans, offline plans, check, dev and
+explain never acquire scratch for this goal. Binding resolution and connected
+rehearsal are independent; an unavailable advisory scratch is not retried by
+the rehearsal.
+
+An unavailable or incompatible scratch, or a compile failure that cannot prove
+ineligible code, produces `plan.domain-vet-unavailable` at warning severity.
+The project may raise that finding to error through policies. This deliberately
+differs from DEC-1515.1: a binding question has no fallback because its answer
+is needed for correctness; this code vet is advisory because apply still runs
+unchanged in-transaction declared::vet and its owner and closing checks.

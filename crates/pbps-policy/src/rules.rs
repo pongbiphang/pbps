@@ -48,7 +48,17 @@ pub const CHANGE_NARROWING_ON_DATA: &str = "change.narrowing-on-data";
 pub const GRANT_WIDEN: &str = "grant.widen";
 pub const CHANGE_WINDOW: &str = "change.window";
 
-pub const RULES: [Rule; 10] = [
+pub const DOMAIN_VET_UNAVAILABLE: &str = "plan.domain-vet-unavailable";
+
+pub const RULES: [Rule; 11] = [
+    Rule {
+        id: DOMAIN_VET_UNAVAILABLE,
+        point: Point::ConnectedPlan,
+        default: Some(Severity::Warning),
+        about: "the selected scratch can vet declared domain CHECK and DEFAULT code before apply",
+        params: &[],
+        required: &[],
+    },
     Rule {
         id: NAMING_TABLE,
         point: Point::Declaration,

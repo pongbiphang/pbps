@@ -8230,6 +8230,46 @@ pub fn cmd_plan_db(
             &managed_modules(Some(&entry.snapshot), Some(&loaded.schema)),
         )
         .await?;
+        let mut domain_vet_unavailable = false;
+        let mut domain_code = None;
+        if conn.driver() == pbps_db::Driver::Postgres
+            && crate::resolution::domain::needed(cs.changes())
+            && let Some(entry) = scratch.as_mut()
+        {
+            match crate::resolution::domain::vet(entry, &mut conn, target, project, desired_side).await {
+                crate::resolution::domain::Verdict::Passed => {
+                    domain_code = Some(crate::engine::ConnectedCheck {
+                        name: "declared-domain-code", engine: "PostgreSQL", status: "checked",
+                        message: "Declared domain CHECK and DEFAULT code passed the advisory scratch vet; apply repeats its own in-transaction vet.".into(),
+                    });
+                }
+                crate::resolution::domain::Verdict::Refused(finding) => {
+                    entry.finish().await.map_err(|refused| match refused {
+                        crate::resolution::Refused::Unanswerable(error) => error,
+                        crate::resolution::Refused::Finding(finding) => anyhow::anyhow!(finding.message),
+                    })?;
+                    return Ok(Connected::Refused { finding, findings });
+                }
+                crate::resolution::domain::Verdict::Unavailable(finding) => {
+                    domain_vet_unavailable = true;
+                    domain_code = Some(crate::engine::ConnectedCheck {
+                        name: "declared-domain-code", engine: "PostgreSQL", status: "deferred",
+                        message: "Scratch could not answer the advisory domain-code vet; apply vets CHECK and DEFAULT code in its transaction.".into(),
+                    });
+                    if let Some(finding) = finding {
+                        // Keep the warning with the approved typed change as
+                        // well as in the command's findings envelope.
+                        pbps_diff::order::writebacks::findings(&mut cs, &[(0, finding.clone())]);
+                        let finding = crate::policy_finding(&finding);
+                        if finding.severity == crate::output::Severity::Error {
+                            return Ok(Connected::Refused { finding, findings });
+                        }
+                        if !json { eprintln!("{}: {}", finding.severity_word(), finding.message); }
+                        findings.push(finding);
+                    }
+                }
+            }
+        }
         // Case 3, last: the target is read again, after every read above,
         // and must still be what the resolver's run read; then the plan is
         // sealed in the order the passes above left (DEC-1516.1).
@@ -8279,7 +8319,9 @@ pub fn cmd_plan_db(
         // today's behaviour until its own rehearsal lands (#2379).
         let course = crate::rehearsal::connected::course(
             conn.driver(),
-            scratch.is_some(),
+            // An unavailable advisory scratch must not become a fatal retry
+            // through the independent rehearsal (DEC-2309.1).
+            scratch.is_some() && !domain_vet_unavailable,
             crate::rehearsal::connected::switched_off(project, target.environment(), no_rehearse),
         );
         use crate::rehearsal::connected::Course;
@@ -8359,6 +8401,7 @@ pub fn cmd_plan_db(
             ]
             .into_iter()
             .chain(domain_validation)
+            .chain(domain_code)
             .collect::<Vec<_>>(),
             findings,
             cost,
@@ -8446,7 +8489,7 @@ pub fn cmd_plan_db(
             risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
             connected_checks: {
                 let mut checks = connected_checks;
-                if declared_type_pins.iter().any(|pin| matches!(&pin.definition, pbps_model::ManagedType::Domain { default, checks, .. } if default.is_some() || !checks.is_empty())) {
+                if !checks.iter().any(|check| check.name == "declared-domain-code") && declared_type_pins.iter().any(|pin| matches!(&pin.definition, pbps_model::ManagedType::Domain { default, checks, .. } if default.is_some() || !checks.is_empty())) {
                     checks.push(crate::engine::ConnectedCheck {
                         name: "declared-domain-code", engine: "PostgreSQL", status: "deferred",
                         message: "Declared domain checks and defaults are vetted inside apply, immediately after their type statements.".into(),

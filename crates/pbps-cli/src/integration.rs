@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 64;
+pub const SCHEMA_VERSION: u32 = 67;
+// 67: the advisory domain-vet availability policy (#2309).
 // 64: recording self-reported external data work (#2402); ordered after #2432's 63.
 // 63: an environment's `rehearse:` and a connected plan's `rehearsal` (#2379).
 // 62: a view's `schemabinding:`, `indexes:` and `clustered:` (issue #2329).

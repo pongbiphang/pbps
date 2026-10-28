@@ -6169,4 +6169,6 @@ mod recovery2410_tests;
 
 mod docker2410_tests;
 
+#[path = "domain_tests.rs"]
+mod domain_tests;
 mod session2133_tests;
