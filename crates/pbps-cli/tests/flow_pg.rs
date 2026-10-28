@@ -22,6 +22,9 @@ use std::process::{Command, Output};
 #[path = "support/trace.rs"]
 mod trace;
 
+#[path = "support/unseen_properties2445.rs"]
+mod unseen_properties2445;
+
 #[path = "support/domain_vet2309.rs"]
 mod domain_vet2309;
 

@@ -198,6 +198,9 @@ fn tables_query() -> String {
             c.relreplident::text AS replica_identity,
             COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
                        WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index,
+            c.reltablespace::int8 AS tablespace_oid,
+            (SELECT sp.spcname FROM pg_catalog.pg_tablespace sp
+              WHERE sp.oid = c.reltablespace) AS tablespace,
             c.relpersistence::text AS persistence,
             c.relrowsecurity AS row_security,
             c.relforcerowsecurity AS force_row_security,
@@ -545,7 +548,16 @@ fn modules_query() -> String {
     format!(
         "SELECT c.oid::int8 AS oid, 'v' AS kind, n.nspname AS schema_name,
                 c.relname AS name, '' AS on_table,
-                pg_catalog.pg_get_viewdef(c.oid, true) AS definition
+                pg_catalog.pg_get_viewdef(c.oid, true) AS definition,
+                COALESCE((SELECT pg_catalog.array_agg(
+                           pg_catalog.format('%I', a.attname) || ' DEFAULT '
+                             || pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                           ORDER BY a.attnum)
+                            FROM pg_catalog.pg_attribute a
+                            JOIN pg_catalog.pg_attrdef d
+                              ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                           WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped),
+                         '{{}}'::text[]) AS column_defaults
            FROM pg_catalog.pg_class c
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE c.relkind = 'v'
@@ -554,7 +566,7 @@ fn modules_query() -> String {
             AND {view_not_extension}
           UNION ALL
          SELECT p.oid::int8, p.prokind::text, n.nspname, p.proname, '',
-                pg_catalog.pg_get_functiondef(p.oid)
+                pg_catalog.pg_get_functiondef(p.oid), '{{}}'::text[]
            FROM pg_catalog.pg_proc p
            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
           WHERE {ROUTINE_IS_A_MODULE}
@@ -562,7 +574,7 @@ fn modules_query() -> String {
             AND {proc_not_extension}
           UNION ALL
          SELECT tg.oid::int8, 't', n.nspname, tg.tgname, c.relname,
-                pg_catalog.pg_get_triggerdef(tg.oid)
+                pg_catalog.pg_get_triggerdef(tg.oid), '{{}}'::text[]
            FROM pg_catalog.pg_trigger tg
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -796,6 +808,8 @@ fn columns_query() -> String {
                  THEN (SELECT co.collname FROM pg_catalog.pg_collation co
                         WHERE co.oid = a.attcollation)
             END AS collation,
+            CASE WHEN a.attstorage <> ty.typstorage THEN a.attstorage::text END AS storage,
+            NULLIF(a.attcompression::text, '') AS compression,
             ser.ser_count, ser.ser_name, ser.ser_exact, ser.ser_same_schema, ser.ser_same_type,
             ser.ser_same_persistence, ser.ser_start, ser.ser_increment, ser.ser_min, ser.ser_max,
             ser.ser_cache, ser.ser_cycle, ser.ser_users
@@ -1526,6 +1540,12 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             },
             reloptions: strings(row, "reloptions")?,
             toast_reloptions: strings(row, "toast_reloptions")?,
+            tablespace: if number(row, "tablespace_oid")? == 0 {
+                None
+            } else {
+                // A nonzero oid without its name is unreadable, never default.
+                Some(text(row, "tablespace")?)
+            },
             unlogged: text(row, "persistence")? == "u",
             // Present on every row, `null` on all but a partitioned parent:
             // a row without the field is a malformed read, not an ordinary
@@ -1658,6 +1678,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             serial,
             default_sequences: optional_text(row, "default_sequences")?,
             collation: optional_text(row, "collation")?,
+            storage: optional_text(row, "storage")?,
+            compression: optional_text(row, "compression")?,
         });
     }
     for row in batch
@@ -1747,6 +1769,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             name,
             on_table: text(row, "on_table")?,
             definition,
+            column_defaults: strings(row, "column_defaults")?,
         });
     }
     for row in batch
@@ -4748,7 +4771,7 @@ mod tests {
             "seq_start": 7, "seq_increment": 3, "seq_min": 1,
             "seq_max": 2147483647, "seq_cycle": false, "seq_cache": 1,
             "seq_same_type": true, "ser_count": 0,
-            "default_sequences": null, "collation": null
+            "default_sequences": null, "collation": null, "storage": null, "compression": null
         });
         let mut batch = empty_catalog_batch();
         batch.insert("columns".into(), vec![row.clone()]);
@@ -5243,7 +5266,8 @@ mod tests {
     fn row_security_table_row() -> serde_json::Value {
         serde_json::json!({"oid": 7, "schema_name": "app", "table_name": "secured",
             "replica_identity": "d", "identity_index": 0, "reloptions": [],
-            "toast_reloptions": [], "persistence": "p", "row_security": false,
+            "toast_reloptions": [], "tablespace_oid": 0, "tablespace": null,
+            "persistence": "p", "row_security": false,
             "force_row_security": false, "partition_key": null, "partition_strategy": null,
             "partition_parent": null, "partition_bound": null})
     }
@@ -5819,5 +5843,58 @@ mod tests {
             assert_eq!(may_name_a_temporary_schema(&raw), temporary);
             assert_eq!(raw.parse::<pbps_model::ColumnType>().unwrap(), ty);
         }
+    }
+
+    #[test]
+    fn nondefault_tablespaces_require_a_readable_name() {
+        let mut batch = empty_catalog_batch();
+        let mut row = row_security_table_row();
+        batch.insert("tables".into(), vec![row.clone()]);
+        assert!(
+            decode_batch(&batch).unwrap().0.tables[0]
+                .tablespace
+                .is_none()
+        );
+        row["tablespace_oid"] = 42.into();
+        for name in [serde_json::Value::Null, serde_json::json!(42)] {
+            row["tablespace"] = name;
+            batch.insert("tables".into(), vec![row.clone()]);
+            assert!(decode_batch(&batch).is_err());
+        }
+        row["tablespace"] = "custom_space".into();
+        batch.insert("tables".into(), vec![row]);
+        assert_eq!(
+            decode_batch(&batch).unwrap().0.tables[0]
+                .tablespace
+                .as_deref(),
+            Some("custom_space")
+        );
+    }
+
+    #[test]
+    fn missing_or_unreadable_view_defaults_are_never_an_empty_list() {
+        let mut batch = empty_catalog_batch();
+        let row = serde_json::json!({"oid": 1, "kind": "v", "schema_name": "app",
+            "name": "v", "on_table": "", "definition": "SELECT 1", "column_defaults": []});
+        batch.insert("modules".into(), vec![row.clone()]);
+        assert!(
+            decode_batch(&batch).unwrap().0.modules[0]
+                .column_defaults
+                .is_empty()
+        );
+        for defaults in [
+            serde_json::Value::Null,
+            serde_json::json!([null]),
+            serde_json::json!([42]),
+        ] {
+            let mut bad = row.clone();
+            bad["column_defaults"] = defaults;
+            batch.insert("modules".into(), vec![bad]);
+            assert!(decode_batch(&batch).is_err());
+        }
+        let mut missing = row;
+        missing.as_object_mut().unwrap().remove("column_defaults");
+        batch.insert("modules".into(), vec![missing]);
+        assert!(decode_batch(&batch).is_err());
     }
 }

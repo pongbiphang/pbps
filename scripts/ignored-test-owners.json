@@ -2688,6 +2688,32 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "test",
+        "flow_pg"
+      ],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "unseen_properties2445::a_default_added_to_a_baselined_view_is_named_and_refused",
+        "unseen_properties2445::a_view_without_column_defaults_stays_silent",
+        "unseen_properties2445::column_storage_equal_to_its_type_default_stays_silent",
+        "unseen_properties2445::column_storage_is_named_in_pull_and_refused_in_plan",
+        "unseen_properties2445::database_default_table_placement_stays_silent",
+        "unseen_properties2445::explicit_column_compression_is_named_even_when_it_matches_the_server_default",
+        "unseen_properties2445::inherited_compression_stays_silent_under_both_server_defaults",
+        "unseen_properties2445::partition_column_properties_are_named_and_refused",
+        "unseen_properties2445::table_tablespace_is_named_in_pull_and_refused_in_plan",
+        "unseen_properties2445::unreadable_property_catalog_columns_are_errors_in_pull_and_plan"
+      ]
     }
   ]
 }
