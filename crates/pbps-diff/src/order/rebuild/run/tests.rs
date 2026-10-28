@@ -114,7 +114,7 @@ fn inventory_checks_risk_strategy_scope_progress_and_budget() {
 }
 
 #[test]
-fn a_rebuild_composed_over_several_links_cannot_be_prepared_yet() {
+fn a_composed_rebuild_obeys_the_same_engine_and_mode_gate() {
     let (mut root, base, desired, _) = fixture::approval();
     let schema = Schema::default();
     let input = |root: &RebuildPartitionedTable| -> Result<(), String> {
@@ -146,7 +146,7 @@ fn a_rebuild_composed_over_several_links_cannot_be_prepared_yet() {
     root.earlier.push(root.intent.clone());
     let why = input(&root).unwrap_err();
     assert!(
-        why.contains("composed over several approved links"),
+        why.contains("rebuild requires PostgreSQL transactional mode"),
         "{why}"
     );
 }

@@ -790,6 +790,24 @@ pub(crate) fn diff_partial_rebuilding(
             errors: lineage,
         };
     }
+    let rebuilds: Vec<_> = declared
+        .ids
+        .rebuilds
+        .values()
+        .filter_map(|r| declared.ids.tables.get(&r.replacement_root))
+        .filter_map(|table| crate::rebuild::qualify(base, declared, table, dialect).ok())
+        .map(|root| Change::RebuildPartitionedTable(Box::new(root)))
+        .map(|change| PlannedChange {
+            risks: dialect.change_risks(&change),
+            ..PlannedChange::new(change)
+        })
+        .collect();
+    if !rebuilds.is_empty() {
+        return Diffed {
+            changes: ChangeSet { changes: rebuilds },
+            errors: vec![],
+        };
+    }
     let mut errs: Vec<DiffError> =
         pbps_model::module::dependency_cycles(declared.schema, &hints.module_deps)
             .into_iter()

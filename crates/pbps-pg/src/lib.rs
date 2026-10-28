@@ -77,6 +77,7 @@ mod partition_series;
 pub mod partman;
 pub mod pins;
 mod preflight;
+pub mod rebuild;
 pub mod roles;
 pub mod rows;
 pub mod staged;

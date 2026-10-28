@@ -223,3 +223,96 @@ fn independent_replay_rejects_premature_analysis_and_final_name_claims() {
     assert!(skipped.is_empty());
     assert!(!violations.is_empty());
 }
+
+#[test]
+fn final_verification_keeps_every_part_and_the_expansions_completion_order() {
+    let f = Fixture::new();
+    let pg = pbps_pg::Postgres::new();
+    let prepared = f.prepare().unwrap();
+    let done = expand(&f.input(), prepared.clone(), &pg).unwrap();
+    let valid = done.changes.changes().clone();
+    verify_plan(&f.input(), &prepared, &valid, &pg).unwrap();
+    let mut missing = valid.clone();
+    missing.changes.pop();
+    assert!(verify_plan(&f.input(), &prepared, &missing, &pg).is_err());
+    let mut reordered = valid.clone();
+    let own = reordered
+        .changes
+        .iter()
+        .position(|p| matches!(p.change, Change::BuildPartitionedIndex(_)))
+        .unwrap();
+    let analyze = reordered
+        .changes
+        .iter()
+        .position(|p| matches!(p.change, Change::AnalyzeTableTree(_)))
+        .unwrap();
+    reordered.changes.swap(own, analyze);
+    assert!(verify_plan(&f.input(), &prepared, &reordered, &pg).is_err());
+    let mut edited = valid;
+    for p in &mut edited.changes {
+        if let Change::CopyTableRows(c) = &mut p.change {
+            c.max_rows += 1;
+        }
+    }
+    assert!(verify_plan(&f.input(), &prepared, &edited, &pg).is_err());
+}
+
+#[test]
+fn recertification_requires_readable_managed_and_reviewed_dependency_removals() {
+    let mut f = Fixture::new();
+    let prepared = f.prepare().unwrap();
+    let done = expand(&f.input(), prepared, &pbps_pg::Postgres::new()).unwrap();
+    let mut changes = done.changes.changes().clone();
+    let copy = changes
+        .changes
+        .iter()
+        .find_map(|p| {
+            if let Change::CopyTableRows(c) = &p.change {
+                Some((**c).clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes).unwrap();
+    let id = ModuleId::Named(ObjectName::new("app", "late_view"));
+    f.node(8, Held::Dependent(Holds::Module(id.clone())));
+    f.link(1, 8);
+    assert!(
+        recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes)
+            .unwrap_err()
+            .contains("unmanaged")
+    );
+    f.base.modules.insert(
+        id.clone(),
+        Module {
+            kind: ModuleKind::View,
+            definition: "SELECT k FROM app.p".into(),
+            description: None,
+            options: Default::default(),
+        },
+    );
+    assert!(
+        recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes)
+            .unwrap_err()
+            .contains("does not release")
+    );
+    changes.changes.push(PlannedChange::new(Change::DropModule {
+        id,
+        kind: ModuleKind::View,
+    }));
+    recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes).unwrap();
+    f.catalog.publications = Fact::Unreadable("42501 membership".into());
+    assert!(
+        recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes)
+            .unwrap_err()
+            .contains("42501")
+    );
+    f.catalog.publications =
+        Fact::Present([("late_publication".into(), f.root.table.clone())].into());
+    assert!(
+        recertify(&f.catalog, &copy, side(&f.base, &f.ids), &changes)
+            .unwrap_err()
+            .contains("late_publication")
+    );
+}

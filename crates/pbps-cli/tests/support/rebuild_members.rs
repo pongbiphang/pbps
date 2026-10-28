@@ -91,11 +91,41 @@ pub(super) fn check(connection: Option<&str>) {
             }
             for args in plans {
                 let out = d.run(&args);
+                if args.contains(&"--db") {
+                    // The opening row needs its covering leaf, and new
+                    // columns are copied as NULL rather than invented data.
+                    let source = member_cases::source();
+                    let root = member_cases::root();
+                    let required_new = case.desired.tables[&root]
+                        .columns
+                        .iter()
+                        .any(|(n, c)| !c.nullable && !source.tables[&root].columns.contains_key(n));
+                    let null_key = case.desired.tables[&root]
+                        .partition_by
+                        .as_ref()
+                        .unwrap()
+                        .columns
+                        .iter()
+                        .any(|n| !source.tables[&root].columns.contains_key(n));
+                    if required_new
+                        || null_key
+                        || !case.desired.tables.contains_key(&"app.p1".parse().unwrap())
+                    {
+                        assert_ne!(code(&out), 0, "{}", case.name);
+                        assert!(
+                            stderr(&out).contains("max_rows"),
+                            "{}: {}",
+                            case.name,
+                            stderr(&out)
+                        );
+                    } else {
+                        assert_eq!(code(&out), 0, "{}: {}", case.name, stderr(&out));
+                    }
+                    continue;
+                }
                 assert_ne!(code(&out), 0, "{}: {args:?}", case.name);
                 assert!(
-                    stderr(&out).contains(
-                        "recorded intent is valid; table rebuild execution is not available yet"
-                    ),
+                    stderr(&out).contains("requires connected expansion"),
                     "{}: {args:?}: {}",
                     case.name,
                     stderr(&out)

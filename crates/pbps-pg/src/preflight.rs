@@ -3130,7 +3130,8 @@ fn build<'v, 'p: 'v>(
         ));
     }
     match change {
-Change::RebuildPartitionedTable(_) | Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
+        Change::RebuildPartitionedTable(_) => { let (operation, table) = change.pending_rebuild().expect("rebuild variant"); Err(DialectError::RebuildUnavailable { operation, table: table.clone() }) },
+        Change::BuildPartitionedIndex(_) | Change::CopyTableRows(_) | Change::AnalyzeTableTree(_) => Ok(skip(change, "the complete rebuild is recertified under its source-tree lock", unchecked)),
         // A new column the declarations require a value in, with nothing to
         // put there. Every existing row breaks it, so the count is the table's
         // own — and it is a count rather than a yes, because "4,213 rows"

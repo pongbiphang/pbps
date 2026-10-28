@@ -1252,3 +1252,32 @@ Non-UID objects keep their existing boundaries: modules use git history
 computed columns remain table parts (DEC-1174.1), and constraints, indexes and
 row policies retain their reviewed risk gates (SPEC §7.2). This adds no reason
 requirement to those objects and changes no saved-plan or identity format.
+
+
+<a id="dec-2298-13"></a>
+
+**DEC-2298.13. Rebuild links preserve conversion history and copies pin typed conversion stages.**
+Maintainer decision, 2026-10-28: each link keeps the conversions it carries,
+paired with replacement column UIDs; the global conversion map remains
+restricted to live columns. Approval carries the conversion to the replacement;
+withdrawal restores its source ownership. A composed copy follows column UIDs
+and applies each link's conversion over the preceding value, retaining the
+intermediate type and collation. `CopyColumn` persists that ordered sequence,
+including optional `USING` expressions, rather than inferring historical
+expressions from the final live conversion or embedding SQL in type names.
+Empty fields are omitted. The plan format advances to 57 and state to 35;
+if published JSON schemas change, the coordinated schema set is 69.
+
+
+The connected continuation completes the existing prepared expansion. Its final
+observer retains the expansion's explicit addresses and complete typed catalog
+facts in memory, so it does not reconstruct temporary ownership from endpoint
+names. It adds no settlement or constraint union. Preflight creates only an
+empty temporary replacement tree and asks PostgreSQL to evaluate its bounds
+over the typed copy projection. Apply locks the recursive source tree before
+re-reading its shape, dependency closure, row count and bounds, then executes
+copy, statistics, swaps, restoration and retirement in the ordinary transaction.
+Snapshot and baseline install the link identified by the environment's ledger;
+a missing or partial link refuses rather than guessing from equal names or
+shapes. The ordinary failure audit may record the unchanged source state;
+replacement identities are installed only with a successful rebuild commit.

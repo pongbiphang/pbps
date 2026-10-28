@@ -126,7 +126,7 @@ pub(super) fn canonical<D: pbps_dialect::Dialect + ?Sized>(
     plan: PlanningPlan,
     _dialect: &D,
 ) -> Result<CanonicalPlan<D>, String> {
-    reject_pending_rebuild(&plan.payload)?;
+    reject_pending_rebuild(&plan.payload, plan.boundaries.rebuilt())?;
     plan.boundaries.ensure(&plan)?;
     let identities = plan.identities.or_else(|| {
         Some(pbps_model::operation::Operations::expanded(
@@ -513,12 +513,30 @@ pub fn singleton<D: pbps_dialect::Dialect + ?Sized>(
 }
 
 /// No complete-route marker may carry a root or a partially expanded rewrite.
-pub(super) fn reject_pending_rebuild(changes: &ChangeSet) -> Result<(), String> {
+pub(super) fn reject_pending_rebuild(changes: &ChangeSet, expanded: bool) -> Result<(), String> {
     for planned in &changes.changes {
-        if let Some((operation, table)) = planned.change.pending_rebuild() {
+        if !expanded
+            && let Some((operation, table)) = planned.change.pending_rebuild()
+            && !matches!(
+                planned.change,
+                pbps_model::Change::RebuildPartitionedTable(_)
+            )
+        {
             return Err(format!(
-                "{operation} for `{}` cannot be certified before blocking rewrites are enabled",
+                "{operation} for `{}` requires a completed rebuild expansion",
                 table.shown()
+            ));
+        }
+        if let pbps_model::Change::RebuildPartitionedTable(root) = &planned.change {
+            let links = root.earlier.len() + 1;
+            let composed = if links > 1 {
+                format!(" composed over {links} approved links")
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "blocking rewrite{composed} for `{}` requires connected expansion; run `pbps plan --db ...`",
+                root.table.shown()
             ));
         }
     }

@@ -424,14 +424,6 @@ pub fn validate_saved_plan(
     // A lineage record stays in the identity file after its rewrite, so one is
     // not a reason to refuse. A broken one fails the identity validation below
     // (DEC-2298.12); a rewrite still to run is refused change by change.
-    for planned in &plan.changes.changes {
-        if let Some((operation, table)) = planned.change.pending_rebuild() {
-            refuse!(
-                "{operation} for `{}` cannot be admitted before blocking rewrites are enabled",
-                table.shown()
-            );
-        }
-    }
     dialect
         .validate_plan_analysis(plan)
         .map_err(AdmissionError::from_error)?;
@@ -458,6 +450,21 @@ pub fn validate_saved_plan(
         #[error("the plan's post-apply identity mapping is inconsistent")]
         struct Identity(#[source] Box<dyn std::error::Error + Send + Sync>);
         AdmissionError::from_error(Identity(Box::new(source)))
+    })?;
+    super::rebuild::validate_saved(plan, dialect).map_err(|why| {
+        let table = plan
+            .changes
+            .changes
+            .iter()
+            .find_map(|p| {
+                p.change
+                    .pending_rebuild()
+                    .map(|(_, t)| t.shown().to_string())
+            })
+            .unwrap_or_default();
+        AdmissionError::message(format!(
+            "blocking rewrite for `{table}` cannot be admitted: {why}"
+        ))
     })?;
     let mut pinned_types = std::collections::BTreeSet::new();
     for pin in &plan.declared_type_pins {

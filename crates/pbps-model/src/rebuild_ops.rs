@@ -133,12 +133,26 @@ pub struct CopySource {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CopyStage {
+    pub input: crate::ColumnName,
+    pub cast: ColumnType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<Collation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CopyColumn {
     /// An added destination column has no source; it receives a typed NULL.
     pub source: Option<CopySource>,
     pub target: ColumnRef,
     pub cast: ColumnType,
     pub collation: Option<Collation>,
+    /// Ordered conversions from the environment through every approved link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<CopyStage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

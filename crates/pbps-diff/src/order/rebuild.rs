@@ -11,7 +11,7 @@ use pbps_model::operation::Source as OriginSource;
 use pbps_model::{operation::*, plan_names::PlanNames, *};
 use std::collections::{BTreeMap, BTreeSet};
 mod run;
-pub use run::{Expanded, expand};
+pub use run::{Expanded, expand, verify_plan};
 
 /// Engine naming receives shared release facts and the validated proposed ledger.
 /// Its recipes are checked against every approved part and reserved member.
@@ -42,7 +42,7 @@ pub enum Purpose {
     Teardown,
     Restoration,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartStep {
     pub change: PlannedChange,
     pub purpose: Purpose,
@@ -51,7 +51,7 @@ pub struct PartStep {
 /// ```compile_fail
 /// fn upgrade(p: pbps_diff::order::rebuild::Prepared) -> pbps_diff::order::PlanningPlan { p }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Prepared {
     logical: Vec<PlannedChange>,
     target: ValidIds,
@@ -178,14 +178,6 @@ pub fn prepare(
     dialect: &dyn Dialect,
     recipes: &mut Recipes<'_>,
 ) -> Result<Prepared, String> {
-    // The copy of a chain of approvals composes their conversions and
-    // honours every link's cap; lowering it is a later change (DEC-2298.12).
-    if !input.root.earlier.is_empty() {
-        return Err(format!(
-            "{}: a rebuild composed over several approved links cannot be prepared yet",
-            input.root.table.shown()
-        ));
-    }
     if dialect.name() != "postgres" || input.mode != PlanMode::Transactional {
         return Err(format!(
             "{}: rebuild requires PostgreSQL transactional mode",
@@ -264,13 +256,7 @@ pub fn prepare(
             );
         }
     }
-    for (uid, table) in r
-        .intent
-        .source
-        .tables
-        .iter()
-        .chain(&r.intent.replacement.tables)
-    {
+    for (uid, table) in r.source().tables.iter().chain(&r.intent.replacement.tables) {
         let used = occupied.get_mut(&table.schema).unwrap();
         let base = format!("__pbps_rebuild_{uid}");
         let mut name = base.clone();
@@ -354,8 +340,7 @@ pub fn prepare(
         name: r.table.clone(),
     };
     let source_partitions = r
-        .intent
-        .source
+        .source()
         .tables
         .iter()
         .filter(|(_, n)| **n != r.table)
@@ -365,28 +350,10 @@ pub fn prepare(
         })
         .collect();
     let target_partitions = leaves(&r.intent.replacement);
-    let columns = r.after[&r.table]
-        .columns
-        .iter()
-        .map(|(name, c)| CopyColumn {
-            // The column this one continues, by the approval's pairing and not
-            // by name: a column renamed since keeps its rows.
-            source: r
-                .intent
-                .source_column(&r.table.column(name))
-                .and_then(|was| {
-                    let declared = r.before[&r.table].columns.get(&was.name)?;
-                    Some(CopySource {
-                        column: was.clone(),
-                        ty: declared.ty.clone(),
-                        collation: declared.collation.clone(),
-                    })
-                }),
-            target: parent.name.column(name),
-            cast: c.ty.clone(),
-            collation: c.collation.clone(),
-        })
-        .collect();
+    let mut columns = crate::rebuild::copy_columns(r, dialect).map_err(|e| e.to_string())?;
+    for column in &mut columns {
+        column.target.table = parent.name.clone();
+    }
     rule.add(
         Change::CopyTableRows(Box::new(CopyTableRows {
             source,
@@ -394,7 +361,7 @@ pub fn prepare(
             columns,
             source_partitions,
             target_partitions: target_partitions.clone(),
-            max_rows: r.intent.max_rows,
+            max_rows: r.cap(),
         })),
         Purpose::Copy,
     );
@@ -405,10 +372,10 @@ pub fn prepare(
         })),
         Purpose::Analyze,
     );
-    for identities in [&r.intent.source, &r.intent.replacement] {
+    for identities in [r.source(), &r.intent.replacement] {
         for (uid, final_name) in &identities.tables {
             let address = rule.address(uid).name;
-            let old = r.intent.source.tables.contains_key(uid);
+            let old = r.source().tables.contains_key(uid);
             let (from, to) = if old {
                 (final_name.clone(), address)
             } else {
@@ -595,7 +562,7 @@ pub fn prepare(
         }
     }
     // Declare implicit content removals last for the existing write-write contract.
-    for uid in r.intent.source.tables.keys() {
+    for uid in r.source().tables.keys() {
         let relation = rule.address(uid);
         let parent = (uid != input.before.ids.table_uid(&r.table).unwrap()).then(|| {
             rule.address(input.before.ids.table_uid(&r.table).unwrap())
@@ -638,4 +605,188 @@ pub fn index_definitions(table: &Table) -> BTreeMap<IndexPart, PartitionIndexDef
             )
         }))
         .collect()
+}
+
+/// Complete the recorded expansion at the connected continuation boundary.
+/// A raw draft retains its non-executable state; only a genuine route producer
+/// can complete its own engine's route (DEC-1959.5, DEC-2298.13).
+pub fn continue_plan<S: super::RouteState<D>, D: Dialect>(
+    plan: super::PlanningPlan<S>,
+    input: &Input<'_>,
+    prepared: Prepared,
+    dialect: &D,
+) -> Result<super::PlanningPlan<S::Output>, String> {
+    if plan.changes().changes != prepared.logical {
+        return Err("rebuild continuation differs from its qualified logical input".into());
+    }
+    let mut expanded = expand(input, prepared, dialect)?;
+    expanded.changes.boundaries.enable_rebuild();
+    Ok(super::plan::state(expanded.changes))
+}
+
+/// Recertify inbound releases under the execution window using the same typed
+/// catalog closure as preparation. Source-owned parts retire with their tree.
+pub fn recertify(
+    catalog: &Catalog,
+    copy: &CopyTableRows,
+    before: crate::Side<'_>,
+    changes: &ChangeSet,
+) -> Result<(), String> {
+    let closure = catalog.checked(&Root::Table(copy.source.uid.clone()), before.schema)?;
+    for d in closure.surfaces.values() {
+        if matches!(&d.holds, Holds::TablePart { table, .. } if table == &copy.source.name || copy.source_partitions.iter().any(|p| &p.name == table))
+        {
+            continue;
+        }
+        let removal = super::deployment::removal_of(d, before.schema, None)?;
+        if !changes.changes.iter().any(|p| p.change == removal) {
+            return Err(format!(
+                "{}: the reviewed rebuild does not release {}",
+                copy.source.name.shown(),
+                d.described
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check the persisted copy against its lineage and the named endpoint parts.
+/// Admission preserves reviewed order; it does not invent missing operations.
+pub(super) fn validate_saved(
+    plan: &SavedPlan,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<(), String> {
+    let copies: Vec<_> = plan
+        .changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::CopyTableRows(c) = &p.change {
+                Some(&**c)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for p in &plan.changes.changes {
+        if matches!(p.change, Change::RebuildPartitionedTable(_)) {
+            return Err("an unexpanded rebuild cannot be admitted".into());
+        }
+        let owner = if let Change::BuildPartitionedIndex(i) = &p.change {
+            Some(&i.parent.uid)
+        } else if let Change::AnalyzeTableTree(t) = &p.change {
+            Some(&t.parent.uid)
+        } else {
+            None
+        };
+        if let Change::DropTable { uid, .. } = &p.change
+            && plan.ids.rebuilds.contains_key(uid)
+            && !copies.iter().any(|c| &c.source.uid == uid)
+        {
+            return Err("source retirement has no approved copy".into());
+        }
+        if owner.is_some_and(|uid| !copies.iter().any(|c| &c.target.uid == uid)) {
+            return Err("an incomplete rebuild part has no copy".into());
+        }
+    }
+    for copy in copies {
+        if dialect.name() != "postgres" || plan.mode != PlanMode::Transactional {
+            return Err("rebuild requires PostgreSQL transactional mode".into());
+        }
+        let (mut key, intent) = plan
+            .ids
+            .rebuild_into(&copy.target.uid)
+            .ok_or("copy has no recorded rebuild lineage")?;
+        let mut links = vec![intent.clone()];
+        while key != &copy.source.uid {
+            let (previous, record) = plan
+                .ids
+                .rebuild_into(key)
+                .ok_or("copy source is not a lineage link")?;
+            links.insert(0, record.clone());
+            key = previous;
+        }
+        let table = plan
+            .ids
+            .tables
+            .get(&copy.target.uid)
+            .ok_or("replacement parent is not live")?
+            .clone();
+        let create = |uid: &Uid| {
+            plan.changes.changes.iter().find_map(|p| {
+                if let Change::CreateTable {
+                    uid: u,
+                    name,
+                    table,
+                    ..
+                } = &p.change
+                    && u == uid
+                {
+                    Some((name, &**table))
+                } else {
+                    None
+                }
+            })
+        };
+        let (temporary, declared) =
+            create(&copy.target.uid).ok_or("copy has no replacement definition")?;
+        if temporary != &copy.target.name || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::DropTable {uid,..} if uid == &copy.source.uid)) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::AnalyzeTableTree(t) if t.parent == copy.target && t.partitions == copy.target_partitions)) {
+            return Err("copy has incomplete creation, analysis or retirement".into());
+        }
+        let mut source = Table::default();
+        for column in &copy.columns {
+            if let Some(s) = &column.source {
+                source.columns.insert(
+                    s.column.name.clone(),
+                    Column {
+                        collation: s.collation.clone(),
+                        ..Column::new(s.ty.clone())
+                    },
+                );
+            }
+        }
+        let root = RebuildPartitionedTable {
+            table: table.clone(),
+            intent: links.pop().unwrap(),
+            earlier: links,
+            before: [(table.clone(), source)].into(),
+            after: [(table.clone(), declared.clone())].into(),
+        };
+        let mut expected =
+            crate::rebuild::copy_columns(&root, dialect).map_err(|e| e.to_string())?;
+        for column in &mut expected {
+            column.target.table = copy.target.name.clone();
+        }
+        if copy.max_rows != root.cap()
+            || copy.columns != expected
+            || root.source().tables.get(&copy.source.uid) != Some(&copy.source.name)
+        {
+            return Err("copy projection or cap differs from its approved lineage".into());
+        }
+        let sources: BTreeMap<_, _> = std::iter::once(&copy.source)
+            .chain(&copy.source_partitions)
+            .map(|r| (r.uid.clone(), r.name.clone()))
+            .collect();
+        let targets: BTreeSet<_> = std::iter::once(&copy.target)
+            .chain(&copy.target_partitions)
+            .map(|r| r.uid.clone())
+            .collect();
+        if sources != root.source().tables
+            || sources.len() != 1 + copy.source_partitions.len()
+            || targets != root.intent.replacement.tables.keys().cloned().collect()
+            || targets.len() != 1 + copy.target_partitions.len()
+        {
+            return Err("copy tree membership differs from its approved lineage".into());
+        }
+        for relation in std::iter::once(&copy.target).chain(&copy.target_partitions) {
+            let final_name = root
+                .intent
+                .replacement
+                .tables
+                .get(&relation.uid)
+                .ok_or("foreign replacement member")?;
+            if create(&relation.uid).map(|v| v.0) != Some(&relation.name) || !plan.changes.changes.iter().any(|p| matches!(&p.change, Change::RenameTable {uid,from,to,..} if uid == &relation.uid && from == &relation.name && to == final_name)) { return Err("replacement member has no reviewed name swap".into()); }
+        }
+    }
+    Ok(())
 }

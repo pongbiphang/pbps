@@ -193,6 +193,7 @@ impl<'a> Tables<'a> {
 
     pub(crate) fn retired(&self, name: &TableName) -> bool {
         self.retired.contains(name)
+            || matches!(self.names.holder(name, At::Start), Holder::Tracked(uid) if self.names.table_at(uid, At::End).is_none())
     }
 
     pub(crate) fn kept(&self, after: &Schema, moved: &mut Vec<String>) {

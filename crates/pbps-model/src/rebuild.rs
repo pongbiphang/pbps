@@ -57,6 +57,10 @@ pub struct Rebuild {
     /// the approval keeps the types (DEC-2298.12).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub types: BTreeMap<Uid, ColumnShape>,
+    /// Conversion history belongs to this link, paired with replacement UIDs.
+    /// The global map continues to describe live columns only (DEC-2298.13).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub conversions: BTreeMap<Uid, crate::Conversion>,
 }
 
 /// A replacement column's type and collation at approval.

@@ -60,11 +60,17 @@ impl<'a> CreatedChanges<'a> {
                         .unwrap_or(declared.replica_identity.as_ref()),
                     Kind::Attach | Kind::Detach => declared.replica_identity.as_ref(),
                 };
+                let mut finished = declared.clone();
+                if let Some(of) = &mut finished.partition_of
+                    && let Some(parent) = final_table(names, &of.parent, at)
+                {
+                    of.parent = parent;
+                }
                 tables.insert(
                     name,
                     Created {
                         declared,
-                        finished: declared.clone(),
+                        finished,
                         kind,
                         incompatible_defaults: BTreeSet::new(),
                         identity,
@@ -310,7 +316,7 @@ impl Created<'_> {
             }
         }
         if matches!(self.kind, Kind::Create(_)) {
-            super::created_place(declared, now, now_name, moved);
+            super::created_place(&self.finished, now, now_name, moved);
         }
         // A partition's own defaults and NOT NULLs (#1578), as a column's:
         // NOT NULL exactly, a default by presence, the engine respelling

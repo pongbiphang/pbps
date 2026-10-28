@@ -31,6 +31,9 @@ mod default_grouping;
 #[path = "support/type_refs.rs"]
 mod type_refs;
 
+#[path = "support/rebuild2298b.rs"]
+mod rebuild2298b;
+
 #[path = "support/rebuild_members.rs"]
 mod rebuild_members;
 
@@ -97,12 +100,16 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
         assert!(stderr(&offline).contains(expected), "{}", stderr(&offline));
         if let Some(connection) = connection {
             let connected = d.run(&["plan", "--db", connection]);
-            assert_ne!(code(&connected), 0);
-            assert!(
-                stderr(&connected).contains(expected),
-                "{}",
-                stderr(&connected)
-            );
+            if expected == "requires connected expansion" {
+                succeeds(connected);
+            } else {
+                assert_ne!(code(&connected), 0);
+                assert!(
+                    stderr(&connected).contains(expected),
+                    "{}",
+                    stderr(&connected)
+                );
+            }
         }
     };
     for (spelling, domain_base) in [(&desired, "int"), (&canonical, "integer")] {
@@ -120,7 +127,7 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
             approved = Some(bytes);
         }
         d.commit();
-        check("recorded intent is valid; table rebuild execution is not available yet");
+        check("requires connected expansion");
     }
     // A real modifier change is not an alias, even inside the same type family.
     std::fs::write(
@@ -132,7 +139,7 @@ fn check_rebuild_aliases(d: &Demo, path: &std::path::Path, connection: Option<&s
     check("re-approve it with `pbps rebuild-table app.p --max-rows 20 --reason <why>`");
     std::fs::write(path, &canonical).unwrap();
     d.commit();
-    check("recorded intent is valid; table rebuild execution is not available yet");
+    check("requires connected expansion");
 }
 
 #[test]
@@ -227,11 +234,13 @@ fn check_rebuild_additions(
         }
         for args in plans {
             let out = d.run(&args);
+            if args.contains(&"--db") {
+                succeeds(out);
+                continue;
+            }
             assert_ne!(code(&out), 0, "{args:?}");
             assert!(
-                stderr(&out).contains(
-                    "recorded intent is valid; table rebuild execution is not available yet"
-                ),
+                stderr(&out).contains("requires connected expansion"),
                 "column={column}, partition={partition}, {args:?}: {}",
                 stderr(&out)
             );
@@ -397,7 +406,7 @@ fn rebuild_intent_is_a_convergent_git_record_and_never_an_executable_plan() {
 
 #[test]
 #[ignore = "needs live pg"]
-fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
+fn recorded_rebuild_plans_without_changing_the_source_tree() {
     rebuild_members::live();
     let own = OwnDatabase::new(&server(), "rebuild2298");
     let connection = own.connection();
@@ -420,22 +429,15 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
     let path = d.dir.join("schema/app.p.yml");
     check_rebuild_aliases(&d, &path, Some(connection));
-    let artifact = d.dir.join("refused.json");
-    std::fs::write(&artifact, b"keep existing artifact").unwrap();
-    let out = d.run(&[
+    let artifact = d.dir.join("rebuild.json");
+    succeeds(d.run(&[
         "plan",
         "--db",
         connection,
         "--out",
         artifact.to_str().unwrap(),
-    ]);
-    assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
-    assert!(
-        stderr(&out).contains("execution is not available yet"),
-        "{}",
-        stderr(&out)
-    );
-    assert_eq!(std::fs::read(&artifact).unwrap(), b"keep existing artifact");
+    ]));
+    assert!(artifact.is_file());
     assert_eq!(
         scalar(
             connection,
@@ -447,23 +449,13 @@ fn recorded_rebuild_refuses_connected_plans_and_keeps_the_source_tree() {
     // each kind of ledger snapshot, while preserving the on-disk intent.
     let pending = std::fs::read(d.dir.join("schema.ids.json")).unwrap();
     on_server(connection, "DROP TABLE app.p1");
-    for args in [
-        vec!["snapshot", "--db", connection, "--force"],
-        vec![
-            "baseline",
-            "--db",
-            connection,
-            "--reason",
-            "accept missing leaf",
-        ],
-    ] {
-        succeeds(d.run(&args));
-        let snapshot = latest_snapshot(connection);
-        snapshot.ids.validate().unwrap();
-        assert!(snapshot.ids.rebuilds.is_empty());
-        assert!(snapshot.ids.table_uid(&"app.p1".parse().unwrap()).is_none());
-        assert!(snapshot.ids.table_uid(&"app.p".parse().unwrap()).is_some());
-    }
+    succeeds(d.run(&["snapshot", "--db", connection, "--force"]));
+    let snapshot = latest_snapshot(connection);
+    snapshot.ids.validate().unwrap();
+    assert!(snapshot.ids.rebuilds.is_empty());
+    assert!(snapshot.ids.table_uid(&"app.p1".parse().unwrap()).is_none());
+    let refused = d.run(&["baseline", "--db", connection, "--reason", "partial source"]);
+    assert_ne!(code(&refused), 0);
     assert_eq!(
         std::fs::read(d.dir.join("schema.ids.json")).unwrap(),
         pending
@@ -527,7 +519,7 @@ fn identity_intents_after_an_approval_are_ordinary_and_a_withdrawal_restores_the
     succeeds(d.run(&approve));
     let plan = d.run(&["plan", "--no-dev", "--since", source.trim()]);
     assert!(
-        stderr(&plan).contains("execution is not available yet"),
+        stderr(&plan).contains("requires connected expansion"),
         "{}",
         stderr(&plan)
     );
@@ -678,7 +670,7 @@ fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() 
         "{}",
         stderr(&behind)
     );
-    assert!(stderr(&behind).contains("execution is not available yet"));
+    assert!(stderr(&behind).contains("requires connected expansion"));
     // One at the middle link is a single rebuild; one at the last has nothing to do.
     let current = d.run(&["plan", "--no-dev", "--since", &middle]);
     assert_ne!(code(&current), 0);
@@ -687,7 +679,7 @@ fn a_chain_of_approvals_plans_as_one_composed_rebuild_from_any_older_revision() 
         "{}",
         stderr(&current)
     );
-    assert!(stderr(&current).contains("execution is not available yet"));
+    assert!(stderr(&current).contains("requires connected expansion"));
     succeeds(d.run(&["plan", "--no-dev"]));
 }
 
@@ -729,7 +721,7 @@ fn a_chain_that_returns_to_the_first_key_still_plans_as_one_composed_rebuild() {
     assert_ne!(code(&behind), 0);
     assert!(
         stderr(&behind).contains("composed over 2 approved links")
-            && stderr(&behind).contains("execution is not available yet"),
+            && stderr(&behind).contains("requires connected expansion"),
         "{}",
         stderr(&behind)
     );

@@ -503,6 +503,16 @@ impl IdsFile {
         // to rebuild" (DEC-2298.12).
         let mut reserved = BTreeSet::new();
         for (uid, rebuild) in &self.rebuilds {
+            if rebuild.conversions.iter().any(|(to, c)| {
+                !rebuild.replacement.columns.contains_key(to)
+                    || !rebuild.continues.contains_key(to)
+                    || c.from.trim().is_empty()
+                    || c.to.trim().is_empty()
+                    || c.using.trim().is_empty()
+                    || c.from == c.to
+            }) {
+                return Err(IdsError::InvalidRebuild { uid: uid.clone() });
+            }
             let source = rebuild.source.as_ids();
             let target = rebuild.replacement.as_ids();
             let held = |u: &Uid| {

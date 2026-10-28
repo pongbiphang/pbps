@@ -3338,6 +3338,7 @@ mod tests {
                         reason: "planned rewrite".parse().unwrap(),
                         operator: "operator".into(),
                         types: Default::default(),
+                        conversions: Default::default(),
                     },
                 })),
                 Change::CopyTableRows(Box::new(CopyTableRows {
