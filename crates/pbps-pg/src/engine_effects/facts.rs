@@ -96,7 +96,7 @@ pub(super) fn type_value(
 }
 /// This is only a conservative unread-fact check, never a binding resolver.
 /// Quoted/unqualified calls and OID-alias literals need actual catalog proof.
-fn may_bind_expression(expression: &str) -> bool {
+pub(super) fn may_bind_expression(expression: &str) -> bool {
     if !crate::LEXICON.string_literals(expression).is_empty() {
         return true;
     }

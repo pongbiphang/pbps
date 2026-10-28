@@ -138,6 +138,14 @@ fn output(
             let ColumnProperty::Column(attribute) = &transition.property else {
                 unreachable!()
             };
+            // A new expression has no stored binding evidence. Share the
+            // endpoint reader's rule before treating its serialized form as known.
+            if *attribute == Attribute::Type
+                && let ValueSource::Generated(g) = &column.value_source
+                && facts::may_bind_expression(&g.expression)
+            {
+                return Fact::Unread;
+            }
             facts::column(pg, table, name, column)
                 .remove(attribute)
                 .unwrap_or(Fact::Unread)

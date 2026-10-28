@@ -84,3 +84,55 @@ fn numbering_creation_uses_the_statement_address_after_a_parent_rename() {
         matches!(&clauses[..], [Clause::Recurse(d),Clause::Recurse(n)] if matches!(&d.to.known().unwrap().datum, Datum::Definition(text) if text.contains("q_d_seq") && !text.contains("p_d_seq")) && n.lifetime==Lifetime::Create)
     );
 }
+
+#[test]
+fn added_generated_expressions_keep_unread_bindings_distinct_from_known_empty() {
+    for version in [160000, 180000] {
+        for (expression, unread) in [
+            ("app.f(1)", true),
+            ("f (1)", true),
+            ("\"f\"(1)", true),
+            ("'1'::regclass", true),
+            ("1 + 2", false),
+        ] {
+            let mut column = Column::new("integer".parse().unwrap());
+            column.value_source = ValueSource::Generated(pbps_model::Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+            let change = change(
+                "add_column",
+                json!({"table":"app.p","name":"d","column":column}),
+            );
+            let clauses = fixture(&change, Some(version), |_| {});
+            let output = |attribute| {
+                clauses
+                    .iter()
+                    .find_map(|clause| {
+                        if let Clause::Recurse(w) = clause
+                            && matches!(&w.key.property, Property::Column(_, a) if *a == attribute)
+                        {
+                            Some(&w.to)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap()
+            };
+            let ty = output(Attribute::Type);
+            if unread {
+                assert_eq!(*ty, Fact::Unread, "{version}: {expression}");
+            } else {
+                let Fact::Known(value) = ty else {
+                    panic!("a reference-free constant is known")
+                };
+                assert!(matches!(value.datum, Datum::Definition(_)));
+                assert!(value.bindings.is_empty());
+            }
+            assert_eq!(
+                *output(Attribute::Default),
+                facts::definition("no column default")
+            );
+        }
+    }
+}
