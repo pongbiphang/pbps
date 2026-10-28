@@ -9077,3 +9077,39 @@ Change without an arm fails compilation. The matrix keeps the historical
 settle and the sealed proof, and replay independently. The live combined
 rename/attach acceptance is PR 2 after #2296 PR 7 (maintainer decision,
 2026-10-28); PR 1 neither includes those blocked tests nor lifts a guard.
+
+<a id="dec-2296-4"></a>
+
+**DEC-2296.4. A column statement declares its property transitions once;
+PostgreSQL supplies only normalization and recursion policy.**
+`Change::parent_column_uid` identifies the seven parent-column kinds, and
+`Change::column_transitions` borrows their actual statement outputs and physical
+lifetimes, including a table rename's address event. It never substitutes the
+desired endpoint for an intermediate TYPE, DEFAULT release or numbering change.
+Retuning an owned sequence has no DEFAULT event; adding or removing one does.
+The sequence lifetime is independent of the column lifetime. DROP reads the
+baseline numbering fact to distinguish an absent sequence from an unread one.
+The model declares no engine recursion or ownership policy.
+
+PostgreSQL maps those transitions to clauses: names/types/collations preserve
+ownership, defaults overwrite attached values, numbering and addresses affect
+the parent only, and NOT NULL uses the separate measured PG16/PG18 policies.
+TYPE keeps the stored generation form and its existing bindings; it neither
+releases a DEFAULT binding nor borrows the next restoration's binding. An unread
+binding, input version or server-version policy remains an obligation. The
+operation-local `engine_effects::symbolic` producer is staged for the subsequent
+movement/restoration and scheduling slices; no existing guard or shipping
+ordering route is changed here. Meetings use the same model accessor. Future
+lock-window and preflight consumers read these same transitions rather than
+introducing another list of change kinds.
+
+Identity remains a named capability/readback refusal, not an ordering edge.
+Native tests on the pinned PostgreSQL 16/18 fixtures preserve the distinctions:
+recursively adding an identity column refuses 42P16 on 16 and succeeds on 18;
+attaching a candidate with its own identity succeeds on 16 and refuses 55000
+on 18; on 16 a subsequent parent identity-to-sequence conversion refuses 42601
+when SET DEFAULT reaches that candidate's retained identity. These states
+explain the conservative producer refusal; they are not a claim that every
+parent identity operation fails. A numbering change with neither an owned
+sequence input nor output is refused separately. Refusals retain the
+separate-plans remedy. No format, rank, tie-break or settlement stage changes.

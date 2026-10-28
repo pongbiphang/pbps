@@ -14,6 +14,9 @@
 //! the model layer does not have. So risks are computed by the differ, which does
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
+mod columns;
+pub use columns::{ColumnProperty, ColumnTransition, ColumnValue};
+
 use crate::ColumnName;
 use crate::ObjectLocalName;
 use std::collections::{BTreeMap, BTreeSet};
