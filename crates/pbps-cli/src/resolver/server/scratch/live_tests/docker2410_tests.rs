@@ -267,6 +267,31 @@ async fn a_container_that_has_exited_is_removed_at_once() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn a_container_stopped_after_a_running_observation_is_removed_at_once() {
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let (name, _) = start(&mut made, &dead).await;
+    let volumes = volumes_of(&name);
+    let report = swept_with_observation(&token(), &dead, "running", async |id| {
+        let running = docker(&["container", "inspect", "--format", "{{json .}}", id]);
+        // The keeper probe loses its server after observing a running runtime.
+        // Re-reading an exited runtime proves death without a grace period.
+        docker(&["kill", id]);
+        assert_eq!(
+            docker(&["container", "inspect", "--format", "{{.State.Status}}", id]),
+            "exited"
+        );
+        running
+    })
+    .await;
+    assert!(!exists(&name), "{report:?}");
+    assert!(volumes.iter().all(|v| !volume_exists(v)), "{volumes:?}");
+    assert!(removed(&report, &name), "{report:?}");
+    assert!(kept_why(&report, &name).is_empty(), "{report:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
 async fn a_container_from_another_tool_or_without_a_token_is_never_touched() {
     let mut made = Made(Vec::new());
     let (a, b, c, d) = (token(), token(), token(), token());
@@ -383,7 +408,7 @@ async fn recovery_confirms_another_remover_started_between_listing_and_liveness(
     let (name, _) = start(&mut made, &dead).await;
     let volumes = volumes_of(&name);
     let mut remover = None;
-    let report = swept_with_observation(&token(), &dead, async |id| {
+    let report = swept_with_observation(&token(), &dead, "removing", async |id| {
         // Make native writable-layer deletion observable, then gate on the
         // daemon's actual removing state rather than a guessed delay.
         docker(&[

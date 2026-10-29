@@ -409,11 +409,20 @@ case "$1" in
     printf '{"Running":false,"ExitCode":137,"OOMKilled":false,"Error":""}\n';;
   logs) printf 'startup failure; password='; cat "$PBPS_DEV_SECRET";;
   container)
+    if [ "$2" = ls ]; then exit 0; fi
+    if [ -e "$PBPS_DEV_REMOVED" ]; then
+      printf 'Error: no such container\n' >&2; exit 1
+    fi
     case "$4" in
-      '{{.Id}}') printf 'Error: no such container\n' >&2; exit 1;;
-      *) exit 0;;
+      '{{.Id}}') printf 'runtime-id\n';;
+      '{{range .Mounts}}{{.Name}} {{end}}') exit 0;;
+      '{{.State.Status}}') printf 'exited\n';;
+      *) exit 99;;
     esac;;
-  kill|rm) printf '%s\n' "$*" >> "$PBPS_DEV_LOG";;
+  kill) printf '%s\n' "$*" >> "$PBPS_DEV_LOG";;
+  rm)
+    printf '%s\n' "$*" >> "$PBPS_DEV_LOG"
+    : > "$PBPS_DEV_REMOVED";;
   *) exit 99;;
 esac
 "#,
@@ -438,6 +447,7 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
     let secret = d.dir.join("secret");
     let id = d.dir.join("id");
     let once = d.dir.join("once");
+    let removed = d.dir.join("removed");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let mapping = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     drop(listener);
@@ -467,6 +477,7 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
     for (mapping, status, first, diagnostic) in cases {
         std::fs::write(&log, "").unwrap();
         let _ = std::fs::remove_file(&once);
+        let _ = std::fs::remove_file(&removed);
         let started = std::time::Instant::now();
         let mut command = Command::new(BIN);
         command
@@ -478,6 +489,7 @@ pub(super) fn runtime_refusals(mapping_case: bool) {
             .env("PBPS_DEV_SECRET", &secret)
             .env("PBPS_DEV_ID", &id)
             .env("PBPS_DEV_ONCE", &once)
+            .env("PBPS_DEV_REMOVED", &removed)
             .env("PBPS_DEV_FIRST", first)
             .env("PBPS_DEV_MAPPING", mapping)
             .env("PBPS_DEV_PORT_STATUS", status);

@@ -5290,3 +5290,10 @@ as the marked keeper: the keeper intentionally outlives normal teardown.
 The native race regression retains an actual `removing` observation across the
 listing/liveness boundary and confirms container and volume absence. A volume
 held by another owned container cannot count as recovered.
+
+The post-probe runtime read also accepts an ownership-checked observation of
+that same immutable ID as `exited` or `dead`: a competing remover may have
+stopped the engine before its record enters `removing`. This proves death at
+once under DEC-2410.3; a still-running unreadable server remains unprovable.
+Native PostgreSQL and SQL Server regressions retain a running observation,
+stop the engine, and require immediate recovery with confirmed absence.

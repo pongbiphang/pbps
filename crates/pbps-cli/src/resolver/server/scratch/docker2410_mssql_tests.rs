@@ -151,6 +151,45 @@ async fn a_sql_server_container_is_alive_while_its_keeper_is_and_removed_at_once
 
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
+async fn a_sql_server_container_stopped_after_a_running_observation_is_removed_at_once() {
+    let (made, name, token, connection) = start().await;
+    let keeper = Keeper::open(Driver::Mssql, &connection, &token)
+        .await
+        .unwrap();
+    let own = format!("{:032x}", rand::random::<u128>());
+    let (between, go) = engine::pause_between_reads(&token);
+    let (report, ()) = tokio::join!(swept(&own), async {
+        // The real SQL probe has connected and read the persistent mark.
+        // Killing its engine now reproduces the I/O race before the live read.
+        tokio::time::timeout(Duration::from_secs(30), between)
+            .await
+            .expect("the keeper probe reached its live read")
+            .unwrap();
+        docker(&["kill", &name]);
+        assert_eq!(
+            docker(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &name
+            ]),
+            "exited"
+        );
+        go.send(()).unwrap();
+    });
+    let removed = !exists(&name);
+    drop(keeper);
+    drop(made);
+    let group = report.groups.iter().find(|group| group.token == token);
+    assert!(removed, "{report:?}");
+    let group = group.unwrap_or_else(|| panic!("no group for {token}: {report:?}"));
+    assert!(group.kept.is_empty(), "{report:?}");
+    assert!(group.removed.iter().any(|r| r.names == [name.clone()]));
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures and a container runtime"]
 async fn a_sql_server_keeper_that_connects_between_the_two_reads_is_alive_and_not_yet_kept() {
     let (_made, _, run, connection) = start().await;
     let (between, go) = engine::pause_between_reads(&run);

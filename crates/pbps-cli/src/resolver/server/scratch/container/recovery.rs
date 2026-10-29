@@ -291,10 +291,17 @@ impl<'a> Containers<'a> {
         let live = verdict(&state, seen, age, self.grace);
         // A keeper probe can race the same removal. A live keeper always wins;
         // only an unreadable running server needs another runtime observation.
+        // A remover can stop it before deletion enters `removing` (DEC-2513.1).
         if state.status == "running" && matches!(live, Liveness::Unprovable(_)) {
             match self.state(&listed.id, token).await {
                 Err(why) if super::no_such_container(&why) => return Liveness::Dead,
                 Err(why) => return Liveness::Unprovable(why),
+                Ok(now) if now.id != listed.id => {
+                    return Liveness::Unprovable("its container identity changed".into());
+                }
+                Ok(now) if matches!(now.status.as_str(), "exited" | "dead") => {
+                    return Liveness::Dead;
+                }
                 Ok(now) if now.status == "removing" => {
                     return match wait_removed(&listed.id).await {
                         Ok(()) => Liveness::Dead,
@@ -487,12 +494,13 @@ pub(in crate::resolver::server::scratch) async fn swept_alone(
 }
 
 // Feed a real runtime observation into the normal classifier after listing.
-// Keeping it across the scheduling boundary makes the removing race repeatable
-// even when the daemon finishes deletion before classification is polled.
+// Keeping it across the scheduling boundary makes runtime transitions repeatable
+// even when they finish before classification is polled.
 #[cfg(test)]
 pub(in crate::resolver::server::scratch) async fn swept_with_observation(
     own: &str,
     token: &str,
+    expected_status: &str,
     between: impl AsyncFnOnce(&str) -> String,
 ) -> recovery::Report {
     struct Listed<'a> {
@@ -530,8 +538,8 @@ pub(in crate::resolver::server::scratch) async fn swept_with_observation(
     let state = inner.listed[token].as_ref().unwrap();
     let observed = state_from_json(&between(&state.id).await, token).unwrap();
     assert_eq!(
-        observed.status, "removing",
-        "the other remover is already in progress"
+        observed.status, expected_status,
+        "the retained observation precedes classification"
     );
     recovery::sweep(&mut Listed {
         inner,
