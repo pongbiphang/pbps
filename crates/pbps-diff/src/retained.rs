@@ -71,6 +71,29 @@ pub fn candidates(base: Side<'_>, desired: Side<'_>, hints: &Hints) -> Vec<Retai
         {
             continue;
         }
+        for (column_uid, column) in desired
+            .ids
+            .columns
+            .iter()
+            .filter(|(_, c)| &c.table == table)
+        {
+            let target = ExpressionTarget::ColumnDefault {
+                uid: column_uid.clone(),
+                column: column.clone(),
+            };
+            if let (Some(before), Some(after)) = (
+                target.expression(base.schema),
+                target.expression(desired.schema),
+            ) && before != after
+            {
+                out.push(RetainedExpression {
+                    target,
+                    before: before.clone(),
+                    after: after.clone(),
+                    anchors: anchors.clone(),
+                });
+            }
+        }
         for (name, after) in &new.checks {
             if let Some(before) = old.checks.get(name)
                 && before != after
@@ -121,16 +144,7 @@ pub(crate) fn comparison<'a>(
             matches!(c, Change::RenameEnumValue { uid, ordinal, .. } if uid == &anchor.uid && ordinal == &anchor.ordinal))
         else { continue; };
         retained.push(answer.clone());
-        let ExpressionTarget::Check { table, name, .. } = &answer.target;
-        schema
-            .to_mut()
-            .tables
-            .get_mut(table)
-            .unwrap()
-            .checks
-            .get_mut(name)
-            .unwrap()
-            .expression = answer.after.clone();
+        *answer.target.expression_mut(schema.to_mut()).unwrap() = answer.after.clone();
     }
     schema
 }
