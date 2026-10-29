@@ -1385,6 +1385,21 @@ impl Weave<'_> {
 impl Expansion for Weave<'_> {
     type Obligation = Named;
 
+    fn bind_inputs(
+        &self,
+        operations: &pbps_model::operation::Operations,
+    ) -> Result<pbps_model::operation::Operations, String> {
+        let changes: Vec<_> = operations.iter().map(|op| op.planned().clone()).collect();
+        let view = Projection::of(
+            &self.sources,
+            &changes,
+            self.declared,
+            self.found.dependents(),
+            &self.parents,
+        )?;
+        Ok(view.bind_inputs(operations))
+    }
+
     fn rule(&self) -> &'static str {
         "weave"
     }

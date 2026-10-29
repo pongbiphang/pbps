@@ -2132,6 +2132,7 @@
         "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename",
         "physical_sources::a_detached_column_removes_its_existing_foreign_key_before_the_referenced_table",
         "physical_sources::column_order_and_membership_match_the_catalog_at_each_boundary",
+        "address_chain2296::a_renamed_dependent_keeps_its_old_target_between_address_versions",
         "alias_batches::ten_thousand_aliases_keep_every_requested_row_at_the_default_stack_limit",
         "alias_batches::aliases_in_different_batches_still_refuse_a_collision",
         "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",

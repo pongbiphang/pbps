@@ -141,6 +141,15 @@ An incarnation's removal ends its tree and column values: Base or bound-current
 readers precede that removal, while a later incarnation's reader waits for it.
 Independent value replay checks the same lifetime at every read.
 
+Woven input addresses consume the shared table/column name-version chain
+(DEC-2296.9). Logical origin and object incarnation stay unchanged: a teardown
+may read a retained table at its final or intermediate address. Input lookup
+is separate from fixed baseline/final snapshot lookup, including when a name
+is reused. Rename dependencies follow those event versions. Holding PUBLIC
+companions preserves their reserved operation IDs; subsequent parts use the
+same monotonic planning allocator. These are existing effect/name inputs, not
+a new ordering pass or membership replay.
+
 ### Membership-scoped effect contract
 
 `operation::symbolic` declares recursive property writes, membership

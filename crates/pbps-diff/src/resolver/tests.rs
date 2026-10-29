@@ -5024,7 +5024,7 @@ mod operations {
         );
         assert_eq!(at, 4);
         assert_eq!(whole.source(), Source::Change(1));
-        assert!(matches!(whole.origin(), Origin::Whole(1)));
+        assert!(matches!(&*whole.origin(), Origin::Whole(1)));
     }
 
     /// A view the evidence rebuilds on an engine that rebuilds modules is

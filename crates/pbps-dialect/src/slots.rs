@@ -159,7 +159,11 @@ fn constraint_names(
         // the existing settle delay that arrival (DEC-2100.2).
         for op in introduced {
             if let Some((table, parent)) = partition(op)
-                && owners.table(parent, op.origin().spelling()).ok() == Some(uid.uid().clone())
+                && op
+                    .input_owners(owners)
+                    .table(parent, op.origin().spelling())
+                    .ok()
+                    == Some(uid.uid().clone())
                 && let Ok(key) = op.key(owners)
             {
                 let named = address(key, table.schema.clone());
@@ -204,7 +208,9 @@ fn arriving_clones(
     let Some((table, parent)) = partition(op) else {
         return Ok(Vec::new());
     };
-    let parent = owners.table(parent, op.origin().spelling())?;
+    let parent = op
+        .input_owners(owners)
+        .table(parent, op.origin().spelling())?;
     let scope = op.key(owners)?;
     let mut triggers = BTreeMap::new();
     for (id, module) in &before.schema.modules {
@@ -217,7 +223,9 @@ fn arriving_clones(
     let previous = preceding(operations, op);
     for earlier in previous {
         if let Some(id @ ModuleId::Trigger { on, name }) = earlier.change().module_id() {
-            let owner = owners.table(on, earlier.origin().spelling())?;
+            let owner = earlier
+                .input_owners(owners)
+                .table(on, earlier.origin().spelling())?;
             let key = (owner, name.clone());
             if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
                 earlier.change()
@@ -292,7 +300,8 @@ pub fn names(
         .find(|n| n.address.kind == NameKind::Module(ModuleKind::Trigger))
         .and_then(|n| n.address.table.clone())
         .or_else(|| match op.change().module_id()? {
-            ModuleId::Trigger { on, .. } => owners
+            ModuleId::Trigger { on, .. } => op
+                .input_owners(owners)
                 .table(on, op.origin().spelling())
                 .ok()
                 .and_then(|uid| before.ids.tables.get(&uid))
@@ -302,7 +311,8 @@ pub fn names(
         });
     if let Change::DropModule { id, .. } | Change::AlterModule { id, .. } = op.change() {
         let old_id = match id {
-            ModuleId::Trigger { on, name } => owners
+            ModuleId::Trigger { on, name } => op
+                .input_owners(owners)
                 .table(on, op.origin().spelling())
                 .ok()
                 .and_then(|uid| before.ids.tables.get(&uid))

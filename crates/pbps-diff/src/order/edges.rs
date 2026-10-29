@@ -252,7 +252,10 @@ fn reads_before(reader: &Operation, rename: &Operation) -> bool {
     let Origin::Change(j) = rename.source() else {
         return false;
     };
-    match reader.origin().spelling() {
+    if let Some(before) = reader.address_before(rename) {
+        return before;
+    }
+    match reader.logical_origin().spelling() {
         Spelling::Base => true,
         Spelling::Final => false,
         Spelling::At(At::Start) => true,
@@ -261,6 +264,7 @@ fn reads_before(reader: &Operation, rename: &Operation) -> bool {
         // have not happened.
         Spelling::At(At::Before(i)) => j >= i,
         Spelling::At(At::After(i)) => j > i,
+        Spelling::Input(_) => unreachable!("logical origins do not carry address bindings"),
     }
 }
 
@@ -748,3 +752,7 @@ pub fn declared_edges(
 pub fn ids(operations: &[Operation]) -> Vec<OperationId> {
     operations.iter().map(Operation::id).collect()
 }
+
+#[cfg(test)]
+#[path = "edges_address_tests.rs"]
+mod address_tests;
