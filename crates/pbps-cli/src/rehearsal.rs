@@ -529,6 +529,9 @@ async fn run_statements(
     let framing = framed.and_then(|(dialect, zone, transactional)| {
         transactional.then(|| dialect.transaction_framing(zone))
     });
+    if framing.is_none() && statements.iter().any(|s| s.drop_guard.is_some()) {
+        return Err(Rejected::of("guarded drops require a transactional rehearsal; this unframed consumer cannot skip the guard".into()));
+    }
     if let Some((dialect, zone, _)) = framed
         && let Some(pins) = dialect.session_pins(zone)
     {
@@ -542,7 +545,11 @@ async fn run_statements(
             .context("cannot open the rehearsal's transaction")?;
     }
     for (i, statement) in statements.iter().enumerate() {
-        if let Err(e) = conn.execute(&statement.sql).await {
+        let executed = match crate::engine::check_drop_requirement(conn, statement).await {
+            Ok(()) => conn.execute(&statement.sql).await,
+            Err(error) => Err(error),
+        };
+        if let Err(e) = executed {
             if let Some(framing) = &framing {
                 // Its own error must not replace the statement's.
                 let _ = conn.rollback(framing).await;
@@ -564,6 +571,46 @@ fn clear_row_security(schema: &mut Schema) {
     for table in schema.tables.values_mut() {
         table.row_security = Default::default();
         table.row_policies.clear();
+    }
+}
+
+#[cfg(test)]
+mod drop_requirement_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs live PostgreSQL 16 and 18"]
+    fn guarded_rehearsals_execute_or_refuse_the_guard_on_both_postgres_majors() {
+        crate::db::runtime().unwrap().block_on(async {
+            for (major, variable) in [(18, "PBPS_TEST_PG_DB"), (16, "PBPS_TEST_PG_OLD_DB")] {
+                let server = std::env::var(variable).unwrap();
+                let name = format!("pbps_require_rehearsal2400_{major}_{}", std::process::id());
+                let mut admin = Conn::connect(pbps_db::Driver::Postgres, &server).await.unwrap();
+                admin.execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await.unwrap();
+                admin.execute(&format!("CREATE DATABASE {name}")).await.unwrap();
+                let mut conn = Conn::connect(pbps_db::Driver::Postgres, &format!("{server} dbname={name}")).await.unwrap();
+                conn.execute("CREATE SCHEMA app; CREATE TABLE app.t (amount integer); INSERT INTO app.t VALUES (0)").await.unwrap();
+                let mut statement = Statement::new("ALTER TABLE app.t DROP COLUMN amount");
+                statement.drop_guard = Some(pbps_model::DropGuard {
+                    table_uid: "t_000001".parse().unwrap(), table: "app.t".parse().unwrap(), detach_from: None,
+                    requirements: [("c_000001".parse().unwrap(), pbps_model::DropRequirement { table_uid: "t_000001".parse().unwrap(), predicate: "amount = 1".into(), required_at: "2026-10-28".into(), operator: "reviewer".into() })].into(),
+                });
+                let statements = [statement];
+                let failed = |_: usize, _: &str, error: &pbps_db::DbError| anyhow::anyhow!(error.to_string());
+                let unframed = run_statements(&mut conn, &statements, None, failed).await.unwrap_err();
+                assert!(unframed.to_string().contains("unframed consumer cannot skip the guard"));
+                let dialect = pbps_pg::Postgres::new();
+                let zone = SessionZone::utc();
+                let refused = run_statements(&mut conn, &statements, Some((&dialect, &zone, true)), failed).await.unwrap_err();
+                assert!(refused.to_string().contains("1 row(s) of app.t violate"), "{refused}");
+                conn.execute("UPDATE app.t SET amount=1").await.unwrap();
+                run_statements(&mut conn, &statements, Some((&dialect, &zone, true)), failed).await.unwrap();
+                let rows = conn.query("SELECT count(*)::bigint AS n FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='amount' AND NOT attisdropped").await.unwrap();
+                assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(0));
+                drop(conn);
+                admin.execute(&format!("DROP DATABASE {name} WITH (FORCE)")).await.unwrap();
+            }
+        });
     }
 }
 

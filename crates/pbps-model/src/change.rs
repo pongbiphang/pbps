@@ -3290,6 +3290,9 @@ pub struct PlannedChange {
     #[serde(flatten)]
     pub change: Change,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_guard: Option<crate::DropGuard>,
+
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub risks: BTreeSet<RiskClass>,
 
@@ -3324,12 +3327,14 @@ impl PartialEq for PlannedChange {
         // Destructured, so a field added later has to be placed here.
         let PlannedChange {
             change,
+            drop_guard,
             risks,
             strategy,
             findings,
             provenance: _,
         } = self;
         *change == other.change
+            && *drop_guard == other.drop_guard
             && *risks == other.risks
             && *strategy == other.strategy
             && *findings == other.findings
@@ -3372,6 +3377,7 @@ impl PlannedChange {
         let risks = change.intrinsic_risks();
         Self {
             change,
+            drop_guard: None,
             risks,
             strategy: Strategy::default(),
             findings: Vec::new(),

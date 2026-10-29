@@ -82,6 +82,9 @@ mod default_rebuild;
 #[path = "support/literal_inputs2378.rs"]
 mod literal_inputs2378;
 
+#[path = "support/drop_requirements2400.rs"]
+mod drop_requirements2400;
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
@@ -37190,6 +37193,7 @@ async fn doctor_asks_a_pending_drops_schema_for_usage() {
         project.tombstones.insert(
             uid,
             pbps_model::ids::Tombstone {
+                require: None,
                 was: was.to_owned(),
                 dropped_at: "2026-09-28".to_owned(),
                 reason: "the schema's last table goes".to_owned(),
@@ -37246,6 +37250,7 @@ async fn doctor_reports_an_absent_recorded_table_when_only_its_tombstone_remains
     project.tombstones.insert(
         uid,
         pbps_model::ids::Tombstone {
+            require: None,
             was: "public.last".to_owned(),
             dropped_at: "2026-09-26".to_owned(),
             reason: "the last table goes".to_owned(),

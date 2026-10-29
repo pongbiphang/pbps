@@ -36,6 +36,7 @@ pub fn approval() -> (
         desired.tombstones.insert(
             uid.clone(),
             Tombstone {
+                require: None,
                 was,
                 dropped_at: root.intent.allowed_at.clone(),
                 reason: root.intent.reason.as_ref().into(),

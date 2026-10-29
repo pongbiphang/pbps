@@ -37,6 +37,8 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
+    #[error("{reason}")]
+    DropRequirement { reason: String },
     #[error("type `{}`: new enum label `{}` is used by {}; apply the label first, then the rest", .name.shown(), pbps_model::escape::Escaped(.label), pbps_model::escape::Escaped(.subject))]
     EnumValueUse {
         name: pbps_model::TypeRef,
@@ -2640,6 +2642,16 @@ pub(crate) fn diff_partial_rebuilding(
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
     let mut changes = ChangeSet { changes: planned };
+    if let Err(reason) = crate::drop_requirements::assign(&mut changes, base.ids, declared.ids)
+        .and_then(|()| crate::drop_requirements::validate(&changes, base.ids, declared.ids))
+    {
+        errs.push(DiffError::DropRequirement { reason });
+    }
+    if !dialect.records_conversions() && changes.changes.iter().any(|p| p.drop_guard.is_some()) {
+        errs.push(DiffError::DropRequirement {
+            reason: "guarded drops are not supported on this engine yet".into(),
+        });
+    }
     // Replacement risk belongs to both policy parts, including in partial
     // reports. Reuse the same UID/name pairing as final plan admission.
     let risks = crate::order::generated::risks(&changes, declared.ids, dialect);

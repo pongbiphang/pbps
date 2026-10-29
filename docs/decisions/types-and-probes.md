@@ -4061,3 +4061,55 @@ insert retaining old authored names byte for byte, outside edits (including
 NULL) refusing and rolling back, changed/retained/unchanged defaults, quoted
 schema moves, rename chains and a reused old name. Unit cases cover prefix
 boundaries, built-in casts, source UID separation and nonliteral refusal.
+
+<a id="dec-2400-1"></a>
+
+**DEC-2400.1. A recorded drop's row requirement is vetted against the target
+and checked under the lock held through its removal.** `Tombstone.require`
+holds the owning table UID, verbatim predicate, recording operator and date; absence preserves
+old ids/plan/state bytes. Connected recording refuses before the ids write,
+unlike offline conversion recording (ADR-0020). Re-recording replaces the
+requirement, omission preserves it and `--clear-require` removes it explicitly.
+The UID selects intent; a table drop also selects its removed column UIDs.
+Typed guard metadata travels with the certified drop and is rechecked against
+the retained baseline before apply. It is never reconstructed from emitted SQL
+or a tombstone's rendered address.
+Recording resolves the selected retired UID through the target baseline, never
+through the declaration's table address. The guard carries that table UID;
+`PlanNames` resolves its holder and changed-column owners at each operation.
+Referenced column UIDs are bound at Start, so table/column renames follow the
+identity and an address reused by another holder cannot match. Missing identity
+evidence refuses without an address fallback.
+
+PostgreSQL extends the existing CHECK binding and DEC-2181.1 decoder, retaining
+DEC-2378.1's Parse/Describe and modifier guards and DEC-2378.2's empty path.
+The shared requirement vetter establishes apply's existing session pins before
+binding, retaining the target's captured time zone, so recording, planning and
+apply parse the predicate identically even under different session defaults.
+`LIKE ... EXCLUDING ALL` copies the actual table's column type identities
+without calling their modifier inputs; this was measured with an advisory-lock
+witness on 16.15 and 18.6. The boolean CHECK retains the tree and its `conkey`
+identifies referenced columns. Non-built-in code and volatile functions refuse;
+subqueries, foreign-table references and non-boolean values fail binding.
+Before binding, the shared lexer blanks literals and comments; parentheses
+outside quoted identifiers must stay at nonnegative depth and finish at zero.
+This keeps the predicate inside both the binding CHECK and the execution count,
+whose different wrappers must never change its meaning.
+Same-plan changes of referenced columns and rebuild-source identities require
+separate plans, without expression substitution or another PostgreSQL parser.
+
+Inside apply's READ COMMITTED transaction, ACCESS EXCLUSIVE is acquired directly,
+without ONLY and without a weaker lock to upgrade. The vetter's rollback is a
+savepoint after that acquisition, so it releases neither the table nor its
+children. The count's fresh snapshot follows lock acquisition and the lock is
+held through the drop and commit. Readers wait too. `count(*) WHERE (predicate)
+IS NOT TRUE` fails on FALSE or NULL and returns the full bigint violation count.
+Unreadable security/count evidence, a query error and missing privilege refuse;
+ordinary probes' unchecked fallback cannot apply. No new timeout is introduced.
+Every consumer executes the typed guard or refuses, including transactional
+rehearsal, unframed/staged execution and standalone SQL export. SQL Server's
+parser core and later integration remain separate PRs of #2400.
+
+Pinned on PostgreSQL 16 and 18 by the guarded-drop recording/apply regressions,
+the late-row rollback witness, the own-column/built-in audit tests, RLS and
+privilege refusals, and the partition lock/writer-wait regression.

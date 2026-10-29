@@ -481,6 +481,7 @@ pub fn record(
         out.tombstones.insert(
             uid.clone(),
             pbps_model::Tombstone {
+                require: None,
                 was,
                 dropped_at: ctx.today.clone(),
                 reason: reason.as_ref().into(),
@@ -903,6 +904,7 @@ pub(crate) fn lineage_errors(
             | pbps_model::ids::IdsError::OrphanColumn { .. }
             | pbps_model::ids::IdsError::OrphanMove { .. }
             | pbps_model::ids::IdsError::OrphanConversion { .. }
+            | pbps_model::ids::IdsError::InvalidDropRequirement { .. }
             | pbps_model::ids::IdsError::InvalidConversion { .. }
             | pbps_model::ids::IdsError::NotHeld { .. } => None,
         };

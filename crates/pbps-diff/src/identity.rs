@@ -931,6 +931,7 @@ fn resolve_types(
             r.ids.tombstones.insert(
                 uid.clone(),
                 Tombstone {
+                    require: None,
                     was: name.raw().to_string(),
                     dropped_at: ctx.today.clone(),
                     reason: reason.to_string(),
@@ -1077,6 +1078,7 @@ fn resolve_roles(
             r.ids.tombstones.insert(
                 uid.clone(),
                 Tombstone {
+                    require: None,
                     was: role.raw().to_owned(),
                     dropped_at: ctx.today.clone(),
                     reason: reason.to_string(),
@@ -1410,6 +1412,7 @@ fn resolve_columns(
                 r.ids.tombstones.insert(
                     uid.clone(),
                     Tombstone {
+                        require: None,
                         was: column.raw().to_string(),
                         dropped_at: ctx.today.clone(),
                         reason: reason.to_string(),
@@ -1648,6 +1651,7 @@ fn drop_table_in_ids(
     ctx: &Context,
 ) {
     let make = |was: String| Tombstone {
+        require: None,
         was,
         dropped_at: ctx.today.clone(),
         reason: reason.to_string(),

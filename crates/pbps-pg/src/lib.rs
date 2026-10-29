@@ -65,6 +65,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
     unicode_identifiers: true,
 };
 pub mod domain_alter;
+pub mod drop_requirements;
 pub mod estimate;
 pub mod generated;
 pub mod impact;
@@ -1210,15 +1211,33 @@ impl pbps_dialect::PlanDialect for Postgres {
         let defaults = emit::RowDefaultIndex::new(changes);
         Box::new(move |position| {
             let planned = &changes.changes[position];
+            // Lowering calls this closure directly, so guard handling belongs here.
             let context = defaults.at(position);
-            match mode {
+            let mut statements = match mode {
                 pbps_model::PlanMode::Transactional => {
-                    emit::emit_in(self, &planned.change, planned.strategy, &context)
+                    emit::emit_in(self, &planned.change, planned.strategy, &context)?
                 }
                 pbps_model::PlanMode::Staged => {
-                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)
+                    if planned.drop_guard.is_some() {
+                        return Err(DialectError::Invalid {
+                            dialect: "postgres",
+                            message: "guarded drops require a transactional plan; --staged is unsupported"
+                                .into(),
+                        });
+                    }
+                    emit::emit_staged_in(self, &planned.change, planned.strategy, &context)?
                 }
+            };
+            if let Some(guard) = &planned.drop_guard {
+                let first = statements
+                    .first_mut()
+                    .ok_or_else(|| DialectError::Invalid {
+                        dialect: "postgres",
+                        message: "a guarded drop emitted no statement".into(),
+                    })?;
+                first.drop_guard = Some(guard.clone());
             }
+            Ok(statements)
         })
     }
 
@@ -8032,7 +8051,8 @@ mod certified_emission_tests {
                     (0, 0)
                 );
                 assert_eq!(
-                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
+                    pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc())
+                        .unwrap(),
                     script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,
@@ -8084,6 +8104,56 @@ mod certified_emission_tests {
 
     use super::*;
     use pbps_model::{Change, ChangeSet, PlanMode, PlannedChange};
+
+    #[test]
+    fn prepared_lowering_keeps_drop_requirements_and_refuses_staged_execution() {
+        let dialect = Postgres::new();
+        let uid: pbps_model::Uid = "t_aaaaaa".parse().unwrap();
+        let table: pbps_model::TableName = "app.gone".parse().unwrap();
+        let guard = pbps_model::DropGuard {
+            table_uid: uid.clone(),
+            table: table.clone(),
+            detach_from: None,
+            requirements: [(
+                uid.clone(),
+                pbps_model::DropRequirement {
+                    table_uid: uid.clone(),
+                    predicate: "id IS NULL".into(),
+                    required_at: "2026-10-29".into(),
+                    operator: "reviewer".into(),
+                },
+            )]
+            .into(),
+        };
+        for guarded in [false, true] {
+            let mut change = PlannedChange::new(Change::DropTable {
+                uid: uid.clone(),
+                name: table.clone(),
+                detach_from: None,
+            });
+            change.drop_guard = guarded.then(|| guard.clone());
+            for mode in [PlanMode::Transactional, PlanMode::Staged] {
+                let ordered = pbps_diff::order::singleton(change.clone(), mode, &dialect);
+                let result = pbps_dialect::lower::lower_all(
+                    &ordered as &dyn pbps_diff::order::PlanView<Postgres>,
+                    &dialect,
+                );
+                if guarded && mode == PlanMode::Staged {
+                    assert!(result.unwrap_err().to_string().contains(
+                        "guarded drops require a transactional plan; --staged is unsupported"
+                    ));
+                } else {
+                    let lowered = result.unwrap();
+                    assert_eq!(lowered.statements()[0].drop_guard, change.drop_guard);
+                    assert!(
+                        lowered.statements()[1..]
+                            .iter()
+                            .all(|statement| statement.drop_guard.is_none())
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn certified_lowering_preserves_statement_bytes_and_mode() {

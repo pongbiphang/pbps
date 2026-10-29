@@ -427,6 +427,24 @@ pub fn validate_saved_plan(
     dialect
         .validate_plan_analysis(plan)
         .map_err(AdmissionError::from_error)?;
+    for step in &plan.changes.changes {
+        if let Some(guard) = &step.drop_guard {
+            if plan.mode.is_staged() || !dialect.records_conversions() {
+                refuse!("guarded drops require a PostgreSQL transactional plan");
+            }
+            if guard.requirements.is_empty()
+                || guard.requirements.iter().any(|(uid, r)| {
+                    plan.ids
+                        .tombstones
+                        .get(uid)
+                        .and_then(|t| t.require.as_ref())
+                        != Some(r)
+                })
+            {
+                refuse!("the drop guard disagrees with its recorded requirements");
+            }
+        }
+    }
     // A matching checksum approves these bytes, not a broader execution mode
     // than the planner accepts. Count logical changes, since one rename may
     // emit a schema transfer and a rename (ADR-0003, decision 2) — and the

@@ -1165,6 +1165,12 @@ pub fn changes(cs: &ChangeSet) -> String {
     changes_with_remedy(cs, None)
 }
 
+pub fn required_rows(guard: &pbps_model::DropGuard) -> Vec<String> {
+    guard.requirements.values().map(|r| format!(
+        "{} requires `{}` immediately before removal; the scan holds ACCESS EXCLUSIVE through the drop, so readers and writers wait",
+        guard.table.shown(), Escaped(&r.predicate))).collect()
+}
+
 fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
     let mut out = String::new();
     let mut current = None;
@@ -1190,6 +1196,11 @@ fn changes_with_remedy(cs: &ChangeSet, remedy: Option<&str>) -> String {
             )
         };
         out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
+        if let Some(guard) = &p.drop_guard {
+            for line in required_rows(guard) {
+                out.push_str(&format!("      {line}\n"));
+            }
+        }
         // A step a planning rule added says which, and for what (#1776,
         // DEC-1958.3). A plan read back from its file has none to say.
         if let Some(o) = &p.provenance {

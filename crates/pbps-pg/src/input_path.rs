@@ -251,6 +251,7 @@ pub enum Part {
     Default,
     /// The expression a recorded conversion retypes a column with (#2331).
     Conversion,
+    RowRequirement,
 }
 
 /// The type and the part of it an expression is in.
@@ -274,6 +275,7 @@ impl fmt::Display for Use {
             }
             Part::Default => write!(f, "the DEFAULT of `{}`", self.ty),
             Part::Conversion => write!(f, "the conversion of {}", self.ty),
+            Part::RowRequirement => write!(f, "the row requirement of {}", self.ty),
         }
     }
 }
@@ -889,20 +891,106 @@ pub async fn vet_conversion(
         // pre-flight do, independently of the caller's session (DEC-2378.2).
         conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
             .await.map_err(|_| unvetted("could not be vetted: its resolution path could not be pinned".into()))?;
-        if let Some(inputs) = literal_inputs::before_bind(conn, using, &normalized).await.map_err(unvetted)? {
+        if let Some(inputs) = literal_inputs::before_bind(conn, using, Some(&normalized)).await.map_err(unvetted)? {
             // Keep the original CHECK statement and its shape audit unchanged.
             // This separate empty table only supplies column types to Describe.
             conn.execute_with(&format!(
                 "CREATE TEMPORARY TABLE pg_temp.pbps_conversion_input ({quoted} {ty}) ON COMMIT DROP"
             ), &[]).await.map_err(|_| unvetted("could not be vetted: its parameter binding table could not be created".into()))?;
-            inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input")).await.map_err(unvetted)?;
+            inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), false).await.map_err(unvetted)?;
         }
-        vet_in_transaction(conn, quoted, ty, using, shown).await
+        vet_in_transaction(conn, quoted, ty, using, shown, 1, false).await.map(|_| ())
     }
     .await;
     let closed = conn.rollback(&WRITABLE).await;
     result?;
     closed.map_err(|_| unvetted("could not be vetted: its transaction did not close".into()))
+}
+
+/// Bind and audit one boolean expression over the actual table's columns.
+/// LIKE copies catalog type identities without invoking their modifier inputs.
+/// All callers (record, plan and apply) use this same security boundary.
+pub async fn vet_requirement(
+    conn: &mut Conn,
+    within: Within,
+    table: &pbps_model::TableName,
+    predicate: &str,
+) -> Result<BTreeSet<pbps_model::ColumnName>, String> {
+    let refused = |why: &str| {
+        format!(
+            "the row requirement `{}` of {} {why}",
+            pbps_model::escape::Escaped(predicate),
+            table.shown()
+        )
+    };
+    if predicate.trim().is_empty() {
+        return Err(refused("is blank"));
+    }
+    // Binding and counting add different wrappers. The predicate must not
+    // close either wrapper and splice its operators into the surrounding SQL.
+    let mut depth = 0usize;
+    let mut quoted = false;
+    for ch in crate::LEXICON.header(predicate).chars() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if !quoted {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1).ok_or_else(|| {
+                        refused("has unbalanced parentheses; it must be one complete expression")
+                    })?;
+                }
+                _ => {}
+            }
+        }
+    }
+    if depth != 0 {
+        return Err(refused(
+            "has unbalanced parentheses; it must be one complete expression",
+        ));
+    }
+    let qualified = format!(
+        "{}.{}",
+        crate::quote(&table.schema).map_err(|_| refused("has an invalid table name"))?,
+        crate::quote(&table.name).map_err(|_| refused("has an invalid table name"))?
+    );
+    let framing = match within {
+        Within::OwnTransaction => pbps_dialect::TransactionFraming {
+            begin: "BEGIN ISOLATION LEVEL READ COMMITTED;".into(),
+            commit: "COMMIT;".into(), rollback: "ROLLBACK;".into(),
+        },
+        Within::CallersTransaction => pbps_dialect::TransactionFraming {
+            begin: "SAVEPOINT pbps_drop_requirement;".into(),
+            commit: "RELEASE SAVEPOINT pbps_drop_requirement;".into(),
+            rollback: "ROLLBACK TO SAVEPOINT pbps_drop_requirement; RELEASE SAVEPOINT pbps_drop_requirement;".into(),
+        },
+    };
+    conn.begin(&framing)
+        .await
+        .map_err(|_| refused("could not be vetted: no transaction to bind it in"))?;
+    let result = async {
+        // Recording and early planning start fresh sessions. Bind under the
+        // same parser settings as apply, including the target's captured zone.
+        let zone = conn.session_zone().cloned().unwrap_or_else(pbps_model::SessionZone::utc);
+        conn.execute(&crate::session_pins(&zone)).await.map_err(|_| refused("could not be vetted: its session settings could not be pinned"))?;
+        let rows = conn.query_with("SELECT count(*)::pg_catalog.int4 AS columns FROM pg_catalog.pg_attribute WHERE attrelid OPERATOR(pg_catalog.=) $1::pg_catalog.text::pg_catalog.regclass AND attnum OPERATOR(pg_catalog.>) 0 AND NOT attisdropped", &[pbps_db::Param::Str(&qualified)]).await.map_err(|_| refused("could not be vetted: its table columns could not be read"))?;
+        let columns: i32 = rows.first().and_then(|r| r.try_get("columns").ok().flatten()).ok_or_else(|| refused("could not be vetted: its table columns are unreadable"))?;
+        if let Some(inputs) = literal_inputs::before_bind(conn, predicate, None).await? {
+            conn.execute_with(&format!("CREATE TEMPORARY TABLE pg_temp.pbps_conversion_input (LIKE {qualified} EXCLUDING ALL) ON COMMIT DROP"), &[]).await.map_err(|_| refused("could not be vetted: its binding table could not be created"))?;
+            inputs.check(conn, &pbps_model::TableName::new("pg_temp", "pbps_conversion_input"), true).await?;
+        }
+        vet_in_transaction(conn, &format!("LIKE {qualified} EXCLUDING ALL"), "", predicate, &table.shown().to_string(), columns, true).await
+    }.await;
+    let closed = conn.rollback(&framing).await;
+    let columns = result?;
+    closed.map_err(|_| refused("could not be vetted: its transaction did not close"))?;
+    Ok(columns)
+}
+
+fn expression_check(expression: &str, predicate: bool) -> String {
+    let test = if predicate { "TRUE" } else { "NULL" };
+    format!("(({expression}) IS {test}) OR true")
 }
 
 async fn vet_in_transaction(
@@ -911,8 +999,20 @@ async fn vet_in_transaction(
     ty: &str,
     using: &str,
     shown: &str,
-) -> Result<(), String> {
-    let refuse = |why: &str| format!("the conversion `USING {using}` of {shown} {why}");
+    columns: i32,
+    predicate: bool,
+) -> Result<BTreeSet<pbps_model::ColumnName>, String> {
+    let refuse = |why: &str| {
+        if predicate {
+            format!(
+                "the row requirement `{}` of {shown} {why}",
+                pbps_model::escape::Escaped(using)
+            )
+        } else {
+            format!("the conversion `USING {using}` of {shown} {why}")
+        }
+    };
+    let check = expression_check(using, predicate);
     // **One statement, by the protocol and not by reading the text** (round 3
     // review). `execute` is a simple-protocol batch, and text such as
     // `NULL) IS NULL) OR true)); COMMIT; SELECT f(); --` closes this statement
@@ -926,7 +1026,7 @@ async fn vet_in_transaction(
         .execute_with(
             &format!(
                 "CREATE TEMPORARY TABLE pg_temp.pbps_conversion ({column} {ty}, \
-                 CONSTRAINT pbps_conversion CHECK ((({using}) IS NULL) OR true)) ON COMMIT DROP"
+                 CONSTRAINT pbps_conversion CHECK ({check})) ON COMMIT DROP"
             ),
             &[],
         )
@@ -935,10 +1035,16 @@ async fn vet_in_transaction(
         let code = e
             .server_error_code()
             .unwrap_or_else(|| "unknown".to_owned());
-        return Err(refuse(&format!(
-            "does not bind against the column alone (SQLSTATE {code}): it may use only the \
+        return Err(refuse(&if predicate {
+            format!(
+                "does not bind against this table's columns (SQLSTATE {code}): only this table's columns and no subqueries are allowed"
+            )
+        } else {
+            format!(
+                "does not bind against the column alone (SQLSTATE {code}): it may use only the \
              column itself, no other column, subquery or object the engine cannot resolve there"
-        )));
+            )
+        }));
     }
     // One statement can still be closed into more than one clause of the
     // `CREATE TABLE`: `1) IS NULL) OR true), d integer DEFAULT (((1` adds a
@@ -954,7 +1060,7 @@ async fn vet_in_transaction(
                  WHERE a.attrelid OPERATOR(pg_catalog.=) r.oid
                    AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped)::pg_catalog.int4 AS columns,
                (SELECT count(*) FROM pg_catalog.pg_constraint c
-                 WHERE c.conrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS constraints,
+                 WHERE c.conrelid OPERATOR(pg_catalog.=) r.oid AND c.contype OPERATOR(pg_catalog.<>) 'n')::pg_catalog.int4 AS constraints,
                (SELECT count(*) FROM pg_catalog.pg_attrdef d
                  WHERE d.adrelid OPERATOR(pg_catalog.=) r.oid)::pg_catalog.int4 AS defaults,
                (SELECT count(*) FROM pg_catalog.pg_inherits i
@@ -982,7 +1088,7 @@ async fn vet_in_transaction(
         .map(|name| row.try_get::<i32>(name).ok().flatten())
         .collect()
     });
-    if counts.as_deref() != Some(&[1, 1, 0, 0, 0, 1]) {
+    if counts.as_deref() != Some(&[columns, 1, 0, 0, 0, 1]) {
         return Err(refuse(
             "is more than one expression: it closes the check it is bound in and adds to the \
              statement, and it may be the one expression and nothing else",
@@ -1027,7 +1133,11 @@ async fn vet_in_transaction(
     }
     let used_by = Use {
         ty: shown.to_owned(),
-        part: Part::Conversion,
+        part: if predicate {
+            Part::RowRequirement
+        } else {
+            Part::Conversion
+        },
     };
     let functions: BTreeMap<Oid, Vec<Use>> = bound
         .routines
@@ -1050,18 +1160,36 @@ async fn vet_in_transaction(
             Failure::Read(_) => refuse("could not be vetted: the catalog could not be read"),
             Failure::Uncertified(why) => refuse(&format!("could not be vetted: {why}")),
         })?;
-    if reasons.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !reasons.is_empty() {
+        return Err(format!(
             "{}; nothing has been changed",
             reasons
                 .iter()
                 .map(|r| Reason::Routine(r.clone()).to_string())
                 .collect::<Vec<_>>()
                 .join("; ")
-        ))
+        ));
     }
+    if !predicate {
+        return Ok(BTreeSet::new());
+    }
+    let routines = function_rows(conn, &functions.keys().copied().collect::<Vec<_>>())
+        .await
+        .map_err(|_| refuse("could not be vetted: routine volatility is unreadable"))?;
+    if routines.values().any(|r| r.volatility == "v") {
+        return Err(refuse(
+            "calls a volatile routine, which cannot be used in a row requirement",
+        ));
+    }
+    let rows = conn.query("SELECT a.attname::pg_catalog.text AS name FROM pg_catalog.pg_constraint c CROSS JOIN LATERAL unnest(c.conkey) k(attnum) JOIN pg_catalog.pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE c.conrelid = 'pg_temp.pbps_conversion'::pg_catalog.regclass AND c.conname = 'pbps_conversion'").await
+        .map_err(|_| refuse("could not be vetted: its referenced columns are unreadable"))?;
+    rows.iter()
+        .map(|r| {
+            need::<&str>(r, "name")
+                .map(Into::into)
+                .map_err(|_| refuse("could not be vetted: a referenced column is unreadable"))
+        })
+        .collect()
 }
 
 /// `server_version_num` / 10000: 16 or 18, the majors the decoder was measured
@@ -1823,7 +1951,16 @@ pub(crate) async fn vet_copy_conversion(
 ) -> Result<(), String> {
     let name = crate::quote(column.raw()).map_err(|e| e.to_string())?;
     let ty = crate::types::normalize(from).map_err(|e| e.to_string())?;
-    vet_in_transaction(conn, &name, &ty.raw().to_string(), using, column.raw()).await?;
+    vet_in_transaction(
+        conn,
+        &name,
+        &ty.raw().to_string(),
+        using,
+        column.raw(),
+        1,
+        false,
+    )
+    .await?;
     conn.execute("DROP TABLE pg_temp.pbps_conversion")
         .await
         .map_err(|_| "rebuild conversion binding could not be removed".to_owned())?;

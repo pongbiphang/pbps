@@ -49,6 +49,9 @@ mod rebuild_members;
 #[path = "support/conversions2331.rs"]
 mod conversions2331;
 
+#[path = "support/drop_requirements2400.rs"]
+mod drop_requirements2400;
+
 #[path = "support/conversions2359.rs"]
 mod conversions2359;
 

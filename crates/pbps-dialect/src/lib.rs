@@ -267,6 +267,8 @@ pub struct DeclaredTypeStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
     pub sql: String,
+    /// The recorded row requirement belongs to this drop, never inferred from SQL.
+    pub drop_guard: Option<pbps_model::DropGuard>,
     /// The declared type this statement leaves, vetted before its transaction commits.
     pub declared_type: Option<DeclaredTypeStatement>,
 
@@ -423,6 +425,7 @@ impl Statement {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
+            drop_guard: None,
             declared_type: None,
             row_write: None,
             index_build: None,
@@ -4883,7 +4886,7 @@ pub fn render_script<D: Dialect + ?Sized>(
     plan: &lower::LoweredPlan<D>,
     dialect: &D,
     zone: &SessionZone,
-) -> String {
+) -> Result<String, DialectError> {
     render_statements(plan.statements(), dialect, zone)
 }
 
@@ -4917,7 +4920,7 @@ pub fn prepare_bootstrap_script<D: PlanDialect>(
 }
 
 impl<D: Dialect + ?Sized> BootstrapScript<D> {
-    pub fn render(&self, dialect: &D, zone: &SessionZone) -> String {
+    pub fn render(&self, dialect: &D, zone: &SessionZone) -> Result<String, DialectError> {
         let statements: Vec<_> = self
             .guard
             .iter()
@@ -4932,21 +4935,29 @@ fn render_statements(
     statements: &[Statement],
     dialect: &(impl Dialect + ?Sized),
     zone: &SessionZone,
-) -> String {
+) -> Result<String, DialectError> {
+    if statements.iter().any(|s| s.drop_guard.is_some()) {
+        return Err(DialectError::Invalid {
+            dialect: dialect.name(),
+            message:
+                "standalone SQL export cannot execute a vetted row requirement; use plan/apply"
+                    .into(),
+        });
+    }
     let Some(pins) = dialect
         .session_pins(zone)
         .filter(|_| !statements.is_empty())
     else {
-        return render_batches(statements, dialect.batch_separator());
+        return Ok(render_batches(statements, dialect.batch_separator()));
     };
     let prepared: Vec<_> = std::iter::once(Statement::new(pins).own_batch())
         .chain(statements.iter().cloned())
         .collect();
-    format!(
+    Ok(format!(
         "-- Execute statements/batches in order, not as one query.\n\
          -- Session settings must take effect before the following SQL is parsed.\n\n{}",
         render_batches(&prepared, dialect.batch_separator())
-    )
+    ))
 }
 
 fn render_batches(statements: &[Statement], separator: Option<&str>) -> String {
@@ -5400,11 +5411,11 @@ mod tests {
         assert_eq!(render_batches(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
         assert_eq!(render_batches(&[], Some("GO")), "");
         assert_eq!(
-            render_statements(&stmts, &MinimalDialect, &SessionZone::utc()),
+            render_statements(&stmts, &MinimalDialect, &SessionZone::utc()).unwrap(),
             render_batches(&stmts, None)
         );
         assert_eq!(
-            render_statements(&[], &MinimalDialect, &SessionZone::utc()),
+            render_statements(&[], &MinimalDialect, &SessionZone::utc()).unwrap(),
             ""
         );
     }

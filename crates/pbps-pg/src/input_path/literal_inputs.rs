@@ -50,7 +50,7 @@ async fn unsafe_types(conn: &mut Conn) -> Result<Vec<(i64, String, String)>, DbE
 pub(super) async fn before_bind(
     conn: &mut Conn,
     expression: &str,
-    source_type: &ColumnType,
+    source_type: Option<&ColumnType>,
 ) -> Result<Option<LiteralInputs>, String> {
     let modifiers = conn
         .query(
@@ -67,15 +67,18 @@ pub(super) async fn before_bind(
     if !modifiers.is_empty() {
         // Strip modifiers structurally: resolving the full source spelling
         // would itself call typmodin. Keep its array identity in the OID.
-        let mut source = source_type.clone();
-        source.args.clear();
-        let source = source.raw().to_string();
         let unreadable = "could not be vetted: modifier-input type names could not be resolved";
-        let source_oid = resolve_type(conn, &source)
-            .await
-            .map_err(|_| unreadable)?
-            .ok_or(unreadable)?;
-        let mut oids = vec![source_oid];
+        let mut oids = Vec::new();
+        if let Some(source_type) = source_type {
+            let mut source = source_type.clone();
+            source.args.clear();
+            oids.push(
+                resolve_type(conn, &source.raw().to_string())
+                    .await
+                    .map_err(|_| unreadable)?
+                    .ok_or(unreadable)?,
+            );
+        }
         for name in type_names(expression) {
             if let Some(oid) = resolve_type(conn, &name).await.map_err(|_| unreadable)? {
                 oids.push(oid);
@@ -126,13 +129,19 @@ pub(super) struct LiteralInputs {
 }
 
 impl LiteralInputs {
-    pub(super) async fn check(self, conn: &mut Conn, binding: &TableName) -> Result<(), String> {
+    pub(super) async fn check(
+        self,
+        conn: &mut Conn,
+        binding: &TableName,
+        predicate: bool,
+    ) -> Result<(), String> {
         let table = format!(
             "{}.{}",
             crate::quote(&binding.schema).map_err(|e| e.to_string())?,
             crate::quote(&binding.name).map_err(|e| e.to_string())?
         );
-        let sql = format!("SELECT (({}) IS NULL) OR true FROM {table}", self.rewritten);
+        let check = super::expression_check(&self.rewritten, predicate);
+        let sql = format!("SELECT {check} FROM {table}");
         let prepared = conn.prepare_query(&sql).await.map_err(|e| {
             let code = e.server_error_code().unwrap_or_else(|| "unknown".into());
             format!("could not be vetted: literal parameter preparation failed (SQLSTATE {code}); write the literal as CAST('...' AS type) or '...'::type")
