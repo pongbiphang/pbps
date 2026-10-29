@@ -767,3 +767,76 @@ fn a_refusal_shows_the_address_it_names_escaped() {
     .unwrap_err();
     assert!(shown(unicode).contains("app.名前_ünï.c"));
 }
+
+#[test]
+fn pending_observations_do_not_become_early_name_transitions_or_execution_proof() {
+    let table: TableName = "app.p".parse().unwrap();
+    let owner: Uid = "t_aaaaaa".parse().unwrap();
+    let column: Uid = "c_aaaaaa".parse().unwrap();
+    let ids = IdsFile {
+        tables: [(owner.clone(), table.clone())].into(),
+        columns: [(column.clone(), table.column("amount"))].into(),
+        ..Default::default()
+    };
+    let mut steps = vec![
+        PlannedChange::new(Change::RenameColumn {
+            uid: column.clone(),
+            table: table.clone(),
+            from: "n".into(),
+            to: "amount".into(),
+            table_was: None,
+        }),
+        PlannedChange::new(Change::AlterColumnDefault {
+            uid: column.clone(),
+            column: table.column("n"),
+            from: Some("1".into()),
+            to: None,
+        }),
+    ];
+    assert!(PlanNames::of(&steps, &ids).is_err());
+    let pending = [column.clone()].into();
+    let names = PlanNames::of_templates(&steps, &ids, &pending).unwrap();
+    assert_eq!(names.column_at(&column, At::End).unwrap().1.raw(), "amount");
+    assert!(PlanNames::of_templates(&steps, &ids, &[owner.clone()].into()).is_err());
+    // A template is not a certificate: the strict view still rejects this list.
+    assert!(PlanNames::of(&steps, &ids).is_err());
+    steps.swap(0, 1);
+    assert!(PlanNames::of(&steps, &ids).is_ok());
+    if let Change::AlterColumnDefault { uid, .. } = &mut steps[0].change {
+        *uid = owner.clone();
+    }
+    assert!(PlanNames::of_templates(&steps, &ids, &[owner].into()).is_err());
+}
+
+#[test]
+fn pending_table_observations_still_require_the_correct_recorded_kind() {
+    let owner: Uid = "t_aaaaaa".parse().unwrap();
+    let column: Uid = "c_aaaaaa".parse().unwrap();
+    let old: TableName = "app.a".parse().unwrap();
+    let new: TableName = "app.b".parse().unwrap();
+    let ids = IdsFile {
+        tables: [(owner.clone(), new.clone())].into(),
+        ..Default::default()
+    };
+    let steps = vec![
+        p(Change::RenameTable {
+            uid: owner.clone(),
+            from: old.clone(),
+            to: new.clone(),
+            defaults: vec![],
+        }),
+        p(Change::SetPartitionDefault {
+            uid: owner.clone(),
+            table: old,
+            parent: "app.p".parse().unwrap(),
+            column: "d".into(),
+            from: Some("1".into()),
+            to: None,
+            fallback: None,
+        }),
+    ];
+    assert!(PlanNames::of(&steps, &ids).is_err());
+    let view = PlanNames::of_templates(&steps, &ids, &[owner.clone()].into()).unwrap();
+    assert_eq!(view.table_at(&owner, At::End), Some(&new));
+    assert!(PlanNames::of_templates(&steps, &ids, &[column].into()).is_err());
+}

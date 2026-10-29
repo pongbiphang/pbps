@@ -265,7 +265,14 @@ fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
         let releases = match facts.module_dependents {
             Some(found) => {
                 let partitions = standing_partitions(declared.schema, &cs);
-                let view = declared.sources.project(&cs.changes).map_err(Refusal)?;
+                let view = super::sources::Projection::of(
+                    &declared.sources,
+                    &cs.changes,
+                    declared.schema,
+                    found.values().flatten(),
+                    &cs.boundaries.parents(),
+                )
+                .map_err(Refusal)?;
                 released(&cs, found, &partitions, &view)
             }
             // `weave` did not run, so no module drop was placed after the

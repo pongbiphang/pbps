@@ -243,6 +243,9 @@ impl<'a> ModuleAdapter<'a> {
     pub fn get(&self, module: &ModuleId) -> Option<&'a Vec<Dependent>> {
         self.0.get(module)
     }
+    pub fn dependents(&self) -> impl Iterator<Item = &'a Dependent> {
+        self.0.values().flatten()
+    }
 }
 
 #[cfg(test)]

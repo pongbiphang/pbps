@@ -183,3 +183,151 @@ async fn a_detached_column_removes_its_existing_foreign_key_before_the_reference
     db.conn.rollback(&framing).await.unwrap();
     db.drop().await;
 }
+
+/// Catalog ordinals and membership change at the same boundaries as the
+/// projection. A detached child stops receiving the parent's appended columns.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; run scripts/live-tests-pg.sh"]
+async fn column_order_and_membership_match_the_catalog_at_each_boundary() {
+    use pbps_model::physical_sources::{Located, PhysicalSources};
+    use pbps_model::plan_names::{At, PlanNames};
+    use pbps_model::{Change, Column, IdsFile, PlannedChange, TableName, Uid};
+    let mut db = TestDb::create("physical_boundaries2296").await;
+    db.conn
+        .execute(
+            "CREATE TABLE public.parent(k integer, d integer) PARTITION BY RANGE(k);
+         CREATE TABLE public.child(k integer, d integer);",
+        )
+        .await
+        .unwrap();
+    let baseline = pbps_pg::catalog::introspect(&mut db.conn)
+        .await
+        .unwrap()
+        .schema;
+    let p: TableName = "public.parent".parse().unwrap();
+    let c: TableName = "public.child".parse().unwrap();
+    let uid = |s: &str| s.parse::<Uid>().unwrap();
+    let base = IdsFile {
+        tables: [(uid("t_aaaaaa"), p.clone()), (uid("t_bbbbbb"), c.clone())].into(),
+        columns: [
+            (uid("c_aaaaaa"), p.column("k")),
+            (uid("c_bbbbbb"), p.column("d")),
+            (uid("c_cccccc"), c.column("k")),
+            (uid("c_dddddd"), c.column("d")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut goal = base.clone();
+    goal.columns.retain(|_, at| at.table != c);
+    goal.columns.insert(uid("c_bbbbbb"), p.column("e"));
+    for (id, at) in [
+        ("c_eeeeee", p.column("z")),
+        ("c_ffffff", p.column("w")),
+        ("c_gggggg", c.column("k")),
+        ("c_hhhhhh", c.column("e")),
+        ("c_jjjjjj", c.column("z")),
+    ] {
+        goal.columns.insert(uid(id), at);
+    }
+    let column = || Box::new(Column::new("integer".parse().unwrap()));
+    let mut detached = baseline.tables[&c].clone();
+    let d = detached.columns.shift_remove("d").unwrap();
+    detached.columns.insert("e".into(), d);
+    detached.columns.insert("z".into(), *column());
+    let changes: Vec<_> = vec![
+        Change::AttachPartition {
+            uid: uid("t_bbbbbb"),
+            table: c.clone(),
+            parent: p.clone(),
+            bound: pbps_model::PartitionBound::Default,
+            key: vec![],
+            shape: Box::default(),
+        },
+        Change::RenameColumn {
+            uid: uid("c_bbbbbb"),
+            table: p.clone(),
+            from: "d".into(),
+            to: "e".into(),
+            table_was: None,
+        },
+        Change::AddColumn {
+            uid: uid("c_eeeeee"),
+            table: p.clone(),
+            name: "z".into(),
+            column: column(),
+        },
+        Change::DetachPartition {
+            uid: uid("t_bbbbbb"),
+            table: c.clone(),
+            parent: p.clone(),
+            names: vec![],
+            shape: Box::new(detached),
+        },
+        Change::AddColumn {
+            uid: uid("c_ffffff"),
+            table: p.clone(),
+            name: "w".into(),
+            column: column(),
+        },
+    ]
+    .into_iter()
+    .map(PlannedChange::new)
+    .collect();
+    let view =
+        PhysicalSources::of(PlanNames::of(&changes, &goal).unwrap(), &baseline, &base).unwrap();
+    let sql = [
+        "ALTER TABLE public.parent ATTACH PARTITION public.child DEFAULT",
+        "ALTER TABLE public.parent RENAME COLUMN d TO e",
+        "ALTER TABLE public.parent ADD COLUMN z integer",
+        "ALTER TABLE public.parent DETACH PARTITION public.child",
+        "ALTER TABLE public.parent ADD COLUMN w integer",
+    ];
+    for boundary in 0..=sql.len() {
+        let at = boundary.checked_sub(1).map_or(At::Start, At::After);
+        for table in [&p, &c] {
+            let relation = table.raw().to_string();
+            let rows = db
+                .conn
+                .query(&format!(
+                    "SELECT attname::text AS name FROM pg_catalog.pg_attribute
+                 WHERE attrelid='{relation}'::regclass AND attnum>0 AND NOT attisdropped ORDER BY attnum"
+                ))
+                .await
+                .unwrap();
+            let columns = rows
+                .iter()
+                .map(|r| r.try_get::<&str>("name").unwrap().unwrap().into())
+                .collect();
+            assert_eq!(
+                view.columns_at(table, at),
+                Located::Present(columns),
+                "{boundary}: {}",
+                table.shown()
+            );
+        }
+        let rows = db
+            .conn
+            .query(
+                "SELECT n.nspname || '.' || c.relname AS name FROM pg_catalog.pg_inherits i
+             JOIN pg_catalog.pg_class c ON c.oid=i.inhrelid
+             JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+             WHERE i.inhparent='public.parent'::regclass ORDER BY name",
+            )
+            .await
+            .unwrap();
+        let members = rows
+            .iter()
+            .map(|r| r.try_get::<&str>("name").unwrap().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(
+            view.members_at(&p, at),
+            Located::Present(members),
+            "{boundary}"
+        );
+        if let Some(sql) = sql.get(boundary) {
+            db.conn.execute(sql).await.unwrap();
+        }
+    }
+    db.drop().await;
+}

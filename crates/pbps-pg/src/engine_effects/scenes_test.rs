@@ -241,3 +241,117 @@ pub(super) fn with_own_values(mut s: Scene, motion: Motion, column: &str, not_nu
     );
     s
 }
+
+use pbps_model::Change;
+pub(super) fn steps(s: &self::Scene, kind: Kind, motion: Motion) -> Vec<Change> {
+    let p = self::name("app.p");
+    let a = self::name("app.a");
+    let q = s.ids.tables[&self::uid("t_aaaaaa")].clone();
+    let old = &s.before.tables[&p].columns["d"];
+    let new = s.after.tables[&q].columns.get("d");
+    let uid = self::uid("c_bbbbbb");
+    let change = match kind {
+        Kind::Add | Kind::Generated => Change::AddColumn {
+            uid: self::uid("c_eeeeee"),
+            table: p.clone(),
+            name: "x".into(),
+            column: Box::new(s.after.tables[&q].columns["x"].clone()),
+        },
+        Kind::Drop => Change::DropColumn {
+            uid,
+            column: p.column("d"),
+        },
+        Kind::Rename => Change::RenameColumn {
+            uid,
+            table: p.clone(),
+            from: "d".into(),
+            to: "e".into(),
+            table_was: None,
+        },
+        Kind::Widen | Kind::Narrow | Kind::Collation => {
+            let new = new.unwrap();
+            Change::AlterColumnType {
+                uid,
+                column: p.column("d"),
+                from: old.ty.clone(),
+                to: new.ty.clone(),
+                from_nullable: old.nullable,
+                to_nullable: new.nullable,
+                from_collation: old.collation.clone(),
+                to_collation: new.collation.clone(),
+                through_external_partitions: false,
+                using: None,
+            }
+        }
+        Kind::SetNotNull | Kind::DropNotNull => Change::AlterColumnNullability {
+            uid,
+            column: p.column("d"),
+            ty: old.ty.clone(),
+            to_nullable: new.unwrap().nullable,
+            collation: old.collation.clone(),
+            through_external_partitions: false,
+        },
+        Kind::SetDefault | Kind::DropDefault => {
+            let default = |c: &Column| {
+                if let ValueSource::Default(e) = &c.value_source {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            };
+            Change::AlterColumnDefault {
+                uid,
+                column: p.column("d"),
+                from: default(old),
+                to: default(new.unwrap()),
+            }
+        }
+        Kind::ParentName | Kind::ParentSchema => Change::RenameTable {
+            uid: self::uid("t_aaaaaa"),
+            from: p,
+            to: q.clone(),
+            defaults: vec![],
+        },
+    };
+    let movement = match motion {
+        Motion::Attach => Change::AttachPartition {
+            uid: self::uid("t_bbbbbb"),
+            table: a.clone(),
+            parent: q.clone(),
+            bound: self::bound(),
+            key: vec![],
+            shape: Box::new(s.after.tables[&a].clone()),
+        },
+        Motion::Detach => Change::DetachPartition {
+            uid: self::uid("t_bbbbbb"),
+            table: a.clone(),
+            parent: q.clone(),
+            names: vec![],
+            shape: Box::new(s.after.tables[&a].clone()),
+        },
+        Motion::Drop => Change::DropTable {
+            uid: self::uid("t_bbbbbb"),
+            name: a,
+            detach_from: Some(q.clone()),
+        },
+    };
+    let mut result = vec![change, movement];
+    // The reference's DEFAULT expansion gives an equal candidate an explicit
+    // inherited restoration; that terminal event makes both cuts agree.
+    if matches!(kind, Kind::SetDefault)
+        && motion == Motion::Attach
+        && s.before.tables[&self::name("app.a")].columns["d"].value_source
+            == s.after.tables[&q].columns["d"].value_source
+    {
+        result.push(Change::SetPartitionDefault {
+            uid: self::uid("t_bbbbbb"),
+            table: self::name("app.a"),
+            parent: q,
+            column: "d".into(),
+            from: Some("7".into()),
+            to: None,
+            fallback: Some("7".into()),
+        });
+    }
+    result
+}

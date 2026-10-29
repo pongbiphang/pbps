@@ -91,6 +91,7 @@ fn key_surfaces_keep_observed_teardown_declared_restoration_and_physical_names()
             &original.holds,
             &view,
             At::Before(0),
+            Intent::Restore,
             &pbps_dialect::MinimalDialect,
         )
         .unwrap();
@@ -242,6 +243,7 @@ fn missing_source_and_unaccounted_descriptions_are_shown_once() {
         sources,
         dialect: &pbps_dialect::MinimalDialect,
         partitions: Partitions::default(),
+        parents: BTreeSet::new(),
     };
     let named = Named {
         need: Need::Removed {

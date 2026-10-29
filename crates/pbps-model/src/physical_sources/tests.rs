@@ -486,3 +486,248 @@ fn conflicting_recorded_identity_is_refused_instead_of_rebinding_a_source() {
             .contains("baseline identity for app.child.n disagrees")
     );
 }
+
+#[test]
+fn physical_order_survives_rename_and_appends_new_member_columns() {
+    let (before, mut old_ids) = baseline(true);
+    old_ids
+        .columns
+        .insert(uid("c_aaaaaa"), table("parent").column("n"));
+    old_ids
+        .columns
+        .insert(uid("c_bbbbbb"), table("parent").column("k"));
+    let mut after = old_ids.clone();
+    after
+        .columns
+        .insert(uid("c_aaaaaa"), table("parent").column("amount"));
+    after
+        .columns
+        .insert(uid("c_eeeeee"), table("parent").column("z"));
+    let changes = steps(vec![
+        Change::RenameColumn {
+            uid: uid("c_aaaaaa"),
+            table: table("parent"),
+            from: "n".into(),
+            to: "amount".into(),
+            table_was: None,
+        },
+        Change::AddColumn {
+            uid: uid("c_eeeeee"),
+            table: table("parent"),
+            name: "z".into(),
+            column: Box::new(Column::new("integer".parse().unwrap())),
+        },
+    ]);
+    let view =
+        PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
+    for target in ["parent", "child"] {
+        assert_eq!(
+            view.columns_at(&table(target), At::Start),
+            Located::Present(vec!["k".into(), "n".into()])
+        );
+        assert_eq!(
+            view.columns_at(&table(target), At::After(0)),
+            Located::Present(vec!["k".into(), "amount".into()])
+        );
+        assert_eq!(
+            view.columns_at(&table(target), At::End),
+            Located::Present(vec!["k".into(), "amount".into(), "z".into()])
+        );
+        assert_eq!(
+            view.columns_at(&table(target), At::Before(changes.len())),
+            Located::Unavailable
+        );
+    }
+    assert_eq!(
+        view.columns_at(&table("unmanaged"), At::Start),
+        Located::Unavailable
+    );
+}
+#[test]
+fn reusing_a_dropped_column_name_does_not_reuse_its_old_position() {
+    let (mut before, mut old_ids) = baseline(false);
+    before
+        .tables
+        .get_mut(&table("parent"))
+        .unwrap()
+        .columns
+        .insert("z".into(), Column::new("integer".parse().unwrap()));
+    old_ids
+        .columns
+        .insert(uid("c_eeeeee"), table("parent").column("z"));
+    let mut after = old_ids.clone();
+    after.columns.remove(&uid("c_bbbbbb"));
+    after
+        .columns
+        .insert(uid("c_ffffff"), table("parent").column("n"));
+    let changes = steps(vec![
+        Change::DropColumn {
+            uid: uid("c_bbbbbb"),
+            column: table("parent").column("n"),
+        },
+        Change::AddColumn {
+            uid: uid("c_ffffff"),
+            table: table("parent"),
+            name: "n".into(),
+            column: Box::new(Column::new("integer".parse().unwrap())),
+        },
+    ]);
+    let view =
+        PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &old_ids).unwrap();
+    assert_eq!(
+        view.columns_at(&table("parent"), At::Start),
+        Located::Present(vec!["k".into(), "n".into(), "z".into()])
+    );
+    assert_eq!(
+        view.columns_at(&table("parent"), At::End),
+        Located::Present(vec!["k".into(), "z".into(), "n".into()])
+    );
+}
+
+#[test]
+fn excluded_families_are_unavailable_instead_of_an_empty_physical_shape() {
+    let (mut before, mut ids) = baseline(false);
+    let child = before.tables.get_mut(&table("child")).unwrap();
+    let column = child.columns.shift_remove("n").unwrap();
+    child.columns.insert("amount".into(), column);
+    ids.columns
+        .insert(uid("c_dddddd"), table("child").column("amount"));
+    let changes = steps(vec![
+        attach(),
+        Change::RenameColumn {
+            uid: uid("c_bbbbbb"),
+            table: table("parent"),
+            from: "n".into(),
+            to: "amount".into(),
+            table_was: None,
+        },
+    ]);
+    let mut after = ids.clone();
+    after
+        .columns
+        .insert(uid("c_bbbbbb"), table("parent").column("amount"));
+    after.columns.remove(&uid("c_cccccc"));
+    after.columns.remove(&uid("c_dddddd"));
+    assert!(PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &ids).is_err());
+    let partial = PhysicalSources::of_excluding(
+        PlanNames::of(&changes, &after).unwrap(),
+        &before,
+        &ids,
+        [uid("t_aaaaaa"), uid("t_bbbbbb")].into(),
+    )
+    .unwrap();
+    assert_eq!(
+        partial.columns_at(&table("child"), At::End),
+        Located::Unavailable
+    );
+    assert_eq!(
+        partial.locate_table(&table("child"), At::End),
+        Located::Unavailable
+    );
+    assert_eq!(
+        partial.source(&table("child").column("n"), At::Start),
+        Source::Unavailable
+    );
+    assert_eq!(
+        partial.locate(&table("child").column("n"), At::Start),
+        Located::Unavailable
+    );
+}
+
+#[test]
+fn membership_uses_the_requested_boundary_and_never_an_unknown_subset() {
+    for attached in [false, true] {
+        let (before, ids) = baseline(attached);
+        let (_, after) = baseline(!attached);
+        let changes = steps(vec![if attached { detach() } else { attach() }]);
+        let sources =
+            PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &ids).unwrap();
+        let before_members = if attached {
+            vec![table("child")]
+        } else {
+            Vec::new()
+        };
+        let after_members = if attached {
+            Vec::new()
+        } else {
+            vec![table("child")]
+        };
+        assert_eq!(
+            sources.members_at(&table("parent"), At::Before(0)),
+            Located::Present(before_members)
+        );
+        assert_eq!(
+            sources.members_at(&table("parent"), At::After(0)),
+            Located::Present(after_members.clone())
+        );
+        assert_eq!(
+            sources.members_at(&table("parent"), At::End),
+            Located::Present(after_members)
+        );
+        assert_eq!(
+            sources.members_at(&table("parent"), At::Before(1)),
+            Located::Unavailable
+        );
+    }
+    let (before, mut ids) = baseline(true);
+    let after = ids.clone();
+    ids.tables.remove(&uid("t_bbbbbb"));
+    let changes = Vec::new();
+    let sources =
+        PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &ids).unwrap();
+    assert_eq!(
+        sources.members_at(&table("parent"), At::End),
+        Located::Unavailable
+    );
+}
+
+#[test]
+fn an_unread_shape_is_not_a_known_empty_column_list() {
+    let (mut before, mut ids) = baseline(false);
+    before
+        .tables
+        .get_mut(&table("parent"))
+        .unwrap()
+        .columns
+        .clear();
+    ids.columns.retain(|_, at| at.table != table("parent"));
+    let steps = Vec::new();
+    let known = PhysicalSources::of(PlanNames::of(&steps, &ids).unwrap(), &before, &ids).unwrap();
+    assert_eq!(
+        known.columns_at(&table("parent"), At::Start),
+        Located::Present(Vec::new())
+    );
+    assert_eq!(
+        known.members_at(&table("parent"), At::Start),
+        Located::Present(Vec::new())
+    );
+    let unread = PhysicalSources::of(
+        PlanNames::of(&steps, &ids).unwrap(),
+        &Schema::default(),
+        &ids,
+    )
+    .unwrap();
+    assert_eq!(
+        unread.columns_at(&table("parent"), At::Start),
+        Located::Unavailable
+    );
+    assert_eq!(
+        unread.members_at(&table("parent"), At::Start),
+        Located::Unavailable
+    );
+    let mut after = ids.clone();
+    after.tables.insert(uid("t_cccccc"), table("empty"));
+    let changes = self::steps(vec![Change::CreateTable {
+        uid: uid("t_cccccc"),
+        name: table("empty"),
+        table: Box::default(),
+        beside_default: None,
+        moves_at_most: None,
+    }]);
+    let created =
+        PhysicalSources::of(PlanNames::of(&changes, &after).unwrap(), &before, &ids).unwrap();
+    assert_eq!(
+        created.columns_at(&table("empty"), At::End),
+        Located::Present(Vec::new())
+    );
+}
