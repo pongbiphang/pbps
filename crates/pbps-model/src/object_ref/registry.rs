@@ -161,42 +161,40 @@ impl<'a> Registry<'a> {
             {
                 out.add(root.clone(), Selector::Part(part), &declaration, false);
             }
-            // A partition has its own physical column surfaces, with the parent's
-            // shape and its own defaults/NOT NULL overrides, but no column UIDs.
-            let shape = table
-                .partition_of
-                .as_ref()
-                .and_then(|p| schema.tables.get(&p.parent))
-                .unwrap_or(table);
-            for (column, spec) in &shape.columns {
-                let root = Root::Column(name.column(column));
-                let inherited = table.partition_of.is_some();
-                let mut register_column = |part| {
-                    let entry = out.add(root.clone(), part, &declaration, inherited);
-                    entry.inherited_from =
-                        table.partition_of.as_ref().map(|p| p.parent.column(column));
-                };
-                register_column(Selector::Whole);
-                let own = table
-                    .partition_of
-                    .as_ref()
-                    .and_then(|p| p.columns.get(column));
-                if !spec.nullable || own.is_some_and(|c| c.not_null) {
-                    register_column(Selector::NotNull);
-                }
-                let facet = match &spec.value_source {
-                    ValueSource::Default(_) => Some(Selector::Default),
-                    ValueSource::Generated(_) => Some(Selector::Generation),
-                    ValueSource::Sequence(_) if !inherited => Some(Selector::Sequence),
-                    ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
-                };
-                if let Some(facet) = facet {
-                    register_column(facet);
-                }
-                if own.is_some_and(|c| c.default.is_some())
-                    && !matches!(&spec.value_source, ValueSource::Default(_))
-                {
-                    register_column(Selector::Default);
+            // Only the root declares columns and owns their UIDs. Every level's
+            // overrides contribute facets: None/false inherit (DEC-1578.1).
+            if let Some(chain) = crate::partitions::ancestor_chain(name, &schema.tables) {
+                let (root_name, shape) = chain.last().expect("a chain includes its root");
+                for (column, spec) in &shape.columns {
+                    let root = Root::Column(name.column(column));
+                    let inherited = table.partition_of.is_some();
+                    let mut register_column = |part| {
+                        let entry = out.add(root.clone(), part, &declaration, inherited);
+                        entry.inherited_from = inherited.then(|| root_name.column(column));
+                    };
+                    register_column(Selector::Whole);
+                    let mut overrides = chain.iter().filter_map(|(_, ancestor)| {
+                        ancestor.partition_of.as_ref()?.columns.get(column)
+                    });
+                    if !spec.nullable || overrides.clone().any(|c| c.not_null) {
+                        register_column(Selector::NotNull);
+                    }
+                    let facet = match &spec.value_source {
+                        ValueSource::Default(_) => Some(Selector::Default),
+                        ValueSource::Generated(_) => Some(Selector::Generation),
+                        ValueSource::Sequence(_) if !inherited => Some(Selector::Sequence),
+                        ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {
+                            None
+                        }
+                    };
+                    if let Some(facet) = facet {
+                        register_column(facet);
+                    }
+                    if overrides.any(|c| c.default.is_some())
+                        && !matches!(&spec.value_source, ValueSource::Default(_))
+                    {
+                        register_column(Selector::Default);
+                    }
                 }
             }
             for (column, spec) in &table.computed {
@@ -392,13 +390,13 @@ impl<'a> Registry<'a> {
             Root::Type(n) => recorded(owners.managed_type(n, spelling)),
             Root::Role(n) => recorded(owners.role(n, spelling)),
             Root::Column(c) if entry.inherited_from.is_some() => {
-                let parent = entry
+                let root_column = entry
                     .inherited_from
                     .as_ref()
-                    .expect("inherited column anchor");
+                    .expect("inherited root column anchor");
                 owners.table(&c.table, spelling).and_then(|table| {
                     owners
-                        .column(parent, spelling)
+                        .column(root_column, spelling)
                         .map(|column| BoundRoot::InheritedColumn { table, column })
                 })
             }

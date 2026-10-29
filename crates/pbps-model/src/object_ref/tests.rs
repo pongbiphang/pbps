@@ -834,3 +834,5 @@ fn diagnostic_references_escape_controls_once_without_changing_identity() {
         assert!(!text.contains('\n'));
     }
 }
+
+mod partitions;

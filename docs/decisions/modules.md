@@ -2136,3 +2136,12 @@ and the live `an_indexed_view_round_trips_and_is_restated_with_its_indexes`
 The registry enumerates declared objects and facets, never SQL tokens, in one index. Dialect normalization precedes uniqueness, owner duplication and SCC validation. Binding delegates to the existing Owners/PlanNames spelling boundary: baseline and final references use their own identities, and inherited columns use their parent's recorded column anchor beside the child's table anchor. No UID is fabricated for a missing object or a name-keyed part. Missing, ambiguous and out-of-database providers are refusals, not absent edges.
 
 The coordinator moved `object_deps` persistence and version-aware migration to the first PR that persists a non-module edge. PR A therefore keeps ModuleDeps as the only plan/state authority, converts legacy annotations through the general in-memory model and writes them back losslessly. IDs, plan/state versions and published schemas do not change. Typed parsing/validation is not authorization to accept new YAML or alter ordering; those belong to later PRs of this issue.
+
+
+<a id="dec-2469-2"></a>
+
+**DEC-2469.2. Inherited object references use the root column identity at every partition depth.** (#2469, #2507.) Column declarations and their recorded UIDs belong to the root table, while each descendant supplies its own table UID. The registry and serial grant resolution share the bounded ancestor traversal already required by DEC-2202.1; a missing ancestor or cycle supplies no column ownership facts. An intermediate partition's empty `columns` is not an empty effective shape.
+
+Every level's `PartitionColumn` overrides contribute default and NOT NULL facets under DEC-1578.1: absent defaults and false NOT NULL flags inherit, and overrides cannot create a column absent from the root. The registry records facet presence, not expression values. Binding pairs the descendant's table UID with the root's column UID through the existing baseline/final Owners boundary. This changes neither partition deployment validation nor the YAML or persisted formats.
+
+Pinned by the multi-level validation, binding, invalid-ancestry and absent-column tests in `crates/pbps-model/src/object_ref/tests/partitions.rs`, and the existing multi-level serial grant tests in `crates/pbps-model/src/role.rs`.

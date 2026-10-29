@@ -16,12 +16,32 @@
 use std::collections::BTreeMap;
 
 use crate::plan_names::{At, Holder, PlanNames};
-use crate::{ColumnRef, Schema, TableName, TypeRef};
+use crate::{ColumnRef, Schema, Table, TableName, TypeRef};
 
-/// The partitions of a schema, by parent, and each partition's parent.
+/// The declaration chain from `table` through its root, inclusive.
 ///
-/// A tree is one level deep: a partitioned table that is itself a partition
-/// is not one pbps holds (DEC-1170.1), so a parent is never a partition.
+/// Like serial grant resolution (DEC-2202.1), this can run before partition
+/// validation: a missing ancestor or a cycle supplies no column ownership facts.
+pub(crate) fn ancestor_chain<'a>(
+    table: &TableName,
+    tables: &'a BTreeMap<TableName, Table>,
+) -> Option<Vec<(&'a TableName, &'a Table)>> {
+    let mut next = table;
+    let mut chain = Vec::new();
+    for _ in 0..tables.len() {
+        let (name, table) = tables.get_key_value(next)?;
+        chain.push((name, table));
+        if let Some(of) = &table.partition_of {
+            next = &of.parent;
+        } else {
+            return Some(chain);
+        }
+    }
+    None
+}
+
+/// The direct partition links of a schema, by parent and child.
+/// Column ownership at arbitrary depth uses `ancestor_chain`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Partitions {
     parents: BTreeMap<TableName, TableName>,
