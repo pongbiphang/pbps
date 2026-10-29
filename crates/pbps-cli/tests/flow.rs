@@ -23946,6 +23946,15 @@ fn consumer_contracts_connected_refusals_and_saved_apply_boundary() {
     consumer_contracts::live(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
 
+#[path = "support/consumer_retirements.rs"]
+mod consumer_retirements;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
+    consumer_retirements::live(&std::env::var("PBPS_TEST_DB").unwrap());
+}
+
 #[path = "support/deployment_services.rs"]
 mod deployment_services1165;
 
@@ -23958,13 +23967,4 @@ fn deployment_services1165_offline_bytes_and_early_refusals_stay_unchanged() {
 #[ignore = "needs live SQL Server"]
 fn deployment_services1165_command_contracts_on_mssql() {
     deployment_services1165::connected(&std::env::var("PBPS_TEST_DB").unwrap(), false);
-}
-
-#[path = "support/consumer_retirements.rs"]
-mod consumer_retirements;
-
-#[test]
-#[ignore = "needs live mssql"]
-fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
-    consumer_retirements::live(&std::env::var("PBPS_TEST_DB").unwrap());
 }

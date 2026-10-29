@@ -36294,26 +36294,6 @@ fn consumer_contracts_classify_effective_domain_attributes_instead_of_redundant_
     }
 }
 
-#[path = "support/deployment_services.rs"]
-mod deployment_services1165;
-
-#[test]
-fn deployment_services1165_offline_bytes_and_early_refusals_stay_unchanged() {
-    deployment_services1165::offline(true);
-}
-
-#[test]
-#[ignore = "needs live PostgreSQL 18"]
-fn deployment_services1165_command_contracts_on_pg18() {
-    deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_DB").unwrap(), true);
-}
-
-#[test]
-#[ignore = "needs live PostgreSQL 16"]
-fn deployment_services1165_command_contracts_on_pg16() {
-    deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
-}
-
 #[path = "support/consumer_retirements.rs"]
 mod consumer_retirements;
 
@@ -36401,4 +36381,24 @@ fn consumer_retirements_do_not_mistake_partition_transitions_for_retirement() {
             "{note:?}"
         );
     }
+}
+
+#[path = "support/deployment_services.rs"]
+mod deployment_services1165;
+
+#[test]
+fn deployment_services1165_offline_bytes_and_early_refusals_stay_unchanged() {
+    deployment_services1165::offline(true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn deployment_services1165_command_contracts_on_pg18() {
+    deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_DB").unwrap(), true);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn deployment_services1165_command_contracts_on_pg16() {
+    deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
 }
