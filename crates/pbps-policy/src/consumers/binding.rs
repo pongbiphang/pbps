@@ -25,12 +25,16 @@ pub struct Entry {
     pub(super) target: Target,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Bindings(pub(super) Vec<Entry>);
 
 impl Bindings {
     pub fn contracts(&self) -> impl Iterator<Item = &Entry> {
         self.0.iter()
+    }
+
+    pub fn on_sides(&self, sides: &[Side<'_>; 2]) -> Self {
+        Self(self.0.iter().map(|entry| entry.on_sides(sides)).collect())
     }
 
     /// Spelling and review metadata do not retire an identity-bound contract.
@@ -59,21 +63,28 @@ impl Entry {
         Bindings(vec![self.clone()])
     }
 
-    /// Compare both declarations in the same identity context: attaching retires
-    /// a column UID, and detaching creates one. The ordinary resolver bridges it.
-    pub fn resolve(
-        &self,
-        sides: &[Side<'_>; 2],
-        spell: &dyn Fn(&pbps_model::ModuleId) -> pbps_model::ModuleId,
-    ) -> Result<Self, Vec<String>> {
-        let mut declaration = super::Consumer::default();
-        if self.writes {
-            declaration.writes.push(self.text.clone());
-        } else {
-            declaration.uses.push(self.text.clone());
+    /// Preserve the bound target, including when a vacated spelling is reused.
+    /// Only a named column needs the ordinary partition identity bridge; find
+    /// its table by UID and reuse Object::key, never parse the entry's text.
+    pub fn on_sides(&self, sides: &[Side<'_>; 2]) -> Self {
+        let mut entry = self.clone();
+        if let Target::NamedColumn { table, name } = &self.target {
+            entry.target = sides
+                .iter()
+                .find_map(|side| {
+                    let table = side.ids.tables.get(table)?;
+                    side.schema.tables.get(table)?;
+                    let object = Object::Column(table.column(name.clone()));
+                    // Computed columns also have named targets. Start from a
+                    // side with this bound key, not an ordinary replacement.
+                    if object.key(*side, &[*side])? != self.target {
+                        return None;
+                    }
+                    object.key(*side, sides)
+                })
+                .unwrap_or_else(|| self.target.clone());
         }
-        Bindings::resolve(&[(self.consumer.clone(), declaration)].into(), sides, spell)
-            .map(|bound| bound.0.into_iter().next().expect("one restored contract"))
+        entry
     }
 
     pub(super) fn access(&self) -> &'static str {

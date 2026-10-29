@@ -68,15 +68,13 @@ fn assess(
     // Ask the existing rule, including its severity, suppression and restoration
     // decisions. A removal unrelated to an error in this plan is not evidence.
     for contract in &old {
-        let contract = contract
-            .resolve(&policy_sides, &|id| crate::policy_module_id(id, dialect))
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
-        if current.contains(&contract) {
+        let restored = contract.on_sides(&policy_sides);
+        if current.contains(&restored) {
             continue;
         }
         let errors: Vec<_> = pbps_policy::consumers::plan(
             cs,
-            &contract.bindings(),
+            &restored.bindings(),
             &policy_sides,
             &policies,
             ctx,
@@ -97,12 +95,12 @@ fn assess(
             ),
             "Git history does not establish the baseline as an ancestor of the candidate; fetch the complete history"
         );
-        let source = if history.contains(candidate, &contract)? {
+        let source = if history.contains(candidate, contract)? {
             "working tree, not committed".to_owned()
         } else {
             format!(
                 "commit `{}`",
-                history.retiring_commit(revision, candidate, &contract)?
+                history.retiring_commit(revision, candidate, contract)?
             )
         };
         for (index, finding) in errors {
@@ -126,7 +124,7 @@ fn assess(
 }
 
 struct Historical {
-    consumers: pbps_policy::consumers::Consumers,
+    bound: Bindings,
     baseline: baseline::Baseline,
 }
 struct History<'a> {
@@ -142,16 +140,28 @@ impl History<'_> {
     ) -> anyhow::Result<(Bindings, [pbps_policy::consumers::Side<'_>; 2])> {
         if !self.revisions.contains_key(revision) {
             let historical = match baseline::config_at(self.project, revision)? {
-                Some(config) if !config.consumers.is_empty() => Some(Historical {
-                    consumers: config.consumers,
-                    baseline: baseline::load(
+                Some(config) if !config.consumers.is_empty() => {
+                    let baseline = baseline::load(
                         self.project,
                         &baseline::Source::Git {
                             rev: revision.into(),
                         },
                         self.dialect,
-                    )?,
-                }),
+                    )?;
+                    let side = pbps_policy::consumers::Side {
+                        schema: &baseline.schema,
+                        ids: &baseline.ids,
+                    };
+                    // Bind declarations once in their own revision. A later
+                    // reuse of a name cannot change the target already recorded.
+                    let bound = Bindings::resolve(&config.consumers, &[side; 2], &|id| {
+                        crate::policy_module_id(id, self.dialect)
+                    })
+                    .map_err(|errors| {
+                        anyhow::anyhow!("consumer contracts at `{revision}`: {}", errors.join("; "))
+                    })?;
+                    Some(Historical { bound, baseline })
+                }
                 _ => None,
             };
             self.revisions.insert(revision.into(), historical);
@@ -166,25 +176,12 @@ impl History<'_> {
                 ids: &historical.baseline.ids,
             },
         ];
-        let bound = Bindings::resolve(&historical.consumers, &sides, &|id| {
-            crate::policy_module_id(id, self.dialect)
-        })
-        .map_err(|errors| {
-            anyhow::anyhow!("consumer contracts at `{revision}`: {}", errors.join("; "))
-        })?;
-        Ok((bound, sides))
+        Ok((historical.bound.clone(), sides))
     }
 
     fn contains(&mut self, revision: &str, contract: &BoundContract) -> anyhow::Result<bool> {
-        let dialect = self.dialect;
         let (bound, sides) = self.bindings(revision)?;
-        if bound.contracts().next().is_none() {
-            return Ok(false);
-        }
-        let restored = contract
-            .resolve(&sides, &|id| crate::policy_module_id(id, dialect))
-            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
-        Ok(bound.contains(&restored))
+        Ok(bound.on_sides(&sides).contains(&contract.on_sides(&sides)))
     }
 
     fn retiring_commit(

@@ -1915,7 +1915,7 @@ fn restored_partition_contracts_share_the_ordinary_two_sided_binding() {
             !new.contains(entry),
             "one-sided targets differ across the transition"
         );
-        let restored = entry.resolve(&sides, &spell).unwrap();
+        let restored = entry.on_sides(&sides);
         let current = Bindings::resolve(&declared, &sides, &spell).unwrap();
         assert!(current.contains(&restored));
         // Negative: sharing an object does not retire another consumer's entry.
@@ -1927,5 +1927,106 @@ fn restored_partition_contracts_share_the_ordinary_two_sided_binding() {
                 .unwrap()
                 .contains(&restored)
         );
+    }
+}
+
+#[test]
+fn restoration_keeps_table_column_and_module_targets_without_parsing_entry_text() {
+    let before = schema();
+    let old = ids();
+    let mut after = before.clone();
+    let mut new = old.clone();
+    let renamed: TableName = "app.renamed".parse().unwrap();
+    after
+        .tables
+        .insert(renamed.clone(), before.tables[&name()].clone());
+    new.tables.insert(uid("t_aaaaaa"), renamed.clone());
+    new.tables.insert(uid("t_bbbbbb"), name());
+    new.columns.insert(uid("c_aaaaaa"), renamed.column("old"));
+    new.columns.insert(uid("c_bbbbbb"), name().column("old"));
+    let initial = Side {
+        schema: &before,
+        ids: &old,
+    };
+    let sides = [
+        initial,
+        Side {
+            schema: &after,
+            ids: &new,
+        },
+    ];
+    for object in ["app.t", "app.t.old"] {
+        let bound =
+            Bindings::resolve(&consumers(object, false), &[initial; 2], &Clone::clone).unwrap();
+        let mut entry = bound.contracts().next().unwrap().clone();
+        entry.text = "this is display text, not a declaration to resolve".into();
+        assert!(bound.contains(&entry.on_sides(&sides)));
+        // The replacement object's UID does not match the original target.
+        let replacement =
+            Bindings::resolve(&consumers(object, false), &[sides[1]; 2], &Clone::clone).unwrap();
+        assert!(
+            !replacement
+                .on_sides(&sides)
+                .contains(&entry.on_sides(&sides))
+        );
+    }
+    let mut module = before.clone();
+    let id: pbps_model::ModuleId = "app.view".parse().unwrap();
+    module.modules.insert(
+        id.clone(),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::View,
+            definition: "SELECT 1 AS id".into(),
+            description: None,
+            options: Default::default(),
+        },
+    );
+    let side = Side {
+        schema: &module,
+        ids: &old,
+    };
+    let bound =
+        Bindings::resolve(&consumers("app.view", false), &[side; 2], &Clone::clone).unwrap();
+    let mut entry = bound.contracts().next().unwrap().clone();
+    entry.text.clear();
+    assert!(bound.contains(&entry.on_sides(&sides)));
+}
+
+#[test]
+fn named_computed_contracts_do_not_acquire_an_ordinary_replacements_uid() {
+    let ordinary = schema();
+    let owned = ids();
+    let mut computed = ordinary.clone();
+    computed
+        .tables
+        .get_mut(&name())
+        .unwrap()
+        .columns
+        .shift_remove(&pbps_model::ColumnName::from("old"));
+    computed.tables.get_mut(&name()).unwrap().computed.insert(
+        "old".into(),
+        pbps_model::ComputedColumn {
+            expression: "1".into(),
+            persisted: false,
+            not_null: false,
+        },
+    );
+    let mut unowned = owned.clone();
+    unowned.columns.remove(&uid("c_aaaaaa"));
+    let plain = Side {
+        schema: &ordinary,
+        ids: &owned,
+    };
+    let derived = Side {
+        schema: &computed,
+        ids: &unowned,
+    };
+    let declared = consumers("app.t.old", false);
+    let old = Bindings::resolve(&declared, &[derived; 2], &Clone::clone).unwrap();
+    let replacement = Bindings::resolve(&declared, &[plain; 2], &Clone::clone).unwrap();
+    for sides in [[plain, derived], [derived, plain]] {
+        let restored = old.on_sides(&sides);
+        assert!(restored.contains(old.contracts().next().unwrap()));
+        assert!(!restored.contains(replacement.contracts().next().unwrap()));
     }
 }

@@ -451,6 +451,61 @@ fn consumer_retirements_do_not_attribute_through_a_shallow_merged_branch() {
     );
 }
 
+#[test]
+fn consumer_retirements_keep_bound_targets_when_a_renamed_objects_name_is_reused() {
+    for object in ["app.t", "app.t.old"] {
+        let declared = format!("consumers:\n  reader: {{uses: [{object}]}}\n");
+        let (d, baseline) = start("retirement-reused-name", &declared);
+        let retiring = retire(&d);
+        d.table(&COLUMNS.replace("table: app.t", "table: app.renamed\nrenamed_from: app.t"));
+        // Vacant-name control: the retired table or column keeps its original UID.
+        let (_, report) = plan(&d, &baseline);
+        let note = notes(&report, "consumer.retired");
+        assert_eq!(note.len(), 1, "{object}: {report}");
+        assert!(note[0].contains(&retiring), "{note:?}");
+        assert!(notes(&report, "consumer.retirement-unavailable").is_empty());
+        d.commit();
+        std::fs::write(d.dir.join("schema/replacement.yml"), COLUMNS).unwrap();
+        let (_, report) = plan(&d, &baseline);
+        let note = notes(&report, "consumer.retired");
+        assert_eq!(note.len(), 1, "{object}: {report}");
+        assert!(note[0].contains(&retiring), "{note:?}");
+        assert!(
+            notes(&report, "consumer.retirement-unavailable").is_empty(),
+            "{report}"
+        );
+        // A live entry for the renamed original is still the same bound target.
+        config(&d, &declared.replace("app.t", "app.renamed"));
+        let out = d.run(&["plan", "--no-dev", "--since", &baseline, "--format", "json"]);
+        assert_eq!(code(&out), 2, "{}{}", stdout(&out), stderr(&out));
+        let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+        assert!(notes(&report, "consumer.retired").is_empty(), "{report}");
+        assert!(
+            notes(&report, "consumer.retirement-unavailable").is_empty(),
+            "{report}"
+        );
+        config(&d, "");
+        d.commit();
+        // The same declaration text can later name a different UID. Neither
+        // introducing nor retiring that new contract changes the old retirement.
+        config(&d, &declared);
+        ok(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        let replacement_retirement = retire(&d);
+        let (_, report) = plan(&d, &baseline);
+        let note = notes(&report, "consumer.retired");
+        assert_eq!(note.len(), 1, "{object}: {report}");
+        assert!(
+            note[0].contains(&retiring) && !note[0].contains(&replacement_retirement),
+            "{note:?}"
+        );
+        assert!(
+            notes(&report, "consumer.retirement-unavailable").is_empty(),
+            "{report}"
+        );
+    }
+}
+
 pub fn live(server: &str) {
     let own = OwnDatabase::new(server, "consumer_retirement");
     let connection = own.connection();
