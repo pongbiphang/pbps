@@ -9297,3 +9297,31 @@ dependent-bearing changes/order/spellings golden; and the successful real-diff
 setup of `physical_column_lists_are_obligations_at_attach_and_detach`. Their
 reference assertions are unchanged. No guard lift, format, scratch/fill or
 annotation-projection change is included here.
+
+
+<a id="dec-2296-11"></a>
+
+**DEC-2296.11. A positional stored source is not evidence of its future values.**
+A candidate may fill its NULLs with USING before attaching and before its parent
+becomes NOT NULL. PhysicalSources proves physical continuity, not the result of
+that conversion. Selected scalar probes and baseline-aware range scans therefore
+share a prefix-value guard. It uses the existing PlanFacts value/row events and
+positional membership at each writer and reader, so only contributing identities
+are affected, including recursive writes before a detach or after an attach.
+Column additions/backfills, generated-expression changes, retypes, enum rebuilds,
+row writes and moves out of a DEFAULT cannot silently reuse stored values.
+Rebuild/copy phases intentionally have no ordinary PlanFacts row events; later
+positional probes remain unchecked after such a phase until its separate
+recertification, rather than treating the missing events as unchanged values.
+Changes after the probe, unrelated identities and default metadata alone do not
+invalidate its read. Missing membership evidence remains unknown.
+
+The smaller sound fix reports affected row probes as unchecked. The ordinary
+rows_after projection already declines recorded USING expressions because they
+cannot be respelled without rewriting SQL. This change introduces no second
+conversion evaluator. The engine still enforces constraints during apply; a
+NULL-preserving conversion still fails NOT NULL there. A source with unchanged
+stored NULLs still produces a positive refusal before apply. Range metadata
+probes remain independent and continue to run. The existing no-baseline API
+retains its prior behavior; production baseline-aware callers use the shared
+guard. No high-level guard, ordering rule, annotation contract or format changes.

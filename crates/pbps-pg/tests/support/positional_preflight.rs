@@ -585,3 +585,161 @@ async fn membership_null_probes_read_each_selected_stored_source_once() {
         .unwrap();
     db.drop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+async fn converted_membership_values_are_unchecked_and_engine_constraints_still_decide() {
+    use pbps_model::{
+        Change, IdsFile, PlannedChange, Uid, operation::Snapshot, plan_names::PlanNames,
+    };
+    let mut db = TestDb::create("rewritten_membership2296f").await;
+    let uid = |s: &str| s.parse::<Uid>().unwrap();
+    let p: TableName = "public.p".parse().unwrap();
+    let a: TableName = "public.a".parse().unwrap();
+    let pg = Postgres::new();
+    let frame = pg.transaction_framing(&pbps_model::SessionZone::utc());
+    for (label, using, key, expected) in [
+        ("fills NULLs", Some("coalesce(d,0)"), false, true),
+        ("preserves NULLs", Some("d::bigint"), false, false),
+        (
+            "unevaluable future values",
+            Some("coalesce(d,(random()*0)::integer)"),
+            false,
+            true,
+        ),
+        ("range key fills NULLs", Some("coalesce(k,1)"), true, true),
+        ("unchanged NULLs", None, false, false),
+    ] {
+        let child_types = if key {
+            "k integer, d bigint"
+        } else if using.is_some() {
+            "k bigint, d integer"
+        } else {
+            "k bigint, d bigint"
+        };
+        db.conn.execute(&format!("CREATE TABLE public.p(k bigint, d bigint) PARTITION BY RANGE(k); CREATE TABLE public.a({child_types}); INSERT INTO public.a VALUES {};", if key { "(NULL,1)" } else { "(1,NULL)" })).await.unwrap();
+        let schema = pbps_pg::catalog::introspect(&mut db.conn)
+            .await
+            .unwrap()
+            .schema;
+        let ids = IdsFile {
+            tables: [(uid("t_aaaaaa"), p.clone()), (uid("t_bbbbbb"), a.clone())].into(),
+            columns: [
+                (uid("c_aaaaaa"), p.column("k")),
+                (uid("c_bbbbbb"), p.column("d")),
+                (uid("c_cccccc"), a.column("k")),
+                (uid("c_dddddd"), a.column("d")),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut after = ids.clone();
+        after.columns.retain(|_, c| c.table != a);
+        let mut changes = Vec::new();
+        if let Some(using) = using {
+            changes.push(Change::AlterColumnType {
+                uid: uid(if key { "c_cccccc" } else { "c_dddddd" }),
+                column: a.column(if key { "k" } else { "d" }),
+                from: ty("integer"),
+                to: ty("bigint"),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+                using: Some(using.into()),
+            });
+        }
+        changes.push(Change::AttachPartition {
+            uid: uid("t_bbbbbb"),
+            table: a.clone(),
+            parent: p.clone(),
+            bound: pbps_model::PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("0".into())],
+                to: vec![pbps_model::BoundDatum::Value("10".into())],
+            },
+            key: vec![],
+            shape: Box::default(),
+        });
+        changes.push(Change::AlterColumnNullability {
+            uid: uid("c_bbbbbb"),
+            column: p.column("d"),
+            ty: ty("bigint"),
+            to_nullable: false,
+            through_external_partitions: false,
+            collation: None,
+        });
+        let changes: Vec<_> = changes.into_iter().map(PlannedChange::new).collect();
+        let names = PlanNames::of(&changes, &after).unwrap();
+        let report = pg.preflight_with_sources(
+            &names,
+            &pbps_model::Partitions::of(&schema).renamed(&names),
+            Snapshot {
+                schema: &schema,
+                ids: &ids,
+            },
+        );
+        let mut refused = false;
+        for probe in &report.probes {
+            let rows = db
+                .conn
+                .query(&probe.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}: {}", probe.sql));
+            refused |= rows[0].try_get_at::<i32>(0).unwrap().is_some_and(|n| n > 0);
+        }
+        if using.is_some() {
+            assert!(!refused, "{label}: {report:?}");
+            assert!(
+                report
+                    .unchecked
+                    .iter()
+                    .any(|u| u.description.contains("public.p.d")
+                        && u.reason.contains("value changes")),
+                "{label}: {report:?}"
+            );
+            assert!(
+                !report
+                    .probes
+                    .iter()
+                    .any(|p| p.description.contains("existing NULLs")),
+                "{label}: {report:?}"
+            );
+            if key {
+                assert!(
+                    !report
+                        .probes
+                        .iter()
+                        .any(|p| p.description.contains("outside the range")),
+                    "{report:?}"
+                );
+            }
+            assert!(
+                report
+                    .probes
+                    .iter()
+                    .any(|p| p.description.contains("grant")),
+                "metadata probes remain: {report:?}"
+            );
+        } else {
+            assert!(refused, "{label}: stored NULLs are still refused");
+        }
+        db.conn.begin(&frame).await.unwrap();
+        let mut accepted = true;
+        'apply: for change in &changes {
+            for sql in pg.fixture_emit(&change.change, change.strategy).unwrap() {
+                if db.conn.execute(&sql.sql).await.is_err() {
+                    accepted = false;
+                    break 'apply;
+                }
+            }
+        }
+        db.conn.rollback(&frame).await.unwrap();
+        assert_eq!(accepted, expected, "{label}");
+        db.conn
+            .execute("DROP TABLE public.a; DROP TABLE public.p;")
+            .await
+            .unwrap();
+    }
+    db.drop().await;
+}

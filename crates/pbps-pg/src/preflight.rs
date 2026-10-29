@@ -4513,8 +4513,9 @@ pub(crate) fn probes(
         }
     }
     partition_probes(
-        plan_names.changes(),
+        plan_names,
         &facts,
+        before,
         partitions,
         &mut out,
         &mut unchecked,
@@ -4532,12 +4533,14 @@ pub(crate) fn probes(
 /// dropped, which the engine refuses to detach. Both are asked of the current
 /// prefix, because a partition already dropped has taken its rows with it.
 fn partition_probes(
-    changes: &[pbps_model::PlannedChange],
+    plan_names: &PlanNames<'_>,
     facts: &PlanFacts,
+    before: Option<pbps_model::operation::Snapshot<'_>>,
     partitions: &pbps_model::Partitions,
     out: &mut Vec<Probe>,
     unchecked: &mut Vec<Unchecked>,
 ) {
+    let changes = plan_names.changes();
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
@@ -4556,6 +4559,12 @@ fn partition_probes(
             names
         });
         let names = &projection;
+        let rows = |tables: &[&TableName], probe: Result<Probe, DialectError>| {
+            if let Some(before) = before {
+                membership::unchanged(plan_names, step, before, tables)?;
+            }
+            probe
+        };
         // Only completed detach/drop statements remove rows from a range
         // check. A later removal cannot make this statement valid.
         let leaving = |of: &TableName| {
@@ -4610,8 +4619,10 @@ fn partition_probes(
             // the catalog's to say when the move runs, and the moving
             // statement asks the values it meets there (#1763 review).
             if names.recomputed.is_empty() && names.retyped.is_empty() {
-                match default_reference_probe(name, &parent, &stored, names, &dropped_before, bound)
-                {
+                match rows(
+                    &[default],
+                    default_reference_probe(name, &parent, &stored, names, &dropped_before, bound),
+                ) {
                     Ok(probe) => out.push(probe),
                     Err(error) => {
                         unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
@@ -4627,17 +4638,33 @@ fn partition_probes(
             // An unlogged table is in no publication, whatever it publishes:
             // measured on 16 and 18, the subscriber went on replicating
             // (#1763 review).
-            let inserted = (!table.unlogged)
-                .then(|| default_insert_publication_probe(name, &parent, &stored, bound));
+            let inserted = (!table.unlogged).then(|| {
+                rows(
+                    &[default],
+                    default_insert_publication_probe(name, &parent, &stored, bound),
+                )
+            });
             // The rows a human did not allow to move (#1788), asked by
             // their count alone: the questions above say what a move would
             // set off, this one whether it may happen at all.
-            let unallowed = default_move_bound_probe(name, &parent, &stored, bound, *moves_at_most);
+            let unallowed = rows(
+                &[default],
+                default_move_bound_probe(name, &parent, &stored, bound, *moves_at_most),
+            );
             for probe in [
-                default_hidden_referencers_probe(name, &parent, &stored, names, bound),
-                default_trigger_probe(name, &parent, &stored, &gone, bound),
+                rows(
+                    &[default],
+                    default_hidden_referencers_probe(name, &parent, &stored, names, bound),
+                ),
+                rows(
+                    &[default],
+                    default_trigger_probe(name, &parent, &stored, &gone, bound),
+                ),
                 default_statement_probe(name, &stored, &gone),
-                default_publication_probe(name, &parent, &stored, bound),
+                rows(
+                    &[default],
+                    default_publication_probe(name, &parent, &stored, bound),
+                ),
             ]
             .into_iter()
             .chain(inserted)
@@ -4665,12 +4692,15 @@ fn partition_probes(
                 .view()
                 .table(&of.parent)
                 .unwrap_or_else(|| of.parent.clone());
-            partition_range_probe(
-                name,
-                &parent,
-                &before_the_plan(&of.parent, bound),
-                &leaving,
-                "create a partition",
+            rows(
+                &[&of.parent],
+                partition_range_probe(
+                    name,
+                    &parent,
+                    &before_the_plan(&of.parent, bound),
+                    &leaving,
+                    "create a partition",
+                ),
             )
         } else if let Change::DropTable {
             name,
@@ -4707,7 +4737,7 @@ fn partition_probes(
             let leaving = leaving(parent);
             let bound = &before_the_plan(parent, bound);
             for probe in [
-                attach_range_probe(table, parent, bound),
+                rows(&[table], attach_range_probe(table, parent, bound)),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {
@@ -4721,7 +4751,10 @@ fn partition_probes(
             if matches!(bound, pbps_model::PartitionBound::Hash { .. }) {
                 continue;
             }
-            partition_range_probe(table, parent, bound, &leaving, "attach a table")
+            rows(
+                &[parent],
+                partition_range_probe(table, parent, bound, &leaving, "attach a table"),
+            )
         } else if let Change::AttachPartition {
             table,
             parent,
@@ -4759,7 +4792,10 @@ fn partition_probes(
                 .collect();
             let beside: Vec<&pbps_model::PartitionBound> = beside.iter().collect();
             for probe in [
-                attach_default_rows_probe(table, parent, &beside, &leaving),
+                rows(
+                    &[table],
+                    attach_default_rows_probe(table, parent, &beside, &leaving),
+                ),
                 attach_trigger_probe(table, parent, &changes[..step], &changes[step + 1..]),
                 attach_column_grant_probe(table),
             ] {

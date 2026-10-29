@@ -72,14 +72,12 @@ pub(super) fn sources(
         };
         let mut tables = vec![column.table.clone()];
         tables.extend(members);
+        unchanged(names, step, before, &tables.iter().collect::<Vec<_>>())?;
         let mut sources = Vec::new();
         for table in tables {
-            let uid = owner(names, &table, At::Before(step)).ok_or_else(|| {
+            owner(names, &table, At::Before(step)).ok_or_else(|| {
                 unavailable("a selected row contribution has no current table identity")
             })?;
-            // Moving tables with declared row writes retain their existing
-            // representation guard. Never guess a row after an unknown write.
-            if names.changes()[..step].iter().any(|p|matches!(&p.change,Change::InsertRow{table:t,..}|Change::UpdateRow{table:t,..}|Change::DeleteRow{table:t,..} if owner(names,t,At::End).as_ref()==Some(&uid))){return Err(unavailable("the selected membership contribution has preceding row writes which cannot be evaluated before apply"));}
             match physical.source(&table.column(&column.name), At::Before(step)) {
                 Source::Stored(source) => sources.push(source),
                 Source::Created { .. } => {
@@ -97,6 +95,100 @@ pub(super) fn sources(
         Ok(sources)
     })())
 }
+/// Physical continuity proves addresses, not the values after a rewrite.
+/// Share this conservative rule with range scans; metadata probes stay separate.
+/// The ordinary rows_after projection cannot respell recorded USING expressions
+/// either (DEC-2296.11), so no second conversion projection is introduced here.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(super) fn unchanged(
+    names: &PlanNames<'_>,
+    step: usize,
+    before: Snapshot<'_>,
+    tables: &[&TableName],
+) -> Result<(), DialectError> {
+    // Rebuild phases deliberately have no ordinary PlanFacts row events.
+    // Their later recertification cannot supply evidence to an earlier probe.
+    if names.changes()[..step]
+        .iter()
+        .any(|p| p.change.pending_rebuild().is_some())
+    {
+        return Err(unavailable(
+            "a preceding rebuild phase has values which cannot be evaluated before apply",
+        ));
+    }
+    let facts = PlanFacts::of(names);
+    let writers = facts
+        .before(step)
+        .events()
+        .filter_map(|(at, event)| {
+            let table = match event {
+                Event::AlterColumnType { column, .. }
+                | Event::AlterColumnExpression { column }
+                | Event::RebuildEnumColumn { column }
+                | Event::DropColumn { column, .. } => &column.table,
+                Event::AddColumn { table, .. }
+                | Event::AddComputedColumn { table, .. }
+                | Event::DropComputedColumn { table, .. }
+                | Event::InsertRow { table, .. }
+                | Event::UpdateRow { table, .. }
+                | Event::DeleteRow { table, .. } => table,
+                Event::CreateTable { .. } => match &names.changes()[at].change {
+                    Change::CreateTable {
+                        beside_default: Some(default),
+                        ..
+                    } => default,
+                    _ => return None,
+                },
+                Event::DropTable { .. }
+                | Event::RenameColumn { .. }
+                | Event::AddForeignKey { .. }
+                | Event::DropForeignKey { .. }
+                | Event::AttachPartition { .. } => return None,
+            };
+            Some((at, table))
+        })
+        .collect::<Vec<_>>();
+    if writers.is_empty() {
+        return Ok(());
+    }
+    let reason = || {
+        unavailable(
+            "the selected contribution has preceding row writes or value changes which cannot be evaluated before apply",
+        )
+    };
+    let physical = PhysicalSources::of(names.clone(), before.schema, before.ids)
+        .map_err(|e| unavailable(&e.to_string()))?;
+    let mut reads = BTreeSet::new();
+    for table in tables {
+        reads.insert(owner(names, table, At::Before(step)).ok_or_else(reason)?);
+        let pbps_model::physical_sources::Located::Present(members) =
+            physical.members_at(table, At::Before(step))
+        else {
+            return Err(reason());
+        };
+        for member in members {
+            reads.insert(owner(names, &member, At::Before(step)).ok_or_else(reason)?);
+        }
+    }
+    for (at, table) in writers {
+        let uid = owner(names, table, At::Before(at)).ok_or_else(reason)?;
+        if reads.contains(&uid) {
+            return Err(reason());
+        }
+        let pbps_model::physical_sources::Located::Present(members) =
+            physical.members_at(table, At::Before(at))
+        else {
+            return Err(reason());
+        };
+        for member in members {
+            if reads.contains(&owner(names, &member, At::Before(at)).ok_or_else(reason)?) {
+                return Err(reason());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +449,155 @@ mod tests {
                     .any(|p| p.description.contains("cannot become"))
             );
         }
+    }
+    #[test]
+    fn prior_source_value_rewrites_are_unchecked_and_later_ones_are_not_borrowed() {
+        let (schema, ids, after, steps) = fixture(true, true);
+        let a: TableName = "app.a".parse().unwrap();
+        let rewrites = [
+            Change::AlterColumnType {
+                uid: "c_dddddd".parse().unwrap(),
+                column: a.column("d"),
+                from: "integer".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+                using: Some("coalesce(d,0)".into()),
+            },
+            Change::AlterColumnExpression {
+                uid: "c_dddddd".parse().unwrap(),
+                column: a.column("d"),
+                from: "k".into(),
+                to: "k+1".into(),
+            },
+            Change::AddColumn {
+                uid: "c_eeeeee".parse().unwrap(),
+                table: a.clone(),
+                name: "x".into(),
+                column: Box::new(pbps_model::Column {
+                    value_source: ValueSource::Default("1".into()),
+                    ..pbps_model::Column::new("integer".parse().unwrap())
+                }),
+            },
+        ];
+        for change in rewrites {
+            for earlier in [false, true] {
+                let rewrite = pbps_model::PlannedChange::new(change.clone());
+                let input = if earlier {
+                    vec![rewrite, steps[0].clone(), steps[1].clone()]
+                } else {
+                    vec![steps[1].clone(), rewrite, steps[0].clone()]
+                };
+                let names = PlanNames::of(&input, &after).unwrap();
+                let result = sources(
+                    &names,
+                    if earlier { 2 } else { 0 },
+                    Snapshot {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                )
+                .unwrap();
+                assert_eq!(result.is_err(), earlier, "{change:?}: {result:?}");
+            }
+        }
+    }
+    #[test]
+    fn unrelated_rewrites_and_default_metadata_do_not_hide_known_sources() {
+        let (mut schema, mut ids, mut after, mut steps) = fixture(true, true);
+        let u: TableName = "app.unrelated".parse().unwrap();
+        schema
+            .tables
+            .insert(u.clone(), pbps_model::Table::default());
+        ids.tables.insert("t_dddddd".parse().unwrap(), u.clone());
+        after.tables.insert("t_dddddd".parse().unwrap(), u.clone());
+        ids.columns
+            .insert("c_ffffff".parse().unwrap(), u.column("d"));
+        after
+            .columns
+            .insert("c_ffffff".parse().unwrap(), u.column("d"));
+        for table in [u, "app.a".parse().unwrap()] {
+            let change = if table.name == "unrelated" {
+                Change::AlterColumnExpression {
+                    uid: "c_ffffff".parse().unwrap(),
+                    column: table.column("d"),
+                    from: "1".into(),
+                    to: "2".into(),
+                }
+            } else {
+                Change::AlterColumnDefault {
+                    uid: "c_dddddd".parse().unwrap(),
+                    column: table.column("d"),
+                    from: None,
+                    to: Some("1".into()),
+                }
+            };
+            steps.insert(0, pbps_model::PlannedChange::new(change));
+        }
+        let names = PlanNames::of(&steps, &after).unwrap();
+        assert!(
+            sources(
+                &names,
+                3,
+                Snapshot {
+                    schema: &schema,
+                    ids: &ids
+                }
+            )
+            .unwrap()
+            .is_ok()
+        );
+    }
+    #[test]
+    fn rebuild_copy_prefixes_never_supply_stored_value_evidence() {
+        let (schema, ids, _, _) = fixture(true, true);
+        let p: TableName = "app.p".parse().unwrap();
+        let a: TableName = "app.a".parse().unwrap();
+        let copy = Change::CopyTableRows(Box::new(pbps_model::CopyTableRows {
+            source: pbps_model::RebuildRelation {
+                uid: "t_aaaaaa".parse().unwrap(),
+                name: p.clone(),
+            },
+            target: pbps_model::RebuildRelation {
+                uid: "t_bbbbbb".parse().unwrap(),
+                name: a.clone(),
+            },
+            columns: ["k", "d"]
+                .into_iter()
+                .map(|c| pbps_model::CopyColumn {
+                    source: Some(pbps_model::CopySource {
+                        column: p.column(c),
+                        ty: "bigint".parse().unwrap(),
+                        collation: None,
+                    }),
+                    target: a.column(c),
+                    cast: "bigint".parse().unwrap(),
+                    collation: None,
+                    stages: vec![],
+                })
+                .collect(),
+            source_partitions: vec![pbps_model::RebuildRelation {
+                uid: "t_cccccc".parse().unwrap(),
+                name: "app.b".parse().unwrap(),
+            }],
+            target_partitions: vec![],
+            max_rows: 32,
+        }));
+        let input = [pbps_model::PlannedChange::new(copy)];
+        let names = PlanNames::of(&input, &ids).unwrap();
+        let before = Snapshot {
+            schema: &schema,
+            ids: &ids,
+        };
+        assert!(unchanged(&names, 0, before, &[&a]).is_ok());
+        assert!(
+            unchanged(&names, 1, before, &[&a])
+                .unwrap_err()
+                .to_string()
+                .contains("preceding rebuild phase")
+        );
     }
 }
