@@ -9,8 +9,8 @@ import { Lexer, Parser, Evaluator, data } from '@actions/expressions';
 import { falsy } from '@actions/expressions/result';
 
 const workflow = readFileSync(process.argv[2], 'utf8');
-function property(block, key) {
-  const matches = [...block.matchAll(new RegExp(`^ +${key}: (.+)$`, 'gm'))];
+function property(block, key, indentation = " +") {
+  const matches = [...block.matchAll(new RegExp(`^${indentation}${key}: (.+)$`, 'gm'))];
   assert.equal(matches.length, 1, `one ${key} declaration`);
   return matches[0][1];
 }
@@ -25,7 +25,7 @@ const policy = {
   cancel: property(concurrency, 'cancel-in-progress'),
   approve: '${{ true }}',
   environment: property(job('approve'), 'environment'),
-  gate: property(job('gate'), 'if'),
+  gate: property(job('gate'), 'if', ' {4}'),
   check: property(job('gate'), 'name'),
 };
 function value(input) {

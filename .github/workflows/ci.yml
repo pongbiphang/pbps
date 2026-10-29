@@ -351,15 +351,22 @@ jobs:
             docker exec "$id" tail -n 300 /var/opt/mssql/log/errorlog >&2 || docker logs "$id" >&2 2>&1 || true
           fi
 
-  # Scratch separation needs two matching SQL Servers on its own runner.
+  # Each resolver shard needs two matching SQL Servers (DEC-2357.1).
   resolver-mssql:
     needs: [approve, lint]
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['0', '1', '2']
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -368,23 +375,25 @@ jobs:
         run: |
           source scripts/resolver-mssql-fixtures.sh
           # The Express cases need the edition job's second server.
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 \
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-mssql --test live -- --ignored scratch2236 \
             --skip an_express_supplied_reference_predicts_a_fresh_database_exactly \
             --skip an_express_database_closed_before_its_read_still_reads_as_open
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 deployer2267
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 staged2268
-          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 externals2269
-          cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests
-          cargo test --profile live-test -p pbps-cli --bin pbps -- --ignored --test-threads=1 engine::mssql_live_tests
-          # The CLI kill cases need this job's second instance; the `live` job
-          # skips them. The count is asserted so a rename cannot leave the job
-          # green while running none of them.
-          out=$(cargo test --profile live-test -p pbps-cli --test flow -- --ignored --test-threads=1 recovery2410:: 2>&1)
-          echo "$out"
-          echo "$out" | grep -qE '^test result: ok\. 6 passed' || {
-            echo "expected the six SQL Server kill cases to run and pass" >&2
-            exit 1
-          }
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-mssql --test live -- --ignored deployer2267
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-mssql --test live -- --ignored staged2268
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-mssql --test live -- --ignored externals2269
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-cli --lib -- --ignored mssql_live_tests
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql "${{ matrix.shard }}/3" test --profile live-test -p pbps-cli --bin pbps -- --ignored engine::mssql_live_tests
+          # Assert the complete kill-case inventory before partitioning: a
+          # renamed-away case must fail even when this shard's share passes.
+          python3 scripts/live-shards.py ci --allow-empty --output .resolver-mssql --expected-tests 6 "${{ matrix.shard }}/3" \
+            test --profile live-test -p pbps-cli --test flow -- --ignored recovery2410::
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: resolver-mssql-${{ matrix.shard }}
+          path: .resolver-mssql/
+          include-hidden-files: true
+          if-no-files-found: error
 
   # LocalDB is a per-user Windows instance that accepts only a named pipe and
   # integrated authentication, so no Linux job can qualify it as the resolver's
@@ -989,6 +998,16 @@ jobs:
         with:
           ref: ${{ needs.approve.outputs.checkout_sha }}
       - run: python3 scripts/check_gate_needs.py
+      # Compare every executed share with each invocation's authoritative list.
+      - uses: actions/download-artifact@v8
+        if: github.event_name != 'pull_request'
+        with:
+          pattern: resolver-mssql-*
+          path: .resolver-mssql/
+          merge-multiple: true
+      - name: Audit the resolver shard union
+        if: github.event_name != 'pull_request'
+        run: python3 scripts/live-shards.py audit .resolver-mssql 3 --expected-invocations 7
       # Through the environment, not `${{ }}` inside `run:`: interpolation
       # would splice the value into the program text.
       #

@@ -341,11 +341,13 @@ def run_tests(command, assigned):
     return reported, code, time.monotonic() - started, bool(valid)
 
 
-def ci_shard(value, args):
+def ci_shard(value, args, *, expected_tests=None, output=None, allow_empty=False):
     """Use CI's existing services; this path never owns fixture containers."""
     index, count = selector(value)
+    require(not allow_empty or output is not None, "empty CI shares require audited receipts")
     cargo, flags, listing = libtest_args(args)
-    require(listing == ["--ignored"], "CI shards require the full --ignored list without filters")
+    require("--ignored" in listing and "--include-ignored" not in listing,
+            "CI shards require --ignored tests")
     real = shutil.which("cargo")
     require(real is not None, "cargo is not installed")
     enumeration = subprocess.run([real, *cargo, *listing, "--list", "--format=pretty", "--color=never"],
@@ -353,12 +355,28 @@ def ci_shard(value, args):
     require(enumeration.returncode == 0, "cargo --list failed")
     names = listed_tests(enumeration.stdout)
     require(names, "CI --ignored --list contains zero tests")
-    assigned = partition(names, count, "", None, round_robin=True)[index]
+    if expected_tests is not None:
+        require(len(names) == expected_tests,
+                f"expected {expected_tests} tests, listed {len(names)}")
+    groups = partition(names, count, "", None, round_robin=True)
+    assigned = groups[index]
     print(f"ci shard {index}/{count}: {len(assigned)}/{len(names)} tests", flush=True)
-    require(assigned, "CI shard has no assigned tests")
-    _, code, _, valid = run_tests(
-        [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
-         "--color=never", *assigned], assigned)
+    require(assigned or allow_empty, "CI shard has no assigned tests")
+    reported, code, seconds, valid = {}, 0, 0.0, True
+    if assigned:
+        reported, code, seconds, valid = run_tests(
+            [real, *cargo, *flags, "--exact", "--test-threads=1", "--format=pretty",
+             "--color=never", *assigned], assigned)
+    if output is not None:
+        root = Path(output) / str(index)
+        root.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(json.dumps(args).encode()).hexdigest()[:24]
+        path = root / (key + ".json")
+        require(not path.exists(), "CI invocation already has a receipt")
+        receipt = {"args": args, "identity": key, "listed": names, "groups": groups,
+                   "assigned": assigned, "reported": reported, "pinned": False,
+                   "seconds": seconds, "valid": valid}
+        path.write_text(json.dumps(receipt, indent=2) + "\n")
     require(valid, "assigned tests or their libtest summary were not reported exactly once")
     return code
 
@@ -421,9 +439,12 @@ def shard(suite, extra):
     return result.returncode
 
 
-def audit(suite_root, count):
+def audit(suite_root, count, *, expected_invocations=None):
     receipts = [{p.stem: json.loads(p.read_text()) for p in (suite_root / str(i)).glob("*.json")}
                 for i in range(count)]
+    if expected_invocations is not None:
+        require(all(len(shard) == expected_invocations for shard in receipts),
+                "unexpected invocation receipt count")
     require(all(any(r["assigned"] for r in shard.values()) for shard in receipts),
             "a shard is empty for the whole suite")
     passed = failed = 0
@@ -611,8 +632,26 @@ def drive(args):
 
 def main():
     if sys.argv[1:2] == ["ci"]:
-        require(len(sys.argv) >= 4, "ci requires i/N and cargo test arguments")
-        return ci_shard(sys.argv[2], sys.argv[3:])
+        parser = argparse.ArgumentParser(description="Shard one ignored cargo test selection")
+        parser.add_argument("--expected-tests", type=int)
+        parser.add_argument("--allow-empty", action="store_true",
+                            help="allow empty invocation shares only with audited output receipts")
+        parser.add_argument("--output", help="write enumerated and executed test receipts")
+        parser.add_argument("selector")
+        parser.add_argument("cargo", nargs=argparse.REMAINDER)
+        args = parser.parse_args(sys.argv[2:])
+        return ci_shard(args.selector, args.cargo, expected_tests=args.expected_tests,
+                        output=args.output, allow_empty=args.allow_empty)
+    if sys.argv[1:2] == ["audit"]:
+        parser = argparse.ArgumentParser(description="Audit receipts from every shard")
+        parser.add_argument("output", type=Path)
+        parser.add_argument("count", type=int)
+        parser.add_argument("--expected-invocations", type=int)
+        args = parser.parse_args(sys.argv[2:])
+        require(args.count > 0, "shard count must be positive")
+        result, _ = audit(args.output, args.count, expected_invocations=args.expected_invocations)
+        print(json.dumps(result, sort_keys=True))
+        return int(bool(result["failed"]))
     # Internal entries let the shell runners retain their authoritative command
     # sequence. Unset shard mode never enters this driver or its cargo proxy.
     if sys.argv[1:2] == ["cargo"]:

@@ -584,6 +584,31 @@ class WorkflowKeySpellings(unittest.TestCase):
                     audit.check_workflow_key_spellings(template.replace("ENTRY", key + ": value"), "live")
 
 
+class QuotedShardMatrix(unittest.TestCase):
+    def test_literal_digit_axes_expand_only_exact_known_references(self):
+        workflow = """jobs:
+  resolver:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['0', '1', '2']
+    steps:
+      - run: python3 scripts/live-shards.py ci "${{ matrix.shard }}/3" test -p demo --lib -- --ignored
+"""
+        scripts = list(audit.workflow_runs(workflow, "resolver"))
+        self.assertEqual(len(scripts), 3)
+        for index, script in enumerate(scripts):
+            self.assertIn(f'"{index}/3"', script)
+        conditional = workflow.replace('      - run:', "      - name: selected share\n        if: matrix.shard == '1'\n        run:")
+        self.assertEqual(len(list(audit.workflow_runs(conditional, "resolver"))), 1)
+        self.assertIn('"1/3"', next(audit.workflow_runs(conditional, "resolver")))
+        with self.assertRaisesRegex(audit.InventoryError, "unknown matrix axis"):
+            list(audit.workflow_runs(workflow.replace('matrix.shard', 'matrix.other'), "resolver"))
+        for value in ("0", "'true'", "'a,b'", "'0/3'"):
+            with self.subTest(value=value), self.assertRaises(audit.InventoryError):
+                list(audit.workflow_runs(workflow.replace("'0', '1', '2'", value), "resolver"))
+
+
 class CargoSelectors(unittest.TestCase):
 
     def test_ci_shards_are_real_owners_and_invalid_wrappers_are_refused(self):
@@ -598,6 +623,18 @@ class CargoSelectors(unittest.TestCase):
                     audit.cargo_selection(["python3", "scripts/live-shards.py", "ci", selector, *cargo])
         self.assertIsNone(audit.cargo_selection(
             ["python3", "unrelated.py", "ci", "0/3", *cargo]))
+
+    def test_ci_receipt_options_preserve_selection_and_reject_unknown_or_incomplete_options(self):
+        cargo = ["test", "--profile", "live-test", "-p", "demo", "--lib", "--",
+                 "--ignored", "recovery", "--skip", "express"]
+        expected = audit.cargo_selection(["cargo", *cargo])
+        prefix = ["python3", "scripts/live-shards.py", "ci"]
+        self.assertEqual(audit.cargo_selection(
+            [*prefix, "--allow-empty", "--output", "receipts", "--expected-tests", "6", "0/3", *cargo]), expected)
+        for options in (["--output"], ["--unknown", "x"], ["--expected-tests", "no"],
+                        ["--expected-tests", "0"], ["--output", "--expected-tests", "6"]):
+            with self.subTest(options=options), self.assertRaises(audit.InventoryError):
+                audit.cargo_selection([*prefix, *options, "0/3", *cargo])
 
     def test_ambiguous_or_unsupported_cargo_arguments_supply_no_owner(self):
         for arguments in (["--profile"], ["--profile", "--lib"], ["--profile="],

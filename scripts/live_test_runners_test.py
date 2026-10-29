@@ -72,7 +72,7 @@ class CIShardedExecution(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "shard union"):
                 SHARDS.verify_union(names, broken)
 
-    def run_ci(self, value="0/3", mode="ok", extra=()):
+    def run_ci(self, value="0/3", mode="ok", extra=(), options=()):
         with tempfile.TemporaryDirectory(prefix="pbps-ci-shard-") as temporary:
             root = Path(temporary)
             client = root / "cargo"
@@ -90,11 +90,18 @@ if "--list" in args:
     if mode == "short": names = names[:1]
     if mode == "unreadable":
         print("unreadable"); sys.exit(0)
+    tail = args[args.index("--") + 1:]
+    skips = [tail[i + 1] for i, a in enumerate(tail[:-1]) if a == "--skip"]
+    filters = [a for i, a in enumerate(tail) if not a.startswith("-")
+               and (i == 0 or tail[i - 1] != "--skip")]
+    names = [n for n in names if (not filters or any(f in n for f in filters))
+             and not any(skip in n for skip in skips)]
     for name in names: print(name + ": test")
     print(f"\n{len(names)} tests, 0 benchmarks")
 else:
     tail = args[args.index("--") + 1:]
-    names = [a for a in tail if not a.startswith("-")]
+    names = [a for i, a in enumerate(tail) if not a.startswith("-")
+             and (i == 0 or tail[i - 1] != "--skip")]
     if mode == "missing": names = names[:-1]
     if mode == "duplicate": names.append(names[0])
     if mode == "extra": names.append("unassigned_case")
@@ -113,7 +120,7 @@ else:
             env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
                        PBPS_CI_CALLS=str(calls), PBPS_CI_MODE=mode)
             result = subprocess.run(
-                [sys.executable, str(SHARDS.SCRIPT), "ci", value, "test",
+                [sys.executable, str(SHARDS.SCRIPT), "ci", *options, value, "test",
                  "-p", "pbps-cli", "--test", "flow_pg", "--", "--ignored", *extra],
                 cwd=ROOT, env=env, text=True, capture_output=True, timeout=20)
             recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
@@ -172,13 +179,105 @@ else:
                 if mode != "failed":
                     self.assertIn("not reported exactly once", result.stderr)
 
-    def test_ci_refuses_filtered_input_and_invalid_selectors_before_running_cargo(self):
+    def test_ci_refuses_invalid_selectors_and_incompatible_modes_before_running_cargo(self):
         for value, extra in (("3/3", ()), ("0/0", ()), ("bad", ()),
-                             ("0/3", ("--skip", "future")), ("0/3", ("trigger",))):
+                             ("0/3", ("--include-ignored",)), ("0/3", ("--unknown",))):
             with self.subTest(value=value, extra=extra):
                 result, calls = self.run_ci(value, extra=extra)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(calls, [])
+
+    def test_filtered_ci_preserves_skips_and_requires_the_full_expected_count(self):
+        result, calls = self.run_ci("0/1", extra=("future", "--skip", "zebra"),
+                                    options=("--expected-tests", "1"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("future", calls[0])
+        self.assertIn("--skip", calls[0])
+        self.assertNotIn("future", calls[1])
+        self.assertIn("future_case", calls[1])
+        self.assertIn("--skip", calls[1])
+        result, calls = self.run_ci(options=("--expected-tests", "7"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected 7 tests, listed 6", result.stderr)
+        self.assertEqual(len(calls), 1)
+
+    def test_ci_receipts_audit_actual_union_and_refuse_missing_or_unselected_tests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(3):
+                result, _ = self.run_ci(f"{index}/3", options=("--output", str(root)))
+                self.assertEqual(result.returncode, 0, result.stderr)
+            result, _ = SHARDS.audit(root, 3, expected_invocations=1)
+            self.assertEqual(result, {"passed": 6, "failed": 0, "union": "exact"})
+            command = [sys.executable, str(SHARDS.SCRIPT), "audit", str(root), "3",
+                       "--expected-invocations", "1"]
+            audited = subprocess.run(command, text=True, capture_output=True, timeout=20)
+            self.assertEqual(audited.returncode, 0, audited.stderr)
+            self.assertEqual(json.loads(audited.stdout), result)
+            path = next((root / "1").glob("*.json"))
+            original = path.read_text()
+            row = json.loads(original)
+            row["assigned"].pop()
+            path.write_text(json.dumps(row))
+            with self.assertRaisesRegex(ValueError, "assignment differs"):
+                SHARDS.audit(root, 3)
+            path.write_text(original)
+            for receipt in root.glob("*/*.json"):
+                row = json.loads(receipt.read_text())
+                row["listed"].append("test_no_shard_selected")
+                receipt.write_text(json.dumps(row))
+            with self.assertRaisesRegex(ValueError, "shard union"):
+                SHARDS.audit(root, 3)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "invocation receipt count"):
+                SHARDS.audit(root, 3, expected_invocations=1)
+
+    def test_empty_invocation_receipts_are_allowed_but_an_empty_whole_shard_still_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            options = ("--allow-empty", "--output", str(root))
+            for index in range(3):
+                result, calls = self.run_ci(f"{index}/3", mode="short", options=options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls), 2 if index == 0 else 1)
+            with self.assertRaisesRegex(ValueError, "empty for the whole suite"):
+                SHARDS.audit(root, 3, expected_invocations=1)
+            for index in range(3):
+                result, _ = self.run_ci(f"{index}/3", extra=("--skip", "absent"), options=options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            result, _ = SHARDS.audit(root, 3, expected_invocations=2)
+            self.assertEqual(result, {"passed": 7, "failed": 0, "union": "exact"})
+        result, calls = self.run_ci("1/3", mode="short", options=("--allow-empty",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("require audited receipts", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_resolver_matrix_retains_all_seven_selections_and_required_union_audit(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        runs = list(inventory.workflow_runs(workflow, "resolver-mssql"))
+        commands = [c for run in runs for c in inventory.shell_commands(run)]
+        selections = [inventory.cargo_selection(c) for c in commands]
+        selections = [s for s in selections if s is not None]
+        self.assertEqual(len(selections), 21)
+        expected_filters = {"scratch2236", "deployer2267", "staged2268", "externals2269",
+                            "mssql_live_tests", "engine::mssql_live_tests", "recovery2410::"}
+        for index in range(3):
+            selected = [c for c in commands if f"{index}/3" in c]
+            self.assertEqual({next(f for f in c if f in expected_filters) for c in selected},
+                             expected_filters)
+            self.assertEqual(len(selected), 7)
+            kill = [c for c in selected if "recovery2410::" in c]
+            self.assertEqual(len(kill), 1)
+            self.assertEqual(kill[0][kill[0].index("--expected-tests") + 1], "6")
+        body = workflow.split("  resolver-mssql:\n")[1].split("  resolver-localdb:\n")[0]
+        self.assertIn("source scripts/resolver-mssql-fixtures.sh", body)
+        self.assertIn("fail-fast: false", body)
+        self.assertIn("--skip an_express_supplied_reference_predicts_a_fresh_database_exactly", body)
+        self.assertIn("--skip an_express_database_closed_before_its_read_still_reads_as_open", body)
+        gate = workflow.split("  gate:\n")[1]
+        self.assertRegex(gate, r"needs: \[[^\]]*resolver-mssql")
+        self.assertIn("merge-multiple: true", gate)
+        self.assertIn("audit .resolver-mssql 3 --expected-invocations 7", gate)
 
 
 class ShardedExecution(unittest.TestCase):
