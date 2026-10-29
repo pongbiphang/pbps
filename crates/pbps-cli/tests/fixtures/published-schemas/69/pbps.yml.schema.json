@@ -101,6 +101,13 @@
           "type": "null"
         }
       ]
+    },
+    "consumers": {
+      "description": "External consumers whose declared uses and writes the plan must protect.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Consumer"
+      }
     }
   },
   "additionalProperties": false,
@@ -545,6 +552,48 @@
                 }
               ]
             },
+            "consumer.breaking": {
+              "description": "Checks a declared consumer keeps the object names it still uses or writes.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "consumer.unproven": {
+              "description": "Checks a declared consumer's changed interface or writes cannot be proven compatible.",
+              "anyOf": [
+                {
+                  "const": false
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "severity": {
+                      "description": "error, warning, note or off.",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
             "naming.table": {
               "description": "Checks a table's name (without its schema) matches `pattern`. Takes pattern.",
               "anyOf": [
@@ -807,6 +856,8 @@
           "type": "string",
           "enum": [
             "plan.domain-vet-unavailable",
+            "consumer.breaking",
+            "consumer.unproven",
             "naming.table",
             "naming.column",
             "naming.index",
@@ -843,6 +894,36 @@
         "rule",
         "reason"
       ]
+    },
+    "Consumer": {
+      "type": "object",
+      "properties": {
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uses": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "writes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "x-pbps-schema-version": 69,

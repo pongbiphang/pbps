@@ -2746,18 +2746,10 @@
       "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
     },
     {
-      "target": [
-        "pbps-pg",
-        "test",
-        "live"
-      ],
+      "target": ["pbps-pg", "test", "live"],
       "owner": "pg",
       "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "drop_requirements2400::requirement_parentheses_cannot_splice_the_binding_or_count_wrapper_on_postgres_18",
         "drop_requirements2400::requirement_parentheses_cannot_splice_the_binding_or_count_wrapper_on_postgres_16",
@@ -2770,18 +2762,10 @@
       ]
     },
     {
-      "target": [
-        "pbps-cli",
-        "test",
-        "flow_pg"
-      ],
+      "target": ["pbps-cli", "test", "flow_pg"],
       "owner": "pg",
       "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "drop_requirements2400::guarded_drops_record_replace_clear_pin_and_apply_on_postgres_18",
         "drop_requirements2400::guarded_drops_record_replace_clear_pin_and_apply_on_postgres_16",
@@ -2802,18 +2786,10 @@
       ]
     },
     {
-      "target": [
-        "pbps-cli",
-        "bin",
-        "pbps"
-      ],
+      "target": ["pbps-cli", "bin", "pbps"],
       "owner": "pg",
       "validate_on": "linux",
-      "ignored_on": [
-        "linux",
-        "win32",
-        "darwin"
-      ],
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "rehearsal::drop_requirement_tests::guarded_rehearsals_execute_or_refuse_the_guard_on_both_postgres_majors"
       ]
