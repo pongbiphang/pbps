@@ -1122,73 +1122,18 @@ mod live {
         );
     }
 
+    #[path = "swap2505.rs"]
+    mod swap2505;
+
     #[tokio::test]
     #[ignore = "needs docker and the pinned PostgreSQL scratch image"]
     async fn a_start_failing_after_its_id_is_recorded_removes_that_container_not_the_one_now_holding_its_name()
      {
-        use pbps_cli::resolver::server::scratch::container::{Held, Owner};
-        /// An owner whose record succeeds, but which first renames the
-        /// container away and puts another under its name: what a name
-        /// reused by someone else looks like.
-        struct Swapping(String, String);
-        impl Owner for Swapping {
-            fn token(&self) -> String {
-                self.0.clone()
-            }
-            fn labels(&self) -> Vec<String> {
-                vec![format!("{RUN_LABEL}={}", self.0)]
-            }
-            fn recoverable(&self) -> bool {
-                true
-            }
-            async fn before_create(&mut self) -> Result<(), String> {
-                Ok(())
-            }
-            async fn created(&mut self, id: &str) -> Result<(), String> {
-                let docker = |args: &[&str]| {
-                    let done = std::process::Command::new("docker").args(args).output();
-                    let done = done.map_err(|e| e.to_string())?;
-                    done.status
-                        .success()
-                        .then_some(())
-                        .ok_or_else(|| format!("docker {args:?}: {done:?}"))
-                };
-                let name = format!("pbps-scratch-{}", self.0);
-                docker(&["rename", id, &self.1])?;
-                docker(&["create", "--name", &name, &image()])
-            }
+        if std::env::var_os("PBPS_SWAP2505_CHILD").is_some() {
+            swap2505::exercise().await;
+        } else {
+            swap2505::controls().await;
         }
-        struct Made(Vec<String>);
-        impl Drop for Made {
-            fn drop(&mut self) {
-                for name in &self.0 {
-                    let _ = std::process::Command::new("docker")
-                        .args(["rm", "--force", "--volumes", name])
-                        .output();
-                }
-            }
-        }
-        let _serial = Dir::new();
-        let token = record::new_run_id();
-        let (name, moved) = (
-            format!("pbps-scratch-{token}"),
-            format!("pbps-moved-{token}"),
-        );
-        let _made = Made(vec![name.clone(), moved.clone()]);
-        let mut owner = Swapping(token, moved.clone());
-        let started =
-            Held::start_owned(Driver::Postgres, &image(), PullPolicy::Never, &mut owner).await;
-        assert!(started.is_err(), "the replacement has no published port");
-        let exists = |name: &str| {
-            std::process::Command::new("docker")
-                .args(["container", "inspect", name])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        };
-        assert!(!exists(&moved), "the container this run started is removed");
-        assert!(exists(&name), "the one now holding its name is not touched");
     }
 
     #[tokio::test]
