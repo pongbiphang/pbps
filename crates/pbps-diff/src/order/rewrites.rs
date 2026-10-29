@@ -1,6 +1,6 @@
 //! Settle binding releases through the general effect graph (DEC-2228.1).
 
-use super::{Baseline, Because, Checks, Schedule, analyse_with_catalog, graph};
+use super::{Baseline, Because, Checks, Schedule, graph};
 use pbps_dialect::{Dialect, slots::CatalogFacts};
 use pbps_model::operation::{
     Incarnation, ModuleEdits, ObjectKey, Operations, PlanOwners, Requirement, Snapshot,
@@ -76,7 +76,15 @@ fn settle_requirements<S: Clone>(
         schema: after.schema,
         ids: after.ids,
     };
-    let effects = analyse_with_catalog(&operations, &owners, base, end, dialect, catalog);
+    let effects = super::shadow::analyse_planning(
+        &operations,
+        &owners,
+        base,
+        end,
+        dialect,
+        catalog,
+        &changes,
+    );
     if !effects.effects.iter().any(|fx| {
         fx.requires.iter().any(|r| {
             matches!(r, Requirement::BeforeRewrite(_))

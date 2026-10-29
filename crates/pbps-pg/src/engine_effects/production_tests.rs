@@ -1033,3 +1033,136 @@ fn a_new_parent_keeps_its_existing_birth_and_attachment_contract() {
         );
     }
 }
+
+#[test]
+fn ordinary_analysis_does_not_invent_membership_catalog_reads() {
+    use pbps_model::operation::symbolic::{Clause, Fact};
+    let mut s = scene(false);
+    let parent: TableName = "app.p".parse().unwrap();
+    let child: TableName = "app.a".parse().unwrap();
+    for schema in [&mut s.before, &mut s.after] {
+        schema
+            .tables
+            .get_mut(&parent)
+            .unwrap()
+            .columns
+            .get_mut("d")
+            .unwrap()
+            .value_source = ValueSource::Default("app.f(1)".into());
+    }
+    s.before
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .columns
+        .get_mut("d")
+        .unwrap()
+        .value_source = ValueSource::Default("app.f(1)".into());
+    s.after
+        .tables
+        .get_mut(&child)
+        .unwrap()
+        .partition_of
+        .as_mut()
+        .unwrap()
+        .columns
+        .clear();
+    let steps = vec![
+        Change::AlterColumnDefault {
+            uid: "c_dddddd".parse().unwrap(),
+            column: child.column("d"),
+            from: None,
+            to: None,
+        },
+        Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: parent.column("d"),
+            from: Some("app.f(1)".into()),
+            to: None,
+        },
+        Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: parent.column("d"),
+            from: None,
+            to: Some("app.f(1)".into()),
+        },
+        Change::SetPartitionDefault {
+            uid: "t_bbbbbb".parse().unwrap(),
+            table: child,
+            parent: parent.clone(),
+            column: "d".into(),
+            from: None,
+            to: None,
+            fallback: Some("app.f(1)".into()),
+        },
+        attach(&s),
+    ];
+    let planned: Vec<_> = steps.into_iter().map(PlannedChange::new).collect();
+    let ops = Operations::of_plan(&planned, ModuleEdits::Rebuilt);
+    let owners = PlanOwners::new(
+        PlanNames::of(&planned, &s.ids).unwrap(),
+        &s.base_ids,
+        &s.ids,
+    );
+    let inspect = |after: &Schema, stored| {
+        pbps_diff::order::analyse_with_membership(
+            &ops,
+            &owners,
+            Snapshot {
+                schema: &s.before,
+                ids: &s.base_ids,
+            },
+            Snapshot {
+                schema: after,
+                ids: &s.ids,
+            },
+            &Postgres::new().with_server_version(180000),
+            None,
+            stored,
+        )
+    };
+    let ordinary = pbps_diff::order::analyse_with_catalog(
+        &ops,
+        &owners,
+        Snapshot {
+            schema: &s.before,
+            ids: &s.base_ids,
+        },
+        Snapshot {
+            schema: &s.after,
+            ids: &s.ids,
+        },
+        &Postgres::new().with_server_version(180000),
+        None,
+    );
+    assert!(ordinary.unowned.is_empty());
+    assert!(ordinary.effects.iter().all(|e| e.symbolic.is_empty()));
+    assert_eq!(ordinary.symbolic, Default::default());
+    // An explicit successful but empty read does not prove expression bindings.
+    let empty_read = Default::default();
+    let observed = inspect(&s.after, Some(&empty_read));
+    assert!(
+        observed
+            .effects
+            .iter()
+            .flat_map(|e| &e.symbolic)
+            .any(|c| matches!(c, Clause::Recurse(w) if w.from == Fact::Unread))
+    );
+    // An explicit contract with no read still demands its missing facts.
+    s.after
+        .tables
+        .get_mut(&parent)
+        .unwrap()
+        .columns
+        .get_mut("d")
+        .unwrap()
+        .value_source = ValueSource::Default("app.f(2)".into());
+    let changed = inspect(&s.after, None);
+    assert!(
+        changed
+            .effects
+            .iter()
+            .flat_map(|e| &e.symbolic)
+            .any(|c| matches!(c, Clause::Recurse(w) if w.from == Fact::Unread))
+    );
+}

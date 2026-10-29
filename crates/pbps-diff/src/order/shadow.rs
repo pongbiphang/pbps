@@ -34,6 +34,8 @@ pub struct Shadowed {
     pub unowned: Vec<(OperationId, OwnerError)>,
 }
 
+/// Explicit operation-level analysis, including the membership contract.
+/// Catalog-dependent facts remain obligations until evidence is supplied.
 pub fn analyse(
     operations: &Operations,
     owners: &dyn Owners,
@@ -41,11 +43,13 @@ pub fn analyse(
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Shadowed {
-    analyse_with_catalog(operations, owners, before, after, dialect, None)
+    analyse_with_membership(operations, owners, before, after, dialect, None, None)
 }
 
-/// The same effects, with connected identifier comparisons. Missing comparisons
-/// remain unknown; a failed read must never be supplied as an empty answer.
+/// Ordinary effects with connected identifier comparisons, without opting into
+/// a membership contract. Temporary dependent writes can resemble column intent;
+/// registered plan obligations or explicit membership analysis own that contract.
+/// Missing comparisons remain unknown; a failed read is never an empty answer.
 pub fn analyse_with_catalog(
     operations: &Operations,
     owners: &dyn Owners,
@@ -54,7 +58,9 @@ pub fn analyse_with_catalog(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
 ) -> Shadowed {
-    analyse_with_membership(operations, owners, before, after, dialect, catalog, None)
+    analyse_scoped(
+        operations, owners, before, after, dialect, catalog, None, false,
+    )
 }
 
 /// Analyse the same operations with stored membership binding evidence.
@@ -69,6 +75,47 @@ pub fn analyse_with_membership(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
     stored: Option<&pbps_model::operation::MembershipCatalog>,
+) -> Shadowed {
+    analyse_scoped(
+        operations, owners, before, after, dialect, catalog, stored, true,
+    )
+}
+
+/// The contract is activated by the plan's registered membership obligations.
+/// Ordinary dependent expansion already owns its order and reads no membership
+/// bindings; its temporary column writes do not register a new contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn analyse_planning<S>(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    plan: &super::PlanningPlan<S>,
+) -> Shadowed {
+    analyse_scoped(
+        operations,
+        owners,
+        before,
+        after,
+        dialect,
+        catalog,
+        None,
+        !plan.boundaries.is_empty(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyse_scoped(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
+    membership: bool,
 ) -> Shadowed {
     use pbps_model::operation::{End, Lineage, MembershipCatalog};
     let lineage = Lineage::of(before, after);
@@ -86,7 +133,7 @@ pub fn analyse_with_membership(
         },
         &payload,
     );
-    let mut facts = if meetings.is_empty() {
+    let mut facts = if !membership || meetings.is_empty() {
         Default::default()
     } else {
         dialect.symbolic_facts(
@@ -151,6 +198,9 @@ pub fn analyse_with_membership(
             let engine = dialect
                 .engine_effects(op, owners, before, after, catalog)
                 .and_then(|e| {
+                    if !membership {
+                        return Ok(e);
+                    }
                     dialect
                         .symbolic_effects(op, owners, before, after, &facts, &lineage)
                         .map(|s| e.merged(s))

@@ -9145,3 +9145,20 @@ to accept a retained guard instead. The dependent-bearing meeting-plan golden's
 full changes/spellings comparison waits for PR 4's pending projection, PR 5's
 spelling/identity plumbing and PR 7 activation; its existing inventory assertion
 continues to run. These are delivery gates, not new product exceptions.
+
+<a id="dec-2296-6"></a>
+
+**DEC-2296.6. Ordinary effect analysis does not activate a membership contract
+from dependent expansion.** A module rebuild can expand into parent and
+candidate DEFAULT releases and restorations beside ATTACH. The existing route
+proves their order and expression scope and reads no membership catalog for
+those generated writes. Identifier-comparison analysis and ordinary carrier
+or observer graphs must retain that contract, rather than interpreting the
+expanded payload as new membership intent. Typed planning analysis activates
+the symbolic producer for registered membership obligations; explicit
+operation-level membership analysis also requests the full contract. Neither
+missing nor successfully empty membership reads establish expression bindings:
+activated contracts keep the resulting facts Unread and refuse them normally.
+The pending-boundary discharge and ensure checks, every schema-diff guard,
+all fact readers and all symbolic obligations remain in force. No comparison
+of expression text is used to infer catalog binding equality.

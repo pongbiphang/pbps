@@ -100,7 +100,8 @@ fn policy_release_schedule(
         schema: declared.schema,
         ids: declared.sources.after,
     };
-    let effects = pbps_diff::order::analyse(&operations, &owners, before, after, dialect);
+    let effects =
+        pbps_diff::order::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
     if let Some((id, why)) = effects.unowned.first() {
         return Err(Refusal(format!(
             "policy release operation {id} has unread effects: {why}"

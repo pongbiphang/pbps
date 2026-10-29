@@ -88,7 +88,7 @@ pub fn release_schedule(
         schema: after.schema,
         ids: after.ids,
     };
-    let effects = super::analyse(&operations, &owners, before, after, dialect);
+    let effects = super::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
     if let Some((id, why)) = effects.unowned.first() {
         return Err(format!(
             "policy release operation {id} has unread effects: {why}"

@@ -21,10 +21,10 @@ pub(crate) fn part_effects(
 
 pub use assess::{Answer, Assessment, assess};
 
-#[cfg(test)]
-use crate::order::Source;
 use crate::order::resolver_finish::settle;
-use crate::order::{Baseline, Checks, Schedule, analyse, graph};
+use crate::order::{Baseline, Checks, Schedule, graph};
+#[cfg(test)]
+use crate::order::{Source, analyse};
 use pbps_dialect::Dialect;
 use pbps_model::escape::Escaped;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
@@ -235,7 +235,8 @@ fn scheduled(
         },
     );
     let baseline = Baseline::of(before, owners);
-    let shadowed = analyse(operations, owners, before, after, dialect);
+    let shadowed =
+        crate::order::analyse_with_catalog(operations, owners, before, after, dialect, None);
     let effect_graph = graph(
         operations.as_slice(),
         &shadowed.effects,

@@ -655,7 +655,7 @@ pub(crate) fn order_carried_moves<S: Clone>(
         .map(|p| matches!(p.change, pbps_model::Change::RenameTable { .. }))
         .collect();
     if !only_crossed_by(&settled.sequence, &renames) {
-        use pbps_diff::order::{Baseline, Checks, Schedule, analyse, graph};
+        use pbps_diff::order::{Baseline, Checks, Schedule, analyse_with_catalog, graph};
         use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
         if !moving.iter().any(|&moves| moves) {
             return;
@@ -673,7 +673,7 @@ pub(crate) fn order_carried_moves<S: Clone>(
             schema: sides.1.schema,
             ids: sides.1.ids,
         };
-        let effects = analyse(&operations, &owners, before, after, dialect);
+        let effects = analyse_with_catalog(&operations, &owners, before, after, dialect, None);
         if !effects.unowned.is_empty() {
             return;
         }
