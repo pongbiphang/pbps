@@ -545,7 +545,7 @@ fn keep_handover_dependents(
     let graph = edges::graph(
         operations.as_slice(),
         &effects.effects,
-        &edges::Baseline::of(before, &owners),
+        &edges::Baseline::of(before, &owners).with_symbolic(effects.symbolic.clone()),
         declared.module_deps,
         edges::Checks::ALL,
     );

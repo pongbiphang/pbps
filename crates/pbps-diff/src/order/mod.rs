@@ -86,7 +86,7 @@ pub use saved::{
     AdmissionError, AdmittedPlan, ArtifactView, SealedPlan, admit, seal, validate_saved_plan,
 };
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
-pub use shadow::{Report, Shadowed, analyse, analyse_with_catalog};
+pub use shadow::{Report, Shadowed, analyse, analyse_with_catalog, analyse_with_membership};
 pub use verify::{Violation, verify};
 
 #[cfg(test)]

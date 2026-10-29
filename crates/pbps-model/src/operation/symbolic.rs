@@ -157,7 +157,8 @@ impl ShapeCheck {
             Self::SameDefinition => parent.definition_eq(child),
             Self::NotNullAtLeast => matches!(
                 (&parent.datum, &child.datum),
-                (Datum::NotNull(false), Datum::NotNull(_))
+                (Datum::Absent, Datum::Absent)
+                    | (Datum::NotNull(false), Datum::NotNull(_))
                     | (Datum::NotNull(true), Datum::NotNull(true))
             ),
         }

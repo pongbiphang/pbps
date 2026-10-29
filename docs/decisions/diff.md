@@ -9113,3 +9113,35 @@ explain the conservative producer refusal; they are not a claim that every
 parent identity operation fails. A numbering change with neither an owned
 sequence input nor output is refused separately. Refusals retain the
 separate-plans remedy. No format, rank, tie-break or settlement stage changes.
+
+<a id="dec-2296-5"></a>
+
+**DEC-2296.5. Column movement producers are qualified below the differ before
+canonical activation, and the full reference assertions remain activation
+gates.** The coordinator clarified the PR split on 2026-10-29: PR 3 retains
+every schema-diff guard. It implements lineage-keyed movement, the shared
+attribute restoration, measured engine merges and the analysis/binding hooks.
+Its reference cut/merge assertions and class scenes run over explicit operations
+through the existing Schedule and independent replay, without a test-only
+guard bypass. A family whose parent is born in the plan keeps the existing
+birth/attachment contract; recursive versions require a baseline parent.
+The lineage is shared by operation mappers; a detached default
+is a transfer-qualified restoration, while an attaching standalone source
+keeps the parent-only version chain ATTACH consumes. Prototype inputs are
+bound only along a unique chain already established by the ordinary graph;
+incomparable writers remain forks. Merge completion reads all declared
+intermediate values, never a selected trial order.
+
+The canonical `class.rs` test's successful real `diff`, completed schedule and
+nonempty certified result remain PR 7 activation assertions. Its lock-note
+count waits for PR 6's annotation and is checked through activation in PR 7.
+Its permitted-order replay and complete final-state assertions are exercised
+below the differ now and must also remain on the canonical route at activation.
+`physical_column_lists_are_obligations_at_attach_and_detach` retains its
+successful-diff setup and physical-order/remedy assertions for PR 6's positional
+checks and PR 7's guard lift. The reference's absent-numbering and missing-UID
+assertions already run at the operation/facts level. No assertion is relaxed
+to accept a retained guard instead. The dependent-bearing meeting-plan golden's
+full changes/spellings comparison waits for PR 4's pending projection, PR 5's
+spelling/identity plumbing and PR 7 activation; its existing inventory assertion
+continues to run. These are delivery gates, not new product exceptions.

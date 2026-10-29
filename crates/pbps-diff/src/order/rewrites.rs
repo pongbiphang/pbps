@@ -93,7 +93,7 @@ fn settle_requirements<S: Clone>(
     let mut graph = graph(
         operations.as_slice(),
         &effects.effects,
-        &Baseline::of(base, &owners),
+        &Baseline::of(base, &owners).with_symbolic(effects.symbolic.clone()),
         declared,
         Checks::ALL,
     );

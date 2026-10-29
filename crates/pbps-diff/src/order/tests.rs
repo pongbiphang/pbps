@@ -532,6 +532,7 @@ fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
     plan.logical.remove(0);
     let (alone, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let report = Shadowed {
+        symbolic: Default::default(),
         effects: vec![fx[0].clone()],
         unowned: Vec::new(),
     }
@@ -552,6 +553,7 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
     let report = Shadowed {
+        symbolic: Default::default(),
         effects: vec![fx[1].clone(), fx[0].clone()],
         unowned: Vec::new(),
     }
@@ -570,6 +572,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     standing.logical.remove(0);
     let (ops, fx, baseline) = standing.analysed(ModuleEdits::InPlace);
     let report = Shadowed {
+        symbolic: Default::default(),
         effects: fx,
         unowned: Vec::new(),
     }
@@ -587,6 +590,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     let (ops, fx, baseline) = both.analysed(ModuleEdits::InPlace);
     let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
     let report = Shadowed {
+        symbolic: Default::default(),
         effects: vec![fx[1].clone(), fx[0].clone()],
         unowned: Vec::new(),
     }
@@ -1460,6 +1464,7 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
             let reordered = crate::order::reordered_operations(ops, order);
             let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
             let report = Shadowed {
+                symbolic: Default::default(),
                 effects,
                 unowned: Vec::new(),
             }
@@ -5052,6 +5057,7 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
     // Only the class-order observer may defer this edge: the shared and
     // final schedule must still reject it if the hook fails to repair it.
     let report = super::shadow::Shadowed {
+        symbolic: Default::default(),
         effects: fx.clone(),
         unowned: vec![],
     }

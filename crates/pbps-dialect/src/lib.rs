@@ -3334,6 +3334,30 @@ pub trait Dialect {
         Ok(pbps_model::operation::Effects::default())
     }
 
+    /// Operation-local membership clauses over the analysis's shared lineage.
+    #[allow(clippy::too_many_arguments)]
+    fn symbolic_effects(
+        &self,
+        _op: &pbps_model::operation::Operation,
+        _owners: &dyn pbps_model::operation::Owners,
+        _before: pbps_model::operation::Snapshot<'_>,
+        _after: pbps_model::operation::Snapshot<'_>,
+        _facts: &pbps_model::operation::symbolic::Facts,
+        _lineage: &pbps_model::operation::Lineage,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        Ok(Default::default())
+    }
+
+    /// Complete a transfer's merge over intermediate declared values too.
+    fn transfer_policy(
+        &self,
+        transfer: &pbps_model::operation::symbolic::Transfer,
+        _parents: &[pbps_model::operation::symbolic::Value],
+        _candidates: &[pbps_model::operation::symbolic::Value],
+    ) -> Result<pbps_model::operation::symbolic::TransferPolicy, String> {
+        Ok(transfer.policy.clone())
+    }
+
     /// Pure, normalized property facts for the partition families a plan
     /// moves, from the two snapshots and what the connected seam read of the
     /// baseline's stored columns. Known absence and unread facts stay
