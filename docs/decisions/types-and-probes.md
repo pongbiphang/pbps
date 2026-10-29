@@ -4226,3 +4226,39 @@ and `a_function_replaced_between_plan_and_apply_is_vetted_as_replaced` through
 plan and apply; and the unit tests over trees captured from both majors in
 `resolver/capture/body_tests.rs` and `input_path/body.rs`. The `AS $$` form of
 the earlier refusal fixtures stays refused.
+
+<a id="dec-2520-1"></a>
+
+**DEC-2520.1. Declaration execution outside the approved plan uses typed single-command boundaries.**
+Scratch reconstruction and the types-only vet execute a separately lowered
+program. Their typed tables/types/modules still contain verbatim SQL
+expressions; typed outer structure does not make a statement tail safe. The
+approved-plan execution path remains unchanged.
+
+The emitter retains native-command boundaries alongside its rendered SQL.
+Scope setup, each typed DDL item and cleanup are kept separately; domain
+alteration commands are separated where the emitter builds them, never by
+splitting SQL text. The original rendered plan SQL and checkpoint grouping are
+unchanged, including serial sequence creation and ownership. The two scratch
+callers share the PostgreSQL executor, using empty-parameter extended execution
+so the server parses one command before executing it. Scope cleanup is attempted even after refusal; enclosing
+transactions/savepoints still own rollback and scratch release.
+
+A syntax/multiple-command refusal in type vetting names its declared type and
+expression parts. Other advisory availability and managed-code rules remain.
+Reconstruction retains its declaration-named failure and records the failed
+native command so server positions and excerpts use the SQL actually submitted,
+including after a scope prefix or earlier command. Literal semicolons and
+dollar-quoted routine bodies remain one command. Unknown or invalid declaration
+text is never repaired with a lexer. This in-memory emission metadata changes no saved plan, state or
+published schema format.
+
+The target rebuild probe remains unchanged: rebuild qualification permits only
+plain copied columns (no value sources, computed columns or partition column
+overrides), and the factory removes keys, CHECKs, indexes and foreign keys from
+its temporary table specifications. Identifiers and partition bound values are
+quoted, types are normalized, and storage values are literals. Thus declared
+expressions do not reach the temporary DDL; the CHECK appears only in the
+approved plan. Copy USING expressions are already vetted with extended
+execution in input_path::vet_in_transaction (DEC-1635.4). Live cases pin both
+early default refusal and CHECK exclusion without executing the plan. The apply-time probe consumes the verified saved plan.

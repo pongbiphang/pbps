@@ -125,11 +125,18 @@ pub async fn vet(
             session.execute(&pins).await.map_err(read)?;
         }
         for statement in lowered.groups().iter().flat_map(|g| g.statements()) {
-            if let Err(error) = session.execute(&statement.sql).await {
+            if let Err(failure) = pbps_pg::statement::execute(session, statement).await {
+                let error = failure.error;
                 let Some(annotation) = &statement.declared_type else {
                     return Err(read(error));
                 };
                 let code = error.server_error_code();
+                if code.as_deref() == Some("42601") {
+                    return Err(Refused::Code(format!(
+                        "declared type `{}` could not bind {} as one statement: {error}",
+                        annotation.name.shown(), expression_parts(annotation),
+                    )));
+                }
                 // Undefined functions are not proof of user code unless the
                 // missing function is declared by this project. Other compile
                 // failures are advisory; apply still owns the binding verdict.

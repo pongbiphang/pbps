@@ -540,3 +540,89 @@ fn concurrent_row(d: &Demo, connection: &str, path: &std::path::Path) -> Output 
     rt.block_on(writer.execute("COMMIT")).unwrap();
     child.wait_with_output().unwrap()
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn rebuild2520_probe_cannot_execute_declared_expressions() {
+    for server in [server(), old_server()] {
+        let own = OwnDatabase::new(&server, "rebuild2520");
+        on_server(own.connection(), "CREATE SCHEMA app");
+        let d = Demo::new("rebuild2520");
+        let before = "table: app.p\ncolumns:\n  k: {type: integer, nullable: false}\n  bucket: {type: integer, nullable: false}\n  payload: {type: integer}\npartition_by: [k]\npartitions:\n  p1: {from: ['0'], to: ['10']}\n";
+        std::fs::write(d.dir.join("schema/app.p.yml"), before).unwrap();
+        succeeds(d.run(&["plan", "--no-dev"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", own.connection()]));
+        on_server(own.connection(), "INSERT INTO app.p(k,bucket) VALUES(1,1)");
+        let desired = before.replace("partition_by: [k]", "partition_by: [bucket]");
+        let payload = "0)) PARTITION BY RANGE (bucket); COMMIT; CREATE TABLE public.marker2520(id integer); SELECT ((0";
+        let with_default = desired.replace(
+            "  payload: {type: integer}",
+            &format!("  payload: {{type: integer, default: {payload:?}}}"),
+        );
+        std::fs::write(d.dir.join("schema/app.p.yml"), with_default).unwrap();
+        let refused = d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "1",
+            "--reason",
+            "hardening proof",
+        ]);
+        assert_ne!(code(&refused), 0);
+        assert!(stderr(&refused).contains("app.p"), "{}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains("plain copied columns"),
+            "{}",
+            stderr(&refused)
+        );
+        let payload = "k >= 0); COMMIT; CREATE TABLE public.marker2520(id integer); SELECT (true";
+        let after = format!("{desired}checks:\n  allowed: {payload:?}\n");
+        std::fs::write(d.dir.join("schema/app.p.yml"), after).unwrap();
+        succeeds(d.run(&[
+            "rebuild-table",
+            "app.p",
+            "--max-rows",
+            "1",
+            "--reason",
+            "hardening proof",
+        ]));
+        d.commit();
+        let path = d.dir.join("unsafe.plan.json");
+        let out = d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--no-rehearse",
+            "--out",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            scalar(
+                own.connection(),
+                "SELECT (pg_catalog.to_regclass('public.marker2520') IS NOT NULL)::integer::bigint"
+            ),
+            0,
+            "rebuild probe ran a trailing statement on the target"
+        );
+        // The factory strips CHECKs from the probe's bare tables. The CHECK
+        // belongs to the approved plan, which this test deliberately never applies.
+        succeeds(out);
+        assert!(path.exists());
+        assert_eq!(scalar(own.connection(), "SELECT count(*) FROM app.p"), 1);
+        std::fs::write(
+            d.dir.join("schema/app.p.yml"),
+            format!("{desired}checks:\n  allowed: \"';'::text = ';'::text\"\n"),
+        )
+        .unwrap();
+        approve(&d, "1");
+        succeeds(d.run(&[
+            "plan",
+            "--db",
+            own.connection(),
+            "--no-rehearse",
+            "--out",
+            path.to_str().unwrap(),
+        ]));
+    }
+}

@@ -878,7 +878,7 @@ impl Reconstruction {
             None => Vec::new(),
         };
         for (ordinal, statement) in group.statements().iter().enumerate() {
-            conn.execute(&statement.sql)
+            crate::statement::execute(conn, statement)
                 .await
                 .map_err(|error| trial::Failure::Statement {
                     error,

@@ -270,6 +270,9 @@ pub struct Statement {
     pub sql: String,
     /// The recorded row requirement belongs to this drop, never inferred from SQL.
     pub drop_guard: Option<pbps_model::DropGuard>,
+    /// Emitter-owned command boundaries for execution outside the approved plan.
+    /// The rendered plan SQL stays unchanged; declaration text is never split.
+    pub execution: Option<StatementExecution>,
     /// The declared type this statement leaves, vetted before its transaction commits.
     pub declared_type: Option<DeclaredTypeStatement>,
 
@@ -422,11 +425,19 @@ pub enum Released {
     Module(ModuleId),
 }
 
+/// One native command per item, with cleanup attempted even after refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementExecution {
+    pub commands: Vec<String>,
+    pub cleanup: Option<String>,
+}
+
 impl Statement {
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
             drop_guard: None,
+            execution: None,
             declared_type: None,
             row_write: None,
             index_build: None,

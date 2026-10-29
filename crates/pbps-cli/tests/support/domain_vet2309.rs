@@ -555,3 +555,54 @@ fn domain_vet2309_xml_fragments_use_deployment_pins_with_database_and_role_defau
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domain2520_statement_tail_refuses_and_literal_semicolons_stay_valid() {
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let server = std::env::var(variable).unwrap();
+        let own = OwnDatabase::new(&server, "domain2520target");
+        on_server(own.connection(), "CREATE SCHEMA app");
+        let scratch = Scratch::new(&server);
+        let d = Demo::new("domain2520");
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            own.connection(),
+            "--reason",
+            "empty database",
+        ]));
+        config(&d, "");
+        std::fs::write(d.dir.join("externals.sql"), "").unwrap();
+        declaration(
+            &d,
+            "domain: app.d\ntype: integer\nchecks:\n  allowed: 'VALUE > 0); CREATE TABLE public.marker2520(id integer); SELECT (true'\n",
+        );
+        let out = plan(&d, own.connection(), &scratch.connection, &[]);
+        for db in [own.connection(), scratch.database.connection()] {
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT (pg_catalog.to_regclass('public.marker2520') IS NOT NULL)::integer::bigint"
+                ),
+                0,
+                "domain vet executed a trailing marker2520 statement"
+            );
+        }
+        assert_ne!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        let text = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(
+            text.contains("app.d") && text.contains("one statement"),
+            "{text}"
+        );
+        scratch.released();
+        assert!(!d.dir.join("vet.plan.json").exists());
+        declaration(
+            &d,
+            "domain: app.d\ntype: text\ndefault: \"';'\"\nchecks: {allowed: \"VALUE = ';'\"}\n",
+        );
+        succeeds(plan(&d, own.connection(), &scratch.connection, &[]));
+        scratch.released();
+    }
+}

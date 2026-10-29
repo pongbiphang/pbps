@@ -2467,10 +2467,23 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
 /// not reach an operator a user of that schema could add: [`unscoped`] for a
 /// statement that is pbps's alone, [`on_catalog_path`] inside one that is not.
 fn scoped(pg: &Postgres, schema: &str, body: &str) -> Result<Statement, DialectError> {
-    Ok(Statement::new(format!(
-        "SET search_path = {};\n{body}\nSET search_path = '';",
-        write_path(pg, schema)?
-    )))
+    scoped_items(pg, schema, vec![body.to_owned()])
+}
+
+fn scoped_items(
+    pg: &Postgres,
+    schema: &str,
+    mut commands: Vec<String>,
+) -> Result<Statement, DialectError> {
+    let setup = format!("SET search_path = {};", write_path(pg, schema)?);
+    let cleanup = "SET search_path = '';".to_owned();
+    let mut statement = Statement::new(format!("{setup}\n{}\n{cleanup}", commands.join("\n")));
+    commands.insert(0, setup);
+    statement.execution = Some(pbps_dialect::StatementExecution {
+        commands,
+        cleanup: Some(cleanup),
+    });
+    Ok(statement)
 }
 
 /// A statement on the empty path: pbps's own qualified names (DEC-1564.1),
@@ -2529,8 +2542,15 @@ fn clear_external_partitions(table: &TableName, column: &str, mut sql: Vec<State
         parent = literal(&qualified(table)?),
     );
     let parents = sql.last_mut().expect("the parent's statement comes first");
+    let extra = atomically(&body);
+    if let Some(execution) = &mut parents.execution {
+        if let Some(cleanup) = &execution.cleanup {
+            execution.commands.push(cleanup.clone());
+        }
+        execution.commands.push(extra.clone());
+    }
     parents.sql.push('\n');
-    parents.sql.push_str(&atomically(&body));
+    parents.sql.push_str(&extra);
     Ok(sql)
 }
 
@@ -3785,7 +3805,7 @@ fn alter_domain(
     if commands.is_empty() {
         return Ok(Vec::new());
     }
-    let mut statement = scoped(pg, name.schema(), &commands.join("\n"))?;
+    let mut statement = scoped_items(pg, name.schema(), commands)?;
     statement.declared_type = Some(pbps_dialect::DeclaredTypeStatement {
         uid: uid.clone(),
         name: name.clone(),
@@ -4196,12 +4216,13 @@ pub(crate) fn emit_in(
             let body = match owned_sequence_statements(table, name.raw(), column, false)? {
                 Some((create, owned, sequence)) => {
                     let owner = sequence_to_table_owner(table, &sequence)?;
-                    format!("{create}\n{owner}\n{add}\n{owned}")
+                    vec![create, owner, add, owned]
                 }
-                None => add,
+                None => vec![add],
             };
             Ok(vec![
-                on(pg, table, &body)?.creating(Created::Column(table.clone(), name.clone())),
+                scoped_items(pg, &table.schema, body)?
+                    .creating(Created::Column(table.clone(), name.clone())),
             ])
         }
 
@@ -4398,7 +4419,13 @@ pub(crate) fn emit_in(
                 // schema-scoped ALTER could call code neither judged (DEC-2378.2).
                 // Keep the pin in the emitted statement for rehearsal, plan
                 // tests and standalone SQL replay too.
-                unscoped(format!("SET search_path = '';\n{body}"))?
+                let setup = "SET search_path = '';".to_owned();
+                let mut statement = Statement::new(format!("{setup}\n{body}"));
+                statement.execution = Some(pbps_dialect::StatementExecution {
+                    commands: vec![setup, body],
+                    cleanup: None,
+                });
+                vec![statement]
             } else {
                 one(pg, &column.table, body)?
             };
@@ -5990,12 +6017,11 @@ fn create_table(
     // limitation (#1631).
     let body = sequences
         .iter()
-        .map(|(sequence, _, _)| sequence.as_str())
-        .chain([create.as_str()])
-        .chain(sequences.iter().map(|(_, owned, _)| owned.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut out = vec![on(pg, name, &body)?];
+        .map(|(sequence, _, _)| sequence.clone())
+        .chain([create])
+        .chain(sequences.iter().map(|(_, owned, _)| owned.clone()))
+        .collect();
+    let mut out = vec![scoped_items(pg, &name.schema, body)?];
 
     for (n, u) in &table.unique {
         out.push(on(
@@ -11473,5 +11499,37 @@ mod tests {
                 pbps_dialect::TypeChangeRisk::Incompatible
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod statement_boundaries2520 {
+    use super::*;
+
+    #[test]
+    fn scope_boundaries_preserve_the_rendered_plan_and_opaque_body() {
+        let body = "CREATE FUNCTION app.f() RETURNS text LANGUAGE sql AS $q$ SELECT ';'; $q$;";
+        let statement = scoped(&Postgres::new(), "app", body).unwrap();
+        assert_eq!(
+            statement.sql,
+            format!("SET search_path = \"app\", \"pg_temp\";\n{body}\nSET search_path = '';")
+        );
+        let execution = statement.execution.unwrap();
+        assert_eq!(execution.commands[1], body);
+        assert_eq!(execution.cleanup.as_deref(), Some("SET search_path = '';"));
+    }
+
+    #[test]
+    fn typed_command_lists_keep_their_original_rendering_without_text_splitting() {
+        let commands = vec![
+            "ALTER DOMAIN app.d DROP NOT NULL;".to_owned(),
+            "ALTER DOMAIN app.d SET DEFAULT ';';".to_owned(),
+        ];
+        let rendered = scoped(&Postgres::new(), "app", &commands.join("\n"))
+            .unwrap()
+            .sql;
+        let statement = scoped_items(&Postgres::new(), "app", commands.clone()).unwrap();
+        assert_eq!(statement.sql, rendered);
+        assert_eq!(&statement.execution.unwrap().commands[1..], commands);
     }
 }
