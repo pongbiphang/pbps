@@ -376,6 +376,16 @@ impl Run<'_> {
         let unfillable = prepared.unfillable();
         let failed = |error: Error, staged: &engine::Staged, waiting: Option<&String>| {
             let error = staged.through_shape_view(error);
+            if let Error::Creation(mut failure) = error {
+                if !(chains.is_empty() && unfillable.is_empty() && waiting.is_none()) {
+                    let context = std::sync::Arc::make_mut(&mut failure);
+                    context.externals = true;
+                    context
+                        .context
+                        .extend(chains.iter().chain(&unfillable).chain(waiting).cloned());
+                }
+                return Error::Creation(failure);
+            }
             if let Error::Binding(reason) = &error
                 && !(chains.is_empty() && unfillable.is_empty() && waiting.is_none())
             {

@@ -316,6 +316,7 @@ fn the_created_map_names_the_step_of_every_table_and_module() {
 #[test]
 fn only_a_failure_naming_the_statement_is_a_verdict_on_the_declaration() {
     let server = |code: &str| pbps_db::DbError::Driver {
+        diagnostic: None,
         message: "x".into(),
         code: Some(code.into()),
     };

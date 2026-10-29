@@ -20,6 +20,10 @@ use std::{collections::BTreeSet, marker::PhantomData, ops::Range};
 #[derive(Debug, Clone)]
 pub struct TrialProgram<E: Engine> {
     hard: Vec<Vec<usize>>,
+    why: Vec<super::EdgeWhy>,
+    dropped: Vec<super::DroppedGuess>,
+    sources: Vec<usize>,
+    subjects: Vec<String>,
     brand: PhantomData<fn(E) -> E>,
 }
 impl<E: Engine> TrialProgram<E> {
@@ -63,10 +67,94 @@ impl<E: Engine> TrialProgram<E> {
         }
         Ok(Self {
             hard,
+            why: Vec::new(),
+            dropped: Vec::new(),
+            sources: Vec::new(),
+            subjects: Vec::new(),
             brand: PhantomData,
         })
     }
 
+    /// A remedy must not close a known dependency cycle, even when one of its
+    /// legs is only inferred. An uncertain guess may suppress advice, never
+    /// justify a hard-cycle remedy.
+    pub fn can_precede(&self, before: usize, after: usize) -> bool {
+        let mut pending = vec![before];
+        let mut seen = BTreeSet::new();
+        while let Some(at) = pending.pop() {
+            if at == after {
+                return false;
+            }
+            if seen.insert(at) {
+                pending.extend(&self.hard[at]);
+                if let Some(&operation) = self.sources.get(at) {
+                    pending.extend(
+                        self.why
+                            .iter()
+                            .filter(|why| why.edge.after == operation)
+                            .filter_map(|why| {
+                                self.sources
+                                    .iter()
+                                    .position(|&source| source == why.edge.before)
+                            }),
+                    );
+                }
+            }
+        }
+        true
+    }
+    pub(super) fn set_trace(
+        &mut self,
+        why: Vec<super::EdgeWhy>,
+        dropped: Vec<super::DroppedGuess>,
+        sources: Vec<usize>,
+        names: &ChangeSet,
+    ) {
+        self.why = why;
+        self.dropped = dropped;
+        self.sources = sources;
+        self.subjects = names
+            .changes
+            .iter()
+            .map(|p| pbps_model::escape::Escaped(&p.change.subject()).to_string())
+            .collect();
+    }
+    pub fn explanation(&self, at: usize) -> Vec<String> {
+        let operation = self.sources[at];
+        let mut lines = vec![format!(
+            "initial rank {}; attempts require every hard predecessor",
+            at + 1
+        )];
+        for why in self.why.iter().filter(|w| w.edge.after == operation) {
+            lines.push(format!(
+                "{:?} prerequisite from {}",
+                why.rule, self.subjects[why.edge.before]
+            ));
+        }
+        for dropped in self
+            .dropped
+            .iter()
+            .filter(|d| d.edge.after == operation || d.edge.before == operation)
+        {
+            lines.push(format!(
+                "guess {} → {} set aside ({} stage); cycle component: {}",
+                self.subjects[dropped.edge.before],
+                self.subjects[dropped.edge.after],
+                if dropped.backward_only {
+                    "backward-first"
+                } else {
+                    "remaining-guesses"
+                },
+                dropped
+                    .members
+                    .iter()
+                    .map(|&m| self.subjects[m].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        lines
+    }
     /// A range is a blueprint interval; earlier committed ranges are facts,
     /// never permission to draw a provider across a chained-fill boundary.
     pub fn begin(&self) -> Progress<E> {
@@ -178,6 +266,25 @@ pub struct Attempt<'a, 'p, E: Engine> {
 impl<E: Engine> Attempt<'_, '_, E> {
     pub fn position(&self) -> usize {
         self.position
+    }
+    pub fn overtaken(&self) -> Vec<String> {
+        let operation = self.trials.program.sources[self.position];
+        self.trials
+            .program
+            .why
+            .iter()
+            .filter(|w| w.edge.after == operation && w.edge.source == Source::Guess)
+            .filter(|w| !self.trials.program.dropped.iter().any(|d| d.edge == w.edge))
+            .filter(|w| {
+                self.trials
+                    .program
+                    .sources
+                    .iter()
+                    .position(|&s| s == w.edge.before)
+                    .is_some_and(|rank| !self.trials.done[rank])
+            })
+            .map(|w| self.trials.program.subjects[w.edge.before].clone())
+            .collect()
     }
     pub fn is_recovery(&self) -> bool {
         self.trials.syntax[self.position]

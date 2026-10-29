@@ -1117,6 +1117,7 @@ mod tests {
         for code in [Some("1088"), Some("1205"), None] {
             let original = "original driver failure";
             let error = migration_error(DbError::Driver {
+                diagnostic: None,
                 message: original.into(),
                 code: code.map(str::to_owned),
             });

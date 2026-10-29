@@ -1158,6 +1158,18 @@ impl Scratch<'_> {
 /// write through it, and a routine's body is checked against it when it is
 /// created (measured on 18: `cannot insert into view`, SQLSTATE 55000).
 pub(super) fn through_shape_view(error: Error, staged: &Staged) -> Error {
+    if let Error::Creation(mut failure) = error {
+        let original = failure.report.to_string();
+        if let Error::Binding(reason) = through_shape_view(Error::Binding(original.clone()), staged)
+            && let Some(note) = reason.strip_prefix(&original)
+            && !note.is_empty()
+        {
+            std::sync::Arc::make_mut(&mut failure)
+                .context
+                .push(note.to_owned());
+        }
+        return Error::Creation(failure);
+    }
     let Error::Binding(reason) = error else {
         return error;
     };
@@ -1579,6 +1591,9 @@ pub(in crate::resolver::server) async fn generation_version(
 pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructError) -> Error {
     use pbps_pg::resolver::reconstruct::ReconstructError;
     match error {
+        ReconstructError::Refused(report) => Error::Creation(std::sync::Arc::new(
+            super::super::CreationFailure::new(report),
+        )),
         ReconstructError::Read { .. }
         | ReconstructError::Interrupted { .. }
         | ReconstructError::Transaction(_) => Error::Read(error.to_string()),

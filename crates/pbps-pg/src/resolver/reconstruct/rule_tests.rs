@@ -1374,7 +1374,7 @@ async fn scratch_refusals_name_what_is_missing() {
             assert!(
                 why.contains("does not exist")
                     && why.contains(missing)
-                    && why.contains("`depends_on:`"),
+                    && why.contains("change the declaration:"),
                 "fixture {at}: {why}"
             );
         }

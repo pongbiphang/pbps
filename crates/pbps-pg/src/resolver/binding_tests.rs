@@ -1376,7 +1376,9 @@ async fn a_missing_prerequisite_or_a_cycle_refuses_the_reconstruction_by_declara
         .await
         .unwrap_err();
         assert!(
-            missing.contains("scratch compilation of view app.v failed"),
+            missing.contains("scratch could not create view app.v")
+                && missing.contains("42P01")
+                && missing.contains("ext.t is not declared"),
             "{variable}: {missing}"
         );
         let cycle = Declared::default()
@@ -1396,7 +1398,10 @@ async fn a_missing_prerequisite_or_a_cycle_refuses_the_reconstruction_by_declara
         .await
         .unwrap_err();
         assert!(
-            refused.contains("scratch compilation of function app."),
+            refused.contains("scratch could not create function app.a()")
+                && refused.contains("scratch could not create function app.b()")
+                && refused.contains("42883")
+                && !refused.contains("fix:"),
             "{variable}: {refused}"
         );
     }
@@ -2627,8 +2632,11 @@ async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
                 _ => assert!(
                     matches!(
                         &compiled,
-                        Err(reconstruct::ReconstructError::Compile { reason, .. })
-                            if reason.contains("refused by the scratch trigger")
+                        Err(reconstruct::ReconstructError::Refused(report))
+                            if !report.stalled && report.pending.iter().any(|pending|
+                                pending.last.as_ref().is_some_and(|last|
+                                    last.error.server_error_code().as_deref() == Some("P0001")
+                                        && last.error.to_string().contains("refused by the scratch trigger")))
                     ),
                     "{variable}: {compiled:?}"
                 ),

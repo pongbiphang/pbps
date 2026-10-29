@@ -55,6 +55,26 @@ async fn a_server_refusal_carries_the_servers_own_sentence() {
         "the seam must not fall back to tokio_postgres's own Display"
     );
     assert_eq!(error.server_error_code().as_deref(), Some("42P01"));
+    let diagnostic = error.diagnostic().expect("structured driver facts");
+    assert_eq!(
+        diagnostic.primary,
+        r#"relation "no_such_table" does not exist"#
+    );
+    assert!(matches!(
+        diagnostic.position,
+        Some(pbps_db::ErrorPosition::Original(15))
+    ));
+    conn.execute("SET check_function_bodies = off; CREATE FUNCTION pg_temp.position_probe() RETURNS integer LANGUAGE sql AS $$ SELECT absent_column $$; SET check_function_bodies = on; CREATE TEMP TABLE position_table(x integer); INSERT INTO position_table VALUES (1)").await.unwrap();
+    let internal = conn
+        .execute("ALTER TABLE position_table ADD COLUMN y integer DEFAULT pg_temp.position_probe()")
+        .await
+        .unwrap_err();
+    let diagnostic = internal.diagnostic().expect("internal driver facts");
+    assert!(
+        matches!(&diagnostic.position, Some(pbps_db::ErrorPosition::Internal { position: 9, query }) if query == " SELECT absent_column "),
+        "{diagnostic:?}"
+    );
+    assert!(!format!("{internal:?}").contains("SELECT absent_column"));
 }
 
 /// `detail()` and `hint()` never reach the message, even though the object

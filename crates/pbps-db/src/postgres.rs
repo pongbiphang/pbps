@@ -179,6 +179,27 @@ impl From<tokio_postgres::Error> for DbError {
             .map(server_error_message)
             .unwrap_or_else(|| e.to_string());
         DbError::Driver {
+            diagnostic: e.as_db_error().map(|db| {
+                Box::new(crate::DriverDiagnostic {
+                    primary: db.message().to_owned(),
+                    schema: db.schema().map(str::to_owned),
+                    table: db.table().map(str::to_owned),
+                    column: db.column().map(str::to_owned),
+                    datatype: db.datatype().map(str::to_owned),
+                    constraint: db.constraint().map(str::to_owned),
+                    position: db.position().map(|p| match p {
+                        tokio_postgres::error::ErrorPosition::Original(p) => {
+                            crate::ErrorPosition::Original(*p)
+                        }
+                        tokio_postgres::error::ErrorPosition::Internal { position, query } => {
+                            crate::ErrorPosition::Internal {
+                                position: *position,
+                                query: query.clone(),
+                            }
+                        }
+                    }),
+                })
+            }),
             code: e.code().map(|c| c.code().to_owned()),
             message,
         }

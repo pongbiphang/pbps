@@ -1,10 +1,10 @@
 //! PostgreSQL creation trials, isolated from committed observations (DEC-2465.1).
-use super::{Progress, ReconstructError, Reconstruction, Step, judged_the_statement, with_remedy};
+use super::{Progress, ReconstructError, Reconstruction, Step, judged_the_statement};
 use pbps_db::{DbError, transport::ExecuteConnection};
 use pbps_diff::order::scratch::Trials;
 
 pub(super) enum Failure {
-    Statement(DbError),
+    Statement { error: DbError, statement: usize },
     Terminal(ReconstructError),
 }
 
@@ -19,20 +19,22 @@ impl Reconstruction {
         conn: &mut impl ExecuteConnection,
         mut cursor: Trials<'_, crate::Postgres>,
     ) -> Result<(Vec<(usize, Step)>, Progress<crate::Postgres>), ReconstructError> {
-        let pg16 =
+        let version =
             crate::roles::server_version_num(conn)
                 .await
                 .map_err(|e| ReconstructError::Read {
                     declaration: "scratch server version".into(),
                     reason: e.to_string(),
-                })?
-                / 10_000
-                == 16;
+                })?;
+        let pg16 = version / 10_000 == 16;
         let mut delta = Vec::with_capacity(cursor.pending().count());
-        let mut last = vec![None::<String>; self.steps.len()];
+        let mut last = vec![None::<super::refusal::Diagnosis>; self.steps.len()];
+        let mut recoveries = last.clone();
+        let mut overtakes = Vec::new();
         while let Some(attempt) = cursor.next_ready() {
             let at = attempt.position();
             let recovery = attempt.is_recovery();
+            let overtaken = attempt.overtaken();
             conn.execute("SAVEPOINT pbps_creation_trial")
                 .await
                 .map_err(|_| ReconstructError::Transaction("savepoint"))?;
@@ -44,24 +46,32 @@ impl Reconstruction {
                     conn.execute("RELEASE SAVEPOINT pbps_creation_trial")
                         .await
                         .map_err(|_| ReconstructError::Transaction("release savepoint"))?;
+                    if !overtaken.is_empty() {
+                        overtakes.push((step.declaration.clone(), delta.len(), overtaken));
+                    }
                     delta.push((at, step));
                     attempt.succeeded();
                 }
-                Err(Failure::Statement(error)) => {
+                Err(Failure::Statement { error, statement }) => {
                     let code = error.server_error_code();
-                    let diagnosis = format!(
-                        "[{}] {}",
-                        code.as_deref().unwrap_or("no SQLSTATE"),
-                        with_remedy(&error)
-                    );
-                    if recovery {
-                        return Err(ReconstructError::Compile {
+                    // Recovery preserves the first creation verdict only when
+                    // this attempt also reached an engine verdict (DEC-2465.3).
+                    if !judged_the_statement(&error) {
+                        return Err(ReconstructError::Interrupted {
                             declaration: self.steps[at].declaration.clone(),
-                            reason: format!(
-                                "{}; recovery refusal: {diagnosis}",
-                                last[at].as_deref().expect("parked error")
-                            ),
+                            reason: error.to_string(),
                         });
+                    }
+                    let diagnosis = self.diagnosis(at, statement, error, &delta, overtaken);
+                    if recovery {
+                        recoveries[at] = Some(diagnosis);
+                        return Err(self.pending_refusal(
+                            version,
+                            &cursor,
+                            &last,
+                            &recoveries,
+                            overtakes,
+                        ));
                     }
                     if candidate(code.as_deref(), self.steps[at].foreign_key)
                         || (pg16 && code.as_deref() == Some("42601"))
@@ -77,17 +87,17 @@ impl Reconstruction {
                             attempt.park_syntax();
                         }
                     } else {
-                        return Err(if judged_the_statement(&error) {
-                            ReconstructError::Compile {
-                                declaration: self.steps[at].declaration.clone(),
-                                reason: diagnosis,
-                            }
-                        } else {
-                            ReconstructError::Interrupted {
-                                declaration: self.steps[at].declaration.clone(),
-                                reason: diagnosis,
-                            }
-                        });
+                        let pending = super::refusal::Pending {
+                            declaration: self.steps[at].declaration.clone(),
+                            subject: self.steps[at].subject.clone(),
+                            owner: self.steps[at].owner.clone(),
+                            dependency: None,
+                            last: Some(diagnosis),
+                            recovery: None,
+                            blocked: Vec::new(),
+                            why: self.trial.explanation(at),
+                        };
+                        return Err(self.refusal(version, vec![pending], false, overtakes));
                     }
                 }
                 Err(Failure::Terminal(error)) => return Err(error),
@@ -95,41 +105,35 @@ impl Reconstruction {
         }
         let pending: Vec<_> = cursor.pending().collect();
         if !pending.is_empty() {
-            let declarations = pending
-                .iter()
-                .map(|&at| self.steps[at].declaration.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let reason = pending
-                .iter()
-                .map(|&at| {
-                    let blocked = cursor
-                        .blocked_by(at)
-                        .map(|before| self.steps[before].declaration.as_str())
-                        .collect::<Vec<_>>();
-                    format!(
-                        "{}: {}{}",
-                        self.steps[at].declaration,
-                        last[at]
-                            .as_deref()
-                            .unwrap_or("[not attempted; no SQLSTATE]"),
-                        if blocked.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; hard prerequisites: {}", blocked.join(", "))
-                        }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ReconstructError::Compile {
-                declaration: declarations,
-                reason: format!(
-                    "{reason}; no eligible creation made progress in this scratch range; range boundaries are fixed and providers outside it cannot be pulled across"
-                ),
-            });
+            return Err(self.pending_refusal(version, &cursor, &last, &recoveries, overtakes));
         }
         Ok((delta, cursor.finish().expect("complete range")))
+    }
+    fn pending_refusal(
+        &self,
+        version: i64,
+        cursor: &Trials<'_, crate::Postgres>,
+        last: &[Option<super::refusal::Diagnosis>],
+        recoveries: &[Option<super::refusal::Diagnosis>],
+        overtakes: Vec<(String, usize, Vec<String>)>,
+    ) -> ReconstructError {
+        let pending = cursor
+            .pending()
+            .map(|at| super::refusal::Pending {
+                declaration: self.steps[at].declaration.clone(),
+                subject: self.steps[at].subject.clone(),
+                owner: self.steps[at].owner.clone(),
+                dependency: None,
+                last: last[at].clone(),
+                recovery: recoveries[at].clone(),
+                blocked: cursor
+                    .blocked_by(at)
+                    .map(|before| self.steps[before].declaration.clone())
+                    .collect(),
+                why: self.trial.explanation(at),
+            })
+            .collect();
+        self.refusal(version, pending, true, overtakes)
     }
 }
 

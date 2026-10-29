@@ -68,6 +68,9 @@ pub fn session_application_name() -> &'static str {
     NAME.get_or_init(|| format!("pbps/{}/{:08x}", std::process::id(), rand::random::<u32>()))
 }
 
+mod diagnostic;
+pub use diagnostic::{DriverDiagnostic, ErrorPosition};
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("the connection string is malformed: {0}")]
@@ -104,7 +107,8 @@ pub enum DbError {
     /// The driver reported a failure — the server refused the statement, or
     /// the protocol broke.
     ///
-    /// Flat text and an optional code rather than the driver's own error type.
+    /// Flat text, an optional code and neutral transient diagnostics, rather
+    /// than the driver's own error type.
     /// A variant holding one driver's type would put that driver's name into
     /// every signature that mentions `DbError`, which is exactly what the seam
     /// exists to prevent, and with two drivers it could only hold one of them.
@@ -118,6 +122,7 @@ pub enum DbError {
     Driver {
         message: String,
         code: Option<String>,
+        diagnostic: Option<Box<DriverDiagnostic>>,
     },
 
     /// Tool-authored context around an existing failure. `message` must never
@@ -186,6 +191,19 @@ pub enum DbError {
 }
 
 impl DbError {
+    pub fn diagnostic(&self) -> Option<&DriverDiagnostic> {
+        match self {
+            Self::Driver { diagnostic, .. } => diagnostic.as_deref(),
+            Self::Context { source, .. } => source.diagnostic(),
+            Self::BadConnectionString(_)
+            | Self::Connect { .. }
+            | Self::ConnectTimeout { .. }
+            | Self::Refused(_)
+            | Self::WrongSession { .. }
+            | Self::UnsupportedServer { .. }
+            | Self::BadRow(_) => None,
+        }
+    }
     /// Adds this tool's own explanation without flattening the source into it.
     pub fn context(self, message: impl Into<String>) -> Self {
         Self::Context {
@@ -829,6 +847,7 @@ mod tests {
         };
         assert_eq!(chain(&error), ["cannot reach `db.test:5432`: refused"]);
         let wrapped = DbError::Driver {
+            diagnostic: None,
             message: "server sentence".into(),
             code: None,
         }
@@ -840,6 +859,7 @@ mod tests {
     fn context_keeps_the_original_code_and_source_separate_from_its_message() {
         for code in [Some("42501"), Some("1088"), None] {
             let error = DbError::Driver {
+                diagnostic: None,
                 message: "server-only text".into(),
                 code: code.map(str::to_owned),
             }

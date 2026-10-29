@@ -2641,6 +2641,7 @@ mod tests {
     fn an_unreadable_ledger_check_is_unknown_not_untrusted() {
         let mut d = EnvDiagnosis::unknown("prod".to_owned(), Some("prod".to_owned()), "ready");
         d.ledger = LedgerCheck::of(Err(pbps_db::DbError::Driver {
+            diagnostic: None,
             message: "canceling statement: secret-marker".to_owned(),
             code: Some("57014".to_owned()),
         }));

@@ -160,6 +160,7 @@ fn describe(surface: &pbps_model::resolver::Surface) -> String {
 
 /// Everything case 3 needs from the plan being made.
 pub struct Request<'a> {
+    pub sources: Option<&'a pbps_load::DeclarationSourceIndex>,
     pub dependencies: &'a pbps_model::dependency::Dependencies,
     pub selection: &'a ResolverSelection,
     pub assessment: &'a Assessment,
@@ -568,6 +569,15 @@ mod producer {
 
     fn refused(request: &Request<'_>, failure: ProduceError) -> Refused {
         match failure {
+            ProduceError::Run(Error::Creation(mut failure)) => {
+                std::sync::Arc::make_mut(&mut failure).sources =
+                    request.sources.cloned().unwrap_or_default();
+                if failure.externals {
+                    Refused::Unanswerable(Error::Creation(failure).into())
+                } else {
+                    unresolved(request, failure)
+                }
+            }
             ProduceError::Run(error) if answered(&error) => unresolved(request, error),
             ProduceError::Run(error) => Refused::Unanswerable(error.into()),
             ProduceError::Acquire(_) | ProduceError::Cleanup(_) => {
@@ -612,6 +622,7 @@ mod producer {
             // A declared surface had no sound verdict, or the environment was
             // read and differs.
             Error::Binding(_) | Error::Incompatible(_) => true,
+            Error::Creation(failure) => !failure.externals,
             // The recheck read the target in full and found it other than
             // the run read it (#1516). Never a run's failure: the recheck
             // runs after the run, and `deploy` names it `resolver.recheck`.
@@ -834,6 +845,7 @@ mod tests {
     #[test]
     fn an_unreadable_cluster_identity_names_the_grant_only_when_it_was_refused() {
         let denied = pbps_db::DbError::Driver {
+            diagnostic: None,
             message: "permission denied for function pg_control_system".into(),
             code: Some("42501".into()),
         };
@@ -852,6 +864,7 @@ mod tests {
         }
         // Negative: a lost connection is not a missing grant.
         let lost = pbps_db::DbError::Driver {
+            diagnostic: None,
             message: "connection reset".into(),
             code: Some("08006".into()),
         };
@@ -984,6 +997,7 @@ mod tests {
         let hints = Hints::default();
         let dependencies = Default::default();
         let request = |target_identity| Request {
+            sources: None,
             dependencies: &dependencies,
             selection: &selection,
             assessment: &assessment,
@@ -1064,6 +1078,7 @@ mod tests {
         let refusal = |connection: &str, driver| {
             let target = crate::db::target_from_connection(connection, driver);
             let request = Request {
+                sources: None,
                 dependencies: &Default::default(),
                 selection: &selection,
                 assessment: &assessment,

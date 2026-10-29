@@ -451,6 +451,7 @@ impl From<tiberius::error::Error> for DbError {
     /// rather than a second fix (DECISIONS 454).
     fn from(e: tiberius::error::Error) -> Self {
         DbError::Driver {
+            diagnostic: None,
             code: e.code().map(|c| c.to_string()),
             message: e.to_string(),
         }

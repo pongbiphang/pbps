@@ -31,6 +31,7 @@
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
 use pbps_diff::order::scratch::{Part, Progress, TrialProgram};
+pub mod refusal;
 mod trial;
 use pbps_model::ValueSource;
 use pbps_model::{Change, ModuleId, ModuleKind};
@@ -38,8 +39,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Why the desired namespace could not be built on scratch. A named limit,
 /// never a partially compiled namespace that evidence could be read from.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ReconstructError {
+    #[error("{0}")]
+    Refused(#[source] std::sync::Arc<refusal::Refusal>),
     #[error("the desired namespace cannot be reconstructed through a {0} change")]
     Unsupported(String),
     #[error("the emitter cannot write {declaration}: {reason}")]
@@ -47,7 +50,7 @@ pub enum ReconstructError {
     #[error("scratch compilation of {declaration} failed: {reason}")]
     Compile { declaration: String, reason: String },
     /// A catalog read around a step failed: nothing was learned about the
-    /// declaration, so it is not a [`ReconstructError::Compile`] verdict
+    /// declaration, so it is not a [`ReconstructError::Refused`] verdict
     /// (SPEC 9.8, #1575).
     #[error("reading back what compiling {declaration} made failed: {reason}")]
     Read { declaration: String, reason: String },
@@ -111,6 +114,9 @@ pub type Named = (Nameable, String, String);
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Metadata {
+    owner: Option<pbps_model::diagnostic::Declaration>,
+    subject: Change,
+    body: Option<String>,
     table_part: Option<pbps_model::TableName>,
     foreign_key: bool,
     /// What an error names: the declaration, never the statement text.
@@ -781,10 +787,13 @@ impl Reconstruction {
                 .map_err(|e| trial::Failure::Terminal(unread(e)))?,
             None => Vec::new(),
         };
-        for statement in group.statements() {
+        for (ordinal, statement) in group.statements().iter().enumerate() {
             conn.execute(&statement.sql)
                 .await
-                .map_err(trial::Failure::Statement)?;
+                .map_err(|error| trial::Failure::Statement {
+                    error,
+                    statement: ordinal,
+                })?;
         }
         #[cfg(test)]
         self.inject(conn, trial_tests::Point::Readback, at)
@@ -815,22 +824,6 @@ impl Reconstruction {
             step.created = Some(created.clone());
         }
         Ok(step)
-    }
-}
-
-/// The server's refusal of a compile statement, and when it names an object
-/// that does not exist yet (`42P01` relation, `42883` function, `42704` type,
-/// `42703` column) the way out: scratch orders the declarations by the names
-/// their texts use, some of which it can only guess, and `depends_on:` states
-/// the order it should have (DEC-2389.4).
-fn with_remedy(error: &pbps_db::DbError) -> String {
-    match error.server_error_code().as_deref() {
-        Some("42P01" | "42883" | "42704" | "42703") => format!(
-            "{error}; scratch orders the declarations by the names their texts use, and this \
-             one needs an object that is not created yet: list it under `depends_on:` of the \
-             module that needs it to state the order"
-        ),
-        _ => error.to_string(),
     }
 }
 
@@ -996,6 +989,7 @@ async fn array_type(
 
 /// One operation as a part, validated where it is made, so a declaration the
 /// emitter cannot write is refused by name before anything is ordered.
+#[allow(clippy::wildcard_enum_match_arm)]
 fn part(
     dialect: &crate::Postgres,
     operation: usize,
@@ -1014,6 +1008,23 @@ fn part(
         operation,
         change: planned.clone(),
         metadata: Metadata {
+            subject: planned.change.clone(),
+            owner: match &planned.change {
+                Change::CreateModule { id, .. } => {
+                    Some(pbps_model::diagnostic::Declaration::Module(id.clone()))
+                }
+                Change::CreateType { name, .. } => {
+                    Some(pbps_model::diagnostic::Declaration::Type(name.clone()))
+                }
+                other => other
+                    .table()
+                    .cloned()
+                    .map(pbps_model::diagnostic::Declaration::Table),
+            },
+            body: match &planned.change {
+                Change::CreateModule { module, .. } => Some(module.definition.clone()),
+                _ => None,
+            },
             table_part: None,
             foreign_key: matches!(planned.change, Change::AddForeignKey { .. }),
             declaration: declaration.to_owned(),
@@ -1145,3 +1156,6 @@ impl Reconstruction {
         self.committed = (0..self.steps.len()).collect();
     }
 }
+
+#[cfg(test)]
+mod refusal_tests;

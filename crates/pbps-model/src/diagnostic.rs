@@ -9,6 +9,15 @@ use crate::{Column, TableName, ValueSource};
 
 pub type SourceConflicts = BTreeMap<TableName, BTreeMap<ColumnName, Vec<ValueSource>>>;
 
+/// A declaration owner, outside semantic equality and saved artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Declaration {
+    Table(TableName),
+    Module(crate::ModuleId),
+    Type(crate::TypeRef),
+    Role(crate::RoleName),
+}
+
 /// The sources actually supplied for each column of one diagnostic table.
 /// With no recovery entry, the checked column supplies its sole source.
 #[derive(Clone, Copy, Debug, Default)]

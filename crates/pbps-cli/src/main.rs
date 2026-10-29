@@ -3243,6 +3243,30 @@ fn load(project: &Project, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::L
         }
         anyhow::anyhow!("the declarations have {count} problem(s)")
     })?;
+    loaded.sources = loaded
+        .sources
+        .into_iter()
+        .map(|(owner, path)| {
+            let owner = match owner {
+                pbps_model::diagnostic::Declaration::Module(pbps_model::ModuleId::Routine(r)) => {
+                    pbps_model::diagnostic::Declaration::Module(pbps_model::ModuleId::Routine(
+                        pbps_model::RoutineId::new(
+                            r.name,
+                            r.args
+                                .into_iter()
+                                .map(|a| dialect.normalize_routine_arg(&a).unwrap_or(a))
+                                .collect(),
+                        ),
+                    ))
+                }
+                other @ (pbps_model::diagnostic::Declaration::Table(_)
+                | pbps_model::diagnostic::Declaration::Module(_)
+                | pbps_model::diagnostic::Declaration::Type(_)
+                | pbps_model::diagnostic::Declaration::Role(_)) => other,
+            };
+            (owner, path)
+        })
+        .collect();
     let collisions =
         routine_ids_as_the_dialect_spells_them(&mut loaded.schema, &mut loaded.hints, dialect);
     if !collisions.is_empty() {
@@ -5978,6 +6002,7 @@ mod tests {
             schema.tables.insert(parent.name, parent.table);
             schema.tables.insert(child.name, child.table);
             pbps_load::Loaded {
+                sources: Default::default(),
                 dependencies: Default::default(),
                 schema,
                 intents: Vec::new(),
@@ -6022,6 +6047,7 @@ mod tests {
             schema.tables.insert(versioned.name, versioned.table);
             schema.tables.insert(child.name, child.table);
             pbps_load::Loaded {
+                sources: Default::default(),
                 dependencies: Default::default(),
                 schema,
                 intents: Vec::new(),
@@ -6830,4 +6856,39 @@ mod certified_fixture {
         env!("CARGO_MANIFEST_DIR"),
         "/../pbps-diff/tests/support/emission.rs"
     ));
+}
+
+#[cfg(test)]
+mod declaration_source_tests {
+    #[test]
+    fn validated_source_paths_follow_normalized_routine_identities() {
+        let root = std::env::temp_dir().join(format!("pbps-cli-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(root.as_path().join("schema")).unwrap();
+        let file = root.as_path().join("schema/unrelated.yaml");
+        std::fs::write(
+            &file,
+            "function: app.f(int)\ndefinition: (integer) RETURNS integer LANGUAGE sql RETURN 1\n",
+        )
+        .unwrap();
+        let project = pbps_config::Project {
+            root: root.as_path().into(),
+            config: pbps_config::Config::parse(
+                "dialect: postgres\n",
+                &root.as_path().join("pbps.yml"),
+            )
+            .unwrap(),
+        };
+        let loaded = super::load(&project, &pbps_pg::Postgres::new()).unwrap();
+        let key = pbps_model::diagnostic::Declaration::Module("app.f(integer)".parse().unwrap());
+        assert_eq!(loaded.sources[&key], file);
+        assert!(
+            !loaded
+                .sources
+                .contains_key(&pbps_model::diagnostic::Declaration::Module(
+                    "app.f(int)".parse().unwrap()
+                ))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

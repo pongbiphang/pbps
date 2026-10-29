@@ -29,18 +29,22 @@ pub use pbps_model::Intent;
 
 /// The result of loading an entire `schema/` directory.
 ///
-/// Three things, deliberately apart: the state, the one-shot intent, and the
-/// persistent annotations that say *how* rather than *where* (`strategy:`,
-/// `depends_on:`). Only the first may ever take part in a comparison of two
-/// states — see inviolable constraint 1.
+/// The state, one-shot intent and persistent annotations stay separate.
+/// Source paths travel beside all three, never in semantic equality or saved
+/// artifacts — see inviolable constraint 1.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Loaded {
+    pub sources: DeclarationSourceIndex,
     pub dependencies: pbps_model::dependency::Dependencies,
     pub schema: Schema,
     pub intents: Vec<Intent>,
     /// Only what was declared; absence means the default.
     pub hints: Hints,
 }
+
+/// Paths captured by the successful checked load, never reconstructed later.
+pub type DeclarationSourceIndex =
+    std::collections::BTreeMap<pbps_model::diagnostic::Declaration, std::path::PathBuf>;
 
 /// Rejected source declarations, retained only for the diagnostic visitor.
 /// The checked load APIs never return these beside a usable schema.
@@ -306,6 +310,10 @@ fn collect_files(
                     errs.push(already(&path, &format!("type `{}`", t.name.shown()), first));
                     continue;
                 }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Type(t.name.clone()),
+                    path.clone(),
+                );
                 seen_types.insert(t.name.clone(), path);
                 if let Some(from) = t.renamed_from {
                     loaded.intents.push(Intent::RenameType {
@@ -344,8 +352,16 @@ fn collect_files(
                     continue;
                 }
                 for (child, _) in &t.partitions {
+                    loaded.sources.insert(
+                        pbps_model::diagnostic::Declaration::Table(child.clone()),
+                        path.clone(),
+                    );
                     seen_tables.insert(child.clone(), path.clone());
                 }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Table(t.name.clone()),
+                    path.clone(),
+                );
                 seen_tables.insert(t.name.clone(), path);
                 LoadedFile::Table(t)
             }
@@ -354,6 +370,10 @@ fn collect_files(
                     errs.push(already(&path, &format!("`{}`", m.id.shown()), first));
                     continue;
                 }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Module(m.id.clone()),
+                    path.clone(),
+                );
                 seen_modules.insert(m.id.clone(), path);
                 LoadedFile::Module(m)
             }
@@ -363,6 +383,10 @@ fn collect_files(
                     errs.push(already(&path, &format!("role `{}`", r.name.shown()), first));
                     continue;
                 }
+                loaded.sources.insert(
+                    pbps_model::diagnostic::Declaration::Role(r.name.clone()),
+                    path.clone(),
+                );
                 seen_roles.insert(r.name.clone(), path);
                 loaded.intents.append(&mut r.intents);
                 loaded.schema.roles.insert(r.name, r.role);
@@ -1473,5 +1497,71 @@ indexes:
         let errs = load_schema_dir(&dir).unwrap_err();
         assert!(errs[0].to_string().contains("already declared"), "{errs:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The same scalar renderer used by declaration formatting.
+pub use fmt::scalar as render_scalar;
+
+#[cfg(test)]
+mod source_index_tests {
+    use super::*;
+    use pbps_model::diagnostic::Declaration;
+    #[test]
+    fn checked_loading_preserves_actual_paths_without_reconstructing_names() {
+        let dir = std::env::temp_dir().join(format!("pbps-source-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = dir.as_path().join("unrelated-file.yml");
+        let module = dir.as_path().join("another-name.yaml");
+        std::fs::write(&table, "table: app.t\ncolumns:\n  id: {type: int}\n").unwrap();
+        std::fs::write(&module, "view: app.v\ndefinition: SELECT 1 AS n\n").unwrap();
+        let loaded = load_schema_dir(dir.as_path()).unwrap();
+        assert_eq!(
+            loaded.sources[&Declaration::Table("app.t".parse().unwrap())],
+            table
+        );
+        assert_eq!(
+            loaded.sources[&Declaration::Module("app.v".parse().unwrap())],
+            module
+        );
+        assert_eq!(loaded.sources.len(), 2);
+        std::fs::write(
+            dir.as_path().join("duplicate.yml"),
+            "view: app.v\ndefinition: SELECT 2 AS n\n",
+        )
+        .unwrap();
+        assert!(load_schema_dir(dir.as_path()).is_err());
+        assert!(Loaded::default().sources.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dependency_remedy_tests {
+    #[test]
+    fn a_rendered_module_remedy_passes_the_real_dependency_validator() {
+        let provider: pbps_model::ModuleId = "app.g(integer)".parse().unwrap();
+        let yaml = super::render_scalar(&provider.raw().to_string());
+        let text = format!("view: app.v\ndefinition: SELECT 1 AS n\ndepends_on: [{yaml}]\n");
+        let owner = super::load_module_str(std::path::Path::new("v.yaml"), &text).unwrap();
+        let target = super::load_module_str(std::path::Path::new("g.yaml"), "function: app.g(integer)\ndefinition: (integer) RETURNS integer LANGUAGE sql RETURN 1\n").unwrap();
+        let mut schema = pbps_model::Schema::default();
+        schema.modules.insert(owner.id.clone(), owner.module);
+        schema.modules.insert(target.id, target.module);
+        let deps = [(owner.id, owner.depends_on)].into();
+        assert!(pbps_model::module::check_dependencies(&schema, &deps).is_empty());
+        assert!(
+            super::load_module_str(
+                std::path::Path::new("bad.yaml"),
+                "view: app.v\ndefinition: SELECT 1\ndepends_on: [table::app.t]\n"
+            )
+            .is_ok()
+        );
+        let invalid = [(
+            "app.v".parse().unwrap(),
+            ["table::app.t".parse().unwrap()].into(),
+        )]
+        .into();
+        assert!(!pbps_model::module::check_dependencies(&schema, &invalid).is_empty());
     }
 }

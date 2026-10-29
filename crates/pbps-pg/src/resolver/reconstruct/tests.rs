@@ -696,7 +696,7 @@ fn a_change_no_bootstrap_contains_is_refused_by_kind() {
         }],
     )
     .unwrap_err();
-    assert_eq!(refused, ReconstructError::Unsupported("drop_table".into()));
+    assert!(matches!(refused, ReconstructError::Unsupported(ref op) if op == "drop_table"));
 }
 
 /// A created table's identity on one of its indexes is a step after that
@@ -854,6 +854,7 @@ fn split_generated_tables_expose_names_before_either_function() {
 #[test]
 fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
     let failed = |code: Option<&str>| pbps_db::DbError::Driver {
+        diagnostic: None,
         message: "failed".into(),
         code: code.map(Into::into),
     };
@@ -1365,12 +1366,8 @@ fn an_earlier_emission_refusal_precedes_a_later_unsupported_change() {
         .to_string();
     let actual =
         Reconstruction::new(&pg, &super::fixture_plan(&changes), &Default::default()).unwrap_err();
-    assert_eq!(
-        actual,
-        ReconstructError::Emit {
-            declaration: format!("table {}", table.shown()),
-            reason
-        }
+    assert!(
+        matches!(actual, ReconstructError::Emit { declaration, reason: found } if declaration == format!("table {}", table.shown()) && found == reason)
     );
 }
 
@@ -1486,7 +1483,7 @@ fn only_the_creation_of_a_type_is_part_of_a_bootstrap() {
         let changes = [create_type("app.mood", mood()), change];
         let error = Reconstruction::new(&pg, &super::fixture_plan(&changes), &Default::default())
             .unwrap_err();
-        assert_eq!(error, ReconstructError::Unsupported(op.into()));
+        assert!(matches!(error, ReconstructError::Unsupported(ref found) if found == op));
     }
     let untouched = build_reconstruction(&pg, &bootstrap()).unwrap();
     assert!(

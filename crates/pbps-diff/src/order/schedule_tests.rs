@@ -676,3 +676,41 @@ fn the_fallback_over_guesses_is_deterministic() {
         schedule(5, &edges).settle_raw(given).unwrap().sequence
     );
 }
+
+#[test]
+fn scratch_trace_records_exact_removed_guesses_and_both_stages() {
+    let edges = [
+        (0, 1, Source::Guess),
+        (1, 0, Source::Guess),
+        (1, 2, Source::Guess),
+        (2, 0, Source::Effect),
+        (2, 3, Source::Guess),
+    ];
+    let mut dropped = Vec::new();
+    let raw = schedule(4, &edges)
+        .settle_scratch(plan(&["a", "b", "c", "d"]), &mut dropped)
+        .unwrap();
+    let normal = schedule(4, &edges)
+        .settle_raw(plan(&["a", "b", "c", "d"]))
+        .unwrap();
+    assert_eq!(raw.sequence, normal.sequence);
+    assert_eq!(raw.proof, normal.proof);
+    assert_eq!(dropped.len(), 3);
+    assert!(
+        dropped
+            .iter()
+            .any(|d| d.backward_only && d.edge.before == 1 && d.edge.after == 0)
+    );
+    assert_eq!(dropped.iter().filter(|d| !d.backward_only).count(), 2);
+    assert!(dropped.iter().all(|d| d.members == [0, 1, 2]));
+    assert!(
+        !dropped
+            .iter()
+            .any(|d| d.edge.before == 2 && d.edge.after == 3)
+    );
+    let mut none = Vec::new();
+    schedule(2, &[(0, 1, Source::Guess)])
+        .settle_scratch(plan(&["a", "b"]), &mut none)
+        .unwrap();
+    assert!(none.is_empty());
+}

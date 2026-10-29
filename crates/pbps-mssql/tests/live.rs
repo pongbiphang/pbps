@@ -1081,6 +1081,7 @@ async fn create_database_apart(server: &str, name: &str) {
 #[test]
 fn only_model_lock_contention_is_retried_and_only_so_often() {
     let driver = |code: &str| pbps_db::DbError::Driver {
+        diagnostic: None,
         message: "server text".into(),
         code: Some(code.into()),
     };
