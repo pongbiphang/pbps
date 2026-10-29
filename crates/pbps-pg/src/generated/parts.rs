@@ -19,6 +19,44 @@ pub(crate) fn parts(
     version: Option<i64>,
     scratch: bool,
 ) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(
+        change,
+        ids,
+        functions,
+        needs_complete_shape,
+        version,
+        scratch,
+        &Default::default(),
+    )
+}
+
+pub(crate) fn demanded(
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    needs_complete_shape: bool,
+    version: Option<i64>,
+    demand: &pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
+    parts_in(
+        change,
+        ids,
+        functions,
+        needs_complete_shape,
+        version,
+        true,
+        demand,
+    )
+}
+fn parts_in(
+    change: &Change,
+    ids: &IdsFile,
+    functions: &[ModuleId],
+    needs_complete_shape: bool,
+    version: Option<i64>,
+    scratch: bool,
+    demand: &pbps_dialect::creation::Demand,
+) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
         uid,
         name,
@@ -30,9 +68,10 @@ pub(crate) fn parts(
         return Ok(None);
     };
     let calls = |text: &str| functions.iter().any(|id| super::may_call(text, id.name()));
-    let calling = table.columns.values().position(|c| {
-        matches!(&c.value_source,
-        ValueSource::Generated(g) if calls(&g.expression))
+    let calling = table.columns.iter().position(|(column, c)| {
+        demand.columns.contains(column)
+            || matches!(&c.value_source,
+        ValueSource::Generated(g) if calls(&g.expression) || demand.generation.contains(column))
     });
     // A table that generates nothing from a planned function is split only
     // on scratch, and then there is no suffix.
@@ -55,8 +94,21 @@ pub(crate) fn parts(
         .partition_by
         .as_ref()
         .is_some_and(|key| key.columns.iter().any(|c| suffix.contains(c)));
-    let placeholder = partition_key || later_input || needs_complete_shape;
+    let placeholder = partition_key
+        || later_input
+        || needs_complete_shape
+        || suffix.iter().any(|c| demand.required_columns.contains(c));
     let held = placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN);
+    if held
+        && (!demand.generation.is_empty()
+            || (!demand.required_columns.is_empty()
+                && table
+                    .columns
+                    .values()
+                    .any(|c| matches!(c.value_source, ValueSource::Generated(_)))))
+    {
+        return Err(DialectError::Unsupported { dialect: "postgres", feature: "the demanded generation needs a complete-table placeholder and SET EXPRESSION, unavailable before PostgreSQL 17".into() });
+    }
     if held && !scratch {
         return Ok(None);
     }
@@ -72,7 +124,7 @@ pub(crate) fn parts(
             .columns
             .iter()
             .filter_map(|(column, c)| {
-                matches!(&c.value_source, ValueSource::Generated(g) if calls(&g.expression))
+                matches!(&c.value_source, ValueSource::Generated(g) if calls(&g.expression) || demand.generation.contains(column))
                     .then_some(column.clone())
             })
             .collect::<Vec<_>>()
@@ -102,7 +154,7 @@ pub(crate) fn parts(
     if placeholder {
         for (column, spec) in &mut bare.columns {
             if let ValueSource::Generated(g) = &mut spec.value_source
-                && calls(&g.expression)
+                && (calls(&g.expression) || demand.generation.contains(column))
             {
                 let from = crate::emit::generation_placeholder(&spec.ty)?;
                 tail.push(Change::AlterColumnExpression {

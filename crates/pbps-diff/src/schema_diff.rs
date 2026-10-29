@@ -622,20 +622,31 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        let pending = crate::order::boundaries::meetings(base, declared, &d.changes);
-        let mut plan = crate::order::propose(d.changes);
-        plan.pending_boundaries(
-            pending,
-            if dialect.rebuilds_modules() {
-                pbps_model::operation::ModuleEdits::Rebuilt
-            } else {
-                pbps_model::operation::ModuleEdits::InPlace
-            },
-        );
-        Ok(crate::order::differ(plan))
+        Ok(finish_diff(base, declared, dialect, d.changes))
     } else {
         Err(d.errors)
     }
+}
+
+// The annotation entry point admits the same complete differ result, with
+// class-order refusals checked against its final hard order before returning.
+pub(crate) fn finish_diff(
+    base: Side<'_>,
+    declared: Side<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    changes: ChangeSet,
+) -> crate::order::DiffPlan {
+    let pending = crate::order::boundaries::meetings(base, declared, &changes);
+    let mut plan = crate::order::propose(changes);
+    plan.pending_boundaries(
+        pending,
+        if dialect.rebuilds_modules() {
+            pbps_model::operation::ModuleEdits::Rebuilt
+        } else {
+            pbps_model::operation::ModuleEdits::InPlace
+        },
+    );
+    crate::order::differ(plan)
 }
 
 /// Everything [`diff`] found, with the differences it could not express kept

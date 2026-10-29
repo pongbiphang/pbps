@@ -321,9 +321,20 @@ impl Reconstruction {
                         None,
                     )?);
                 }
-                Change::AlterColumnDefault { column, .. } if is_part => {
+                Change::AlterColumnDefault { column, .. }
+                | Change::AlterColumnNullability { column, .. }
+                    if is_part =>
+                {
                     steps.push(make(
-                        &format!("the default of {}", column.shown()),
+                        &format!(
+                            "the {} of {}",
+                            if matches!(change, Change::AlterColumnNullability { .. }) {
+                                "NOT NULL"
+                            } else {
+                                "default"
+                            },
+                            column.shown()
+                        ),
                         Vec::new(),
                         None,
                     )?);
@@ -1249,3 +1260,6 @@ impl Reconstruction {
 
 #[cfg(test)]
 mod refusal_tests;
+
+#[cfg(test)]
+mod creation_tests;

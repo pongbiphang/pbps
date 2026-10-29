@@ -188,6 +188,14 @@ impl Reconstruction {
                 )?),
                 // What a split table is made of, and the differ's own foreign
                 // keys: created after what they name by the route's constraints.
+                Change::AddColumn { table, name, .. } => steps.push(step(
+                    format!("column {}", table.column(name.clone()).shown()),
+                    Vec::new(),
+                )?),
+                Change::AlterColumnNullability { column, .. } => steps.push(step(
+                    format!("nullability of {}", column.shown()),
+                    Vec::new(),
+                )?),
                 Change::AddComputedColumn { table, name, .. } => steps.push(step(
                     format!("computed column {}", table.column(name.clone()).shown()),
                     Vec::new(),

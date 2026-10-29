@@ -23,6 +23,13 @@ struct Side {
     references: BTreeSet<Ref>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Creation {
+    pub references: BTreeSet<ObjectRef>,
+    pub columns: BTreeMap<ObjectRef, pbps_model::ColumnName>,
+    pub dependencies: Arc<BTreeMap<ObjectRef, BTreeSet<ObjectRef>>>,
+}
+
 /// Descriptive identity evidence beside a draft, never saved-plan data.
 #[derive(Debug, Clone)]
 pub struct Contract {
@@ -34,6 +41,7 @@ pub struct Contract {
     goal: Vec<Annotation<BoundRoot>>,
     labels: BTreeMap<Ref, String>,
     demanded: BTreeMap<Root, BTreeSet<ObjectRef>>,
+    creation: BTreeMap<pbps_model::operation::Source, (BTreeSet<ObjectRef>, Creation)>,
     pub(crate) extended: bool,
 }
 
@@ -173,7 +181,86 @@ impl Contract {
             .into_iter()
             .flat_map(|d| &d.0)
             .any(|(owner, providers)| !legacy(owner) || providers.iter().any(|p| !legacy(p)));
+        let names = PlanNames::of(&plan.changes, after.ids).map_err(|e| e.to_string())?;
+        let dependencies: Arc<BTreeMap<_, _>> = Arc::new(goal.0.iter().cloned().collect());
+        let mut creation = BTreeMap::new();
+        for (step, origin) in plan.changes.iter().zip(&plan.origins) {
+            if !matches!(
+                step.change,
+                Change::CreateTable { .. }
+                    | Change::AddColumn { .. }
+                    | Change::AddComputedColumn { .. }
+            ) {
+                continue;
+            }
+            let Some(table) = step.change.table() else {
+                continue;
+            };
+            let spelling = if matches!(step.change, Change::CreateTable { .. }) {
+                origin.spelling().produced()
+            } else {
+                origin.spelling()
+            };
+            let uid = owners.table(table, spelling).map_err(|e| e.to_string())?;
+            let canonical = Root::Table(after.ids.tables.get(&uid).unwrap_or(table).clone());
+            let mut requested = BTreeSet::new();
+            let mut references = BTreeSet::new();
+            let mut columns = BTreeMap::new();
+            for reference in demanded.get(&canonical).into_iter().flatten() {
+                let mut actual = reference.clone();
+                match &mut actual.root {
+                    Root::Table(name) => *name = table.clone(),
+                    Root::Column(column) => {
+                        column.table = table.clone();
+                        let bound = registry
+                            .bind(reference, &owners, Spelling::Final)
+                            .map_err(|e| e.to_string())?;
+                        let column_uid = match &bound.root {
+                            BoundRoot::Recorded(uid)
+                            | BoundRoot::InheritedColumn { column: uid, .. } => Some(uid),
+                            BoundRoot::LocalColumn { .. }
+                            | BoundRoot::Module(_)
+                            | BoundRoot::Trigger { .. } => None,
+                        };
+                        if let (Some(uid), Spelling::At(at)) =
+                            (column_uid, origin.spelling().produced())
+                            && let Some((_, name)) = names.column_at(uid, at)
+                        {
+                            column.name = name.clone();
+                        }
+                    }
+                    Root::Type(_) | Root::Module(_) | Root::Role(_) => {}
+                }
+                if let Root::Column(column) = &actual.root {
+                    columns.insert(reference.clone(), column.name.clone());
+                }
+                // Provider-only existence/generation can stay in the legal prefix.
+                if !matches!(reference.root, Root::Column(_))
+                    || !matches!(reference.part, Selector::Whole | Selector::Generation)
+                    || dependencies.get(reference).is_some_and(|p| !p.is_empty())
+                {
+                    requested.insert(actual);
+                }
+                if matches!(reference.part, Selector::Generation | Selector::Whole)
+                    && matches!(reference.root, Root::Column(_))
+                {
+                    references.extend(dependencies.get(reference).into_iter().flatten().cloned());
+                }
+            }
+            creation.insert(
+                origin.source(),
+                (
+                    requested,
+                    Creation {
+                        references,
+                        columns,
+                        dependencies: dependencies.clone(),
+                    },
+                ),
+            );
+        }
         Ok(Self {
+            creation,
             logical: plan.changes().clone(),
             modules,
             before: Arc::new(Side::of(before, &owners, Spelling::Base)?),
@@ -187,7 +274,14 @@ impl Contract {
     }
 
     #[allow(clippy::wildcard_enum_match_arm)]
-    pub(crate) fn demands(&self, change: &Change) -> BTreeSet<ObjectRef> {
+    pub(crate) fn demands(
+        &self,
+        change: &Change,
+        origin: &pbps_model::operation::Origin,
+    ) -> BTreeSet<ObjectRef> {
+        if let Some((references, _)) = self.creation.get(&origin.source()) {
+            return references.clone();
+        }
         let root = match change {
             Change::CreateTable { name, .. } => Root::Table(name.clone()),
             Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
@@ -200,6 +294,14 @@ impl Contract {
             _ => return BTreeSet::new(),
         };
         self.demanded.get(&root).cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn prerequisites(&self, origin: &pbps_model::operation::Origin) -> Creation {
+        self.creation
+            .get(&origin.source())
+            .map_or_else(Creation::default, |(_, prerequisites)| {
+                prerequisites.clone()
+            })
     }
 
     pub(crate) fn constraints<S>(
@@ -335,6 +437,8 @@ impl Contract {
                 ProjectionError::InternalCycle(n) => (n, "an internal creation cycle: the indivisible owner's contained surface requires the owner first"),
             };
             let annotation = &self.goal[number];
+            let setup = [&annotation.owner, &annotation.provider].iter().any(|r| matches!(&r.root, BoundRoot::Recorded(uid) if self.after.ids.roles.contains_key(uid)) && !self.before.references.contains(*r));
+            let reason=if matches!(error,ProjectionError::Missing(_)) && setup { "a fixed external setup boundary has no installation operation; provision the role before the baseline" } else {reason};
             format!("cannot project annotation `{}` depends on `{}`: {reason}", self.labels[&annotation.owner], self.labels[&annotation.provider])
         })
     }
@@ -501,7 +605,10 @@ impl Contract {
                         schema.tables.insert(name.clone(), shape.clone());
                     }
                 }
-                schema.tables.insert(name.clone(), (**table).clone());
+                // Policies are installed by their own Change, never CREATE TABLE.
+                let mut payload = (**table).clone();
+                payload.row_policies.clear();
+                schema.tables.insert(name.clone(), payload);
                 Root::Table(name.clone())
             }
             Change::AddColumn {

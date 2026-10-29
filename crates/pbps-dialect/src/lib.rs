@@ -39,6 +39,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod creation;
 pub mod drop_requirements;
 pub mod engine_effects;
 pub mod estimate;
@@ -2756,6 +2757,27 @@ pub trait Dialect {
         functions: &[pbps_model::ModuleId],
         needs_complete_shape: bool,
         _demanded: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        self.creation_parts(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            _demanded,
+            _required_columns,
+        )
+    }
+
+    /// Engine-owned demand recipe, beneath the shared annotation identity seam.
+    fn creation_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
+        _demanded: &std::collections::BTreeSet<pbps_model::object_ref::ObjectRef>,
+        _required_columns: &std::collections::BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         self.scratch_table_parts(change, ids, functions, needs_complete_shape)
     }

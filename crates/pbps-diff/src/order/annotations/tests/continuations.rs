@@ -58,6 +58,7 @@ impl Dialect for Probe {
         _: &[pbps_model::ModuleId],
         _: bool,
         demanded: &BTreeSet<ObjectRef>,
+        _: &BTreeSet<pbps_model::ColumnName>,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         assert!(demanded.contains(&"default::app.t.x".parse().unwrap()));
         self.requests.fetch_add(1, Ordering::SeqCst);
