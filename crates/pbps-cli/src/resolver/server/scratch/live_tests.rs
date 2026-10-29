@@ -60,6 +60,12 @@ impl Fixture {
         )
     }
 
+    // A dropped client schedules transport teardown; the server may still
+    // count its backend against this fixture role's one-connection limit.
+    async fn reconnect(&self, database: &str, login: &(String, String)) -> Conn {
+        reconnect2245_tests::connect(&self.as_login(database, login)).await
+    }
+
     async fn database(&mut self, purpose: &str, owner: Option<&str>) -> String {
         let name = format!("pbps_v1672_{purpose}_{}", self.token);
         let owner = owner.map(|o| format!(" OWNER {o}")).unwrap_or_default();
@@ -1449,9 +1455,7 @@ async fn not_standard(
     standard: &Standard,
     acl: Option<&std::collections::BTreeSet<pbps_pg::resolver::standard::Entry>>,
 ) -> Vec<String> {
-    let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(database, login))
-        .await
-        .unwrap();
+    let mut conn = fixture.reconnect(database, login).await;
     pbps_pg::resolver::standard::verify(&mut conn, standard, acl)
         .await
         .unwrap()
@@ -6063,9 +6067,7 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
             .await
             .unwrap();
         *fixture.databases.iter_mut().find(|d| **d == other).unwrap() = quoted.clone();
-        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-            .await
-            .unwrap();
+        let mut conn = fixture.reconnect(&scratch_db, &login).await;
         let account = sql::account(&mut conn).await.unwrap();
         drop(conn);
         let authority = resolver_refusal(
@@ -6078,9 +6080,7 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
             .await,
         );
         fixture.admin().await.execute(&format!("ALTER DATABASE {quoted} OWNER TO CURRENT_USER; GRANT CREATE ON DATABASE {quoted} TO {}", login.0)).await.unwrap();
-        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-            .await
-            .unwrap();
+        let mut conn = fixture.reconnect(&scratch_db, &login).await;
         let reach_raw = sql::cleanup_reach(&mut conn).await.unwrap();
         drop(conn);
         let reach = resolver_refusal(
@@ -6101,9 +6101,7 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
             ))
             .await
             .unwrap();
-        let mut conn = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-            .await
-            .unwrap();
+        let mut conn = fixture.reconnect(&scratch_db, &login).await;
         let backend = sql::backend(&mut conn).await.unwrap();
         let defaults = sql::login_defaults(&mut conn).await.unwrap();
         let acl = standard::read_state(&mut conn).await.unwrap().acl;
@@ -6175,6 +6173,7 @@ async fn catalog_prose_scratch_refusals_show_descriptions_without_changing_autho
     }
 }
 
+mod reconnect2245_tests;
 mod recovery2410_tests;
 
 mod docker2410_tests;

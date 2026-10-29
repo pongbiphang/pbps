@@ -732,9 +732,7 @@ async fn two_runs_that_start_together_cannot_both_claim_the_database() {
         let (login, scratch_db) = fixture.confined().await;
         let first = leave_claimed(&fixture, &scratch_db, &login, &token()).await;
         drop(first);
-        let mut second = Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-            .await
-            .unwrap();
+        let mut second = fixture.reconnect(&scratch_db, &login).await;
         let taken = record::claim(
             &mut second,
             &record::Claim::new(&token(), Default::default(), Default::default()),
@@ -1096,10 +1094,7 @@ async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recover
             engine::stop_after_cleanup(&scratch_db, true);
             let stopped = go(Some(externals)).await;
             engine::stop_after_cleanup(&scratch_db, false);
-            let mut as_login =
-                Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-                    .await
-                    .unwrap();
+            let mut as_login = fixture.reconnect(&scratch_db, &login).await;
             let claimed = match record::read_claim(&mut as_login).await.unwrap() {
                 Some(Ok(claim)) => Some(claim.defaults),
                 _ => None,
@@ -1108,10 +1103,7 @@ async fn a_run_killed_after_its_externals_changed_the_logins_defaults_is_recover
             drop(as_login);
             let finished = go(None).await;
             let after = schema_exists(&fixture, &scratch_db, record::CLAIM).await;
-            let mut as_login =
-                Conn::connect(Driver::Postgres, &fixture.as_login(&scratch_db, &login))
-                    .await
-                    .unwrap();
+            let mut as_login = fixture.reconnect(&scratch_db, &login).await;
             let left = sql::login_defaults(&mut as_login).await.unwrap();
             drop(as_login);
             fixture.drop().await;
