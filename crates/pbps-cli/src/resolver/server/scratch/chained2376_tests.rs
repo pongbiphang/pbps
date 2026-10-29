@@ -134,13 +134,26 @@ async fn observe(
             )
             .await?;
         let mut reconstruction = state
-            .reconstruction(&mut source, &binding, &ids, &Default::default(), &mut prepared)
+            .reconstruction(
+                &mut source,
+                &binding,
+                &ids,
+                &Default::default(),
+                &mut prepared,
+            )
             .await?;
         let mut staged = super::super::engine::staged(Driver::Mssql, &prepared)?;
-        reconstruction.compile(
-            &mut prepared, &mut admin, &mut source, &[], None,
-            provenance.outside_writes, &mut staged,
-        ).await?;
+        reconstruction
+            .compile(
+                &mut prepared,
+                &mut admin,
+                &mut source,
+                &[],
+                None,
+                provenance.outside_writes,
+                &mut staged,
+            )
+            .await?;
         let placements = prepared.dependency_placements();
         let super::super::engine::Prepared::Mssql(prepared) = prepared else {
             unreachable!()
@@ -519,6 +532,202 @@ async fn mssql_unnamed_chained_roots_keep_the_producers_key_in_both_file_modes()
                         "{roots:?}"
                     );
                 }
+            }
+        })
+    }
+    reconstruct2374::both(case).await;
+}
+
+#[tokio::test]
+#[ignore = "needs Docker and the owned SQL Server resolver fixtures"]
+async fn mssql_chained_views_wait_only_for_the_foreign_keys_actual_key() {
+    fn case<'a>(
+        target: &'a str,
+        scratch: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            use pbps_model::{
+                ComputedColumn, Index, IndexColumn, IndexKey, Module, ModuleKind, UniqueConstraint,
+            };
+            connection(target)
+                .await
+                .execute("CREATE SCHEMA ext2376 AUTHORIZATION dbo;")
+                .await
+                .unwrap();
+            for kind in ["index", "unique", "primary", "unnamed"] {
+                let function = "(@x int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM ext2376.base_ids WHERE i=@x); END";
+                let key_sql = match kind {
+                    "index" => "CREATE UNIQUE INDEX required_d ON dbo.managed(d);",
+                    "unique" => "ALTER TABLE dbo.managed ADD CONSTRAINT required_d UNIQUE(d);",
+                    "primary" => {
+                        "ALTER TABLE dbo.managed ADD CONSTRAINT required_d PRIMARY KEY(d);"
+                    }
+                    "unnamed" => "ALTER TABLE dbo.managed ADD PRIMARY KEY(d);",
+                    _ => unreachable!(),
+                };
+                // This is a real legal creation order. The view reads only i;
+                // the key over later d is needed by x_required, not the view.
+                for statement in [
+                    "CREATE TABLE dbo.a(i int CONSTRAINT a_pk PRIMARY KEY); CREATE TABLE dbo.managed(i int NOT NULL,CONSTRAINT to_a FOREIGN KEY(i) REFERENCES dbo.a(i) ON DELETE CASCADE);".to_owned(),
+                    "CREATE VIEW ext2376.base_ids AS SELECT NULLIF(i,0) AS i FROM dbo.managed;".to_owned(),
+                    format!("CREATE FUNCTION dbo.f {function}"),
+                    format!("ALTER TABLE dbo.managed ADD c AS dbo.f(i); ALTER TABLE dbo.managed ADD d AS (i + 1) PERSISTED NOT NULL; {key_sql} CREATE INDEX unrelated_d ON dbo.managed(d); CREATE TABLE dbo.x(i int CONSTRAINT x_pk PRIMARY KEY,CONSTRAINT x_required FOREIGN KEY(i) REFERENCES dbo.managed(d) ON DELETE CASCADE);"),
+                ] {
+                    connection(target).await.execute(&statement).await.unwrap();
+                }
+                let mut schema = declared();
+                let table = schema
+                    .desired
+                    .tables
+                    .get_mut(&TableName::new("dbo", "managed"))
+                    .unwrap();
+                table.primary_key = None;
+                table.computed.insert(
+                    "c".into(),
+                    ComputedColumn {
+                        expression: "dbo.f(i)".into(),
+                        persisted: false,
+                        not_null: false,
+                    },
+                );
+                table.computed.insert(
+                    "d".into(),
+                    ComputedColumn {
+                        expression: "i + 1".into(),
+                        persisted: true,
+                        not_null: true,
+                    },
+                );
+                let index = |unique| Index {
+                    columns: vec![IndexColumn {
+                        key: IndexKey::Column("d".into()),
+                        descending: false,
+                        opclass: None,
+                    }],
+                    include: vec![],
+                    unique,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                };
+                table.indexes.insert("unrelated_d".into(), index(false));
+                match kind {
+                    "index" => {
+                        table.indexes.insert("required_d".into(), index(true));
+                    }
+                    "unique" => {
+                        table.unique.insert(
+                            "required_d".into(),
+                            UniqueConstraint {
+                                columns: vec!["d".into()],
+                                storage_parameters: Default::default(),
+                            },
+                        );
+                    }
+                    "primary" | "unnamed" => {
+                        table.primary_key = Some(PrimaryKey {
+                            name: (kind == "primary").then(|| "required_d".into()),
+                            columns: vec!["d".into()],
+                            storage_parameters: Default::default(),
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                schema.desired.modules.insert(
+                    "dbo.f()".parse().unwrap(),
+                    Module {
+                        kind: ModuleKind::Function,
+                        definition: function.into(),
+                        description: None,
+                        options: Default::default(),
+                    },
+                );
+                schema.base = schema.desired.clone();
+                // This pins the native scratch route. Ordinary diff still
+                // refuses function-backed computed creation before that route.
+                let ids = pbps_diff::resolve(
+                    &schema.desired,
+                    &IdsFile::default(),
+                    &[],
+                    &pbps_diff::Context {
+                        operator: "chained-key-regression".into(),
+                        today: "2026-10-29".into(),
+                    },
+                )
+                .unwrap()
+                .ids;
+                let table_name = TableName::new("dbo", "managed");
+                let function_id: pbps_model::ModuleId = "dbo.f()".parse().unwrap();
+                let plan = pbps_diff::order::propose(pbps_model::ChangeSet {
+                    changes: vec![
+                        pbps_model::PlannedChange::new(pbps_model::Change::CreateTable {
+                            uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "managed", 0),
+                            name: table_name.clone(),
+                            table: Box::new(schema.desired.tables[&table_name].clone()),
+                            beside_default: None,
+                            moves_at_most: None,
+                        }),
+                        pbps_model::PlannedChange::new(pbps_model::Change::CreateModule {
+                            id: function_id.clone(),
+                            module: Box::new(schema.desired.modules[&function_id].clone()),
+                        }),
+                    ],
+                });
+                let inputs = capture::required_externals(
+                    &mut connection(target).await,
+                    &[&schema.desired],
+                    &capture_key(),
+                )
+                .await
+                .unwrap();
+                let reconstruction =
+                    pbps_mssql::resolver::reconstruct::Reconstruction::with_chained(
+                        &pbps_mssql::Mssql,
+                        &plan,
+                        &ids,
+                        &Default::default(),
+                        Some(&inputs),
+                        false,
+                    )
+                    .unwrap_or_else(|e| panic!("{kind}: {e}"));
+                let roots: BTreeSet<_> = (0..reconstruction.len())
+                    .filter_map(|at| match reconstruction.auxiliary(at) {
+                        Some(pbps_mssql::resolver::reconstruct::AuxiliaryStep::Rendered(id)) => {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let (scratch_name, scratch_url) = create_database(scratch).await;
+                let result = async {
+                    let mut setup = connection(&scratch_url).await;
+                    setup
+                        .execute("CREATE SCHEMA ext2376 AUTHORIZATION dbo;")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    setup.execute(EARLY).await.map_err(|e| e.to_string())?;
+                    for at in 0..reconstruction.len() {
+                        if reconstruction.auxiliary(at).is_some() {
+                            reconstruction.compile_external(&mut setup, at).await
+                        } else {
+                            reconstruction.compile_steps(&mut setup, at..at + 1).await
+                        }
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok::<_, String>(())
+                }
+                .await;
+                drop_database(scratch, &scratch_name).await;
+                result.unwrap_or_else(|e| panic!("{kind}: {e}"));
+                assert!(
+                    roots.contains(&capture::object("ext2376", "base_ids")),
+                    "{kind}: {roots:?}"
+                );
+                assert!(
+                    roots.contains(&capture::object("dbo", "x_required")),
+                    "{kind}: {roots:?}"
+                );
+                connection(target).await.execute("DROP TABLE dbo.x; DROP TABLE dbo.managed; DROP FUNCTION dbo.f; DROP VIEW ext2376.base_ids; DROP TABLE dbo.a;").await.unwrap();
             }
         })
     }

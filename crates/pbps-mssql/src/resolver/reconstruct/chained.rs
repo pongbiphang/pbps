@@ -47,6 +47,18 @@ pub(super) fn blueprint(
         .collect::<BTreeMap<_, _>>();
     let dependencies = inputs.external_prerequisites();
     for (id, required) in chains {
+        let foreign_key: Option<ForeignKeyPrerequisite> = inputs
+            .captured()
+            .properties(&id)
+            .and_then(|properties| properties.get("foreign_key"))
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    ReconstructError::Unsupported(format!(
+                        "external {id:?} has unreadable captured foreign-key prerequisites"
+                    ))
+                })
+            })
+            .transpose()?;
         let mut after = Vec::new();
         for prerequisite in required {
             let providers: Vec<_> = steps
@@ -54,16 +66,9 @@ pub(super) fn blueprint(
                 .filter(|step| {
                     step.metadata.created.contains(&prerequisite)
                         || supplies_key(&step.change.change, &prerequisite)
-                        || (matches!(
-                            step.change.change,
-                            Change::SetPrimaryKey { .. }
-                                | Change::AddUnique { .. }
-                                | Change::AddIndex { .. }
-                        ) && step
-                            .change
-                            .change
-                            .table()
-                            .is_some_and(|t| object(&t.schema, &t.name) == prerequisite))
+                        || foreign_key
+                            .as_ref()
+                            .is_some_and(|key| key.supplied_by(&step.change.change, &prerequisite))
                 })
                 .map(|step| Node::Operation(step.operation))
                 .collect();
@@ -114,6 +119,40 @@ pub(super) fn blueprint(
     Ok(auxiliary)
 }
 
+// DEC-2376.3: a table reference needs its bare table. Only a foreign key's
+// actual catalog binding needs a particular late constraint or unique index.
+#[derive(serde::Deserialize)]
+struct ForeignKeyPrerequisite {
+    references: ObjectIdentity,
+    key: ReferencedKey,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ReferencedKey {
+    Constraint(ObjectIdentity),
+    Index { unique_index: String },
+}
+
+impl ForeignKeyPrerequisite {
+    fn supplied_by(&self, change: &Change, prerequisite: &ObjectIdentity) -> bool {
+        if prerequisite != &self.references
+            || !change
+                .table()
+                .is_some_and(|table| object(&table.schema, &table.name) == self.references)
+        {
+            return false;
+        }
+        match &self.key {
+            ReferencedKey::Constraint(id) => supplies_key(change, id),
+            ReferencedKey::Index { unique_index } => matches!(change,
+                Change::AddIndex { table, name, .. }
+                    if object(&table.schema, &table.name) == self.references && name.raw() == unique_index
+            ),
+        }
+    }
+}
+
 fn defer_unconsumed(auxiliary: &mut [Auxiliary<Metadata>]) {
     // A renderer with only an external consumer still has to precede the
     // suffix when that consumer eventually supplies a managed step. Follow
@@ -144,18 +183,25 @@ fn defer_unconsumed(auxiliary: &mut [Auxiliary<Metadata>]) {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn supplies_key(change: &Change, id: &ObjectIdentity) -> bool {
     let key = |table: &pbps_model::TableName, name: Option<&pbps_model::ObjectLocalName>| {
-        name.is_some_and(|name| object(&table.schema, name.raw()) == *id)
+        name.map_or_else(
+            || {
+                id.class == "pbps-unnamed-PRIMARY KEY"
+                    && id.signature.first() == Some(&object(&table.schema, &table.name))
+            },
+            |name| object(&table.schema, name.raw()) == *id,
+        )
     };
     match change {
         Change::CreateTable { name, table, .. } => {
-            key(
-                name,
-                table.primary_key.as_ref().and_then(|p| p.name.as_ref()),
-            ) || table.unique.keys().any(|n| key(name, Some(n)))
+            table
+                .primary_key
+                .as_ref()
+                .is_some_and(|primary| key(name, primary.name.as_ref()))
+                || table.unique.keys().any(|n| key(name, Some(n)))
         }
-        Change::SetPrimaryKey { table, to, .. } => {
-            key(table, to.as_ref().and_then(|p| p.name.as_ref()))
-        }
+        Change::SetPrimaryKey { table, to, .. } => to
+            .as_ref()
+            .is_some_and(|primary| key(table, primary.name.as_ref())),
         Change::AddUnique { table, name, .. } => key(table, Some(name)),
         _ => false,
     }

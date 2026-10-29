@@ -5243,3 +5243,8 @@ and shape source. Its published schema-set metadata advances separately;
 saved-plan, evidence and envelope wire versions do not. Apply performs no
 new dependency query. Full SQL Server
 evidence sealing/admission remains #2143's boundary.
+
+
+<a id="dec-2376-3"></a>
+
+**DEC-2376.3. Chained externals wait for their actual key prerequisite, not every index on a referenced table.** A plain table reference needs the bare table; holding it behind unrelated split keys or indexes can invent a cycle through a managed function and later computed columns. Foreign-key capture already records the referenced constraint identity or unique-index name. The SQL Server blueprint uses that private fact to retain the corresponding provider edge on the referenced table itself (a same-named key on another table is no provider), including an unnamed primary key's producer-issued identity, while leaving unrelated keys out. A missing or unreadable captured foreign-key fact is never inferred from statement text. A live regression creates the legal base-table/view/function/computed/key order on the target, then compiles the same native scratch route with a referenced unique index, unique constraint, named primary key and unnamed primary key. Ordinary diff's computed-function limitation is unchanged.
