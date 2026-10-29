@@ -297,8 +297,20 @@ impl Contract {
                     self.record(&mut index, reference, at, definition.transition);
                 }
             }
-            self.payload(&mut index, at, operation, &owners)?;
             self.facets(&mut index, at, operation, &owners, &names)?;
+        }
+        let installers: BTreeSet<_> = index
+            .boundaries
+            .iter()
+            .flat_map(|(reference, boundary)| {
+                boundary
+                    .installs
+                    .iter()
+                    .map(|at| (operations.as_slice()[*at].source(), reference.clone()))
+            })
+            .collect();
+        for (at, operation) in operations.as_slice().iter().enumerate() {
+            self.payload(&mut index, at, operation, &owners, &installers)?;
         }
         index.project(&self.base, &self.goal).map_err(|error| {
             let (number, reason) = match error {
@@ -430,6 +442,7 @@ impl Contract {
         at: usize,
         op: &Operation,
         owners: &dyn Owners,
+        installers: &BTreeSet<(pbps_model::operation::Source, Ref)>,
     ) -> Result<(), String> {
         let mut schema = Schema::default();
         let root = match op.change() {
@@ -495,7 +508,12 @@ impl Contract {
             let bound = registry
                 .bind(reference, owners, op.origin().spelling().produced())
                 .map_err(|e| e.to_string())?;
-            self.record(index, bound, at, Transition::Produces);
+            // A typed recipe part owns its final surface. CREATE can already
+            // expose an inherited fallback without installing the extracted
+            // declaration belonging to the same logical source (DEC-2469.3).
+            if !installers.contains(&(op.source(), bound.clone())) {
+                self.record(index, bound, at, Transition::Produces);
+            }
         }
         if matches!(op.change(), Change::AlterModule { .. }) {
             let reference = ObjectRef {

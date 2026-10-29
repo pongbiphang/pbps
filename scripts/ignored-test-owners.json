@@ -2260,7 +2260,8 @@
         "input_path_tests::a_row_comparison_runs_its_familys_comparison_function_and_not_the_operators",
         "catalog_prose_live_readers_keep_raw_names_and_draft_only_line_comments",
         "default_rebuild::a_retyped_defaults_binding_and_assignment_are_measured_before_rebuild_rules",
-        "annotations2469::module_to_object_annotations_drive_installs_and_removals"
+        "annotations2469::module_to_object_annotations_drive_installs_and_removals",
+        "annotations2469::partition_default_annotations_follow_the_module_across_ancestor_depths"
       ]
     },
     {

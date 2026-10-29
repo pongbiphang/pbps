@@ -351,6 +351,39 @@ fn parts_in(
     let Some(parts) = split.map_err(|e| e.to_string())? else {
         return Ok(None);
     };
+    // Scratch can carry a partition default with a placeholder column UID.
+    // Annotation endpoints need its real child-table/root-column identity;
+    // the existing partition operation resolves that through the shared chain.
+    // Keep the scratch recipe and every unannotated byte unchanged (DEC-2469.3).
+    let parts = if !demanded.is_empty()
+        && let Change::CreateTable {
+            uid, name, table, ..
+        } = &planned.change
+        && let Some(of) = &table.partition_of
+    {
+        parts
+            .into_iter()
+            .map(|part| match part {
+                Change::AlterColumnDefault {
+                    column,
+                    from: None,
+                    to: Some(to),
+                    ..
+                } if column.table == *name => Change::SetPartitionDefault {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    parent: of.parent.clone(),
+                    column: column.name,
+                    from: None,
+                    to: Some(to),
+                    fallback: None,
+                },
+                part => part,
+            })
+            .collect()
+    } else {
+        parts
+    };
     Ok(Some(
         parts
             .into_iter()

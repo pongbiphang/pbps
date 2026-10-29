@@ -134,3 +134,69 @@ async fn module_to_object_annotations_drive_installs_and_removals() {
     db.conn.execute("COMMIT").await.unwrap();
     db.drop().await;
 }
+
+#[path = "annotation_partitions.rs"]
+mod partitions;
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn partition_default_annotations_follow_the_module_across_ancestor_depths() {
+    for (depth, inherited) in [(1, false), (3, false), (1, true), (3, true)] {
+        let mut db = TestDb::create(&format!("annotation_partition_{depth}_{inherited}")).await;
+        db.conn.execute("BEGIN TRANSACTION").await.unwrap();
+        db.conn.execute("CREATE SCHEMA app").await.unwrap();
+        let fallback = if inherited { "DEFAULT 1" } else { "" };
+        db.conn
+            .execute(&format!(
+                "CREATE TABLE app.root(x integer {fallback}) PARTITION BY RANGE(x)"
+            ))
+            .await
+            .unwrap();
+        let mut parent = "app.root".to_owned();
+        for at in 0..depth - 1 {
+            let name = format!("app.middle_{at}");
+            db.conn
+                .execute(&format!(
+                    "CREATE TABLE {name} PARTITION OF {parent} DEFAULT PARTITION BY RANGE(x)"
+                ))
+                .await
+                .unwrap();
+            parent = name;
+        }
+        let scene = partitions::Scene::new(depth);
+        let scene = if inherited {
+            scene.with_root_default()
+        } else {
+            scene
+        };
+        let scene = scene.with_existing_ancestors();
+        let engine = Postgres::new();
+        let plan = scene.plan(&engine).unwrap();
+        let module = plan
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreateModule { .. }))
+            .unwrap();
+        let default = plan
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::SetPartitionDefault { .. }))
+            .unwrap();
+        assert!(module < default);
+        for step in &plan.changes {
+            for statement in engine.fixture_emit(&step.change, step.strategy).unwrap() {
+                db.conn.execute(&statement.sql).await.unwrap();
+            }
+        }
+        db.conn
+            .execute("INSERT INTO app.child DEFAULT VALUES")
+            .await
+            .unwrap();
+        let rows = db.conn.query("SELECT x FROM app.child").await.unwrap();
+        assert_eq!(rows[0].try_get::<i32>("x").unwrap(), Some(7));
+        let rows = db.conn.query("SELECT count(*)::text AS bindings FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef a ON d.classid='pg_catalog.pg_attrdef'::regclass AND d.objid=a.oid WHERE a.adrelid='app.child'::regclass AND d.refclassid='pg_catalog.pg_proc'::regclass AND d.refobjid='app.f()'::regprocedure").await.unwrap();
+        assert_eq!(rows[0].try_get::<&str>("bindings").unwrap(), Some("1"));
+        db.conn.execute("COMMIT").await.unwrap();
+        db.drop().await;
+    }
+}
