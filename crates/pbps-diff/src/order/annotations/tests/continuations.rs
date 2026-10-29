@@ -267,3 +267,103 @@ fn a_contained_surface_cannot_install_its_own_indivisible_owner_first() {
         "{text}"
     );
 }
+
+#[test]
+fn scope_tails_retain_annotations_and_reserved_event_ids() {
+    use pbps_model::operation::{ModuleEdits, Operations, Origin};
+    for (tracked, annotated) in [(false, true), (true, false), (true, true)] {
+        let f = Fixture::new();
+        let goal = dependencies(&[("app.f", &["table::app.t"])]);
+        let mut plan = if annotated {
+            f.plan(f.creates(), &ObjectDeps::default(), &goal).unwrap()
+        } else {
+            propose(ChangeSet {
+                changes: f.creates().into_iter().map(PlannedChange::new).collect(),
+            })
+        };
+        let contract = plan.annotations.clone();
+        if tracked {
+            let operations = Operations::of_plan(&plan.changes, ModuleEdits::Rebuilt);
+            plan.allocator.reserve(&operations);
+            plan.identities = Some(operations);
+        }
+        // A temporarily held companion must stay reserved across an append.
+        let held = plan.allocator.allocate(
+            [(Origin::Whole(0), plan.changes[0].clone())],
+            ModuleEdits::Rebuilt,
+        );
+        let scope = PlannedChange::new(Change::SetDataMode {
+            table: "app.t".parse().unwrap(),
+            from: None,
+            to: Some(pbps_model::data::DataMode::Exact),
+        });
+        let mut appended =
+            crate::order::writebacks::PlanningInput::new(vec![scope]).append_to(plan);
+        if let Some(contract) = contract {
+            assert!(std::sync::Arc::ptr_eq(
+                appended.annotations.as_ref().unwrap(),
+                &contract
+            ));
+        } else {
+            assert!(appended.annotations.is_none());
+        }
+        assert_eq!(
+            appended.annotation_edges().unwrap().len(),
+            usize::from(annotated)
+        );
+        assert_eq!(appended.identities.is_some(), tracked);
+        let fresh = appended.allocator.allocate(
+            [(Origin::Whole(0), appended.changes[0].clone())],
+            ModuleEdits::Rebuilt,
+        );
+        assert_ne!(fresh.as_slice()[0].id(), held.as_slice()[0].id());
+    }
+}
+
+#[test]
+fn fill_placement_consumes_the_annotation_settled_managed_order() {
+    use crate::order::scratch::{FillDependency, FillNode, FillWork};
+    let f = Fixture::new();
+    let engine = Probe::default();
+    let build = |goal| {
+        let plan = f.plan(f.creates(), &ObjectDeps::default(), &goal)?;
+        let prepared = crate::order::scratch::prepare(&plan, &f.ids, &Default::default(), &engine)?;
+        crate::order::scratch::settle(&engine, prepared)
+    };
+    let settled = build(dependencies(&[("app.f", &["table::app.t"])])).unwrap();
+    assert!(matches!(
+        settled.parts()[0].change.change,
+        Change::CreateTable { .. }
+    ));
+    let node = |dependency| FillNode {
+        name: "external dependent".into(),
+        dependencies: vec![dependency],
+    };
+    let table = settled.parts()[0].operation;
+    let program = settled
+        .fill_program(&[node(FillDependency::Managed(table))])
+        .unwrap();
+    assert_eq!(
+        program.work(),
+        &[
+            FillWork::Declared(0),
+            FillWork::Fill(0),
+            FillWork::Declared(1)
+        ]
+    );
+    let omitted = settled
+        .fill_program(&[node(FillDependency::Unavailable("app.absent".into()))])
+        .unwrap();
+    assert_eq!(omitted.omitted(), &[0]);
+    assert_eq!(
+        omitted.work(),
+        &[FillWork::Declared(0), FillWork::Declared(1)]
+    );
+    assert!(
+        build(dependencies(&[
+            ("app.f", &["table::app.t"]),
+            ("table::app.t", &["app.f"])
+        ]))
+        .is_err()
+    );
+}

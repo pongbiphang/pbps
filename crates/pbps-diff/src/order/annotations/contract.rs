@@ -6,9 +6,10 @@ use pbps_model::diagnostic::Declaration;
 use pbps_model::object_ref::{BoundRoot, Registry};
 use pbps_model::operation::symbolic::Attribute;
 use pbps_model::operation::{
-    ColumnKey, ModuleEdits, ObjectKey, Operations, Owners, PartKey, PlanOwners, Snapshot, Spelling,
+    ColumnKey, ModuleEdits, ObjectKey, Operations, Origin, Owners, PartKey, PlanOwners, Snapshot,
+    Spelling,
 };
-use pbps_model::plan_names::PlanNames;
+use pbps_model::plan_names::{At, PlanNames};
 use pbps_model::{IdsFile, Schema, Table, Uid};
 
 type Ref = ObjectRef<BoundRoot>;
@@ -209,7 +210,7 @@ impl Contract {
             .iter()
             .zip(&plan.changes)
             .filter_map(|(origin, step)| {
-                if let pbps_model::operation::Origin::Whole(at) = origin {
+                if let Origin::Whole(at) = origin {
                     Some((*at, step.clone()))
                 } else {
                     None
@@ -381,10 +382,14 @@ impl Contract {
                         .into_iter()
                         .find_map(|s| s.roots.get(table.uid()).map(|root| (s, root)))
                         .ok_or_else(|| "partition column ownership was not recorded".to_owned())?;
-                    let table_name = match spelling {
-                        Spelling::Base => self.before.ids.tables.get(root),
-                        Spelling::Final => self.after.ids.tables.get(root),
-                        Spelling::At(at) => names.table_at(root, at),
+                    // Projection rebuilds observations on the logical timeline.
+                    // Input address versions belong to the retained executable
+                    // operations, not this snapshot lookup (DEC-2296.9).
+                    let table_name = match operation.logical_origin() {
+                        Origin::Teardown(_) => self.before.ids.tables.get(root),
+                        Origin::Restoration(_) => self.after.ids.tables.get(root),
+                        Origin::Whole(at) => names.table_at(root, At::Before(*at)),
+                        Origin::SplitPart(at) => names.table_at(root, At::After(*at)),
                     }
                     .or_else(|| side.ids.tables.get(root))
                     .ok_or_else(|| "root table address is unavailable".to_owned())?;
