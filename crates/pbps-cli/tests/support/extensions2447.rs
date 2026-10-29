@@ -14,7 +14,7 @@ fn servers(mut check: impl FnMut(&str, &str)) {
 fn installed(connection: &str) {
     on_server(
         connection,
-        "CREATE SCHEMA ext; CREATE SCHEMA other; CREATE EXTENSION citext WITH SCHEMA ext VERSION '1.4'; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4'; CREATE TABLE ext.ordinary(id integer);",
+        "CREATE SCHEMA IF NOT EXISTS ext; CREATE SCHEMA IF NOT EXISTS other; CREATE EXTENSION citext WITH SCHEMA ext VERSION '1.4'; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4'; CREATE TABLE ext.ordinary(id integer);",
     );
 }
 
@@ -296,5 +296,270 @@ fn legacy_scope_keeps_unheld_packages_out_until_explicit_adoption() {
         succeeds(d.run(&["verify", "--db", connection]));
         assert_eq!(findings(&d, connection)["data"]["changes"], 0);
         assert!(Path::new(&extension_file(&d, "plpgsql")).is_file());
+    });
+}
+
+const SCRATCH_TARGET: &str = "PBPS_2447_TARGET";
+const SCRATCH_SERVER: &str = "PBPS_2447_SCRATCH";
+const EXACT_PACKAGES: &str = "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION citext WITH SCHEMA ext VERSION '1.4'; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4';";
+
+struct ScratchCase {
+    _database: OwnDatabase,
+    scratch: super::resolver_publication::Confined,
+    demo: Demo,
+    connection: String,
+}
+
+impl ScratchCase {
+    fn new(server: &str, slug: &str, resolver: bool) -> Self {
+        let database = OwnDatabase::new(server, slug);
+        let connection = database.connection().to_owned();
+        installed(&connection);
+        if resolver {
+            on_server(
+                &connection,
+                "CREATE VIEW ext.v AS SELECT id FROM ext.ordinary",
+            );
+        }
+        let demo = adopted(&connection, slug);
+        let scratch = super::resolver_publication::Confined::new(server);
+        std::fs::write(demo.dir.join("pbps.yml"), format!("dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    url_env: {SCRATCH_SERVER}\n    externals: externals.sql\nenvironments:\n  prod:\n    url_env: {SCRATCH_TARGET}\n    resolve_with: scratch\n    fingerprint_key_file: key\n")).unwrap();
+        std::fs::write(demo.dir.join("externals.sql"), EXACT_PACKAGES).unwrap();
+        succeeds(demo.run(&[
+            "key",
+            "generate",
+            "--out",
+            demo.dir.join("key").to_str().unwrap(),
+        ]));
+        std::fs::write(
+            demo.dir.join("schema/ext.ordinary.yml"),
+            "table: ext.ordinary\ncolumns:\n  id: {type: integer}\n  added: {type: integer}\n",
+        )
+        .unwrap();
+        succeeds(demo.run(&["plan", "--no-dev"]));
+        demo.commit();
+        Self {
+            _database: database,
+            scratch,
+            demo,
+            connection,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.demo.run_with_env(
+            args,
+            &[
+                (SCRATCH_TARGET, &self.connection),
+                (SCRATCH_SERVER, &self.scratch.connection),
+            ],
+        )
+    }
+
+    fn plan(&self, resolver: bool) -> std::process::Output {
+        let path = self.demo.dir.join("scratch.plan.json");
+        let mut args = vec![
+            "plan",
+            "--env",
+            "prod",
+            "--out",
+            path.to_str().unwrap(),
+            "--format",
+            "json",
+        ];
+        if resolver {
+            args.push("--no-rehearse");
+        }
+        self.run(&args)
+    }
+
+    fn refused(&self, resolver: bool, required: &[&str]) {
+        let out = self.plan(resolver);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        let message = format!("{}{}", stdout(&out), stderr(&out));
+        for fact in required {
+            assert!(message.contains(fact), "missing {fact}: {message}");
+        }
+        assert!(!self.demo.dir.join("scratch.plan.json").exists());
+        assert_eq!(
+            super::scalar(
+                &self.connection,
+                "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = 'ext.ordinary'::regclass AND attname = 'added'"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn adopted_extensions_allow_resolver_and_rehearsal_for_ordinary_changes() {
+    servers(|server, variable| {
+        for resolver in [true, false] {
+            let case = ScratchCase::new(
+                server,
+                &format!("extensions2447-scratch-{variable}-{resolver}"),
+                resolver,
+            );
+            let report = json_output(succeeds(case.plan(resolver)));
+            if resolver {
+                assert_eq!(
+                    report["data"]["resolver_assessment"]["need"], "resolved",
+                    "{report}"
+                );
+            } else {
+                assert_eq!(
+                    report["data"]["rehearsal"]["outcome"], "converged",
+                    "{report}"
+                );
+            }
+            let path = case.demo.dir.join("scratch.plan.json");
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved.ids.extensions.len(), 3);
+            assert_eq!(saved.changes.changes.len(), 1);
+            assert!(matches!(
+                saved.changes.changes[0].change,
+                pbps_model::Change::AddColumn { .. }
+            ));
+            let checksum = super::plan_checksum(&path);
+            succeeds(case.run(&[
+                "apply",
+                "--env",
+                "prod",
+                "--plan",
+                path.to_str().unwrap(),
+                "--checksum",
+                &checksum,
+            ]));
+            succeeds(case.run(&["verify", "--env", "prod"]));
+            assert_eq!(
+                super::scalar(
+                    &case.connection,
+                    "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = 'ext.ordinary'::regclass AND attname = 'added'"
+                ),
+                1
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn scratch_extensions_require_presence_exact_version_and_schema() {
+    servers(|server, variable| {
+        for resolver in [true, false] {
+            let case = ScratchCase::new(
+                server,
+                &format!("extensions2447-prereq-{variable}-{resolver}"),
+                resolver,
+            );
+            for (sql, facts) in [
+                (
+                    "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4';",
+                    vec!["scratch extension", "citext", "1.4", "absent", "externals"],
+                ),
+                (
+                    "CREATE SCHEMA IF NOT EXISTS ext; CREATE EXTENSION citext WITH SCHEMA ext VERSION '1.6'; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4';",
+                    vec!["scratch extension", "citext", "1.4", "1.6"],
+                ),
+                (
+                    "CREATE SCHEMA IF NOT EXISTS ext; CREATE SCHEMA IF NOT EXISTS other; CREATE EXTENSION citext WITH SCHEMA other VERSION '1.4'; CREATE EXTENSION hstore WITH SCHEMA ext VERSION '1.4';",
+                    vec!["scratch extension", "citext", "ext", "other"],
+                ),
+            ] {
+                std::fs::write(case.demo.dir.join("externals.sql"), sql).unwrap();
+                case.demo.commit();
+                case.refused(resolver, &facts);
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn scratch_bootstrap_does_not_authorize_real_extension_lifecycle_changes() {
+    servers(|server, variable| {
+        let case = ScratchCase::new(
+            server,
+            &format!("extensions2447-lifecycle-scratch-{variable}"),
+            false,
+        );
+        for (name, text, action) in [
+            (
+                "pgcrypto",
+                "extension: pgcrypto\nschema: ext\nversion: '1.3'\n",
+                "CREATE EXTENSION",
+            ),
+            (
+                "citext",
+                "extension: citext\nschema: ext\nversion: '1.6'\n",
+                "UPDATE",
+            ),
+            (
+                "hstore",
+                "extension: hstore\nschema: other\nversion: '1.4'\n",
+                "SET SCHEMA",
+            ),
+        ] {
+            let path = extension_file(&case.demo, name);
+            let old = std::fs::read(&path).ok();
+            std::fs::write(&path, text).unwrap();
+            case.demo.commit();
+            case.refused(false, &[name, action]);
+            match old {
+                Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                None => std::fs::remove_file(path).unwrap(),
+            }
+            case.demo.commit();
+        }
+    });
+}
+
+/// Temporarily hide only this fixture's package scripts, then restore even if
+/// an assertion fails. This distinguishes installed target state from scratch
+/// availability without substituting a different PostgreSQL major.
+struct HiddenCitextScripts {
+    container: String,
+}
+impl HiddenCitextScripts {
+    fn new(container: String) -> Self {
+        succeeds(std::process::Command::new("docker").args(["exec", &container, "sh", "-c", "set -eu; pbps_extension_dir=$(pg_config --sharedir)/extension; for pbps_package_file in \"$pbps_extension_dir\"/citext*.sql; do test -f \"$pbps_package_file\"; mv \"$pbps_package_file\" \"$pbps_package_file.pbps-2447-disabled\"; done"]).output().unwrap());
+        Self { container }
+    }
+}
+impl Drop for HiddenCitextScripts {
+    fn drop(&mut self) {
+        succeeds(std::process::Command::new("docker").args(["exec", &self.container, "sh", "-c", "set -eu; pbps_extension_dir=$(pg_config --sharedir)/extension; for pbps_package_file in \"$pbps_extension_dir\"/citext*.sql.pbps-2447-disabled; do test -f \"$pbps_package_file\"; mv \"$pbps_package_file\" \"${pbps_package_file%.pbps-2447-disabled}\"; done"]).output().unwrap());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn scratch_without_the_exact_installable_extension_version_is_named() {
+    servers(|server, variable| {
+        let case = ScratchCase::new(
+            server,
+            &format!("extensions2447-unavailable-{variable}"),
+            false,
+        );
+        let container_variable = variable.replace("_DB", "_CONTAINER");
+        let hidden = HiddenCitextScripts::new(std::env::var(container_variable).unwrap());
+        assert_eq!(
+            super::scalar(
+                server,
+                "SELECT count(*) FROM pg_catalog.pg_available_extension_versions WHERE name = 'citext' AND version = '1.4'"
+            ),
+            0
+        );
+        case.refused(false, &["citext", "1.4"]);
+        drop(hidden);
+        assert_eq!(
+            super::scalar(
+                server,
+                "SELECT count(*) FROM pg_catalog.pg_available_extension_versions WHERE name = 'citext' AND version = '1.4'"
+            ),
+            1
+        );
     });
 }

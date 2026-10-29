@@ -228,10 +228,21 @@ impl Scratch<'_> {
         match self {
             Self::Postgres(scratch) => {
                 let fill = postgres::fill(target_connection, binding, extras).await?;
-                scratch
+                let mut prepared = scratch
                     .prepare(provisioning, admin, target, authorization, schemas, &fill)
-                    .await
-                    .map(Prepared::Postgres)
+                    .await?;
+                let problems = pbps_pg::resolver::scratch::extension_prerequisites(
+                    prepared.session(admin),
+                    &binding.base.extensions,
+                )
+                .await
+                .map_err(|error| {
+                    Error::Read(format!("scratch extension prerequisites: {error}"))
+                })?;
+                if !problems.is_empty() {
+                    return Err(Error::Binding(problems.join("; ")));
+                }
+                Ok(Prepared::Postgres(prepared))
             }
             Self::Mssql(scratch) => scratch
                 .prepare(

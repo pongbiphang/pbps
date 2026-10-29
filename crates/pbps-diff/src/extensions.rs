@@ -1,6 +1,30 @@
 use crate::{Side, schema_diff::DiffError};
 use std::collections::BTreeSet;
 
+/// The already-adopted packages a scratch bootstrap must start with.
+///
+/// This is not a target baseline or lifecycle permission: scratch consumers
+/// must verify these exact prerequisites before compiling managed objects.
+/// Real target differences continue through `differences` (DEC-2447.1).
+pub fn scratch_base(desired: Side<'_>) -> (pbps_model::Schema, pbps_model::IdsFile) {
+    (
+        pbps_model::Schema {
+            extensions: desired.schema.extensions.clone(),
+            ..Default::default()
+        },
+        pbps_model::IdsFile {
+            extensions: desired
+                .ids
+                .extensions
+                .iter()
+                .filter(|(_, name)| desired.schema.extensions.contains_key(*name))
+                .map(|(uid, name)| (uid.clone(), name.clone()))
+                .collect(),
+            ..Default::default()
+        },
+    )
+}
+
 /// Refusals share the drift channel, so no executable plan can lose an
 /// extension difference merely because no Change can yet express it.
 pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<DiffError> {
@@ -73,6 +97,74 @@ pub fn differences(base: Side<'_>, desired: Side<'_>, dialect: &str) -> Vec<Diff
 mod tests {
     use super::*;
     use pbps_model::{Extension, IdsFile, Schema};
+
+    #[test]
+    fn scratch_prerequisites_preserve_packages_without_authorizing_target_creation() {
+        let schema = Schema {
+            extensions: [(
+                "citext".into(),
+                Extension {
+                    schema: "ext".into(),
+                    version: "1.4".into(),
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let ids = IdsFile {
+            extensions: [("e_000001".parse().unwrap(), "citext".into())].into(),
+            ..Default::default()
+        };
+        let desired = Side {
+            schema: &schema,
+            ids: &ids,
+        };
+        let (scratch, scratch_ids) = scratch_base(desired);
+        assert_eq!(scratch.extensions, schema.extensions);
+        assert_eq!(scratch_ids.extensions, ids.extensions);
+        assert!(
+            scratch.tables.is_empty()
+                && scratch.types.is_empty()
+                && scratch.roles.is_empty()
+                && scratch.modules.is_empty()
+        );
+        assert!(
+            differences(
+                Side {
+                    schema: &scratch,
+                    ids: &scratch_ids
+                },
+                desired,
+                "postgres"
+            )
+            .is_empty()
+        );
+        let empty = Schema::default();
+        assert!(
+            differences(
+                Side {
+                    schema: &empty,
+                    ids: &IdsFile::default()
+                },
+                desired,
+                "postgres"
+            )[0]
+            .to_string()
+            .contains("CREATE EXTENSION")
+        );
+        assert!(
+            differences(
+                Side {
+                    schema: &scratch,
+                    ids: &scratch_ids
+                },
+                desired,
+                "mssql"
+            )[0]
+            .to_string()
+            .contains("PostgreSQL extensions")
+        );
+    }
 
     #[test]
     fn lifecycle_differences_are_named_and_unchanged_packages_have_no_drift() {

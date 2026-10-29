@@ -4190,3 +4190,17 @@ stay visible. Real PostgreSQL 16/18 tests pin adoption, no-op comparison, native
 version/schema/missing-package drift, lifecycle refusals, old scope, members
 and comments. Type-provider acceptance and executable extension transitions
 are deliberately not claimed by this read-only contract.
+
+
+Scratch bootstrap is not a requested lifecycle transition. Its comparison base
+retains the exact adopted extension definitions and identities, but no ordinary
+managed objects. Before compiling those objects, both resolver and rehearsal
+require each package to be installed on the isolated scratch at the exact
+version and schema. The operator provisions it through the existing externals
+file on run-owned or supplied scratch; PR A never installs or alters a package
+itself. An
+absent or mismatching prerequisite refuses by name, without substituting a
+server default or skipping the package. The existing environment compatibility
+check still requires target versions to be available on scratch. This rule
+keeps extension code execution/provider certification in the later slices;
+real-target CREATE/DROP/UPDATE/SET SCHEMA differences keep their refusals.
