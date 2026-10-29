@@ -189,7 +189,7 @@ fn acceptance(server: &str) {
         assert!(stdout(&planned).contains("WAL"));
         let plan: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(plan.version, 57);
+        assert_eq!(plan.version, pbps_model::plan::CURRENT_VERSION);
         let refused = apply_plan(&d, connection, &path, false);
         assert_ne!(code(&refused), 0, "separate risk approval is required");
         succeeds(apply(&d, connection, &path));
