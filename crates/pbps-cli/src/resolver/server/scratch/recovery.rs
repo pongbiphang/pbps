@@ -224,7 +224,7 @@ impl Report {
             let short = &group.token[..group.token.len().min(8)];
             if !group.removed.is_empty() {
                 lines.push(format!(
-                    "warning: run {short}… ended without cleaning up its scratch (its session is gone); removed {}",
+                    "warning: scratch left by run {short}…: confirmed removal of {}",
                     group
                         .removed
                         .iter()
@@ -279,6 +279,22 @@ pub fn take() -> Collected {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_report_confirms_absence_without_attributing_another_removers_work() {
+        let report = Report {
+            groups: vec![Group {
+                token: "run".into(),
+                removed: vec![Resource::one("docker container", "owned")],
+                kept: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let text = report.render().unwrap();
+        assert!(text.contains("confirmed removal of docker container owned"));
+        assert!(!text.contains("its session is gone"));
+        assert_eq!(Report::default().render(), None);
+    }
+
     use super::*;
 
     /// A cluster in memory: what is there, who is alive, and what refuses.

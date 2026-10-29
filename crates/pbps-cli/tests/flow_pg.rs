@@ -1183,6 +1183,12 @@ fn a_docker_run_killed_after_its_keeper_connected_is_removed_by_the_next_run() {
 
 #[test]
 #[ignore = "needs live postgres and docker"]
+fn a_docker_run_killed_during_use_is_confirmed_while_another_remover_runs() {
+    recovery2410_docker::during_concurrent_removal(&server());
+}
+
+#[test]
+#[ignore = "needs live postgres and docker"]
 fn a_docker_run_killed_inside_its_externals_file_is_removed_by_the_next_run() {
     recovery2410_docker::during_use(&server());
 }

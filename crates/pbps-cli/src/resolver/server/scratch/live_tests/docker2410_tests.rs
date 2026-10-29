@@ -6,7 +6,7 @@
 //! `tests/flow_pg.rs`. The grace for a container that never had a keeper is
 //! twenty seconds here, not five minutes.
 
-use super::super::container::{Keeper, swept, swept_alone};
+use super::super::container::{Keeper, swept, swept_alone, swept_with_observation};
 use super::setting;
 use crate::resolver::server::engine;
 use pbps_db::resolver::Kept;
@@ -372,5 +372,121 @@ async fn a_container_whose_server_cannot_be_read_is_kept_and_named_with_the_comm
         group.kept[0].why.contains("could not be read"),
         "{}",
         group.kept[0].why
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn recovery_confirms_another_remover_started_between_listing_and_liveness() {
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let (name, _) = start(&mut made, &dead).await;
+    let volumes = volumes_of(&name);
+    let mut remover = None;
+    let report = swept_with_observation(&token(), &dead, async |id| {
+        // Make native writable-layer deletion observable, then gate on the
+        // daemon's actual removing state rather than a guessed delay.
+        docker(&[
+            "exec",
+            id,
+            "sh",
+            "-c",
+            "mkdir /pbps2513; seq 1 60000 | xargs -n 1000 sh -c 'touch \"$@\"' sh",
+        ]);
+        remover = Some(
+            Command::new("docker")
+                .args(["rm", "--force", "--volumes", id])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args(["container", "inspect", "--format", "{{json .}}", id])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "the removing observation must precede absence: {output:?}"
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let observed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if observed["State"]["Status"] == "removing" {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the other remover never started"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    let output = remover.unwrap().wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!exists(&name), "{report:?}");
+    assert!(volumes.iter().all(|v| !volume_exists(v)), "{volumes:?}");
+    assert!(removed(&report, &name), "{report:?}");
+    assert!(kept_why(&report, &name).is_empty(), "{report:?}");
+    assert!(report.render().unwrap().contains("confirmed removal of"));
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
+async fn recovery_keeps_unconfirmed_volumes_named_after_the_container_is_gone() {
+    // Drop the containers before this last-resort anonymous-volume cleanup.
+    struct Volume(Option<String>);
+    impl Drop for Volume {
+        fn drop(&mut self) {
+            if let Some(name) = &self.0 {
+                let _ = Command::new("docker").args(["volume", "rm", name]).output();
+            }
+        }
+    }
+    let mut cleanup = Volume(None);
+    let mut made = Made(Vec::new());
+    let dead = token();
+    let (name, connection) = start(&mut made, &dead).await;
+    let volumes = volumes_of(&name);
+    let volume = volumes.first().expect("the pinned image has a data volume");
+    cleanup.0 = Some(volume.clone());
+    let holder = format!("pbps2513-volume-holder-{}", token());
+    docker(&[
+        "run",
+        "--detach",
+        "--pull",
+        "never",
+        "--name",
+        &holder,
+        "--mount",
+        &format!("type=volume,src={volume},dst=/held"),
+        "--entrypoint",
+        "sleep",
+        &image(),
+        "600",
+    ]);
+    made.0.push(holder);
+    drop(
+        Keeper::open(Driver::Postgres, &connection, &dead)
+            .await
+            .unwrap(),
+    );
+    let report = swept_alone(&token(), &dead, GRACE).await;
+    assert!(!exists(&name), "{report:?}");
+    assert!(
+        volume_exists(volume),
+        "the other owned container still holds it"
+    );
+    assert!(
+        !removed(&report, &name),
+        "container absence alone is not recovery: {report:?}"
+    );
+    assert!(
+        kept_why(&report, &name)
+            .iter()
+            .any(|why| why.contains(volume)),
+        "{report:?}"
     );
 }

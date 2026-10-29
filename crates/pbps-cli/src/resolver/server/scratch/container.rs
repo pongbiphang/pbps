@@ -13,7 +13,7 @@ use super::super::{Error, ProduceError, engine};
 
 mod recovery;
 #[cfg(test)]
-pub(super) use recovery::{Keeper, seen, swept, swept_alone};
+pub(super) use recovery::{Keeper, seen, swept, swept_alone, swept_with_observation};
 mod startup;
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};
@@ -417,12 +417,58 @@ impl Container {
     }
 }
 
-/// Whether the runtime says the container is being removed, by this run or
-/// by another's sweep.
-async fn removing(id: &str) -> bool {
-    docker(&["container", "inspect", "--format", "{{.State.Status}}", id])
-        .await
-        .is_ok_and(|status| status.trim() == "removing")
+// One status read decides whether to wait: a second inspect can race the
+// transition from removing to absent (DEC-2513.1).
+fn container_absent(id: &str, observed: Result<String, String>) -> Result<bool, String> {
+    match observed {
+        Err(why) if no_such_container(&why) => Ok(true),
+        Err(why) => Err(why),
+        Ok(status) if status.trim() == "removing" => Ok(false),
+        Ok(status) => Err(format!(
+            "the docker container {id} is still {}",
+            status.trim()
+        )),
+    }
+}
+
+async fn wait_absent<F: std::future::Future<Output = Result<bool, String>>>(
+    within: Duration,
+    mut observe: impl FnMut() -> F,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "removal was not confirmed within {}ms",
+                within.as_millis()
+            ));
+        }
+        match tokio::time::timeout_at(deadline, observe()).await {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => {}
+            Ok(Err(why)) => return Err(why),
+            Err(_) => {
+                return Err(format!(
+                    "removal was not confirmed within {}ms",
+                    within.as_millis()
+                ));
+            }
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline),
+        )
+        .await;
+    }
+}
+
+async fn wait_removed(id: &str) -> Result<(), String> {
+    wait_absent(Duration::from_secs(5), || async move {
+        container_absent(
+            id,
+            docker(&["container", "inspect", "--format", "{{.State.Status}}", id]).await,
+        )
+    })
+    .await
 }
 
 /// [`Container::remove`] for a container named, not owned: a leftover of a run
@@ -442,6 +488,15 @@ pub async fn remove_named(id: &str) -> Result<(), Vec<String>> {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     });
+    remove_with_volumes(id, volumes).await
+}
+
+// Recovery captures these names before a concurrent remover can erase the
+// container record. Absence of that record cannot prove volume cleanup.
+async fn remove_with_volumes(
+    id: &str,
+    volumes: Result<Vec<String>, String>,
+) -> Result<(), Vec<String>> {
     let _ = docker(&["kill", id]).await;
     let _ = docker(&["rm", "--force", "--volumes", id]).await;
     let mut left = Vec::new();
@@ -449,44 +504,34 @@ pub async fn remove_named(id: &str) -> Result<(), Vec<String>> {
     // unreachable daemon or a timeout says nothing, and the container
     // may still run. A container another run's sweep is removing is waited
     // for, with its volumes: two sweeps may find the same dead one.
-    let mut waits = 0;
-    let gone = loop {
-        match docker(&["container", "inspect", "--format", "{{.Id}}", id]).await {
-            Err(why) if no_such_container(&why) => break true,
-            Ok(_) if waits < 50 && removing(id).await => {
-                waits += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            _ => break false,
+    let gone = match wait_removed(id).await {
+        Ok(()) => true,
+        Err(why) => {
+            left.push(format!("the docker container {id} and its volumes: {why}"));
+            false
         }
     };
-    if !gone {
-        left.push(format!("the docker container {id} and its volumes"));
-    }
     match volumes {
         Ok(volumes) => {
             for volume in volumes {
-                let mut tries = 0;
-                loop {
-                    match docker(&["volume", "inspect", "--format", "{{.Name}}", &volume]).await {
-                        Err(why) if no_such_volume(&why) => {}
-                        Ok(_) if gone && tries < 30 => {
-                            tries += 1;
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
-                        }
-                        _ => left.push(format!("the docker volume {volume}")),
+                let volume = volume.as_str();
+                let confirmed = wait_absent(Duration::from_secs(3), || async move {
+                    match docker(&["volume", "inspect", "--format", "{{.Name}}", volume]).await {
+                        Err(why) if no_such_volume(&why) => Ok(true),
+                        Ok(_) if gone => Ok(false),
+                        Ok(_) => Err("its container is not confirmed absent".into()),
+                        Err(why) => Err(why),
                     }
-                    break;
+                })
+                .await;
+                if let Err(why) = confirmed {
+                    left.push(format!("the docker volume {volume}: {why}"));
                 }
             }
         }
-        // Never created, or created and never named: nothing to read.
-        Err(why) if no_such_container(&why) => {}
-        Err(_) if left.is_empty() => left.push(format!(
-            "the volumes of the docker container {id}, which could not be read"
+        Err(why) => left.push(format!(
+            "the volumes of the docker container {id}, which could not be read: {why}"
         )),
-        Err(_) => {}
     }
     if left.is_empty() { Ok(()) } else { Err(left) }
 }
@@ -677,6 +722,50 @@ pub(super) fn published_port(text: &str, container_port: u16) -> Result<u16, Str
 
 #[cfg(test)]
 mod tests {
+    use super::{container_absent, wait_absent};
+
+    #[test]
+    fn recovery_absence_requires_the_daemons_explicit_missing_container() {
+        assert_eq!(
+            container_absent("owned", Err("No such container: owned".into())),
+            Ok(true)
+        );
+        assert_eq!(
+            container_absent("owned", Ok("removing\n".into())),
+            Ok(false)
+        );
+        for response in [
+            Ok("running".into()),
+            Ok("".into()),
+            Err("permission denied".into()),
+            Err("daemon unavailable".into()),
+            Err("No such volume: owned".into()),
+        ] {
+            assert!(container_absent("owned", response).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_wait_is_bounded_and_an_unreadable_daemon_is_not_absence() {
+        let within = Duration::from_millis(20);
+        let stuck = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_absent(within, || async { Ok(false) }),
+        )
+        .await
+        .unwrap();
+        assert!(stuck.unwrap_err().contains("not confirmed within"));
+        let denied = wait_absent(within, || async { Err("permission denied".into()) }).await;
+        assert_eq!(denied, Err("permission denied".into()));
+        let stalled = wait_absent(within, || async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(true)
+        })
+        .await;
+        assert!(stalled.unwrap_err().contains("not confirmed within"));
+        assert_eq!(wait_absent(within, || async { Ok(true) }).await, Ok(()));
+    }
+
     use super::{
         Container, no_such_container, no_such_image, no_such_volume, published_port, run_args,
         unfinished_start,

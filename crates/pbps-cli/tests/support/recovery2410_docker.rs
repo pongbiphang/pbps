@@ -142,6 +142,37 @@ fn exists(name: &str) -> bool {
         .success()
 }
 
+fn volumes_of(name: &str) -> Vec<String> {
+    let out = succeeds(
+        Command::new("docker")
+            .args([
+                "container",
+                "inspect",
+                "--format",
+                "{{range .Mounts}}{{.Name}} {{end}}",
+                name,
+            ])
+            .output()
+            .unwrap(),
+    );
+    stdout(&out).split_whitespace().map(str::to_owned).collect()
+}
+
+fn assert_absent(kind: &str, name: &str) {
+    let out = Command::new("docker")
+        .args([kind, "inspect", name])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success()
+            && stderr(&out)
+                .to_ascii_lowercase()
+                .contains(&format!("no such {kind}")),
+        "{}",
+        said(&out)
+    );
+}
+
 fn remove(name: &str) {
     let _ = Command::new("docker")
         .args(["rm", "--force", "--volumes", name])
@@ -209,7 +240,7 @@ fn sleeping(name: &str, marker: &str) -> bool {
             "-Atc",
             &format!(
                 "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%{marker}%' AND pid <> \
-                 pg_backend_pid()"
+                 pg_backend_pid() AND state='active' AND wait_event='PgSleep'"
             ),
         ])
         .output()
@@ -263,28 +294,84 @@ pub fn before_the_first_connection(server: &str) {
 /// Killed once its keeper has connected: the container is the dead run's, and
 /// the next run removes it, with no wait.
 pub fn after_the_connection(server: &str) {
+    after_connection(server, false);
+}
+
+pub fn during_concurrent_removal(server: &str) {
+    after_connection(server, true);
+}
+
+fn after_connection(server: &str, concurrent: bool) {
     let f = Fixture::new(server, "rec-dk-conn");
+    f.externals("SELECT pg_sleep(120) /* pbps2513_in_use */;\n");
     let mut child = f.start();
     let pid = child.id();
     until("the run's container", || !containers_of(pid).is_empty());
     let name = containers_of(pid).remove(0);
     let _left = Leftovers(vec![name.clone()]);
-    // The mark is written after the session is there, and a kill in between
-    // leaves a keeper that never connected, which the next run keeps.
-    until("the keeper's session and its mark", || {
-        keepers(&name) > 0 && marked(&name)
+    // The keeper outlives cleanup. An executing externals query proves this
+    // CLI has not reached teardown, rather than merely not finished it.
+    until("the marked keeper and known in-use work", || {
+        keepers(&name) > 0 && marked(&name) && sleeping(&name, "pbps2513_in_use")
     });
+    let volumes = volumes_of(&name);
+    let id = stdout(&succeeds(
+        Command::new("docker")
+            .args(["container", "inspect", "--format", "{{.Id}}", &name])
+            .output()
+            .unwrap(),
+    ))
+    .trim()
+    .to_owned();
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(exists(&name), "a killed run leaves its container");
+    f.externals("SELECT 1;\n");
+    let remover = concurrent.then(|| {
+        Command::new("docker")
+            .args(["rm", "--force", "--volumes", &id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    });
     let next = f.plan(&["--format", "json"]);
+    if let Some(remover) = remover {
+        let out = remover.wait_with_output().unwrap();
+        let why = stderr(&out).to_ascii_lowercase();
+        assert!(
+            out.status.success()
+                || why.contains("no such container")
+                || why.contains("already in progress"),
+            "{}",
+            said(&out)
+        );
+    }
     assert_eq!(code(&next), 0, "{}", said(&next));
-    assert!(!exists(&name), "the next run removed it");
-    assert!(
-        recovered(&next).iter().any(|m| m.contains(&name)),
-        "and said so: {}",
-        said(&next)
-    );
+    assert_absent("container", &name);
+    for volume in &volumes {
+        assert_absent("volume", volume);
+    }
+    let report: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+    for finding in report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["message"].as_str().unwrap().contains(&name))
+    {
+        let message = finding["message"].as_str().unwrap();
+        // Another remover may finish before listing (no finding), or erase
+        // metadata before it is captured (a named, unproved volume cleanup).
+        // Neither outcome permits claiming this sweep performed the removal.
+        assert!(
+            (finding["id"] == "scratch.recovered" && message.starts_with("confirmed removal of "))
+                || (finding["id"] == "scratch.leftover"
+                    && message.contains("volumes could not be read before removal")
+                    && message.to_ascii_lowercase().contains("no such container")),
+            "{}",
+            said(&next)
+        );
+    }
 }
 
 /// Killed inside its externals file: the same.

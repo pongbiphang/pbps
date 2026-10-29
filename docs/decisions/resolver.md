@@ -5261,3 +5261,32 @@ readers of the same bare table. Managed prerequisite discovery still traverses
 externals to find their managed anchors. The native four-key regression uses
 two external views before their managed function and computed-column consumers;
 a lexically earlier true external relay also retains its required provider edge.
+
+<a id="dec-2513-1"></a>
+
+**DEC-2513.1. Docker recovery confirms in-progress removal using retained identity and volume evidence.**
+Measured on Docker Engine 29.1.3 (API 1.52), deletion passes through `removing`;
+inspection still returns the immutable ID and mounts, while a second
+`rm --force --volumes` refuses because removal is already in progress.
+Neither that refusal nor container-record disappearance proves volume cleanup.
+The recovery listing captures ownership-checked ID and volume names before
+liveness. Subsequent observations and removal use that ID, never a reused name.
+Missing identity or volume metadata remains a named warning.
+
+An explicit `removing` observation is re-read for at most five seconds, with
+one atomic status read per attempt; only the daemon's missing-container
+response proves absence. The bound includes stalled daemon calls. A keeper
+probe that loses a race to removal re-observes the runtime; a live keeper
+still prevents recovery. Each captured volume must separately be confirmed
+absent, with a bounded three-second wait. Persistent removal, unknown/denied
+responses, foreign ownership and unconfirmed volumes stay named and conservative.
+Human and JSON recovery messages say that removal was confirmed, without
+attributing another remover's work to this sweep.
+Completion before listing needs no finding; metadata lost before its read
+remains a warning without invented volume evidence.
+
+The SIGKILL fixture waits for an active, identifiable externals query as well
+as the marked keeper: the keeper intentionally outlives normal teardown.
+The native race regression retains an actual `removing` observation across the
+listing/liveness boundary and confirms container and volume absence. A volume
+held by another owned container cannot count as recovered.
