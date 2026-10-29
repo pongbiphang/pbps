@@ -16,23 +16,53 @@ pub(super) enum Target {
     Module(ModuleId),
 }
 
-#[derive(Debug)]
-pub(super) struct Entry {
-    pub consumer: String,
-    pub text: String,
-    pub subject: String,
-    pub writes: bool,
-    pub target: Target,
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub(super) consumer: String,
+    pub(super) text: String,
+    pub(super) subject: String,
+    pub(super) writes: bool,
+    pub(super) target: Target,
 }
 
 #[derive(Debug, Default)]
 pub struct Bindings(pub(super) Vec<Entry>);
 
+impl Bindings {
+    pub fn contracts(&self) -> impl Iterator<Item = &Entry> {
+        self.0.iter()
+    }
+
+    /// Spelling and review metadata do not retire an identity-bound contract.
+    pub fn contains(&self, entry: &Entry) -> bool {
+        self.0.iter().any(|own| {
+            own.consumer == entry.consumer
+                && own.writes == entry.writes
+                && own.target == entry.target
+        })
+    }
+}
+
 impl Entry {
-    pub fn access(&self) -> &'static str {
+    /// The declaration spelling, retained for retirement diagnostics.
+    pub fn declaration(&self) -> String {
+        format!(
+            "consumers.{}.{}: {}",
+            self.consumer,
+            self.access(),
+            self.text
+        )
+    }
+
+    /// Evaluate one restored entry through the ordinary plan rule.
+    pub fn bindings(&self) -> Bindings {
+        Bindings(vec![self.clone()])
+    }
+
+    pub(super) fn access(&self) -> &'static str {
         if self.writes { "writes" } else { "uses" }
     }
-    pub fn table(&self) -> Option<&Uid> {
+    pub(super) fn table(&self) -> Option<&Uid> {
         match &self.target {
             Target::Table(uid)
             | Target::Column { table: uid, .. }
@@ -40,14 +70,14 @@ impl Entry {
             Target::Module(_) => None,
         }
     }
-    pub fn column(&self, uid: &Uid) -> bool {
+    pub(super) fn column(&self, uid: &Uid) -> bool {
         match &self.target {
             Target::Table(_) => true,
             Target::Column { uid: own, .. } => own == uid,
             Target::NamedColumn { .. } | Target::Module(_) => false,
         }
     }
-    pub fn named_column(&self, name: &pbps_model::ColumnName, sides: &[Side<'_>]) -> bool {
+    pub(super) fn named_column(&self, name: &pbps_model::ColumnName, sides: &[Side<'_>]) -> bool {
         match &self.target {
             Target::Table(_) => true,
             Target::NamedColumn { name: own, .. } => own == name,
@@ -57,7 +87,7 @@ impl Entry {
             Target::Module(_) => false,
         }
     }
-    pub fn change_text(&self, change: &Change) -> String {
+    pub(super) fn change_text(&self, change: &Change) -> String {
         // Only typed names and the serialized tag feed prose, never SQL.
         let value = serde_json::to_value(change).expect("a typed change serializes");
         let op = value["op"]

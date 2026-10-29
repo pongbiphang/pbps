@@ -7211,15 +7211,15 @@ fn plan_db(
                 checkout::assess(project.root(), &target.label, revision.as_ref(), &removals)?
                     .into_iter()
                     .collect();
-            Ok::<_, anyhow::Error>((conn, entry, findings))
+            Ok::<_, anyhow::Error>((conn, entry, findings, revision.and_then(|r| r.git_sha)))
         });
         // A failed target read cannot produce a plan, but must not replace the
         // established local identity refusals with an environment failure
         // (SPEC 9.8). Retain the error until those checks finish; it is never
         // missing evidence that would permit planning to continue.
-        let (checked_target, checkout_findings) = match checked_target {
-            Ok((conn, entry, findings)) => (Ok((conn, entry)), findings),
-            Err(error) => (Err(error), Vec::new()),
+        let (checked_target, checkout_findings, retirement_revision) = match checked_target {
+            Ok((conn, entry, findings, revision)) => (Ok((conn, entry)), findings, revision),
+            Err(error) => (Err(error), Vec::new(), None),
         };
         if !json {
             eprint!("{}", crate::output::human(&checkout_findings));
@@ -8208,6 +8208,7 @@ fn plan_db(
             &mut cs, project, dialect.as_ref(), true,
             pbps_diff::Side { schema: &base, ids: &recorded_ids },
             pbps_diff::Side { schema: &declared, ids: &resolved.ids },
+            retirement_revision.as_ref(),
         );
         if !json {
             for f in &policy {

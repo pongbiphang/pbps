@@ -23959,3 +23959,12 @@ fn deployment_services1165_offline_bytes_and_early_refusals_stay_unchanged() {
 fn deployment_services1165_command_contracts_on_mssql() {
     deployment_services1165::connected(&std::env::var("PBPS_TEST_DB").unwrap(), false);
 }
+
+#[path = "support/consumer_retirements.rs"]
+mod consumer_retirements;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
+    consumer_retirements::live(&std::env::var("PBPS_TEST_DB").unwrap());
+}

@@ -4,7 +4,7 @@ mod binding;
 mod changes;
 
 use crate::{Context, Policies, evaluate::Live};
-pub use binding::Bindings;
+pub use binding::{Bindings, Entry as BoundContract};
 use pbps_model::{ChangeSet, Finding, IdsFile, ModuleId, Schema, Uid};
 use std::collections::{BTreeMap, BTreeSet};
 

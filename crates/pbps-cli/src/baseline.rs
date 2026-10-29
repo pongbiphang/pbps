@@ -57,6 +57,8 @@ pub struct Baseline {
     /// as it is.
     pub declared: pbps_model::Declared,
     pub description: String,
+    /// Provenance for plan-time consumer retirement evidence, not a schema input.
+    pub git_sha: Option<pbps_model::Text>,
     /// An empty baseline has to be flagged, or "everything is new" reads as a
     /// real plan.
     pub is_empty_fallback: bool,
@@ -97,6 +99,7 @@ pub fn load(
                 hints: pbps_model::Hints::default(),
                 declared: snap.declared,
                 description: format!("baseline file {}", path.display()),
+                git_sha: snap.git_sha,
                 is_empty_fallback: false,
             })
         }
@@ -107,6 +110,7 @@ pub fn load(
             hints: pbps_model::Hints::default(),
             declared: pbps_model::Declared::default(),
             description: "empty baseline".into(),
+            git_sha: None,
             is_empty_fallback: true,
         }),
     }
@@ -201,6 +205,49 @@ fn paths_at(project: &Project, rev: &str) -> anyhow::Result<(String, String)> {
     let config = pbps_config::Config::parse(&text, &project.config_file())
         .map_err(|e| anyhow::anyhow!("`{config_rel}` at `{rev}` does not parse: {e}"))?;
     paths_from(&config, &config_rel, &relative_to(root)?, rev)
+}
+
+/// Read an exact historical config through the same checked Git-object reader
+/// as declarations. A missing file is not a failed read or an invalid config.
+pub(crate) fn config_at(
+    project: &Project,
+    rev: &str,
+) -> anyhow::Result<Option<pbps_config::Config>> {
+    let relative = relative_to(&project.config_file())?;
+    // The recursive reader omits an empty tree. Check the exact entry first so
+    // a directory or symlink named pbps.yml is not mistaken for an absent file.
+    let entry = git(
+        &project.root,
+        &["ls-tree", "--full-tree", "-z", rev, "--", &relative],
+    )
+    .with_context(|| format!("cannot read `{relative}` at `{rev}`"))?;
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        entry.starts_with("100644 blob ") || entry.starts_with("100755 blob "),
+        "`{relative}` at `{rev}` is not a regular config file"
+    );
+    let mut config = None;
+    git_objects::read_with(
+        &project.root,
+        rev,
+        &relative,
+        |path, _| path == relative,
+        |path, mode, bytes| {
+            anyhow::ensure!(
+                matches!(mode, "100644" | "100755"),
+                "`{path}` at `{rev}` is not a regular config file"
+            );
+            let text = std::str::from_utf8(bytes).context("historical config is not UTF-8")?;
+            config = Some(
+                pbps_config::Config::parse(text, &project.config_file())
+                    .map_err(|e| anyhow::anyhow!("`{path}` at `{rev}` does not parse: {e}"))?,
+            );
+            Ok(())
+        },
+    )?;
+    Ok(config)
 }
 
 /// The declarations directory and identity file `config` names, as git names
@@ -308,8 +355,16 @@ fn load_from_git(
                 "empty baseline (`{rev}` does not exist yet; this repo has no commits)"
             ),
             is_empty_fallback: true,
+            git_sha: None,
         });
     }
+
+    let pinned = git(
+        root,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )?;
+    let revision_label = rev;
+    let rev = pinned.trim();
 
     // git paths are relative to the repo root, whereas the declarations
     // directory is relative to the project root — and it is *that* revision's
@@ -394,7 +449,8 @@ fn load_from_git(
         ids,
         hints,
         declared: pbps_model::Declared::default(),
-        description: format!("git {rev} ({count} objects)"),
+        description: format!("git {revision_label} ({count} objects)"),
+        git_sha: Some(rev.into()),
         is_empty_fallback: count == 0,
     })
 }
@@ -623,7 +679,7 @@ pub(crate) fn git_command(dir: &Path) -> Command {
     command
 }
 
-fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = git_command(dir)
         .args(args)
         .output()

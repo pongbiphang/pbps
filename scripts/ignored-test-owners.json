@@ -2706,7 +2706,21 @@
       "owner": "mssql",
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["consumer_retirements_connected_evidence_uses_the_deployed_revision"]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow"],
+      "owner": "mssql",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
       "cases": ["consumer_contracts_connected_refusals_and_saved_apply_boundary"]
+    },
+    {
+      "target": ["pbps-cli", "test", "flow_pg"],
+      "owner": "pg",
+      "validate_on": "linux",
+      "ignored_on": ["linux", "win32", "darwin"],
+      "cases": ["consumer_retirements_connected_evidence_uses_the_deployed_revision"]
     },
     {
       "target": ["pbps-cli", "test", "flow_pg"],

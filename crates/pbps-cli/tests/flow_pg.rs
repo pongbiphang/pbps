@@ -36313,3 +36313,14 @@ fn deployment_services1165_command_contracts_on_pg18() {
 fn deployment_services1165_command_contracts_on_pg16() {
     deployment_services1165::connected(&std::env::var("PBPS_TEST_PG_OLD_DB").unwrap(), true);
 }
+
+#[path = "support/consumer_retirements.rs"]
+mod consumer_retirements;
+
+#[test]
+#[ignore = "needs live pg"]
+fn consumer_retirements_connected_evidence_uses_the_deployed_revision() {
+    for variable in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        consumer_retirements::live(&std::env::var(variable).unwrap());
+    }
+}

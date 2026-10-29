@@ -1143,6 +1143,7 @@ reads: the envelope's schema is published and checked against real output, and
 `state list` gives the ledger timeline `status`'s newest-entry row cannot
 (DECISIONS 214-216).
 
-Declared consumer contracts (#2398 PR 1) guard named read/write interfaces at
-plan time, with validation and ordinary severity/suppression settings. PR 2
-will explain contract retirements the plan relies on.
+Declared consumer contracts (#2398) guard named read/write interfaces at
+plan time, with validation and ordinary severity/suppression settings. `explain`
+shows relied-on retirements from saved findings: entry, reason and retiring
+commit, with uncommitted removals and unavailable history named explicitly.

@@ -269,3 +269,14 @@ stay opaque, so a changed view/routine interface is unproven; unchanged
 restoration uses the differ's own part/module decisions through one CLI callback. Contracts add no apply gate or execution language.
 Schema set 68 publishes the configuration and rule catalogue; other formats
 stay unchanged. Retirement explanations follow in PR 2.
+
+<a id="dec-2398-2"></a>
+
+**DEC-2398.2. Explain carries only retirement evidence this plan relies on
+(#2398 PR 2).** Restore each removed identity-bound contract and run the
+ordinary consumer rule under this plan's policy and timestamp; only an
+unsuppressed error establishes reliance. Git's first topological commit in
+`baseline..candidate` where the entry is absent and a parent has it is the
+retiring commit. An uncommitted removal and unavailable history are named
+explicitly. Informational saved findings carry the entry, reason and provenance
+to `explain` without a checkout, new artifact field, version bump or apply gate.

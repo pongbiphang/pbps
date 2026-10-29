@@ -1803,3 +1803,87 @@ fn element_domain_defaults_leave_array_contracts_unchanged_but_checks_still_appl
         }
     }
 }
+
+#[test]
+fn retirement_membership_uses_consumer_access_and_target_identity_not_spelling() {
+    let before = schema();
+    let old = ids();
+    let mut after = before.clone();
+    let mut new = old.clone();
+    let table = after.tables.get_mut(&name()).unwrap();
+    let old_name: pbps_model::ColumnName = "old".into();
+    let column = table.columns.shift_remove(&old_name).unwrap();
+    table.columns.insert("new".into(), column);
+    new.columns.insert(uid("c_aaaaaa"), name().column("new"));
+    let sides = [
+        Side {
+            schema: &before,
+            ids: &old,
+        },
+        Side {
+            schema: &after,
+            ids: &new,
+        },
+    ];
+    let original =
+        Bindings::resolve(&consumers("app.t.old", false), &sides, &Clone::clone).unwrap();
+    let renamed = Bindings::resolve(&consumers("app.t.new", false), &sides, &Clone::clone).unwrap();
+    let entry = original.contracts().next().unwrap();
+    assert!(renamed.contains(entry));
+    assert_eq!(entry.declaration(), "consumers.billing-v41.uses: app.t.old");
+    assert!(entry.bindings().contains(entry));
+    let writes = Bindings::resolve(&consumers("app.t.new", true), &sides, &Clone::clone).unwrap();
+    assert!(!writes.contains(entry));
+    let mut other = consumers("app.t.new", false);
+    let consumer = other.remove("billing-v41").unwrap();
+    other.insert("different-consumer".into(), consumer);
+    assert!(
+        !Bindings::resolve(&other, &sides, &Clone::clone)
+            .unwrap()
+            .contains(entry)
+    );
+    assert!(!Bindings::default().contains(entry));
+}
+
+#[test]
+fn retirement_membership_reuses_canonical_routine_binding() {
+    let mut schema = schema();
+    let canonical: ModuleId = "app.f(integer)".parse().unwrap();
+    schema.modules.insert(
+        canonical.clone(),
+        Module {
+            kind: ModuleKind::Function,
+            definition: "(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$".into(),
+            description: None,
+            options: ModuleOptions::default(),
+        },
+    );
+    let ids = ids();
+    let side = Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let spell = |id: &ModuleId| {
+        id.raw()
+            .to_string()
+            .replace("(int)", "(integer)")
+            .parse()
+            .unwrap()
+    };
+    let old = Bindings::resolve(&consumers("app.f(int)", false), &[side; 2], &spell).unwrap();
+    let current =
+        Bindings::resolve(&consumers("app.f(integer)", false), &[side; 2], &spell).unwrap();
+    let entry = old.contracts().next().unwrap();
+    assert!(current.contains(entry));
+    schema.modules.insert(
+        "app.f(text)".parse().unwrap(),
+        schema.modules[&canonical].clone(),
+    );
+    let side = Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let different =
+        Bindings::resolve(&consumers("app.f(text)", false), &[side; 2], &spell).unwrap();
+    assert!(!different.contains(entry));
+}
