@@ -18,7 +18,35 @@ pub fn of(
     after: Snapshot<'_>,
     facts: &Facts,
 ) -> Result<Effects, OwnerError> {
+    with_lineage(
+        pg,
+        op,
+        owners,
+        before,
+        after,
+        facts,
+        &pbps_model::operation::Lineage::of(before, after),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::wildcard_enum_match_arm)]
+pub(crate) fn with_lineage(
+    pg: &Postgres,
+    op: &Operation,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    facts: &Facts,
+    lineage: &pbps_model::operation::Lineage,
+) -> Result<Effects, OwnerError> {
     let mut fx = Effects::default();
+    if facts.parents.is_empty() {
+        return Ok(fx);
+    }
+    if let Some(clauses) = super::movement::of(pg, op, owners, before, after, facts, lineage)? {
+        fx.symbolic = clauses;
+        return Ok(fx);
+    }
     let transitions = op.change().column_transitions();
     if facts.parents.is_empty() || transitions.is_empty() {
         return Ok(fx);
@@ -42,7 +70,14 @@ pub fn of(
         }
         _ => return Ok(fx),
     };
-    if !facts.parents.contains(&parent) {
+    let source = !facts.parents.contains(&parent)
+        && matches!(op.change(), Change::AlterColumnDefault { .. })
+        && lineage.families().any(|(p, f)| {
+            facts.parents.contains(p)
+                && f.standing(&parent, pbps_model::operation::End::Goal)
+                    == pbps_model::operation::Standing::Member
+        });
+    if !facts.parents.contains(&parent) && !source {
         return Ok(fx);
     }
     if let Some(refusal) = columns::refusal(pg, op.change()) {
@@ -80,10 +115,13 @@ pub fn of(
                 }
             }
         }
-        let Some((scope, policy)) = columns::policy(pg, &transition) else {
+        let Some((mut scope, policy)) = columns::policy(pg, &transition) else {
             fx.symbolic.push(Clause::Require(Fact::Unread));
             continue;
         };
+        if source {
+            scope = Scope::ParentOnly;
+        }
         let to = output(
             pg,
             op.change(),
@@ -111,7 +149,7 @@ pub fn of(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn output(
+pub(super) fn output(
     pg: &Postgres,
     change: &Change,
     transition: &ColumnTransition<'_>,

@@ -2674,6 +2674,37 @@ impl Dialect for Postgres {
         true
     }
 
+    fn symbolic_effects(
+        &self,
+        op: &pbps_model::operation::Operation,
+        owners: &dyn pbps_model::operation::Owners,
+        before: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
+        facts: &pbps_model::operation::symbolic::Facts,
+        lineage: &pbps_model::operation::Lineage,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        engine_effects::operations::with_lineage(self, op, owners, before, after, facts, lineage)
+    }
+
+    fn transfer_policy(
+        &self,
+        transfer: &pbps_model::operation::symbolic::Transfer,
+        parents: &[pbps_model::operation::symbolic::Value],
+        candidates: &[pbps_model::operation::symbolic::Value],
+    ) -> Result<pbps_model::operation::symbolic::TransferPolicy, String> {
+        if let pbps_model::operation::symbolic::Property::Column(_, attribute) = &transfer.parent {
+            Ok(engine_effects::attach_policy(
+                attribute,
+                self.server_version_num,
+                parents,
+                candidates,
+            )?
+            .1)
+        } else {
+            Ok(transfer.policy.clone())
+        }
+    }
+
     fn symbolic_facts(
         &self,
         before: pbps_model::operation::Snapshot<'_>,

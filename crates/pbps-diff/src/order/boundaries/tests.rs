@@ -358,3 +358,60 @@ fn only_a_parent_whose_columns_change_beside_its_members_is_read() {
     };
     assert!(read(&attach(true), held, held).is_empty());
 }
+
+#[test]
+fn version_binding_requires_a_unique_existing_writer_chain() {
+    use pbps_model::operation::{Incarnation, Resource, symbolic::*};
+    let (_, ops, mut fx, mut state) = fixture();
+    let Clause::Move(m) = &fx[0].symbolic[0] else {
+        panic!()
+    };
+    let parent = m.parent.clone();
+    let key = Key {
+        parent: parent.clone(),
+        property: Property::Address,
+    };
+    let value = |text: &str| {
+        Fact::Known(Value {
+            datum: Datum::Definition(text.into()),
+            bindings: Default::default(),
+            ownership: Ownership::Own,
+        })
+    };
+    state.cells.insert(
+        (parent.clone(), Property::Address),
+        Cell {
+            value: value("base"),
+            version: Version::Base,
+            origin: None,
+        },
+    );
+    for (at, effect) in fx.iter_mut().enumerate() {
+        effect.symbolic = vec![Clause::Recurse(RecursiveWrite {
+            key: key.clone(),
+            input: Version::Base,
+            from: value("base"),
+            to: value(if at == 0 { "a" } else { "b" }),
+            scope: Scope::ParentOnly,
+            policy: WritePolicy::PreserveOwnership,
+            lifetime: Lifetime::Retain,
+        })];
+    }
+    let baseline = crate::order::Baseline::empty().with_symbolic(state);
+    let fork = fx.clone();
+    bind(&ops, &mut fx, &baseline);
+    assert_eq!(
+        fx, fork,
+        "incomparable writers must retain their explicit fork"
+    );
+    for effect in &mut fx {
+        effect.rewrites.push(Resource::Object(
+            ObjectKey::Table(parent.clone()),
+            Incarnation::Base,
+        ));
+    }
+    bind(&ops, &mut fx, &baseline);
+    assert!(
+        matches!(&fx[1].symbolic[..],[Clause::Recurse(w)] if w.input==Version::After(ops.as_slice()[0].id()) && w.from==value("a"))
+    );
+}

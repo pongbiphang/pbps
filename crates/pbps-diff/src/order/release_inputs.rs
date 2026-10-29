@@ -6,7 +6,7 @@ use pbps_dialect::Dialect;
 use pbps_model::ModuleDeps;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 
-use super::{Baseline, Checks, Graph, PlanningPlan, Schedule, analyse, graph};
+use super::{Baseline, Checks, Graph, PlanningPlan, Schedule, graph};
 
 /// Add the effect closure of inserts crossed by a released input's drop.
 /// Catalog/lexical waits and unrelated Keeps remain the caller's proposals;
@@ -73,14 +73,15 @@ pub fn carry_inserts<S>(
         schema: after.schema,
         ids: after.ids,
     };
-    let effects = analyse(&operations, &owners, base, end, dialect);
+    let effects =
+        super::shadow::analyse_planning(&operations, &owners, base, end, dialect, None, plan);
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());
     }
     let mut graph = graph(
         operations.as_slice(),
         &effects.effects,
-        &Baseline::of(base, &owners),
+        &Baseline::of(base, &owners).with_symbolic(effects.symbolic.clone()),
         declared,
         Checks::ALL,
     );
@@ -178,7 +179,7 @@ pub(super) fn pending_consumers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order::{Source, propose};
+    use crate::order::{Source, analyse, propose};
     use pbps_model::resolver::OrderReason;
     use pbps_model::{
         Change, ChangeSet, Column, ForeignKey, IdsFile, PlannedChange, PrimaryKey,

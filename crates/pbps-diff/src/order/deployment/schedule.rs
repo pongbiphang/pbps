@@ -538,14 +538,14 @@ fn keep_handover_dependents(
         schema: declared.schema,
         ids: declared.sources.after,
     };
-    let effects = shadow::analyse(&operations, &owners, before, after, dialect);
+    let effects = shadow::analyse_with_catalog(&operations, &owners, before, after, dialect, None);
     if let Some((_, error)) = effects.unowned.first() {
         return Err(Refusal(error.to_string()));
     }
     let graph = edges::graph(
         operations.as_slice(),
         &effects.effects,
-        &edges::Baseline::of(before, &owners),
+        &edges::Baseline::of(before, &owners).with_symbolic(effects.symbolic.clone()),
         declared.module_deps,
         edges::Checks::ALL,
     );

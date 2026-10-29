@@ -1804,6 +1804,8 @@
         "darwin"
       ],
       "cases": [
+        "column_meetings::default_transfers_and_restorations_match_both_native_cuts",
+        "column_meetings::not_null_transfer_ownership_matches_the_versioned_policy",
         "column_policy::column_statement_policies_match_native_recursion",
         "column_policy::identity_capability_refusals_keep_their_native_sqlstates",
         "dependencies_tests::execution::expansion_replays_own_parts_external_bindings_and_member_lifetimes",

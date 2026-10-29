@@ -29,10 +29,13 @@ pub struct Report {
 /// that nothing reads it as independent.
 #[derive(Debug, Clone)]
 pub struct Shadowed {
+    pub symbolic: pbps_model::operation::symbolic::State,
     pub effects: Vec<Effects>,
     pub unowned: Vec<(OperationId, OwnerError)>,
 }
 
+/// Explicit operation-level analysis, including the membership contract.
+/// Catalog-dependent facts remain obligations until evidence is supplied.
 pub fn analyse(
     operations: &Operations,
     owners: &dyn Owners,
@@ -40,11 +43,13 @@ pub fn analyse(
     after: Snapshot<'_>,
     dialect: &(impl Dialect + ?Sized),
 ) -> Shadowed {
-    analyse_with_catalog(operations, owners, before, after, dialect, None)
+    analyse_with_membership(operations, owners, before, after, dialect, None, None)
 }
 
-/// The same effects, with connected identifier comparisons. Missing comparisons
-/// remain unknown; a failed read must never be supplied as an empty answer.
+/// Ordinary effects with connected identifier comparisons, without opting into
+/// a membership contract. Temporary dependent writes can resemble column intent;
+/// registered plan obligations or explicit membership analysis own that contract.
+/// Missing comparisons remain unknown; a failed read is never an empty answer.
 pub fn analyse_with_catalog(
     operations: &Operations,
     owners: &dyn Owners,
@@ -53,12 +58,153 @@ pub fn analyse_with_catalog(
     dialect: &(impl Dialect + ?Sized),
     catalog: Option<&pbps_dialect::slots::CatalogFacts>,
 ) -> Shadowed {
+    analyse_scoped(
+        operations, owners, before, after, dialect, catalog, None, false,
+    )
+}
+
+/// Analyse the same operations with stored membership binding evidence.
+/// Missing evidence keeps individual facts unread; it is never permission to
+/// synthesize an empty binding set (DEC-2296.4).
+#[allow(clippy::too_many_arguments)]
+pub fn analyse_with_membership(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
+) -> Shadowed {
+    analyse_scoped(
+        operations, owners, before, after, dialect, catalog, stored, true,
+    )
+}
+
+/// The contract is activated by the plan's registered membership obligations.
+/// Ordinary dependent expansion already owns its order and reads no membership
+/// bindings; its temporary column writes do not register a new contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn analyse_planning<S>(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    plan: &super::PlanningPlan<S>,
+) -> Shadowed {
+    analyse_scoped(
+        operations,
+        owners,
+        before,
+        after,
+        dialect,
+        catalog,
+        None,
+        !plan.boundaries.is_empty(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyse_scoped(
+    operations: &Operations,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    after: Snapshot<'_>,
+    dialect: &(impl Dialect + ?Sized),
+    catalog: Option<&pbps_dialect::slots::CatalogFacts>,
+    stored: Option<&pbps_model::operation::MembershipCatalog>,
+    membership: bool,
+) -> Shadowed {
+    use pbps_model::operation::{End, Lineage, MembershipCatalog};
+    let lineage = Lineage::of(before, after);
+    let payload = pbps_model::ChangeSet {
+        changes: operations.iter().map(|op| op.planned().clone()).collect(),
+    };
+    let meetings = super::boundaries::meetings(
+        crate::Side {
+            schema: before.schema,
+            ids: before.ids,
+        },
+        crate::Side {
+            schema: after.schema,
+            ids: after.ids,
+        },
+        &payload,
+    );
+    let mut facts = if !membership || meetings.is_empty() {
+        Default::default()
+    } else {
+        dialect.symbolic_facts(
+            before,
+            after,
+            stored.unwrap_or(&MembershipCatalog::default()),
+        )
+    };
+    // New parents use the existing birth/attachment contract, not a recursive
+    // write against a baseline property version that never existed.
+    facts.parents.retain(|p| {
+        meetings.iter().any(|m| m.parent == *p.uid())
+            && lineage.family(p).is_some_and(|f| f.present(End::Base))
+    });
+    let family: std::collections::BTreeSet<_> = lineage
+        .families()
+        .filter(|(p, _)| facts.parents.contains(p))
+        .flat_map(|(p, f)| std::iter::once(p).chain(f.children()))
+        .cloned()
+        .collect();
+    for state in [&mut facts.base, &mut facts.goal] {
+        state.tables.retain(|t| family.contains(t));
+        state.cells.retain(|(t, _), _| family.contains(t));
+        state.members.retain(|c, _| family.contains(c));
+    }
+    if !facts.parents.is_empty() {
+        // Only explicit module births change a retained routine binding.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let born: std::collections::BTreeSet<_> = operations
+            .iter()
+            .filter_map(|op| match op.change() {
+                pbps_model::Change::CreateModule { id, .. } => {
+                    Some(pbps_model::operation::ObjectKey::Module(id.clone()))
+                }
+                pbps_model::Change::AlterModule { id, .. } if dialect.rebuilds_modules() => {
+                    Some(pbps_model::operation::ObjectKey::Module(id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for cell in facts.goal.cells.values_mut() {
+            if let pbps_model::operation::symbolic::Fact::Known(value) = &mut cell.value {
+                value.bindings = value
+                    .bindings
+                    .iter()
+                    .cloned()
+                    .map(|mut binding| {
+                        if born.contains(&binding.input) {
+                            binding.incarnation = pbps_model::operation::Incarnation::Final;
+                        }
+                        binding
+                    })
+                    .collect();
+            }
+        }
+    }
     let mut unowned = Vec::new();
-    let effects = operations
+    let mut effects: Vec<_> = operations
         .iter()
         .map(|op: &Operation| {
             let portable = effects(op, owners, before, after);
-            let engine = dialect.engine_effects(op, owners, before, after, catalog);
+            let engine = dialect
+                .engine_effects(op, owners, before, after, catalog)
+                .and_then(|e| {
+                    if !membership {
+                        return Ok(e);
+                    }
+                    dialect
+                        .symbolic_effects(op, owners, before, after, &facts, &lineage)
+                        .map(|s| e.merged(s))
+                });
             match (portable, engine) {
                 (Ok(p), Ok(e)) => p.merged(e),
                 (Err(error), _) | (_, Err(error)) => {
@@ -68,7 +214,19 @@ pub fn analyse_with_catalog(
             }
         })
         .collect();
-    Shadowed { effects, unowned }
+    if effects.iter().any(|e| !e.symbolic.is_empty()) {
+        super::boundaries::bind(
+            operations,
+            &mut effects,
+            &Baseline::of(before, owners).with_symbolic(facts.base.clone()),
+        );
+        super::boundaries::transfers(&mut effects, &facts.base, dialect);
+    }
+    Shadowed {
+        effects,
+        unowned,
+        symbolic: facts.base,
+    }
 }
 
 impl Shadowed {
@@ -79,9 +237,10 @@ impl Shadowed {
         baseline: &Baseline,
         declared: &ModuleDeps,
     ) -> Report {
+        let baseline = baseline.clone().with_symbolic(self.symbolic.clone());
         let ops = operations.as_slice();
-        let violations = verify_with(ops, &self.effects, baseline, declared, Checks::ALL);
-        let g = graph(ops, &self.effects, baseline, declared, Checks::ALL);
+        let violations = verify_with(ops, &self.effects, &baseline, declared, Checks::ALL);
+        let g = graph(ops, &self.effects, &baseline, declared, Checks::ALL);
         Report {
             violations,
             graph: g,

@@ -109,14 +109,19 @@ pub fn swapped(graph: &Graph, n: usize, earlier: usize, later: usize) -> Option<
 }
 
 #[derive(Clone, Copy)]
-enum Direction {
+pub(super) enum Direction {
     Forward,
     Backward,
 }
 
 /// Every position a path of edges reaches from `from` (`from` excluded),
 /// along the edges or against them.
-fn reaches(graph: &Graph, n: usize, from: usize, direction: Direction) -> BTreeSet<usize> {
+pub(super) fn reaches(
+    graph: &Graph,
+    n: usize,
+    from: usize,
+    direction: Direction,
+) -> BTreeSet<usize> {
     let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
     for e in &graph.edges {
         match direction {
